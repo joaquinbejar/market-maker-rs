@@ -859,18 +859,22 @@ mod tests {
 
     #[test]
     fn test_backtest_result_avg_trade_pnl() {
-        let mut result = BacktestResult::default();
-        result.net_pnl = dec!(100.0);
-        result.num_trades = 10;
+        let result = BacktestResult {
+            net_pnl: dec!(100.0),
+            num_trades: 10,
+            ..Default::default()
+        };
 
         assert_eq!(result.avg_trade_pnl(), dec!(10.0));
     }
 
     #[test]
     fn test_backtest_result_duration() {
-        let mut result = BacktestResult::default();
-        result.start_time = 1000;
-        result.end_time = 5000;
+        let result = BacktestResult {
+            start_time: 1000,
+            end_time: 5000,
+            ..Default::default()
+        };
 
         assert_eq!(result.duration_ms(), 4000);
     }
