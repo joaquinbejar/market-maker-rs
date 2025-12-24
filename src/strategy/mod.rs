@@ -1,9 +1,11 @@
 //! Strategy module containing pure mathematical calculations for market making.
 //!
-//! This module implements the Avellaneda-Stoikov model, which solves the optimal
-//! market making problem using stochastic control theory.
+//! This module implements various market making strategies:
+//! - Avellaneda-Stoikov model using stochastic control theory
+//! - Grid trading for ranging markets
+//! - Depth-based offering
 //!
-//! # Key Formulas
+//! # Key Formulas (Avellaneda-Stoikov)
 //!
 //! ## Reservation Price
 //! ```text
@@ -33,3 +35,6 @@ pub mod interface;
 
 /// Depth-based offering strategy.
 pub mod depth_based;
+
+/// Grid trading strategy.
+pub mod grid;
