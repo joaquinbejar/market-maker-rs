@@ -11,6 +11,7 @@
 //! - **Market data types**: `BookLevel`, `OrderBookSnapshot`, `Fill`
 //! - **Connector traits**: `ExchangeConnector`, `MarketDataStream`
 //! - **Mock implementation**: `MockExchangeConnector` for testing
+//! - **Order management**: `OrderManager`, `ManagedOrder` for order lifecycle
 //!
 //! # Example
 //!
@@ -39,8 +40,14 @@ pub mod connector;
 /// Mock exchange connector for testing.
 pub mod mock;
 
+/// Order management system.
+pub mod order_manager;
+
 pub use connector::{
     BookLevel, ExchangeConnector, Fill, MarketDataStream, OrderBookSnapshot, OrderId, OrderRequest,
     OrderResponse, OrderStatus, OrderType, Side, TimeInForce,
 };
 pub use mock::{MockConfig, MockExchangeConnector};
+pub use order_manager::{
+    ManagedOrder, OrderManager, OrderManagerConfig, OrderManagerStats, ThreadSafeOrderManager,
+};
