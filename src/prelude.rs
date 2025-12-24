@@ -30,6 +30,6 @@ pub use crate::market_state::snapshot::MarketState;
 
 // Re-export risk types
 pub use crate::risk::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState, RiskLimits, TriggerReason,
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState, DrawdownRecord, DrawdownTracker,
+    RiskLimits, TriggerReason,
 };
-pub use crate::risk::RiskLimits;
