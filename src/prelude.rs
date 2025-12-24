@@ -44,4 +44,7 @@ pub use crate::risk::{
 pub use crate::analytics::order_flow::{
     OrderFlowAnalyzer, OrderFlowAnalyzerBuilder, OrderFlowStats, TradeSide,
 };
+pub use crate::analytics::vpin::{
+    BucketStats, TradeClassifier, VPINCalculator, VPINConfig, VolumeBucket,
+};
 // Note: Trade is already exported from strategy::adaptive_spread
