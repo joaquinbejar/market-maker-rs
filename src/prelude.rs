@@ -23,6 +23,7 @@ pub use crate::strategy::adaptive_spread::{
     TradeFlowImbalance,
 };
 pub use crate::strategy::config::StrategyConfig;
+pub use crate::strategy::glft::{GLFTConfig, GLFTStrategy, PenaltyFunction};
 pub use crate::strategy::grid::{GridConfig, GridOrder, GridStrategy, OrderSide};
 pub use crate::strategy::quote::Quote;
 
