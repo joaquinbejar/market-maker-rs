@@ -72,7 +72,7 @@ pub enum PenaltyFunction {
 ///     dec!(0.1),    // risk_aversion (gamma)
 ///     dec!(1.5),    // order_intensity (k)
 ///     dec!(0.05),   // terminal_penalty (phi)
-///     3600_000,     // terminal_time (1 hour in ms)
+///     3_600_000,     // terminal_time (1 hour in ms)
 ///     dec!(0.0001), // min_spread
 /// ).unwrap();
 /// ```
@@ -127,7 +127,7 @@ impl GLFTConfig {
     /// use market_maker_rs::dec;
     ///
     /// let config = GLFTConfig::new(
-    ///     dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)
+    ///     dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)
     /// ).unwrap();
     /// ```
     pub fn new(
@@ -210,7 +210,7 @@ impl GLFTConfig {
 /// use market_maker_rs::dec;
 ///
 /// let config = GLFTConfig::new(
-///     dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)
+///     dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)
 /// ).unwrap();
 ///
 /// let reservation = GLFTStrategy::calculate_reservation_price(
@@ -218,7 +218,7 @@ impl GLFTConfig {
 ///     dec!(10.0),   // inventory
 ///     &config,
 ///     dec!(0.2),    // volatility
-///     1800_000,     // current_time (halfway through session)
+///     1_800_000,     // current_time (halfway through session)
 /// ).unwrap();
 ///
 /// // With positive inventory and terminal penalty, reservation < mid_price
@@ -389,7 +389,7 @@ impl GLFTStrategy {
     /// use market_maker_rs::dec;
     ///
     /// let config = GLFTConfig::new(
-    ///     dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)
+    ///     dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)
     /// ).unwrap();
     ///
     /// let (bid, ask) = GLFTStrategy::calculate_optimal_quotes(
@@ -463,13 +463,13 @@ impl GLFTStrategy {
     ///
     /// // At session start (full time remaining), gamma = base
     /// let gamma_start = GLFTStrategy::calculate_dynamic_gamma(
-    ///     dec!(0.1), 3600_000, 3600_000, true, dec!(1.0)
+    ///     dec!(0.1), 3_600_000, 3_600_000, true, dec!(1.0)
     /// );
     /// assert_eq!(gamma_start, dec!(0.1));
     ///
     /// // At session end (no time remaining), gamma = base * (1 + alpha)
     /// let gamma_end = GLFTStrategy::calculate_dynamic_gamma(
-    ///     dec!(0.1), 0, 3600_000, true, dec!(1.0)
+    ///     dec!(0.1), 0, 3_600_000, true, dec!(1.0)
     /// );
     /// assert_eq!(gamma_end, dec!(0.2)); // 0.1 * (1 + 1.0)
     /// ```
@@ -579,28 +579,28 @@ mod tests {
 
     #[test]
     fn test_config_valid() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001));
+        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001));
         assert!(config.is_ok());
     }
 
     #[test]
     fn test_config_invalid_risk_aversion() {
-        let config = GLFTConfig::new(dec!(0.0), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001));
+        let config = GLFTConfig::new(dec!(0.0), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001));
         assert!(config.is_err());
 
-        let config = GLFTConfig::new(dec!(-0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001));
+        let config = GLFTConfig::new(dec!(-0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001));
         assert!(config.is_err());
     }
 
     #[test]
     fn test_config_invalid_order_intensity() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(0.0), dec!(0.05), 3600_000, dec!(0.0001));
+        let config = GLFTConfig::new(dec!(0.1), dec!(0.0), dec!(0.05), 3_600_000, dec!(0.0001));
         assert!(config.is_err());
     }
 
     #[test]
     fn test_config_invalid_terminal_penalty() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(-0.05), 3600_000, dec!(0.0001));
+        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(-0.05), 3_600_000, dec!(0.0001));
         assert!(config.is_err());
     }
 
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_config_with_dynamic_gamma() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001))
+        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001))
             .unwrap()
             .with_dynamic_gamma(dec!(1.5));
 
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn test_config_with_penalty_function() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001))
+        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001))
             .unwrap()
             .with_penalty_function(PenaltyFunction::Exponential);
 
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn test_reservation_price_flat_inventory() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let reservation = GLFTStrategy::calculate_reservation_price(
             dec!(100.0),
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn test_reservation_price_long_inventory() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let reservation = GLFTStrategy::calculate_reservation_price(
             dec!(100.0),
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn test_reservation_price_short_inventory() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let reservation = GLFTStrategy::calculate_reservation_price(
             dec!(100.0),
@@ -687,18 +687,18 @@ mod tests {
     fn test_terminal_penalty_effect() {
         // Config with terminal penalty
         let config_with_penalty =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3_600_000, dec!(0.0001)).unwrap();
 
         // Config without terminal penalty
         let config_no_penalty =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.0), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.0), 3_600_000, dec!(0.0001)).unwrap();
 
         let reservation_with = GLFTStrategy::calculate_reservation_price(
             dec!(100.0),
             dec!(10.0),
             &config_with_penalty,
             dec!(0.2),
-            1800_000, // Halfway through session
+            1_800_000, // Halfway through session
         )
         .unwrap();
 
@@ -707,7 +707,7 @@ mod tests {
             dec!(10.0),
             &config_no_penalty,
             dec!(0.2),
-            1800_000,
+            1_800_000,
         )
         .unwrap();
 
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn test_terminal_penalty_increases_near_end() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3_600_000, dec!(0.0001)).unwrap();
 
         // Early in session
         let reservation_early = GLFTStrategy::calculate_reservation_price(
@@ -736,7 +736,7 @@ mod tests {
             dec!(10.0),
             &config,
             dec!(0.2),
-            3500_000, // Near end of session
+            3_500_000, // Near end of session
         )
         .unwrap();
 
@@ -748,8 +748,8 @@ mod tests {
     fn test_dynamic_gamma_at_start() {
         let gamma = GLFTStrategy::calculate_dynamic_gamma(
             dec!(0.1),
-            3600_000, // Full time remaining
-            3600_000,
+            3_600_000, // Full time remaining
+            3_600_000,
             true,
             dec!(1.0),
         );
@@ -763,7 +763,7 @@ mod tests {
         let gamma = GLFTStrategy::calculate_dynamic_gamma(
             dec!(0.1),
             0, // No time remaining
-            3600_000,
+            3_600_000,
             true,
             dec!(1.0),
         );
@@ -776,8 +776,8 @@ mod tests {
     fn test_dynamic_gamma_halfway() {
         let gamma = GLFTStrategy::calculate_dynamic_gamma(
             dec!(0.1),
-            1800_000, // Half time remaining
-            3600_000,
+            1_800_000, // Half time remaining
+            3_600_000,
             true,
             dec!(1.0),
         );
@@ -791,7 +791,7 @@ mod tests {
         let gamma = GLFTStrategy::calculate_dynamic_gamma(
             dec!(0.1),
             0, // No time remaining
-            3600_000,
+            3_600_000,
             false, // Disabled
             dec!(1.0),
         );
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn test_optimal_spread_positive() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let spread = GLFTStrategy::calculate_optimal_spread(&config, dec!(0.2), 0).unwrap();
 
@@ -813,10 +813,10 @@ mod tests {
     #[test]
     fn test_optimal_spread_min_constraint() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(1.0)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(1.0)).unwrap();
 
         let spread =
-            GLFTStrategy::calculate_optimal_spread(&config, dec!(0.001), 3599_999).unwrap();
+            GLFTStrategy::calculate_optimal_spread(&config, dec!(0.001), 3_599_999).unwrap();
 
         // Should be at least min_spread
         assert!(spread >= dec!(1.0));
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn test_optimal_quotes_valid() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let (bid, ask) = GLFTStrategy::calculate_optimal_quotes(
             dec!(100.0),
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn test_optimal_quotes_with_inventory() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let (bid_flat, ask_flat) = GLFTStrategy::calculate_optimal_quotes(
             dec!(100.0),
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_compare_with_as() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3600_000, dec!(0.0001))
+        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3_600_000, dec!(0.0001))
             .unwrap()
             .with_dynamic_gamma(dec!(1.0));
 
@@ -875,7 +875,7 @@ mod tests {
                 dec!(10.0),
                 &config,
                 dec!(0.2),
-                1800_000,
+                1_800_000,
             )
             .unwrap();
 
@@ -888,17 +888,17 @@ mod tests {
     fn test_penalty_function_linear() {
         // At start (full time), penalty = 0
         let penalty_start =
-            GLFTStrategy::calculate_penalty_function(3600_000, 3600_000, PenaltyFunction::Linear);
+            GLFTStrategy::calculate_penalty_function(3_600_000, 3_600_000, PenaltyFunction::Linear);
         assert_eq!(penalty_start, dec!(0.0));
 
         // At end (no time), penalty = 1
         let penalty_end =
-            GLFTStrategy::calculate_penalty_function(0, 3600_000, PenaltyFunction::Linear);
+            GLFTStrategy::calculate_penalty_function(0, 3_600_000, PenaltyFunction::Linear);
         assert_eq!(penalty_end, dec!(1.0));
 
         // Halfway, penalty = 0.5
         let penalty_half =
-            GLFTStrategy::calculate_penalty_function(1800_000, 3600_000, PenaltyFunction::Linear);
+            GLFTStrategy::calculate_penalty_function(1_800_000, 3_600_000, PenaltyFunction::Linear);
         assert_eq!(penalty_half, dec!(0.5));
     }
 
@@ -906,21 +906,21 @@ mod tests {
     fn test_penalty_function_quadratic() {
         // At start, penalty = 0
         let penalty_start = GLFTStrategy::calculate_penalty_function(
-            3600_000,
-            3600_000,
+            3_600_000,
+            3_600_000,
             PenaltyFunction::Quadratic,
         );
         assert_eq!(penalty_start, dec!(0.0));
 
         // At end, penalty = 1
         let penalty_end =
-            GLFTStrategy::calculate_penalty_function(0, 3600_000, PenaltyFunction::Quadratic);
+            GLFTStrategy::calculate_penalty_function(0, 3_600_000, PenaltyFunction::Quadratic);
         assert_eq!(penalty_end, dec!(1.0));
 
         // Halfway, penalty = 0.25 (0.5²)
         let penalty_half = GLFTStrategy::calculate_penalty_function(
-            1800_000,
-            3600_000,
+            1_800_000,
+            3_600_000,
             PenaltyFunction::Quadratic,
         );
         assert_eq!(penalty_half, dec!(0.25));
@@ -929,7 +929,7 @@ mod tests {
     #[test]
     fn test_invalid_mid_price() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let result = GLFTStrategy::calculate_reservation_price(
             dec!(0.0),
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn test_invalid_volatility() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let result = GLFTStrategy::calculate_reservation_price(
             dec!(100.0),
@@ -962,7 +962,7 @@ mod tests {
     #[test]
     fn test_serialization() {
         let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3600_000, dec!(0.0001)).unwrap();
+            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: GLFTConfig = serde_json::from_str(&json).unwrap();
