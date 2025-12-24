@@ -27,3 +27,6 @@ pub use crate::position::pnl::PnL;
 
 // Re-export market state types
 pub use crate::market_state::snapshot::MarketState;
+
+// Re-export risk types
+pub use crate::risk::RiskLimits;
