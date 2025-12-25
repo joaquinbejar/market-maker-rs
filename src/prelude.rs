@@ -36,8 +36,9 @@ pub use crate::market_state::snapshot::MarketState;
 
 // Re-export risk types
 pub use crate::risk::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState, DrawdownRecord, DrawdownTracker,
-    RiskLimits, TriggerReason,
+    Alert, AlertHandler, AlertManager, AlertSeverity, AlertType, CallbackAlertHandler,
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState, CollectingAlertHandler,
+    DrawdownRecord, DrawdownTracker, LogAlertHandler, RiskLimits, TriggerReason,
 };
 
 // Re-export analytics types

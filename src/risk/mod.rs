@@ -14,6 +14,7 @@
 //! - **Order Scaling**: Automatic reduction of order sizes near limits
 //! - **Circuit Breakers**: Automatic trading halts on adverse conditions
 //! - **Drawdown Tracking**: Monitor and limit decline from peak equity
+//! - **Alert System**: Configurable alerts for critical events
 //!
 //! # Example
 //!
@@ -43,10 +44,16 @@
 //! assert_eq!(tracker.current_drawdown(), dec!(0.1)); // 10% drawdown
 //! ```
 
+/// Alert system for critical event notification.
+pub mod alerts;
 mod circuit_breaker;
 mod drawdown;
 mod limits;
 
+pub use alerts::{
+    Alert, AlertHandler, AlertManager, AlertSeverity, AlertType, CallbackAlertHandler,
+    CollectingAlertHandler, LogAlertHandler,
+};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState, TriggerReason,
 };
