@@ -9,6 +9,7 @@
 //! - `order_flow`: Order flow imbalance analysis and trade tracking
 //! - `vpin`: VPIN (Volume-Synchronized Probability of Informed Trading) calculation
 //! - `intensity`: Dynamic order intensity estimation for A-S model
+//! - `live_metrics`: Real-time operational metrics tracking
 //!
 //! # Example
 //!
@@ -32,10 +33,14 @@ pub mod vpin;
 /// Dynamic order intensity estimation.
 pub mod intensity;
 
+/// Live metrics tracking for real-time monitoring.
+pub mod live_metrics;
+
 pub use intensity::{
     FillObservation, FillSide, IntensityEstimate, ObservationStats, OrderIntensityConfig,
     OrderIntensityEstimator,
 };
+pub use live_metrics::{Counter, Gauge, LiveMetrics, MetricsSnapshot, SharedLiveMetrics};
 pub use order_flow::{
     OrderFlowAnalyzer, OrderFlowAnalyzerBuilder, OrderFlowStats, Trade, TradeSide,
 };

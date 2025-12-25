@@ -45,6 +45,9 @@ pub use crate::analytics::intensity::{
     FillObservation, FillSide, IntensityEstimate, ObservationStats, OrderIntensityConfig,
     OrderIntensityEstimator,
 };
+pub use crate::analytics::live_metrics::{
+    Counter, Gauge, LiveMetrics, MetricsSnapshot, SharedLiveMetrics,
+};
 pub use crate::analytics::order_flow::{
     OrderFlowAnalyzer, OrderFlowAnalyzerBuilder, OrderFlowStats, TradeSide,
 };
