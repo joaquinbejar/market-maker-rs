@@ -22,6 +22,11 @@ pub use crate::strategy::adaptive_spread::{
     AdaptiveSpread, AdaptiveSpreadCalculator, AdaptiveSpreadConfig, OrderBookImbalance, Trade,
     TradeFlowImbalance,
 };
+pub use crate::strategy::calibration::{
+    CalibrationConfig, CalibrationResult, FillObservation as CalibrationFillObservation,
+    OptimizedParameters, OrderIntensityCalibrator, ParameterOptimizer, RegimeAdjustments,
+    RiskAversionCalibrator, VolatilityRegime, VolatilityRegimeDetector,
+};
 pub use crate::strategy::config::StrategyConfig;
 pub use crate::strategy::glft::{GLFTConfig, GLFTStrategy, PenaltyFunction};
 pub use crate::strategy::grid::{GridConfig, GridOrder, GridStrategy, OrderSide};

@@ -46,3 +46,6 @@ pub mod adaptive_spread;
 
 /// Guéant-Lehalle-Fernandez-Tapia (GLFT) model extension.
 pub mod glft;
+
+/// Parameter calibration tools for strategy optimization.
+pub mod calibration;
