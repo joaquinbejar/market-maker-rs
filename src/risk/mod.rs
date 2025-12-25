@@ -15,6 +15,7 @@
 //! - **Circuit Breakers**: Automatic trading halts on adverse conditions
 //! - **Drawdown Tracking**: Monitor and limit decline from peak equity
 //! - **Alert System**: Configurable alerts for critical events
+//! - **Portfolio Risk**: Correlation-aware multi-asset risk management
 //!
 //! # Example
 //!
@@ -50,6 +51,9 @@ mod circuit_breaker;
 mod drawdown;
 mod limits;
 
+/// Portfolio risk management with correlation-aware calculations.
+pub mod portfolio;
+
 pub use alerts::{
     Alert, AlertHandler, AlertManager, AlertSeverity, AlertType, CallbackAlertHandler,
     CollectingAlertHandler, LogAlertHandler,
@@ -59,3 +63,6 @@ pub use circuit_breaker::{
 };
 pub use drawdown::{DrawdownRecord, DrawdownTracker};
 pub use limits::RiskLimits;
+pub use portfolio::{
+    AssetId, CorrelationMatrix, HedgeCalculator, PortfolioPosition, PortfolioRiskCalculator,
+};
