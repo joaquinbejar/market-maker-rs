@@ -197,6 +197,7 @@ impl ApiState {
     }
 
     /// Updates the configuration.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_config(
         &self,
         base_spread_bps: Option<u32>,
