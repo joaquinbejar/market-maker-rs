@@ -80,3 +80,11 @@ required-features = ["options"]
 [[example]]
 name = "chain_market_making"
 required-features = ["chain"]
+
+[[example]]
+name = "multi_underlying"
+required-features = ["multi-underlying"]
+
+[[example]]
+name = "event_system"
+required-features = ["events"]

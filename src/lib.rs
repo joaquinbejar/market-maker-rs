@@ -119,6 +119,11 @@
 //! - [`prelude`]: Convenient re-exports of commonly used types
 //! - `options`: Options pricing, Greeks, and market making (feature: `options`)
 //! - `chain`: Option chain integration and multi-strike quoting (feature: `chain`)
+//! - `api`: REST/WebSocket API layer (feature: `api`)
+//! - `persistence`: Data persistence layer (feature: `persistence`)
+//! - `multi_underlying`: Multi-asset management (feature: `multi-underlying`)
+//! - `events`: Event broadcasting system (feature: `events`)
+//! - `data_feeds`: Real-time market data feeds (feature: `data-feeds`)
 //!
 //! ## Quick Start
 //!
@@ -151,6 +156,11 @@
 //! - `serde`: Enable serialization/deserialization for all types
 //! - `options`: Enable OptionStratLib integration for options pricing and Greeks calculation
 //! - `chain`: Enable Option-Chain-OrderBook integration (includes `options`)
+//! - `api`: Enable REST/WebSocket API layer with OpenAPI documentation
+//! - `persistence`: Enable persistence layer for market maker data
+//! - `multi-underlying`: Enable multi-asset management with correlation tracking
+//! - `events`: Enable event broadcasting system for real-time updates
+//! - `data-feeds`: Enable real-time market data feed abstractions
 //!
 //! ## Examples
 //!
@@ -313,6 +323,77 @@
 //! if !status.can_quote() {
 //!     // Stop quoting or hedge
 //! }
+//! ```
+//!
+//! ### Multi-Underlying Management (Feature: `multi-underlying`)
+//!
+//! ```rust,ignore
+//! use market_maker_rs::multi_underlying::{
+//!     MultiUnderlyingManager, UnderlyingConfig, CapitalAllocationStrategy,
+//! };
+//! use market_maker_rs::dec;
+//!
+//! // Create manager with $1M capital
+//! let mut manager = MultiUnderlyingManager::new(dec!(1_000_000))
+//!     .with_allocation_strategy(CapitalAllocationStrategy::RiskParity)
+//!     .with_max_total_delta(dec!(50000));
+//!
+//! // Add underlyings with target weights
+//! manager.add_underlying(UnderlyingConfig::new("BTC", dec!(0.40))).unwrap();
+//! manager.add_underlying(UnderlyingConfig::new("ETH", dec!(0.30))).unwrap();
+//!
+//! // Set correlations
+//! manager.set_correlation("BTC", "ETH", dec!(0.85));
+//!
+//! // Update market data
+//! manager.update_price("BTC", dec!(45000));
+//! manager.update_greeks("BTC", dec!(5.5), dec!(0.02), dec!(1500));
+//!
+//! // Get unified risk view
+//! let risk = manager.get_unified_risk();
+//! println!("Total delta: {}", risk.greeks.total_dollar_delta);
+//!
+//! // Get cross-asset hedge suggestions
+//! let hedges = manager.get_cross_asset_hedges();
+//! ```
+//!
+//! ### Event Broadcasting (Feature: `events`)
+//!
+//! ```rust,ignore
+//! use market_maker_rs::events::{
+//!     EventBroadcaster, EventBroadcasterConfig, EventFilter, EventType,
+//!     MarketMakerEvent, Side,
+//! };
+//! use std::sync::Arc;
+//!
+//! // Create broadcaster
+//! let config = EventBroadcasterConfig::default();
+//! let broadcaster = Arc::new(EventBroadcaster::new(config));
+//!
+//! // Subscribe to all events
+//! let mut all_rx = broadcaster.subscribe();
+//!
+//! // Subscribe with filter (fills only)
+//! let filter = EventFilter::new()
+//!     .with_event_types([EventType::OrderFilled])
+//!     .with_symbols(["BTC".to_string()]);
+//! let mut filtered_rx = broadcaster.subscribe_filtered(filter);
+//!
+//! // Broadcast an event
+//! broadcaster.broadcast(MarketMakerEvent::OrderFilled {
+//!     order_id: "ORD-001".to_string(),
+//!     symbol: "BTC".to_string(),
+//!     instrument: "BTC-PERP".to_string(),
+//!     side: Side::Buy,
+//!     quantity: 10,
+//!     price: 50000,
+//!     fee: 5,
+//!     edge: 100,
+//!     timestamp: 1234567890,
+//! }).await;
+//!
+//! // Get history for reconnection
+//! let missed = broadcaster.get_reconnection_history(last_sequence).await;
 //! ```
 
 #![warn(missing_docs)]
