@@ -45,6 +45,9 @@ tokio = { version = "1.48", features = ["rt-multi-thread", "net", "macros", "syn
 optionstratlib = { version = "0.13", default-features = false, optional = true }
 chrono = { version = "0.4", optional = true }
 option-chain-orderbook = { version = "0.1", optional = true }
+axum = { version = "0.8", optional = true }
+utoipa = { version = "5.4", features = ["axum_extras"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"
@@ -57,6 +60,7 @@ prometheus = ["dep:prometheus", "dep:hyper", "dep:http-body-util", "dep:hyper-ut
 options = ["dep:optionstratlib", "dep:chrono"]
 chain = ["dep:option-chain-orderbook", "options"]
 data-feeds = ["dep:tokio"]
+api = ["dep:axum", "dep:tokio", "dep:utoipa", "dep:tower-http", "serde"]
 
 [[example]]
 name = "options_greeks"

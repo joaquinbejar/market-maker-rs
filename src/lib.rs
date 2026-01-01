@@ -462,3 +462,22 @@ pub mod options;
 /// ```
 #[cfg(feature = "chain")]
 pub mod chain;
+
+/// REST/WebSocket API module for market maker control and monitoring.
+///
+/// This module is only available when the `api` feature is enabled.
+/// It provides:
+/// - **REST Endpoints**: Status, configuration, quotes, positions, Greeks, P&L
+/// - **OpenAPI Documentation**: Auto-generated API docs with utoipa
+/// - **CORS Support**: Configurable cross-origin resource sharing
+/// - **State Management**: Thread-safe shared state for the market maker
+///
+/// # Feature Flag
+///
+/// Enable with:
+/// ```toml
+/// [dependencies]
+/// market-maker-rs = { version = "0.3", features = ["api"] }
+/// ```
+#[cfg(feature = "api")]
+pub mod api;
