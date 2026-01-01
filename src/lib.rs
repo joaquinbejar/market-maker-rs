@@ -481,3 +481,25 @@ pub mod chain;
 /// ```
 #[cfg(feature = "api")]
 pub mod api;
+
+/// Persistence layer for market maker data.
+///
+/// This module is only available when the `persistence` feature is enabled.
+/// It provides abstractions for persisting market maker data including:
+/// - **Fill Records**: Trade executions with price, quantity, fees
+/// - **Position Snapshots**: Point-in-time position state
+/// - **Daily P&L**: Aggregated daily profit/loss records
+/// - **Configuration**: Persistent settings storage
+/// - **Event Logs**: System events and alerts
+///
+/// The module includes an in-memory implementation for testing.
+///
+/// # Feature Flag
+///
+/// Enable with:
+/// ```toml
+/// [dependencies]
+/// market-maker-rs = { version = "0.3", features = ["persistence"] }
+/// ```
+#[cfg(feature = "persistence")]
+pub mod persistence;

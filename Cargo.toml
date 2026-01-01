@@ -61,6 +61,7 @@ options = ["dep:optionstratlib", "dep:chrono"]
 chain = ["dep:option-chain-orderbook", "options"]
 data-feeds = ["dep:tokio"]
 api = ["dep:axum", "dep:tokio", "dep:utoipa", "dep:tower-http", "serde"]
+persistence = ["dep:tokio"]
 
 [[example]]
 name = "options_greeks"
