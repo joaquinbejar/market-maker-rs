@@ -31,6 +31,7 @@ liquidity to the market.
 - **Optimal Pricing**: Stochastic control theory for spread optimization
 - **Risk Management**: Circuit breakers, drawdown limits, and position controls
 - **Multi-Asset**: Correlation-aware portfolio risk management
+- **Options Market Making**: Greeks-aware quoting with delta hedging
 
 ### Features
 
@@ -72,6 +73,23 @@ liquidity to the market.
 - **Order Manager**: Order lifecycle management with state tracking
 - **Latency Tracking**: Histogram-based latency measurement
 - **Mock Connector**: Testing without real exchange connectivity
+- **OrderBook-rs Connector**: Integration with lock-free order book
+
+#### Options Market Making (Feature: `options`)
+
+- **Greeks Calculation**: Delta, gamma, theta, vega, rho via OptionStratLib
+- **Portfolio Greeks**: Aggregation across multiple positions
+- **Greeks-Aware Quoting**: Spread adjustment based on gamma exposure
+- **Delta Hedging**: Automatic hedge order generation
+- **Risk Management**: Greeks-based limits and circuit breakers
+- **Auto-Hedging**: Configurable triggers for delta neutralization
+
+#### Option Chain Integration (Feature: `chain`)
+
+- **Multi-Strike Quoting**: Quote all strikes in an expiration
+- **Chain-Level Risk**: Aggregate Greeks across the chain
+- **ATM Detection**: Automatic spread adjustment for ATM options
+- **Chain Risk Manager**: Chain-wide limits and hedging
 
 #### Parameter Calibration
 
@@ -113,6 +131,8 @@ Where:
 - [`backtest`]: Historical simulation with fill models and metrics
 - [`types`]: Common types, decimals, and error definitions
 - [`prelude`]: Convenient re-exports of commonly used types
+- `options`: Options pricing, Greeks, and market making (feature: `options`)
+- `chain`: Option chain integration and multi-strike quoting (feature: `chain`)
 
 ### Quick Start
 
@@ -144,6 +164,7 @@ println!("Bid: {}, Ask: {}", bid, ask);
 - `prometheus`: Enable Prometheus metrics export (adds `prometheus`, `hyper`, `tokio` dependencies)
 - `serde`: Enable serialization/deserialization for all types
 - `options`: Enable OptionStratLib integration for options pricing and Greeks calculation
+- `chain`: Enable Option-Chain-OrderBook integration (includes `options`)
 
 ### Examples
 
@@ -213,6 +234,99 @@ portfolio.set_position(eth, dec!(10.0), dec!(0.08));
 
 let calculator = PortfolioRiskCalculator::new(matrix);
 let vol = calculator.portfolio_volatility(&portfolio).unwrap();
+```
+
+#### Options Greeks (Feature: `options`)
+
+```rust
+use market_maker_rs::options::{OptionsAdapter, PortfolioGreeks, PositionGreeks};
+use optionstratlib::model::option::Options;
+
+// Calculate Greeks for an option
+let greeks = OptionsAdapter::calculate_greeks(&option).unwrap();
+println!("Delta: {}, Gamma: {}", greeks.delta, greeks.gamma);
+
+// Aggregate portfolio Greeks
+let mut portfolio = PortfolioGreeks::new();
+portfolio.add(&greeks, dec!(10.0)); // 10 contracts
+
+// Check delta neutrality
+let shares_to_hedge = portfolio.shares_to_hedge(dec!(100.0));
+```
+
+#### Options Market Making (Feature: `options`)
+
+```rust
+use market_maker_rs::options::{
+    OptionsMarketMaker, OptionsMarketMakerImpl, OptionsMarketMakerConfig,
+    GreeksLimits, PortfolioGreeks,
+};
+
+// Create market maker with Greeks-aware quoting
+let config = OptionsMarketMakerConfig::default();
+let market_maker = OptionsMarketMakerImpl::new(config);
+
+// Calculate Greeks-adjusted quotes
+let (bid, ask) = market_maker.calculate_greeks_adjusted_quotes(
+    &option,
+    &portfolio_greeks,
+    &risk_limits,
+).unwrap();
+
+// Get delta hedge suggestions
+let hedges = market_maker.calculate_delta_hedge(
+    &portfolio_greeks,
+    underlying_price,
+    "BTC",
+).unwrap();
+```
+
+#### Greeks Risk Management (Feature: `options`)
+
+```rust
+use market_maker_rs::options::{
+    GreeksRiskManager, AutoHedgerConfig, GreeksLimits, OrderDecision,
+};
+
+// Create risk manager with auto-hedging
+let limits = GreeksLimits::default();
+let hedger_config = AutoHedgerConfig::default();
+let mut risk_manager = GreeksRiskManager::new("BTC", limits, hedger_config);
+
+// Check if order is allowed
+let decision = risk_manager.check_order(&option_greeks, dec!(10.0));
+match decision {
+    OrderDecision::Allowed => { /* proceed */ },
+    OrderDecision::Scaled { new_size, .. } => { /* use scaled size */ },
+    OrderDecision::Rejected { reason } => { /* reject */ },
+}
+
+// Check if hedging is needed
+if risk_manager.needs_hedge() {
+    let hedge = risk_manager.calculate_hedge_order(underlying_price);
+}
+```
+
+#### Option Chain Market Making (Feature: `chain`)
+
+```rust
+use market_maker_rs::chain::{ChainMarketMaker, ChainMarketMakerConfig};
+use option_chain_orderbook::orderbook::ExpirationOrderBook;
+use std::sync::Arc;
+
+// Create chain market maker
+let chain = Arc::new(ExpirationOrderBook::new("BTC", expiration));
+let config = ChainMarketMakerConfig::default();
+let mm = ChainMarketMaker::new(chain, config);
+
+// Refresh all quotes across the chain
+let quotes = mm.refresh_all_quotes(underlying_price).unwrap();
+
+// Check chain risk status
+let status = mm.check_chain_risk();
+if !status.can_quote() {
+    // Stop quoting or hedge
+}
 ```
 
 ## 🛠 Makefile Commands

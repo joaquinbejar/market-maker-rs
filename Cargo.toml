@@ -56,3 +56,19 @@ serde = ["dep:serde", "dep:serde_json", "dep:pretty-simple-display", "rust_decim
 prometheus = ["dep:prometheus", "dep:hyper", "dep:http-body-util", "dep:hyper-util", "dep:tokio"]
 options = ["dep:optionstratlib", "dep:chrono"]
 chain = ["dep:option-chain-orderbook", "options"]
+
+[[example]]
+name = "options_greeks"
+required-features = ["options"]
+
+[[example]]
+name = "options_market_making"
+required-features = ["options"]
+
+[[example]]
+name = "options_risk_management"
+required-features = ["options"]
+
+[[example]]
+name = "chain_market_making"
+required-features = ["chain"]
