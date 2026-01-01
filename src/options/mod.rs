@@ -48,5 +48,12 @@ pub mod adapter;
 /// Portfolio Greeks aggregation and tracking.
 pub mod greeks;
 
+/// Options-specific market making functionality.
+pub mod market_maker;
+
 pub use adapter::OptionsAdapter;
 pub use greeks::{PortfolioGreeks, PositionGreeks};
+pub use market_maker::{
+    GreeksLimits, HedgeOrder, HedgeType, OptionsMarketMaker, OptionsMarketMakerConfig,
+    OptionsMarketMakerImpl,
+};

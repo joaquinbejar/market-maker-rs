@@ -84,4 +84,7 @@ pub use crate::backtest::{
 
 // Re-export options types (when feature is enabled)
 #[cfg(feature = "options")]
-pub use crate::options::{OptionsAdapter, PortfolioGreeks, PositionGreeks};
+pub use crate::options::{
+    GreeksLimits, HedgeOrder, HedgeType, OptionsAdapter, OptionsMarketMaker,
+    OptionsMarketMakerConfig, OptionsMarketMakerImpl, PortfolioGreeks, PositionGreeks,
+};
