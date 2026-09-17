@@ -22,7 +22,8 @@ use rust_decimal_macros::dec;
 ///
 /// ```rust,ignore
 /// use market_maker_rs::options::OptionsAdapter;
-/// use optionstratlib::{Options, ExpirationDate, OptionStyle, pos};
+/// use optionstratlib::{Options, ExpirationDate, OptionStyle};
+/// use optionstratlib::prelude::pos_or_panic;
 ///
 /// let option = Options::new(/* ... */);
 /// let greeks = OptionsAdapter::calculate_greeks(&option)?;
@@ -214,21 +215,21 @@ impl OptionsAdapter {
 mod tests {
     use super::*;
     use optionstratlib::model::types::{OptionStyle, OptionType, Side};
-    use optionstratlib::pos;
+    use optionstratlib::prelude::pos_or_panic;
 
     fn create_test_option() -> Options {
         Options::new(
             OptionType::European,
             Side::Long,
             "TEST".to_string(),
-            pos!(100.0),                      // strike
-            ExpirationDate::Days(pos!(30.0)), // 30 days to expiry
-            pos!(0.2),                        // 20% IV
-            pos!(1.0),                        // quantity
-            pos!(100.0),                      // underlying price (ATM)
-            dec!(0.05),                       // 5% risk-free rate
+            pos_or_panic!(100.0),                      // strike
+            ExpirationDate::Days(pos_or_panic!(30.0)), // 30 days to expiry
+            pos_or_panic!(0.2),                        // 20% IV
+            pos_or_panic!(1.0),                        // quantity
+            pos_or_panic!(100.0),                      // underlying price (ATM)
+            dec!(0.05),                                // 5% risk-free rate
             OptionStyle::Call,
-            pos!(0.0), // no dividend
+            pos_or_panic!(0.0), // no dividend
             None,
         )
     }
@@ -261,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_time_to_terminal_ms() {
-        let expiration = ExpirationDate::Days(pos!(365.0));
+        let expiration = ExpirationDate::Days(pos_or_panic!(365.0));
         let ms = OptionsAdapter::time_to_terminal_ms(&expiration);
 
         // Should be approximately 1 year in milliseconds
@@ -319,11 +320,11 @@ mod tests {
         assert_eq!(OptionsAdapter::intrinsic_value(&option), Decimal::ZERO);
 
         // ITM call
-        option.underlying_price = pos!(110.0);
+        option.underlying_price = pos_or_panic!(110.0);
         assert_eq!(OptionsAdapter::intrinsic_value(&option), dec!(10.0));
 
         // OTM call
-        option.underlying_price = pos!(90.0);
+        option.underlying_price = pos_or_panic!(90.0);
         assert_eq!(OptionsAdapter::intrinsic_value(&option), Decimal::ZERO);
     }
 
@@ -336,11 +337,11 @@ mod tests {
         assert_eq!(OptionsAdapter::intrinsic_value(&option), Decimal::ZERO);
 
         // ITM put
-        option.underlying_price = pos!(90.0);
+        option.underlying_price = pos_or_panic!(90.0);
         assert_eq!(OptionsAdapter::intrinsic_value(&option), dec!(10.0));
 
         // OTM put
-        option.underlying_price = pos!(110.0);
+        option.underlying_price = pos_or_panic!(110.0);
         assert_eq!(OptionsAdapter::intrinsic_value(&option), Decimal::ZERO);
     }
 

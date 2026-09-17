@@ -12,7 +12,7 @@ use market_maker_rs::options::{
 use optionstratlib::model::ExpirationDate;
 use optionstratlib::model::option::Options;
 use optionstratlib::model::types::{OptionStyle, OptionType, Side};
-use optionstratlib::pos;
+use optionstratlib::prelude::pos_or_panic;
 use rust_decimal_macros::dec;
 
 fn main() {
@@ -74,14 +74,14 @@ fn main() {
         OptionType::European,
         Side::Long,
         "BTC".to_string(),
-        pos!(50000.0), // strike = underlying (ATM)
-        ExpirationDate::Days(pos!(30.0)),
-        pos!(0.6),
-        pos!(1.0),
-        pos!(50000.0), // underlying price
+        pos_or_panic!(50000.0), // strike = underlying (ATM)
+        ExpirationDate::Days(pos_or_panic!(30.0)),
+        pos_or_panic!(0.6),
+        pos_or_panic!(1.0),
+        pos_or_panic!(50000.0), // underlying price
         dec!(0.05),
         OptionStyle::Call,
-        pos!(0.0),
+        pos_or_panic!(0.0),
         None,
     );
 
@@ -90,14 +90,14 @@ fn main() {
         OptionType::European,
         Side::Long,
         "BTC".to_string(),
-        pos!(55000.0), // 10% OTM
-        ExpirationDate::Days(pos!(30.0)),
-        pos!(0.6),
-        pos!(1.0),
-        pos!(50000.0),
+        pos_or_panic!(55000.0), // 10% OTM
+        ExpirationDate::Days(pos_or_panic!(30.0)),
+        pos_or_panic!(0.6),
+        pos_or_panic!(1.0),
+        pos_or_panic!(50000.0),
         dec!(0.05),
         OptionStyle::Call,
-        pos!(0.0),
+        pos_or_panic!(0.0),
         None,
     );
 

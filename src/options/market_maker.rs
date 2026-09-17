@@ -506,21 +506,21 @@ mod tests {
     use super::*;
     use optionstratlib::model::ExpirationDate;
     use optionstratlib::model::types::{OptionStyle, OptionType, Side};
-    use optionstratlib::pos;
+    use optionstratlib::prelude::pos_or_panic;
 
     fn create_test_option() -> Options {
         Options::new(
             OptionType::European,
             Side::Long,
             "TEST".to_string(),
-            pos!(100.0),
-            ExpirationDate::Days(pos!(30.0)),
-            pos!(0.2),
-            pos!(1.0),
-            pos!(100.0),
+            pos_or_panic!(100.0),
+            ExpirationDate::Days(pos_or_panic!(30.0)),
+            pos_or_panic!(0.2),
+            pos_or_panic!(1.0),
+            pos_or_panic!(100.0),
             dec!(0.05),
             OptionStyle::Call,
-            pos!(0.0),
+            pos_or_panic!(0.0),
             None,
         )
     }
@@ -661,7 +661,7 @@ mod tests {
 
         // Create OTM option
         let mut otm_option = create_test_option();
-        otm_option.strike_price = pos!(120.0); // 20% OTM
+        otm_option.strike_price = pos_or_panic!(120.0); // 20% OTM
 
         let otm_adjustment = mm.gamma_spread_adjustment(&otm_option, dec!(0.05));
 

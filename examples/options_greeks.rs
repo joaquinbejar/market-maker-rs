@@ -9,7 +9,7 @@ use market_maker_rs::options::{OptionsAdapter, PortfolioGreeks};
 use optionstratlib::model::ExpirationDate;
 use optionstratlib::model::option::Options;
 use optionstratlib::model::types::{OptionStyle, OptionType, Side};
-use optionstratlib::pos;
+use optionstratlib::prelude::pos_or_panic;
 use rust_decimal_macros::dec;
 
 fn main() {
@@ -20,14 +20,14 @@ fn main() {
         OptionType::European,
         Side::Long,
         "BTC".to_string(),
-        pos!(50000.0),                    // strike price
-        ExpirationDate::Days(pos!(30.0)), // 30 days to expiry
-        pos!(0.6),                        // 60% implied volatility
-        pos!(1.0),                        // quantity
-        pos!(48000.0),                    // underlying price
-        dec!(0.05),                       // 5% risk-free rate
+        pos_or_panic!(50000.0),                    // strike price
+        ExpirationDate::Days(pos_or_panic!(30.0)), // 30 days to expiry
+        pos_or_panic!(0.6),                        // 60% implied volatility
+        pos_or_panic!(1.0),                        // quantity
+        pos_or_panic!(48000.0),                    // underlying price
+        dec!(0.05),                                // 5% risk-free rate
         OptionStyle::Call,
-        pos!(0.0), // no dividend
+        pos_or_panic!(0.0), // no dividend
         None,
     );
 
@@ -67,14 +67,14 @@ fn main() {
         OptionType::European,
         Side::Long,
         "BTC".to_string(),
-        pos!(50000.0),
-        ExpirationDate::Days(pos!(30.0)),
-        pos!(0.6),
-        pos!(1.0),
-        pos!(48000.0),
+        pos_or_panic!(50000.0),
+        ExpirationDate::Days(pos_or_panic!(30.0)),
+        pos_or_panic!(0.6),
+        pos_or_panic!(1.0),
+        pos_or_panic!(48000.0),
         dec!(0.05),
         OptionStyle::Put,
-        pos!(0.0),
+        pos_or_panic!(0.0),
         None,
     );
 

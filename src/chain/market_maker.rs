@@ -122,11 +122,9 @@ impl ChainQuoteUpdate {
         ask_size: u64,
         theo: u64,
     ) -> Self {
-        let spread_bps = if theo > 0 {
-            ((ask_price - bid_price) * 10000) / theo
-        } else {
-            0
-        };
+        let spread_bps = ((ask_price - bid_price) * 10000)
+            .checked_div(theo)
+            .unwrap_or(0);
 
         Self {
             strike,
@@ -469,10 +467,11 @@ impl ChainMarketMaker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use optionstratlib::{ExpirationDate, pos};
+    use optionstratlib::ExpirationDate;
+    use optionstratlib::prelude::pos_or_panic;
 
     fn create_test_chain() -> Arc<ExpirationOrderBook> {
-        let exp = ExpirationDate::Days(pos!(30.0));
+        let exp = ExpirationDate::Days(pos_or_panic!(30.0));
         let chain = ExpirationOrderBook::new("BTC", exp);
 
         // Add some strikes

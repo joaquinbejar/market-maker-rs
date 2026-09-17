@@ -204,19 +204,19 @@ impl OrderBookConnector {
         }
     }
 
-    /// Converts a Decimal price to u64 for orderbook-rs.
-    fn price_to_u64(&self, price: Decimal) -> u64 {
+    /// Converts a Decimal price to the raw `u128` used by orderbook-rs.
+    fn price_to_u128(&self, price: Decimal) -> u128 {
         let multiplier = Decimal::from(10u64.pow(self.config.price_precision));
         let scaled = price * multiplier;
         scaled
             .to_string()
             .parse::<f64>()
-            .map(|f| f as u64)
+            .map(|f| f as u128)
             .unwrap_or(0)
     }
 
-    /// Converts a u64 price from orderbook-rs to Decimal.
-    fn u64_to_price(&self, price: u64) -> Decimal {
+    /// Converts a raw `u128` price from orderbook-rs to Decimal.
+    fn u128_to_price(&self, price: u128) -> Decimal {
         let divisor = Decimal::from(10u64.pow(self.config.price_precision));
         Decimal::from(price) / divisor
     }
@@ -274,7 +274,7 @@ impl ExchangeConnector for OrderBookConnector {
                 let price = request.price.ok_or_else(|| {
                     MMError::InvalidConfiguration("Limit order requires price".to_string())
                 })?;
-                let ob_price = self.price_to_u64(price);
+                let ob_price = self.price_to_u128(price);
 
                 self.order_book
                     .add_limit_order(ob_order_id, ob_price, quantity, ob_side, ob_tif, None)
@@ -299,7 +299,7 @@ impl ExchangeConnector for OrderBookConnector {
                 let price = request.price.ok_or_else(|| {
                     MMError::InvalidConfiguration("PostOnly order requires price".to_string())
                 })?;
-                let ob_price = self.price_to_u64(price);
+                let ob_price = self.price_to_u128(price);
 
                 self.order_book
                     .add_post_only_order(ob_order_id, ob_price, quantity, ob_side, ob_tif, None)
@@ -382,14 +382,14 @@ impl ExchangeConnector for OrderBookConnector {
                 side,
                 time_in_force,
                 ..
-            } => (*price, *quantity, *side, *time_in_force),
+            } => (price.as_u128(), quantity.as_u64(), *side, *time_in_force),
             orderbook_rs::OrderType::PostOnly {
                 price,
                 quantity,
                 side,
                 time_in_force,
                 ..
-            } => (*price, *quantity, *side, *time_in_force),
+            } => (price.as_u128(), quantity.as_u64(), *side, *time_in_force),
             _ => {
                 return Err(MMError::InvalidPositionUpdate(
                     "Unsupported order type for modification".to_string(),
@@ -404,7 +404,7 @@ impl ExchangeConnector for OrderBookConnector {
 
         // Create new order with updated values
         let final_price = new_price
-            .map(|p| self.price_to_u64(p))
+            .map(|p| self.price_to_u128(p))
             .unwrap_or(current_price);
         let final_quantity = new_quantity
             .map(|q| self.quantity_to_u64(q))
@@ -469,7 +469,7 @@ impl ExchangeConnector for OrderBookConnector {
         let mapping = self.order_mapping.read().unwrap();
         let mut orders = Vec::new();
 
-        for (id_str, _ob_id) in mapping.iter() {
+        for id_str in mapping.keys() {
             let id_string = id_str.to_string();
             orders.push(OrderResponse {
                 order_id: OrderId::new(id_string),
@@ -525,8 +525,8 @@ impl ExchangeConnector for OrderBookConnector {
             .iter()
             .map(|level| {
                 BookLevel::new(
-                    self.u64_to_price(level.price),
-                    self.u64_to_quantity(level.visible_quantity),
+                    self.u128_to_price(level.price().as_u128()),
+                    self.u64_to_quantity(level.visible_quantity().as_u64()),
                 )
             })
             .collect();
@@ -536,8 +536,8 @@ impl ExchangeConnector for OrderBookConnector {
             .iter()
             .map(|level| {
                 BookLevel::new(
-                    self.u64_to_price(level.price),
-                    self.u64_to_quantity(level.visible_quantity),
+                    self.u128_to_price(level.price().as_u128()),
+                    self.u64_to_quantity(level.visible_quantity().as_u64()),
                 )
             })
             .collect();
