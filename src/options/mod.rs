@@ -19,18 +19,19 @@
 //!
 //! ```rust,ignore
 //! use market_maker_rs::options::{PortfolioGreeks, OptionsAdapter};
-//! use optionstratlib::{Options, ExpirationDate, OptionStyle, pos};
+//! use optionstratlib::{Options, ExpirationDate, OptionStyle};
+//! use optionstratlib::prelude::pos_or_panic;
 //!
 //! // Create an option using OptionStratLib
 //! let option = Options::new(
 //!     OptionType::European,
 //!     Side::Long,
 //!     "BTC".to_string(),
-//!     pos!(50000.0),
-//!     ExpirationDate::Days(pos!(30.0)),
-//!     pos!(0.6),
-//!     pos!(1.0),
-//!     pos!(48000.0),
+//!     pos_or_panic!(50000.0),
+//!     ExpirationDate::Days(pos_or_panic!(30.0)),
+//!     pos_or_panic!(0.6),
+//!     pos_or_panic!(1.0),
+//!     pos_or_panic!(48000.0),
 //!     0.05,
 //!     OptionStyle::Call,
 //!     0.0,

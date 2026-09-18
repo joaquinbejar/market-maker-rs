@@ -11,7 +11,7 @@ use market_maker_rs::chain::{
 use market_maker_rs::options::PositionGreeks;
 use option_chain_orderbook::orderbook::ExpirationOrderBook;
 use optionstratlib::model::ExpirationDate;
-use optionstratlib::pos;
+use optionstratlib::prelude::pos_or_panic;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 
@@ -19,7 +19,7 @@ fn main() {
     println!("=== Option Chain Market Making ===\n");
 
     // Create an expiration order book for BTC options
-    let expiration = ExpirationDate::Days(pos!(30.0));
+    let expiration = ExpirationDate::Days(pos_or_panic!(30.0));
     let chain = ExpirationOrderBook::new("BTC", expiration);
 
     // Add strikes to the chain

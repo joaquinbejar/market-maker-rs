@@ -340,7 +340,7 @@ impl GridStrategy {
         }
 
         // Sort by price (lowest to highest)
-        orders.sort_by(|a, b| a.price.cmp(&b.price));
+        orders.sort_by_key(|a| a.price);
 
         orders
     }
