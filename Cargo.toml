@@ -1,6 +1,6 @@
 [package]
 name = "market-maker-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A Rust library implementing quantitative market making strategies, starting with the Avellaneda-Stoikov model"
@@ -44,7 +44,7 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "macros", "sync", "time"], optional = true }
 optionstratlib = { version = "0.21", default-features = false, optional = true }
 chrono = { version = "0.4", optional = true }
-option-chain-orderbook = { version = "0.11", optional = true }
+option-chain-orderbook = { version = "0.12", optional = true }
 axum = { version = "0.8", optional = true }
 utoipa = { version = "5.5", features = ["axum_extras"], optional = true }
 tower-http = { version = "0.7", features = ["cors"], optional = true }
