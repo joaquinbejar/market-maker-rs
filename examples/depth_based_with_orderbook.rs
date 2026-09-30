@@ -26,8 +26,8 @@ fn main() {
     println!("=== Setup ===\n");
 
     // Create orderbook for BTC/USD
-    // Note: OrderBook requires type parameters for the price/quantity types
-    let orderbook: OrderBook<OrderId> = OrderBook::new("BTC/USD");
+    // Note: OrderBook is generic over per-order extra fields; `()` means none
+    let orderbook: DefaultOrderBook = OrderBook::new("BTC/USD");
     println!("Created OrderBook instance from orderbook-rs");
     println!("  Symbol: {}", orderbook.symbol());
     println!();
