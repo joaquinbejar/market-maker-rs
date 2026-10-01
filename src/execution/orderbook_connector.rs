@@ -172,9 +172,13 @@ impl OrderBookConnector {
     fn next_order_id(&self) -> (OrderId, OBOrderId) {
         let id = self.order_id_counter.fetch_add(1, Ordering::SeqCst);
         let order_id = OrderId::new(id.to_string());
-        // OBOrderId::new() generates a new unique ID internally
-        let ob_order_id = OBOrderId::new();
+        let ob_order_id = OBOrderId::sequential(id);
         (order_id, ob_order_id)
+    }
+
+    /// Generates a new unique orderbook-rs order ID from the shared counter.
+    fn next_ob_order_id(&self) -> OBOrderId {
+        OBOrderId::sequential(self.order_id_counter.fetch_add(1, Ordering::SeqCst))
     }
 
     /// Converts our Side to orderbook-rs Side.
@@ -411,7 +415,7 @@ impl ExchangeConnector for OrderBookConnector {
             .unwrap_or(current_quantity);
 
         // Generate new order ID for the replacement order
-        let new_ob_order_id = OBOrderId::new();
+        let new_ob_order_id = self.next_ob_order_id();
 
         self.order_book
             .add_limit_order(
@@ -518,7 +522,10 @@ impl ExchangeConnector for OrderBookConnector {
     }
 
     async fn get_orderbook(&self, _symbol: &str, depth: usize) -> MMResult<OrderBookSnapshot> {
-        let snapshot: OBSnapshot = self.order_book.create_snapshot(depth);
+        let snapshot: OBSnapshot = self
+            .order_book
+            .create_snapshot(depth)
+            .map_err(|e| MMError::InvalidMarketState(e.to_string()))?;
 
         let bids: Vec<BookLevel> = snapshot
             .bids

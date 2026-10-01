@@ -125,14 +125,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-market-maker-rs = "0.1.2"
+market-maker-rs = "0.5"
 ```
 
 With optional features:
 
 ```toml
 [dependencies]
-market-maker-rs = { version = "0.1.2", features = ["serde"] }
+market-maker-rs = { version = "0.5", features = ["serde"] }
 ```
 
 ### Quick Start

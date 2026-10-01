@@ -493,7 +493,7 @@ pub mod backtest;
 /// Enable with:
 /// ```toml
 /// [dependencies]
-/// market-maker-rs = { version = "0.3", features = ["data-feeds"] }
+/// market-maker-rs = { version = "0.5", features = ["data-feeds"] }
 /// ```
 #[cfg(feature = "data-feeds")]
 pub mod data_feeds;
@@ -520,7 +520,7 @@ pub mod prelude;
 /// Enable with:
 /// ```toml
 /// [dependencies]
-/// market-maker-rs = { version = "0.2", features = ["options"] }
+/// market-maker-rs = { version = "0.5", features = ["options"] }
 /// ```
 #[cfg(feature = "options")]
 pub mod options;
@@ -539,7 +539,7 @@ pub mod options;
 /// Enable with:
 /// ```toml
 /// [dependencies]
-/// market-maker-rs = { version = "0.3", features = ["chain"] }
+/// market-maker-rs = { version = "0.5", features = ["chain"] }
 /// ```
 #[cfg(feature = "chain")]
 pub mod chain;
@@ -558,7 +558,7 @@ pub mod chain;
 /// Enable with:
 /// ```toml
 /// [dependencies]
-/// market-maker-rs = { version = "0.3", features = ["api"] }
+/// market-maker-rs = { version = "0.5", features = ["api"] }
 /// ```
 #[cfg(feature = "api")]
 pub mod api;
@@ -580,7 +580,7 @@ pub mod api;
 /// Enable with:
 /// ```toml
 /// [dependencies]
-/// market-maker-rs = { version = "0.3", features = ["persistence"] }
+/// market-maker-rs = { version = "0.5", features = ["persistence"] }
 /// ```
 #[cfg(feature = "persistence")]
 pub mod persistence;
@@ -600,7 +600,7 @@ pub mod persistence;
 /// Enable with:
 /// ```toml
 /// [dependencies]
-/// market-maker-rs = { version = "0.3", features = ["multi-underlying"] }
+/// market-maker-rs = { version = "0.5", features = ["multi-underlying"] }
 /// ```
 #[cfg(feature = "multi-underlying")]
 pub mod multi_underlying;
@@ -625,7 +625,7 @@ pub mod multi_underlying;
 /// Enable with:
 /// ```toml
 /// [dependencies]
-/// market-maker-rs = { version = "0.3", features = ["events"] }
+/// market-maker-rs = { version = "0.5", features = ["events"] }
 /// ```
 #[cfg(feature = "events")]
 pub mod events;
