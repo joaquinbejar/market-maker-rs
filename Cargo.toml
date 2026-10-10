@@ -42,9 +42,9 @@ hyper = { version = "1.11", features = ["server", "http1"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "macros", "sync", "time"], optional = true }
-optionstratlib = { version = "0.21", default-features = false, optional = true }
+optionstratlib = { version = "0.22", default-features = false, features = ["pricing"], optional = true }
 chrono = { version = "0.4", optional = true }
-option-chain-orderbook = { version = "0.12", optional = true }
+option-chain-orderbook = { version = "0.13", optional = true }
 axum = { version = "0.8", optional = true }
 utoipa = { version = "6.0", features = ["axum_extras"], optional = true }
 tower-http = { version = "0.7", features = ["cors"], optional = true }
