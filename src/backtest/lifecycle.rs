@@ -327,6 +327,9 @@ pub enum ExecutionKind {
     Fill,
     /// Order canceled; `remaining` is the canceled quantity.
     Canceled,
+    /// Cancel arrived too late: the order was already terminal (for
+    /// example completely filled). Earlier fills stand.
+    CancelRejected,
 }
 
 /// Record of one order lifecycle transition.
@@ -356,7 +359,8 @@ pub struct ExecutionReport {
 }
 
 impl ExecutionReport {
-    /// Builds a non fill report (accepted, rejected or canceled) for `order`.
+    /// Builds a non fill report (accepted, rejected, canceled or cancel
+    /// rejected) for `order`.
     #[must_use]
     pub fn status(stamp: EventStamp, order: &SimOrder, kind: ExecutionKind) -> Self {
         Self {

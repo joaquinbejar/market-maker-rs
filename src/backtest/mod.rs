@@ -46,6 +46,8 @@ pub mod engine;
 /// Realistic fill models for backtesting.
 pub mod fill_models;
 
+pub mod latency;
+
 pub mod lifecycle;
 
 /// Performance metrics calculator.
@@ -59,6 +61,7 @@ pub use fill_models::{
     FillModel, FillResult, ImmediateFillModel, MarketImpactFillModel, ProbabilisticFillModel,
     QueuePositionFillModel, SimulatedOrder,
 };
+pub use latency::{MAX_SIM_LATENCY_MS, SimLatencyConfig};
 pub use lifecycle::{
     EventStamp, ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId, SimOrderState,
 };
