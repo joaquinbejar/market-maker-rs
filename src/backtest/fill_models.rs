@@ -38,6 +38,7 @@
 
 use crate::Decimal;
 use crate::execution::Side;
+use crate::types::error::{MMError, MMResult};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -186,6 +187,16 @@ impl FillResult {
 ///
 /// Fill models determine how and when orders get filled during backtesting.
 /// Different models provide varying levels of realism.
+///
+/// # Engine contract
+///
+/// [`BacktestEngine`](super::BacktestEngine) calls [`FillModel::on_tick`]
+/// once per tick, then `simulate_fill` for every resting order. It passes the
+/// order's original quantity and the time since the order became active. A
+/// `PartialFill { filled_quantity, .. }` is read as the cumulative quantity
+/// the order would have filled by now: the engine books only the increase
+/// over what is already filled, so the same volume is never filled twice. A
+/// `FullFill` fills whatever remains.
 pub trait FillModel: Send + Sync {
     /// Simulates whether and how an order fills given market state.
     ///
@@ -210,6 +221,30 @@ pub trait FillModel: Send + Sync {
 
     /// Returns the model name for identification.
     fn name(&self) -> &'static str;
+
+    /// Observes a market tick before any order is evaluated against it.
+    ///
+    /// Models that keep market state (for example queue depth estimates)
+    /// update it here. The default implementation does nothing.
+    fn on_tick(&mut self, _tick: &MarketTick) {}
+
+    /// Checks the model parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] if a parameter is out of
+    /// range. The default implementation accepts any configuration.
+    fn validate(&self) -> MMResult<()> {
+        Ok(())
+    }
+
+    /// Describes the model and its parameters for result reports.
+    ///
+    /// Heuristic models must say so; no description may claim exact queue
+    /// position reconstruction unless the model replays order level data.
+    fn description(&self) -> String {
+        self.name().to_string()
+    }
 }
 
 /// Immediate fill model - the simplest fill model.
@@ -283,6 +318,11 @@ impl FillModel for ImmediateFillModel {
 
     fn name(&self) -> &'static str {
         "ImmediateFill"
+    }
+
+    fn description(&self) -> String {
+        "ImmediateFill: reference best bid/offer cross, full fill at limit price (optimistic)"
+            .to_string()
     }
 }
 
@@ -437,6 +477,28 @@ impl FillModel for QueuePositionFillModel {
 
     fn name(&self) -> &'static str {
         "QueuePosition"
+    }
+
+    fn on_tick(&mut self, tick: &MarketTick) {
+        self.update_queue(tick);
+    }
+
+    fn validate(&self) -> MMResult<()> {
+        if self.fill_rate <= Decimal::ZERO {
+            return Err(MMError::InvalidConfiguration(format!(
+                "QueuePosition fill_rate must be positive, got {}",
+                self.fill_rate
+            )));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "QueuePosition: heuristic estimate, queue ahead from top of book size, \
+             constant clearing rate {} per ms, min queue time {} ms (not order level queue)",
+            self.fill_rate, self.min_queue_time_ms
+        )
     }
 }
 
@@ -611,6 +673,29 @@ impl FillModel for ProbabilisticFillModel {
     fn name(&self) -> &'static str {
         "Probabilistic"
     }
+
+    fn validate(&self) -> MMResult<()> {
+        if self.base_probability < Decimal::ZERO || self.base_probability > Decimal::ONE {
+            return Err(MMError::InvalidConfiguration(format!(
+                "Probabilistic base_probability must be in [0, 1], got {}",
+                self.base_probability
+            )));
+        }
+        if self.depth_factor < Decimal::ZERO || self.time_factor < Decimal::ZERO {
+            return Err(MMError::InvalidConfiguration(
+                "Probabilistic depth_factor and time_factor must be non negative".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "Probabilistic: heuristic estimate, base probability {}, depth factor {}, \
+             time factor {}, seed {}",
+            self.base_probability, self.depth_factor, self.time_factor, self.seed
+        )
+    }
 }
 
 impl Default for ProbabilisticFillModel {
@@ -762,6 +847,35 @@ impl<M: FillModel> FillModel for MarketImpactFillModel<M> {
 
     fn name(&self) -> &'static str {
         "MarketImpact"
+    }
+
+    fn on_tick(&mut self, tick: &MarketTick) {
+        self.base_model.on_tick(tick);
+    }
+
+    fn validate(&self) -> MMResult<()> {
+        if self.impact_coefficient < Decimal::ZERO {
+            return Err(MMError::InvalidConfiguration(format!(
+                "MarketImpact impact_coefficient must be non negative, got {}",
+                self.impact_coefficient
+            )));
+        }
+        if self.average_daily_volume <= Decimal::ZERO {
+            return Err(MMError::InvalidConfiguration(format!(
+                "MarketImpact average_daily_volume must be positive, got {}",
+                self.average_daily_volume
+            )));
+        }
+        self.base_model.validate()
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "MarketImpact: square root impact, coefficient {}, average daily volume {}, over [{}]",
+            self.impact_coefficient,
+            self.average_daily_volume,
+            self.base_model.description()
+        )
     }
 }
 
@@ -1174,5 +1288,112 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: FillResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, deserialized);
+    }
+
+    fn all_models() -> Vec<Box<dyn FillModel>> {
+        vec![
+            Box::new(ImmediateFillModel::new()),
+            Box::new(QueuePositionFillModel::new(dec!(0.5))),
+            Box::new(ProbabilisticFillModel::default()),
+            Box::new(MarketImpactFillModel::new(
+                dec!(0.1),
+                dec!(1000),
+                ImmediateFillModel::new(),
+            )),
+        ]
+    }
+
+    #[test]
+    fn test_contract_partial_fill_never_exceeds_quantity() {
+        let crossing = MarketTick::new(10, dec!(99), dec!(3), dec!(100), dec!(3));
+        for mut model in all_models() {
+            model.on_tick(&crossing);
+            for side in [Side::Buy, Side::Sell] {
+                let price = match side {
+                    Side::Buy => dec!(100),
+                    Side::Sell => dec!(99),
+                };
+                let order = SimulatedOrder::new(side, price, dec!(2), 0);
+                for t in [0u64, 1, 5, 50, 5000] {
+                    if let FillResult::PartialFill {
+                        filled_quantity, ..
+                    } = model.simulate_fill(&order, &crossing, t)
+                    {
+                        assert!(filled_quantity > Decimal::ZERO, "{}", model.name());
+                        assert!(filled_quantity <= order.quantity, "{}", model.name());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_contract_no_fill_without_cross() {
+        // Buy below the ask and sell above the bid never fill.
+        let tick = MarketTick::new(10, dec!(99), dec!(3), dec!(101), dec!(3));
+        for mut model in all_models() {
+            model.on_tick(&tick);
+            let buy = SimulatedOrder::new(Side::Buy, dec!(100), dec!(1), 0);
+            let sell = SimulatedOrder::new(Side::Sell, dec!(100), dec!(1), 0);
+            if model.name() != "Probabilistic" {
+                assert_eq!(model.simulate_fill(&buy, &tick, 100), FillResult::NoFill);
+                assert_eq!(model.simulate_fill(&sell, &tick, 100), FillResult::NoFill);
+            }
+        }
+    }
+
+    #[test]
+    fn test_contract_descriptions_are_honest() {
+        for model in all_models() {
+            let description = model.description();
+            assert!(description.starts_with(model.name()), "{description}");
+            assert!(!description.contains("L3"), "{description}");
+        }
+        assert!(
+            QueuePositionFillModel::default()
+                .description()
+                .contains("heuristic estimate")
+        );
+        assert!(
+            ProbabilisticFillModel::default()
+                .description()
+                .contains("heuristic estimate")
+        );
+    }
+
+    #[test]
+    fn test_contract_validation() {
+        for model in all_models() {
+            assert!(model.validate().is_ok(), "{}", model.name());
+        }
+        assert!(QueuePositionFillModel::new(dec!(-1)).validate().is_err());
+        assert!(
+            ProbabilisticFillModel::new(dec!(1.5), dec!(1), dec!(0.1), 1)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            MarketImpactFillModel::new(dec!(0.1), Decimal::ZERO, ImmediateFillModel::new())
+                .validate()
+                .is_err()
+        );
+        assert!(
+            MarketImpactFillModel::new(
+                dec!(0.1),
+                dec!(10),
+                QueuePositionFillModel::new(Decimal::ZERO)
+            )
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_queue_model_updates_on_tick_hook() {
+        let mut model = QueuePositionFillModel::new(dec!(1));
+        let tick = MarketTick::new(1, dec!(99), dec!(4), dec!(100), dec!(2));
+        model.on_tick(&tick);
+        assert_eq!(model.get_queue_depth(dec!(100)), dec!(2));
+        assert_eq!(model.get_queue_depth(dec!(99)), dec!(4));
     }
 }
