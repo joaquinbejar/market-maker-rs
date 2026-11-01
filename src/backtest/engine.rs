@@ -580,7 +580,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
     fn match_active_orders(&mut self, tick: &MarketTick, now: u64) {
         for index in 0..self.orders.len() {
             let order = &self.orders[index];
-            if !order.is_eligible_at(now) {
+            // Eligibility uses the tick's exchange time, not the clamped
+            // clock, so an out of order tick older than the activation
+            // can never fill the order.
+            if !order.is_eligible_at(tick.timestamp) {
                 continue;
             }
             let crosses = match order.side {
@@ -606,7 +609,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
     }
 
     /// Cancels every resting order and submits the new bid and ask. New
-    /// orders become eligible only for ticks after `now`.
+    /// orders become eligible only for ticks after `now`. A crossed or
+    /// locked quote (bid at or above ask) is rejected on both sides so the
+    /// engine never rests two orders that could trade with each other.
     fn replace_quotes(&mut self, quote: &Quote, now: u64) {
         for index in 0..self.orders.len() {
             if self.orders[index].cancel().is_ok() {
@@ -619,12 +624,13 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
         self.orders.clear();
 
         let size = self.config.default_order_size;
+        let crossed = quote.bid_price >= quote.ask_price;
         for (side, price) in [(Side::Buy, quote.bid_price), (Side::Sell, quote.ask_price)] {
             let id = self.next_order_id;
             self.next_order_id += 1;
             let stamp = self.clock.stamp();
             let mut order = SimOrder::new(id, side, price, size, stamp, now);
-            let kind = if order.validate().is_ok() {
+            let kind = if !crossed && order.validate().is_ok() {
                 let _ = order.accept();
                 ExecutionKind::Accepted
             } else {
@@ -753,7 +759,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
 
     /// Returns the execution reports recorded so far, in event order.
     ///
-    /// Reports are recorded when [`BacktestConfig::record_trades`] is set.
+    /// Reports are recorded only when [`BacktestConfig::record_trades`] is
+    /// set; otherwise this is empty, while the strategy still receives every
+    /// report through [`BacktestStrategy::on_execution_report`].
     #[must_use]
     pub fn execution_reports(&self) -> &[ExecutionReport] {
         &self.reports
@@ -1433,6 +1441,43 @@ mod tests {
             vec![ExecutionKind::Rejected, ExecutionKind::Accepted]
         );
         assert_eq!(engine.open_orders().len(), 1);
+    }
+
+    #[test]
+    fn test_crossed_quote_is_rejected_on_both_sides() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(97.0), dec!(103.0)),
+        ];
+        let mut engine = scripted_engine(
+            ticks,
+            vec![Some((dec!(100), dec!(100))), Some((dec!(101), dec!(99)))],
+        );
+        let result = engine.run();
+        assert!(
+            engine
+                .execution_reports()
+                .iter()
+                .all(|r| r.kind == ExecutionKind::Rejected)
+        );
+        assert_eq!(engine.execution_reports().len(), 4);
+        assert!(engine.open_orders().is_empty());
+        assert_eq!(result.num_trades, 0);
+    }
+
+    #[test]
+    fn test_out_of_order_tick_cannot_fill_before_activation() {
+        // Submitted at 1000; 1001 does not cross; the stale tick at 999
+        // crosses but predates the activation and must not fill.
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(98.0), dec!(102.0)),
+            create_test_tick(999, dec!(97.0), dec!(99.0)),
+        ];
+        let mut engine = scripted_engine(ticks, vec![Some((dec!(100), dec!(103))), None, None]);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 0);
+        assert_eq!(engine.open_orders().len(), 2);
     }
 
     #[test]
