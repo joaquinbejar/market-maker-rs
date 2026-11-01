@@ -494,6 +494,7 @@ pub struct BacktestEngine<
     deliveries: Vec<Delivery>,
     observed: VecDeque<MarketTick>,
     agent_position: InventoryPosition,
+    last_delivery_at: u64,
 }
 
 /// Venue side message waiting for its effective time.
@@ -593,6 +594,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             deliveries: Vec::new(),
             observed: VecDeque::new(),
             agent_position: InventoryPosition::new(),
+            last_delivery_at: 0,
         }
     }
 
@@ -934,7 +936,12 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     }
 
     fn queue_delivery(&mut self, report: ExecutionReport, fill: Option<SimulatedFill>) {
-        let at = self.delayed(report.stamp.timestamp, self.latency.ack_ms);
+        // The report channel is FIFO: jitter delays a report but never lets
+        // it overtake one produced earlier.
+        let at = self
+            .delayed(report.stamp.timestamp, self.latency.ack_ms)
+            .max(self.last_delivery_at);
+        self.last_delivery_at = at;
         let sequence = self.next_message;
         self.next_message += 1;
         if self.config.record_trades {
@@ -1110,6 +1117,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.deliveries.clear();
         self.observed.clear();
         self.agent_position = InventoryPosition::new();
+        self.last_delivery_at = 0;
         self.next_order_id = 1;
         self.reports.clear();
     }
@@ -2255,6 +2263,16 @@ mod tests {
         assert_eq!(first.trades, second.trades);
         assert_eq!(first_reports, engine.execution_reports());
         assert_eq!(first_seen, engine.strategy().seen);
+        // FIFO report channel: the strategy receives reports in the order
+        // the venue produced them, even with jitter.
+        let delivered = engine.strategy().reports.clone();
+        let produced: Vec<ExecutionReport> = engine
+            .execution_reports()
+            .iter()
+            .take(delivered.len())
+            .cloned()
+            .collect();
+        assert_eq!(delivered, produced);
     }
 
     #[test]
