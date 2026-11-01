@@ -398,9 +398,9 @@ impl QueuePositionFillModel {
     ///
     /// Uses the bid/ask sizes as estimates of queue depth at those levels.
     pub fn update_queue(&mut self, tick: &MarketTick) {
-        // Use string keys to avoid Decimal hash issues
-        let bid_key = tick.bid_price.to_string();
-        let ask_key = tick.ask_price.to_string();
+        // Normalized string keys: 100, 100.0 and 100.00 are the same level.
+        let bid_key = tick.bid_price.normalize().to_string();
+        let ask_key = tick.ask_price.normalize().to_string();
 
         self.queue_depth.insert(bid_key, tick.bid_size);
         self.queue_depth.insert(ask_key, tick.ask_size);
@@ -410,7 +410,7 @@ impl QueuePositionFillModel {
     #[must_use]
     pub fn get_queue_depth(&self, price: Decimal) -> Decimal {
         self.queue_depth
-            .get(&price.to_string())
+            .get(&price.normalize().to_string())
             .copied()
             .unwrap_or(Decimal::ZERO)
     }
@@ -1394,6 +1394,21 @@ mod tests {
         let tick = MarketTick::new(1, dec!(99), dec!(4), dec!(100), dec!(2));
         model.on_tick(&tick);
         assert_eq!(model.get_queue_depth(dec!(100)), dec!(2));
+        assert_eq!(model.get_queue_depth(dec!(99)), dec!(4));
+    }
+
+    #[test]
+    fn test_queue_depth_ignores_decimal_scale() {
+        let mut model = QueuePositionFillModel::new(dec!(1));
+        model.on_tick(&MarketTick::new(
+            1,
+            dec!(99.0),
+            dec!(4),
+            dec!(100.0),
+            dec!(2),
+        ));
+        assert_eq!(model.get_queue_depth(dec!(100)), dec!(2));
+        assert_eq!(model.get_queue_depth(dec!(100.00)), dec!(2));
         assert_eq!(model.get_queue_depth(dec!(99)), dec!(4));
     }
 }
