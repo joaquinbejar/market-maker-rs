@@ -3,6 +3,17 @@
 //! This module provides the core backtesting engine that simulates strategy
 //! execution on historical market data.
 //!
+//! # Execution semantics
+//!
+//! Orders persist across ticks and follow the causal lifecycle in
+//! [`crate::backtest::lifecycle`]. For each tick the engine first matches the
+//! orders that were already resting (best bid/offer cross, full remaining
+//! quantity at the limit price plus slippage), then asks the strategy for a
+//! new quote. A new quote replaces the resting orders and only becomes
+//! eligible on later ticks. Every transition is published as an
+//! [`ExecutionReport`] to [`BacktestStrategy::on_execution_report`] and
+//! recorded in [`BacktestEngine::execution_reports`].
+//!
 //! # Example
 //!
 //! ```rust
@@ -55,6 +66,7 @@ use crate::position::pnl::PnL;
 use crate::strategy::quote::Quote;
 
 use super::data::{HistoricalDataSource, MarketTick};
+use super::lifecycle::{ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -372,13 +384,21 @@ impl BacktestResult {
 ///
 /// Implement this trait to create a strategy that can be backtested.
 pub trait BacktestStrategy {
-    /// Called on each market tick.
+    /// Called on each market tick, after resting orders were matched
+    /// against it.
     ///
-    /// Returns an optional quote to place in the market.
+    /// Returning `Some(quote)` cancels every resting order and submits a new
+    /// bid and ask of [`BacktestConfig::default_order_size`]. The new orders
+    /// can only fill on later ticks, never on the tick they were computed
+    /// from. Returning `None` leaves resting orders in place.
     fn on_tick(&mut self, tick: &MarketTick, position: &InventoryPosition) -> Option<Quote>;
 
     /// Called when an order is filled.
     fn on_fill(&mut self, fill: &SimulatedFill);
+
+    /// Called for every order lifecycle transition (accept, reject, fill,
+    /// cancel), in event order. The default implementation ignores reports.
+    fn on_execution_report(&mut self, _report: &ExecutionReport) {}
 
     /// Resets the strategy state.
     fn reset(&mut self);
@@ -440,6 +460,10 @@ pub struct BacktestEngine<S: BacktestStrategy, D: HistoricalDataSource> {
     max_position: Decimal,
     peak_equity: Decimal,
     max_drawdown: Decimal,
+    clock: SimClock,
+    orders: Vec<SimOrder>,
+    next_order_id: SimOrderId,
+    reports: Vec<ExecutionReport>,
 }
 
 impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
@@ -459,6 +483,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
             max_position: Decimal::ZERO,
             peak_equity: initial_capital,
             max_drawdown: Decimal::ZERO,
+            clock: SimClock::new(),
+            orders: Vec::new(),
+            next_order_id: 1,
+            reports: Vec::new(),
         }
     }
 
@@ -482,10 +510,18 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
             }
             end_time = tick.timestamp;
 
-            // Get strategy quote
+            // Simulated time follows the data; out of order ticks are
+            // processed at the current time so it never goes backwards.
+            let now = self.clock.now().max(tick.timestamp);
+            let _ = self.clock.advance_to(now);
+
+            // 1. Market data first: match orders that were already active
+            //    before this tick.
+            self.match_active_orders(&tick, now);
+
+            // 2. Decide on this tick; new orders can only match later ticks.
             if let Some(quote) = self.strategy.on_tick(&tick, &self.position) {
-                // Simulate fills
-                self.simulate_fills(&tick, &quote);
+                self.replace_quotes(&quote, now);
             }
 
             // Update PnL mark-to-market
@@ -537,20 +573,83 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
         }
     }
 
-    /// Simulates order fills based on market tick and quote.
-    fn simulate_fills(&mut self, tick: &MarketTick, quote: &Quote) {
-        // Check if bid gets filled (market sells into our bid)
-        if tick.ask_price <= quote.bid_price {
-            let fill_price = self.apply_slippage(quote.bid_price, Side::Buy);
-            let fill = self.create_fill(Side::Buy, fill_price, tick.timestamp);
-            self.process_fill(fill);
+    /// Matches every active order against the tick using a best bid/offer
+    /// cross: a buy fills when the ask is at or below its price, a sell when
+    /// the bid is at or above its price. The whole remaining quantity fills
+    /// at the order price plus slippage.
+    fn match_active_orders(&mut self, tick: &MarketTick, now: u64) {
+        for index in 0..self.orders.len() {
+            let order = &self.orders[index];
+            // Eligibility uses the tick's exchange time, not the clamped
+            // clock, so an out of order tick older than the activation
+            // can never fill the order.
+            if !order.is_eligible_at(tick.timestamp) {
+                continue;
+            }
+            let crosses = match order.side {
+                Side::Buy => tick.ask_price <= order.price,
+                Side::Sell => tick.bid_price >= order.price,
+            };
+            if !crosses {
+                continue;
+            }
+            let quantity = order.remaining();
+            let side = order.side;
+            let price = self.apply_slippage(order.price, side);
+            if self.orders[index].apply_fill(quantity).is_err() {
+                continue;
+            }
+            let fee = price * quantity * self.config.fee_rate;
+            let stamp = self.clock.stamp();
+            let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
+            self.emit(report);
+            self.process_fill(SimulatedFill::with_fee(side, price, quantity, now, fee));
         }
+        self.orders.retain(|order| !order.state.is_terminal());
+    }
 
-        // Check if ask gets filled (market buys from our ask)
-        if tick.bid_price >= quote.ask_price {
-            let fill_price = self.apply_slippage(quote.ask_price, Side::Sell);
-            let fill = self.create_fill(Side::Sell, fill_price, tick.timestamp);
-            self.process_fill(fill);
+    /// Cancels every resting order and submits the new bid and ask. New
+    /// orders become eligible only for ticks after `now`. A crossed or
+    /// locked quote (bid at or above ask) is rejected on both sides so the
+    /// engine never rests two orders that could trade with each other.
+    fn replace_quotes(&mut self, quote: &Quote, now: u64) {
+        for index in 0..self.orders.len() {
+            if self.orders[index].cancel().is_ok() {
+                let stamp = self.clock.stamp();
+                let report =
+                    ExecutionReport::status(stamp, &self.orders[index], ExecutionKind::Canceled);
+                self.emit(report);
+            }
+        }
+        self.orders.clear();
+
+        let size = self.config.default_order_size;
+        let crossed = quote.bid_price >= quote.ask_price;
+        for (side, price) in [(Side::Buy, quote.bid_price), (Side::Sell, quote.ask_price)] {
+            let id = self.next_order_id;
+            self.next_order_id += 1;
+            let stamp = self.clock.stamp();
+            let mut order = SimOrder::new(id, side, price, size, stamp, now);
+            let kind = if !crossed && order.validate().is_ok() {
+                let _ = order.accept();
+                ExecutionKind::Accepted
+            } else {
+                let _ = order.reject();
+                ExecutionKind::Rejected
+            };
+            let stamp = self.clock.stamp();
+            self.emit(ExecutionReport::status(stamp, &order, kind));
+            if kind == ExecutionKind::Accepted {
+                self.orders.push(order);
+            }
+        }
+    }
+
+    /// Delivers a report to the strategy and records it.
+    fn emit(&mut self, report: ExecutionReport) {
+        self.strategy.on_execution_report(&report);
+        if self.config.record_trades {
+            self.reports.push(report);
         }
     }
 
@@ -564,14 +663,6 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
             Side::Buy => price + slippage,
             Side::Sell => price - slippage,
         }
-    }
-
-    /// Creates a fill with fee calculation.
-    fn create_fill(&self, side: Side, price: Decimal, timestamp: u64) -> SimulatedFill {
-        let quantity = self.config.default_order_size;
-        let notional = price * quantity;
-        let fee = notional * self.config.fee_rate;
-        SimulatedFill::with_fee(side, price, quantity, timestamp, fee)
     }
 
     /// Processes a fill: updates position, PnL, and notifies strategy.
@@ -666,6 +757,22 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
         (&self.position, &self.pnl)
     }
 
+    /// Returns the execution reports recorded so far, in event order.
+    ///
+    /// Reports are recorded only when [`BacktestConfig::record_trades`] is
+    /// set; otherwise this is empty, while the strategy still receives every
+    /// report through [`BacktestStrategy::on_execution_report`].
+    #[must_use]
+    pub fn execution_reports(&self) -> &[ExecutionReport] {
+        &self.reports
+    }
+
+    /// Returns the orders currently resting in the simulated book.
+    #[must_use]
+    pub fn open_orders(&self) -> &[SimOrder] {
+        &self.orders
+    }
+
     /// Returns a reference to the strategy.
     #[must_use]
     pub fn strategy(&self) -> &S {
@@ -689,6 +796,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
         self.max_position = Decimal::ZERO;
         self.peak_equity = self.config.initial_capital;
         self.max_drawdown = Decimal::ZERO;
+        self.clock.reset();
+        self.orders.clear();
+        self.next_order_id = 1;
+        self.reports.clear();
     }
 }
 
@@ -903,17 +1014,10 @@ mod tests {
 
     #[test]
     fn test_backtest_engine_with_fills() {
-        // Create ticks where market crosses our quotes
-        // Strategy quotes with spread 0.02 around mid price
-        // For a fill to occur on tick N, the quote generated from tick N must cross
-        // the market prices of tick N itself.
-        //
-        // Tick 1: mid=100.1, bid_quote=100.09, ask_quote=100.11
-        //         market ask=100.2 > our bid=100.09 -> no fill
-        //         market bid=100.0 < our ask=100.11 -> no fill
-        //
-        // Tick 2: mid=100.0, bid_quote=99.99, ask_quote=100.01
-        //         market ask=99.98 <= our bid=99.99 -> BUY fill!
+        // Quotes are submitted on one tick and can only fill on a later tick.
+        // Tick 1 quotes bid 100.09 / ask 100.11 around mid 100.1.
+        // Tick 2 has ask 99.98 <= resting bid 100.09, so the bid submitted on
+        // tick 1 fills on tick 2 at its limit price.
         let ticks = vec![
             create_test_tick(1000, dec!(100.0), dec!(100.2)), // No fill
             create_test_tick(1001, dec!(99.95), dec!(99.98)), // Ask 99.98 <= bid_quote ~99.965
@@ -930,9 +1034,10 @@ mod tests {
         let result = engine.run();
 
         assert_eq!(result.num_ticks, 2);
-        // Tick 2: mid = 99.965, bid_quote = 99.955, ask_quote = 99.975
-        // market ask = 99.98 > bid_quote 99.955 -> no fill
-        // This test verifies the engine runs without error
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.trades[0].side, Side::Buy);
+        assert_eq!(result.trades[0].price, dec!(100.09));
+        assert_eq!(result.trades[0].timestamp, 1001);
         // Actual fill logic depends on market crossing our quotes
         assert_eq!(result.start_time, 1000);
         assert_eq!(result.end_time, 1001);
@@ -1177,5 +1282,251 @@ mod tests {
             ..Default::default()
         };
         assert!(unprofitable.net_pnl < Decimal::ZERO);
+    }
+
+    /// Strategy returning scripted quotes per tick index and recording reports.
+    struct ScriptedStrategy {
+        quotes: Vec<Option<(Decimal, Decimal)>>,
+        index: usize,
+        reports: Vec<ExecutionReport>,
+        fills: usize,
+    }
+
+    impl ScriptedStrategy {
+        fn new(quotes: Vec<Option<(Decimal, Decimal)>>) -> Self {
+            Self {
+                quotes,
+                index: 0,
+                reports: Vec::new(),
+                fills: 0,
+            }
+        }
+    }
+
+    impl BacktestStrategy for ScriptedStrategy {
+        fn on_tick(&mut self, tick: &MarketTick, _position: &InventoryPosition) -> Option<Quote> {
+            let quote = self.quotes.get(self.index).copied().flatten();
+            self.index += 1;
+            quote.map(|(bid, ask)| Quote {
+                bid_price: bid,
+                bid_size: Decimal::ONE,
+                ask_price: ask,
+                ask_size: Decimal::ONE,
+                timestamp: tick.timestamp,
+            })
+        }
+        fn on_fill(&mut self, _fill: &SimulatedFill) {
+            self.fills += 1;
+        }
+        fn on_execution_report(&mut self, report: &ExecutionReport) {
+            self.reports.push(report.clone());
+        }
+        fn reset(&mut self) {
+            self.index = 0;
+            self.reports.clear();
+            self.fills = 0;
+        }
+    }
+
+    fn scripted_engine(
+        ticks: Vec<MarketTick>,
+        quotes: Vec<Option<(Decimal, Decimal)>>,
+    ) -> BacktestEngine<ScriptedStrategy, VecDataSource> {
+        BacktestEngine::new(
+            BacktestConfig::default().with_default_order_size(dec!(2)),
+            ScriptedStrategy::new(quotes),
+            VecDataSource::new(ticks),
+        )
+    }
+
+    #[test]
+    fn test_quote_never_fills_on_its_own_tick() {
+        // The quote crosses the market on the tick it is computed from.
+        let ticks = vec![create_test_tick(1000, dec!(99.0), dec!(99.5))];
+        let mut engine = scripted_engine(ticks, vec![Some((dec!(100), dec!(101)))]);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 0);
+        assert_eq!(engine.open_orders().len(), 2);
+    }
+
+    #[test]
+    fn test_equal_timestamp_tick_does_not_fill_new_order() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1000, dec!(99.0), dec!(99.5)),
+            create_test_tick(1001, dec!(99.0), dec!(99.5)),
+        ];
+        let mut engine = scripted_engine(ticks, vec![Some((dec!(100), dec!(103)))]);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.trades[0].timestamp, 1001);
+        assert_eq!(result.trades[0].quantity, dec!(2));
+    }
+
+    #[test]
+    fn test_orders_persist_when_strategy_returns_none() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(98.0), dec!(102.0)),
+            create_test_tick(1002, dec!(101.5), dec!(102.0)),
+        ];
+        let mut engine = scripted_engine(ticks, vec![Some((dec!(99), dec!(101))), None, None]);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.trades[0].side, Side::Sell);
+        assert_eq!(result.trades[0].price, dec!(101));
+        assert_eq!(result.final_position, dec!(-2));
+        // The bid is still resting.
+        assert_eq!(engine.open_orders().len(), 1);
+        assert_eq!(engine.open_orders()[0].side, Side::Buy);
+    }
+
+    #[test]
+    fn test_full_report_history_for_cancel_replace_and_fill() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(98.0), dec!(102.0)),
+            create_test_tick(1002, dec!(97.0), dec!(99.4)),
+        ];
+        let mut engine = scripted_engine(
+            ticks,
+            vec![
+                Some((dec!(99), dec!(101))),
+                Some((dec!(99.5), dec!(100.5))),
+                None,
+            ],
+        );
+        engine.run();
+        let history: Vec<(u64, SimOrderId, ExecutionKind)> = engine
+            .execution_reports()
+            .iter()
+            .map(|r| (r.stamp.timestamp, r.order_id, r.kind))
+            .collect();
+        assert_eq!(
+            history,
+            vec![
+                (1000, 1, ExecutionKind::Accepted),
+                (1000, 2, ExecutionKind::Accepted),
+                (1001, 1, ExecutionKind::Canceled),
+                (1001, 2, ExecutionKind::Canceled),
+                (1001, 3, ExecutionKind::Accepted),
+                (1001, 4, ExecutionKind::Accepted),
+                (1002, 3, ExecutionKind::Fill),
+            ]
+        );
+        let stamps: Vec<EventStampKey> = engine
+            .execution_reports()
+            .iter()
+            .map(|r| (r.stamp.timestamp, r.stamp.sequence))
+            .collect();
+        let mut sorted = stamps.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(stamps, sorted, "stamps are unique and strictly increasing");
+        // Strategy saw the same reports in the same order.
+        assert_eq!(engine.strategy().reports, engine.execution_reports());
+        assert_eq!(engine.strategy().fills, 1);
+    }
+
+    type EventStampKey = (u64, u64);
+
+    #[test]
+    fn test_invalid_quote_side_is_rejected() {
+        let ticks = vec![create_test_tick(1000, dec!(98.0), dec!(102.0))];
+        let mut engine = scripted_engine(ticks, vec![Some((dec!(0), dec!(101)))]);
+        engine.run();
+        let kinds: Vec<ExecutionKind> = engine.execution_reports().iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![ExecutionKind::Rejected, ExecutionKind::Accepted]
+        );
+        assert_eq!(engine.open_orders().len(), 1);
+    }
+
+    #[test]
+    fn test_crossed_quote_is_rejected_on_both_sides() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(97.0), dec!(103.0)),
+        ];
+        let mut engine = scripted_engine(
+            ticks,
+            vec![Some((dec!(100), dec!(100))), Some((dec!(101), dec!(99)))],
+        );
+        let result = engine.run();
+        assert!(
+            engine
+                .execution_reports()
+                .iter()
+                .all(|r| r.kind == ExecutionKind::Rejected)
+        );
+        assert_eq!(engine.execution_reports().len(), 4);
+        assert!(engine.open_orders().is_empty());
+        assert_eq!(result.num_trades, 0);
+    }
+
+    #[test]
+    fn test_out_of_order_tick_cannot_fill_before_activation() {
+        // Submitted at 1000; 1001 does not cross; the stale tick at 999
+        // crosses but predates the activation and must not fill.
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(98.0), dec!(102.0)),
+            create_test_tick(999, dec!(97.0), dec!(99.0)),
+        ];
+        let mut engine = scripted_engine(ticks, vec![Some((dec!(100), dec!(103))), None, None]);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 0);
+        assert_eq!(engine.open_orders().len(), 2);
+    }
+
+    #[test]
+    fn test_replay_is_deterministic() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(97.0), dec!(99.4)),
+            create_test_tick(1002, dec!(100.6), dec!(103.0)),
+            create_test_tick(1003, dec!(98.0), dec!(102.0)),
+        ];
+        let quotes = vec![
+            Some((dec!(99.5), dec!(100.5))),
+            Some((dec!(99.5), dec!(100.5))),
+            None,
+            Some((dec!(99), dec!(101))),
+        ];
+        let mut engine = scripted_engine(ticks, quotes);
+        let first = engine.run();
+        let first_reports = engine.execution_reports().to_vec();
+        engine.reset();
+        let second = engine.run();
+        assert_eq!(first_reports, engine.execution_reports());
+        assert_eq!(first.trades, second.trades);
+        assert_eq!(first.net_pnl, second.net_pnl);
+        assert_eq!(first.num_trades, 2);
+    }
+
+    #[test]
+    fn test_fill_fee_matches_report() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(97.0), dec!(99.0)),
+        ];
+        let mut engine = BacktestEngine::new(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(2))
+                .with_fee_rate(dec!(0.001)),
+            ScriptedStrategy::new(vec![Some((dec!(100), dec!(110)))]),
+            VecDataSource::new(ticks),
+        );
+        let result = engine.run();
+        let fill = engine
+            .execution_reports()
+            .iter()
+            .find(|r| r.is_fill())
+            .expect("fill report");
+        assert_eq!(fill.fee, dec!(0.2));
+        assert_eq!(result.total_fees, dec!(0.2));
+        assert_eq!(fill.cumulative_quantity, dec!(2));
+        assert_eq!(fill.remaining, Decimal::ZERO);
     }
 }

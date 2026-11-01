@@ -46,6 +46,8 @@ pub mod engine;
 /// Realistic fill models for backtesting.
 pub mod fill_models;
 
+pub mod lifecycle;
+
 /// Performance metrics calculator.
 pub mod metrics;
 
@@ -56,5 +58,8 @@ pub use engine::{
 pub use fill_models::{
     FillModel, FillResult, ImmediateFillModel, MarketImpactFillModel, ProbabilisticFillModel,
     QueuePositionFillModel, SimulatedOrder,
+};
+pub use lifecycle::{
+    EventStamp, ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId, SimOrderState,
 };
 pub use metrics::{EquityPoint, MetricsCalculator, MetricsConfig, PerformanceMetrics, TradeRecord};
