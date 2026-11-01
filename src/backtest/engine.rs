@@ -12,7 +12,16 @@
 //! [`ImmediateFillModel`]), booking
 //! partial fills at the model price plus slippage, then asks the strategy
 //! for a new quote. A new quote replaces the resting orders and only becomes
-//! eligible on later ticks. Every transition is published as an
+//! eligible on later ticks. With [`BacktestEngine::with_latency`] the
+//! strategy observes ticks late, orders activate and cancels take effect
+//! after their delays, and reports reach the strategy after the
+//! acknowledgement delay; a cancel that arrives after a fill is reported as
+//! `CancelRejected` and the fill stands. Events scheduled between two ticks
+//! (observations, activations, cancels, report deliveries) happen at their
+//! own times, in chronological order, before the next tick is matched.
+//! Jitter applies to every delay, observations included. Reports still in
+//! flight when the data ends are delivered after the last tick. Every
+//! transition is published as an
 //! [`ExecutionReport`] to [`BacktestStrategy::on_execution_report`] and
 //! recorded in [`BacktestEngine::execution_reports`].
 //!
@@ -70,7 +79,9 @@ use crate::types::error::MMResult;
 
 use super::data::{HistoricalDataSource, MarketTick};
 use super::fill_models::{FillModel, FillResult, ImmediateFillModel, SimulatedOrder};
+use super::latency::{JitterRng, SimLatencyConfig};
 use super::lifecycle::{ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -395,6 +406,9 @@ pub trait BacktestStrategy {
     /// bid and ask of [`BacktestConfig::default_order_size`]. The new orders
     /// can only fill on later ticks, never on the tick they were computed
     /// from. Returning `None` leaves resting orders in place.
+    ///
+    /// With simulated latency, `tick` may be older than the venue time and
+    /// `position` only reflects fills whose reports were already delivered.
     fn on_tick(&mut self, tick: &MarketTick, position: &InventoryPosition) -> Option<Quote>;
 
     /// Called when an order is filled.
@@ -477,6 +491,39 @@ pub struct BacktestEngine<
     orders: Vec<SimOrder>,
     next_order_id: SimOrderId,
     reports: Vec<ExecutionReport>,
+    latency: SimLatencyConfig,
+    jitter: JitterRng,
+    next_message: u64,
+    /// Venue messages keyed by `(effective time, sequence)`.
+    pending: BTreeMap<(u64, u64), PendingAction>,
+    /// Key in `pending` of each order waiting for activation.
+    pending_activations: HashMap<SimOrderId, (u64, u64)>,
+    /// Orders targeted by a cancel still in flight.
+    cancel_targets: HashSet<SimOrderId>,
+    /// Terminal orders (filled or rejected) with a cancel still in flight,
+    /// kept so the cancel can be answered with `CancelRejected`.
+    awaiting_cancel: HashMap<SimOrderId, SimOrder>,
+    /// FIFO report channel to the strategy, non decreasing delivery times.
+    deliveries: VecDeque<Delivery>,
+    /// FIFO observation channel: (time the strategy sees it, tick).
+    observed: VecDeque<(u64, MarketTick)>,
+    agent_position: InventoryPosition,
+    last_delivery_at: u64,
+    last_observed_at: u64,
+}
+
+#[derive(Debug, Clone)]
+enum PendingAction {
+    Activate(SimOrder),
+    Cancel(SimOrderId),
+}
+
+/// Report waiting to reach the strategy.
+#[derive(Debug, Clone)]
+struct Delivery {
+    at: u64,
+    report: ExecutionReport,
+    fill: Option<SimulatedFill>,
 }
 
 impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
@@ -506,6 +553,26 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         Ok(Self::build(config, strategy, data_source, fill_model))
     }
 
+    /// Applies simulated latency to observations, submissions, cancels and
+    /// acknowledgements. The default is zero latency.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::types::error::MMError::InvalidConfiguration`] if a
+    /// delay exceeds [`super::latency::MAX_SIM_LATENCY_MS`].
+    pub fn with_latency(mut self, latency: SimLatencyConfig) -> MMResult<Self> {
+        latency.validate()?;
+        self.latency = latency;
+        self.jitter = JitterRng::new(latency.seed);
+        Ok(self)
+    }
+
+    /// Returns the simulated latency configuration.
+    #[must_use]
+    pub fn latency(&self) -> &SimLatencyConfig {
+        &self.latency
+    }
+
     fn build(config: BacktestConfig, strategy: S, data_source: D, fill_model: F) -> Self {
         let initial_capital = config.initial_capital;
         Self {
@@ -525,6 +592,18 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             orders: Vec::new(),
             next_order_id: 1,
             reports: Vec::new(),
+            latency: SimLatencyConfig::default(),
+            jitter: JitterRng::new(0),
+            next_message: 0,
+            pending: BTreeMap::new(),
+            pending_activations: HashMap::new(),
+            cancel_targets: HashSet::new(),
+            awaiting_cancel: HashMap::new(),
+            deliveries: VecDeque::new(),
+            observed: VecDeque::new(),
+            agent_position: InventoryPosition::new(),
+            last_delivery_at: 0,
+            last_observed_at: 0,
         }
     }
 
@@ -551,16 +630,26 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             // Simulated time follows the data; out of order ticks are
             // processed at the current time so it never goes backwards.
             let now = self.clock.now().max(tick.timestamp);
+
+            // 1. Every scheduled event up to now happens first, in time
+            //    order: venue messages, report deliveries and observations
+            //    that fell between the previous tick and this one.
+            self.advance_events(now);
             let _ = self.clock.advance_to(now);
 
-            // 1. Market data first: match orders that were already active
-            //    before this tick.
+            // 2. Market data: match orders that were already active before
+            //    this tick.
             self.match_active_orders(&tick, now);
 
-            // 2. Decide on this tick; new orders can only match later ticks.
-            if let Some(quote) = self.strategy.on_tick(&tick, &self.position) {
-                self.replace_quotes(&quote, now);
-            }
+            // 3. The tick enters the FIFO observation channel; the strategy
+            //    decides when it sees it, with the position it has been told
+            //    about. New orders can only match later ticks.
+            let ready = self
+                .delayed(tick.timestamp, self.latency.observation_ms)
+                .max(self.last_observed_at);
+            self.last_observed_at = ready;
+            self.observed.push_back((ready, tick.clone()));
+            self.advance_events(now);
 
             // Update PnL mark-to-market
             let mid_price = tick.mid_price();
@@ -586,6 +675,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             callback(num_ticks as usize, total_ticks);
         }
 
+        // Reports still in flight reach the strategy after the data ends.
+        self.flush_deliveries();
+
         BacktestResult {
             total_pnl: self.pnl.total,
             total_fees: self.total_fees,
@@ -608,6 +700,60 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             },
             max_drawdown: self.max_drawdown,
             sharpe_ratio: self.calculate_sharpe_ratio(),
+        }
+    }
+
+    /// Delivers the reports still in flight when the data ends, so the
+    /// strategy hears about every fill in the result. Venue messages and
+    /// observations still pending are dropped: no market data is left to
+    /// act on.
+    fn flush_deliveries(&mut self) {
+        while !self.deliveries.is_empty() {
+            self.deliver_next();
+        }
+    }
+
+    /// Runs every scheduled event with time at or before `until` in
+    /// chronological order. At equal times venue messages come first, then
+    /// report deliveries, then observations, so a decision sees every report
+    /// delivered at its own time. Events created while running (a decision
+    /// scheduling a zero delay submission) are picked up in the same pass.
+    fn advance_events(&mut self, until: u64) {
+        loop {
+            let venue = self.pending.first_key_value().map(|(key, _)| key.0);
+            let report = self.deliveries.front().map(|d| d.at);
+            let observation = self.observed.front().map(|(at, _)| *at);
+            let mut next: Option<(u64, u8)> = None;
+            for (time, class) in [(venue, 0u8), (report, 1), (observation, 2)] {
+                if let Some(t) = time
+                    && t <= until
+                    && next.is_none_or(|n| (t, class) < n)
+                {
+                    next = Some((t, class));
+                }
+            }
+            let Some((time, class)) = next else {
+                break;
+            };
+            // Out of order data can schedule an event before the clock;
+            // it then happens at the current time.
+            let at = time.max(self.clock.now());
+            let _ = self.clock.advance_to(at);
+            match class {
+                0 => self.apply_next_venue_message(),
+                1 => self.deliver_next(),
+                _ => self.observe_next(at),
+            }
+        }
+    }
+
+    /// Hands the oldest observed tick to the strategy at time `at`.
+    fn observe_next(&mut self, at: u64) {
+        let Some((_, seen)) = self.observed.pop_front() else {
+            return;
+        };
+        if let Some(quote) = self.strategy.on_tick(&seen, &self.agent_position) {
+            self.replace_quotes(&quote, at);
         }
     }
 
@@ -655,26 +801,46 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let fee = price * quantity * self.config.fee_rate;
             let stamp = self.clock.stamp();
             let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
-            self.emit(report);
-            self.process_fill(SimulatedFill::with_fee(side, price, quantity, now, fee));
+            let fill = SimulatedFill::with_fee(side, price, quantity, now, fee);
+            self.process_fill(fill.clone());
+            self.queue_delivery(report, Some(fill));
         }
-        self.orders.retain(|order| !order.state.is_terminal());
+        let targets = &self.cancel_targets;
+        let awaiting = &mut self.awaiting_cancel;
+        self.orders.retain(|order| {
+            if !order.state.is_terminal() {
+                return true;
+            }
+            if targets.contains(&order.id) {
+                awaiting.insert(order.id, order.clone());
+            }
+            false
+        });
     }
 
-    /// Cancels every resting order and submits the new bid and ask. New
-    /// orders become eligible only for ticks after `now`. A crossed or
-    /// locked quote (bid at or above ask) is rejected on both sides so the
-    /// engine never rests two orders that could trade with each other.
+    /// Schedules cancels for every resting or pending order and submits the
+    /// new bid and ask. Cancels take effect after the cancel latency; new
+    /// orders become active after the submission latency and only match
+    /// ticks after that. A crossed or locked quote (bid at or above ask) is
+    /// rejected locally on both sides at decision time, so the engine never
+    /// rests two orders that could trade with each other.
     fn replace_quotes(&mut self, quote: &Quote, now: u64) {
-        for index in 0..self.orders.len() {
-            if self.orders[index].cancel().is_ok() {
-                let stamp = self.clock.stamp();
-                let report =
-                    ExecutionReport::status(stamp, &self.orders[index], ExecutionKind::Canceled);
-                self.emit(report);
-            }
+        let mut targets: Vec<SimOrderId> = self
+            .orders
+            .iter()
+            .filter(|o| !o.state.is_terminal())
+            .map(|o| o.id)
+            .collect();
+        targets.extend(self.pending_activations.keys().copied());
+        targets.retain(|id| !self.cancel_targets.contains(id));
+        // Ids are allocated in order, so sorting keeps scheduling (and the
+        // jitter draws) deterministic.
+        targets.sort_unstable();
+        for id in targets {
+            let effective = self.delayed(now, self.latency.cancel_ms);
+            self.cancel_targets.insert(id);
+            self.schedule(effective, PendingAction::Cancel(id));
         }
-        self.orders.clear();
 
         let size = self.config.default_order_size;
         let crossed = quote.bid_price >= quote.ask_price;
@@ -682,28 +848,133 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let id = self.next_order_id;
             self.next_order_id += 1;
             let stamp = self.clock.stamp();
-            let mut order = SimOrder::new(id, side, price, size, stamp, now);
-            let kind = if !crossed && order.validate().is_ok() {
-                let _ = order.accept();
-                ExecutionKind::Accepted
-            } else {
+            if crossed {
+                let mut order = SimOrder::new(id, side, price, size, stamp, now);
                 let _ = order.reject();
-                ExecutionKind::Rejected
-            };
-            let stamp = self.clock.stamp();
-            self.emit(ExecutionReport::status(stamp, &order, kind));
-            if kind == ExecutionKind::Accepted {
-                self.orders.push(order);
+                let stamp = self.clock.stamp();
+                self.queue_delivery(
+                    ExecutionReport::status(stamp, &order, ExecutionKind::Rejected),
+                    None,
+                );
+                continue;
+            }
+            let effective = self.delayed(now, self.latency.submit_ms);
+            let order = SimOrder::new(id, side, price, size, stamp, effective);
+            self.schedule(effective, PendingAction::Activate(order));
+        }
+    }
+
+    /// Adds latency and jitter to `now`.
+    fn delayed(&mut self, now: u64, base_ms: u64) -> u64 {
+        let jitter = self.jitter.draw(self.latency.jitter_ms);
+        now.saturating_add(base_ms).saturating_add(jitter)
+    }
+
+    fn schedule(&mut self, effective: u64, action: PendingAction) {
+        let key = (effective, self.next_message);
+        self.next_message += 1;
+        if let PendingAction::Activate(order) = &action {
+            self.pending_activations.insert(order.id, key);
+        }
+        self.pending.insert(key, action);
+    }
+
+    /// Applies the earliest venue message, in `(effective time, sequence)`
+    /// order.
+    fn apply_next_venue_message(&mut self) {
+        let Some((_, action)) = self.pending.pop_first() else {
+            return;
+        };
+        match action {
+            PendingAction::Activate(mut order) => {
+                self.pending_activations.remove(&order.id);
+                let kind = if order.validate().is_ok() {
+                    let _ = order.accept();
+                    ExecutionKind::Accepted
+                } else {
+                    let _ = order.reject();
+                    ExecutionKind::Rejected
+                };
+                let stamp = self.clock.stamp();
+                self.emit(ExecutionReport::status(stamp, &order, kind));
+                if kind == ExecutionKind::Accepted {
+                    self.orders.push(order);
+                } else if self.cancel_targets.contains(&order.id) {
+                    self.awaiting_cancel.insert(order.id, order);
+                }
+            }
+            PendingAction::Cancel(id) => {
+                self.cancel_targets.remove(&id);
+                self.apply_cancel(id);
             }
         }
     }
 
-    /// Delivers a report to the strategy and records it.
-    fn emit(&mut self, report: ExecutionReport) {
-        self.strategy.on_execution_report(&report);
-        if self.config.record_trades {
-            self.reports.push(report);
+    /// Cancels order `id` if it is still open or not yet active; otherwise
+    /// reports that the cancel arrived too late. Fills that happened earlier
+    /// always stand.
+    fn apply_cancel(&mut self, id: SimOrderId) {
+        let stamp = self.clock.stamp();
+        if let Some(index) = self.orders.iter().position(|o| o.id == id)
+            && self.orders[index].cancel().is_ok()
+        {
+            let report =
+                ExecutionReport::status(stamp, &self.orders[index], ExecutionKind::Canceled);
+            self.orders.remove(index);
+            self.emit(report);
+            return;
         }
+        if let Some(key) = self.pending_activations.remove(&id) {
+            if let Some(PendingAction::Activate(mut order)) = self.pending.remove(&key) {
+                let _ = order.cancel();
+                self.emit(ExecutionReport::status(
+                    stamp,
+                    &order,
+                    ExecutionKind::Canceled,
+                ));
+            }
+            return;
+        }
+        if let Some(order) = self.awaiting_cancel.remove(&id) {
+            let report = ExecutionReport::status(stamp, &order, ExecutionKind::CancelRejected);
+            self.emit(report);
+        }
+    }
+
+    /// Delivers the oldest queued report to the strategy, updating the
+    /// position the strategy knows about.
+    fn deliver_next(&mut self) {
+        let Some(delivery) = self.deliveries.pop_front() else {
+            return;
+        };
+        self.strategy.on_execution_report(&delivery.report);
+        if let Some(fill) = delivery.fill {
+            let signed_qty = match fill.side {
+                Side::Buy => fill.quantity,
+                Side::Sell => -fill.quantity,
+            };
+            self.agent_position
+                .update_fill(signed_qty, fill.price, fill.timestamp);
+            self.strategy.on_fill(&fill);
+        }
+    }
+
+    /// Records a venue report and queues it for the strategy.
+    fn emit(&mut self, report: ExecutionReport) {
+        self.queue_delivery(report, None);
+    }
+
+    fn queue_delivery(&mut self, report: ExecutionReport, fill: Option<SimulatedFill>) {
+        // The report channel is FIFO: jitter delays a report but never lets
+        // it overtake one produced earlier.
+        let at = self
+            .delayed(report.stamp.timestamp, self.latency.ack_ms)
+            .max(self.last_delivery_at);
+        self.last_delivery_at = at;
+        if self.config.record_trades {
+            self.reports.push(report.clone());
+        }
+        self.deliveries.push_back(Delivery { at, report, fill });
     }
 
     /// Applies slippage to a fill price.
@@ -744,9 +1015,6 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         if abs_position > self.max_position {
             self.max_position = abs_position;
         }
-
-        // Notify strategy
-        self.strategy.on_fill(&fill);
 
         // Record trade
         if self.config.record_trades {
@@ -864,6 +1132,17 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.fill_model.reset();
         self.clock.reset();
         self.orders.clear();
+        self.jitter.reset();
+        self.next_message = 0;
+        self.pending.clear();
+        self.pending_activations.clear();
+        self.cancel_targets.clear();
+        self.awaiting_cancel.clear();
+        self.deliveries.clear();
+        self.observed.clear();
+        self.agent_position = InventoryPosition::new();
+        self.last_delivery_at = 0;
+        self.last_observed_at = 0;
         self.next_order_id = 1;
         self.reports.clear();
     }
@@ -896,7 +1175,9 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 mod tests {
     use super::*;
     use crate::backtest::VecDataSource;
-    use crate::backtest::{MarketImpactFillModel, ProbabilisticFillModel, QueuePositionFillModel};
+    use crate::backtest::{
+        MarketImpactFillModel, ProbabilisticFillModel, QueuePositionFillModel, SimLatencyConfig,
+    };
     use crate::dec;
 
     struct TestStrategy {
@@ -1357,6 +1638,7 @@ mod tests {
         index: usize,
         reports: Vec<ExecutionReport>,
         fills: usize,
+        seen: Vec<(u64, Decimal)>,
     }
 
     impl ScriptedStrategy {
@@ -1366,12 +1648,14 @@ mod tests {
                 index: 0,
                 reports: Vec::new(),
                 fills: 0,
+                seen: Vec::new(),
             }
         }
     }
 
     impl BacktestStrategy for ScriptedStrategy {
-        fn on_tick(&mut self, tick: &MarketTick, _position: &InventoryPosition) -> Option<Quote> {
+        fn on_tick(&mut self, tick: &MarketTick, position: &InventoryPosition) -> Option<Quote> {
+            self.seen.push((tick.timestamp, position.quantity));
             let quote = self.quotes.get(self.index).copied().flatten();
             self.index += 1;
             quote.map(|(bid, ask)| Quote {
@@ -1392,6 +1676,7 @@ mod tests {
             self.index = 0;
             self.reports.clear();
             self.fills = 0;
+            self.seen.clear();
         }
     }
 
@@ -1832,5 +2117,361 @@ mod tests {
         let second = engine.run();
         assert_eq!(first.trades, second.trades);
         assert_eq!(first_reports, engine.execution_reports());
+    }
+
+    fn latency_engine(
+        ticks: Vec<MarketTick>,
+        quotes: Vec<Option<(Decimal, Decimal)>>,
+        latency: SimLatencyConfig,
+    ) -> BacktestEngine<ScriptedStrategy, VecDataSource> {
+        scripted_engine(ticks, quotes)
+            .with_latency(latency)
+            .unwrap()
+    }
+
+    /// Bid 100 rests from t=1000; at t=1002 the strategy requotes (bid 90),
+    /// which cancels the 100 bid; the market sells down to 99.5 at t=1004.
+    fn race_ticks() -> Vec<MarketTick> {
+        vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(98.0), dec!(102.0)),
+            create_test_tick(1002, dec!(98.0), dec!(102.0)),
+            create_test_tick(1004, dec!(97.0), dec!(99.5)),
+            create_test_tick(1008, dec!(98.0), dec!(102.0)),
+        ]
+    }
+
+    fn race_quotes() -> Vec<Option<(Decimal, Decimal)>> {
+        vec![
+            Some((dec!(100), dec!(200))),
+            None,
+            Some((dec!(90), dec!(200))),
+            None,
+            None,
+        ]
+    }
+
+    fn kinds_for(
+        engine: &BacktestEngine<ScriptedStrategy, VecDataSource>,
+        id: SimOrderId,
+    ) -> Vec<(u64, ExecutionKind)> {
+        engine
+            .execution_reports()
+            .iter()
+            .filter(|r| r.order_id == id)
+            .map(|r| (r.stamp.timestamp, r.kind))
+            .collect()
+    }
+
+    #[test]
+    fn test_cancel_before_fill() {
+        // Cancel decided at 1002 takes effect at 1003, before the cross at 1004.
+        let latency = SimLatencyConfig::new().with_cancel_ms(1);
+        let mut engine = latency_engine(race_ticks(), race_quotes(), latency);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 0);
+        assert_eq!(
+            kinds_for(&engine, 1),
+            vec![
+                (1000, ExecutionKind::Accepted),
+                (1003, ExecutionKind::Canceled)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fill_before_cancel_stands() {
+        // Cancel decided at 1002 takes effect at 1007, after the cross at 1004.
+        let latency = SimLatencyConfig::new().with_cancel_ms(5);
+        let mut engine = latency_engine(race_ticks(), race_quotes(), latency);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.trades[0].timestamp, 1004);
+        assert_eq!(
+            kinds_for(&engine, 1),
+            vec![
+                (1000, ExecutionKind::Accepted),
+                (1004, ExecutionKind::Fill),
+                (1007, ExecutionKind::CancelRejected),
+            ]
+        );
+        // The late cancel does not reverse the fill or its cashflow.
+        assert_eq!(result.final_position, dec!(2));
+        assert_eq!(engine.get_state().0.quantity, dec!(2));
+        assert_eq!(engine.get_state().1.realized, dec!(-200));
+    }
+
+    #[test]
+    fn test_events_between_ticks_happen_on_time() {
+        // The 1000 tick is seen at 1002 and the bid is active from 1003,
+        // before the next tick at 1010, which it can therefore match.
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1010, dec!(97.0), dec!(99.0)),
+        ];
+        let latency = SimLatencyConfig::new()
+            .with_observation_ms(2)
+            .with_submit_ms(1);
+        let mut engine = latency_engine(ticks, vec![Some((dec!(100), dec!(200)))], latency);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(
+            kinds_for(&engine, 1),
+            vec![(1003, ExecutionKind::Accepted), (1010, ExecutionKind::Fill)]
+        );
+    }
+
+    #[test]
+    fn test_observation_jitter_delays_decisions() {
+        let (jitter, seed) = (5, 11);
+        // Replay the engine's draws: the first observation, one per tick
+        // enqueued before the decision, then the bid submission.
+        let mut rng = JitterRng::new(seed);
+        let observe = rng.draw(jitter);
+        for _ in 1..observe {
+            rng.draw(jitter);
+        }
+        let submit = rng.draw(jitter);
+        assert!(observe > 0, "the seed must delay the first observation");
+        let ticks = (0..30)
+            .map(|i| create_test_tick(1000 + i, dec!(98.0), dec!(102.0)))
+            .collect();
+        let latency = SimLatencyConfig::new().with_jitter(jitter, seed);
+        let mut engine = latency_engine(ticks, vec![Some((dec!(100), dec!(101)))], latency);
+        engine.run();
+        assert_eq!(
+            kinds_for(&engine, 1)[0],
+            (1000 + observe + submit, ExecutionKind::Accepted)
+        );
+    }
+
+    #[test]
+    fn test_cancel_of_rejected_order_is_answered() {
+        // Bid 0 is rejected at 1003; the cancel decided at 1001 lands at
+        // 1006 and must still produce an outcome.
+        let ticks = (0..9)
+            .map(|i| create_test_tick(1000 + i, dec!(98.0), dec!(102.0)))
+            .collect();
+        let latency = SimLatencyConfig::new().with_submit_ms(3).with_cancel_ms(5);
+        let mut engine = latency_engine(
+            ticks,
+            vec![Some((dec!(0), dec!(101))), Some((dec!(99), dec!(101)))],
+            latency,
+        );
+        engine.run();
+        assert_eq!(
+            kinds_for(&engine, 1),
+            vec![
+                (1003, ExecutionKind::Rejected),
+                (1006, ExecutionKind::CancelRejected)
+            ]
+        );
+        assert_eq!(
+            kinds_for(&engine, 2),
+            vec![
+                (1003, ExecutionKind::Accepted),
+                (1006, ExecutionKind::Canceled)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reports_in_flight_are_delivered_after_last_tick() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(97.0), dec!(99.0)),
+        ];
+        let latency = SimLatencyConfig::new().with_ack_ms(5);
+        let mut engine = latency_engine(ticks, vec![Some((dec!(100), dec!(200)))], latency);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(engine.strategy().fills, 1);
+        assert_eq!(engine.strategy().reports, engine.execution_reports());
+    }
+
+    #[test]
+    fn test_cancel_faster_than_submit_removes_pending_order() {
+        let ticks = (0..9)
+            .map(|i| create_test_tick(1000 + i, dec!(98.0), dec!(102.0)))
+            .collect();
+        let latency = SimLatencyConfig::new().with_submit_ms(5).with_cancel_ms(1);
+        let mut engine = latency_engine(
+            ticks,
+            vec![Some((dec!(99), dec!(101))), Some((dec!(98), dec!(102)))],
+            latency,
+        );
+        engine.run();
+        // Never accepted: the cancel at 1002 removes the activation due at 1005.
+        assert_eq!(kinds_for(&engine, 1), vec![(1002, ExecutionKind::Canceled)]);
+    }
+
+    #[test]
+    fn test_late_cancel_after_partial_fill_keeps_filled_part() {
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default().with_default_order_size(dec!(2)),
+            ScriptedStrategy::new(vec![
+                Some((dec!(100), dec!(200))),
+                None,
+                Some((dec!(99), dec!(200))),
+            ]),
+            VecDataSource::new(queue_ticks()),
+            QueuePositionFillModel::new(dec!(0.5)),
+        )
+        .unwrap()
+        .with_latency(SimLatencyConfig::new().with_cancel_ms(3))
+        .unwrap();
+        let result = engine.run();
+        let history: Vec<(u64, ExecutionKind)> = engine
+            .execution_reports()
+            .iter()
+            .filter(|r| r.order_id == 1)
+            .map(|r| (r.stamp.timestamp, r.kind))
+            .collect();
+        // Requote at 1003 cancels at 1006, after the 1005 partial fill.
+        assert_eq!(
+            history,
+            vec![
+                (1000, ExecutionKind::Accepted),
+                (1003, ExecutionKind::PartialFill),
+                (1005, ExecutionKind::PartialFill),
+                (1006, ExecutionKind::Canceled),
+            ]
+        );
+        let canceled = engine
+            .execution_reports()
+            .iter()
+            .find(|r| r.order_id == 1 && r.kind == ExecutionKind::Canceled)
+            .unwrap();
+        assert_eq!(canceled.cumulative_quantity, dec!(1.5));
+        assert_eq!(result.final_position, dec!(1.5));
+    }
+
+    #[test]
+    fn test_submission_latency_delays_activation() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1002, dec!(97.0), dec!(99.0)),
+            create_test_tick(1003, dec!(97.0), dec!(99.0)),
+            create_test_tick(1004, dec!(97.0), dec!(99.0)),
+        ];
+        let latency = SimLatencyConfig::new().with_submit_ms(3);
+        let mut engine = latency_engine(ticks, vec![Some((dec!(100), dec!(200)))], latency);
+        let result = engine.run();
+        // Active from 1003, so the 1002 and 1003 ticks cannot fill it.
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.trades[0].timestamp, 1004);
+        assert_eq!(kinds_for(&engine, 1)[0], (1003, ExecutionKind::Accepted));
+    }
+
+    #[test]
+    fn test_agent_never_observes_report_before_ack_delay() {
+        let ticks: Vec<MarketTick> = (0..7)
+            .map(|i| {
+                if i == 1 {
+                    create_test_tick(1000 + i, dec!(97.0), dec!(99.0))
+                } else {
+                    create_test_tick(1000 + i, dec!(98.0), dec!(102.0))
+                }
+            })
+            .collect();
+        let latency = SimLatencyConfig::new().with_ack_ms(3);
+        let mut engine = latency_engine(ticks, vec![Some((dec!(100), dec!(200)))], latency);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.trades[0].timestamp, 1001);
+        // Exchange position changes at 1001; the strategy learns at 1004.
+        assert_eq!(
+            engine.strategy().seen,
+            vec![
+                (1000, dec!(0)),
+                (1001, dec!(0)),
+                (1002, dec!(0)),
+                (1003, dec!(0)),
+                (1004, dec!(2)),
+                (1005, dec!(2)),
+                (1006, dec!(2)),
+            ]
+        );
+        assert_eq!(engine.strategy().fills, 1);
+    }
+
+    #[test]
+    fn test_observation_latency_delays_ticks() {
+        let ticks: Vec<MarketTick> = (0..5)
+            .map(|i| create_test_tick(1000 + i, dec!(98.0), dec!(102.0)))
+            .collect();
+        let latency = SimLatencyConfig::new().with_observation_ms(2);
+        let mut engine = latency_engine(ticks, vec![], latency);
+        engine.run();
+        let seen: Vec<u64> = engine.strategy().seen.iter().map(|(t, _)| *t).collect();
+        assert_eq!(seen, vec![1000, 1001, 1002]);
+    }
+
+    #[test]
+    fn test_jitter_is_reproducible_with_same_seed() {
+        let ticks: Vec<MarketTick> = (0..60)
+            .map(|i| {
+                let ask = if i % 3 == 0 { dec!(99.0) } else { dec!(102.0) };
+                create_test_tick(1000 + i, dec!(98.0), ask)
+            })
+            .collect();
+        let quotes = (0..60)
+            .map(|i| (i % 4 == 0).then_some((dec!(100), dec!(200))))
+            .collect();
+        let latency = SimLatencyConfig::new()
+            .with_submit_ms(1)
+            .with_cancel_ms(1)
+            .with_ack_ms(1)
+            .with_jitter(4, 42);
+        let mut engine = latency_engine(ticks, quotes, latency);
+        let first = engine.run();
+        let first_reports = engine.execution_reports().to_vec();
+        let first_seen = engine.strategy().seen.clone();
+        engine.reset();
+        let second = engine.run();
+        assert!(first.num_trades > 0);
+        assert_eq!(first.trades, second.trades);
+        assert_eq!(first_reports, engine.execution_reports());
+        assert_eq!(first_seen, engine.strategy().seen);
+        // FIFO report channel: the strategy receives reports in the order
+        // the venue produced them, even with jitter.
+        let delivered = engine.strategy().reports.clone();
+        let produced: Vec<ExecutionReport> = engine
+            .execution_reports()
+            .iter()
+            .take(delivered.len())
+            .cloned()
+            .collect();
+        assert_eq!(delivered, produced);
+    }
+
+    #[test]
+    fn test_zero_latency_matches_default_engine() {
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(97.0), dec!(99.4)),
+            create_test_tick(1002, dec!(100.6), dec!(103.0)),
+            create_test_tick(1003, dec!(98.0), dec!(102.0)),
+        ];
+        let quotes = vec![
+            Some((dec!(99.5), dec!(100.5))),
+            Some((dec!(99.5), dec!(100.5))),
+            None,
+            Some((dec!(99), dec!(101))),
+        ];
+        let mut plain = scripted_engine(ticks.clone(), quotes.clone());
+        let mut zero = latency_engine(ticks, quotes, SimLatencyConfig::default());
+        let a = plain.run();
+        let b = zero.run();
+        assert_eq!(a.trades, b.trades);
+        assert_eq!(plain.execution_reports(), zero.execution_reports());
+        assert_eq!(plain.strategy().seen, zero.strategy().seen);
+    }
+
+    #[test]
+    fn test_invalid_latency_is_rejected() {
+        let engine = scripted_engine(vec![], vec![]);
+        let huge = SimLatencyConfig::new().with_submit_ms(crate::backtest::MAX_SIM_LATENCY_MS + 1);
+        assert!(engine.with_latency(huge).is_err());
     }
 }
