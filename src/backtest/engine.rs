@@ -7,9 +7,11 @@
 //!
 //! Orders persist across ticks and follow the causal lifecycle in
 //! [`crate::backtest::lifecycle`]. For each tick the engine first matches the
-//! orders that were already resting (best bid/offer cross, full remaining
-//! quantity at the limit price plus slippage), then asks the strategy for a
-//! new quote. A new quote replaces the resting orders and only becomes
+//! orders that were already resting through the configured
+//! [`FillModel`] (by default the optimistic
+//! [`ImmediateFillModel`]), booking
+//! partial fills at the model price plus slippage, then asks the strategy
+//! for a new quote. A new quote replaces the resting orders and only becomes
 //! eligible on later ticks. Every transition is published as an
 //! [`ExecutionReport`] to [`BacktestStrategy::on_execution_report`] and
 //! recorded in [`BacktestEngine::execution_reports`].
@@ -64,8 +66,10 @@ use crate::execution::Side;
 use crate::position::inventory::InventoryPosition;
 use crate::position::pnl::PnL;
 use crate::strategy::quote::Quote;
+use crate::types::error::MMResult;
 
 use super::data::{HistoricalDataSource, MarketTick};
+use super::fill_models::{FillModel, FillResult, ImmediateFillModel, SimulatedOrder};
 use super::lifecycle::{ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId};
 
 #[cfg(feature = "serde")]
@@ -410,6 +414,10 @@ pub trait BacktestStrategy {
 ///
 /// * `S` - Strategy type implementing `BacktestStrategy`
 /// * `D` - Data source type implementing `HistoricalDataSource`
+/// * `F` - Fill model implementing [`FillModel`]; defaults to
+///   [`ImmediateFillModel`], the optimistic best bid/offer cross used as the
+///   reference mode. Choose another model with
+///   [`BacktestEngine::with_fill_model`].
 ///
 /// # Example
 ///
@@ -448,8 +456,13 @@ pub trait BacktestStrategy {
 /// assert_eq!(result.num_trades, 0);
 /// ```
 #[derive(Debug)]
-pub struct BacktestEngine<S: BacktestStrategy, D: HistoricalDataSource> {
+pub struct BacktestEngine<
+    S: BacktestStrategy,
+    D: HistoricalDataSource,
+    F: FillModel = ImmediateFillModel,
+> {
     config: BacktestConfig,
+    fill_model: F,
     strategy: S,
     data_source: D,
     position: InventoryPosition,
@@ -467,12 +480,37 @@ pub struct BacktestEngine<S: BacktestStrategy, D: HistoricalDataSource> {
 }
 
 impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
-    /// Creates a new backtest engine.
+    /// Creates a new backtest engine with the reference
+    /// [`ImmediateFillModel`].
     #[must_use]
     pub fn new(config: BacktestConfig, strategy: S, data_source: D) -> Self {
+        Self::build(config, strategy, data_source, ImmediateFillModel::new())
+    }
+}
+
+impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<S, D, F> {
+    /// Creates a backtest engine that executes resting orders through
+    /// `fill_model`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`FillModel::validate`] if the model
+    /// parameters are invalid.
+    pub fn with_fill_model(
+        config: BacktestConfig,
+        strategy: S,
+        data_source: D,
+        fill_model: F,
+    ) -> MMResult<Self> {
+        fill_model.validate()?;
+        Ok(Self::build(config, strategy, data_source, fill_model))
+    }
+
+    fn build(config: BacktestConfig, strategy: S, data_source: D, fill_model: F) -> Self {
         let initial_capital = config.initial_capital;
         Self {
             config,
+            fill_model,
             strategy,
             data_source,
             position: InventoryPosition::new(),
@@ -498,7 +536,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
     /// Runs the backtest with a progress callback.
     ///
     /// The callback receives (current_tick, total_ticks).
-    pub fn run_with_progress<F: FnMut(usize, usize)>(&mut self, mut callback: F) -> BacktestResult {
+    pub fn run_with_progress<P: FnMut(usize, usize)>(&mut self, mut callback: P) -> BacktestResult {
         let total_ticks = self.data_source.len();
         let mut num_ticks = 0u64;
         let mut start_time = 0u64;
@@ -573,11 +611,12 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
         }
     }
 
-    /// Matches every active order against the tick using a best bid/offer
-    /// cross: a buy fills when the ask is at or below its price, a sell when
-    /// the bid is at or above its price. The whole remaining quantity fills
-    /// at the order price plus slippage.
+    /// Matches every eligible resting order against the tick through the
+    /// fill model. Fill quantities reported by the model are cumulative per
+    /// order; only the increase over the filled quantity is booked, at the
+    /// model's price plus slippage.
     fn match_active_orders(&mut self, tick: &MarketTick, now: u64) {
+        self.fill_model.on_tick(tick);
         for index in 0..self.orders.len() {
             let order = &self.orders[index];
             // Eligibility uses the tick's exchange time, not the clamped
@@ -586,16 +625,30 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
             if !order.is_eligible_at(tick.timestamp) {
                 continue;
             }
-            let crosses = match order.side {
-                Side::Buy => tick.ask_price <= order.price,
-                Side::Sell => tick.bid_price >= order.price,
-            };
-            if !crosses {
+            let side = order.side;
+            let view = SimulatedOrder::new(side, order.price, order.quantity, order.active_after);
+            let time_in_queue = tick.timestamp.saturating_sub(order.active_after);
+            let (quantity, model_price) =
+                match self.fill_model.simulate_fill(&view, tick, time_in_queue) {
+                    FillResult::NoFill => continue,
+                    FillResult::FullFill { fill_price } => (order.remaining(), fill_price),
+                    FillResult::PartialFill {
+                        filled_quantity,
+                        fill_price,
+                    } => (
+                        filled_quantity.min(order.quantity) - order.filled,
+                        fill_price,
+                    ),
+                };
+            if quantity <= Decimal::ZERO {
                 continue;
             }
-            let quantity = order.remaining();
-            let side = order.side;
-            let price = self.apply_slippage(order.price, side);
+            let price = self.apply_slippage(model_price, side);
+            // A model or slippage output that is not a valid price is
+            // ignored: it would book negative proceeds and fees.
+            if price <= Decimal::ZERO {
+                continue;
+            }
             if self.orders[index].apply_fill(quantity).is_err() {
                 continue;
             }
@@ -767,6 +820,18 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
         &self.reports
     }
 
+    /// Returns the fill model.
+    #[must_use]
+    pub fn fill_model(&self) -> &F {
+        &self.fill_model
+    }
+
+    /// Describes the fill model and its parameters, for result reports.
+    #[must_use]
+    pub fn fill_model_description(&self) -> String {
+        self.fill_model.description()
+    }
+
     /// Returns the orders currently resting in the simulated book.
     #[must_use]
     pub fn open_orders(&self) -> &[SimOrder] {
@@ -796,6 +861,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource> BacktestEngine<S, D> {
         self.max_position = Decimal::ZERO;
         self.peak_equity = self.config.initial_capital;
         self.max_drawdown = Decimal::ZERO;
+        self.fill_model.reset();
         self.clock.reset();
         self.orders.clear();
         self.next_order_id = 1;
@@ -830,6 +896,7 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 mod tests {
     use super::*;
     use crate::backtest::VecDataSource;
+    use crate::backtest::{MarketImpactFillModel, ProbabilisticFillModel, QueuePositionFillModel};
     use crate::dec;
 
     struct TestStrategy {
@@ -1528,5 +1595,242 @@ mod tests {
         assert_eq!(result.total_fees, dec!(0.2));
         assert_eq!(fill.cumulative_quantity, dec!(2));
         assert_eq!(fill.remaining, Decimal::ZERO);
+    }
+
+    fn queue_ticks() -> Vec<MarketTick> {
+        // Buy quoted at 100 on tick 1000. The ask sits at 100 with size 1, so
+        // the queue model sees 1 unit ahead of the order.
+        let crossing = |ts| MarketTick::new(ts, dec!(99), dec!(1), dec!(100), dec!(1));
+        vec![
+            MarketTick::new(1000, dec!(99), dec!(1), dec!(101), dec!(1)),
+            crossing(1001),
+            crossing(1003),
+            crossing(1005),
+            crossing(1007),
+        ]
+    }
+
+    fn queue_quotes() -> Vec<Option<(Decimal, Decimal)>> {
+        vec![Some((dec!(100), dec!(200)))]
+    }
+
+    #[test]
+    fn test_changing_fill_model_changes_executions() {
+        let mut immediate = scripted_engine(queue_ticks(), queue_quotes());
+        let immediate_result = immediate.run();
+
+        let mut queued = BacktestEngine::with_fill_model(
+            BacktestConfig::default().with_default_order_size(dec!(2)),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+            QueuePositionFillModel::new(dec!(0.5)),
+        )
+        .unwrap();
+        let queued_result = queued.run();
+
+        // Immediate: whole order at the first crossing tick.
+        assert_eq!(immediate_result.num_trades, 1);
+        assert_eq!(immediate_result.trades[0].timestamp, 1001);
+        assert_eq!(immediate_result.trades[0].quantity, dec!(2));
+
+        // Queue model: cleared volume 0.5 per ms behind 1 unit of queue.
+        // t=1001: cleared 0.5, no fill. t=1003: cleared 1.5, cumulative 0.5.
+        // t=1005: cleared 2.5, cumulative 1.5. t=1007: cleared 3.5, full.
+        let fills: Vec<(u64, Decimal)> = queued_result
+            .trades
+            .iter()
+            .map(|f| (f.timestamp, f.quantity))
+            .collect();
+        assert_eq!(
+            fills,
+            vec![(1003, dec!(0.5)), (1005, dec!(1.0)), (1007, dec!(0.5))]
+        );
+        assert_eq!(queued_result.final_position, dec!(2));
+        let kinds: Vec<ExecutionKind> = queued
+            .execution_reports()
+            .iter()
+            .filter(|r| r.is_fill())
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ExecutionKind::PartialFill,
+                ExecutionKind::PartialFill,
+                ExecutionKind::Fill
+            ]
+        );
+        assert!(
+            queued
+                .fill_model_description()
+                .contains("heuristic estimate")
+        );
+        assert!(immediate.fill_model_description().contains("reference"));
+    }
+
+    #[test]
+    fn test_partial_fills_conserve_cash_and_fees() {
+        let config = BacktestConfig::default()
+            .with_default_order_size(dec!(2))
+            .with_fee_rate(dec!(0.001));
+        let mut queued = BacktestEngine::with_fill_model(
+            config.clone(),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+            QueuePositionFillModel::new(dec!(0.5)),
+        )
+        .unwrap();
+        let partial = queued.run();
+        assert_eq!(partial.num_trades, 3);
+
+        // Same economics as one 2.0 fill at 100 with fee 0.2.
+        assert_eq!(partial.total_fees, dec!(0.2));
+        assert_eq!(partial.final_position, dec!(2));
+        let (_, pnl) = queued.get_state();
+        assert_eq!(pnl.realized, dec!(-200));
+        let fees_in_reports: Decimal = queued
+            .execution_reports()
+            .iter()
+            .filter(|r| r.is_fill())
+            .map(|r| r.fee)
+            .sum();
+        assert_eq!(fees_in_reports, dec!(0.2));
+    }
+
+    /// Model returning a scripted cumulative quantity per tick, used to
+    /// check that a decreasing cumulative fill books nothing.
+    #[derive(Debug)]
+    struct CumulativeStub {
+        script: Vec<Decimal>,
+        tick: usize,
+    }
+
+    impl FillModel for CumulativeStub {
+        fn simulate_fill(
+            &self,
+            order: &SimulatedOrder,
+            _tick: &MarketTick,
+            _time_in_queue_ms: u64,
+        ) -> FillResult {
+            match self.script.get(self.tick.saturating_sub(1)) {
+                Some(q) if *q > Decimal::ZERO && order.side == Side::Buy => {
+                    FillResult::PartialFill {
+                        filled_quantity: *q,
+                        fill_price: order.price,
+                    }
+                }
+                _ => FillResult::NoFill,
+            }
+        }
+        fn reset(&mut self) {
+            self.tick = 0;
+        }
+        fn name(&self) -> &'static str {
+            "CumulativeStub"
+        }
+        fn on_tick(&mut self, _tick: &MarketTick) {
+            self.tick += 1;
+        }
+    }
+
+    #[test]
+    fn test_decreasing_cumulative_partial_fill_is_skipped() {
+        // Tick 1 places the quote; ticks 2..4 report cumulative 1.0, 0.5, 1.5.
+        let stub = CumulativeStub {
+            script: vec![Decimal::ZERO, dec!(1.0), dec!(0.5), dec!(1.5)],
+            tick: 0,
+        };
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default().with_default_order_size(dec!(2)),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+            stub,
+        )
+        .unwrap();
+        let result = engine.run();
+        let fills: Vec<(u64, Decimal)> = result
+            .trades
+            .iter()
+            .map(|f| (f.timestamp, f.quantity))
+            .collect();
+        assert_eq!(fills, vec![(1001, dec!(1.0)), (1005, dec!(0.5))]);
+        assert_eq!(result.final_position, dec!(1.5));
+    }
+
+    #[test]
+    fn test_non_positive_model_price_is_not_booked() {
+        // Square root impact large enough to push a sell below zero.
+        let model = MarketImpactFillModel::new(dec!(1), dec!(1), ImmediateFillModel::new());
+        let ticks = vec![
+            MarketTick::new(1000, dec!(0.05), dec!(1), dec!(0.2), dec!(1)),
+            MarketTick::new(1001, dec!(0.15), dec!(1), dec!(0.2), dec!(1)),
+        ];
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default().with_default_order_size(dec!(1)),
+            ScriptedStrategy::new(vec![Some((dec!(0.01), dec!(0.1)))]),
+            VecDataSource::new(ticks),
+            model,
+        )
+        .unwrap();
+        let result = engine.run();
+        assert_eq!(result.num_trades, 0);
+        assert_eq!(result.total_fees, Decimal::ZERO);
+        assert_eq!(engine.open_orders().len(), 2);
+    }
+
+    #[test]
+    fn test_partial_fills_never_exceed_order_quantity() {
+        // A generous clearing rate must still fill exactly the order size.
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default().with_default_order_size(dec!(2)),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+            QueuePositionFillModel::new(dec!(100)),
+        )
+        .unwrap();
+        let result = engine.run();
+        let total: Decimal = result.trades.iter().map(|f| f.quantity).sum();
+        assert_eq!(total, dec!(2));
+        assert_eq!(result.num_trades, 1);
+    }
+
+    #[test]
+    fn test_invalid_fill_model_is_rejected() {
+        let result = BacktestEngine::with_fill_model(
+            BacktestConfig::default(),
+            ScriptedStrategy::new(vec![]),
+            VecDataSource::new(vec![]),
+            QueuePositionFillModel::new(Decimal::ZERO),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_probabilistic_model_replays_after_reset() {
+        let ticks: Vec<MarketTick> = (0..40)
+            .map(|i| MarketTick::new(1000 + i, dec!(99), dec!(5), dec!(100), dec!(5)))
+            .collect();
+        let quotes = (0..40)
+            .map(|i| {
+                if i % 5 == 0 {
+                    Some((dec!(100), dec!(99.5)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default(),
+            ScriptedStrategy::new(quotes),
+            VecDataSource::new(ticks),
+            ProbabilisticFillModel::default(),
+        )
+        .unwrap();
+        let first = engine.run();
+        let first_reports = engine.execution_reports().to_vec();
+        engine.reset();
+        let second = engine.run();
+        assert_eq!(first.trades, second.trades);
+        assert_eq!(first_reports, engine.execution_reports());
     }
 }
