@@ -1,6 +1,6 @@
 [package]
 name = "market-maker-rs"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A Rust library implementing quantitative market making strategies, starting with the Avellaneda-Stoikov model"
