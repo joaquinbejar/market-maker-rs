@@ -26,6 +26,15 @@ struct Ledger {
 }
 
 impl Ledger {
+    /// Rebuilds a ledger from the fills stored by the order manager.
+    fn from_fills<'a>(fills: impl IntoIterator<Item = &'a Fill>) -> Self {
+        let mut ledger = Self::default();
+        for fill in fills {
+            ledger.apply(fill);
+        }
+        ledger
+    }
+
     fn apply(&mut self, fill: &Fill) {
         let notional = fill.price * fill.quantity;
         match fill.side {
@@ -137,9 +146,13 @@ fn partial_fill_then_cancel_reconciles_exactly() {
     assert_eq!(ledger.cash, dec!(-40.04));
     assert_eq!(ledger.fees, dec!(0.04));
 
-    // Reconciliation: fills recorded by the order manager match the ledger.
+    // Reconciliation: the fills stored by the order manager, after the
+    // cancel, rebuild the same position, cash and fees.
     let recorded: Decimal = order.fills.iter().map(|f| f.quantity).sum();
     assert_eq!(recorded, position.quantity);
+    let stored = Ledger::from_fills(&order.fills);
+    assert_eq!(stored.cash, dec!(-40.04));
+    assert_eq!(stored.fees, dec!(0.04));
 }
 
 #[test]
@@ -215,6 +228,20 @@ fn round_trip_with_two_fills_reconciles_exactly() {
     // Gross: -100 + 102 = 2; fees: 0.075 + 0.025 + 0.102 = 0.202.
     assert_eq!(ledger.fees, dec!(0.202));
     assert_eq!(ledger.cash, dec!(1.798));
+
+    // Reconciliation from the order manager's stored fills: signed quantity
+    // ties to the position and the rebuilt cash and fees match exactly.
+    let bid = manager.get_order_by_client_id("b-1").expect("bid exists");
+    let ask = manager.get_order_by_client_id("a-1").expect("ask exists");
+    let stored_fills: Vec<&Fill> = bid.fills.iter().chain(ask.fills.iter()).collect();
+    let net: Decimal = stored_fills
+        .iter()
+        .map(|f| signed(f.side, f.quantity))
+        .sum();
+    assert_eq!(net, position.quantity);
+    let stored = Ledger::from_fills(stored_fills);
+    assert_eq!(stored.fees, dec!(0.202));
+    assert_eq!(stored.cash, dec!(1.798));
 }
 
 #[test]
