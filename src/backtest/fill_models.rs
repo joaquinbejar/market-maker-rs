@@ -443,8 +443,18 @@ impl FillModel for QueuePositionFillModel {
             return FillResult::NoFill;
         }
 
-        // Get queue depth at our price level
-        let queue_ahead = self.get_queue_depth(order.price);
+        // When the market trades strictly through our price, the level has
+        // been consumed and nothing is ahead; only an at touch level keeps
+        // its estimated queue.
+        let through = match order.side {
+            Side::Buy => tick.ask_price < order.price,
+            Side::Sell => tick.bid_price > order.price,
+        };
+        let queue_ahead = if through {
+            Decimal::ZERO
+        } else {
+            self.get_queue_depth(order.price)
+        };
 
         // Calculate how much volume has cleared
         let cleared = self.volume_cleared(time_in_queue_ms);
@@ -479,7 +489,10 @@ impl FillModel for QueuePositionFillModel {
         "QueuePosition"
     }
 
+    /// Keeps only the current top of book levels, so memory stays bounded
+    /// on long streams and no stale depth survives a price move.
     fn on_tick(&mut self, tick: &MarketTick) {
+        self.queue_depth.clear();
         self.update_queue(tick);
     }
 
