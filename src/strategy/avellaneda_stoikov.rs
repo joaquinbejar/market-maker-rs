@@ -32,10 +32,12 @@
 //!   `σ = v * s`
 //! - `T - t`: milliseconds, converted to years of 365 days
 //! - `γ` and `k`: 1 / price units
-//! - `ln` and powers are evaluated through `f64`. On the validated fixtures
-//!   the relative error is around 1e-15, but precision degrades when `γ / k`
-//!   is tiny: below about 1e-16, `1 + γ / k` rounds to 1 in `f64`, the
-//!   intensity term collapses to zero and quote generation fails. The
+//! - `ln` and powers are evaluated through `f64`, so accuracy depends on the
+//!   inputs. On the validated fixtures the relative error is around 1e-15.
+//!   It degrades as `γ / k` shrinks, because `1 + γ / k` loses digits when it
+//!   is converted to `f64` before `ln`: at zero horizon with `γ = 1e-10` and
+//!   `k = 1` the spread is off by about 8e-8 relative, and below about 1e-16
+//!   the intensity term collapses to zero and quote generation fails. The
 //!   continuous quotes are not rounded to tick here
 
 use crate::Decimal;

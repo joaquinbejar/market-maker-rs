@@ -206,13 +206,19 @@ mod reference {
         let n = m.len();
         let mut a = m.clone();
         let mut v = identity(n);
-        for _sweep in 0..100 {
+        let off_diagonal = |a: &Mat| -> (f64, f64) {
             let off: f64 = (0..n)
                 .flat_map(|i| (0..n).filter(move |&j| j != i).map(move |j| (i, j)))
                 .map(|(i, j)| a[i][j] * a[i][j])
                 .sum();
             let scale: f64 = (0..n).map(|i| a[i][i] * a[i][i]).sum::<f64>().max(1e-300);
+            (off, scale)
+        };
+        let mut converged = false;
+        for _sweep in 0..100 {
+            let (off, scale) = off_diagonal(&a);
             if off <= 1e-30 * scale {
+                converged = true;
                 break;
             }
             for p in 0..n {
@@ -246,6 +252,13 @@ mod reference {
                     }
                 }
             }
+        }
+        if !converged {
+            let (off, scale) = off_diagonal(&a);
+            assert!(
+                off <= 1e-30 * scale,
+                "Jacobi did not converge in 100 sweeps: off diagonal {off:e}, diagonal {scale:e}"
+            );
         }
         ((0..n).map(|i| a[i][i]).collect(), v)
     }

@@ -44,9 +44,11 @@
 //! Fernandez-Tapia (arXiv:1105.3115v5). That model bounds the inventory to
 //! `-Q..=Q` and obtains the quotes from `v(t) = exp(-M (T - t)) * 1`, which
 //! depends on the fill intensity scale `A`; this type has neither `A` nor
-//! `Q`, and its spread is the A-S spread. With `φ = 0` and dynamic gamma off
-//! it returns exactly the A-S quotes, which the paper (footnote 8) obtains as
-//! the first order expansion of its solution near `T`. Units follow the A-S
+//! `Q`, and its spread is the A-S spread floored at `min_spread`. With
+//! `φ = 0`, dynamic gamma off and the `min_spread` floor inactive (the A-S
+//! spread at or above it) it returns exactly the A-S quotes, which the paper
+//! (footnote 8) obtains as the first order expansion of its solution near
+//! `T`; when the floor binds, the spread is `min_spread` instead. Units follow the A-S
 //! module: absolute volatility per √year and times in milliseconds with a
 //! 365 day year. The comparison with a reference solution of the paper is in
 //! `tests/glft_reference.rs`.
