@@ -83,6 +83,7 @@ use super::fill_models::{FillModel, FillResult, ImmediateFillModel, SimulatedOrd
 use super::latency::{JitterRng, SimLatencyConfig};
 use super::lifecycle::{ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::panic::{RefUnwindSafe, UnwindSafe};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -518,7 +519,7 @@ pub struct BacktestEngine<
     last_delivery_at: u64,
     last_observed_at: u64,
     /// Selected accountant; `None` keeps the built in bookkeeping.
-    accountant: Option<Box<dyn FillAccountant + Send + Sync>>,
+    accountant: Option<Box<dyn FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe>>,
     accounting_errors: Vec<(u64, MMError)>,
     next_execution_id: u64,
 }
@@ -1162,7 +1163,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     #[must_use]
     pub fn with_accountant(
         mut self,
-        accountant: impl FillAccountant + Send + Sync + 'static,
+        accountant: impl FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
     ) -> Self {
         self.accountant = Some(Box::new(accountant));
         self
@@ -2937,7 +2938,8 @@ mod auto_traits {
     use super::*;
     use crate::backtest::VecDataSource;
 
-    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send_sync<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+    use std::panic::{RefUnwindSafe, UnwindSafe};
 
     struct Noop;
     impl BacktestStrategy for Noop {
