@@ -401,21 +401,12 @@ impl FillAccountant for MarginGateAccountant {
         let shared = self.account.lock();
         let ledger = shared.gate.ledger();
         let position = ledger.position(&shared.instrument);
-        // Base fees are valued in quote at their execution price. The
-        // snapshot has no error channel, so the sums saturate.
-        let base_fees: Decimal = ledger
-            .journal()
-            .iter()
-            .filter(|e| e.instrument == shared.instrument)
-            .filter_map(|e| {
-                e.fee
-                    .as_ref()
-                    .filter(|f| f.asset == shared.base)
-                    .map(|f| f.amount.saturating_mul(e.price))
-            })
-            .fold(Decimal::ZERO, Decimal::saturating_add);
+        // The account is dedicated to one instrument, so the fees paid in
+        // its base asset are this instrument's base fees (O(1), no journal
+        // scan). They are deducted from the position: the account holds
+        // the traded quantity minus the base it paid as fees.
+        let base_fees = ledger.fees_paid(&shared.base);
         let quote_fees = ledger.fees_paid(&shared.quote);
-        let fees = quote_fees.saturating_add(base_fees);
         let total = ledger
             .balance(&shared.quote)
             .map_or(Decimal::ZERO, |b| b.total);
@@ -428,10 +419,14 @@ impl FillAccountant for MarginGateAccountant {
             })
             .sum();
         AccountingSnapshot {
-            position: position.as_ref().map_or(Decimal::ZERO, |p| p.quantity),
+            position: position
+                .as_ref()
+                .map_or(Decimal::ZERO, |p| p.quantity)
+                .saturating_sub(base_fees),
             average_entry_price: position.as_ref().and_then(|p| p.average_price()),
             cash_flow: total - deposits + quote_fees,
-            fees,
+            fees: quote_fees,
+            base_fees,
             fills_posted: ledger.journal().len() as u64,
         }
     }

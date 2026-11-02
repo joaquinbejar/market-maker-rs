@@ -459,6 +459,8 @@ impl PretradePolicy for LimitsPolicy {
                 execution_id,
                 side,
                 quantity,
+                fee,
+                fee_asset,
                 ..
             } => {
                 // A fill with an unsupported side is unknown exposure: latch
@@ -475,7 +477,14 @@ impl PretradePolicy for LimitsPolicy {
                 if !self.executions.insert(execution_id.clone()) {
                     return Ok(());
                 }
-                self.position += Self::signed(dir, *quantity);
+                // A fee paid in base reduces the base held, like the
+                // engine's position: a buy receives `quantity - fee`, a
+                // sell delivers `quantity + fee`.
+                let base_fee = match fee_asset {
+                    FeeAsset::Base => *fee,
+                    FeeAsset::Quote | FeeAsset::Other(_) => Decimal::ZERO,
+                };
+                self.position += Self::signed(dir, *quantity) - base_fee;
                 if let Some((_, remaining)) = self.live.get_mut(order_id) {
                     *remaining -= *quantity;
                     if *remaining <= Decimal::ZERO {

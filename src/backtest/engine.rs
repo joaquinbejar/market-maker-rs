@@ -121,6 +121,11 @@ pub struct SimulatedFill {
     /// for every fill the engine produces; `None` for fills built by hand.
     #[cfg_attr(feature = "serde", serde(default))]
     pub execution_id: Option<u64>,
+    /// Fee charged in the base asset, in base units; zero unless the fee
+    /// currency is [`FeeCurrency::Base`]. It reduces the base held: see
+    /// [`SimulatedFill::base_delta`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub base_fee: Decimal,
 }
 
 impl SimulatedFill {
@@ -134,6 +139,7 @@ impl SimulatedFill {
             timestamp,
             fee: Decimal::ZERO,
             execution_id: None,
+            base_fee: Decimal::ZERO,
         }
     }
 
@@ -153,7 +159,23 @@ impl SimulatedFill {
             timestamp,
             fee,
             execution_id: None,
+            base_fee: Decimal::ZERO,
         }
+    }
+
+    /// Change of the base asset held: the signed quantity minus the base
+    /// fee (a buy receives `quantity - base_fee`, a sell delivers
+    /// `quantity + base_fee`). Saturates instead of overflowing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if the side is neither buy
+    /// nor sell.
+    pub fn base_delta(&self) -> MMResult<Decimal> {
+        Ok(match Dir::try_from(self.side)? {
+            Dir::Buy => self.quantity.saturating_sub(self.base_fee),
+            Dir::Sell => -self.quantity.saturating_add(self.base_fee),
+        })
     }
 
     /// Sets the engine execution id.
@@ -223,10 +245,14 @@ impl SlippageModel {
 /// computed in its own currency, rounded half to even to that currency's
 /// scale, and posted to the accountant with the matching [`FeeAsset`].
 /// Result metrics ([`BacktestResult::total_fees`], net PnL) stay in the
-/// quote asset: a fee in another currency is valued in quote at the fill.
-/// The position is the traded quantity; a base fee is not deducted from it,
-/// it is a cost valued at the fill price, as a ledger debits it from the
-/// base balance rather than from the instrument position.
+/// quote asset.
+///
+/// - A base fee reduces the base held: the position the engine, the
+///   strategy and the pretrade policy see is the net base holding (a buy of
+///   1 with a 0.001 base fee leaves 0.999). The fees paid in base are
+///   marked at the current mid like the position, so equity is always cash
+///   plus net holdings at the mark.
+/// - A third asset fee is converted once at `quote_per_unit`.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum FeeCurrency {
@@ -711,6 +737,10 @@ pub struct BacktestEngine<
     equity_curve: Vec<(u64, Decimal)>,
     trades: Vec<SimulatedFill>,
     total_fees: Decimal,
+    /// Fees fixed in quote (quote and third asset fees).
+    fixed_fees: Decimal,
+    /// Fees paid in base, in base units; marked at every tick.
+    base_fee_quantity: Decimal,
     max_position: Decimal,
     peak_equity: Decimal,
     max_drawdown: Decimal,
@@ -735,6 +765,8 @@ pub struct BacktestEngine<
     /// FIFO observation channel: (time the strategy sees it, tick).
     observed: VecDeque<(u64, MarketTick)>,
     agent_position: InventoryPosition,
+    /// Last price the position was marked at.
+    last_mark: Option<Decimal>,
     last_delivery_at: u64,
     last_observed_at: u64,
     /// Selected accountant; `None` keeps the built in bookkeeping.
@@ -838,6 +870,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             equity_curve: Vec::new(),
             trades: Vec::new(),
             total_fees: Decimal::ZERO,
+            fixed_fees: Decimal::ZERO,
+            base_fee_quantity: Decimal::ZERO,
             max_position: Decimal::ZERO,
             peak_equity: initial_capital,
             max_drawdown: Decimal::ZERO,
@@ -855,6 +889,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             deliveries: VecDeque::new(),
             observed: VecDeque::new(),
             agent_position: InventoryPosition::new(),
+            last_mark: None,
             last_delivery_at: 0,
             last_observed_at: 0,
             accountant: None,
@@ -916,8 +951,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
             // Update PnL mark-to-market
             let mid_price = tick.mid_price();
-            self.pnl.unrealized = self.position.quantity * mid_price;
-            self.pnl.total = self.pnl.realized + self.pnl.unrealized;
+            self.mark_to(mid_price);
 
             // Track equity
             let equity = self.config.initial_capital + self.pnl.total - self.total_fees;
@@ -1096,8 +1130,11 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let fee = charge.quote_value;
             let stamp = self.clock.stamp();
             let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
-            let fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
+            let mut fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
                 .with_execution_id(self.next_execution_id);
+            if charge.asset == FeeAsset::Base {
+                fill.base_fee = charge.amount;
+            }
             let (order_id, cumulative) = (self.orders[index].id, self.orders[index].filled);
             // The policy books the fill first so a ledger it owns is up to
             // date when the accountant reads it.
@@ -1313,13 +1350,13 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             return;
         };
         self.strategy.on_execution_report(&delivery.report);
-        if let Some((dir, fill)) = delivery.fill {
-            let signed_qty = match dir {
-                Dir::Buy => fill.quantity,
-                Dir::Sell => -fill.quantity,
-            };
-            self.agent_position
-                .update_fill(signed_qty, fill.price, fill.timestamp);
+        if let Some((_, fill)) = delivery.fill {
+            // The fill was produced by the engine, so its side is buy or
+            // sell; an error leaves the known position unchanged.
+            if let Ok(base_delta) = fill.base_delta() {
+                self.agent_position
+                    .update_fill(base_delta, fill.price, fill.timestamp);
+            }
             self.strategy.on_fill(&fill);
         }
     }
@@ -1413,13 +1450,16 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             return;
         }
 
-        // Update position
-        let signed_qty = match dir {
-            Dir::Buy => fill.quantity,
-            Dir::Sell => -fill.quantity,
+        // Update position: the net base held (base fees deducted).
+        let base_delta = match fill.base_delta() {
+            Ok(delta) => delta,
+            Err(error) => {
+                self.record_fault(error);
+                return;
+            }
         };
         self.position
-            .update_fill(signed_qty, fill.price, fill.timestamp);
+            .update_fill(base_delta, fill.price, fill.timestamp);
 
         // Update realized PnL for closing trades
         // Simplified: just track the cash flow
@@ -1429,8 +1469,16 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         };
         self.pnl.add_realized(cash_flow);
 
-        // Track fees
-        self.total_fees += fill.fee;
+        // Track fees: base fees are kept in base units and marked.
+        match charge.asset {
+            FeeAsset::Base => {
+                self.base_fee_quantity = self.base_fee_quantity.saturating_add(charge.amount);
+            }
+            FeeAsset::Quote | FeeAsset::Other(_) => {
+                self.fixed_fees = self.fixed_fees.saturating_add(charge.quote_value);
+            }
+        }
+        self.mark_to(fill.price);
         self.track_fill(fill);
     }
 
@@ -1641,6 +1689,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.equity_curve.clear();
         self.trades.clear();
         self.total_fees = Decimal::ZERO;
+        self.fixed_fees = Decimal::ZERO;
+        self.base_fee_quantity = Decimal::ZERO;
         self.max_position = Decimal::ZERO;
         self.peak_equity = self.config.initial_capital;
         self.max_drawdown = Decimal::ZERO;
@@ -1656,6 +1706,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.deliveries.clear();
         self.observed.clear();
         self.agent_position = InventoryPosition::new();
+        self.last_mark = None;
         self.last_delivery_at = 0;
         self.last_observed_at = 0;
         self.next_order_id = 1;
@@ -1686,9 +1737,28 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.position.avg_entry_price = snapshot.average_entry_price.unwrap_or(Decimal::ZERO);
         self.position.last_update = timestamp;
         self.pnl.realized = snapshot.cash_flow;
-        self.pnl.total = self.pnl.realized + self.pnl.unrealized;
-        self.total_fees = snapshot.fees;
+        self.fixed_fees = snapshot.fees;
+        self.base_fee_quantity = snapshot.base_fees;
+        let mark = self.last_mark.unwrap_or(self.position.avg_entry_price);
+        self.mark_to(mark);
         self.max_position = self.max_position.max(snapshot.position.abs());
+    }
+
+    /// Marks the position and the base fees paid at `mark`.
+    ///
+    /// Equity is cash plus the net base held at the mark. Base fees are
+    /// added back to the gross PnL and counted as fees at the same mark, so
+    /// `net = total - fees` stays exact.
+    fn mark_to(&mut self, mark: Decimal) {
+        self.last_mark = Some(mark);
+        let base_fee_value = self.base_fee_quantity.saturating_mul(mark);
+        self.pnl.unrealized = self
+            .position
+            .quantity
+            .saturating_mul(mark)
+            .saturating_add(base_fee_value);
+        self.pnl.total = self.pnl.realized.saturating_add(self.pnl.unrealized);
+        self.total_fees = self.fixed_fees.saturating_add(base_fee_value);
     }
 }
 
@@ -1987,6 +2057,67 @@ mod tests {
         );
         let reported: Vec<Decimal> = result.trades.iter().map(|f| f.fee).collect();
         assert_eq!(reported, vec![dec!(0.05), dec!(0.1), dec!(0.05)]);
+    }
+
+    /// One crossing tick at 100, then the mid moves to 200.
+    fn base_fee_engine(
+        quotes: Vec<Option<(Decimal, Decimal)>>,
+        ticks: Vec<MarketTick>,
+    ) -> BacktestEngine<ScriptedStrategy, VecDataSource> {
+        BacktestEngine::new(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(1))
+                .with_fee_rate(dec!(0.01))
+                .with_fee_currency(FeeCurrency::Base { scale: 8 }),
+            ScriptedStrategy::new(quotes),
+            VecDataSource::new(ticks),
+        )
+    }
+
+    #[test]
+    fn test_engine_base_fee_price_move_marks_net_holdings() {
+        // Buy 1 at 100 with a 1% fee in base: 0.99 held, cash -100. At a
+        // mid of 200 the equity change is -100 + 0.99 * 200 = 98.
+        let ticks = vec![
+            MarketTick::new(1000, dec!(99), dec!(1), dec!(101), dec!(1)),
+            MarketTick::new(1001, dec!(99), dec!(1), dec!(100), dec!(1)),
+            MarketTick::new(1002, dec!(199), dec!(1), dec!(201), dec!(1)),
+        ];
+        let mut engine = base_fee_engine(vec![Some((dec!(100), dec!(300)))], ticks);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.final_position, dec!(0.99));
+        assert_eq!(result.net_pnl, dec!(98));
+        // The fee (0.01 BTC) is marked at 200 like the holdings.
+        assert_eq!(result.total_fees, dec!(2));
+        assert_eq!(result.total_pnl, dec!(100));
+    }
+
+    #[test]
+    fn test_engine_base_fee_round_trip_leaves_the_fee_short() {
+        // Buy 1 at 100 then sell 1 at 100, 1% base fee each: 0.99 then
+        // -0.02 held; the strategy sees the same net inventory.
+        let ticks = vec![
+            MarketTick::new(1000, dec!(99), dec!(1), dec!(101), dec!(1)),
+            MarketTick::new(1001, dec!(99), dec!(1), dec!(100), dec!(1)),
+            MarketTick::new(1002, dec!(99), dec!(1), dec!(101), dec!(1)),
+            // Crosses the resting ask at 100.
+            MarketTick::new(1003, dec!(100), dec!(1), dec!(102), dec!(1)),
+            MarketTick::new(1004, dec!(99), dec!(1), dec!(101), dec!(1)),
+        ];
+        let quotes = vec![
+            Some((dec!(100), dec!(300))),
+            None,
+            Some((dec!(50), dec!(100))),
+        ];
+        let mut engine = base_fee_engine(quotes, ticks);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 2);
+        assert_eq!(result.final_position, dec!(-0.02));
+        // Cash 0, holdings -0.02 at the last mid of 100.
+        assert_eq!(result.net_pnl, dec!(-2));
+        let seen = engine.strategy().seen.last().map(|(_, q)| *q);
+        assert_eq!(seen, Some(dec!(-0.02)));
     }
 
     #[test]
@@ -3234,10 +3365,15 @@ mod tests {
             assert_eq!(acc.ledger().fees_paid(&usdc), Decimal::ZERO);
             // The sell delivers 1 BTC plus the 0.001 BTC fee.
             assert_eq!(acc.overdrafts().get(&btc), Some(&dec!(1.001)));
+            // The account delivered 1.001 BTC; the fee is reported in base
+            // for the engine to mark.
             let snapshot = acc.snapshot();
-            assert_eq!(snapshot.position, dec!(-1));
+            assert_eq!(snapshot.position, dec!(-1.001));
             assert_eq!(snapshot.cash_flow, dec!(100));
-            assert_eq!(snapshot.fees, dec!(0.1));
+            assert_eq!(snapshot.fees, Decimal::ZERO);
+            assert_eq!(snapshot.base_fees, dec!(0.001));
+            acc.reset();
+            assert_eq!(acc.snapshot().base_fees, Decimal::ZERO);
         }
 
         #[test]
@@ -3276,9 +3412,10 @@ mod tests {
                 }
             };
             let (builtin, ledger) = (run(false), run(true));
-            // 2.0 BTC bought at 100 with a 0.1% fee in BTC: 0.002 BTC,
-            // valued at 0.2 USDC.
-            assert_eq!(builtin.total_fees, dec!(0.2));
+            // 2.0 BTC bought at 100 with a 0.1% fee in BTC: 0.002 BTC held
+            // less, and the fee is marked at the last mid (99.5).
+            assert_eq!(builtin.final_position, dec!(1.998));
+            assert_eq!(builtin.total_fees, dec!(0.199));
             assert_eq!(ledger.total_fees, builtin.total_fees);
             assert_eq!(ledger.final_position, builtin.final_position);
             assert_eq!(ledger.net_pnl, builtin.net_pnl);

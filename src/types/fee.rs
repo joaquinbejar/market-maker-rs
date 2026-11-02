@@ -2,6 +2,7 @@
 
 /// Asset in which a fill's fee is charged.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FeeAsset {
     /// The quote asset of the instrument (the default convention).
