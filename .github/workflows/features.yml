@@ -1,0 +1,70 @@
+name: Feature Matrix
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  no_default_features:
+    name: Test (no default features)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
+
+      - name: Run tests without default features
+        run: cargo test --no-default-features
+
+  feature_check:
+    name: Check (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - serde
+          - prometheus
+          - options
+          - chain
+          - data-feeds
+          - api
+          - persistence
+          - multi-underlying
+          - events
+          - margin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
+
+      - name: Check feature ${{ matrix.feature }} alone
+        run: cargo check --no-default-features --features ${{ matrix.feature }}
