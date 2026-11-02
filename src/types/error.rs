@@ -73,7 +73,8 @@ pub enum MMError {
     ///
     /// This error occurs when an order, fill or query carries an
     /// [`Action`] other than [`Action::Buy`] or [`Action::Sell`], for example
-    /// [`Action::Other`]. It is returned before any state changes.
+    /// [`Action::Other`]. It is returned before any state changes, except
+    /// that a pretrade policy receiving such a fill also latches a fault.
     #[error("unsupported action {action}: only buy and sell are supported")]
     UnsupportedAction {
         /// The action given.

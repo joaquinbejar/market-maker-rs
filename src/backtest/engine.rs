@@ -529,6 +529,9 @@ pub struct BacktestEngine<
     /// Pretrade policy every new order passes before submission.
     policy: Option<Box<dyn PretradePolicy + Send + Sync + UnwindSafe + RefUnwindSafe>>,
     pretrade_log: Vec<PretradeRecord>,
+    /// Errors of the fill model or the pretrade policy; while not empty,
+    /// every new quote is refused.
+    faults: Vec<MMError>,
 }
 
 /// One pretrade decision taken by the engine's policy.
@@ -642,6 +645,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             next_execution_id: 1,
             policy: None,
             pretrade_log: Vec::new(),
+            faults: Vec::new(),
         }
     }
 
@@ -815,23 +819,33 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let side = order.side;
             // The engine only creates buy and sell orders (see
             // `submit_quotes`); this is the single conversion point.
-            let Ok(dir) = Dir::try_from(side) else {
-                continue;
+            let dir = match Dir::try_from(side) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    self.faults.push(error);
+                    continue;
+                }
             };
             let view = SimulatedOrder::new(side, order.price, order.quantity, order.active_after);
             let time_in_queue = tick.timestamp.saturating_sub(order.active_after);
-            let (quantity, model_price) =
-                match self.fill_model.simulate_fill(&view, tick, time_in_queue) {
-                    FillResult::NoFill => continue,
-                    FillResult::FullFill { fill_price } => (order.remaining(), fill_price),
-                    FillResult::PartialFill {
-                        filled_quantity,
-                        fill_price,
-                    } => (
-                        filled_quantity.min(order.quantity) - order.filled,
-                        fill_price,
-                    ),
-                };
+            let outcome = match self.fill_model.simulate_fill(&view, tick, time_in_queue) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.faults.push(error);
+                    continue;
+                }
+            };
+            let (quantity, model_price) = match outcome {
+                FillResult::NoFill => continue,
+                FillResult::FullFill { fill_price } => (order.remaining(), fill_price),
+                FillResult::PartialFill {
+                    filled_quantity,
+                    fill_price,
+                } => (
+                    filled_quantity.min(order.quantity) - order.filled,
+                    fill_price,
+                ),
+            };
             if quantity <= Decimal::ZERO {
                 continue;
             }
@@ -924,8 +938,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let id = self.next_order_id;
             self.next_order_id += 1;
             let stamp = self.clock.stamp();
-            let mut refused = crossed;
-            if !crossed && let Some(policy) = self.policy.as_mut() {
+            // After a fault the policy or the fill model could not account
+            // for something: no new order is admitted.
+            let mut refused = crossed || !self.faults.is_empty();
+            if !refused && let Some(policy) = self.policy.as_mut() {
                 let request = PretradeRequest::new(
                     id.to_string(),
                     side,
@@ -942,10 +958,13 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 let approved = decision.approved_quantity(size);
                 let whole_lots = round_to_step(approved, self.config.lot_size, false) == approved;
                 refused = approved <= Decimal::ZERO || !whole_lots;
-                if approved > Decimal::ZERO && !whole_lots {
-                    policy.on_order_event(&OrderEvent::VenueRejected {
+                if approved > Decimal::ZERO
+                    && !whole_lots
+                    && let Err(error) = policy.on_order_event(&OrderEvent::VenueRejected {
                         order_id: id.to_string(),
-                    });
+                    })
+                {
+                    self.faults.push(error);
                 }
                 if !refused {
                     size = approved;
@@ -1086,8 +1105,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     }
 
     fn notify_policy(&mut self, event: OrderEvent) {
-        if let Some(policy) = self.policy.as_mut() {
-            policy.on_order_event(&event);
+        if let Some(policy) = self.policy.as_mut()
+            && let Err(error) = policy.on_order_event(&event)
+        {
+            self.faults.push(error);
         }
     }
 
@@ -1310,6 +1331,17 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.accountant.as_ref().map(|a| a.description())
     }
 
+    /// Errors returned by the fill model or the pretrade policy, in order.
+    ///
+    /// Each one means a component could not account for an order or an
+    /// event, so from the first one on the engine refuses every new quote
+    /// (reported as `Rejected`), as a policy rejection would, until
+    /// [`BacktestEngine::reset`]. Orders already resting keep working.
+    #[must_use]
+    pub fn faults(&self) -> &[MMError] {
+        &self.faults
+    }
+
     /// Posts the selected accountant refused, as `(execution id, error)`.
     ///
     /// The fill still happened at the venue; the result metrics follow the
@@ -1378,6 +1410,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             policy.reset();
         }
         self.pretrade_log.clear();
+        self.faults.clear();
         self.reports.clear();
         self.sync_accounting(0);
     }
@@ -2411,8 +2444,8 @@ mod tests {
             order: &SimulatedOrder,
             _tick: &MarketTick,
             _time_in_queue_ms: u64,
-        ) -> FillResult {
-            match self.script.get(self.tick.saturating_sub(1)) {
+        ) -> MMResult<FillResult> {
+            Ok(match self.script.get(self.tick.saturating_sub(1)) {
                 Some(q) if *q > Decimal::ZERO && order.side == Action::Buy => {
                     FillResult::PartialFill {
                         filled_quantity: *q,
@@ -2420,7 +2453,7 @@ mod tests {
                     }
                 }
                 _ => FillResult::NoFill,
-            }
+            })
         }
         fn reset(&mut self) {
             self.tick = 0;
@@ -2817,12 +2850,129 @@ mod tests {
             self.seen.lock().unwrap().push(request.clone());
             self.decision.clone()
         }
-        fn on_order_event(&mut self, event: &OrderEvent) {
+        fn on_order_event(&mut self, event: &OrderEvent) -> MMResult<()> {
             self.events.lock().unwrap().push(event.clone());
+            Ok(())
         }
         fn reset(&mut self) {
             self.seen.lock().unwrap().clear();
         }
+    }
+
+    /// Fill model that fails on every order.
+    #[derive(Debug)]
+    struct FailingFillModel;
+
+    impl FillModel for FailingFillModel {
+        fn simulate_fill(
+            &self,
+            _order: &SimulatedOrder,
+            _tick: &MarketTick,
+            _time_in_queue_ms: u64,
+        ) -> MMResult<FillResult> {
+            Err(MMError::NumericalError("model failure".to_string()))
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &'static str {
+            "Failing"
+        }
+    }
+
+    #[test]
+    fn test_fault_stops_admission_until_reset() {
+        let policy = FixedPolicy::new(PretradeDecision::Accepted);
+        let seen = policy.seen.clone();
+        let quotes = vec![Some((dec!(100), dec!(200))); 5];
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default().with_default_order_size(dec!(2)),
+            ScriptedStrategy::new(quotes.clone()),
+            VecDataSource::new(queue_ticks()),
+            FailingFillModel,
+        )
+        .unwrap()
+        .with_pretrade_policy(policy);
+        let result = engine.run();
+
+        assert_eq!(result.num_trades, 0);
+        assert!(!engine.faults().is_empty());
+        assert!(
+            engine
+                .faults()
+                .iter()
+                .all(|f| *f == MMError::NumericalError("model failure".to_string()))
+        );
+        // Only the quotes decided before the first fault reached the
+        // policy; every later one was refused without asking it.
+        let asked = seen.lock().unwrap().len();
+        let refused = engine
+            .execution_reports()
+            .iter()
+            .filter(|r| r.kind == ExecutionKind::Rejected)
+            .count();
+        assert!(asked > 0, "the first quotes reach the policy");
+        assert!(refused > 0, "later quotes are refused");
+        assert_eq!(asked + refused, 2 * quotes.len());
+
+        engine.reset();
+        assert!(engine.faults().is_empty());
+    }
+
+    /// Accepts every order, recording the decision times, and fails on
+    /// every fill.
+    #[derive(Debug, Default)]
+    struct FailingOnFillPolicy {
+        checked_at: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl PretradePolicy for FailingOnFillPolicy {
+        fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
+            self.checked_at.lock().unwrap().push(request.timestamp);
+            PretradeDecision::Accepted
+        }
+        fn on_order_event(&mut self, event: &OrderEvent) -> MMResult<()> {
+            match event {
+                OrderEvent::Fill { .. } => Err(MMError::UnsupportedAction {
+                    action: Action::Other,
+                }),
+                _ => Ok(()),
+            }
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn test_policy_error_on_a_fill_stops_admission() {
+        let quotes = vec![Some((dec!(100), dec!(200))); 5];
+        let policy = FailingOnFillPolicy::default();
+        let checked_at = policy.checked_at.clone();
+        let mut engine =
+            scripted_engine(queue_ticks(), quotes.clone()).with_pretrade_policy(policy);
+        let result = engine.run();
+
+        // The fill happened at the venue and is kept.
+        assert!(result.num_trades >= 1);
+        assert_eq!(
+            engine.faults().first(),
+            Some(&MMError::UnsupportedAction {
+                action: Action::Other
+            })
+        );
+        // The policy is never asked again after the first fill, and the
+        // quotes decided after it are refused.
+        let reports = engine.execution_reports();
+        let first_fill_at = reports
+            .iter()
+            .find(|r| matches!(r.kind, ExecutionKind::Fill | ExecutionKind::PartialFill))
+            .map(|r| r.stamp.timestamp)
+            .unwrap();
+        let checked_at = checked_at.lock().unwrap();
+        assert!(!checked_at.is_empty());
+        assert!(checked_at.iter().all(|t| *t <= first_fill_at));
+        assert!(
+            reports
+                .iter()
+                .any(|r| r.kind == ExecutionKind::Rejected && r.stamp.timestamp > first_fill_at)
+        );
     }
 
     #[test]
@@ -3052,45 +3202,54 @@ mod tests {
         }
 
         #[test]
-        fn test_margin_policy_unsupported_action_is_rejected_and_fill_recorded() {
+        fn test_margin_policy_unsupported_action_is_rejected_and_fill_latches_a_fault() {
             let account = account(None);
             let mut policy = account.policy();
-            let request = |side| {
-                PretradeRequest::new(
-                    "o-1",
-                    side,
-                    Some(dec!(100)),
-                    dec!(1),
-                    OrderPurpose::Quote,
-                    0,
-                )
+            let request = |id: &str, side| {
+                PretradeRequest::new(id, side, Some(dec!(100)), dec!(1), OrderPurpose::Quote, 0)
             };
             assert_eq!(
-                policy.check(&request(Action::Other)),
+                policy.check(&request("o-0", Action::Other)),
                 PretradeDecision::Rejected {
                     reason: "unsupported action Other: only buy and sell are supported".to_string(),
                 }
             );
-            assert!(account.errors().is_empty());
+            assert_eq!(account.fault(), None);
 
-            // A fill with an unsupported side on an order the gate knows is
-            // recorded as an error and not booked.
-            assert!(!policy.check(&request(Action::Buy)).is_rejected());
-            policy.on_order_event(&OrderEvent::Fill {
-                order_id: "o-1".to_string(),
-                execution_id: "e-1".to_string(),
-                side: Action::Other,
-                price: dec!(100),
-                quantity: dec!(1),
-                cumulative_quantity: dec!(1),
-                fee: Decimal::ZERO,
-                timestamp: 1,
-            });
+            // A fill with an unsupported side is unknown exposure: it fails,
+            // books nothing and latches a fault that rejects every order.
+            assert!(!policy.check(&request("o-1", Action::Buy)).is_rejected());
+            let unsupported = MMError::UnsupportedAction {
+                action: Action::Other,
+            };
             assert_eq!(
-                account.errors(),
-                vec!["fill: unsupported action Other: only buy and sell are supported".to_string()]
+                policy.on_order_event(&OrderEvent::Fill {
+                    order_id: "o-1".to_string(),
+                    execution_id: "e-1".to_string(),
+                    side: Action::Other,
+                    price: dec!(100),
+                    quantity: dec!(1),
+                    cumulative_quantity: dec!(1),
+                    fee: Decimal::ZERO,
+                    timestamp: 1,
+                }),
+                Err(unsupported.clone())
             );
+            assert_eq!(account.fault(), Some(unsupported));
+            assert!(account.errors().is_empty());
             assert!(account.with_gate(|gate| gate.ledger().journal().is_empty()));
+            assert_eq!(
+                policy.check(&request("o-2", Action::Buy)),
+                PretradeDecision::Rejected {
+                    reason:
+                        "policy fault: unsupported action Other: only buy and sell are supported"
+                            .to_string(),
+                }
+            );
+
+            policy.reset();
+            assert_eq!(account.fault(), None);
+            assert!(!policy.check(&request("o-3", Action::Buy)).is_rejected());
         }
 
         #[test]

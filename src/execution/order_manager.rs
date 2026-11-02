@@ -186,7 +186,14 @@ impl ManagedOrder {
     }
 
     /// Records a fill and updates quantities and average price.
-    pub fn record_fill(&mut self, fill: &Fill, timestamp: u64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if the fill's side or the
+    /// order's side is neither buy nor sell; the order is unchanged.
+    pub fn record_fill(&mut self, fill: &Fill, timestamp: u64) -> MMResult<()> {
+        Dir::try_from(self.side)?;
+        Dir::try_from(fill.side)?;
         let new_filled = self.filled_quantity + fill.quantity;
 
         // Calculate new VWAP
@@ -213,6 +220,7 @@ impl ManagedOrder {
                 remaining_qty: self.remaining_quantity,
             };
         }
+        Ok(())
     }
 
     /// Updates the order status.
@@ -383,7 +391,9 @@ impl OrderManager {
     ///
     /// Returns [`MMError::UnsupportedAction`] if `request.side` is neither
     /// buy nor sell, before the policy is asked, and the
-    /// [`OrderManager::register_order`] errors for an approved order.
+    /// [`OrderManager::register_order`] errors for an approved order. If
+    /// registration fails and the policy then fails to release the
+    /// reservation, the policy's error is returned instead.
     pub fn register_order_checked(
         &mut self,
         request: &OrderRequest,
@@ -414,10 +424,11 @@ impl OrderManager {
             self.register_order(&approved_request, client_order_id.clone(), timestamp)
         {
             // The policy reserved the approved quantity; nothing reached the
-            // venue, so release it.
+            // venue, so release it. A policy that cannot take the release
+            // is the more serious failure and is reported instead.
             policy.on_order_event(&OrderEvent::VenueRejected {
                 order_id: client_order_id,
-            });
+            })?;
             return Err(error);
         }
         Ok(decision)
@@ -538,8 +549,8 @@ impl OrderManager {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The fill's side is neither buy nor sell
-    ///   ([`MMError::UnsupportedAction`]), before any state changes
+    /// - The fill's side, or the matched order's side, is neither buy nor
+    ///   sell ([`MMError::UnsupportedAction`]), before any state changes
     /// - No order matches the fill's order ID
     pub fn record_fill(&mut self, fill: &Fill, timestamp: u64) -> MMResult<()> {
         Dir::try_from(fill.side)?;
@@ -557,7 +568,7 @@ impl OrderManager {
                 MMError::InvalidMarketState(format!("order not found: {}", client_id))
             })?;
 
-            order.record_fill(fill, timestamp);
+            order.record_fill(fill, timestamp)?;
             (order.symbol.clone(), order.is_terminal())
         };
 
@@ -938,7 +949,7 @@ mod tests {
 
         // Partial fill
         let fill1 = create_test_fill(&order.order_id, dec!(50000.0), dec!(0.3));
-        order.record_fill(&fill1, 1001);
+        order.record_fill(&fill1, 1001).unwrap();
 
         assert_eq!(order.filled_quantity, dec!(0.3));
         assert_eq!(order.remaining_quantity, dec!(0.7));
@@ -947,7 +958,7 @@ mod tests {
 
         // Another partial fill at different price
         let fill2 = create_test_fill(&order.order_id, dec!(49900.0), dec!(0.2));
-        order.record_fill(&fill2, 1002);
+        order.record_fill(&fill2, 1002).unwrap();
 
         assert_eq!(order.filled_quantity, dec!(0.5));
         assert_eq!(order.remaining_quantity, dec!(0.5));
@@ -956,7 +967,7 @@ mod tests {
 
         // Complete fill
         let fill3 = create_test_fill(&order.order_id, dec!(50100.0), dec!(0.5));
-        order.record_fill(&fill3, 1003);
+        order.record_fill(&fill3, 1003).unwrap();
 
         assert_eq!(order.filled_quantity, dec!(1.0));
         assert_eq!(order.remaining_quantity, Decimal::ZERO);
@@ -1365,5 +1376,40 @@ mod tests {
             shared.get_open_quantity("BTC-USD", Action::Buy).unwrap(),
             Decimal::ZERO
         );
+    }
+
+    #[test]
+    fn test_managed_order_record_fill_unsupported_action_leaves_order_unchanged() {
+        let order = ManagedOrder::new(
+            OrderId::new("12345"),
+            "client-1".to_string(),
+            "BTC-USD".to_string(),
+            Action::Buy,
+            OrderType::Limit,
+            dec!(50000.0),
+            dec!(1.0),
+            1000,
+        );
+
+        // An unsupported fill side.
+        let mut direct = order.clone();
+        let mut fill = create_test_fill(&order.order_id, dec!(50000.0), dec!(0.3));
+        fill.side = Action::Other;
+        assert_eq!(direct.record_fill(&fill, 1001), Err(unsupported()));
+
+        // An order whose side the caller changed to an unsupported one.
+        let mut altered = order.clone();
+        altered.side = Action::Other;
+        let fill = create_test_fill(&order.order_id, dec!(50000.0), dec!(0.3));
+        assert_eq!(altered.record_fill(&fill, 1001), Err(unsupported()));
+
+        for unchanged in [&direct, &altered] {
+            assert_eq!(unchanged.filled_quantity, Decimal::ZERO);
+            assert_eq!(unchanged.remaining_quantity, dec!(1.0));
+            assert_eq!(unchanged.average_fill_price, Decimal::ZERO);
+            assert_eq!(unchanged.status, OrderStatus::Pending);
+            assert_eq!(unchanged.updated_at, 1000);
+            assert!(unchanged.fills.is_empty());
+        }
     }
 }

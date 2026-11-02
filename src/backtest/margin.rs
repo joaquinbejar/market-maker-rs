@@ -37,6 +37,7 @@ struct Shared {
     instrument: InstrumentId,
     quote: Asset,
     errors: Vec<String>,
+    fault: Option<MMError>,
 }
 
 /// One `margin-rs` account (risk gate and ledger) shared by a pretrade
@@ -87,6 +88,7 @@ impl MarginAccount {
                 instrument,
                 quote,
                 errors: Vec::new(),
+                fault: None,
             })),
         })
     }
@@ -118,6 +120,13 @@ impl MarginAccount {
         self.lock().errors.clone()
     }
 
+    /// The fault latched by a fill with an unsupported side, if any. While
+    /// it is set, the policy rejects every order; reset clears it.
+    #[must_use]
+    pub fn fault(&self) -> Option<MMError> {
+        self.lock().fault.clone()
+    }
+
     /// Locks the shared account; a poisoned lock is recovered, since every
     /// gate operation leaves the gate consistent on error.
     fn lock(&self) -> MutexGuard<'_, Shared> {
@@ -130,6 +139,7 @@ impl MarginAccount {
         let mut shared = self.lock();
         shared.gate = shared.initial.clone();
         shared.errors.clear();
+        shared.fault = None;
     }
 }
 
@@ -145,6 +155,9 @@ fn ledger_side(dir: Dir) -> LedgerSide {
 }
 
 /// [`PretradePolicy`] over a shared [`MarginAccount`].
+///
+/// A fill whose side is neither buy nor sell latches a fault on the account
+/// ([`MarginAccount::fault`]): every order is then rejected until reset.
 #[derive(Debug, Clone)]
 pub struct MarginRiskPolicy {
     account: MarginAccount,
@@ -169,6 +182,11 @@ impl PretradePolicy for MarginRiskPolicy {
             }
         };
         let mut shared = self.account.lock();
+        if let Some(fault) = &shared.fault {
+            return PretradeDecision::Rejected {
+                reason: format!("policy fault: {fault}"),
+            };
+        }
         if let Some(asked) = &request.instrument
             && asked != shared.instrument.as_str()
         {
@@ -233,8 +251,17 @@ impl PretradePolicy for MarginRiskPolicy {
         Self::record(&mut shared, "market data", result);
     }
 
-    fn on_order_event(&mut self, event: &OrderEvent) {
+    fn on_order_event(&mut self, event: &OrderEvent) -> MMResult<()> {
         let mut shared = self.account.lock();
+        // A fill with an unsupported side is unknown exposure, whether or
+        // not the gate saw the order: latch the fault and fail, booking
+        // nothing.
+        if let OrderEvent::Fill { side, .. } = event
+            && let Err(error) = Dir::try_from(*side)
+        {
+            shared.fault = Some(error.clone());
+            return Err(error);
+        }
         let raw = match event {
             OrderEvent::Accepted { order_id }
             | OrderEvent::VenueRejected { order_id }
@@ -244,11 +271,11 @@ impl PretradePolicy for MarginRiskPolicy {
             | OrderEvent::Fill { order_id, .. } => order_id,
         };
         let Ok(id) = order_id(raw) else {
-            return;
+            return Ok(());
         };
         // Orders the gate never saw (rejected locally) are ignored.
         if shared.gate.order(&id).is_none() {
-            return;
+            return Ok(());
         }
         match event {
             OrderEvent::Accepted { .. } => {
@@ -277,18 +304,13 @@ impl PretradePolicy for MarginRiskPolicy {
                 fee,
                 ..
             } => {
-                let dir = match Dir::try_from(*side) {
-                    Ok(dir) => dir,
-                    Err(error) => {
-                        shared.errors.push(format!("fill: {error}"));
-                        return;
-                    }
-                };
+                // Checked at the top of the method.
+                let dir = Dir::try_from(*side)?;
                 let execution_id = match ExecutionId::new(execution_id) {
                     Ok(id) => id,
                     Err(error) => {
                         shared.errors.push(format!("execution id: {error}"));
-                        return;
+                        return Ok(());
                     }
                 };
                 let mut execution = Execution::new(
@@ -313,6 +335,7 @@ impl PretradePolicy for MarginRiskPolicy {
                 }
             }
         }
+        Ok(())
     }
 
     fn reset(&mut self) {

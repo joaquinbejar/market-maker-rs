@@ -6,10 +6,14 @@
 //! OptionStratLib use, so no conversion glue is needed between them.
 //!
 //! `Action` is `#[non_exhaustive]` and has an `Other` variant. Only `Buy`
-//! and `Sell` are supported: every public entry point converts its action
-//! into the private `Dir` once, and any other action is rejected with
+//! and `Sell` are supported: every method that takes or processes an order,
+//! a fill or a side converts the action into the private `Dir` once, and
+//! returns
 //! [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction)
-//! before any state changes.
+//! for any other before changing anything. The exceptions are documented
+//! where they apply: [`PretradePolicy::check`](crate::risk::pretrade::PretradePolicy::check)
+//! returns a rejection instead of an error, and a policy that receives a
+//! fill with an unsupported side latches a fault on purpose.
 
 use crate::types::error::{MMError, MMResult};
 
