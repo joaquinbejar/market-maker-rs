@@ -423,7 +423,7 @@ fn as_expansion(p: &Params, tau_s: f64, q: i64) -> (f64, f64) {
 }
 
 #[test]
-fn generator_matches_proposition_two() {
+fn test_glft_generator_paper_parameters_match_proposition_two() {
     let p = PAPER;
     let q_max = 8;
     let m = reference::generator(&p, q_max);
@@ -452,7 +452,7 @@ fn generator_matches_proposition_two() {
 }
 
 #[test]
-fn two_matrix_exponentials_agree() {
+fn test_glft_expm_jacobi_and_taylor_agree_within_tolerance() {
     let p = PAPER;
     for q_max in [8, 16, 32] {
         for tau in [0.0, 1.0, 10.0, 60.0, 600.0, 3600.0] {
@@ -484,7 +484,7 @@ fn two_matrix_exponentials_agree() {
 }
 
 #[test]
-fn semigroup_property_holds() {
+fn test_glft_expm_split_horizon_satisfies_semigroup() {
     let p = PAPER;
     let q_max = 16;
     let m = reference::generator(&p, q_max);
@@ -504,7 +504,7 @@ fn semigroup_property_holds() {
 }
 
 #[test]
-fn v_is_positive_and_respects_the_paper_lower_bound() {
+fn test_glft_value_vector_positive_above_paper_lower_bound() {
     // Appendix, proof of Proposition 2: v_q(t) >= exp(-(alpha Q^2 - eta)(T - t)).
     // With the shift c the computed vector is exp(c tau) v.
     let p = PAPER;
@@ -528,7 +528,7 @@ fn v_is_positive_and_respects_the_paper_lower_bound() {
 }
 
 #[test]
-fn normalization_avoids_overflow_at_long_horizons() {
+fn test_glft_expm_long_horizon_normalized_without_overflow() {
     let p = PAPER;
     let q_max = 32;
     let tau = 36_000.0;
@@ -547,7 +547,7 @@ fn normalization_avoids_overflow_at_long_horizons() {
 }
 
 #[test]
-fn terminal_condition_matches_the_current_type() {
+fn test_glft_quotes_at_terminal_time_match_current_type() {
     // At t = T, v = 1 and both quotes are (1/gamma) ln(1 + gamma/k) at every
     // inventory; with phi = 0 the current type gives the same distances.
     let p = PAPER;
@@ -563,7 +563,7 @@ fn terminal_condition_matches_the_current_type() {
 }
 
 #[test]
-fn near_terminal_the_reference_reduces_to_avellaneda_stoikov() {
+fn test_glft_quotes_near_terminal_reduce_to_avellaneda_stoikov() {
     // Footnote 8: the A-S quotes are the first order expansion of Theorem 1
     // for t close to T, away from the inventory bounds. The error must be
     // second order: dividing tau by 10 divides it by about 100.
@@ -593,7 +593,7 @@ fn near_terminal_the_reference_reduces_to_avellaneda_stoikov() {
 }
 
 #[test]
-fn long_horizon_quotes_converge_to_the_spectral_limit() {
+fn test_glft_quotes_long_horizon_converge_to_spectral_limit() {
     let p = PAPER;
     let q_max = 32;
     let f0 = reference::ground_state(&p, q_max);
@@ -608,7 +608,7 @@ fn long_horizon_quotes_converge_to_the_spectral_limit() {
 }
 
 #[test]
-fn quotes_converge_as_the_inventory_domain_is_truncated_less() {
+fn test_glft_quotes_larger_inventory_bound_converge() {
     let p = PAPER;
     let qs = [8, 16, 32, 64];
     let quotes: Vec<Vec<(f64, f64)>> = qs
@@ -636,7 +636,7 @@ fn quotes_converge_as_the_inventory_domain_is_truncated_less() {
 }
 
 #[test]
-fn inventory_bounds_remove_one_side() {
+fn test_glft_quotes_at_inventory_bound_omit_one_side() {
     let p = PAPER;
     let q_max = 8;
     let (bid_at_top, ask_at_top) = reference::quotes(Method::Taylor, &p, q_max, PAPER_T, q_max);
@@ -650,7 +650,7 @@ fn inventory_bounds_remove_one_side() {
 }
 
 #[test]
-fn current_type_deviates_from_the_reference_at_the_paper_horizon() {
+fn test_glft_current_type_paper_horizon_deviates_from_reference() {
     // Evidence, not a target: with the paper parameters at T - t = 600 s the
     // A-S skew per unit of inventory is gamma sigma^2 tau = 0.54 ticks, while
     // the reference skews by about 0.068 ticks. Update this test if the type
@@ -734,7 +734,7 @@ const AS_CONTROL: &[ControlRow] = &[
 ];
 
 #[test]
-fn with_zero_penalty_the_current_type_reproduces_the_as_control() {
+fn test_glft_current_type_zero_penalty_reproduces_as_control() {
     let d = |s: &str| Decimal::from_str(s).expect("fixture literal");
     let tol = dec!(0.000000000001);
     for (s, q, g, sig, tau, k, bid, ask) in AS_CONTROL {
@@ -761,7 +761,7 @@ fn fmt_opt(x: Option<f64>) -> String {
 /// `cargo test --test glft_reference -- --ignored --nocapture`.
 #[test]
 #[ignore = "evidence table, run on demand"]
-fn evidence_table() {
+fn test_glft_reference_paper_parameters_print_evidence_table() {
     let p = PAPER;
     let q_max = 32;
     println!(
