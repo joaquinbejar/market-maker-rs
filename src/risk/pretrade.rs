@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(policy.check(&buy("d", dec!(1))), PretradeDecision::Accepted);
     }
 
-    /// MM-REVIEWER's probe: a real fill of unknown direction must not leave
+    /// Regression: a real fill of unknown direction must not leave
     /// the policy approving orders against an understated position.
     #[test]
     fn test_unknown_direction_fill_does_not_fail_open() {
