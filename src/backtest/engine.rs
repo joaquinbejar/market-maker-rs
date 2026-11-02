@@ -518,7 +518,7 @@ pub struct BacktestEngine<
     last_delivery_at: u64,
     last_observed_at: u64,
     /// Selected accountant; `None` keeps the built in bookkeeping.
-    accountant: Option<Box<dyn FillAccountant>>,
+    accountant: Option<Box<dyn FillAccountant + Send + Sync>>,
     accounting_errors: Vec<(u64, MMError)>,
     next_execution_id: u64,
 }
@@ -1160,7 +1160,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     /// and equity of the run are read from its snapshot instead of the built
     /// in bookkeeping. See [`crate::backtest::accounting`].
     #[must_use]
-    pub fn with_accountant(mut self, accountant: impl FillAccountant + 'static) -> Self {
+    pub fn with_accountant(
+        mut self,
+        accountant: impl FillAccountant + Send + Sync + 'static,
+    ) -> Self {
         self.accountant = Some(Box::new(accountant));
         self
     }
@@ -2326,7 +2329,7 @@ mod tests {
     /// records every posted fill in a shared log.
     #[derive(Debug, Default)]
     struct RecordingAccountant {
-        log: std::rc::Rc<std::cell::RefCell<Vec<AccountingFill>>>,
+        log: std::sync::Arc<std::sync::Mutex<Vec<AccountingFill>>>,
         snapshot: AccountingSnapshot,
         refuse_from: Option<u64>,
     }
@@ -2336,7 +2339,7 @@ mod tests {
             if self.refuse_from.is_some_and(|id| fill.execution_id >= id) {
                 return Err(MMError::InvalidPositionUpdate("refused".to_string()));
             }
-            self.log.borrow_mut().push(fill.clone());
+            self.log.lock().unwrap().push(fill.clone());
             self.snapshot.position += fill.signed_quantity();
             self.snapshot.cash_flow += fill.cash_flow();
             self.snapshot.fees += fill.fee;
@@ -2347,7 +2350,7 @@ mod tests {
             self.snapshot.clone()
         }
         fn reset(&mut self) {
-            self.log.borrow_mut().clear();
+            self.log.lock().unwrap().clear();
             self.snapshot = AccountingSnapshot::default();
         }
         fn description(&self) -> String {
@@ -2375,7 +2378,7 @@ mod tests {
         let mut engine = queued_engine_with_fees().with_accountant(accountant);
         let result = engine.run();
 
-        let log = log.borrow();
+        let log = log.lock().unwrap();
         let posted: Vec<(u64, SimOrderId, Decimal, Decimal, Decimal, FeeAsset)> = log
             .iter()
             .map(|f| {
@@ -2446,15 +2449,15 @@ mod tests {
         let log = accountant.log.clone();
         let mut engine = queued_engine_with_fees().with_accountant(accountant);
         let first = engine.run();
-        let first_log = log.borrow().clone();
+        let first_log = log.lock().unwrap().clone();
         engine.reset();
-        assert!(log.borrow().is_empty());
+        assert!(log.lock().unwrap().is_empty());
         assert_eq!(
             engine.accounting_snapshot(),
             Some(AccountingSnapshot::default())
         );
         let second = engine.run();
-        assert_eq!(*log.borrow(), first_log);
+        assert_eq!(*log.lock().unwrap(), first_log);
         assert_eq!(second.net_pnl, first.net_pnl);
     }
 
@@ -2926,5 +2929,27 @@ mod tests {
         let engine = scripted_engine(vec![], vec![]);
         let huge = SimLatencyConfig::new().with_submit_ms(crate::backtest::MAX_SIM_LATENCY_MS + 1);
         assert!(engine.with_latency(huge).is_err());
+    }
+}
+
+#[cfg(test)]
+mod auto_traits {
+    use super::*;
+    use crate::backtest::VecDataSource;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    struct Noop;
+    impl BacktestStrategy for Noop {
+        fn on_tick(&mut self, _tick: &MarketTick, _position: &InventoryPosition) -> Option<Quote> {
+            None
+        }
+        fn on_fill(&mut self, _fill: &SimulatedFill) {}
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn test_engine_stays_send_and_sync() {
+        assert_send_sync::<BacktestEngine<Noop, VecDataSource>>();
     }
 }
