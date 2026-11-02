@@ -6,6 +6,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `BacktestEngine::faults` keeps only the first `MAX_RECORDED_FAULTS` (16)
+  errors; `BacktestEngine::fault_count` reports the total. Admission still
+  stops at the first fault (#133).
+
 ### Breaking
 
 - `BacktestResult` has a new public field `accounting: AccountingStatus`

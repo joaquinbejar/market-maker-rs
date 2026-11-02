@@ -333,6 +333,10 @@ impl BacktestConfig {
     }
 }
 
+/// Maximum number of faults kept by [`BacktestEngine::faults`]; later
+/// faults are only counted (see [`BacktestEngine::fault_count`]).
+pub const MAX_RECORDED_FAULTS: usize = 16;
+
 /// Backtest result containing performance metrics.
 ///
 /// # Example
@@ -588,8 +592,10 @@ pub struct BacktestEngine<
     policy: Option<Box<dyn PretradePolicy + Send + Sync + UnwindSafe + RefUnwindSafe>>,
     pretrade_log: Vec<PretradeRecord>,
     /// Errors of the fill model or the pretrade policy; while not empty,
-    /// every new quote is refused.
+    /// every new quote is refused. Holds at most [`MAX_RECORDED_FAULTS`].
     faults: Vec<MMError>,
+    /// Total faults, recorded or not (saturating).
+    fault_count: u64,
 }
 
 /// One pretrade decision taken by the engine's policy.
@@ -704,6 +710,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             policy: None,
             pretrade_log: Vec::new(),
             faults: Vec::new(),
+            fault_count: 0,
         }
     }
 
@@ -884,7 +891,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let dir = match Dir::try_from(side) {
                 Ok(dir) => dir,
                 Err(error) => {
-                    self.faults.push(error);
+                    self.record_fault(error);
                     continue;
                 }
             };
@@ -893,7 +900,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let outcome = match self.fill_model.simulate_fill(&view, tick, time_in_queue) {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    self.faults.push(error);
+                    self.record_fault(error);
                     continue;
                 }
             };
@@ -1027,7 +1034,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                         order_id: id.to_string(),
                     })
                 {
-                    self.faults.push(error);
+                    self.record_fault(error);
                 }
                 if !refused {
                     size = approved;
@@ -1167,11 +1174,19 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.queue_delivery(report, None);
     }
 
+    /// Counts a fault and keeps it if the bounded list has room.
+    fn record_fault(&mut self, error: MMError) {
+        self.fault_count = self.fault_count.saturating_add(1);
+        if self.faults.len() < MAX_RECORDED_FAULTS {
+            self.faults.push(error);
+        }
+    }
+
     fn notify_policy(&mut self, event: OrderEvent) {
         if let Some(policy) = self.policy.as_mut()
             && let Err(error) = policy.on_order_event(&event)
         {
-            self.faults.push(error);
+            self.record_fault(error);
         }
     }
 
@@ -1394,15 +1409,27 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.accountant.as_ref().map(|a| a.description())
     }
 
-    /// Errors returned by the fill model or the pretrade policy, in order.
+    /// The first errors returned by the fill model or the pretrade policy,
+    /// in order.
     ///
     /// Each one means a component could not account for an order or an
     /// event, so from the first one on the engine refuses every new quote
     /// (reported as `Rejected`), as a policy rejection would, until
     /// [`BacktestEngine::reset`]. Orders already resting keep working.
+    ///
+    /// The list is bounded: only the first [`MAX_RECORDED_FAULTS`] errors
+    /// are kept, so a component that fails on every call cannot grow it
+    /// without limit. [`BacktestEngine::fault_count`] counts all of them.
     #[must_use]
     pub fn faults(&self) -> &[MMError] {
         &self.faults
+    }
+
+    /// Total number of faults since the last reset, including the ones not
+    /// kept in [`BacktestEngine::faults`]. Saturates at `u64::MAX`.
+    #[must_use]
+    pub fn fault_count(&self) -> u64 {
+        self.fault_count
     }
 
     /// Posts the selected accountant refused, as `(execution id, error)`.
@@ -1474,6 +1501,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         }
         self.pretrade_log.clear();
         self.faults.clear();
+        self.fault_count = 0;
         self.reports.clear();
         self.sync_accounting(0);
     }
@@ -3064,6 +3092,57 @@ mod tests {
 
         engine.reset();
         assert!(engine.faults().is_empty());
+        assert_eq!(engine.fault_count(), 0);
+    }
+
+    /// Fill model that fails on every call and counts the calls.
+    #[derive(Debug, Default)]
+    struct CountingFailingModel {
+        calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl FillModel for CountingFailingModel {
+        fn simulate_fill(
+            &self,
+            _order: &SimulatedOrder,
+            _tick: &MarketTick,
+            _time_in_queue_ms: u64,
+        ) -> MMResult<FillResult> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(MMError::NumericalError("model failure".to_string()))
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &'static str {
+            "CountingFailing"
+        }
+    }
+
+    #[test]
+    fn test_engine_faults_always_failing_model_list_stays_bounded() {
+        let model = CountingFailingModel::default();
+        let calls = model.calls.clone();
+        let ticks: Vec<MarketTick> = (0..500u64)
+            .map(|i| MarketTick::new(1000 + i, dec!(99), dec!(1), dec!(101), dec!(1)))
+            .collect();
+        // One quote, then none: its two orders keep resting and the model
+        // fails on both at every later tick.
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default().with_default_order_size(dec!(1)),
+            ScriptedStrategy::new(vec![Some((dec!(98), dec!(102)))]),
+            VecDataSource::new(ticks),
+            model,
+        )
+        .unwrap();
+        engine.run();
+        let total = calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(total > MAX_RECORDED_FAULTS as u64 * 10, "calls {total}");
+        assert_eq!(engine.faults().len(), MAX_RECORDED_FAULTS);
+        assert_eq!(engine.fault_count(), total);
+        assert_eq!(engine.open_orders().len(), 2);
+        engine.reset();
+        assert!(engine.faults().is_empty());
+        assert_eq!(engine.fault_count(), 0);
     }
 
     /// Accepts every order, recording the decision times, and fails on
