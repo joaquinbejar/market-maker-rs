@@ -34,6 +34,20 @@ jobs:
       - name: Run tests without default features
         run: cargo test --no-default-features
 
+      - name: Feature list matches Cargo.toml
+        # The matrix below is hand maintained; fail when a feature is added
+        # to or removed from Cargo.toml without updating it.
+        run: |
+          declared=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].features | keys[] | select(. != "default")' | sort)
+          checked=$(sed -n '/^        feature:$/,/^$/p' .github/workflows/features.yml \
+            | sed -n 's/^          - //p' | sort)
+          if [ "$declared" != "$checked" ]; then
+            echo "Cargo.toml features:"; echo "$declared"
+            echo "Matrix features:"; echo "$checked"
+            exit 1
+          fi
+
   feature_check:
     name: Check (${{ matrix.feature }})
     runs-on: ubuntu-latest
@@ -67,4 +81,4 @@ jobs:
           sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
 
       - name: Check feature ${{ matrix.feature }} alone
-        run: cargo check --no-default-features --features ${{ matrix.feature }}
+        run: cargo check --no-default-features --features ${{ matrix.feature }} --all-targets
