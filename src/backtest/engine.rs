@@ -526,7 +526,7 @@ pub struct BacktestEngine<
     accounting_errors: Vec<(u64, MMError)>,
     next_execution_id: u64,
     /// Pretrade policy every new order passes before submission.
-    policy: Option<Box<dyn PretradePolicy>>,
+    policy: Option<Box<dyn PretradePolicy + Send + Sync>>,
     pretrade_log: Vec<PretradeRecord>,
 }
 
@@ -1241,7 +1241,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     /// the market mark of every tick and every lifecycle event of the orders,
     /// in venue order. See [`crate::risk::pretrade`].
     #[must_use]
-    pub fn with_pretrade_policy(mut self, policy: impl PretradePolicy + 'static) -> Self {
+    pub fn with_pretrade_policy(
+        mut self,
+        policy: impl PretradePolicy + Send + Sync + 'static,
+    ) -> Self {
         self.policy = Some(Box::new(policy));
         self
     }
@@ -2756,7 +2759,7 @@ mod tests {
     #[derive(Debug)]
     struct FixedPolicy {
         decision: PretradeDecision,
-        seen: std::rc::Rc<std::cell::RefCell<Vec<PretradeRequest>>>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<PretradeRequest>>>,
     }
 
     impl FixedPolicy {
@@ -2770,11 +2773,11 @@ mod tests {
 
     impl PretradePolicy for FixedPolicy {
         fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
-            self.seen.borrow_mut().push(request.clone());
+            self.seen.lock().unwrap().push(request.clone());
             self.decision.clone()
         }
         fn reset(&mut self) {
-            self.seen.borrow_mut().clear();
+            self.seen.lock().unwrap().clear();
         }
     }
 
@@ -2860,7 +2863,7 @@ mod tests {
         assert!(engine.open_orders().is_empty());
 
         // The engine run does not reset the policy, so both paths are logged.
-        let purposes: Vec<OrderPurpose> = seen.borrow().iter().map(|r| r.purpose).collect();
+        let purposes: Vec<OrderPurpose> = seen.lock().unwrap().iter().map(|r| r.purpose).collect();
         assert_eq!(
             purposes,
             vec![
@@ -3421,5 +3424,7 @@ mod auto_traits {
     #[test]
     fn test_engine_stays_send_and_sync() {
         assert_send_sync::<BacktestEngine<Noop, VecDataSource>>();
+        #[cfg(feature = "margin")]
+        assert_send_sync::<crate::backtest::MarginAccount>();
     }
 }

@@ -13,9 +13,8 @@
 //! the gate trips itself on accounting breaches and execution anomalies, and
 //! then rejects every new order.
 
-use std::cell::RefCell;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use margin_rs::ledger::{Execution, Side as LedgerSide, TransferKind};
 use margin_rs::risk::{
@@ -44,12 +43,12 @@ struct Shared {
 /// policy and an accountant. Cloning shares the same account.
 #[derive(Clone)]
 pub struct MarginAccount {
-    shared: Rc<RefCell<Shared>>,
+    shared: Arc<Mutex<Shared>>,
 }
 
 impl fmt::Debug for MarginAccount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let shared = self.shared.borrow();
+        let shared = self.lock();
         f.debug_struct("MarginAccount")
             .field("instrument", &shared.instrument.as_str())
             .field("errors", &shared.errors.len())
@@ -82,7 +81,7 @@ impl MarginAccount {
             }
         };
         Ok(Self {
-            shared: Rc::new(RefCell::new(Shared {
+            shared: Arc::new(Mutex::new(Shared {
                 initial: gate.clone(),
                 gate,
                 instrument,
@@ -110,17 +109,25 @@ impl MarginAccount {
 
     /// Runs `f` with read access to the gate.
     pub fn with_gate<R>(&self, f: impl FnOnce(&RiskGate) -> R) -> R {
-        f(&self.shared.borrow().gate)
+        f(&self.lock().gate)
     }
 
     /// Gate errors raised while forwarding lifecycle events.
     #[must_use]
     pub fn errors(&self) -> Vec<String> {
-        self.shared.borrow().errors.clone()
+        self.lock().errors.clone()
+    }
+
+    /// Locks the shared account; a poisoned lock is recovered, since every
+    /// gate operation leaves the gate consistent on error.
+    fn lock(&self) -> MutexGuard<'_, Shared> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn reset(&self) {
-        let mut shared = self.shared.borrow_mut();
+        let mut shared = self.lock();
         shared.gate = shared.initial.clone();
         shared.errors.clear();
     }
@@ -153,7 +160,7 @@ impl MarginRiskPolicy {
 
 impl PretradePolicy for MarginRiskPolicy {
     fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
-        let mut shared = self.account.shared.borrow_mut();
+        let mut shared = self.account.lock();
         let Some(price) = request.price else {
             return PretradeDecision::Rejected {
                 reason: "margin gate needs a limit price".to_string(),
@@ -202,14 +209,14 @@ impl PretradePolicy for MarginRiskPolicy {
     }
 
     fn on_market_data(&mut self, mark: Decimal, timestamp: u64) {
-        let mut shared = self.account.shared.borrow_mut();
+        let mut shared = self.account.lock();
         let instrument = shared.instrument.clone();
         let result = shared.gate.on_market_data(&instrument, mark, timestamp);
         Self::record(&mut shared, "market data", result);
     }
 
     fn on_order_event(&mut self, event: &OrderEvent) {
-        let mut shared = self.account.shared.borrow_mut();
+        let mut shared = self.account.lock();
         let raw = match event {
             OrderEvent::Accepted { order_id }
             | OrderEvent::VenueRejected { order_id }
@@ -289,7 +296,7 @@ impl PretradePolicy for MarginRiskPolicy {
     fn description(&self) -> String {
         format!(
             "margin-rs risk gate for {}",
-            self.account.shared.borrow().instrument.as_str()
+            self.account.lock().instrument.as_str()
         )
     }
 }
@@ -306,7 +313,7 @@ pub struct MarginGateAccountant {
 
 impl FillAccountant for MarginGateAccountant {
     fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
-        let shared = self.account.shared.borrow();
+        let shared = self.account.lock();
         let id = ExecutionId::new(format!("sim-{}", fill.execution_id))
             .map_err(|e| MMError::InvalidPositionUpdate(format!("execution id: {e}")))?;
         if shared.gate.ledger().execution_cashflow(&id).is_none() {
@@ -319,7 +326,7 @@ impl FillAccountant for MarginGateAccountant {
     }
 
     fn snapshot(&self) -> AccountingSnapshot {
-        let shared = self.account.shared.borrow();
+        let shared = self.account.lock();
         let ledger = shared.gate.ledger();
         let position = ledger.position(&shared.instrument);
         let fees = ledger.fees_paid(&shared.quote);
@@ -350,7 +357,7 @@ impl FillAccountant for MarginGateAccountant {
     fn description(&self) -> String {
         format!(
             "margin-rs gate ledger for {}",
-            self.account.shared.borrow().instrument.as_str()
+            self.account.lock().instrument.as_str()
         )
     }
 }
