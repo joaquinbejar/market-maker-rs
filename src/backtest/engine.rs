@@ -217,6 +217,145 @@ impl SlippageModel {
     }
 }
 
+/// Currency in which the backtest charges fees.
+///
+/// The fee rate applies to the traded notional in every case. The fee is
+/// computed in its own currency, rounded half to even to that currency's
+/// scale, and posted to the accountant with the matching [`FeeAsset`].
+/// Result metrics ([`BacktestResult::total_fees`], net PnL) stay in the
+/// quote asset: a fee in another currency is valued in quote at the fill.
+/// The position is the traded quantity; a base fee is not deducted from it,
+/// it is a cost valued at the fill price, as a ledger debits it from the
+/// base balance rather than from the instrument position.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum FeeCurrency {
+    /// Quote asset: `price * quantity * rate`, unrounded (the historical
+    /// behaviour).
+    #[default]
+    Quote,
+    /// Base asset: `quantity * rate`, rounded to `scale` decimal places.
+    Base {
+        /// Decimal places of the base asset.
+        scale: u32,
+    },
+    /// A third asset: `price * quantity * rate / quote_per_unit`, rounded
+    /// to `scale` decimal places.
+    Other {
+        /// Asset code, posted as [`FeeAsset::Other`].
+        asset: String,
+        /// Price of one unit of the asset in the quote asset; positive.
+        quote_per_unit: Decimal,
+        /// Decimal places of the asset.
+        scale: u32,
+    },
+}
+
+/// A fee computed for one execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeeCharge {
+    /// Amount in [`FeeCharge::asset`] units.
+    pub amount: Decimal,
+    /// Asset the fee is charged in.
+    pub asset: FeeAsset,
+    /// Value of the fee in the quote asset, used by the result metrics.
+    pub quote_value: Decimal,
+}
+
+impl FeeCurrency {
+    /// Largest scale a [`Decimal`] can hold.
+    const MAX_SCALE: u32 = 28;
+
+    /// Checks the parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] if a scale exceeds 28, the
+    /// asset code is empty or `quote_per_unit` is not positive.
+    pub fn validate(&self) -> MMResult<()> {
+        match self {
+            Self::Quote => Ok(()),
+            Self::Base { scale } => Self::check_scale(*scale),
+            Self::Other {
+                asset,
+                quote_per_unit,
+                scale,
+            } => {
+                if asset.trim().is_empty() {
+                    return Err(MMError::InvalidConfiguration(
+                        "fee asset code must not be empty".to_string(),
+                    ));
+                }
+                if *quote_per_unit <= Decimal::ZERO {
+                    return Err(MMError::InvalidConfiguration(format!(
+                        "fee asset quote_per_unit must be positive, got {quote_per_unit}"
+                    )));
+                }
+                Self::check_scale(*scale)
+            }
+        }
+    }
+
+    fn check_scale(scale: u32) -> MMResult<()> {
+        if scale > Self::MAX_SCALE {
+            return Err(MMError::InvalidConfiguration(format!(
+                "fee scale {scale} exceeds {}",
+                Self::MAX_SCALE
+            )));
+        }
+        Ok(())
+    }
+
+    /// Computes the fee of one execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] for invalid parameters (see
+    /// [`FeeCurrency::validate`]) and [`MMError::NumericalError`] on
+    /// overflow.
+    pub fn charge(&self, price: Decimal, quantity: Decimal, rate: Decimal) -> MMResult<FeeCharge> {
+        self.validate()?;
+        let overflow = || MMError::NumericalError("fee computation overflowed".to_string());
+        let notional = price.checked_mul(quantity).ok_or_else(overflow)?;
+        let quote_fee = notional.checked_mul(rate).ok_or_else(overflow)?;
+        let round = |value: Decimal, scale: u32| {
+            value.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointNearestEven)
+        };
+        match self {
+            Self::Quote => Ok(FeeCharge {
+                amount: quote_fee,
+                asset: FeeAsset::Quote,
+                quote_value: quote_fee,
+            }),
+            Self::Base { scale } => {
+                let amount = round(quantity.checked_mul(rate).ok_or_else(overflow)?, *scale);
+                Ok(FeeCharge {
+                    amount,
+                    asset: FeeAsset::Base,
+                    quote_value: amount.checked_mul(price).ok_or_else(overflow)?,
+                })
+            }
+            Self::Other {
+                asset,
+                quote_per_unit,
+                scale,
+            } => {
+                let amount = round(
+                    quote_fee
+                        .checked_div(*quote_per_unit)
+                        .ok_or_else(overflow)?,
+                    *scale,
+                );
+                Ok(FeeCharge {
+                    amount,
+                    asset: FeeAsset::Other(asset.clone()),
+                    quote_value: amount.checked_mul(*quote_per_unit).ok_or_else(overflow)?,
+                })
+            }
+        }
+    }
+}
+
 /// Backtest configuration.
 ///
 /// # Example
@@ -237,6 +376,9 @@ pub struct BacktestConfig {
     pub initial_capital: Decimal,
     /// Trading fee rate (as decimal, e.g., 0.001 for 0.1%).
     pub fee_rate: Decimal,
+    /// Currency the fee is charged in.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fee_currency: FeeCurrency,
     /// Minimum tick size. When positive, simulated bids are rounded down
     /// and asks up to a multiple of it; zero disables price rounding.
     pub tick_size: Decimal,
@@ -259,6 +401,7 @@ impl Default for BacktestConfig {
         Self {
             initial_capital: Decimal::from(100_000),
             fee_rate: Decimal::ZERO,
+            fee_currency: FeeCurrency::Quote,
             tick_size: Decimal::from_str_exact("0.01").unwrap(),
             lot_size: Decimal::from_str_exact("0.001").unwrap(),
             slippage: SlippageModel::None,
@@ -287,6 +430,16 @@ impl BacktestConfig {
     #[must_use]
     pub fn with_fee_rate(mut self, rate: Decimal) -> Self {
         self.fee_rate = rate;
+        self
+    }
+
+    /// Sets the fee currency. Invalid parameters are reported when the
+    /// first fee is computed: the fill is not booked and the engine records
+    /// a fault (see [`BacktestEngine::faults`]); call
+    /// [`FeeCurrency::validate`] to check them up front.
+    #[must_use]
+    pub fn with_fee_currency(mut self, currency: FeeCurrency) -> Self {
+        self.fee_currency = currency;
         self
     }
 
@@ -924,10 +1077,23 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             if price <= Decimal::ZERO {
                 continue;
             }
+            let charge =
+                match self
+                    .config
+                    .fee_currency
+                    .charge(price, quantity, self.config.fee_rate)
+                {
+                    Ok(charge) => charge,
+                    Err(error) => {
+                        self.record_fault(error);
+                        continue;
+                    }
+                };
             if self.orders[index].apply_fill(quantity).is_err() {
                 continue;
             }
-            let fee = price * quantity * self.config.fee_rate;
+            // Reports and result metrics carry the fee valued in quote.
+            let fee = charge.quote_value;
             let stamp = self.clock.stamp();
             let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
             let fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
@@ -942,10 +1108,11 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 price,
                 quantity,
                 cumulative_quantity: cumulative,
-                fee,
+                fee: charge.amount,
+                fee_asset: charge.asset.clone(),
                 timestamp: now,
             });
-            self.process_fill(fill.clone(), dir, order_id, cumulative);
+            self.process_fill(fill.clone(), dir, order_id, cumulative, charge);
             self.queue_delivery(report, Some((dir, fill)));
         }
         let targets = &self.cancel_targets;
@@ -1222,6 +1389,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         dir: Dir,
         order_id: SimOrderId,
         cumulative: Decimal,
+        charge: FeeCharge,
     ) {
         let execution_id = self.next_execution_id;
         self.next_execution_id += 1;
@@ -1233,8 +1401,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 price: fill.price,
                 quantity: fill.quantity,
                 cumulative_quantity: cumulative,
-                fee: fill.fee,
-                fee_asset: FeeAsset::Quote,
+                fee: charge.amount,
+                fee_asset: charge.asset,
                 timestamp: fill.timestamp,
             };
             if let Err(error) = accountant.post_fill(&posted) {
@@ -1713,6 +1881,132 @@ mod tests {
 
         assert_eq!(config.initial_capital, dec!(50000.0));
         assert_eq!(config.fee_rate, dec!(0.001));
+    }
+
+    #[test]
+    fn test_fee_currency_quote_matches_historical_formula() {
+        let charge = FeeCurrency::Quote
+            .charge(dec!(100.5), dec!(0.3), dec!(0.001))
+            .unwrap();
+        assert_eq!(charge.amount, dec!(0.03015));
+        assert_eq!(charge.asset, FeeAsset::Quote);
+        assert_eq!(charge.quote_value, dec!(0.03015));
+    }
+
+    #[test]
+    fn test_fee_currency_base_buy_and_sell_rounds_half_even_to_scale() {
+        let base = FeeCurrency::Base { scale: 4 };
+        // 0.25 * 0.001 = 0.00025 -> 0.0002 (half to even).
+        let charge = base.charge(dec!(100), dec!(0.25), dec!(0.001)).unwrap();
+        assert_eq!(charge.amount, dec!(0.0002));
+        assert_eq!(charge.asset, FeeAsset::Base);
+        assert_eq!(charge.quote_value, dec!(0.02));
+        // 0.35 * 0.001 = 0.00035 -> 0.0004.
+        let charge = base.charge(dec!(100), dec!(0.35), dec!(0.001)).unwrap();
+        assert_eq!(charge.amount, dec!(0.0004));
+        assert_eq!(charge.quote_value, dec!(0.04));
+    }
+
+    #[test]
+    fn test_fee_currency_third_asset_converts_through_its_quote_price() {
+        let other = FeeCurrency::Other {
+            asset: "BNB".to_string(),
+            quote_per_unit: dec!(300),
+            scale: 6,
+        };
+        // 100 * 2 * 0.001 = 0.2 quote = 0.000666666.. BNB -> 0.000667.
+        let charge = other.charge(dec!(100), dec!(2), dec!(0.001)).unwrap();
+        assert_eq!(charge.amount, dec!(0.000667));
+        assert_eq!(charge.asset, FeeAsset::Other("BNB".to_string()));
+        assert_eq!(charge.quote_value, dec!(0.2001));
+    }
+
+    #[test]
+    fn test_fee_currency_invalid_parameters_return_configuration_error() {
+        for currency in [
+            FeeCurrency::Base { scale: 29 },
+            FeeCurrency::Other {
+                asset: " ".to_string(),
+                quote_per_unit: dec!(1),
+                scale: 2,
+            },
+            FeeCurrency::Other {
+                asset: "BNB".to_string(),
+                quote_per_unit: Decimal::ZERO,
+                scale: 2,
+            },
+        ] {
+            assert!(matches!(
+                currency.validate(),
+                Err(MMError::InvalidConfiguration(_))
+            ));
+            assert!(matches!(
+                currency.charge(dec!(1), dec!(1), dec!(0.001)),
+                Err(MMError::InvalidConfiguration(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_fee_currency_overflow_returns_numerical_error() {
+        assert!(matches!(
+            FeeCurrency::Quote.charge(Decimal::MAX, dec!(2), dec!(1)),
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[test]
+    fn test_engine_base_fee_posts_base_amount_and_reports_quote_value() {
+        let accountant = RecordingAccountant::default();
+        let log = accountant.log.clone();
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(2))
+                .with_fee_rate(dec!(0.001))
+                .with_fee_currency(FeeCurrency::Base { scale: 8 }),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+            QueuePositionFillModel::new(dec!(0.5)),
+        )
+        .unwrap()
+        .with_accountant(accountant);
+        let result = engine.run();
+        let posted: Vec<(Decimal, FeeAsset)> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| (f.fee, f.fee_asset.clone()))
+            .collect();
+        assert_eq!(
+            posted,
+            vec![
+                (dec!(0.0005), FeeAsset::Base),
+                (dec!(0.001), FeeAsset::Base),
+                (dec!(0.0005), FeeAsset::Base),
+            ]
+        );
+        let reported: Vec<Decimal> = result.trades.iter().map(|f| f.fee).collect();
+        assert_eq!(reported, vec![dec!(0.05), dec!(0.1), dec!(0.05)]);
+    }
+
+    #[test]
+    fn test_engine_invalid_fee_currency_records_fault_and_books_nothing() {
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(2))
+                .with_fee_rate(dec!(0.001))
+                .with_fee_currency(FeeCurrency::Base { scale: 40 }),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+            QueuePositionFillModel::new(dec!(0.5)),
+        )
+        .unwrap();
+        let result = engine.run();
+        assert_eq!(result.num_trades, 0);
+        assert!(matches!(
+            engine.faults().first(),
+            Some(MMError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]
@@ -2666,7 +2960,7 @@ mod tests {
                     f.quantity,
                     f.cumulative_quantity,
                     f.fee,
-                    f.fee_asset,
+                    f.fee_asset.clone(),
                 )
             })
             .collect();
@@ -2929,12 +3223,65 @@ mod tests {
         }
 
         #[test]
-        fn test_base_fee_is_refused() {
+        fn test_margin_ledger_base_fee_debits_base_and_is_valued_in_quote() {
             let mut acc = accountant(dec!(1000));
-            let mut fill = ask_fill(1, dec!(100), dec!(1), dec!(0.01));
+            let mut fill = ask_fill(1, dec!(100), dec!(1), dec!(0.001));
             fill.fee_asset = FeeAsset::Base;
+            acc.post_fill(&fill).unwrap();
+            let btc = Asset::new("BTC").unwrap();
+            let usdc = Asset::new("USDC").unwrap();
+            assert_eq!(acc.ledger().fees_paid(&btc), dec!(0.001));
+            assert_eq!(acc.ledger().fees_paid(&usdc), Decimal::ZERO);
+            // The sell delivers 1 BTC plus the 0.001 BTC fee.
+            assert_eq!(acc.overdrafts().get(&btc), Some(&dec!(1.001)));
+            let snapshot = acc.snapshot();
+            assert_eq!(snapshot.position, dec!(-1));
+            assert_eq!(snapshot.cash_flow, dec!(100));
+            assert_eq!(snapshot.fees, dec!(0.1));
+        }
+
+        #[test]
+        fn test_margin_ledger_third_asset_fee_is_refused() {
+            let mut acc = accountant(dec!(1000));
+            let mut fill = ask_fill(1, dec!(100), dec!(1), dec!(0.5));
+            fill.fee_asset = FeeAsset::Other("BNB".to_string());
             assert!(acc.post_fill(&fill).is_err());
             assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+        }
+
+        #[test]
+        fn test_margin_ledger_engine_base_fees_match_builtin_metrics() {
+            let config = || {
+                BacktestConfig::default()
+                    .with_default_order_size(dec!(2))
+                    .with_fee_rate(dec!(0.001))
+                    .with_fee_currency(FeeCurrency::Base { scale: 8 })
+            };
+            let run = |with_ledger: bool| {
+                let engine = BacktestEngine::with_fill_model(
+                    config(),
+                    ScriptedStrategy::new(queue_quotes()),
+                    VecDataSource::new(queue_ticks()),
+                    QueuePositionFillModel::new(dec!(0.5)),
+                )
+                .unwrap();
+                if with_ledger {
+                    let mut engine = engine.with_accountant(accountant(dec!(1000)));
+                    let result = engine.run();
+                    assert!(engine.accounting_errors().is_empty());
+                    result
+                } else {
+                    let mut engine = engine;
+                    engine.run()
+                }
+            };
+            let (builtin, ledger) = (run(false), run(true));
+            // 2.0 BTC bought at 100 with a 0.1% fee in BTC: 0.002 BTC,
+            // valued at 0.2 USDC.
+            assert_eq!(builtin.total_fees, dec!(0.2));
+            assert_eq!(ledger.total_fees, builtin.total_fees);
+            assert_eq!(ledger.final_position, builtin.final_position);
+            assert_eq!(ledger.net_pnl, builtin.net_pnl);
         }
 
         #[test]
@@ -3430,6 +3777,46 @@ mod tests {
         }
 
         #[test]
+        fn test_margin_policy_fee_assets_book_base_and_refuse_third_asset() {
+            let account = account(None);
+            let mut policy = account.policy();
+            let request = |id: &str| {
+                PretradeRequest::new(
+                    id,
+                    Action::Buy,
+                    Some(dec!(100)),
+                    dec!(1),
+                    OrderPurpose::Quote,
+                    0,
+                )
+            };
+            let fill = |id: &str, fee_asset| OrderEvent::Fill {
+                order_id: id.to_string(),
+                execution_id: format!("e-{id}"),
+                side: Action::Buy,
+                price: dec!(100),
+                quantity: dec!(1),
+                cumulative_quantity: dec!(1),
+                fee: dec!(0.001),
+                fee_asset,
+                timestamp: 1,
+            };
+            assert!(!policy.check(&request("o-1")).is_rejected());
+            policy
+                .on_order_event(&fill("o-1", crate::types::fee::FeeAsset::Base))
+                .unwrap();
+            let btc = Asset::new("BTC").unwrap();
+            assert!(account.with_gate(|gate| gate.ledger().fees_paid(&btc) == dec!(0.001)));
+            assert!(account.errors().is_empty());
+
+            assert!(!policy.check(&request("o-2")).is_rejected());
+            let other = fill("o-2", crate::types::fee::FeeAsset::Other("BNB".to_string()));
+            assert!(policy.on_order_event(&other).is_err());
+            assert!(account.fault().is_some());
+            assert!(account.with_gate(|gate| gate.ledger().journal().len() == 1));
+        }
+
+        #[test]
         fn test_margin_policy_unsupported_action_is_rejected_and_fill_latches_a_fault() {
             let account = account(None);
             let mut policy = account.policy();
@@ -3459,6 +3846,7 @@ mod tests {
                     quantity: dec!(1),
                     cumulative_quantity: dec!(1),
                     fee: Decimal::ZERO,
+                    fee_asset: crate::types::fee::FeeAsset::Quote,
                     timestamp: 1,
                 }),
                 Err(unsupported.clone())

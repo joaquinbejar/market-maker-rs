@@ -22,7 +22,7 @@ use margin_rs::risk::{
 };
 use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId, OrderId};
 
-use super::accounting::{AccountingFill, AccountingSnapshot, FillAccountant};
+use super::accounting::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
 use crate::Decimal;
 use crate::risk::pretrade::{
     OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
@@ -35,6 +35,7 @@ struct Shared {
     initial: RiskGate,
     gate: RiskGate,
     instrument: InstrumentId,
+    base: Asset,
     quote: Asset,
     errors: Vec<String>,
     fault: Option<MMError>,
@@ -66,8 +67,8 @@ impl MarginAccount {
     /// Returns [`MMError::InvalidConfiguration`] if `instrument` is not a
     /// spot instrument registered in the gate's ledger.
     pub fn new(gate: RiskGate, instrument: InstrumentId) -> MMResult<Self> {
-        let quote = match gate.ledger().instrument(&instrument) {
-            Some(Instrument::Spot(spot)) => spot.quote().clone(),
+        let (base, quote) = match gate.ledger().instrument(&instrument) {
+            Some(Instrument::Spot(spot)) => (spot.base().clone(), spot.quote().clone()),
             Some(_) => {
                 return Err(MMError::InvalidConfiguration(format!(
                     "instrument {} is not a spot instrument",
@@ -86,6 +87,7 @@ impl MarginAccount {
                 initial: gate.clone(),
                 gate,
                 instrument,
+                base,
                 quote,
                 errors: Vec::new(),
                 fault: None,
@@ -256,6 +258,20 @@ impl PretradePolicy for MarginRiskPolicy {
         // A fill with an unsupported side is unknown exposure, whether or
         // not the gate saw the order: latch the fault and fail, booking
         // nothing.
+        if let OrderEvent::Fill {
+            fee,
+            fee_asset: FeeAsset::Other(asset),
+            ..
+        } = event
+            && !fee.is_zero()
+        {
+            // The account has no such asset: the fee cannot be booked.
+            let error = MMError::InvalidPositionUpdate(format!(
+                "margin account cannot book a fee in {asset}"
+            ));
+            shared.fault = Some(error.clone());
+            return Err(error);
+        }
         if let OrderEvent::Fill { side, .. } = event
             && let Err(error) = Dir::try_from(*side)
         {
@@ -302,6 +318,7 @@ impl PretradePolicy for MarginRiskPolicy {
                 quantity,
                 cumulative_quantity,
                 fee,
+                fee_asset,
                 ..
             } => {
                 // Checked at the top of the method.
@@ -322,7 +339,13 @@ impl PretradePolicy for MarginRiskPolicy {
                 );
                 // Negative fees are rebates and are booked as such.
                 if !fee.is_zero() {
-                    execution = execution.with_fee(shared.quote.clone(), *fee);
+                    let asset = match fee_asset {
+                        FeeAsset::Quote => shared.quote.clone(),
+                        FeeAsset::Base => shared.base.clone(),
+                        // Refused at the top of the method.
+                        FeeAsset::Other(_) => return Ok(()),
+                    };
+                    execution = execution.with_fee(asset, *fee);
                 }
                 let report = FillReport::new(execution, *cumulative_quantity);
                 let result = shared.gate.on_fill(&id, &report);
@@ -378,7 +401,20 @@ impl FillAccountant for MarginGateAccountant {
         let shared = self.account.lock();
         let ledger = shared.gate.ledger();
         let position = ledger.position(&shared.instrument);
-        let fees = ledger.fees_paid(&shared.quote);
+        // Base fees are valued in quote at their execution price.
+        let base_fees: Decimal = ledger
+            .journal()
+            .iter()
+            .filter(|e| e.instrument == shared.instrument)
+            .filter_map(|e| {
+                e.fee
+                    .as_ref()
+                    .filter(|f| f.asset == shared.base)
+                    .map(|f| f.amount * e.price)
+            })
+            .sum();
+        let quote_fees = ledger.fees_paid(&shared.quote);
+        let fees = quote_fees + base_fees;
         let total = ledger
             .balance(&shared.quote)
             .map_or(Decimal::ZERO, |b| b.total);
@@ -393,7 +429,7 @@ impl FillAccountant for MarginGateAccountant {
         AccountingSnapshot {
             position: position.as_ref().map_or(Decimal::ZERO, |p| p.quantity),
             average_entry_price: position.as_ref().and_then(|p| p.average_price()),
-            cash_flow: total - deposits + fees,
+            cash_flow: total - deposits + quote_fees,
             fees,
             fills_posted: ledger.journal().len() as u64,
         }

@@ -48,14 +48,7 @@ use crate::types::error::MMResult;
 
 use super::lifecycle::SimOrderId;
 
-/// Asset in which a fill's fee is charged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FeeAsset {
-    /// The quote asset of the instrument (the engine's convention).
-    Quote,
-    /// The base asset of the instrument.
-    Base,
-}
+pub use crate::types::fee::FeeAsset;
 
 /// One fill as posted to a [`FillAccountant`].
 #[derive(Debug, Clone, PartialEq)]
@@ -180,8 +173,10 @@ mod margin_ledger {
     ///   balance goes negative (for example selling base the account never
     ///   held); the resulting shortfalls are kept in
     ///   [`MarginLedgerAccountant::overdrafts`] instead of refusing the fill.
-    /// - Fees may be negative (rebates). Only quote denominated fees are
-    ///   supported; a base fee is refused as an accounting error.
+    /// - Fees may be negative (rebates). Quote fees are debited from the
+    ///   quote balance and base fees from the base balance; the snapshot
+    ///   values base fees in quote at their execution price. A fee in a
+    ///   third asset is refused as an accounting error.
     /// - The snapshot covers only executions of the selected instrument, so
     ///   other activity in the ledger never leaks into the backtest.
     /// - The ledger enforces its instrument and asset scales: configure
@@ -194,6 +189,7 @@ mod margin_ledger {
         initial: Ledger,
         ledger: Ledger,
         instrument: InstrumentId,
+        base: Asset,
         quote: Asset,
         overdrafts: BTreeMap<Asset, Decimal>,
     }
@@ -207,8 +203,8 @@ mod margin_ledger {
         /// Returns [`MMError::InvalidConfiguration`] if the instrument is not
         /// a registered spot instrument.
         pub fn new(ledger: Ledger, instrument: InstrumentId) -> MMResult<Self> {
-            let quote = match ledger.instrument(&instrument) {
-                Some(Instrument::Spot(spot)) => spot.quote().clone(),
+            let (base, quote) = match ledger.instrument(&instrument) {
+                Some(Instrument::Spot(spot)) => (spot.base().clone(), spot.quote().clone()),
                 Some(_) => {
                     return Err(MMError::InvalidConfiguration(format!(
                         "instrument {} is not a spot instrument",
@@ -226,6 +222,7 @@ mod margin_ledger {
                 initial: ledger.clone(),
                 ledger,
                 instrument,
+                base,
                 quote,
                 overdrafts: BTreeMap::new(),
             })
@@ -251,11 +248,19 @@ mod margin_ledger {
 
     impl FillAccountant for MarginLedgerAccountant {
         fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
-            if fill.fee_asset == FeeAsset::Base && !fill.fee.is_zero() {
-                return Err(MMError::InvalidPositionUpdate(
-                    "margin ledger adapter supports quote denominated fees only".to_string(),
-                ));
-            }
+            let fee_asset = match &fill.fee_asset {
+                FeeAsset::Quote => self.quote.clone(),
+                FeeAsset::Base => self.base.clone(),
+                FeeAsset::Other(code) => {
+                    if fill.fee.is_zero() {
+                        self.quote.clone()
+                    } else {
+                        return Err(MMError::InvalidPositionUpdate(format!(
+                            "margin ledger adapter cannot book a fee in {code}"
+                        )));
+                    }
+                }
+            };
             let id = ExecutionId::new(format!("sim-{}", fill.execution_id))
                 .map_err(|e| margin_error("execution id", e))?;
             // Before booking: a rejected post leaves the ledger unchanged.
@@ -267,7 +272,7 @@ mod margin_ledger {
                 Execution::new(id, self.instrument.clone(), side, fill.price, fill.quantity);
             // Negative fees are rebates and are booked as such.
             if !fill.fee.is_zero() {
-                execution = execution.with_fee(self.quote.clone(), fill.fee);
+                execution = execution.with_fee(fee_asset, fill.fee);
             }
             let booked = self
                 .ledger
@@ -297,8 +302,13 @@ mod margin_ledger {
                     LedgerSide::Buy => -entry.notional,
                     LedgerSide::Sell => entry.notional,
                 };
-                if let Some(fee) = entry.fee.as_ref().filter(|f| f.asset == self.quote) {
-                    snapshot.fees += fee.amount;
+                if let Some(fee) = entry.fee.as_ref() {
+                    if fee.asset == self.quote {
+                        snapshot.fees += fee.amount;
+                    } else if fee.asset == self.base {
+                        // Valued in quote at the execution price.
+                        snapshot.fees += fee.amount * entry.price;
+                    }
                 }
                 snapshot.fills_posted += 1;
             }

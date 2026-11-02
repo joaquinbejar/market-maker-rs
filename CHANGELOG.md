@@ -14,6 +14,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- Backtest fees can be charged in the base asset or a third asset:
+  `BacktestConfig::fee_currency` (`FeeCurrency::{Quote, Base, Other}`,
+  default `Quote`, unchanged behaviour). `FeeAsset` moved to
+  `types::fee` (still re-exported from `backtest`), gained
+  `Other(String)` and is no longer `Copy`. `OrderEvent::Fill` has a new
+  `fee_asset` field. `MarginLedgerAccountant` and the margin policy book
+  base fees on the base asset instead of refusing them (#127).
 - `BacktestResult` has a new public field `accounting: AccountingStatus`
   (accountant description and the execution ids it refused), and
   `SimulatedFill` has a new public field `execution_id: Option<u64>`

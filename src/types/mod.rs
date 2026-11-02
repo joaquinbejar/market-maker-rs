@@ -16,3 +16,6 @@ pub mod primitives;
 
 /// Trade direction and option style shared with the other crates.
 pub mod action;
+
+/// Fee currency of an execution.
+pub mod fee;
