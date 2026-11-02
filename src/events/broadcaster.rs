@@ -426,7 +426,7 @@ fn current_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::types::{EventType, Side};
+    use crate::events::types::{Action, EventType};
 
     #[test]
     fn test_config_builder() {
@@ -550,7 +550,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,

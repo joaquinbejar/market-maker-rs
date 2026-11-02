@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::types::action::Action;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +68,18 @@ pub enum MMError {
     /// such as failed connections, timeouts, or disconnections.
     #[error("connection error: {0}")]
     ConnectionError(String) = 6,
+
+    /// Unsupported trade direction.
+    ///
+    /// This error occurs when an order, fill or query carries an
+    /// [`Action`] other than [`Action::Buy`] or [`Action::Sell`], for example
+    /// [`Action::Other`]. It is returned before any state changes, except
+    /// that a pretrade policy receiving such a fill also latches a fault.
+    #[error("unsupported action {action}: only buy and sell are supported")]
+    UnsupportedAction {
+        /// The action given.
+        action: Action,
+    } = 7,
 }
 
 impl MMError {
@@ -104,6 +118,7 @@ impl MMError {
             | Self::InvalidQuoteGeneration(msg)
             | Self::InvalidTimestamp(msg)
             | Self::ConnectionError(msg) => msg,
+            Self::UnsupportedAction { .. } => "only buy and sell are supported",
         }
     }
 }
@@ -117,6 +132,7 @@ pub type Result<T> = MMResult<T>;
 #[cfg(test)]
 mod tests {
     use super::super::error::{MMError, MMResult};
+    use crate::types::action::Action;
 
     #[test]
     fn test_error_creation() {
@@ -217,5 +233,36 @@ mod tests {
             let deserialized: MMError = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, err);
         }
+    }
+
+    #[test]
+    fn test_unsupported_action_display_and_message() {
+        let err = MMError::UnsupportedAction {
+            action: Action::Other,
+        };
+        assert_eq!(
+            err.to_string(),
+            "unsupported action Other: only buy and sell are supported"
+        );
+        assert_eq!(err.message(), "only buy and sell are supported");
+        assert!(!err.is_configuration_error());
+        assert!(!err.is_market_state_error());
+        assert!(!err.is_numerical_error());
+        assert!(!err.is_connection_error());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_unsupported_action_serialization() {
+        let err = MMError::UnsupportedAction {
+            action: Action::Other,
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"UnsupportedAction","details":{"action":"Other"}}"#
+        );
+        let deserialized: MMError = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, err);
     }
 }

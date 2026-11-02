@@ -35,8 +35,9 @@ use crate::types::error::{MMError, MMResult};
 
 use super::connector::{
     BookLevel, ExchangeConnector, Fill, MarketDataStream, OrderBookSnapshot, OrderId, OrderRequest,
-    OrderResponse, OrderStatus, Side,
+    OrderResponse, OrderStatus,
 };
+use crate::types::action::{Action, Dir};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -292,12 +293,12 @@ impl MockExchangeConnector {
     }
 
     /// Simulates a fill for a market order.
-    fn simulate_market_fill(&self, request: &OrderRequest) -> (OrderStatus, Decimal) {
+    fn simulate_market_fill(&self, request: &OrderRequest, dir: Dir) -> (OrderStatus, Decimal) {
         let orderbook = self.generate_orderbook(&request.symbol, 1);
 
-        let fill_price = match request.side {
-            Side::Buy => orderbook.best_ask().unwrap_or(self.config.base_price),
-            Side::Sell => orderbook.best_bid().unwrap_or(self.config.base_price),
+        let fill_price = match dir {
+            Dir::Buy => orderbook.best_ask().unwrap_or(self.config.base_price),
+            Dir::Sell => orderbook.best_bid().unwrap_or(self.config.base_price),
         };
 
         let status = OrderStatus::Filled {
@@ -326,6 +327,8 @@ impl MockExchangeConnector {
 #[async_trait]
 impl ExchangeConnector for MockExchangeConnector {
     async fn submit_order(&self, request: OrderRequest) -> MMResult<OrderResponse> {
+        // Validated before any simulated latency, failure or id allocation.
+        let dir = Dir::try_from(request.side)?;
         self.simulate_latency().await;
 
         if self.should_fail() {
@@ -338,7 +341,7 @@ impl ExchangeConnector for MockExchangeConnector {
         let timestamp = self.current_time();
 
         let status = if request.order_type.is_market() {
-            let (status, _) = self.simulate_market_fill(&request);
+            let (status, _) = self.simulate_market_fill(&request, dir);
             status
         } else {
             OrderStatus::Open {
@@ -534,7 +537,7 @@ impl MarketDataStream for MockExchangeConnector {
             trade_id: format!("trade-{}", self.current_time()),
             price: self.config.base_price,
             quantity: Decimal::from_str_exact("0.1").unwrap(),
-            side: Side::Buy,
+            side: Action::Buy,
             timestamp: self.current_time(),
             fee: Decimal::from_str_exact("0.001").unwrap(),
             fee_currency: "USD".to_string(),
@@ -795,5 +798,33 @@ mod tests {
 
         // Market order is filled immediately, so still 1 open
         assert_eq!(connector.open_order_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_unsupported_action_returns_err_without_effects() {
+        let connector = MockExchangeConnector::with_defaults();
+        let fresh = MockExchangeConnector::with_defaults();
+
+        let mut request = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1));
+        request.side = Action::Other;
+        assert_eq!(
+            connector.submit_order(request).await,
+            Err(MMError::UnsupportedAction {
+                action: Action::Other
+            })
+        );
+        assert!(
+            connector
+                .get_open_orders("BTC-USD")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // No order id was consumed.
+        let valid = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1));
+        let first = connector.submit_order(valid.clone()).await.unwrap();
+        let expected = fresh.submit_order(valid).await.unwrap();
+        assert_eq!(first.order_id, expected.order_id);
     }
 }

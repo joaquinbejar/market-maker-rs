@@ -24,14 +24,14 @@
 //!
 //! ```rust
 //! use market_maker_rs::backtest::{SimClock, SimOrder, SimOrderState};
-//! use market_maker_rs::execution::Side;
+//! use market_maker_rs::execution::Action;
 //! use market_maker_rs::dec;
 //!
 //! let mut clock = SimClock::new();
 //! clock.advance_to(1_000).unwrap();
 //! let stamp = clock.stamp();
 //!
-//! let mut order = SimOrder::new(1, Side::Buy, dec!(100), dec!(1), stamp, 1_000);
+//! let mut order = SimOrder::new(1, Action::Buy, dec!(100), dec!(1), stamp, 1_000);
 //! order.accept().unwrap();
 //! assert!(!order.is_eligible_at(1_000));
 //! assert!(order.is_eligible_at(1_001));
@@ -43,7 +43,8 @@
 //! ```
 
 use crate::Decimal;
-use crate::execution::Side;
+use crate::execution::Action;
+use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -157,7 +158,7 @@ pub struct SimOrder {
     /// Stable order identifier.
     pub id: SimOrderId,
     /// Order side.
-    pub side: Side,
+    pub side: Action,
     /// Limit price.
     pub price: Decimal,
     /// Original quantity.
@@ -178,7 +179,7 @@ impl SimOrder {
     #[must_use]
     pub fn new(
         id: SimOrderId,
-        side: Side,
+        side: Action,
         price: Decimal,
         quantity: Decimal,
         submitted_at: EventStamp,
@@ -213,9 +214,11 @@ impl SimOrder {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::InvalidQuoteGeneration`] if price or quantity is
-    /// not strictly positive.
+    /// Returns [`MMError::UnsupportedAction`] if the side is neither buy nor
+    /// sell (checked first), and [`MMError::InvalidQuoteGeneration`] if
+    /// price or quantity is not strictly positive.
     pub fn validate(&self) -> MMResult<()> {
+        Dir::try_from(self.side)?;
         if self.price <= Decimal::ZERO {
             return Err(MMError::InvalidQuoteGeneration(format!(
                 "order {} has non positive price {}",
@@ -235,12 +238,18 @@ impl SimOrder {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::InvalidMarketState`] unless the order is `Submitted`.
+    /// Returns [`MMError::UnsupportedAction`] if the side is neither buy nor
+    /// sell, and [`MMError::InvalidMarketState`] unless the order is
+    /// `Submitted`. The order is unchanged on error.
     pub fn accept(&mut self) -> MMResult<()> {
+        Dir::try_from(self.side)?;
         self.transition_from_submitted(SimOrderState::Active)
     }
 
     /// Moves a submitted order to `Rejected`.
+    ///
+    /// Any side is accepted: rejecting is how an invalid order, including
+    /// one with an unsupported side, is taken out.
     ///
     /// # Errors
     ///
@@ -264,10 +273,12 @@ impl SimOrder {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::InvalidMarketState`] if the order is not live, the
-    /// quantity is not strictly positive, or it exceeds the remainder. The
-    /// order is left unchanged on error.
+    /// Returns [`MMError::UnsupportedAction`] if the side is neither buy nor
+    /// sell (checked first), and [`MMError::InvalidMarketState`] if the
+    /// order is not live, the quantity is not strictly positive, or it
+    /// exceeds the remainder. The order is left unchanged on error.
     pub fn apply_fill(&mut self, quantity: Decimal) -> MMResult<Decimal> {
+        Dir::try_from(self.side)?;
         if !self.state.is_live() {
             return Err(MMError::InvalidMarketState(format!(
                 "order {} cannot be filled in state {:?}",
@@ -297,6 +308,8 @@ impl SimOrder {
     }
 
     /// Cancels a live or submitted order. Earlier fills are kept.
+    ///
+    /// Any side is accepted: cancelling only takes the order out.
     ///
     /// # Errors
     ///
@@ -343,7 +356,7 @@ pub struct ExecutionReport {
     /// Order the report refers to.
     pub order_id: SimOrderId,
     /// Order side.
-    pub side: Side,
+    pub side: Action,
     /// Transition kind.
     pub kind: ExecutionKind,
     /// Execution price for fills, limit price otherwise.
@@ -423,7 +436,7 @@ mod tests {
     }
 
     fn live_order(qty: Decimal) -> SimOrder {
-        let mut order = SimOrder::new(7, Side::Sell, dec!(101), qty, stamp(10, 0), 10);
+        let mut order = SimOrder::new(7, Action::Sell, dec!(101), qty, stamp(10, 0), 10);
         order.accept().unwrap();
         order
     }
@@ -462,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_submitted_order_not_eligible() {
-        let order = SimOrder::new(1, Side::Buy, dec!(100), dec!(1), stamp(0, 0), 0);
+        let order = SimOrder::new(1, Action::Buy, dec!(100), dec!(1), stamp(0, 0), 0);
         assert!(!order.is_eligible_at(100));
     }
 
@@ -500,9 +513,9 @@ mod tests {
 
     #[test]
     fn test_validation_rejects_non_positive_values() {
-        let bad_price = SimOrder::new(1, Side::Buy, dec!(0), dec!(1), stamp(0, 0), 0);
+        let bad_price = SimOrder::new(1, Action::Buy, dec!(0), dec!(1), stamp(0, 0), 0);
         assert!(bad_price.validate().is_err());
-        let bad_qty = SimOrder::new(2, Side::Buy, dec!(1), dec!(-1), stamp(0, 0), 0);
+        let bad_qty = SimOrder::new(2, Action::Buy, dec!(1), dec!(-1), stamp(0, 0), 0);
         assert!(bad_qty.validate().is_err());
         let mut rejected = bad_qty.clone();
         rejected.reject().unwrap();
@@ -529,5 +542,34 @@ mod tests {
         assert_eq!(full.cumulative_quantity, dec!(1));
         let canceled = ExecutionReport::status(stamp(12, 3), &order, ExecutionKind::Canceled);
         assert!(!canceled.is_fill());
+    }
+
+    #[test]
+    fn test_unsupported_action_order_is_refused_before_any_effect() {
+        let unsupported = MMError::UnsupportedAction {
+            action: Action::Other,
+        };
+        let order = SimOrder::new(1, Action::Other, dec!(100), dec!(2), stamp(0, 0), 0);
+
+        assert_eq!(order.validate(), Err(unsupported.clone()));
+
+        let mut accepted = order.clone();
+        assert_eq!(accepted.accept(), Err(unsupported.clone()));
+        assert_eq!(accepted, order);
+
+        // Even when forced live by the caller, it is never filled.
+        let mut live = order.clone();
+        live.state = SimOrderState::Active;
+        let before = live.clone();
+        assert_eq!(live.apply_fill(dec!(1)), Err(unsupported));
+        assert_eq!(live, before);
+
+        // Rejecting or cancelling takes it out.
+        let mut rejected = order.clone();
+        rejected.reject().unwrap();
+        assert_eq!(rejected.state, SimOrderState::Rejected);
+        let mut cancelled = order;
+        cancelled.cancel().unwrap();
+        assert_eq!(cancelled.state, SimOrderState::Canceled);
     }
 }

@@ -164,6 +164,25 @@ let (bid, ask) = market_maker_rs::strategy::avellaneda_stoikov::calculate_optima
 println!("Bid: {}, Ask: {}", bid, ask);
 ```
 
+### Shared Types
+
+The order direction and the option style are the shared enums of the
+`financial_types` crate, also used by `margin-rs`, `arbitrage-rs` and
+OptionStratLib, and re-exported from the [`prelude`]:
+
+- `Action` (`Buy`/`Sell`) for every order, fill and query side. It also
+  has an `Other` variant, which this crate does not support: methods that
+  take or process an order, a fill or a side return
+  `MMError::UnsupportedAction` for it, before changing anything; a
+  pretrade check rejects the order; and a pretrade policy that receives a
+  fill with that side also latches a fault and rejects every later order
+  until it is reset.
+- `OptionStyle` (`Call`/`Put`).
+
+`financial_types` derives `serde` unconditionally, so `serde` is compiled
+even with no features enabled; the `serde` feature still gates this
+crate's own serialization support.
+
 ### Feature Flags
 
 - `prometheus`: Enable Prometheus metrics export (adds `prometheus`, `hyper`, `tokio` dependencies)
@@ -380,7 +399,7 @@ let hedges = manager.get_cross_asset_hedges();
 ```rust
 use market_maker_rs::events::{
     EventBroadcaster, EventBroadcasterConfig, EventFilter, EventType,
-    MarketMakerEvent, Side,
+    MarketMakerEvent, Action,
 };
 use std::sync::Arc;
 
@@ -402,7 +421,7 @@ broadcaster.broadcast(MarketMakerEvent::OrderFilled {
     order_id: "ORD-001".to_string(),
     symbol: "BTC".to_string(),
     instrument: "BTC-PERP".to_string(),
-    side: Side::Buy,
+    side: Action::Buy,
     quantity: 10,
     price: 50000,
     fee: 5,

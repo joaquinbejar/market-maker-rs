@@ -16,9 +16,9 @@
 use std::sync::Arc;
 
 use market_maker_rs::events::{
-    AlertCategory, AlertLevel, CancelReason, CircuitBreakerState, EventAggregator,
+    Action, AlertCategory, AlertLevel, CancelReason, CircuitBreakerState, EventAggregator,
     EventBroadcaster, EventBroadcasterConfig, EventFilter, EventType, HedgeReason,
-    MarketMakerEvent, OptionStyle, Side, SystemStatus,
+    MarketMakerEvent, OptionStyle, SystemStatus,
 };
 
 #[tokio::main]
@@ -115,7 +115,7 @@ async fn demonstrate_broadcasting(broadcaster: &Arc<EventBroadcaster>) {
         order_id: "ORD-001".to_string(),
         symbol: "BTC".to_string(),
         instrument: "BTC-20240329-50000-C".to_string(),
-        side: Side::Buy,
+        side: Action::Buy,
         quantity: 5,
         price: 505,
         fee: 2,
@@ -229,7 +229,7 @@ async fn demonstrate_broadcasting(broadcaster: &Arc<EventBroadcaster>) {
     let hedge_event = MarketMakerEvent::HedgeExecuted {
         symbol: "BTC".to_string(),
         instrument: "BTC-PERP".to_string(),
-        side: Side::Sell,
+        side: Action::Sell,
         quantity: 10,
         price: 50000,
         reason: HedgeReason::DeltaLimit,
@@ -281,7 +281,7 @@ async fn demonstrate_filtering(broadcaster: &Arc<EventBroadcaster>) {
         order_id: "TEST-001".to_string(),
         symbol: "BTC".to_string(),
         instrument: "BTC-PERP".to_string(),
-        side: Side::Buy,
+        side: Action::Buy,
         quantity: 1,
         price: 50000,
         fee: 1,
@@ -293,7 +293,7 @@ async fn demonstrate_filtering(broadcaster: &Arc<EventBroadcaster>) {
         order_id: "TEST-002".to_string(),
         symbol: "ETH".to_string(),
         instrument: "ETH-PERP".to_string(),
-        side: Side::Buy,
+        side: Action::Buy,
         quantity: 1,
         price: 3000,
         fee: 1,

@@ -2,6 +2,7 @@
 name = "market-maker-rs"
 version = "0.6.1"
 edition = "2024"
+rust-version = "1.95"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "A Rust library implementing quantitative market making strategies, starting with the Avellaneda-Stoikov model"
 license = "MIT"
@@ -32,6 +33,10 @@ path = "src/lib.rs"
 thiserror = "2.0"
 rust_decimal = "1.43"
 rust_decimal_macros = "1.40"
+# Shared order direction and option style (`Action`, `OptionStyle`). It
+# derives serde unconditionally, so serde is in the default build through it
+# (owner-approved exception, as in arbitrage-rs).
+financial_types = "0.3"
 margin-rs = { git = "https://github.com/joaquinbejar/margin-rs", rev = "8e10f223f02bbde4cf67e9d3595d16573b9c3746", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }

@@ -18,7 +18,7 @@
 //! use market_maker_rs::backtest::{
 //!     EquityPoint, TradeRecord, MetricsCalculator, MetricsConfig
 //! };
-//! use market_maker_rs::execution::Side;
+//! use market_maker_rs::execution::Action;
 //! use market_maker_rs::dec;
 //!
 //! // Create equity curve
@@ -31,7 +31,7 @@
 //! // Create trade records
 //! let trades = vec![
 //!     TradeRecord::new(
-//!         0, 86400000, Side::Buy,
+//!         0, 86400000, Action::Buy,
 //!         dec!(100.0), dec!(101.0), dec!(10.0),
 //!         dec!(100.0), dec!(1.0)
 //!     ),
@@ -45,7 +45,7 @@
 //! ```
 
 use crate::Decimal;
-use crate::execution::Side;
+use crate::execution::Action;
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -91,11 +91,11 @@ impl EquityPoint {
 ///
 /// ```rust
 /// use market_maker_rs::backtest::TradeRecord;
-/// use market_maker_rs::execution::Side;
+/// use market_maker_rs::execution::Action;
 /// use market_maker_rs::dec;
 ///
 /// let trade = TradeRecord::new(
-///     1000, 2000, Side::Buy,
+///     1000, 2000, Action::Buy,
 ///     dec!(100.0), dec!(105.0), dec!(10.0),
 ///     dec!(50.0), dec!(1.0)
 /// );
@@ -111,7 +111,7 @@ pub struct TradeRecord {
     /// Exit timestamp in milliseconds.
     pub exit_time: u64,
     /// Trade side.
-    pub side: Side,
+    pub side: Action,
     /// Entry price.
     pub entry_price: Decimal,
     /// Exit price.
@@ -131,7 +131,7 @@ impl TradeRecord {
     pub fn new(
         entry_time: u64,
         exit_time: u64,
-        side: Side,
+        side: Action,
         entry_price: Decimal,
         exit_price: Decimal,
         quantity: Decimal,
@@ -922,7 +922,7 @@ mod tests {
         let trade = TradeRecord::new(
             1000,
             2000,
-            Side::Buy,
+            Action::Buy,
             dec!(100.0),
             dec!(105.0),
             dec!(10.0),
@@ -941,7 +941,7 @@ mod tests {
         let trade = TradeRecord::new(
             0,
             0,
-            Side::Buy,
+            Action::Buy,
             dec!(100.0),
             dec!(105.0),
             dec!(10.0),
@@ -956,7 +956,7 @@ mod tests {
         let winner = TradeRecord::new(
             0,
             0,
-            Side::Buy,
+            Action::Buy,
             dec!(100.0),
             dec!(105.0),
             dec!(10.0),
@@ -966,7 +966,7 @@ mod tests {
         let loser = TradeRecord::new(
             0,
             0,
-            Side::Buy,
+            Action::Buy,
             dec!(100.0),
             dec!(95.0),
             dec!(10.0),
@@ -985,7 +985,7 @@ mod tests {
         let trade = TradeRecord::new(
             1000,
             5000,
-            Side::Buy,
+            Action::Buy,
             dec!(100.0),
             dec!(105.0),
             dec!(10.0),
@@ -1124,7 +1124,7 @@ mod tests {
             TradeRecord::new(
                 0,
                 0,
-                Side::Buy,
+                Action::Buy,
                 dec!(100.0),
                 dec!(110.0),
                 dec!(1.0),
@@ -1134,7 +1134,7 @@ mod tests {
             TradeRecord::new(
                 0,
                 0,
-                Side::Buy,
+                Action::Buy,
                 dec!(100.0),
                 dec!(90.0),
                 dec!(1.0),
@@ -1154,7 +1154,7 @@ mod tests {
         let trades = vec![TradeRecord::new(
             0,
             0,
-            Side::Buy,
+            Action::Buy,
             dec!(100.0),
             dec!(110.0),
             dec!(1.0),
@@ -1183,7 +1183,7 @@ mod tests {
             TradeRecord::new(
                 0,
                 86400000,
-                Side::Buy,
+                Action::Buy,
                 dec!(100.0),
                 dec!(101.0),
                 dec!(10.0),
@@ -1193,7 +1193,7 @@ mod tests {
             TradeRecord::new(
                 86400000,
                 172800000,
-                Side::Buy,
+                Action::Buy,
                 dec!(101.0),
                 dec!(102.5),
                 dec!(10.0),
@@ -1203,7 +1203,7 @@ mod tests {
             TradeRecord::new(
                 172800000,
                 259200000,
-                Side::Sell,
+                Action::Sell,
                 dec!(102.5),
                 dec!(101.5),
                 dec!(10.0),
@@ -1213,7 +1213,7 @@ mod tests {
             TradeRecord::new(
                 259200000,
                 345600000,
-                Side::Buy,
+                Action::Buy,
                 dec!(101.5),
                 dec!(103.0),
                 dec!(10.0),
@@ -1346,7 +1346,7 @@ mod tests {
         let trade = TradeRecord::new(
             1000,
             2000,
-            Side::Buy,
+            Action::Buy,
             dec!(100.0),
             dec!(105.0),
             dec!(10.0),

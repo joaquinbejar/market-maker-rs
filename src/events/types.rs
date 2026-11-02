@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+pub use crate::types::action::{Action, OptionStyle};
+
 /// Market maker event types.
 ///
 /// All events that can be broadcast by the market maker system.
@@ -21,7 +23,8 @@ pub enum MarketMakerEvent {
         expiration: String,
         /// Strike price in cents/smallest unit.
         strike: u64,
-        /// Option style (call/put).
+        /// Option style, serialized as `"call"`/`"put"`.
+        #[serde(with = "crate::types::action::serde_lowercase::option_style")]
         style: OptionStyle,
         /// Bid price in cents/smallest unit.
         bid_price: u64,
@@ -45,8 +48,10 @@ pub enum MarketMakerEvent {
         symbol: String,
         /// Instrument identifier (e.g., "BTC-20240329-50000-C").
         instrument: String,
-        /// Order side (buy/sell).
-        side: Side,
+        /// Order side, serialized as `"buy"`/`"sell"`; any other action fails
+        /// to serialize.
+        #[serde(with = "crate::types::action::serde_lowercase::action")]
+        side: Action,
         /// Filled quantity in contracts.
         quantity: u64,
         /// Fill price in cents/smallest unit.
@@ -181,8 +186,10 @@ pub enum MarketMakerEvent {
         symbol: String,
         /// Instrument identifier.
         instrument: String,
-        /// Order side (buy/sell).
-        side: Side,
+        /// Order side, serialized as `"buy"`/`"sell"`; any other action fails
+        /// to serialize.
+        #[serde(with = "crate::types::action::serde_lowercase::action")]
+        side: Action,
         /// Quantity hedged.
         quantity: u64,
         /// Execution price in cents/smallest unit.
@@ -292,26 +299,6 @@ impl MarketMakerEvent {
             _ => None,
         }
     }
-}
-
-/// Option style (call or put).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OptionStyle {
-    /// Call option.
-    Call,
-    /// Put option.
-    Put,
-}
-
-/// Order side (buy or sell).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Side {
-    /// Buy order.
-    Buy,
-    /// Sell order.
-    Sell,
 }
 
 /// Alert severity level.
@@ -545,7 +532,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,
@@ -611,7 +598,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,
@@ -630,7 +617,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,
@@ -654,7 +641,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,
@@ -667,7 +654,7 @@ mod tests {
             order_id: "124".to_string(),
             symbol: "SOL".to_string(),
             instrument: "SOL-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 100,
             fee: 1,
@@ -712,7 +699,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,
@@ -733,7 +720,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,
@@ -746,7 +733,7 @@ mod tests {
             order_id: "124".to_string(),
             symbol: "ETH".to_string(),
             instrument: "ETH-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 3000,
             fee: 3,
@@ -771,7 +758,7 @@ mod tests {
             order_id: "123".to_string(),
             symbol: "BTC".to_string(),
             instrument: "BTC-PERP".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             quantity: 10,
             price: 50000,
             fee: 5,
@@ -806,7 +793,7 @@ mod tests {
                 order_id: "123".to_string(),
                 symbol: "BTC".to_string(),
                 instrument: "BTC-PERP".to_string(),
-                side: Side::Buy,
+                side: Action::Buy,
                 quantity: 10,
                 price: 50000,
                 fee: 5,
@@ -874,7 +861,7 @@ mod tests {
             MarketMakerEvent::HedgeExecuted {
                 symbol: "BTC".to_string(),
                 instrument: "BTC-PERP".to_string(),
-                side: Side::Sell,
+                side: Action::Sell,
                 quantity: 5,
                 price: 50000,
                 reason: HedgeReason::DeltaLimit,
@@ -902,19 +889,8 @@ mod tests {
 
     #[test]
     fn test_enum_serialization() {
-        // Test OptionStyle
-        assert_eq!(
-            serde_json::to_string(&OptionStyle::Call).unwrap(),
-            r#""call""#
-        );
-        assert_eq!(
-            serde_json::to_string(&OptionStyle::Put).unwrap(),
-            r#""put""#
-        );
-
-        // Test Side
-        assert_eq!(serde_json::to_string(&Side::Buy).unwrap(), r#""buy""#);
-        assert_eq!(serde_json::to_string(&Side::Sell).unwrap(), r#""sell""#);
+        // `OptionStyle` and `Action` keep their lowercase form inside the
+        // events; see the golden tests below.
 
         // Test AlertLevel
         assert_eq!(
@@ -944,6 +920,142 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CircuitBreakerState::Tripped).unwrap(),
             r#""tripped""#
+        );
+    }
+
+    fn quote_updated(style: OptionStyle) -> MarketMakerEvent {
+        MarketMakerEvent::QuoteUpdated {
+            symbol: "BTC".to_string(),
+            expiration: "20240329".to_string(),
+            strike: 50000,
+            style,
+            bid_price: 100,
+            ask_price: 110,
+            bid_size: 1,
+            ask_size: 2,
+            theo: 105,
+            timestamp: 1000,
+        }
+    }
+
+    fn order_filled(side: Action) -> MarketMakerEvent {
+        MarketMakerEvent::OrderFilled {
+            order_id: "o-1".to_string(),
+            symbol: "BTC".to_string(),
+            instrument: "BTC-20240329-50000-C".to_string(),
+            side,
+            quantity: 3,
+            price: 120,
+            fee: 1,
+            edge: -2,
+            timestamp: 1000,
+        }
+    }
+
+    fn hedge_executed(side: Action) -> MarketMakerEvent {
+        MarketMakerEvent::HedgeExecuted {
+            symbol: "BTC".to_string(),
+            instrument: "BTC-PERP".to_string(),
+            side,
+            quantity: 4,
+            price: 50000,
+            reason: HedgeReason::DeltaLimit,
+            timestamp: 1000,
+        }
+    }
+
+    /// Golden JSON of every event field that carries a side or an option
+    /// style; identical to the output of the former local enums.
+    #[test]
+    fn test_event_json_golden_side_and_style_fields() {
+        let cases = [
+            (
+                quote_updated(OptionStyle::Call),
+                r#"{"type":"quote_updated","symbol":"BTC","expiration":"20240329","strike":50000,"style":"call","bid_price":100,"ask_price":110,"bid_size":1,"ask_size":2,"theo":105,"timestamp":1000}"#,
+            ),
+            (
+                quote_updated(OptionStyle::Put),
+                r#"{"type":"quote_updated","symbol":"BTC","expiration":"20240329","strike":50000,"style":"put","bid_price":100,"ask_price":110,"bid_size":1,"ask_size":2,"theo":105,"timestamp":1000}"#,
+            ),
+            (
+                order_filled(Action::Buy),
+                r#"{"type":"order_filled","order_id":"o-1","symbol":"BTC","instrument":"BTC-20240329-50000-C","side":"buy","quantity":3,"price":120,"fee":1,"edge":-2,"timestamp":1000}"#,
+            ),
+            (
+                order_filled(Action::Sell),
+                r#"{"type":"order_filled","order_id":"o-1","symbol":"BTC","instrument":"BTC-20240329-50000-C","side":"sell","quantity":3,"price":120,"fee":1,"edge":-2,"timestamp":1000}"#,
+            ),
+            (
+                hedge_executed(Action::Buy),
+                r#"{"type":"hedge_executed","symbol":"BTC","instrument":"BTC-PERP","side":"buy","quantity":4,"price":50000,"reason":"delta_limit","timestamp":1000}"#,
+            ),
+            (
+                hedge_executed(Action::Sell),
+                r#"{"type":"hedge_executed","symbol":"BTC","instrument":"BTC-PERP","side":"sell","quantity":4,"price":50000,"reason":"delta_limit","timestamp":1000}"#,
+            ),
+        ];
+        for (event, golden) in cases {
+            assert_eq!(serde_json::to_string(&event).unwrap(), golden);
+            let back: MarketMakerEvent = serde_json::from_str(golden).unwrap();
+            assert_eq!(back, event);
+            // Also through `serde_json::Value`, which hands owned strings to
+            // the field deserializers.
+            let value: serde_json::Value = serde_json::from_str(golden).unwrap();
+            assert_eq!(
+                serde_json::from_value::<MarketMakerEvent>(value).unwrap(),
+                event
+            );
+        }
+    }
+
+    /// The events accept only the lowercase spellings, as before.
+    #[test]
+    fn test_event_json_rejects_other_spellings() {
+        for (field, value) in [
+            ("side", "other"),
+            ("side", "Buy"),
+            ("side", "Other"),
+            ("side", "BUY"),
+        ] {
+            let json = format!(
+                r#"{{"type":"order_filled","order_id":"o-1","symbol":"BTC","instrument":"I","{field}":"{value}","quantity":3,"price":120,"fee":1,"edge":-2,"timestamp":1000}}"#
+            );
+            assert!(
+                serde_json::from_str::<MarketMakerEvent>(&json).is_err(),
+                "{value}"
+            );
+        }
+        for value in ["Call", "american", "CALL"] {
+            let json = format!(
+                r#"{{"type":"quote_updated","symbol":"BTC","expiration":"E","strike":1,"style":"{value}","bid_price":1,"ask_price":2,"bid_size":1,"ask_size":1,"theo":1,"timestamp":1}}"#
+            );
+            assert!(
+                serde_json::from_str::<MarketMakerEvent>(&json).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    /// An event never serializes a side other than buy or sell.
+    #[test]
+    fn test_event_json_unsupported_action_fails_to_serialize() {
+        for event in [order_filled(Action::Other), hedge_executed(Action::Other)] {
+            let error = serde_json::to_string(&event).unwrap_err();
+            assert!(
+                error.to_string().contains("unsupported action Other"),
+                "{error}"
+            );
+        }
+    }
+
+    /// Serializing the shared enums directly (outside an event) uses their
+    /// own representation, unlike the former local enums.
+    #[test]
+    fn test_shared_enums_direct_serialization() {
+        assert_eq!(serde_json::to_string(&Action::Buy).unwrap(), r#""Buy""#);
+        assert_eq!(
+            serde_json::to_string(&OptionStyle::Call).unwrap(),
+            r#""Call""#
         );
     }
 }

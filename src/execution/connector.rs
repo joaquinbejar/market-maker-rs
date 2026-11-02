@@ -17,26 +17,27 @@
 //!
 //! ```rust
 //! use market_maker_rs::execution::{
-//!     OrderRequest, Side, OrderType, TimeInForce
+//!     OrderRequest, Action, OrderType, TimeInForce
 //! };
 //! use market_maker_rs::dec;
 //!
 //! let request = OrderRequest::new(
 //!     "BTC-USD",
-//!     Side::Buy,
+//!     Action::Buy,
 //!     OrderType::Limit,
 //!     Some(dec!(50000.0)),
 //!     dec!(0.1),
 //! );
 //!
 //! assert_eq!(request.symbol, "BTC-USD");
-//! assert_eq!(request.side, Side::Buy);
+//! assert_eq!(request.side, Action::Buy);
 //! ```
 
 use async_trait::async_trait;
 use std::fmt;
 
 use crate::Decimal;
+use crate::types::action::Dir;
 use crate::types::error::MMResult;
 
 #[cfg(feature = "serde")]
@@ -96,57 +97,21 @@ impl From<&str> for OrderId {
     }
 }
 
-/// Order side (buy or sell).
+/// Order direction: the shared [`financial_types::Action`].
+///
+/// Only [`Action::Buy`] and [`Action::Sell`] are supported; any other action
+/// is rejected with [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction).
 ///
 /// # Example
 ///
 /// ```rust
-/// use market_maker_rs::execution::Side;
+/// use market_maker_rs::execution::Action;
 ///
-/// let side = Side::Buy;
+/// let side = Action::Buy;
 /// assert!(side.is_buy());
 /// assert!(!side.is_sell());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum Side {
-    /// Buy order (bid).
-    Buy,
-    /// Sell order (ask).
-    Sell,
-}
-
-impl Side {
-    /// Returns true if this is a buy order.
-    #[must_use]
-    pub fn is_buy(&self) -> bool {
-        matches!(self, Side::Buy)
-    }
-
-    /// Returns true if this is a sell order.
-    #[must_use]
-    pub fn is_sell(&self) -> bool {
-        matches!(self, Side::Sell)
-    }
-
-    /// Returns the opposite side.
-    #[must_use]
-    pub fn opposite(&self) -> Self {
-        match self {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
-        }
-    }
-}
-
-impl fmt::Display for Side {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Side::Buy => write!(f, "Buy"),
-            Side::Sell => write!(f, "Sell"),
-        }
-    }
-}
+pub use crate::types::action::Action;
 
 /// Order type.
 ///
@@ -361,12 +326,12 @@ impl fmt::Display for OrderStatus {
 /// # Example
 ///
 /// ```rust
-/// use market_maker_rs::execution::{OrderRequest, Side, OrderType, TimeInForce};
+/// use market_maker_rs::execution::{OrderRequest, Action, OrderType, TimeInForce};
 /// use market_maker_rs::dec;
 ///
 /// let request = OrderRequest::new(
 ///     "BTC-USD",
-///     Side::Buy,
+///     Action::Buy,
 ///     OrderType::Limit,
 ///     Some(dec!(50000.0)),
 ///     dec!(0.1),
@@ -381,7 +346,7 @@ pub struct OrderRequest {
     /// Trading symbol (e.g., "BTC-USD").
     pub symbol: String,
     /// Order side (buy or sell).
-    pub side: Side,
+    pub side: Action,
     /// Order type (limit, market, post-only).
     pub order_type: OrderType,
     /// Limit price (required for limit and post-only orders).
@@ -407,7 +372,7 @@ impl OrderRequest {
     #[must_use]
     pub fn new(
         symbol: impl Into<String>,
-        side: Side,
+        side: Action,
         order_type: OrderType,
         price: Option<Decimal>,
         quantity: Decimal,
@@ -426,25 +391,31 @@ impl OrderRequest {
     /// Creates a limit buy order.
     #[must_use]
     pub fn limit_buy(symbol: impl Into<String>, price: Decimal, quantity: Decimal) -> Self {
-        Self::new(symbol, Side::Buy, OrderType::Limit, Some(price), quantity)
+        Self::new(symbol, Action::Buy, OrderType::Limit, Some(price), quantity)
     }
 
     /// Creates a limit sell order.
     #[must_use]
     pub fn limit_sell(symbol: impl Into<String>, price: Decimal, quantity: Decimal) -> Self {
-        Self::new(symbol, Side::Sell, OrderType::Limit, Some(price), quantity)
+        Self::new(
+            symbol,
+            Action::Sell,
+            OrderType::Limit,
+            Some(price),
+            quantity,
+        )
     }
 
     /// Creates a market buy order.
     #[must_use]
     pub fn market_buy(symbol: impl Into<String>, quantity: Decimal) -> Self {
-        Self::new(symbol, Side::Buy, OrderType::Market, None, quantity)
+        Self::new(symbol, Action::Buy, OrderType::Market, None, quantity)
     }
 
     /// Creates a market sell order.
     #[must_use]
     pub fn market_sell(symbol: impl Into<String>, quantity: Decimal) -> Self {
-        Self::new(symbol, Side::Sell, OrderType::Market, None, quantity)
+        Self::new(symbol, Action::Sell, OrderType::Market, None, quantity)
     }
 
     /// Sets the time in force.
@@ -526,7 +497,7 @@ impl OrderResponse {
 /// # Example
 ///
 /// ```rust
-/// use market_maker_rs::execution::{Fill, OrderId, Side};
+/// use market_maker_rs::execution::{Fill, OrderId, Action};
 /// use market_maker_rs::dec;
 ///
 /// let fill = Fill {
@@ -534,7 +505,7 @@ impl OrderResponse {
 ///     trade_id: "trade-1".to_string(),
 ///     price: dec!(50000.0),
 ///     quantity: dec!(0.1),
-///     side: Side::Buy,
+///     side: Action::Buy,
 ///     timestamp: 1234567890,
 ///     fee: dec!(0.5),
 ///     fee_currency: "USD".to_string(),
@@ -554,7 +525,7 @@ pub struct Fill {
     /// Fill quantity.
     pub quantity: Decimal,
     /// Fill side.
-    pub side: Side,
+    pub side: Action,
     /// Fill timestamp in milliseconds.
     pub timestamp: u64,
     /// Fee amount.
@@ -573,12 +544,16 @@ impl Fill {
     /// Returns the net value after fees.
     /// For buys: notional + fee (cost)
     /// For sells: notional - fee (proceeds)
-    #[must_use]
-    pub fn net_value(&self) -> Decimal {
-        match self.side {
-            Side::Buy => self.notional() + self.fee,
-            Side::Sell => self.notional() - self.fee,
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction) if the fill's side is neither
+    /// buy nor sell.
+    pub fn net_value(&self) -> MMResult<Decimal> {
+        Ok(match Dir::try_from(self.side)? {
+            Dir::Buy => self.notional() + self.fee,
+            Dir::Sell => self.notional() - self.fee,
+        })
     }
 }
 
@@ -754,6 +729,12 @@ pub trait ExchangeConnector: Send + Sync {
     /// # Returns
     ///
     /// The order response with the assigned order ID and initial status.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction) when
+    /// `request.side` is neither buy nor sell, before any other effect, and
+    /// their own errors otherwise.
     async fn submit_order(&self, request: OrderRequest) -> MMResult<OrderResponse>;
 
     /// Cancels an existing order.
@@ -881,6 +862,7 @@ pub trait MarketDataStream: Send + Sync {
 mod tests {
     use super::*;
     use crate::dec;
+    use crate::types::error::MMError;
 
     #[test]
     fn test_order_id() {
@@ -894,12 +876,10 @@ mod tests {
 
     #[test]
     fn test_side() {
-        assert!(Side::Buy.is_buy());
-        assert!(!Side::Buy.is_sell());
-        assert!(Side::Sell.is_sell());
-        assert!(!Side::Sell.is_buy());
-        assert_eq!(Side::Buy.opposite(), Side::Sell);
-        assert_eq!(Side::Sell.opposite(), Side::Buy);
+        assert!(Action::Buy.is_buy());
+        assert!(!Action::Buy.is_sell());
+        assert!(Action::Sell.is_sell());
+        assert!(!Action::Sell.is_buy());
     }
 
     #[test]
@@ -954,14 +934,14 @@ mod tests {
     fn test_order_request() {
         let request = OrderRequest::new(
             "BTC-USD",
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             Some(dec!(50000.0)),
             dec!(0.1),
         );
 
         assert_eq!(request.symbol, "BTC-USD");
-        assert_eq!(request.side, Side::Buy);
+        assert_eq!(request.side, Action::Buy);
         assert_eq!(request.order_type, OrderType::Limit);
         assert_eq!(request.price, Some(dec!(50000.0)));
         assert_eq!(request.quantity, dec!(0.1));
@@ -971,11 +951,11 @@ mod tests {
     #[test]
     fn test_order_request_builders() {
         let buy = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1));
-        assert_eq!(buy.side, Side::Buy);
+        assert_eq!(buy.side, Action::Buy);
         assert_eq!(buy.order_type, OrderType::Limit);
 
         let sell = OrderRequest::limit_sell("BTC-USD", dec!(51000.0), dec!(0.1));
-        assert_eq!(sell.side, Side::Sell);
+        assert_eq!(sell.side, Action::Sell);
 
         let market_buy = OrderRequest::market_buy("BTC-USD", dec!(0.1));
         assert_eq!(market_buy.order_type, OrderType::Market);
@@ -990,20 +970,31 @@ mod tests {
             trade_id: "trade-1".to_string(),
             price: dec!(50000.0),
             quantity: dec!(0.1),
-            side: Side::Buy,
+            side: Action::Buy,
             timestamp: 1000,
             fee: dec!(0.5),
             fee_currency: "USD".to_string(),
         };
 
         assert_eq!(fill.notional(), dec!(5000.0));
-        assert_eq!(fill.net_value(), dec!(5000.5)); // Buy: notional + fee
+        assert_eq!(fill.net_value().unwrap(), dec!(5000.5)); // Buy: notional + fee
 
         let sell_fill = Fill {
-            side: Side::Sell,
+            side: Action::Sell,
             ..fill.clone()
         };
-        assert_eq!(sell_fill.net_value(), dec!(4999.5)); // Sell: notional - fee
+        assert_eq!(sell_fill.net_value().unwrap(), dec!(4999.5)); // Sell: notional - fee
+
+        let other_fill = Fill {
+            side: Action::Other,
+            ..fill.clone()
+        };
+        assert_eq!(
+            other_fill.net_value(),
+            Err(MMError::UnsupportedAction {
+                action: Action::Other
+            })
+        );
     }
 
     #[test]

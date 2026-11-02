@@ -18,15 +18,15 @@
 //! use market_maker_rs::backtest::{
 //!     ImmediateFillModel, FillModel, SimulatedOrder, MarketTick, FillResult
 //! };
-//! use market_maker_rs::execution::Side;
+//! use market_maker_rs::execution::Action;
 //! use market_maker_rs::dec;
 //!
 //! let model = ImmediateFillModel::new();
-//! let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+//! let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 //! let tick = MarketTick::new(1001, dec!(99.9), dec!(1.0), dec!(100.0), dec!(1.0));
 //!
 //! // Check if order fills
-//! let result = model.simulate_fill(&order, &tick, 1);
+//! let result = model.simulate_fill(&order, &tick, 1)?;
 //! match result {
 //!     FillResult::FullFill { fill_price } => println!("Filled at {}", fill_price),
 //!     FillResult::PartialFill { filled_quantity, fill_price } => {
@@ -34,10 +34,12 @@
 //!     }
 //!     FillResult::NoFill => println!("No fill"),
 //! }
+//! # Ok::<(), market_maker_rs::types::error::MMError>(())
 //! ```
 
 use crate::Decimal;
-use crate::execution::Side;
+use crate::execution::Action;
+use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,18 +57,19 @@ use serde::{Deserialize, Serialize};
 ///
 /// ```rust
 /// use market_maker_rs::backtest::SimulatedOrder;
-/// use market_maker_rs::execution::Side;
+/// use market_maker_rs::execution::Action;
 /// use market_maker_rs::dec;
 ///
-/// let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
-/// assert_eq!(order.side, Side::Buy);
+/// let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
+/// assert_eq!(order.side, Action::Buy);
 /// assert_eq!(order.price, dec!(100.0));
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SimulatedOrder {
-    /// Order side (Buy or Sell).
-    pub side: Side,
+    /// Order side. Only buy and sell are supported: fill models never fill
+    /// an order with any other action.
+    pub side: Action,
     /// Limit price.
     pub price: Decimal,
     /// Order quantity.
@@ -78,7 +81,7 @@ pub struct SimulatedOrder {
 impl SimulatedOrder {
     /// Creates a new simulated order.
     #[must_use]
-    pub fn new(side: Side, price: Decimal, quantity: Decimal, submitted_at: u64) -> Self {
+    pub fn new(side: Action, price: Decimal, quantity: Decimal, submitted_at: u64) -> Self {
         Self {
             side,
             price,
@@ -96,13 +99,18 @@ impl SimulatedOrder {
     /// Returns true if this is a buy order.
     #[must_use]
     pub fn is_buy(&self) -> bool {
-        self.side == Side::Buy
+        self.side == Action::Buy
     }
 
     /// Returns true if this is a sell order.
     #[must_use]
     pub fn is_sell(&self) -> bool {
-        self.side == Side::Sell
+        self.side == Action::Sell
+    }
+
+    /// The supported direction.
+    fn dir(&self) -> MMResult<Dir> {
+        Dir::try_from(self.side)
     }
 }
 
@@ -209,12 +217,18 @@ pub trait FillModel: Send + Sync {
     /// # Returns
     ///
     /// A `FillResult` indicating no fill, partial fill, or full fill.
+    ///
+    /// # Errors
+    ///
+    /// The built-in models return [`MMError::UnsupportedAction`] for an
+    /// order whose side is neither buy nor sell, without touching their
+    /// state; implementations may return their own errors.
     fn simulate_fill(
         &self,
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
-    ) -> FillResult;
+    ) -> MMResult<FillResult>;
 
     /// Resets the model state (e.g., queue positions).
     fn reset(&mut self);
@@ -261,16 +275,17 @@ pub trait FillModel: Send + Sync {
 ///
 /// ```rust
 /// use market_maker_rs::backtest::{ImmediateFillModel, FillModel, SimulatedOrder, MarketTick};
-/// use market_maker_rs::execution::Side;
+/// use market_maker_rs::execution::Action;
 /// use market_maker_rs::dec;
 ///
 /// let model = ImmediateFillModel::new();
-/// let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+/// let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 ///
 /// // Market ask at 99.9 <= order price 100.0, should fill
 /// let tick = MarketTick::new(1001, dec!(99.8), dec!(1.0), dec!(99.9), dec!(1.0));
-/// let result = model.simulate_fill(&order, &tick, 1);
+/// let result = model.simulate_fill(&order, &tick, 1)?;
 /// assert!(result.is_full_fill());
+/// # Ok::<(), market_maker_rs::types::error::MMError>(())
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct ImmediateFillModel;
@@ -283,15 +298,17 @@ impl ImmediateFillModel {
     }
 }
 
-impl FillModel for ImmediateFillModel {
-    fn simulate_fill(
+impl ImmediateFillModel {
+    /// The fill of a supported order: the model proper.
+    fn fill_for(
         &self,
+        dir: Dir,
         order: &SimulatedOrder,
         tick: &MarketTick,
         _time_in_queue_ms: u64,
     ) -> FillResult {
-        match order.side {
-            Side::Buy => {
+        match dir {
+            Dir::Buy => {
                 // Buy fills when market ask <= order price
                 if tick.ask_price <= order.price {
                     FillResult::FullFill {
@@ -301,7 +318,7 @@ impl FillModel for ImmediateFillModel {
                     FillResult::NoFill
                 }
             }
-            Side::Sell => {
+            Dir::Sell => {
                 // Sell fills when market bid >= order price
                 if tick.bid_price >= order.price {
                     FillResult::FullFill {
@@ -312,6 +329,18 @@ impl FillModel for ImmediateFillModel {
                 }
             }
         }
+    }
+}
+
+impl FillModel for ImmediateFillModel {
+    fn simulate_fill(
+        &self,
+        order: &SimulatedOrder,
+        tick: &MarketTick,
+        time_in_queue_ms: u64,
+    ) -> MMResult<FillResult> {
+        let dir = order.dir()?;
+        Ok(self.fill_for(dir, order, tick, time_in_queue_ms))
     }
 
     fn reset(&mut self) {}
@@ -341,11 +370,11 @@ impl FillModel for ImmediateFillModel {
 ///
 /// ```rust
 /// use market_maker_rs::backtest::{QueuePositionFillModel, FillModel, SimulatedOrder, MarketTick};
-/// use market_maker_rs::execution::Side;
+/// use market_maker_rs::execution::Action;
 /// use market_maker_rs::dec;
 ///
 /// let mut model = QueuePositionFillModel::new(dec!(0.1)); // 0.1 units per ms
-/// let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+/// let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 /// let tick = MarketTick::new(1001, dec!(99.9), dec!(10.0), dec!(100.1), dec!(10.0));
 ///
 /// // Update queue from market data
@@ -421,9 +450,11 @@ impl QueuePositionFillModel {
     }
 }
 
-impl FillModel for QueuePositionFillModel {
-    fn simulate_fill(
+impl QueuePositionFillModel {
+    /// The fill of a supported order: the model proper.
+    fn fill_for(
         &self,
+        dir: Dir,
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
@@ -434,9 +465,9 @@ impl FillModel for QueuePositionFillModel {
         }
 
         // First check if market has crossed our price
-        let market_crossed = match order.side {
-            Side::Buy => tick.ask_price <= order.price,
-            Side::Sell => tick.bid_price >= order.price,
+        let market_crossed = match dir {
+            Dir::Buy => tick.ask_price <= order.price,
+            Dir::Sell => tick.bid_price >= order.price,
         };
 
         if !market_crossed {
@@ -446,9 +477,9 @@ impl FillModel for QueuePositionFillModel {
         // When the market trades strictly through our price, the level has
         // been consumed and nothing is ahead; only an at touch level keeps
         // its estimated queue.
-        let through = match order.side {
-            Side::Buy => tick.ask_price < order.price,
-            Side::Sell => tick.bid_price > order.price,
+        let through = match dir {
+            Dir::Buy => tick.ask_price < order.price,
+            Dir::Sell => tick.bid_price > order.price,
         };
         let queue_ahead = if through {
             Decimal::ZERO
@@ -479,6 +510,18 @@ impl FillModel for QueuePositionFillModel {
             // Still waiting in queue
             FillResult::NoFill
         }
+    }
+}
+
+impl FillModel for QueuePositionFillModel {
+    fn simulate_fill(
+        &self,
+        order: &SimulatedOrder,
+        tick: &MarketTick,
+        time_in_queue_ms: u64,
+    ) -> MMResult<FillResult> {
+        let dir = order.dir()?;
+        Ok(self.fill_for(dir, order, tick, time_in_queue_ms))
     }
 
     fn reset(&mut self) {
@@ -542,7 +585,7 @@ impl Default for QueuePositionFillModel {
 ///
 /// ```rust
 /// use market_maker_rs::backtest::{ProbabilisticFillModel, FillModel, SimulatedOrder, MarketTick};
-/// use market_maker_rs::execution::Side;
+/// use market_maker_rs::execution::Action;
 /// use market_maker_rs::dec;
 ///
 /// let model = ProbabilisticFillModel::new(
@@ -552,7 +595,7 @@ impl Default for QueuePositionFillModel {
 ///     42,         // seed for reproducibility
 /// );
 ///
-/// let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+/// let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 /// let tick = MarketTick::new(1001, dec!(99.9), dec!(10.0), dec!(100.0), dec!(10.0));
 ///
 /// // Probability depends on depth and time
@@ -604,17 +647,32 @@ impl ProbabilisticFillModel {
     /// * `order` - The order to evaluate
     /// * `tick` - Current market tick
     /// * `time_in_queue_ms` - Time in queue in milliseconds
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if the order's side is neither
+    /// buy nor sell.
     pub fn calculate_probability(
         &self,
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
+    ) -> MMResult<Decimal> {
+        Ok(self.probability_for(order.dir()?, order, tick, time_in_queue_ms))
+    }
+
+    /// The fill probability of a supported order.
+    fn probability_for(
+        &self,
+        dir: Dir,
+        order: &SimulatedOrder,
+        tick: &MarketTick,
+        time_in_queue_ms: u64,
     ) -> Decimal {
         // Get available liquidity at our side
-        let available_liquidity = match order.side {
-            Side::Buy => tick.ask_size,
-            Side::Sell => tick.bid_size,
+        let available_liquidity = match dir {
+            Dir::Buy => tick.ask_size,
+            Dir::Sell => tick.bid_size,
         };
 
         // Calculate relative depth (order size / available liquidity)
@@ -647,17 +705,19 @@ impl ProbabilisticFillModel {
     }
 }
 
-impl FillModel for ProbabilisticFillModel {
-    fn simulate_fill(
+impl ProbabilisticFillModel {
+    /// The fill of a supported order: the model proper.
+    fn fill_for(
         &self,
+        dir: Dir,
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
     ) -> FillResult {
         // First check if market has crossed our price
-        let market_crossed = match order.side {
-            Side::Buy => tick.ask_price <= order.price,
-            Side::Sell => tick.bid_price >= order.price,
+        let market_crossed = match dir {
+            Dir::Buy => tick.ask_price <= order.price,
+            Dir::Sell => tick.bid_price >= order.price,
         };
 
         if !market_crossed {
@@ -665,7 +725,7 @@ impl FillModel for ProbabilisticFillModel {
         }
 
         // Calculate fill probability
-        let prob = self.calculate_probability(order, tick, time_in_queue_ms);
+        let prob = self.probability_for(dir, order, tick, time_in_queue_ms);
 
         // Generate random number and compare
         let random = self.next_random();
@@ -677,6 +737,19 @@ impl FillModel for ProbabilisticFillModel {
         } else {
             FillResult::NoFill
         }
+    }
+}
+
+impl FillModel for ProbabilisticFillModel {
+    fn simulate_fill(
+        &self,
+        order: &SimulatedOrder,
+        tick: &MarketTick,
+        time_in_queue_ms: u64,
+    ) -> MMResult<FillResult> {
+        // Before the random draw, so the generator state is untouched.
+        let dir = order.dir()?;
+        Ok(self.fill_for(dir, order, tick, time_in_queue_ms))
     }
 
     fn reset(&mut self) {
@@ -742,7 +815,7 @@ impl Default for ProbabilisticFillModel {
 /// use market_maker_rs::backtest::{
 ///     MarketImpactFillModel, ImmediateFillModel, FillModel, SimulatedOrder, MarketTick
 /// };
-/// use market_maker_rs::execution::Side;
+/// use market_maker_rs::execution::Action;
 /// use market_maker_rs::dec;
 ///
 /// let base_model = ImmediateFillModel::new();
@@ -752,7 +825,7 @@ impl Default for ProbabilisticFillModel {
 ///     base_model,
 /// );
 ///
-/// let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(100.0), 1000);
+/// let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(100.0), 1000);
 /// let tick = MarketTick::new(1001, dec!(99.9), dec!(1000.0), dec!(100.0), dec!(1000.0));
 ///
 /// // Calculate expected impact
@@ -820,21 +893,26 @@ impl<M: FillModel> FillModel for MarketImpactFillModel<M> {
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
-    ) -> FillResult {
+    ) -> MMResult<FillResult> {
+        // Checked here too: a custom base model may not reject an
+        // unsupported side itself.
+        let dir = order.dir()?;
         // First get result from base model
-        let base_result = self.base_model.simulate_fill(order, tick, time_in_queue_ms);
+        let base_result = self
+            .base_model
+            .simulate_fill(order, tick, time_in_queue_ms)?;
 
         // Apply market impact to fill price
-        match base_result {
+        Ok(match base_result {
             FillResult::NoFill => FillResult::NoFill,
             FillResult::PartialFill {
                 filled_quantity,
                 fill_price,
             } => {
                 let impact = self.calculate_impact(filled_quantity);
-                let adjusted_price = match order.side {
-                    Side::Buy => fill_price + impact,
-                    Side::Sell => fill_price - impact,
+                let adjusted_price = match dir {
+                    Dir::Buy => fill_price + impact,
+                    Dir::Sell => fill_price - impact,
                 };
                 FillResult::PartialFill {
                     filled_quantity,
@@ -843,15 +921,15 @@ impl<M: FillModel> FillModel for MarketImpactFillModel<M> {
             }
             FillResult::FullFill { fill_price } => {
                 let impact = self.calculate_impact(order.quantity);
-                let adjusted_price = match order.side {
-                    Side::Buy => fill_price + impact,
-                    Side::Sell => fill_price - impact,
+                let adjusted_price = match dir {
+                    Dir::Buy => fill_price + impact,
+                    Dir::Sell => fill_price - impact,
                 };
                 FillResult::FullFill {
                     fill_price: adjusted_price,
                 }
             }
-        }
+        })
     }
 
     fn reset(&mut self) {
@@ -927,9 +1005,9 @@ mod tests {
     // SimulatedOrder tests
     #[test]
     fn test_simulated_order_new() {
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 
-        assert_eq!(order.side, Side::Buy);
+        assert_eq!(order.side, Action::Buy);
         assert_eq!(order.price, dec!(100.0));
         assert_eq!(order.quantity, dec!(1.0));
         assert_eq!(order.submitted_at, 1000);
@@ -937,14 +1015,14 @@ mod tests {
 
     #[test]
     fn test_simulated_order_notional() {
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(2.5), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(2.5), 1000);
         assert_eq!(order.notional(), dec!(250.0));
     }
 
     #[test]
     fn test_simulated_order_is_buy_sell() {
-        let buy = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
-        let sell = SimulatedOrder::new(Side::Sell, dec!(100.0), dec!(1.0), 1000);
+        let buy = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
+        let sell = SimulatedOrder::new(Action::Sell, dec!(100.0), dec!(1.0), 1000);
 
         assert!(buy.is_buy());
         assert!(!buy.is_sell());
@@ -995,11 +1073,11 @@ mod tests {
     #[test]
     fn test_immediate_fill_buy_fills() {
         let model = ImmediateFillModel::new();
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 
         // Ask at 99.9 <= order price 100.0, should fill
         let tick = create_test_tick(dec!(99.8), dec!(99.9));
-        let result = model.simulate_fill(&order, &tick, 0);
+        let result = model.simulate_fill(&order, &tick, 0).unwrap();
 
         assert!(result.is_full_fill());
         assert_eq!(result.fill_price(), Some(dec!(100.0)));
@@ -1008,11 +1086,11 @@ mod tests {
     #[test]
     fn test_immediate_fill_buy_no_fill() {
         let model = ImmediateFillModel::new();
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 
         // Ask at 100.1 > order price 100.0, should not fill
         let tick = create_test_tick(dec!(100.0), dec!(100.1));
-        let result = model.simulate_fill(&order, &tick, 0);
+        let result = model.simulate_fill(&order, &tick, 0).unwrap();
 
         assert!(!result.is_filled());
     }
@@ -1020,11 +1098,11 @@ mod tests {
     #[test]
     fn test_immediate_fill_sell_fills() {
         let model = ImmediateFillModel::new();
-        let order = SimulatedOrder::new(Side::Sell, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Sell, dec!(100.0), dec!(1.0), 1000);
 
         // Bid at 100.1 >= order price 100.0, should fill
         let tick = create_test_tick(dec!(100.1), dec!(100.2));
-        let result = model.simulate_fill(&order, &tick, 0);
+        let result = model.simulate_fill(&order, &tick, 0).unwrap();
 
         assert!(result.is_full_fill());
         assert_eq!(result.fill_price(), Some(dec!(100.0)));
@@ -1033,11 +1111,11 @@ mod tests {
     #[test]
     fn test_immediate_fill_sell_no_fill() {
         let model = ImmediateFillModel::new();
-        let order = SimulatedOrder::new(Side::Sell, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Sell, dec!(100.0), dec!(1.0), 1000);
 
         // Bid at 99.9 < order price 100.0, should not fill
         let tick = create_test_tick(dec!(99.9), dec!(100.1));
-        let result = model.simulate_fill(&order, &tick, 0);
+        let result = model.simulate_fill(&order, &tick, 0).unwrap();
 
         assert!(!result.is_filled());
     }
@@ -1069,11 +1147,11 @@ mod tests {
     #[test]
     fn test_queue_position_no_fill_market_not_crossed() {
         let model = QueuePositionFillModel::new(dec!(0.1));
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 
         // Ask at 100.1 > order price, market not crossed
         let tick = create_test_tick(dec!(99.9), dec!(100.1));
-        let result = model.simulate_fill(&order, &tick, 1000);
+        let result = model.simulate_fill(&order, &tick, 1000).unwrap();
 
         assert!(!result.is_filled());
     }
@@ -1081,28 +1159,28 @@ mod tests {
     #[test]
     fn test_queue_position_fill_after_queue_clears() {
         let mut model = QueuePositionFillModel::new(dec!(0.1)); // 0.1 per ms
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
 
         // Set up queue with 5 units ahead
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(5.0));
         model.update_queue(&tick);
 
         // After 60ms: cleared 6 units, queue was 5, order is 1 -> full fill
-        let result = model.simulate_fill(&order, &tick, 60);
+        let result = model.simulate_fill(&order, &tick, 60).unwrap();
         assert!(result.is_full_fill());
     }
 
     #[test]
     fn test_queue_position_partial_fill() {
         let mut model = QueuePositionFillModel::new(dec!(0.1)); // 0.1 per ms
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(2.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(2.0), 1000);
 
         // Set up queue with 5 units ahead
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(5.0));
         model.update_queue(&tick);
 
         // After 60ms: cleared 6 units, queue was 5, partial fill of 1 unit
-        let result = model.simulate_fill(&order, &tick, 60);
+        let result = model.simulate_fill(&order, &tick, 60).unwrap();
         assert!(result.is_partial_fill());
         assert_eq!(result.filled_quantity(dec!(2.0)), dec!(1.0));
     }
@@ -1110,15 +1188,15 @@ mod tests {
     #[test]
     fn test_queue_position_min_queue_time() {
         let model = QueuePositionFillModel::with_min_queue_time(dec!(0.1), 100);
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
         let tick = create_test_tick(dec!(99.9), dec!(99.9)); // Market crossed
 
         // Before min time
-        let result = model.simulate_fill(&order, &tick, 50);
+        let result = model.simulate_fill(&order, &tick, 50).unwrap();
         assert!(!result.is_filled());
 
         // After min time
-        let _result = model.simulate_fill(&order, &tick, 100);
+        let _result = model.simulate_fill(&order, &tick, 100).unwrap();
         // May or may not fill depending on queue, but min time check passed
     }
 
@@ -1148,10 +1226,10 @@ mod tests {
     #[test]
     fn test_probabilistic_calculate_probability() {
         let model = ProbabilisticFillModel::new(dec!(0.5), dec!(1.0), dec!(0.01), 42);
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(10.0));
 
-        let prob = model.calculate_probability(&order, &tick, 100);
+        let prob = model.calculate_probability(&order, &tick, 100).unwrap();
 
         // Probability should be between 0 and base_probability
         assert!(prob >= Decimal::ZERO);
@@ -1161,11 +1239,11 @@ mod tests {
     #[test]
     fn test_probabilistic_probability_increases_with_time() {
         let model = ProbabilisticFillModel::new(dec!(0.5), dec!(1.0), dec!(0.01), 42);
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(10.0));
 
-        let prob_early = model.calculate_probability(&order, &tick, 10);
-        let prob_late = model.calculate_probability(&order, &tick, 100);
+        let prob_early = model.calculate_probability(&order, &tick, 10).unwrap();
+        let prob_late = model.calculate_probability(&order, &tick, 100).unwrap();
 
         assert!(prob_late > prob_early);
     }
@@ -1175,12 +1253,12 @@ mod tests {
         let model1 = ProbabilisticFillModel::new(dec!(0.5), dec!(1.0), dec!(0.01), 42);
         let model2 = ProbabilisticFillModel::new(dec!(0.5), dec!(1.0), dec!(0.01), 42);
 
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
         let tick = create_test_tick(dec!(99.9), dec!(99.9)); // Market crossed
 
         // Same seed should produce same results
-        let result1 = model1.simulate_fill(&order, &tick, 100);
-        let result2 = model2.simulate_fill(&order, &tick, 100);
+        let result1 = model1.simulate_fill(&order, &tick, 100).unwrap();
+        let result2 = model2.simulate_fill(&order, &tick, 100).unwrap();
 
         assert_eq!(result1, result2);
     }
@@ -1188,12 +1266,12 @@ mod tests {
     #[test]
     fn test_probabilistic_reset() {
         let mut model = ProbabilisticFillModel::new(dec!(0.5), dec!(1.0), dec!(0.01), 42);
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
         let tick = create_test_tick(dec!(99.9), dec!(99.9));
 
-        let result1 = model.simulate_fill(&order, &tick, 100);
+        let result1 = model.simulate_fill(&order, &tick, 100).unwrap();
         model.reset();
-        let result2 = model.simulate_fill(&order, &tick, 100);
+        let result2 = model.simulate_fill(&order, &tick, 100).unwrap();
 
         // After reset, should get same result
         assert_eq!(result1, result2);
@@ -1215,10 +1293,10 @@ mod tests {
     fn test_market_impact_buy_increases_price() {
         let model = MarketImpactFillModel::new(dec!(1.0), dec!(1000.0), ImmediateFillModel::new());
 
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(100.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(100.0), 1000);
         let tick = create_test_tick(dec!(99.9), dec!(99.9)); // Market crossed
 
-        let result = model.simulate_fill(&order, &tick, 0);
+        let result = model.simulate_fill(&order, &tick, 0).unwrap();
 
         // Buy should have higher fill price due to impact
         if let FillResult::FullFill { fill_price } = result {
@@ -1232,10 +1310,10 @@ mod tests {
     fn test_market_impact_sell_decreases_price() {
         let model = MarketImpactFillModel::new(dec!(1.0), dec!(1000.0), ImmediateFillModel::new());
 
-        let order = SimulatedOrder::new(Side::Sell, dec!(100.0), dec!(100.0), 1000);
+        let order = SimulatedOrder::new(Action::Sell, dec!(100.0), dec!(100.0), 1000);
         let tick = create_test_tick(dec!(100.1), dec!(100.2)); // Market crossed
 
-        let result = model.simulate_fill(&order, &tick, 0);
+        let result = model.simulate_fill(&order, &tick, 0).unwrap();
 
         // Sell should have lower fill price due to impact
         if let FillResult::FullFill { fill_price } = result {
@@ -1250,10 +1328,10 @@ mod tests {
         let model =
             MarketImpactFillModel::new(dec!(0.1), dec!(1000000.0), ImmediateFillModel::new());
 
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
         let tick = create_test_tick(dec!(99.9), dec!(100.1)); // Market not crossed
 
-        let result = model.simulate_fill(&order, &tick, 0);
+        let result = model.simulate_fill(&order, &tick, 0).unwrap();
         assert!(!result.is_filled());
     }
 
@@ -1286,7 +1364,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn test_simulated_order_serialization() {
-        let order = SimulatedOrder::new(Side::Buy, dec!(100.0), dec!(1.0), 1000);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
         let json = serde_json::to_string(&order).unwrap();
         let deserialized: SimulatedOrder = serde_json::from_str(&json).unwrap();
         assert_eq!(order, deserialized);
@@ -1321,16 +1399,12 @@ mod tests {
         let crossing = MarketTick::new(10, dec!(99), dec!(3), dec!(100), dec!(3));
         for mut model in all_models() {
             model.on_tick(&crossing);
-            for side in [Side::Buy, Side::Sell] {
-                let price = match side {
-                    Side::Buy => dec!(100),
-                    Side::Sell => dec!(99),
-                };
+            for (side, price) in [(Action::Buy, dec!(100)), (Action::Sell, dec!(99))] {
                 let order = SimulatedOrder::new(side, price, dec!(2), 0);
                 for t in [0u64, 1, 5, 50, 5000] {
                     if let FillResult::PartialFill {
                         filled_quantity, ..
-                    } = model.simulate_fill(&order, &crossing, t)
+                    } = model.simulate_fill(&order, &crossing, t).unwrap()
                     {
                         assert!(filled_quantity > Decimal::ZERO, "{}", model.name());
                         assert!(filled_quantity <= order.quantity, "{}", model.name());
@@ -1346,11 +1420,17 @@ mod tests {
         let tick = MarketTick::new(10, dec!(99), dec!(3), dec!(101), dec!(3));
         for mut model in all_models() {
             model.on_tick(&tick);
-            let buy = SimulatedOrder::new(Side::Buy, dec!(100), dec!(1), 0);
-            let sell = SimulatedOrder::new(Side::Sell, dec!(100), dec!(1), 0);
+            let buy = SimulatedOrder::new(Action::Buy, dec!(100), dec!(1), 0);
+            let sell = SimulatedOrder::new(Action::Sell, dec!(100), dec!(1), 0);
             if model.name() != "Probabilistic" {
-                assert_eq!(model.simulate_fill(&buy, &tick, 100), FillResult::NoFill);
-                assert_eq!(model.simulate_fill(&sell, &tick, 100), FillResult::NoFill);
+                assert_eq!(
+                    model.simulate_fill(&buy, &tick, 100).unwrap(),
+                    FillResult::NoFill
+                );
+                assert_eq!(
+                    model.simulate_fill(&sell, &tick, 100).unwrap(),
+                    FillResult::NoFill
+                );
             }
         }
     }
@@ -1423,5 +1503,75 @@ mod tests {
         assert_eq!(model.get_queue_depth(dec!(100)), dec!(2));
         assert_eq!(model.get_queue_depth(dec!(100.00)), dec!(2));
         assert_eq!(model.get_queue_depth(dec!(99)), dec!(4));
+    }
+
+    fn unsupported() -> MMError {
+        MMError::UnsupportedAction {
+            action: Action::Other,
+        }
+    }
+
+    #[test]
+    fn test_unsupported_action_returns_err() {
+        // Crosses both a buy at 100 and a sell at 99.
+        let crossing = MarketTick::new(10, dec!(99), dec!(3), dec!(100), dec!(3));
+        let order = SimulatedOrder::new(Action::Other, dec!(100), dec!(2), 0);
+        for mut model in all_models() {
+            model.on_tick(&crossing);
+            for t in [0u64, 1, 5, 50, 5000] {
+                assert_eq!(
+                    model.simulate_fill(&order, &crossing, t),
+                    Err(unsupported()),
+                    "{} t={t}",
+                    model.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_probabilistic_unsupported_action_keeps_generator_state() {
+        let model = ProbabilisticFillModel::default();
+        let crossing = MarketTick::new(10, dec!(99), dec!(3), dec!(100), dec!(3));
+        let order = SimulatedOrder::new(Action::Other, dec!(100), dec!(2), 0);
+        let before = model.state.load(Ordering::Relaxed);
+        assert_eq!(
+            model.simulate_fill(&order, &crossing, 5000),
+            Err(unsupported())
+        );
+        assert_eq!(
+            model.calculate_probability(&order, &crossing, 5000),
+            Err(unsupported())
+        );
+        assert_eq!(model.state.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn test_market_impact_unsupported_action_returns_err_despite_base_model() {
+        /// Fills every order in full at its limit price.
+        struct AlwaysFill;
+        impl FillModel for AlwaysFill {
+            fn simulate_fill(
+                &self,
+                order: &SimulatedOrder,
+                _tick: &MarketTick,
+                _time_in_queue_ms: u64,
+            ) -> MMResult<FillResult> {
+                Ok(FillResult::FullFill {
+                    fill_price: order.price,
+                })
+            }
+            fn reset(&mut self) {}
+            fn name(&self) -> &'static str {
+                "AlwaysFill"
+            }
+        }
+
+        let model = MarketImpactFillModel::new(dec!(0.1), dec!(1000), AlwaysFill);
+        let tick = create_test_tick(dec!(99), dec!(101));
+        let other = SimulatedOrder::new(Action::Other, dec!(100), dec!(2), 0);
+        assert_eq!(model.simulate_fill(&other, &tick, 0), Err(unsupported()));
+        let buy = SimulatedOrder::new(Action::Buy, dec!(100), dec!(2), 0);
+        assert!(model.simulate_fill(&buy, &tick, 0).unwrap().is_full_fill());
     }
 }
