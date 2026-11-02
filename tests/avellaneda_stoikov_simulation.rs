@@ -37,19 +37,32 @@ struct AsStrategy {
     sigma: Decimal,
     k: Decimal,
     horizon_ms: u64,
+    decisions: usize,
+    errors: usize,
+    crossed: usize,
 }
 
 impl BacktestStrategy for AsStrategy {
     fn on_tick(&mut self, tick: &MarketTick, position: &InventoryPosition) -> Option<Quote> {
-        let (bid, ask) = calculate_optimal_quotes(
+        self.decisions += 1;
+        let (bid, ask) = match calculate_optimal_quotes(
             tick.mid_price(),
             position.quantity,
             self.gamma,
             self.sigma,
             self.horizon_ms,
             self.k,
-        )
-        .ok()?;
+        ) {
+            Ok(quotes) => quotes,
+            Err(_) => {
+                // Counted so a test fails instead of silently skipping ticks.
+                self.errors += 1;
+                return None;
+            }
+        };
+        if bid >= ask {
+            self.crossed += 1;
+        }
         Some(Quote {
             bid_price: bid,
             bid_size: dec!(1),
@@ -59,7 +72,11 @@ impl BacktestStrategy for AsStrategy {
         })
     }
     fn on_fill(&mut self, _fill: &SimulatedFill) {}
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.decisions = 0;
+        self.errors = 0;
+        self.crossed = 0;
+    }
 }
 
 /// Deterministic path with a 0.10 wide book: a 60 tick downtrend of 0.8
@@ -113,6 +130,9 @@ fn unlimited() -> BacktestEngine<AsStrategy, VecDataSource> {
             sigma: dec!(2),
             k: dec!(1.5),
             horizon_ms: 3_600_000,
+            decisions: 0,
+            errors: 0,
+            crossed: 0,
         },
         VecDataSource::new(ticks()),
     )
@@ -132,6 +152,11 @@ fn quotes_respect_tick_grid_and_never_cross() {
     let mut engine = engine();
     let result = engine.run();
     assert!(result.num_trades > 0, "the path must exercise fills");
+    // Every decision produced a valid, uncrossed quote.
+    let strategy = engine.strategy();
+    assert!(strategy.decisions > 0);
+    assert_eq!(strategy.errors, 0, "quote generation failed on some ticks");
+    assert_eq!(strategy.crossed, 0, "some quotes were crossed");
     let accepted: Vec<_> = engine
         .execution_reports()
         .iter()
