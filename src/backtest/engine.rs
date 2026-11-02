@@ -75,13 +75,15 @@ use crate::execution::Side;
 use crate::position::inventory::InventoryPosition;
 use crate::position::pnl::PnL;
 use crate::strategy::quote::Quote;
-use crate::types::error::MMResult;
+use crate::types::error::{MMError, MMResult};
 
+use super::accounting::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
 use super::data::{HistoricalDataSource, MarketTick};
 use super::fill_models::{FillModel, FillResult, ImmediateFillModel, SimulatedOrder};
 use super::latency::{JitterRng, SimLatencyConfig};
 use super::lifecycle::{ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::panic::{RefUnwindSafe, UnwindSafe};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -516,6 +518,10 @@ pub struct BacktestEngine<
     agent_position: InventoryPosition,
     last_delivery_at: u64,
     last_observed_at: u64,
+    /// Selected accountant; `None` keeps the built in bookkeeping.
+    accountant: Option<Box<dyn FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe>>,
+    accounting_errors: Vec<(u64, MMError)>,
+    next_execution_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -610,6 +616,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             agent_position: InventoryPosition::new(),
             last_delivery_at: 0,
             last_observed_at: 0,
+            accountant: None,
+            accounting_errors: Vec::new(),
+            next_execution_id: 1,
         }
     }
 
@@ -808,7 +817,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let stamp = self.clock.stamp();
             let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
             let fill = SimulatedFill::with_fee(side, price, quantity, now, fee);
-            self.process_fill(fill.clone());
+            let (order_id, cumulative) = (self.orders[index].id, self.orders[index].filled);
+            self.process_fill(fill.clone(), order_id, cumulative);
             self.queue_delivery(report, Some(fill));
         }
         let targets = &self.cancel_targets;
@@ -1010,7 +1020,29 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     }
 
     /// Processes a fill: updates position, PnL, and notifies strategy.
-    fn process_fill(&mut self, fill: SimulatedFill) {
+    fn process_fill(&mut self, fill: SimulatedFill, order_id: SimOrderId, cumulative: Decimal) {
+        let execution_id = self.next_execution_id;
+        self.next_execution_id += 1;
+        if let Some(accountant) = self.accountant.as_mut() {
+            let posted = AccountingFill {
+                execution_id,
+                order_id,
+                side: fill.side,
+                price: fill.price,
+                quantity: fill.quantity,
+                cumulative_quantity: cumulative,
+                fee: fill.fee,
+                fee_asset: FeeAsset::Quote,
+                timestamp: fill.timestamp,
+            };
+            if let Err(error) = accountant.post_fill(&posted) {
+                self.accounting_errors.push((execution_id, error));
+            }
+            self.sync_accounting(fill.timestamp);
+            self.track_fill(fill);
+            return;
+        }
+
         // Update position
         let signed_qty = match fill.side {
             Side::Buy => fill.quantity,
@@ -1029,7 +1061,11 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
         // Track fees
         self.total_fees += fill.fee;
+        self.track_fill(fill);
+    }
 
+    /// Updates the position high water mark and records the trade.
+    fn track_fill(&mut self, fill: SimulatedFill) {
         // Track max position
         let abs_position = self.position.quantity.abs();
         if abs_position > self.max_position {
@@ -1114,6 +1150,42 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         &self.fill_model
     }
 
+    /// Selects `accountant` as the single accounting authority for fills.
+    ///
+    /// Every fill is posted to it exactly once and the position, PnL, fees
+    /// and equity of the run are read from its snapshot instead of the built
+    /// in bookkeeping. See [`crate::backtest::accounting`].
+    #[must_use]
+    pub fn with_accountant(
+        mut self,
+        accountant: impl FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
+    ) -> Self {
+        self.accountant = Some(Box::new(accountant));
+        self.sync_accounting(0);
+        self
+    }
+
+    /// Snapshot of the selected accountant, if one was selected.
+    #[must_use]
+    pub fn accounting_snapshot(&self) -> Option<AccountingSnapshot> {
+        self.accountant.as_ref().map(|a| a.snapshot())
+    }
+
+    /// Description of the selected accountant, if one was selected.
+    #[must_use]
+    pub fn accountant_description(&self) -> Option<String> {
+        self.accountant.as_ref().map(|a| a.description())
+    }
+
+    /// Posts the selected accountant refused, as `(execution id, error)`.
+    ///
+    /// The fill still happened at the venue; the result metrics follow the
+    /// accountant, so a non empty list means they disagree with the venue.
+    #[must_use]
+    pub fn accounting_errors(&self) -> &[(u64, MMError)] {
+        &self.accounting_errors
+    }
+
     /// Describes the fill model and its parameters, for result reports.
     #[must_use]
     pub fn fill_model_description(&self) -> String {
@@ -1164,7 +1236,30 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.last_delivery_at = 0;
         self.last_observed_at = 0;
         self.next_order_id = 1;
+        if let Some(accountant) = self.accountant.as_mut() {
+            accountant.reset();
+        }
+        self.accounting_errors.clear();
+        self.next_execution_id = 1;
         self.reports.clear();
+        self.sync_accounting(0);
+    }
+
+    /// Copies the selected accountant's state into the engine's position,
+    /// PnL and fee fields, so runs start from the accountant's initial
+    /// state (also with no fills at all).
+    fn sync_accounting(&mut self, timestamp: u64) {
+        let Some(accountant) = self.accountant.as_ref() else {
+            return;
+        };
+        let snapshot = accountant.snapshot();
+        self.position.quantity = snapshot.position;
+        self.position.avg_entry_price = snapshot.average_entry_price.unwrap_or(Decimal::ZERO);
+        self.position.last_update = timestamp;
+        self.pnl.realized = snapshot.cash_flow;
+        self.pnl.total = self.pnl.realized + self.pnl.unrealized;
+        self.total_fees = snapshot.fees;
+        self.max_position = self.max_position.max(snapshot.position.abs());
     }
 }
 
@@ -2245,6 +2340,305 @@ mod tests {
         assert_eq!(engine.open_orders().len(), 2);
     }
 
+    /// Accountant test double: books like the built in bookkeeping and
+    /// records every posted fill in a shared log.
+    #[derive(Debug, Default)]
+    struct RecordingAccountant {
+        log: std::sync::Arc<std::sync::Mutex<Vec<AccountingFill>>>,
+        snapshot: AccountingSnapshot,
+        refuse_from: Option<u64>,
+    }
+
+    impl FillAccountant for RecordingAccountant {
+        fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
+            if self.refuse_from.is_some_and(|id| fill.execution_id >= id) {
+                return Err(MMError::InvalidPositionUpdate("refused".to_string()));
+            }
+            self.log.lock().unwrap().push(fill.clone());
+            self.snapshot.position += fill.signed_quantity();
+            self.snapshot.cash_flow += fill.cash_flow();
+            self.snapshot.fees += fill.fee;
+            self.snapshot.fills_posted += 1;
+            Ok(())
+        }
+        fn snapshot(&self) -> AccountingSnapshot {
+            self.snapshot.clone()
+        }
+        fn reset(&mut self) {
+            self.log.lock().unwrap().clear();
+            self.snapshot = AccountingSnapshot::default();
+        }
+        fn description(&self) -> String {
+            "recording test double".to_string()
+        }
+    }
+
+    fn queued_engine_with_fees()
+    -> BacktestEngine<ScriptedStrategy, VecDataSource, QueuePositionFillModel> {
+        BacktestEngine::with_fill_model(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(2))
+                .with_fee_rate(dec!(0.001)),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+            QueuePositionFillModel::new(dec!(0.5)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_accountant_receives_each_fill_once_with_fee_context() {
+        let accountant = RecordingAccountant::default();
+        let log = accountant.log.clone();
+        let mut engine = queued_engine_with_fees().with_accountant(accountant);
+        let result = engine.run();
+
+        let log = log.lock().unwrap();
+        let posted: Vec<(u64, SimOrderId, Decimal, Decimal, Decimal, FeeAsset)> = log
+            .iter()
+            .map(|f| {
+                (
+                    f.execution_id,
+                    f.order_id,
+                    f.quantity,
+                    f.cumulative_quantity,
+                    f.fee,
+                    f.fee_asset,
+                )
+            })
+            .collect();
+        assert_eq!(
+            posted,
+            vec![
+                (1, 1, dec!(0.5), dec!(0.5), dec!(0.05), FeeAsset::Quote),
+                (2, 1, dec!(1.0), dec!(1.5), dec!(0.1), FeeAsset::Quote),
+                (3, 1, dec!(0.5), dec!(2.0), dec!(0.05), FeeAsset::Quote),
+            ]
+        );
+        assert_eq!(result.num_trades, 3);
+        assert!(engine.accounting_errors().is_empty());
+        assert_eq!(
+            engine.accountant_description().as_deref(),
+            Some("recording test double")
+        );
+    }
+
+    #[test]
+    fn test_selected_accountant_matches_builtin_results() {
+        let builtin = queued_engine_with_fees().run();
+        let mut engine = queued_engine_with_fees().with_accountant(RecordingAccountant::default());
+        let selected = engine.run();
+        assert_eq!(selected.final_position, builtin.final_position);
+        assert_eq!(selected.total_fees, builtin.total_fees);
+        assert_eq!(selected.total_pnl, builtin.total_pnl);
+        assert_eq!(selected.net_pnl, builtin.net_pnl);
+        assert_eq!(selected.max_position, builtin.max_position);
+        let snapshot = engine.accounting_snapshot().unwrap();
+        assert_eq!(snapshot.fills_posted, 3);
+        assert_eq!(snapshot.cash_flow, dec!(-200));
+        assert_eq!(snapshot.fees, dec!(0.2));
+    }
+
+    #[test]
+    fn test_refused_posts_are_reported_and_metrics_follow_accountant() {
+        let accountant = RecordingAccountant {
+            refuse_from: Some(3),
+            ..RecordingAccountant::default()
+        };
+        let mut engine = queued_engine_with_fees().with_accountant(accountant);
+        let result = engine.run();
+        // The venue filled 2.0; the accountant only booked the first 1.5.
+        assert_eq!(result.num_trades, 3);
+        assert_eq!(result.final_position, dec!(1.5));
+        let errors: Vec<u64> = engine
+            .accounting_errors()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(errors, vec![3]);
+    }
+
+    #[test]
+    fn test_accountant_is_reset_with_engine() {
+        let accountant = RecordingAccountant::default();
+        let log = accountant.log.clone();
+        let mut engine = queued_engine_with_fees().with_accountant(accountant);
+        let first = engine.run();
+        let first_log = log.lock().unwrap().clone();
+        engine.reset();
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(
+            engine.accounting_snapshot(),
+            Some(AccountingSnapshot::default())
+        );
+        let second = engine.run();
+        assert_eq!(*log.lock().unwrap(), first_log);
+        assert_eq!(second.net_pnl, first.net_pnl);
+    }
+
+    #[cfg(feature = "margin")]
+    mod margin_ledger {
+        use super::*;
+        use crate::backtest::MarginLedgerAccountant;
+        use margin_rs::ledger::Ledger;
+        use margin_rs::{Asset, InstrumentId, SpotInstrument, TransferId};
+
+        fn accountant(deposit: Decimal) -> MarginLedgerAccountant {
+            let usdc = Asset::new("USDC").unwrap();
+            let btc = Asset::new("BTC").unwrap();
+            let pair = InstrumentId::new("BTC-USDC").unwrap();
+            let mut ledger = Ledger::default();
+            ledger.register_asset(usdc.clone(), 6).unwrap();
+            ledger.register_asset(btc.clone(), 8).unwrap();
+            ledger
+                .register_instrument(
+                    SpotInstrument::new(pair.clone(), btc, usdc.clone(), 2, 2).unwrap(),
+                )
+                .unwrap();
+            ledger
+                .deposit(TransferId::new("seed").unwrap(), usdc, deposit)
+                .unwrap();
+            MarginLedgerAccountant::new(ledger, pair).unwrap()
+        }
+
+        #[test]
+        fn test_margin_ledger_reconciles_with_builtin_results() {
+            let builtin = queued_engine_with_fees().run();
+            let mut engine = queued_engine_with_fees().with_accountant(accountant(dec!(1000)));
+            let result = engine.run();
+            assert!(engine.accounting_errors().is_empty());
+            assert_eq!(result.final_position, builtin.final_position);
+            assert_eq!(result.total_fees, dec!(0.2));
+            assert_eq!(result.net_pnl, builtin.net_pnl);
+            let snapshot = engine.accounting_snapshot().unwrap();
+            assert_eq!(snapshot.cash_flow, dec!(-200));
+            assert_eq!(snapshot.average_entry_price, Some(dec!(100)));
+            assert_eq!(snapshot.fills_posted, 3);
+        }
+
+        #[test]
+        fn test_margin_ledger_books_venue_fills_beyond_the_balance() {
+            // 100.05 USDC covers only the first 0.5; the venue still filled
+            // 2.0, so the ledger books it and records the shortfall.
+            let mut engine = queued_engine_with_fees().with_accountant(accountant(dec!(100.05)));
+            let result = engine.run();
+            assert_eq!(result.num_trades, 3);
+            assert_eq!(result.final_position, dec!(2));
+            assert!(engine.accounting_errors().is_empty());
+        }
+
+        fn ask_fill(id: u64, price: Decimal, quantity: Decimal, fee: Decimal) -> AccountingFill {
+            AccountingFill {
+                execution_id: id,
+                order_id: id,
+                side: Side::Sell,
+                price,
+                quantity,
+                cumulative_quantity: quantity,
+                fee,
+                fee_asset: FeeAsset::Quote,
+                timestamp: 0,
+            }
+        }
+
+        #[test]
+        fn test_sell_first_without_base_is_booked_with_overdraft() {
+            let mut acc = accountant(dec!(1000));
+            acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(0.1)))
+                .unwrap();
+            let snapshot = acc.snapshot();
+            assert_eq!(snapshot.position, dec!(-1));
+            assert_eq!(snapshot.cash_flow, dec!(100));
+            assert_eq!(snapshot.fees, dec!(0.1));
+            let btc = Asset::new("BTC").unwrap();
+            assert_eq!(acc.overdrafts().get(&btc), Some(&dec!(1)));
+            acc.reset();
+            assert!(acc.overdrafts().is_empty());
+        }
+
+        #[test]
+        fn test_negative_fee_is_booked_as_rebate() {
+            let mut acc = accountant(dec!(1000));
+            acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(-0.05)))
+                .unwrap();
+            assert_eq!(acc.snapshot().fees, dec!(-0.05));
+        }
+
+        #[test]
+        fn test_base_fee_is_refused() {
+            let mut acc = accountant(dec!(1000));
+            let mut fill = ask_fill(1, dec!(100), dec!(1), dec!(0.01));
+            fill.fee_asset = FeeAsset::Base;
+            assert!(acc.post_fill(&fill).is_err());
+            assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+        }
+
+        #[test]
+        fn test_other_instruments_do_not_leak_into_the_snapshot() {
+            let usdc = Asset::new("USDC").unwrap();
+            let eth = Asset::new("ETH").unwrap();
+            let eth_pair = InstrumentId::new("ETH-USDC").unwrap();
+            let mut ledger = accountant(dec!(1000)).ledger().clone();
+            ledger.register_asset(eth.clone(), 8).unwrap();
+            ledger
+                .register_instrument(
+                    SpotInstrument::new(eth_pair.clone(), eth, usdc.clone(), 2, 2).unwrap(),
+                )
+                .unwrap();
+            let eth_buy = margin_rs::ledger::Execution::new(
+                margin_rs::ExecutionId::new("eth-1").unwrap(),
+                eth_pair,
+                margin_rs::ledger::Side::Buy,
+                dec!(100),
+                dec!(1),
+            )
+            .with_fee(usdc, dec!(0.1));
+            ledger.book_execution(&eth_buy).unwrap();
+            let acc = MarginLedgerAccountant::new(ledger, InstrumentId::new("BTC-USDC").unwrap())
+                .unwrap();
+            assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+        }
+
+        #[test]
+        fn test_initial_ledger_state_is_used_without_fills() {
+            // Seed a prior BTC position: buy 1 at 90 with a 0.09 fee.
+            let mut acc = accountant(dec!(1000));
+            let buy = AccountingFill {
+                side: Side::Buy,
+                ..ask_fill(99, dec!(90), dec!(1), dec!(0.09))
+            };
+            acc.post_fill(&buy).unwrap();
+            let seeded = MarginLedgerAccountant::new(
+                acc.ledger().clone(),
+                InstrumentId::new("BTC-USDC").unwrap(),
+            )
+            .unwrap();
+            let ticks = vec![create_test_tick(1000, dec!(99.0), dec!(101.0))];
+            let mut engine = BacktestEngine::new(
+                BacktestConfig::default(),
+                ScriptedStrategy::new(vec![None]),
+                VecDataSource::new(ticks),
+            )
+            .with_accountant(seeded);
+            let result = engine.run();
+            assert_eq!(result.num_trades, 0);
+            assert_eq!(result.final_position, dec!(1));
+            assert_eq!(result.total_fees, dec!(0.09));
+            assert_eq!(result.max_position, dec!(1));
+            // Marked at mid 100: -90 cash + 100 inventory, before fees.
+            assert_eq!(result.total_pnl, dec!(10));
+            engine.reset();
+            assert_eq!(engine.get_state().0.quantity, dec!(1));
+        }
+
+        #[test]
+        fn test_unknown_instrument_is_rejected() {
+            let ledger = Ledger::default();
+            let missing = InstrumentId::new("ETH-USDC").unwrap();
+            assert!(MarginLedgerAccountant::new(ledger, missing).is_err());
+        }
+    }
+
     #[test]
     fn test_partial_fills_never_exceed_order_quantity() {
         // A generous clearing rate must still fill exactly the order size.
@@ -2655,5 +3049,28 @@ mod tests {
         let engine = scripted_engine(vec![], vec![]);
         let huge = SimLatencyConfig::new().with_submit_ms(crate::backtest::MAX_SIM_LATENCY_MS + 1);
         assert!(engine.with_latency(huge).is_err());
+    }
+}
+
+#[cfg(test)]
+mod auto_traits {
+    use super::*;
+    use crate::backtest::VecDataSource;
+
+    fn assert_send_sync<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
+    use std::panic::{RefUnwindSafe, UnwindSafe};
+
+    struct Noop;
+    impl BacktestStrategy for Noop {
+        fn on_tick(&mut self, _tick: &MarketTick, _position: &InventoryPosition) -> Option<Quote> {
+            None
+        }
+        fn on_fill(&mut self, _fill: &SimulatedFill) {}
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn test_engine_stays_send_and_sync() {
+        assert_send_sync::<BacktestEngine<Noop, VecDataSource>>();
     }
 }
