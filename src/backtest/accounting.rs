@@ -48,14 +48,7 @@ use crate::types::error::MMResult;
 
 use super::lifecycle::SimOrderId;
 
-/// Asset in which a fill's fee is charged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FeeAsset {
-    /// The quote asset of the instrument (the engine's convention).
-    Quote,
-    /// The base asset of the instrument.
-    Base,
-}
+pub use crate::types::fee::FeeAsset;
 
 /// One fill as posted to a [`FillAccountant`].
 #[derive(Debug, Clone, PartialEq)]
@@ -115,8 +108,13 @@ pub struct AccountingSnapshot {
     pub average_entry_price: Option<Decimal>,
     /// Sum of execution cash flows, excluding fees.
     pub cash_flow: Decimal,
-    /// Fees paid, in the quote asset.
+    /// Fees fixed in the quote asset (quote fees and third asset fees
+    /// converted to quote).
     pub fees: Decimal,
+    /// Fees paid in the base asset, in base units. They are already
+    /// deducted from [`AccountingSnapshot::position`]; the engine marks
+    /// them at the current price.
+    pub base_fees: Decimal,
     /// Number of distinct executions booked.
     pub fills_posted: u64,
 }
@@ -180,8 +178,11 @@ mod margin_ledger {
     ///   balance goes negative (for example selling base the account never
     ///   held); the resulting shortfalls are kept in
     ///   [`MarginLedgerAccountant::overdrafts`] instead of refusing the fill.
-    /// - Fees may be negative (rebates). Only quote denominated fees are
-    ///   supported; a base fee is refused as an accounting error.
+    /// - Fees may be negative (rebates). Quote fees are debited from the
+    ///   quote balance and base fees from the base balance; the snapshot
+    ///   position is the net base held (traded quantity minus base fees)
+    ///   and reports the base fees in base units for the engine to mark. A
+    ///   fee in a third asset is refused as an accounting error.
     /// - The snapshot covers only executions of the selected instrument, so
     ///   other activity in the ledger never leaks into the backtest.
     /// - The ledger enforces its instrument and asset scales: configure
@@ -194,8 +195,13 @@ mod margin_ledger {
         initial: Ledger,
         ledger: Ledger,
         instrument: InstrumentId,
+        base: Asset,
         quote: Asset,
         overdrafts: BTreeMap<Asset, Decimal>,
+        /// Base fees booked on this instrument, kept incrementally so a
+        /// snapshot never rescans the journal for them.
+        base_fees: Decimal,
+        initial_base_fees: Decimal,
     }
 
     impl MarginLedgerAccountant {
@@ -207,8 +213,8 @@ mod margin_ledger {
         /// Returns [`MMError::InvalidConfiguration`] if the instrument is not
         /// a registered spot instrument.
         pub fn new(ledger: Ledger, instrument: InstrumentId) -> MMResult<Self> {
-            let quote = match ledger.instrument(&instrument) {
-                Some(Instrument::Spot(spot)) => spot.quote().clone(),
+            let (base, quote) = match ledger.instrument(&instrument) {
+                Some(Instrument::Spot(spot)) => (spot.base().clone(), spot.quote().clone()),
                 Some(_) => {
                     return Err(MMError::InvalidConfiguration(format!(
                         "instrument {} is not a spot instrument",
@@ -222,12 +228,21 @@ mod margin_ledger {
                     )));
                 }
             };
+            let base_fees = ledger
+                .journal()
+                .iter()
+                .filter(|e| e.instrument == instrument)
+                .filter_map(|e| e.fee.as_ref().filter(|f| f.asset == base))
+                .fold(Decimal::ZERO, |sum, f| sum.saturating_add(f.amount));
             Ok(Self {
                 initial: ledger.clone(),
                 ledger,
                 instrument,
+                base,
                 quote,
                 overdrafts: BTreeMap::new(),
+                base_fees,
+                initial_base_fees: base_fees,
             })
         }
 
@@ -251,11 +266,19 @@ mod margin_ledger {
 
     impl FillAccountant for MarginLedgerAccountant {
         fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
-            if fill.fee_asset == FeeAsset::Base && !fill.fee.is_zero() {
-                return Err(MMError::InvalidPositionUpdate(
-                    "margin ledger adapter supports quote denominated fees only".to_string(),
-                ));
-            }
+            let fee_asset = match &fill.fee_asset {
+                FeeAsset::Quote => self.quote.clone(),
+                FeeAsset::Base => self.base.clone(),
+                FeeAsset::Other(code) => {
+                    if fill.fee.is_zero() {
+                        self.quote.clone()
+                    } else {
+                        return Err(MMError::InvalidPositionUpdate(format!(
+                            "margin ledger adapter cannot book a fee in {code}"
+                        )));
+                    }
+                }
+            };
             let id = ExecutionId::new(format!("sim-{}", fill.execution_id))
                 .map_err(|e| margin_error("execution id", e))?;
             // Before booking: a rejected post leaves the ledger unchanged.
@@ -267,12 +290,15 @@ mod margin_ledger {
                 Execution::new(id, self.instrument.clone(), side, fill.price, fill.quantity);
             // Negative fees are rebates and are booked as such.
             if !fill.fee.is_zero() {
-                execution = execution.with_fee(self.quote.clone(), fill.fee);
+                execution = execution.with_fee(fee_asset, fill.fee);
             }
             let booked = self
                 .ledger
                 .book_execution_allowing_overdraft(&execution, None)
                 .map_err(|e| margin_error("booking", e))?;
+            if fill.fee_asset == FeeAsset::Base {
+                self.base_fees = self.base_fees.saturating_add(fill.fee);
+            }
             for (asset, shortfall) in booked.shortfalls {
                 let worst = self.overdrafts.entry(asset).or_insert(Decimal::ZERO);
                 *worst = (*worst).max(shortfall);
@@ -283,8 +309,14 @@ mod margin_ledger {
         fn snapshot(&self) -> AccountingSnapshot {
             let position = self.ledger.position(&self.instrument);
             let mut snapshot = AccountingSnapshot {
-                position: position.as_ref().map_or(Decimal::ZERO, |p| p.quantity),
+                // The account holds the traded quantity minus the base it
+                // paid as fees.
+                position: position
+                    .as_ref()
+                    .map_or(Decimal::ZERO, |p| p.quantity)
+                    .saturating_sub(self.base_fees),
                 average_entry_price: position.as_ref().and_then(|p| p.average_price()),
+                base_fees: self.base_fees,
                 ..AccountingSnapshot::default()
             };
             for entry in self
@@ -308,6 +340,7 @@ mod margin_ledger {
         fn reset(&mut self) {
             self.ledger = self.initial.clone();
             self.overdrafts.clear();
+            self.base_fees = self.initial_base_fees;
         }
 
         fn description(&self) -> String {

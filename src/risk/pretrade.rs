@@ -38,6 +38,7 @@ use crate::Decimal;
 use crate::execution::Action;
 use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
+use crate::types::fee::FeeAsset;
 
 use super::{CircuitBreaker, RiskLimits};
 
@@ -192,8 +193,10 @@ pub enum OrderEvent {
         quantity: Decimal,
         /// Cumulative filled quantity of the order after this execution.
         cumulative_quantity: Decimal,
-        /// Fee in the quote asset.
+        /// Fee amount, in [`OrderEvent::Fill::fee_asset`] units.
         fee: Decimal,
+        /// Asset in which the fee is charged.
+        fee_asset: FeeAsset,
         /// Venue time, in milliseconds.
         timestamp: u64,
     },
@@ -456,6 +459,8 @@ impl PretradePolicy for LimitsPolicy {
                 execution_id,
                 side,
                 quantity,
+                fee,
+                fee_asset,
                 ..
             } => {
                 // A fill with an unsupported side is unknown exposure: latch
@@ -472,7 +477,16 @@ impl PretradePolicy for LimitsPolicy {
                 if !self.executions.insert(execution_id.clone()) {
                     return Ok(());
                 }
-                self.position += Self::signed(dir, *quantity);
+                // A fee paid in base reduces the base held, like the
+                // engine's position: a buy receives `quantity - fee`, a
+                // sell delivers `quantity + fee`.
+                let base_fee = match fee_asset {
+                    FeeAsset::Base => *fee,
+                    FeeAsset::Quote | FeeAsset::Other(_) => Decimal::ZERO,
+                };
+                self.position = self
+                    .position
+                    .saturating_add(Self::signed(dir, *quantity).saturating_sub(base_fee));
                 if let Some((_, remaining)) = self.live.get_mut(order_id) {
                     *remaining -= *quantity;
                     if *remaining <= Decimal::ZERO {
@@ -569,6 +583,7 @@ mod tests {
                 quantity: dec!(6),
                 cumulative_quantity: dec!(6),
                 fee: Decimal::ZERO,
+                fee_asset: crate::types::fee::FeeAsset::Quote,
                 timestamp: 1,
             })
             .unwrap();
@@ -639,6 +654,7 @@ mod tests {
             quantity: dec!(5),
             cumulative_quantity: dec!(5),
             fee: Decimal::ZERO,
+            fee_asset: crate::types::fee::FeeAsset::Quote,
             timestamp: 1,
         };
         policy.on_order_event(&fill).unwrap();
@@ -752,6 +768,7 @@ mod tests {
             quantity,
             cumulative_quantity: quantity,
             fee: Decimal::ZERO,
+            fee_asset: crate::types::fee::FeeAsset::Quote,
             timestamp: 1,
         }
     }

@@ -39,6 +39,7 @@ jobs:
       - name: Generate code coverage report.
         run:
           cargo tarpaulin
+          --engine llvm
           --all-features
           --workspace
           --timeout 180
