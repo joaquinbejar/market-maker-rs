@@ -105,6 +105,8 @@ fn inverse_future_settles_in_coin_at_satoshi_scale() {
     // equals the USD notional times the relative move against entry:
     // up: 1000 x (61000/60000 - 1) = 16.666... USD.
     let usd_at_exit = (up_exact * dec!(61000)).round_dp(6);
+    let relative_move = (dec!(1000) * (dec!(61000) / dec!(60000) - Decimal::ONE)).round_dp(6);
+    assert_eq!(usd_at_exit, relative_move);
     assert_eq!(usd_at_exit, dec!(16.666667));
 
     // Convexity: an equal move up gains less coin than the move down loses.
@@ -136,10 +138,14 @@ fn perpetual_funding_is_zero_sum() {
     for ((mark, rate), paid) in schedule.iter().zip(long_payments) {
         assert_eq!(dec!(2) * mark * rate, paid);
     }
-    // Funding moves cash between sides; it creates or destroys none: the
-    // short's cash change is the negation of the long's.
-    let short_total: Decimal = long_payments.iter().map(|p| -p).sum();
-    assert_eq!(-long_total - short_total, Decimal::ZERO);
+    // Funding moves cash between sides; it creates or destroys none. The
+    // short side is computed from its own inputs (size -2) and must net
+    // against the long side.
+    let short_total: Decimal = schedule
+        .iter()
+        .map(|(mark, rate)| dec!(-2) * mark * rate)
+        .sum();
+    assert_eq!(long_total + short_total, Decimal::ZERO);
     // A negative rate reverses the direction of the payment.
     assert!(long_payments[1] < Decimal::ZERO);
 }
