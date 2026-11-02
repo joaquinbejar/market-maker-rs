@@ -929,13 +929,21 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                     now,
                 );
                 let decision = policy.check(&request);
-                // Never more than requested, and still a whole lot.
-                size = round_to_step(
-                    decision.approved_quantity(size),
-                    self.config.lot_size,
-                    false,
-                );
-                refused = size <= Decimal::ZERO;
+                // Never more than requested. The policy registered exactly
+                // `approved`, so a size that is not a whole number of lots
+                // is refused and released rather than silently shrunk,
+                // which would leave a stale reservation behind.
+                let approved = decision.approved_quantity(size);
+                let whole_lots = round_to_step(approved, self.config.lot_size, false) == approved;
+                refused = approved <= Decimal::ZERO || !whole_lots;
+                if approved > Decimal::ZERO && !whole_lots {
+                    policy.on_order_event(&OrderEvent::VenueRejected {
+                        order_id: id.to_string(),
+                    });
+                }
+                if !refused {
+                    size = approved;
+                }
                 self.pretrade_log.push(PretradeRecord {
                     order_id: id,
                     request,
@@ -1237,7 +1245,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     ///
     /// A rejection (or a quantity that rounds to zero lots) is reported as a
     /// local `Rejected` and nothing reaches the venue; a reduction submits the
-    /// smaller quantity and can never increase it. The policy also receives
+    /// smaller quantity and can never increase it. A reduction that is not a
+    /// whole number of [`BacktestConfig::lot_size`] lots is refused and
+    /// released in the policy with an [`OrderEvent::VenueRejected`]. The policy also receives
     /// the market mark of every tick and every lifecycle event of the orders,
     /// in venue order. See [`crate::risk::pretrade`].
     #[must_use]
@@ -2760,6 +2770,7 @@ mod tests {
     struct FixedPolicy {
         decision: PretradeDecision,
         seen: std::sync::Arc<std::sync::Mutex<Vec<PretradeRequest>>>,
+        events: std::sync::Arc<std::sync::Mutex<Vec<OrderEvent>>>,
     }
 
     impl FixedPolicy {
@@ -2767,6 +2778,7 @@ mod tests {
             Self {
                 decision,
                 seen: Default::default(),
+                events: Default::default(),
             }
         }
     }
@@ -2775,6 +2787,9 @@ mod tests {
         fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
             self.seen.lock().unwrap().push(request.clone());
             self.decision.clone()
+        }
+        fn on_order_event(&mut self, event: &OrderEvent) {
+            self.events.lock().unwrap().push(event.clone());
         }
         fn reset(&mut self) {
             self.seen.lock().unwrap().clear();
@@ -2870,6 +2885,45 @@ mod tests {
                 OrderPurpose::Hedge,
                 OrderPurpose::Quote,
                 OrderPurpose::Quote
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reduction_off_the_lot_grid_is_released() {
+        // A reduction to 1.5 with lot 1 is not a whole lot: the order is
+        // refused and the policy is told to release what it registered.
+        let policy = FixedPolicy::new(PretradeDecision::Reduced {
+            quantity: dec!(1.5),
+            reason: "capacity".to_string(),
+        });
+        let events = policy.events.clone();
+        let mut engine = BacktestEngine::new(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(2))
+                .with_lot_size(dec!(1)),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+        )
+        .with_pretrade_policy(policy);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 0);
+        assert!(engine.open_orders().is_empty());
+        assert!(
+            engine
+                .pretrade_decisions()
+                .iter()
+                .all(|d| d.submitted == Decimal::ZERO)
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                OrderEvent::VenueRejected {
+                    order_id: "1".to_string()
+                },
+                OrderEvent::VenueRejected {
+                    order_id: "2".to_string()
+                },
             ]
         );
     }
