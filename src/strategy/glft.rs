@@ -36,6 +36,22 @@
 //! ```
 //!
 //! Where `α` controls how much gamma increases near terminal time.
+//!
+//! # Scope
+//!
+//! This is an Avellaneda-Stoikov variant with an ad hoc terminal penalty
+//! `q * φ * f(τ)`; it is not the closed form solution of Guéant, Lehalle and
+//! Fernandez-Tapia (arXiv:1105.3115v5). That model bounds the inventory to
+//! `-Q..=Q` and obtains the quotes from `v(t) = exp(-M (T - t)) * 1`, which
+//! depends on the fill intensity scale `A`; this type has neither `A` nor
+//! `Q`, and its spread is the A-S spread floored at `min_spread`. With
+//! `φ = 0`, dynamic gamma off and the `min_spread` floor inactive (the A-S
+//! spread at or above it) it returns exactly the A-S quotes, which the paper
+//! (footnote 8) obtains as the first order expansion of its solution near
+//! `T`; when the floor binds, the spread is `min_spread` instead. Units follow the A-S
+//! module: absolute volatility per √year and times in milliseconds with a
+//! 365 day year. The comparison with a reference solution of the paper is in
+//! `tests/glft_reference.rs`.
 
 use crate::Decimal;
 use crate::types::decimal::{decimal_ln, decimal_powi};
@@ -55,6 +71,9 @@ pub enum PenaltyFunction {
     #[default]
     Linear,
     /// Exponential penalty: f(τ) = exp(-τ/T) (faster increase near terminal).
+    ///
+    /// Evaluated as the second order Taylor polynomial `1 - x + x²/2` with
+    /// `x = τ/T`, not as the exponential itself.
     Exponential,
     /// Quadratic penalty: f(τ) = (1 - τ/T)² (slower start, faster end).
     Quadratic,
