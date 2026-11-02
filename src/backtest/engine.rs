@@ -2849,6 +2849,31 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_registration_releases_the_policy() {
+        use crate::execution::{OrderManager, OrderRequest};
+        use crate::risk::RiskLimits;
+        use crate::risk::pretrade::LimitsPolicy;
+        let limits = RiskLimits::new(dec!(10), dec!(1_000_000), dec!(0)).unwrap();
+        let mut policy = LimitsPolicy::new(limits);
+        let mut manager = OrderManager::with_defaults();
+        let request = OrderRequest::limit_buy("BTC-USD", dec!(100), dec!(4));
+        // The id is taken outside the policy, so registration fails after
+        // the policy approved and registered the order.
+        manager
+            .register_order(&request, "dup".to_string(), 1)
+            .unwrap();
+        let result = manager.register_order_checked(
+            &request,
+            "dup".to_string(),
+            2,
+            OrderPurpose::Hedge,
+            &mut policy,
+        );
+        assert!(result.is_err());
+        assert_eq!(policy.live_quantity(Side::Buy), Decimal::ZERO);
+    }
+
+    #[test]
     fn test_quote_and_hedge_paths_use_the_same_seam() {
         use crate::execution::{OrderManager, OrderRequest};
         let mut policy = FixedPolicy::new(PretradeDecision::Rejected {
@@ -3028,6 +3053,27 @@ mod tests {
             assert_eq!(bid.submitted, dec!(1));
             assert_eq!(result.final_position, dec!(1));
             assert!(account.errors().is_empty(), "{:?}", account.errors());
+        }
+
+        #[test]
+        fn test_margin_policy_rejects_another_instrument() {
+            use crate::execution::{OrderManager, OrderRequest};
+            let account = account(None);
+            let mut policy = account.policy();
+            let mut manager = OrderManager::with_defaults();
+            let eth = OrderRequest::limit_buy("ETH-USDC", dec!(100), dec!(1));
+            let decision = manager
+                .register_order_checked(
+                    &eth,
+                    "e-1".to_string(),
+                    1,
+                    OrderPurpose::Hedge,
+                    &mut policy,
+                )
+                .unwrap();
+            assert!(decision.is_rejected());
+            assert_eq!(manager.open_order_count(), 0);
+            account.with_gate(|gate| assert_eq!(gate.live_orders().count(), 0));
         }
 
         #[test]

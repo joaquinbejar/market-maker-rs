@@ -31,7 +31,7 @@
 //! assert!(matches!(decision, PretradeDecision::Reduced { .. }));
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::Decimal;
@@ -55,6 +55,9 @@ pub enum OrderPurpose {
 pub struct PretradeRequest {
     /// Order identifier, unique per policy.
     pub order_id: String,
+    /// Instrument the order trades, when the caller knows it. Policies bound
+    /// to one instrument reject a request for another.
+    pub instrument: Option<String>,
     /// Order side.
     pub side: Side,
     /// Limit price; `None` for a market order.
@@ -80,12 +83,20 @@ impl PretradeRequest {
     ) -> Self {
         Self {
             order_id: order_id.into(),
+            instrument: None,
             side,
             price,
             quantity,
             purpose,
             timestamp,
         }
+    }
+
+    /// Names the instrument the order trades.
+    #[must_use]
+    pub fn with_instrument(mut self, instrument: impl Into<String>) -> Self {
+        self.instrument = Some(instrument.into());
+        self
     }
 }
 
@@ -223,7 +234,10 @@ pub trait PretradePolicy: fmt::Debug {
 #[derive(Debug, Clone)]
 pub struct LimitsPolicy {
     limits: RiskLimits,
+    instrument: Option<String>,
+    initial_breaker: Option<CircuitBreaker>,
     breaker: Option<CircuitBreaker>,
+    executions: HashSet<String>,
     position: Decimal,
     mark: Option<Decimal>,
     live: HashMap<String, (Side, Decimal)>,
@@ -235,7 +249,10 @@ impl LimitsPolicy {
     pub fn new(limits: RiskLimits) -> Self {
         Self {
             limits,
+            instrument: None,
+            initial_breaker: None,
             breaker: None,
+            executions: HashSet::new(),
             position: Decimal::ZERO,
             mark: None,
             live: HashMap::new(),
@@ -245,7 +262,16 @@ impl LimitsPolicy {
     /// Adds a circuit breaker whose state gates every order.
     #[must_use]
     pub fn with_circuit_breaker(mut self, breaker: CircuitBreaker) -> Self {
+        self.initial_breaker = Some(breaker.clone());
         self.breaker = Some(breaker);
+        self
+    }
+
+    /// Binds the policy to one instrument: requests naming another are
+    /// rejected.
+    #[must_use]
+    pub fn with_instrument(mut self, instrument: impl Into<String>) -> Self {
+        self.instrument = Some(instrument.into());
         self
     }
 
@@ -293,6 +319,13 @@ impl PretradePolicy for LimitsPolicy {
                 reason: "quantity must be positive".to_string(),
             };
         }
+        if let (Some(bound), Some(asked)) = (&self.instrument, &request.instrument)
+            && bound != asked
+        {
+            return PretradeDecision::Rejected {
+                reason: format!("policy is bound to {bound}, not {asked}"),
+            };
+        }
         if self.live.contains_key(&request.order_id) {
             return PretradeDecision::Rejected {
                 reason: format!("duplicate order id {}", request.order_id),
@@ -317,11 +350,15 @@ impl PretradePolicy for LimitsPolicy {
             Side::Sell => self.limits.max_position + worst,
         };
         capacity = capacity.min(by_position);
-        let by_notional = match request.side {
-            Side::Buy => self.limits.max_notional / price - worst,
-            Side::Sell => self.limits.max_notional / price + worst,
-        };
-        capacity = capacity.min(by_notional);
+        // An unrepresentable quotient (tiny price) means the notional limit
+        // does not bind.
+        if let Some(units) = self.limits.max_notional.checked_div(price) {
+            let by_notional = match request.side {
+                Side::Buy => units - worst,
+                Side::Sell => units + worst,
+            };
+            capacity = capacity.min(by_notional);
+        }
 
         let decision = if capacity >= request.quantity {
             PretradeDecision::Accepted
@@ -359,10 +396,15 @@ impl PretradePolicy for LimitsPolicy {
             }
             OrderEvent::Fill {
                 order_id,
+                execution_id,
                 side,
                 quantity,
                 ..
             } => {
+                // A replayed execution changes nothing.
+                if !self.executions.insert(execution_id.clone()) {
+                    return;
+                }
                 self.position += Self::signed(*side, *quantity);
                 if let Some((_, remaining)) = self.live.get_mut(order_id) {
                     *remaining -= *quantity;
@@ -378,6 +420,8 @@ impl PretradePolicy for LimitsPolicy {
         self.position = Decimal::ZERO;
         self.mark = None;
         self.live.clear();
+        self.executions.clear();
+        self.breaker = self.initial_breaker.clone();
     }
 
     fn description(&self) -> String {
@@ -494,6 +538,70 @@ mod tests {
         let mut policy = policy(dec!(10)).with_circuit_breaker(CircuitBreaker::new(config));
         policy.circuit_breaker_mut().unwrap().trigger_manual(0);
         assert!(policy.check(&buy("a", dec!(1))).is_rejected());
+    }
+
+    #[test]
+    fn test_tiny_price_does_not_panic() {
+        let mut policy = policy(dec!(10));
+        let tiny = PretradeRequest::new(
+            "t",
+            Side::Buy,
+            Some(Decimal::new(1, 28)),
+            dec!(1),
+            OrderPurpose::Quote,
+            0,
+        );
+        assert_eq!(policy.check(&tiny), PretradeDecision::Accepted);
+    }
+
+    #[test]
+    fn test_replayed_fill_is_ignored() {
+        let mut policy = policy(dec!(10));
+        assert_eq!(policy.check(&buy("a", dec!(5))), PretradeDecision::Accepted);
+        let fill = OrderEvent::Fill {
+            order_id: "a".to_string(),
+            execution_id: "e1".to_string(),
+            side: Side::Buy,
+            price: dec!(100),
+            quantity: dec!(5),
+            cumulative_quantity: dec!(5),
+            fee: Decimal::ZERO,
+            timestamp: 1,
+        };
+        policy.on_order_event(&fill);
+        policy.on_order_event(&fill);
+        assert_eq!(policy.position(), dec!(5));
+        let sell = PretradeRequest::new(
+            "s",
+            Side::Sell,
+            Some(dec!(100)),
+            dec!(20),
+            OrderPurpose::Quote,
+            2,
+        );
+        assert_eq!(policy.check(&sell).approved_quantity(dec!(20)), dec!(15));
+    }
+
+    #[test]
+    fn test_reset_restores_the_initial_breaker() {
+        let config =
+            CircuitBreakerConfig::new(dec!(1000), dec!(0.05), 5, dec!(0.10), 300_000, 60_000)
+                .unwrap();
+        let mut policy = policy(dec!(10)).with_circuit_breaker(CircuitBreaker::new(config));
+        policy.circuit_breaker_mut().unwrap().trigger_manual(0);
+        assert!(policy.check(&buy("a", dec!(1))).is_rejected());
+        policy.reset();
+        assert_eq!(policy.check(&buy("b", dec!(1))), PretradeDecision::Accepted);
+    }
+
+    #[test]
+    fn test_bound_instrument_rejects_others() {
+        let mut policy = policy(dec!(10)).with_instrument("BTC-USD");
+        let eth = buy("e", dec!(1)).with_instrument("ETH-USD");
+        assert!(policy.check(&eth).is_rejected());
+        let btc = buy("b", dec!(1)).with_instrument("BTC-USD");
+        assert_eq!(policy.check(&btc), PretradeDecision::Accepted);
+        assert_eq!(policy.check(&buy("n", dec!(1))), PretradeDecision::Accepted);
     }
 
     #[test]

@@ -37,7 +37,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::Decimal;
-use crate::risk::pretrade::{OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest};
+use crate::risk::pretrade::{
+    OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
+};
 use crate::types::error::{MMError, MMResult};
 
 use super::connector::{Fill, OrderId, OrderRequest, OrderResponse, OrderStatus, OrderType, Side};
@@ -393,7 +395,8 @@ impl OrderManager {
             request.quantity,
             purpose,
             timestamp,
-        );
+        )
+        .with_instrument(request.symbol.clone());
         let decision = policy.check(&pretrade);
         let approved = decision.approved_quantity(request.quantity);
         if approved <= Decimal::ZERO {
@@ -401,7 +404,16 @@ impl OrderManager {
         }
         let mut approved_request = request.clone();
         approved_request.quantity = approved;
-        self.register_order(&approved_request, client_order_id, timestamp)?;
+        if let Err(error) =
+            self.register_order(&approved_request, client_order_id.clone(), timestamp)
+        {
+            // The policy reserved the approved quantity; nothing reached the
+            // venue, so release it.
+            policy.on_order_event(&OrderEvent::VenueRejected {
+                order_id: client_order_id,
+            });
+            return Err(error);
+        }
         Ok(decision)
     }
 

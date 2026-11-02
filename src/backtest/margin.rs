@@ -161,6 +161,16 @@ impl MarginRiskPolicy {
 impl PretradePolicy for MarginRiskPolicy {
     fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
         let mut shared = self.account.lock();
+        if let Some(asked) = &request.instrument
+            && asked != shared.instrument.as_str()
+        {
+            return PretradeDecision::Rejected {
+                reason: format!(
+                    "margin account trades {}, not {asked}",
+                    shared.instrument.as_str()
+                ),
+            };
+        }
         let Some(price) = request.price else {
             return PretradeDecision::Rejected {
                 reason: "margin gate needs a limit price".to_string(),
@@ -273,7 +283,8 @@ impl PretradePolicy for MarginRiskPolicy {
                     *price,
                     *quantity,
                 );
-                if *fee > Decimal::ZERO {
+                // Negative fees are rebates and are booked as such.
+                if !fee.is_zero() {
                     execution = execution.with_fee(shared.quote.clone(), *fee);
                 }
                 let report = FillReport::new(execution, *cumulative_quantity);
