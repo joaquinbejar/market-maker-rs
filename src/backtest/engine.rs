@@ -218,13 +218,16 @@ pub struct BacktestConfig {
     pub initial_capital: Decimal,
     /// Trading fee rate (as decimal, e.g., 0.001 for 0.1%).
     pub fee_rate: Decimal,
-    /// Minimum tick size.
+    /// Minimum tick size. When positive, simulated bids are rounded down
+    /// and asks up to a multiple of it; zero disables price rounding.
     pub tick_size: Decimal,
-    /// Minimum lot size.
+    /// Minimum lot size. When positive, simulated order quantities are
+    /// rounded down to a multiple of it; zero disables quantity rounding.
+    /// An order whose rounded quantity is zero is rejected.
     pub lot_size: Decimal,
     /// Slippage model.
     pub slippage: SlippageModel,
-    /// Default order size.
+    /// Order size used for a quote side whose size is not positive.
     pub default_order_size: Decimal,
     /// Record equity curve at each tick.
     pub record_equity_curve: bool,
@@ -403,7 +406,10 @@ pub trait BacktestStrategy {
     /// against it.
     ///
     /// Returning `Some(quote)` cancels every resting order and submits a new
-    /// bid and ask of [`BacktestConfig::default_order_size`]. The new orders
+    /// bid and ask sized by the quote (or [`BacktestConfig::default_order_size`]
+    /// for a side whose size is not positive), with prices rounded to
+    /// [`BacktestConfig::tick_size`] and quantities to
+    /// [`BacktestConfig::lot_size`]. The new orders
     /// can only fill on later ticks, never on the tick they were computed
     /// from. Returning `None` leaves resting orders in place.
     ///
@@ -842,9 +848,23 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             self.schedule(effective, PendingAction::Cancel(id));
         }
 
-        let size = self.config.default_order_size;
+        let tick = self.config.tick_size;
+        let bid_price = round_to_step(quote.bid_price, tick, false);
+        let ask_price = round_to_step(quote.ask_price, tick, true);
+        // Checked on the quote as emitted: rounding away from the market
+        // could otherwise hide a crossed quote.
         let crossed = quote.bid_price >= quote.ask_price;
-        for (side, price) in [(Side::Buy, quote.bid_price), (Side::Sell, quote.ask_price)] {
+        for (side, price, quoted) in [
+            (Side::Buy, bid_price, quote.bid_size),
+            (Side::Sell, ask_price, quote.ask_size),
+        ] {
+            let requested = if quoted > Decimal::ZERO {
+                quoted
+            } else {
+                self.config.default_order_size
+            };
+            // A size that rounds to zero is rejected by the venue checks.
+            let size = round_to_step(requested, self.config.lot_size, false);
             let id = self.next_order_id;
             self.next_order_id += 1;
             let stamp = self.clock.stamp();
@@ -1146,6 +1166,37 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.next_order_id = 1;
         self.reports.clear();
     }
+}
+
+/// Rounds `value` to a multiple of `step`, up or down; a non positive step
+/// leaves the value unchanged.
+///
+/// Works on the remainder, so it never divides into a huge quotient and
+/// never loses precision; if the rounded value would overflow, the value is
+/// returned unrounded and the venue checks decide.
+fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
+    if step <= Decimal::ZERO {
+        return value;
+    }
+    let Some(remainder) = value.checked_rem(step) else {
+        return value;
+    };
+    if remainder.is_zero() {
+        return value;
+    }
+    // Truncation toward zero; adjust to floor for negative values.
+    let toward_zero = value - remainder;
+    let down = if remainder < Decimal::ZERO {
+        toward_zero.checked_sub(step)
+    } else {
+        Some(toward_zero)
+    };
+    let rounded = if up {
+        down.and_then(|d| d.checked_add(step))
+    } else {
+        down
+    };
+    rounded.unwrap_or(value)
 }
 
 /// Approximate square root using Newton's method.
@@ -1658,11 +1709,12 @@ mod tests {
             self.seen.push((tick.timestamp, position.quantity));
             let quote = self.quotes.get(self.index).copied().flatten();
             self.index += 1;
+            // Zero sizes: the engine falls back to `default_order_size`.
             quote.map(|(bid, ask)| Quote {
                 bid_price: bid,
-                bid_size: Decimal::ONE,
+                bid_size: Decimal::ZERO,
                 ask_price: ask,
-                ask_size: Decimal::ONE,
+                ask_size: Decimal::ZERO,
                 timestamp: tick.timestamp,
             })
         }
@@ -1793,6 +1845,136 @@ mod tests {
             vec![ExecutionKind::Rejected, ExecutionKind::Accepted]
         );
         assert_eq!(engine.open_orders().len(), 1);
+    }
+
+    /// Strategy quoting one fixed quote with explicit sizes.
+    struct SizedStrategy(Quote);
+
+    impl BacktestStrategy for SizedStrategy {
+        fn on_tick(&mut self, _tick: &MarketTick, _position: &InventoryPosition) -> Option<Quote> {
+            Some(self.0.clone())
+        }
+        fn on_fill(&mut self, _fill: &SimulatedFill) {}
+        fn reset(&mut self) {}
+    }
+
+    fn sized_reports(config: BacktestConfig, quote: Quote) -> Vec<ExecutionReport> {
+        let ticks = vec![create_test_tick(1000, dec!(90.0), dec!(110.0))];
+        let mut engine = BacktestEngine::new(
+            config.with_record_trades(true),
+            SizedStrategy(quote),
+            VecDataSource::new(ticks),
+        );
+        engine.run();
+        engine.execution_reports().to_vec()
+    }
+
+    fn sized_quote(bid: Decimal, bid_size: Decimal, ask: Decimal, ask_size: Decimal) -> Quote {
+        Quote {
+            bid_price: bid,
+            bid_size,
+            ask_price: ask,
+            ask_size,
+            timestamp: 1000,
+        }
+    }
+
+    #[test]
+    fn test_orders_use_quote_sizes_per_side() {
+        let reports = sized_reports(
+            BacktestConfig::default().with_default_order_size(dec!(5)),
+            sized_quote(dec!(99), dec!(1.5), dec!(101), dec!(0.25)),
+        );
+        let sizes: Vec<(Side, Decimal)> = reports.iter().map(|r| (r.side, r.remaining)).collect();
+        assert_eq!(
+            sizes,
+            vec![(Side::Buy, dec!(1.5)), (Side::Sell, dec!(0.25))]
+        );
+    }
+
+    #[test]
+    fn test_non_positive_quote_size_uses_default() {
+        let reports = sized_reports(
+            BacktestConfig::default().with_default_order_size(dec!(5)),
+            sized_quote(dec!(99), Decimal::ZERO, dec!(101), dec!(-1)),
+        );
+        assert!(reports.iter().all(|r| r.remaining == dec!(5)));
+    }
+
+    #[test]
+    fn test_prices_round_away_from_the_market_on_tick() {
+        let reports = sized_reports(
+            BacktestConfig::default().with_tick_size(dec!(0.5)),
+            sized_quote(dec!(99.74), dec!(1), dec!(100.26), dec!(1)),
+        );
+        let prices: Vec<Decimal> = reports.iter().map(|r| r.price).collect();
+        assert_eq!(prices, vec![dec!(99.5), dec!(100.5)]);
+    }
+
+    #[test]
+    fn test_quantity_rounds_down_to_lot() {
+        let reports = sized_reports(
+            BacktestConfig::default().with_lot_size(dec!(0.1)),
+            sized_quote(dec!(99), dec!(1.29), dec!(101), dec!(0.37)),
+        );
+        let sizes: Vec<Decimal> = reports.iter().map(|r| r.remaining).collect();
+        assert_eq!(sizes, vec![dec!(1.2), dec!(0.3)]);
+    }
+
+    #[test]
+    fn test_quantity_below_one_lot_is_rejected() {
+        let reports = sized_reports(
+            BacktestConfig::default().with_lot_size(dec!(1)),
+            sized_quote(dec!(99), dec!(0.4), dec!(101), dec!(2)),
+        );
+        let kinds: Vec<(Side, ExecutionKind)> = reports.iter().map(|r| (r.side, r.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (Side::Buy, ExecutionKind::Rejected),
+                (Side::Sell, ExecutionKind::Accepted)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_round_to_step_boundaries() {
+        // A tiny step must not overflow through a huge quotient.
+        let tiny = Decimal::new(1, 28);
+        assert_eq!(round_to_step(dec!(100), tiny, false), dec!(100));
+        assert_eq!(round_to_step(dec!(100), tiny, true), dec!(100));
+        // Just under one lot rounds down to zero, never up.
+        let almost = dec!(2.9999999999999999999999999999);
+        assert_eq!(round_to_step(almost, dec!(3), false), Decimal::ZERO);
+        assert_eq!(round_to_step(almost, dec!(3), true), dec!(3));
+        // Huge value with a fine step stays put when rounding up overflows.
+        assert_eq!(round_to_step(Decimal::MAX, dec!(0.7), true), Decimal::MAX);
+        assert_eq!(round_to_step(dec!(-1.25), dec!(0.5), false), dec!(-1.5));
+        assert_eq!(round_to_step(dec!(-1.25), dec!(0.5), true), dec!(-1.0));
+    }
+
+    #[test]
+    fn test_crossed_quote_is_not_hidden_by_rounding() {
+        let reports = sized_reports(
+            BacktestConfig::default(),
+            sized_quote(dec!(100.004), dec!(1), dec!(100.001), dec!(1)),
+        );
+        assert!(reports.iter().all(|r| r.kind == ExecutionKind::Rejected));
+    }
+
+    #[test]
+    fn test_zero_tick_and_lot_keep_values() {
+        let reports = sized_reports(
+            BacktestConfig::default()
+                .with_tick_size(Decimal::ZERO)
+                .with_lot_size(Decimal::ZERO),
+            sized_quote(dec!(99.123), dec!(0.0007), dec!(101.987), dec!(1)),
+        );
+        let got: Vec<(Decimal, Decimal)> = reports.iter().map(|r| (r.price, r.remaining)).collect();
+        assert_eq!(
+            got,
+            vec![(dec!(99.123), dec!(0.0007)), (dec!(101.987), dec!(1))]
+        );
     }
 
     #[test]
