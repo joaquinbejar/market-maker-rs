@@ -81,7 +81,8 @@ fn linear_future_pnl_matches_spot_exposure() {
 // ----------------------------------------------------- inverse future
 
 /// Inverse (coin margined) BTC-USD future, contract value 100 USD, settled
-/// in BTC. PnL in BTC is N x CV x (1/entry - 1/exit).
+/// in BTC. Specification only: margin-rs does not support inverse contracts
+/// yet (joaquinbejar/margin-rs#26), so no library settles this today. PnL in BTC is N x CV x (1/entry - 1/exit).
 ///
 /// Long 10 @ 60000, exit 61000: 1000 x (1/60000 - 1/61000) = 1/3660 BTC =
 /// 0.000273224043... BTC, settled at satoshi scale (half even) as
