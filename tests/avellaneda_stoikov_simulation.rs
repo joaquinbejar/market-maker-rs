@@ -21,6 +21,7 @@ use market_maker_rs::backtest::{
     SimulatedFill, VecDataSource,
 };
 use market_maker_rs::dec;
+use market_maker_rs::execution::Side;
 use market_maker_rs::position::inventory::InventoryPosition;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::risk::pretrade::LimitsPolicy;
@@ -61,8 +62,10 @@ impl BacktestStrategy for AsStrategy {
     fn reset(&mut self) {}
 }
 
-/// Deterministic zig-zag path around 100 with a 0.10 wide book; every few
-/// ticks the market jumps far enough to cross resting quotes.
+/// Deterministic path with a 0.10 wide book: a 60 tick downtrend of 0.8
+/// per tick (each step trades through the resting bid, so a long inventory
+/// builds up), then a zig-zag around the final level that crosses both
+/// sides.
 fn ticks() -> Vec<MarketTick> {
     let offsets = [
         dec!(0),
@@ -76,7 +79,11 @@ fn ticks() -> Vec<MarketTick> {
     ];
     (0..400u64)
         .map(|i| {
-            let mid = dec!(100) + offsets[(i % 8) as usize];
+            let mid = if i < 60 {
+                dec!(100) - dec!(0.8) * Decimal::from(i)
+            } else {
+                dec!(52) + offsets[(i % 8) as usize]
+            };
             MarketTick::new(
                 1_000 + i * 10,
                 mid - dec!(0.05),
@@ -90,6 +97,11 @@ fn ticks() -> Vec<MarketTick> {
 
 fn engine() -> BacktestEngine<AsStrategy, VecDataSource> {
     let limits = RiskLimits::new(MAX_POSITION, dec!(1_000_000), dec!(0)).unwrap();
+    unlimited().with_pretrade_policy(LimitsPolicy::new(limits))
+}
+
+/// Same configuration without the pretrade policy (control run).
+fn unlimited() -> BacktestEngine<AsStrategy, VecDataSource> {
     BacktestEngine::new(
         BacktestConfig::default()
             .with_fee_rate(dec!(0.0005))
@@ -113,7 +125,6 @@ fn engine() -> BacktestEngine<AsStrategy, VecDataSource> {
             .with_jitter(2, 7),
     )
     .unwrap()
-    .with_pretrade_policy(LimitsPolicy::new(limits))
 }
 
 #[test]
@@ -135,18 +146,41 @@ fn quotes_respect_tick_grid_and_never_cross() {
             report.price
         );
     }
-    // Each decision submits a bid below its ask.
-    for pair in engine.pretrade_decisions().chunks(2) {
-        if let [bid, ask] = pair {
-            assert!(bid.request.price < ask.request.price);
-        }
+    // Each decision submits a bid below its ask: pair the two sides of a
+    // decision by decision time.
+    let decisions = engine.pretrade_decisions();
+    assert!(!decisions.is_empty());
+    let mut checked = 0;
+    for bid in decisions.iter().filter(|d| d.request.side == Side::Buy) {
+        let ask = decisions
+            .iter()
+            .find(|d| d.request.side == Side::Sell && d.request.timestamp == bid.request.timestamp)
+            .expect("each decision quotes both sides");
+        assert!(bid.request.price < ask.request.price);
+        checked += 1;
     }
+    assert!(checked > 0);
 }
 
 #[test]
 fn position_never_exceeds_the_pretrade_limit() {
+    // Control: without the policy the same run goes beyond the limit, so the
+    // bound below is not vacuous.
+    let control = unlimited().run();
+    assert!(
+        control.max_position > MAX_POSITION,
+        "control max {}",
+        control.max_position
+    );
     let mut engine = engine();
     let result = engine.run();
+    // The limit actually bound: some order was reduced or rejected.
+    assert!(
+        engine
+            .pretrade_decisions()
+            .iter()
+            .any(|d| d.submitted < d.request.quantity)
+    );
     assert!(
         result.max_position <= MAX_POSITION,
         "max {}",
@@ -157,8 +191,8 @@ fn position_never_exceeds_the_pretrade_limit() {
     let mut position = Decimal::ZERO;
     for fill in &result.trades {
         position += match fill.side {
-            market_maker_rs::execution::Side::Buy => fill.quantity,
-            market_maker_rs::execution::Side::Sell => -fill.quantity,
+            Side::Buy => fill.quantity,
+            Side::Sell => -fill.quantity,
         };
         assert!(position.abs() <= MAX_POSITION);
     }

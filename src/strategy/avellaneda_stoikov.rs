@@ -80,7 +80,7 @@ const SECONDS_PER_YEAR: Decimal = Decimal::from_parts(31_536_000, 0, 0, false, 0
 ///     dec!(100.0),  // mid_price
 ///     dec!(10.0),   // inventory (long)
 ///     dec!(0.1),    // risk_aversion
-///     dec!(0.2),    // volatility (20%)
+///     dec!(0.2),    // absolute volatility, price units per √year
 ///     3600000       // 1 hour in ms
 /// ).unwrap();
 ///
@@ -155,7 +155,7 @@ pub fn calculate_reservation_price(
 ///
 /// let spread = calculate_optimal_spread(
 ///     dec!(0.1),    // risk_aversion
-///     dec!(0.2),    // volatility (20%)
+///     dec!(0.2),    // absolute volatility, price units per √year
 ///     3600000,      // 1 hour
 ///     dec!(1.5)     // order_intensity
 /// ).unwrap();

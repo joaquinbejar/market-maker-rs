@@ -45,6 +45,9 @@ use market_maker_rs::types::error::MMError;
 use std::str::FromStr;
 
 const REL_TOL: Decimal = dec!(0.000000000001);
+/// Tolerance for identities evaluated in exact Decimal arithmetic, where
+/// only the 28th significant digit can differ.
+const EXACT_TOL: Decimal = dec!(0.00000000000000000001);
 
 fn d(value: &str) -> Decimal {
     Decimal::from_str(value).expect("fixture literal")
@@ -174,7 +177,7 @@ fn zero_inventory_quotes_are_symmetric_around_mid() {
         dec!(1.5),
     )
     .unwrap();
-    assert_eq!(dec!(100) - bid, ask - dec!(100));
+    assert!((dec!(100) - bid - (ask - dec!(100))).abs() <= EXACT_TOL);
 }
 
 #[test]
@@ -189,7 +192,7 @@ fn skew_flips_sign_with_inventory_and_spread_does_not_depend_on_it() {
     assert!(long_bid < flat_bid && long_ask < flat_ask);
     assert!(short_bid > flat_bid && short_ask > flat_ask);
     // Equal up to Decimal's last digit (28 significant digits).
-    assert_close("skew symmetry", flat_bid - long_bid, short_bid - flat_bid);
+    assert!(((flat_bid - long_bid) - (short_bid - flat_bid)).abs() <= EXACT_TOL);
     // The spread is the same at every inventory.
     assert_close("long spread", flat_ask - flat_bid, long_ask - long_bid);
     assert_close("short spread", flat_ask - flat_bid, short_ask - short_bid);
@@ -201,6 +204,12 @@ fn zero_horizon_leaves_only_the_intensity_term() {
     // (2 / gamma) ln(1 + gamma / k), whatever the inventory.
     let r = calculate_reservation_price(dec!(50), dec!(3), dec!(0.5), dec!(10), 0).unwrap();
     assert_eq!(r, dec!(50));
+    let spread = calculate_optimal_spread(dec!(0.5), dec!(10), 0, dec!(2)).unwrap();
+    assert_close(
+        "spread at zero horizon",
+        d("0.89257420525683902307"),
+        spread,
+    );
 }
 
 #[test]
