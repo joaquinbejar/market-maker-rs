@@ -9,8 +9,10 @@ project follows [Semantic Versioning](https://semver.org/).
 ### Breaking
 
 - `BacktestResult` has a new public field `accounting: AccountingStatus`
-  (accountant description and the execution ids it refused), so struct
-  literals of `BacktestResult` need it or `..Default::default()` (#126).
+  (accountant description and the execution ids it refused), and
+  `SimulatedFill` has a new public field `execution_id: Option<u64>`
+  (`None` from its constructors, set by the engine); struct literals of
+  either type need the new field (#126).
 - The order direction is the shared `financial_types::Action`, which
   replaces both local `Side { Buy, Sell }` enums (`execution::Side` and
   `events::Side`). It is re-exported as `execution::Action`,

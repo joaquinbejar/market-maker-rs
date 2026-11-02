@@ -117,6 +117,10 @@ pub struct SimulatedFill {
     pub timestamp: u64,
     /// Fee paid for this fill.
     pub fee: Decimal,
+    /// Engine execution id (see [`AccountingFill::execution_id`]), set
+    /// for every fill the engine produces; `None` for fills built by hand.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub execution_id: Option<u64>,
 }
 
 impl SimulatedFill {
@@ -129,6 +133,7 @@ impl SimulatedFill {
             quantity,
             timestamp,
             fee: Decimal::ZERO,
+            execution_id: None,
         }
     }
 
@@ -147,7 +152,15 @@ impl SimulatedFill {
             quantity,
             timestamp,
             fee,
+            execution_id: None,
         }
+    }
+
+    /// Sets the engine execution id.
+    #[must_use]
+    pub fn with_execution_id(mut self, execution_id: u64) -> Self {
+        self.execution_id = Some(execution_id);
+        self
     }
 
     /// Returns the notional value (price * quantity).
@@ -380,9 +393,9 @@ pub struct AccountingStatus {
     pub accountant: Option<String>,
     /// Execution ids whose post the accountant refused, in venue order.
     ///
-    /// Execution ids start at 1 and follow the order of
-    /// [`BacktestResult::trades`], so with trade recording on, execution
-    /// `id` is `trades[id - 1]` (see [`BacktestResult::refused_trades`]).
+    /// Each recorded trade carries its id in
+    /// [`SimulatedFill::execution_id`] (see
+    /// [`BacktestResult::refused_trades`]).
     pub refused_executions: Vec<u64>,
 }
 
@@ -395,15 +408,16 @@ impl AccountingStatus {
 }
 
 impl BacktestResult {
-    /// Venue fills the selected accountant refused to book.
+    /// Venue fills the selected accountant refused to book, matched by
+    /// [`SimulatedFill::execution_id`].
     ///
     /// Empty when trade recording is off or no post was refused. The
     /// remaining trades are exactly the ones reflected in the metrics.
     pub fn refused_trades(&self) -> impl Iterator<Item = &SimulatedFill> + '_ {
-        self.accounting.refused_executions.iter().filter_map(|id| {
-            id.checked_sub(1)
-                .and_then(|index| usize::try_from(index).ok())
-                .and_then(|index| self.trades.get(index))
+        self.trades.iter().filter(|trade| {
+            trade
+                .execution_id
+                .is_some_and(|id| self.accounting.refused_executions.contains(&id))
         })
     }
 
@@ -909,7 +923,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let fee = price * quantity * self.config.fee_rate;
             let stamp = self.clock.stamp();
             let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
-            let fill = SimulatedFill::with_fee(side, price, quantity, now, fee);
+            let fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
+                .with_execution_id(self.next_execution_id);
             let (order_id, cumulative) = (self.orders[index].id, self.orders[index].filled);
             // The policy books the fill first so a ledger it owns is up to
             // date when the accountant reads it.
@@ -2692,6 +2707,8 @@ mod tests {
         );
         assert_eq!(result.accounting.refused_executions, vec![3]);
         assert!(!result.accounting.is_consistent());
+        let ids: Vec<Option<u64>> = result.trades.iter().map(|f| f.execution_id).collect();
+        assert_eq!(ids, vec![Some(1), Some(2), Some(3)]);
         let refused: Vec<Decimal> = result.refused_trades().map(|f| f.quantity).collect();
         assert_eq!(refused, vec![dec!(0.5)]);
         // Venue fills minus the refused ones add up to the booked position.
