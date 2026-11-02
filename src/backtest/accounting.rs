@@ -306,8 +306,11 @@ mod margin_ledger {
                     if fee.asset == self.quote {
                         snapshot.fees += fee.amount;
                     } else if fee.asset == self.base {
-                        // Valued in quote at the execution price.
-                        snapshot.fees += fee.amount * entry.price;
+                        // Valued in quote at the execution price; the
+                        // snapshot has no error channel, so it saturates.
+                        snapshot.fees = snapshot
+                            .fees
+                            .saturating_add(fee.amount.saturating_mul(entry.price));
                     }
                 }
                 snapshot.fills_posted += 1;

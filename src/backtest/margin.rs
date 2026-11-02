@@ -401,7 +401,8 @@ impl FillAccountant for MarginGateAccountant {
         let shared = self.account.lock();
         let ledger = shared.gate.ledger();
         let position = ledger.position(&shared.instrument);
-        // Base fees are valued in quote at their execution price.
+        // Base fees are valued in quote at their execution price. The
+        // snapshot has no error channel, so the sums saturate.
         let base_fees: Decimal = ledger
             .journal()
             .iter()
@@ -410,11 +411,11 @@ impl FillAccountant for MarginGateAccountant {
                 e.fee
                     .as_ref()
                     .filter(|f| f.asset == shared.base)
-                    .map(|f| f.amount * e.price)
+                    .map(|f| f.amount.saturating_mul(e.price))
             })
-            .sum();
+            .fold(Decimal::ZERO, Decimal::saturating_add);
         let quote_fees = ledger.fees_paid(&shared.quote);
-        let fees = quote_fees + base_fees;
+        let fees = quote_fees.saturating_add(base_fees);
         let total = ledger
             .balance(&shared.quote)
             .map_or(Decimal::ZERO, |b| b.total);
