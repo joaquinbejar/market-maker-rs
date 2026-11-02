@@ -851,7 +851,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         let tick = self.config.tick_size;
         let bid_price = round_to_step(quote.bid_price, tick, false);
         let ask_price = round_to_step(quote.ask_price, tick, true);
-        let crossed = bid_price >= ask_price;
+        // Checked on the quote as emitted: rounding away from the market
+        // could otherwise hide a crossed quote.
+        let crossed = quote.bid_price >= quote.ask_price;
         for (side, price, quoted) in [
             (Side::Buy, bid_price, quote.bid_size),
             (Side::Sell, ask_price, quote.ask_size),
@@ -1168,13 +1170,33 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
 /// Rounds `value` to a multiple of `step`, up or down; a non positive step
 /// leaves the value unchanged.
+///
+/// Works on the remainder, so it never divides into a huge quotient and
+/// never loses precision; if the rounded value would overflow, the value is
+/// returned unrounded and the venue checks decide.
 fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
     if step <= Decimal::ZERO {
         return value;
     }
-    let units = value / step;
-    let units = if up { units.ceil() } else { units.floor() };
-    units * step
+    let Some(remainder) = value.checked_rem(step) else {
+        return value;
+    };
+    if remainder.is_zero() {
+        return value;
+    }
+    // Truncation toward zero; adjust to floor for negative values.
+    let toward_zero = value - remainder;
+    let down = if remainder < Decimal::ZERO {
+        toward_zero.checked_sub(step)
+    } else {
+        Some(toward_zero)
+    };
+    let rounded = if up {
+        down.and_then(|d| d.checked_add(step))
+    } else {
+        down
+    };
+    rounded.unwrap_or(value)
 }
 
 /// Approximate square root using Newton's method.
@@ -1913,6 +1935,31 @@ mod tests {
                 (Side::Sell, ExecutionKind::Accepted)
             ]
         );
+    }
+
+    #[test]
+    fn test_round_to_step_boundaries() {
+        // A tiny step must not overflow through a huge quotient.
+        let tiny = Decimal::new(1, 28);
+        assert_eq!(round_to_step(dec!(100), tiny, false), dec!(100));
+        assert_eq!(round_to_step(dec!(100), tiny, true), dec!(100));
+        // Just under one lot rounds down to zero, never up.
+        let almost = dec!(2.9999999999999999999999999999);
+        assert_eq!(round_to_step(almost, dec!(3), false), Decimal::ZERO);
+        assert_eq!(round_to_step(almost, dec!(3), true), dec!(3));
+        // Huge value with a fine step stays put when rounding up overflows.
+        assert_eq!(round_to_step(Decimal::MAX, dec!(0.7), true), Decimal::MAX);
+        assert_eq!(round_to_step(dec!(-1.25), dec!(0.5), false), dec!(-1.5));
+        assert_eq!(round_to_step(dec!(-1.25), dec!(0.5), true), dec!(-1.0));
+    }
+
+    #[test]
+    fn test_crossed_quote_is_not_hidden_by_rounding() {
+        let reports = sized_reports(
+            BacktestConfig::default(),
+            sized_quote(dec!(100.004), dec!(1), dec!(100.001), dec!(1)),
+        );
+        assert!(reports.iter().all(|r| r.kind == ExecutionKind::Rejected));
     }
 
     #[test]
