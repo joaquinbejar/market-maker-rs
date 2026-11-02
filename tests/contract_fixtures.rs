@@ -143,16 +143,47 @@ fn perpetual_funding_is_zero_sum() {
     assert!(long_payments[1] < Decimal::ZERO);
 }
 
-/// Funding timestamps are on the 8 hour grid in milliseconds; a position
-/// opened after a funding instant does not pay it.
+/// Funding instants are on the 8 hour grid in milliseconds, and the
+/// instants a position pays are the half open interval `(opened, closed]`:
+/// a position opened exactly on a funding instant does not pay it.
+///
+/// Hand values: the grid step is 28 800 000 ms. Opened at 1 699 977 600 000
+/// (exactly on the grid: 59 027 x 28 800 000), the first instant paid is the
+/// next one, 1 700 006 400 000. Opened one millisecond later, it is the same.
 #[test]
-fn perpetual_funding_schedule_is_in_milliseconds() {
+fn perpetual_funding_schedule_is_half_open() {
     let interval_ms: u64 = 8 * 60 * 60 * 1000;
     assert_eq!(interval_ms, 28_800_000);
-    let opened_at: u64 = 1_700_000_000_000;
-    let next_funding = opened_at.div_ceil(interval_ms) * interval_ms;
-    assert!(next_funding >= opened_at);
-    assert_eq!(next_funding % interval_ms, 0);
+    let first_paid = |opened_at: u64| (opened_at / interval_ms + 1) * interval_ms;
+
+    let on_grid: u64 = 1_699_977_600_000;
+    assert_eq!(on_grid % interval_ms, 0);
+    assert_eq!(first_paid(on_grid), 1_700_006_400_000);
+    assert_eq!(first_paid(on_grid + 1), 1_700_006_400_000);
+    // Opened one millisecond before an instant, that instant is paid.
+    assert_eq!(first_paid(on_grid - 1), on_grid);
+}
+
+/// Funding settlement rounding: zero sum holds on exact amounts; after
+/// rounding each side once at the settlement scale (2 dp, half even) a
+/// residual can appear, which the ledger must absorb explicitly.
+///
+/// Mark 61234.57, rate 0.000123. A 0.3 BTC long pays exactly 2.259555633,
+/// settled as 2.26. Three 0.1 BTC shorts each receive exactly 0.753185211,
+/// settled as 0.75, so 2.25 in total. Residual: 0.01.
+#[test]
+fn perpetual_funding_rounding_leaves_an_explicit_residual() {
+    let long_exact = dec!(2.259555633);
+    let short_exact = dec!(0.753185211);
+    // Exact amounts are zero sum.
+    assert_eq!(long_exact - dec!(3) * short_exact, Decimal::ZERO);
+    let settle = |v: Decimal| v.round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven);
+    let long_paid = settle(long_exact);
+    let shorts_received = dec!(3) * settle(short_exact);
+    assert_eq!(long_paid, dec!(2.26));
+    assert_eq!(shorts_received, dec!(2.25));
+    // Rounded once per side, the residual is explicit and small.
+    assert_eq!(long_paid - shorts_received, dec!(0.01));
 }
 
 // -------------------------------------------------------------- option
