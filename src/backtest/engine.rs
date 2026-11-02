@@ -75,7 +75,11 @@ use crate::execution::Side;
 use crate::position::inventory::InventoryPosition;
 use crate::position::pnl::PnL;
 use crate::strategy::quote::Quote;
-use crate::types::error::MMResult;
+use crate::types::error::{MMError, MMResult};
+
+use super::accounting::{
+    Accountant, AccountingFill, AccountingSnapshot, FillContext, LegacyAccountant,
+};
 
 use super::data::{HistoricalDataSource, MarketTick};
 use super::fill_models::{FillModel, FillResult, ImmediateFillModel, SimulatedOrder};
@@ -485,11 +489,15 @@ pub struct BacktestEngine<
     fill_model: F,
     strategy: S,
     data_source: D,
-    position: InventoryPosition,
-    pnl: PnL,
+    /// The single accounting authority: every fill is posted here once.
+    accountant: Box<dyn Accountant>,
+    /// Its latest snapshot, refreshed after every posting and mark.
+    accounting: AccountingSnapshot,
+    fill_context: FillContext,
+    next_fill_id: u64,
+    accounting_errors: Vec<MMError>,
     equity_curve: Vec<(u64, Decimal)>,
     trades: Vec<SimulatedFill>,
-    total_fees: Decimal,
     max_position: Decimal,
     peak_equity: Decimal,
     max_drawdown: Decimal,
@@ -579,6 +587,38 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         &self.latency
     }
 
+    /// Posts every fill to `accountant` instead of the default
+    /// [`LegacyAccountant`], with `context` as the instrument and currencies
+    /// of each [`AccountingFill`]. See [`super::accounting`].
+    ///
+    /// The accountant is the only place fills are booked: position, PnL,
+    /// fees, the equity curve and the result all come from its snapshot.
+    #[must_use]
+    pub fn with_accountant(
+        mut self,
+        accountant: impl Accountant + 'static,
+        context: FillContext,
+    ) -> Self {
+        self.accountant = Box::new(accountant);
+        self.fill_context = context;
+        self.accounting = self.accountant.snapshot();
+        self
+    }
+
+    /// Latest accounting results, as reported by the accountant.
+    #[must_use]
+    pub fn accounting(&self) -> &AccountingSnapshot {
+        &self.accounting
+    }
+
+    /// Errors the accountant returned, in order. The simulation never
+    /// undoes a fill because its posting failed; a caller that needs a
+    /// clean ledger checks this is empty.
+    #[must_use]
+    pub fn accounting_errors(&self) -> &[MMError] {
+        &self.accounting_errors
+    }
+
     fn build(config: BacktestConfig, strategy: S, data_source: D, fill_model: F) -> Self {
         let initial_capital = config.initial_capital;
         Self {
@@ -586,11 +626,13 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             fill_model,
             strategy,
             data_source,
-            position: InventoryPosition::new(),
-            pnl: PnL::new(),
+            accountant: Box::new(LegacyAccountant::new()),
+            accounting: AccountingSnapshot::new(),
+            fill_context: FillContext::default(),
+            next_fill_id: 1,
+            accounting_errors: Vec::new(),
             equity_curve: Vec::new(),
             trades: Vec::new(),
-            total_fees: Decimal::ZERO,
             max_position: Decimal::ZERO,
             peak_equity: initial_capital,
             max_drawdown: Decimal::ZERO,
@@ -657,13 +699,16 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             self.observed.push_back((ready, tick.clone()));
             self.advance_events(now);
 
-            // Update PnL mark-to-market
+            // Mark to market through the accountant.
             let mid_price = tick.mid_price();
-            self.pnl.unrealized = self.position.quantity * mid_price;
-            self.pnl.total = self.pnl.realized + self.pnl.unrealized;
+            if let Err(error) = self.accountant.mark_to_market(mid_price, now) {
+                self.accounting_errors.push(error);
+            }
+            self.accounting = self.accountant.snapshot();
 
             // Track equity
-            let equity = self.config.initial_capital + self.pnl.total - self.total_fees;
+            let equity = self.config.initial_capital + self.accounting.pnl.total
+                - self.accounting.total_fees;
             if self.config.record_equity_curve {
                 self.equity_curve.push((tick.timestamp, equity));
             }
@@ -685,15 +730,15 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.flush_deliveries();
 
         BacktestResult {
-            total_pnl: self.pnl.total,
-            total_fees: self.total_fees,
-            net_pnl: self.pnl.total - self.total_fees,
+            total_pnl: self.accounting.pnl.total,
+            total_fees: self.accounting.total_fees,
+            net_pnl: self.accounting.net_pnl(),
             num_trades: self.trades.len() as u64,
             num_ticks,
             start_time,
             end_time,
             max_position: self.max_position,
-            final_position: self.position.quantity,
+            final_position: self.accounting.position.quantity,
             equity_curve: if self.config.record_equity_curve {
                 self.equity_curve.clone()
             } else {
@@ -808,7 +853,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let stamp = self.clock.stamp();
             let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
             let fill = SimulatedFill::with_fee(side, price, quantity, now, fee);
-            self.process_fill(fill.clone());
+            let order_id = self.orders[index].id;
+            self.process_fill(order_id, fill.clone());
             self.queue_delivery(report, Some(fill));
         }
         let targets = &self.cancel_targets;
@@ -1009,29 +1055,26 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         }
     }
 
-    /// Processes a fill: updates position, PnL, and notifies strategy.
-    fn process_fill(&mut self, fill: SimulatedFill) {
-        // Update position
-        let signed_qty = match fill.side {
-            Side::Buy => fill.quantity,
-            Side::Sell => -fill.quantity,
+    /// Posts a fill to the accountant, exactly once, and records it.
+    fn process_fill(&mut self, order_id: SimOrderId, fill: SimulatedFill) {
+        let posting = AccountingFill {
+            fill_id: self.next_fill_id,
+            order_id,
+            side: fill.side,
+            price: fill.price,
+            quantity: fill.quantity,
+            fee: fill.fee,
+            timestamp: fill.timestamp,
+            context: self.fill_context.clone(),
         };
-        self.position
-            .update_fill(signed_qty, fill.price, fill.timestamp);
-
-        // Update realized PnL for closing trades
-        // Simplified: just track the cash flow
-        let cash_flow = match fill.side {
-            Side::Buy => -fill.notional(),
-            Side::Sell => fill.notional(),
-        };
-        self.pnl.add_realized(cash_flow);
-
-        // Track fees
-        self.total_fees += fill.fee;
+        self.next_fill_id += 1;
+        if let Err(error) = self.accountant.post_fill(&posting) {
+            self.accounting_errors.push(error);
+        }
+        self.accounting = self.accountant.snapshot();
 
         // Track max position
-        let abs_position = self.position.quantity.abs();
+        let abs_position = self.accounting.position.quantity.abs();
         if abs_position > self.max_position {
             self.max_position = abs_position;
         }
@@ -1095,7 +1138,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     /// Returns the current state (position and PnL).
     #[must_use]
     pub fn get_state(&self) -> (&InventoryPosition, &PnL) {
-        (&self.position, &self.pnl)
+        (&self.accounting.position, &self.accounting.pnl)
     }
 
     /// Returns the execution reports recorded so far, in event order.
@@ -1141,11 +1184,12 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     pub fn reset(&mut self) {
         self.data_source.reset();
         self.strategy.reset();
-        self.position = InventoryPosition::new();
-        self.pnl = PnL::new();
+        self.accountant.reset();
+        self.accounting = self.accountant.snapshot();
+        self.next_fill_id = 1;
+        self.accounting_errors.clear();
         self.equity_curve.clear();
         self.trades.clear();
-        self.total_fees = Decimal::ZERO;
         self.max_position = Decimal::ZERO;
         self.peak_equity = self.config.initial_capital;
         self.max_drawdown = Decimal::ZERO;

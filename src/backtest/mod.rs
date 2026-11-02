@@ -37,6 +37,9 @@
 //! // let result = engine.run();
 //! ```
 
+/// Accounting port at the fill boundary.
+pub mod accounting;
+
 /// Data types for market data.
 pub mod data;
 
@@ -53,6 +56,9 @@ pub mod lifecycle;
 /// Performance metrics calculator.
 pub mod metrics;
 
+pub use accounting::{
+    Accountant, AccountingFill, AccountingSnapshot, FillContext, LegacyAccountant,
+};
 pub use data::{HistoricalDataSource, MarketTick, OHLCVBar, VecDataSource};
 pub use engine::{
     BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy, SimulatedFill, SlippageModel,
