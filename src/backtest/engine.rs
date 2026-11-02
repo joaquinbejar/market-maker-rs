@@ -1038,12 +1038,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             if let Err(error) = accountant.post_fill(&posted) {
                 self.accounting_errors.push((execution_id, error));
             }
-            let snapshot = accountant.snapshot();
-            self.position.quantity = snapshot.position;
-            self.position.avg_entry_price = snapshot.average_entry_price.unwrap_or(Decimal::ZERO);
-            self.position.last_update = fill.timestamp;
-            self.pnl.realized = snapshot.cash_flow;
-            self.total_fees = snapshot.fees;
+            self.sync_accounting(fill.timestamp);
             self.track_fill(fill);
             return;
         }
@@ -1166,6 +1161,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         accountant: impl FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
     ) -> Self {
         self.accountant = Some(Box::new(accountant));
+        self.sync_accounting(0);
         self
     }
 
@@ -1246,6 +1242,24 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.accounting_errors.clear();
         self.next_execution_id = 1;
         self.reports.clear();
+        self.sync_accounting(0);
+    }
+
+    /// Copies the selected accountant's state into the engine's position,
+    /// PnL and fee fields, so runs start from the accountant's initial
+    /// state (also with no fills at all).
+    fn sync_accounting(&mut self, timestamp: u64) {
+        let Some(accountant) = self.accountant.as_ref() else {
+            return;
+        };
+        let snapshot = accountant.snapshot();
+        self.position.quantity = snapshot.position;
+        self.position.avg_entry_price = snapshot.average_entry_price.unwrap_or(Decimal::ZERO);
+        self.position.last_update = timestamp;
+        self.pnl.realized = snapshot.cash_flow;
+        self.pnl.total = self.pnl.realized + self.pnl.unrealized;
+        self.total_fees = snapshot.fees;
+        self.max_position = self.max_position.max(snapshot.position.abs());
     }
 }
 
@@ -2503,13 +2517,118 @@ mod tests {
         }
 
         #[test]
-        fn test_margin_ledger_refuses_overdraft() {
-            // 100.05 USDC pays for the first 0.5 and the 1.0 is refused.
+        fn test_margin_ledger_books_venue_fills_beyond_the_balance() {
+            // 100.05 USDC covers only the first 0.5; the venue still filled
+            // 2.0, so the ledger books it and records the shortfall.
             let mut engine = queued_engine_with_fees().with_accountant(accountant(dec!(100.05)));
             let result = engine.run();
             assert_eq!(result.num_trades, 3);
-            assert_eq!(result.final_position, dec!(0.5));
-            assert_eq!(engine.accounting_errors().len(), 2);
+            assert_eq!(result.final_position, dec!(2));
+            assert!(engine.accounting_errors().is_empty());
+        }
+
+        fn ask_fill(id: u64, price: Decimal, quantity: Decimal, fee: Decimal) -> AccountingFill {
+            AccountingFill {
+                execution_id: id,
+                order_id: id,
+                side: Side::Sell,
+                price,
+                quantity,
+                cumulative_quantity: quantity,
+                fee,
+                fee_asset: FeeAsset::Quote,
+                timestamp: 0,
+            }
+        }
+
+        #[test]
+        fn test_sell_first_without_base_is_booked_with_overdraft() {
+            let mut acc = accountant(dec!(1000));
+            acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(0.1)))
+                .unwrap();
+            let snapshot = acc.snapshot();
+            assert_eq!(snapshot.position, dec!(-1));
+            assert_eq!(snapshot.cash_flow, dec!(100));
+            assert_eq!(snapshot.fees, dec!(0.1));
+            let btc = Asset::new("BTC").unwrap();
+            assert_eq!(acc.overdrafts().get(&btc), Some(&dec!(1)));
+            acc.reset();
+            assert!(acc.overdrafts().is_empty());
+        }
+
+        #[test]
+        fn test_negative_fee_is_booked_as_rebate() {
+            let mut acc = accountant(dec!(1000));
+            acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(-0.05)))
+                .unwrap();
+            assert_eq!(acc.snapshot().fees, dec!(-0.05));
+        }
+
+        #[test]
+        fn test_base_fee_is_refused() {
+            let mut acc = accountant(dec!(1000));
+            let mut fill = ask_fill(1, dec!(100), dec!(1), dec!(0.01));
+            fill.fee_asset = FeeAsset::Base;
+            assert!(acc.post_fill(&fill).is_err());
+            assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+        }
+
+        #[test]
+        fn test_other_instruments_do_not_leak_into_the_snapshot() {
+            let usdc = Asset::new("USDC").unwrap();
+            let eth = Asset::new("ETH").unwrap();
+            let eth_pair = InstrumentId::new("ETH-USDC").unwrap();
+            let mut ledger = accountant(dec!(1000)).ledger().clone();
+            ledger.register_asset(eth.clone(), 8).unwrap();
+            ledger
+                .register_instrument(
+                    SpotInstrument::new(eth_pair.clone(), eth, usdc.clone(), 2, 2).unwrap(),
+                )
+                .unwrap();
+            let eth_buy = margin_rs::ledger::Execution::new(
+                margin_rs::ExecutionId::new("eth-1").unwrap(),
+                eth_pair,
+                margin_rs::ledger::Side::Buy,
+                dec!(100),
+                dec!(1),
+            )
+            .with_fee(usdc, dec!(0.1));
+            ledger.book_execution(&eth_buy).unwrap();
+            let acc = MarginLedgerAccountant::new(ledger, InstrumentId::new("BTC-USDC").unwrap())
+                .unwrap();
+            assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+        }
+
+        #[test]
+        fn test_initial_ledger_state_is_used_without_fills() {
+            // Seed a prior BTC position: buy 1 at 90 with a 0.09 fee.
+            let mut acc = accountant(dec!(1000));
+            let buy = AccountingFill {
+                side: Side::Buy,
+                ..ask_fill(99, dec!(90), dec!(1), dec!(0.09))
+            };
+            acc.post_fill(&buy).unwrap();
+            let seeded = MarginLedgerAccountant::new(
+                acc.ledger().clone(),
+                InstrumentId::new("BTC-USDC").unwrap(),
+            )
+            .unwrap();
+            let ticks = vec![create_test_tick(1000, dec!(99.0), dec!(101.0))];
+            let mut engine = BacktestEngine::new(
+                BacktestConfig::default(),
+                ScriptedStrategy::new(vec![None]),
+                VecDataSource::new(ticks),
+            )
+            .with_accountant(seeded);
+            let result = engine.run();
+            assert_eq!(result.num_trades, 0);
+            assert_eq!(result.final_position, dec!(1));
+            assert_eq!(result.total_fees, dec!(0.09));
+            assert_eq!(result.max_position, dec!(1));
+            // Marked at mid 100: -90 cash + 100 inventory, before fees.
+            assert_eq!(result.total_pnl, dec!(10));
+            engine.reset();
+            assert_eq!(engine.get_state().0.quantity, dec!(1));
         }
 
         #[test]

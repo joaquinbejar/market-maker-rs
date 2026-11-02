@@ -154,44 +154,53 @@ pub use margin_ledger::MarginLedgerAccountant;
 
 #[cfg(feature = "margin")]
 mod margin_ledger {
+    use std::collections::BTreeMap;
+
     use super::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
     use crate::Decimal;
     use crate::execution::Side;
     use crate::types::error::{MMError, MMResult};
-    use margin_rs::ledger::{Execution, Ledger, Side as LedgerSide, TransferKind};
+    use margin_rs::ledger::{Execution, Ledger, Side as LedgerSide};
     use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId};
 
     /// [`FillAccountant`] backed by the exact single account ledger of
     /// `margin-rs`.
     ///
-    /// Each fill becomes a ledger execution with id `sim-<execution_id>`, so
-    /// booking is idempotent. The ledger enforces its instrument and asset
-    /// scales: configure [`BacktestConfig::tick_size`](crate::backtest::BacktestConfig::tick_size),
-    /// [`BacktestConfig::lot_size`](crate::backtest::BacktestConfig::lot_size)
-    /// and the fee rate so prices, quantities and fees fit them, otherwise
-    /// the post fails and is reported as an accounting error. Insufficient
-    /// balance is also an error: the ledger never overdraws.
+    /// - Each fill becomes a ledger execution with id `sim-<execution_id>`,
+    ///   so booking is idempotent.
+    /// - Fills already happened at the venue, so they are booked even when a
+    ///   balance goes negative (for example selling base the account never
+    ///   held); the resulting shortfalls are kept in
+    ///   [`MarginLedgerAccountant::overdrafts`] instead of refusing the fill.
+    /// - Fees may be negative (rebates). Only quote denominated fees are
+    ///   supported; a base fee is refused as an accounting error.
+    /// - The snapshot covers only executions of the selected instrument, so
+    ///   other activity in the ledger never leaks into the backtest.
+    /// - The ledger enforces its instrument and asset scales: configure
+    ///   [`BacktestConfig::tick_size`](crate::backtest::BacktestConfig::tick_size),
+    ///   [`BacktestConfig::lot_size`](crate::backtest::BacktestConfig::lot_size)
+    ///   and the fee rate so values fit them, otherwise the post fails and is
+    ///   reported as an accounting error.
     #[derive(Debug, Clone)]
     pub struct MarginLedgerAccountant {
         initial: Ledger,
         ledger: Ledger,
         instrument: InstrumentId,
-        base: Asset,
         quote: Asset,
+        overdrafts: BTreeMap<Asset, Decimal>,
     }
 
     impl MarginLedgerAccountant {
         /// Wraps a ledger in which `instrument` is a registered spot
-        /// instrument; deposits made before wrapping are the starting
-        /// balance restored by reset.
+        /// instrument; its current state is what reset restores.
         ///
         /// # Errors
         ///
         /// Returns [`MMError::InvalidConfiguration`] if the instrument is not
-        /// registered in the ledger.
+        /// a registered spot instrument.
         pub fn new(ledger: Ledger, instrument: InstrumentId) -> MMResult<Self> {
-            let (base, quote) = match ledger.instrument(&instrument) {
-                Some(Instrument::Spot(spot)) => (spot.base().clone(), spot.quote().clone()),
+            let quote = match ledger.instrument(&instrument) {
+                Some(Instrument::Spot(spot)) => spot.quote().clone(),
                 Some(_) => {
                     return Err(MMError::InvalidConfiguration(format!(
                         "instrument {} is not a spot instrument",
@@ -209,8 +218,8 @@ mod margin_ledger {
                 initial: ledger.clone(),
                 ledger,
                 instrument,
-                base,
                 quote,
+                overdrafts: BTreeMap::new(),
             })
         }
 
@@ -220,22 +229,11 @@ mod margin_ledger {
             &self.ledger
         }
 
-        fn fee_asset(&self, asset: FeeAsset) -> &Asset {
-            match asset {
-                FeeAsset::Quote => &self.quote,
-                FeeAsset::Base => &self.base,
-            }
-        }
-
-        fn net_deposits(&self, asset: &Asset) -> Decimal {
-            self.ledger
-                .transfers()
-                .filter(|t| &t.asset == asset)
-                .map(|t| match t.kind {
-                    TransferKind::Deposit => t.amount,
-                    TransferKind::Withdrawal => -t.amount,
-                })
-                .sum()
+        /// Largest shortfall per asset created by booking venue fills that
+        /// the balance did not cover.
+        #[must_use]
+        pub fn overdrafts(&self) -> &BTreeMap<Asset, Decimal> {
+            &self.overdrafts
         }
     }
 
@@ -245,6 +243,11 @@ mod margin_ledger {
 
     impl FillAccountant for MarginLedgerAccountant {
         fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
+            if fill.fee_asset == FeeAsset::Base && !fill.fee.is_zero() {
+                return Err(MMError::InvalidPositionUpdate(
+                    "margin ledger adapter supports quote denominated fees only".to_string(),
+                ));
+            }
             let id = ExecutionId::new(format!("sim-{}", fill.execution_id))
                 .map_err(|e| margin_error("execution id", e))?;
             let side = match fill.side {
@@ -253,36 +256,49 @@ mod margin_ledger {
             };
             let mut execution =
                 Execution::new(id, self.instrument.clone(), side, fill.price, fill.quantity);
-            if fill.fee > Decimal::ZERO {
-                execution = execution.with_fee(self.fee_asset(fill.fee_asset).clone(), fill.fee);
+            // Negative fees are rebates and are booked as such.
+            if !fill.fee.is_zero() {
+                execution = execution.with_fee(self.quote.clone(), fill.fee);
             }
-            self.ledger
-                .book_execution(&execution)
+            let booked = self
+                .ledger
+                .book_execution_allowing_overdraft(&execution, None)
                 .map_err(|e| margin_error("booking", e))?;
+            for (asset, shortfall) in booked.shortfalls {
+                let worst = self.overdrafts.entry(asset).or_insert(Decimal::ZERO);
+                *worst = (*worst).max(shortfall);
+            }
             Ok(())
         }
 
         fn snapshot(&self) -> AccountingSnapshot {
             let position = self.ledger.position(&self.instrument);
-            let quantity = position.as_ref().map_or(Decimal::ZERO, |p| p.quantity);
-            let average_entry_price = position.as_ref().and_then(|p| p.average_price());
-            let fees = self.ledger.fees_paid(&self.quote);
-            let total = self
+            let mut snapshot = AccountingSnapshot {
+                position: position.as_ref().map_or(Decimal::ZERO, |p| p.quantity),
+                average_entry_price: position.as_ref().and_then(|p| p.average_price()),
+                ..AccountingSnapshot::default()
+            };
+            for entry in self
                 .ledger
-                .balance(&self.quote)
-                .map_or(Decimal::ZERO, |b| b.total);
-            AccountingSnapshot {
-                position: quantity,
-                average_entry_price,
-                // Quote balance change from trading, fees added back.
-                cash_flow: total - self.net_deposits(&self.quote) + fees,
-                fees,
-                fills_posted: self.ledger.journal().len() as u64,
+                .journal()
+                .iter()
+                .filter(|e| e.instrument == self.instrument)
+            {
+                snapshot.cash_flow += match entry.side {
+                    LedgerSide::Buy => -entry.notional,
+                    LedgerSide::Sell => entry.notional,
+                };
+                if let Some(fee) = entry.fee.as_ref().filter(|f| f.asset == self.quote) {
+                    snapshot.fees += fee.amount;
+                }
+                snapshot.fills_posted += 1;
             }
+            snapshot
         }
 
         fn reset(&mut self) {
             self.ledger = self.initial.clone();
+            self.overdrafts.clear();
         }
 
         fn description(&self) -> String {
