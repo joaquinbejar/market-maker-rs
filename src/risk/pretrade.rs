@@ -484,7 +484,9 @@ impl PretradePolicy for LimitsPolicy {
                     FeeAsset::Base => *fee,
                     FeeAsset::Quote | FeeAsset::Other(_) => Decimal::ZERO,
                 };
-                self.position += Self::signed(dir, *quantity) - base_fee;
+                self.position = self
+                    .position
+                    .saturating_add(Self::signed(dir, *quantity).saturating_sub(base_fee));
                 if let Some((_, remaining)) = self.live.get_mut(order_id) {
                     *remaining -= *quantity;
                     if *remaining <= Decimal::ZERO {

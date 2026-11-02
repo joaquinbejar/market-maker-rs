@@ -532,7 +532,9 @@ pub const MAX_RECORDED_FAULTS: usize = 16;
 pub struct BacktestResult {
     /// Total PnL before fees.
     pub total_pnl: Decimal,
-    /// Total fees paid.
+    /// Total fees paid, in quote. Fees paid in the base asset are valued
+    /// at the final mark, so with base fees this differs from the sum of
+    /// [`SimulatedFill::fee`], which values each fee at its fill price.
     pub total_fees: Decimal,
     /// Net PnL after fees.
     pub net_pnl: Decimal,
