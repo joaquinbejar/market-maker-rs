@@ -152,7 +152,7 @@ const FIXTURES: &[Row] = &[
 ];
 
 #[test]
-fn reference_fixtures_match_within_tolerance() {
+fn test_as_quotes_reference_fixtures_match_within_tolerance() {
     for (s, q, g, sig, tau, k, r, delta, bid, ask) in FIXTURES {
         let (s, q, g, sig, k) = (d(s), d(q), d(g), d(sig), d(k));
         let label = format!("s={s} q={q} gamma={g} sigma={sig} tau={tau} k={k}");
@@ -167,7 +167,7 @@ fn reference_fixtures_match_within_tolerance() {
 }
 
 #[test]
-fn zero_inventory_quotes_are_symmetric_around_mid() {
+fn test_as_quotes_zero_inventory_symmetric_around_mid() {
     let (bid, ask) = calculate_optimal_quotes(
         dec!(100),
         Decimal::ZERO,
@@ -181,7 +181,7 @@ fn zero_inventory_quotes_are_symmetric_around_mid() {
 }
 
 #[test]
-fn skew_flips_sign_with_inventory_and_spread_does_not_depend_on_it() {
+fn test_as_quotes_inventory_sign_flips_skew_keeps_spread() {
     let quotes = |q: Decimal| {
         calculate_optimal_quotes(dec!(100), q, dec!(0.1), dec!(2), 3_600_000, dec!(1.5)).unwrap()
     };
@@ -199,7 +199,7 @@ fn skew_flips_sign_with_inventory_and_spread_does_not_depend_on_it() {
 }
 
 #[test]
-fn zero_horizon_leaves_only_the_intensity_term() {
+fn test_as_spread_zero_horizon_leaves_only_intensity_term() {
     // At T - t = 0 the reservation price is the mid and the spread is
     // (2 / gamma) ln(1 + gamma / k), whatever the inventory.
     let r = calculate_reservation_price(dec!(50), dec!(3), dec!(0.5), dec!(10), 0).unwrap();
@@ -213,7 +213,7 @@ fn zero_horizon_leaves_only_the_intensity_term() {
 }
 
 #[test]
-fn invalid_parameters_are_rejected_with_typed_errors() {
+fn test_as_quotes_invalid_parameters_return_typed_errors() {
     let s = dec!(100);
     let q = Decimal::ONE;
     let tau = 3_600_000;
@@ -254,7 +254,7 @@ fn invalid_parameters_are_rejected_with_typed_errors() {
 }
 
 #[test]
-fn outside_the_domain_quotes_are_refused_not_negative() {
+fn test_as_quotes_negative_reservation_price_refused() {
     // Large inventory and horizon push the reservation price below zero
     // (reference r = -43.7655); the model leaves its domain and the quote
     // function refuses instead of returning a negative bid.
@@ -274,7 +274,7 @@ fn outside_the_domain_quotes_are_refused_not_negative() {
 /// `cargo test --test avellaneda_stoikov_fixtures -- --ignored --nocapture`.
 #[test]
 #[ignore = "evidence table, run on demand"]
-fn discrepancy_table() {
+fn test_as_quotes_fixtures_print_discrepancy_table() {
     println!("| fixture | quantity | expected | actual | abs error | tolerance |");
     println!("|---|---|---|---|---|---|");
     for (i, (s, q, g, sig, tau, k, r, delta, bid, ask)) in FIXTURES.iter().enumerate() {

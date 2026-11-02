@@ -35,7 +35,7 @@ fn round_btc(value: Decimal) -> Decimal {
 /// Sell 0.5 @ 61000: notional 30500, fee 30.5, cash +30469.5.
 /// Net cash 439.5 = gross 500 - fees 60.5; position flat.
 #[test]
-fn spot_round_trip_cashflows() {
+fn test_spot_round_trip_net_cash_equals_gross_minus_fees() {
     let buy_cash = dec!(-30030);
     let sell_cash = dec!(30469.5);
     let fees = dec!(60.5);
@@ -52,7 +52,7 @@ fn spot_round_trip_cashflows() {
 /// Trade 0.5 BTC @ 60000, each side pays 0.1%: buyer cash -30030, seller
 /// cash +29970, base +0.5 and -0.5.
 #[test]
-fn spot_counterparties_conserve_value() {
+fn test_spot_trade_counterparties_conserve_value_except_fees() {
     let (buyer_cash, seller_cash) = (dec!(-30030), dec!(29970));
     let (buyer_base, seller_base) = (dec!(0.5), dec!(-0.5));
     assert_eq!(buyer_base + seller_base, Decimal::ZERO);
@@ -67,7 +67,7 @@ fn spot_counterparties_conserve_value() {
 /// Long 10 contracts @ 60000, close @ 61000: PnL 10 USDT.
 /// Short the same: -10 USDT.
 #[test]
-fn linear_future_pnl_matches_spot_exposure() {
+fn test_linear_future_close_pnl_matches_spot_exposure() {
     let long_pnl = dec!(10);
     let short_pnl = dec!(-10);
     // Independent check: 10 contracts x 0.001 BTC is 0.01 BTC of exposure,
@@ -90,7 +90,7 @@ fn linear_future_pnl_matches_spot_exposure() {
 /// Long 10 @ 60000, exit 59000: 1000 x (1/60000 - 1/59000) = -1/3540 BTC =
 /// -0.000282485875... BTC, settled as -0.00028249 BTC.
 #[test]
-fn inverse_future_settles_in_coin_at_satoshi_scale() {
+fn test_inverse_future_close_settles_in_coin_at_satoshi_scale() {
     let up = dec!(0.00027322);
     let down = dec!(-0.00028249);
 
@@ -124,7 +124,7 @@ fn inverse_future_settles_in_coin_at_satoshi_scale() {
 /// | 3        | 61000 | 0.0002   | 24.4      |
 /// Total paid by the long: 30.5 USDT; received by a 2 BTC short: 30.5.
 #[test]
-fn perpetual_funding_is_zero_sum() {
+fn test_perpetual_funding_schedule_payments_are_zero_sum() {
     let long_payments = [dec!(12), dec!(-5.9), dec!(24.4)];
     let long_total: Decimal = long_payments.iter().sum();
     assert_eq!(long_total, dec!(30.5));
@@ -158,7 +158,7 @@ fn perpetual_funding_is_zero_sum() {
 /// (exactly on the grid: 59 027 x 28 800 000), the first instant paid is the
 /// next one, 1 700 006 400 000. Opened one millisecond later, it is the same.
 #[test]
-fn perpetual_funding_schedule_is_half_open() {
+fn test_perpetual_funding_schedule_paid_instants_are_half_open() {
     let interval_ms: u64 = 8 * 60 * 60 * 1000;
     assert_eq!(interval_ms, 28_800_000);
     let first_paid = |opened_at: u64| (opened_at / interval_ms + 1) * interval_ms;
@@ -179,7 +179,7 @@ fn perpetual_funding_schedule_is_half_open() {
 /// settled as 2.26. Three 0.1 BTC shorts each receive exactly 0.753185211,
 /// settled as 0.75, so 2.25 in total. Residual: 0.01.
 #[test]
-fn perpetual_funding_rounding_leaves_an_explicit_residual() {
+fn test_perpetual_funding_rounding_leaves_explicit_residual() {
     let long_exact = dec!(2.259555633);
     let short_exact = dec!(0.753185211);
     // Exact amounts are zero sum.
@@ -201,7 +201,7 @@ fn perpetual_funding_rounding_leaves_an_explicit_residual() {
 /// Expiry 63000: payoff 2 x 3000 = 6000; buyer net 6000 - 3000 = 3000.
 /// Expiry 59000: payoff 0; buyer net -3000. Seller is the mirror image.
 #[test]
-fn option_expiry_cashflows_mirror_between_sides() {
+fn test_option_expiry_cashflows_mirror_between_sides() {
     let premium_paid = dec!(3000);
     let itm_payoff = dec!(6000);
     let otm_payoff = Decimal::ZERO;
@@ -220,7 +220,7 @@ fn option_expiry_cashflows_mirror_between_sides() {
 /// Call K=60000 payoffs at S=63000 and 59000: 3000 and 0.
 /// Put K=60000 payoffs at the same S: 0 and 1000.
 #[test]
-fn option_payoffs_satisfy_parity_at_expiry() {
+fn test_option_payoffs_at_expiry_satisfy_parity() {
     let cases = [
         (dec!(63000), dec!(3000), Decimal::ZERO),
         (dec!(59000), Decimal::ZERO, dec!(1000)),
@@ -235,14 +235,14 @@ fn option_payoffs_satisfy_parity_at_expiry() {
 /// Overflow is an explicit outcome, never a panic: a notional that does not
 /// fit is reported as `None` by checked arithmetic.
 #[test]
-fn notional_overflow_is_detected() {
+fn test_notional_overflowing_product_is_detected() {
     assert_eq!(Decimal::MAX.checked_mul(dec!(2)), None);
     assert_eq!(dec!(60000).checked_mul(dec!(0.5)), Some(dec!(30000)));
 }
 
 /// Half even rounding at satoshi scale is unbiased on exact midpoints.
 #[test]
-fn settlement_rounding_is_half_even() {
+fn test_settlement_rounding_midpoint_rounds_half_even() {
     assert_eq!(round_btc(dec!(0.000000025)), dec!(0.00000002));
     assert_eq!(round_btc(dec!(0.000000035)), dec!(0.00000004));
 }

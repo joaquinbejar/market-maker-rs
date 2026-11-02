@@ -148,7 +148,7 @@ fn unlimited() -> BacktestEngine<AsStrategy, VecDataSource> {
 }
 
 #[test]
-fn quotes_respect_tick_grid_and_never_cross() {
+fn test_as_backtest_quotes_on_tick_grid_never_cross() {
     let mut engine = engine();
     let result = engine.run();
     assert!(result.num_trades > 0, "the path must exercise fills");
@@ -190,7 +190,7 @@ fn quotes_respect_tick_grid_and_never_cross() {
 }
 
 #[test]
-fn position_never_exceeds_the_pretrade_limit() {
+fn test_as_backtest_position_stays_within_pretrade_limit() {
     // Control: without the policy the same run goes beyond the limit, so the
     // bound below is not vacuous.
     let control = unlimited().run();
@@ -228,7 +228,7 @@ fn position_never_exceeds_the_pretrade_limit() {
 }
 
 #[test]
-fn fees_are_charged_on_every_fill() {
+fn test_as_backtest_every_fill_charges_fee() {
     let mut engine = engine();
     let result = engine.run();
     let fees: Decimal = result.trades.iter().map(|f| f.fee).sum();
@@ -237,7 +237,7 @@ fn fees_are_charged_on_every_fill() {
 }
 
 #[test]
-fn run_replays_identically() {
+fn test_as_backtest_rerun_replays_identically() {
     let mut engine = engine();
     let first = engine.run();
     let first_reports = engine.execution_reports().to_vec();
