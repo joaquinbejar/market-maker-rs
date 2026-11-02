@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::Decimal;
+use crate::risk::pretrade::{OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest};
 use crate::types::error::{MMError, MMResult};
 
 use super::connector::{Fill, OrderId, OrderRequest, OrderResponse, OrderStatus, OrderType, Side};
@@ -361,6 +362,47 @@ impl OrderManager {
     #[must_use]
     pub fn config(&self) -> &OrderManagerConfig {
         &self.config
+    }
+
+    /// Passes the order through `policy` and registers it with the approved
+    /// quantity.
+    ///
+    /// This is the same pretrade seam the backtest engine uses, so quotes and
+    /// hedges sent through the live path are checked by the same policy.
+    /// Nothing is registered on a rejection or a zero approved quantity; a
+    /// reduction never increases the quantity. The caller forwards the
+    /// order's later lifecycle to the policy with
+    /// [`PretradePolicy::on_order_event`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`OrderManager::register_order`] errors for an approved
+    /// order.
+    pub fn register_order_checked(
+        &mut self,
+        request: &OrderRequest,
+        client_order_id: String,
+        timestamp: u64,
+        purpose: OrderPurpose,
+        policy: &mut dyn PretradePolicy,
+    ) -> MMResult<PretradeDecision> {
+        let pretrade = PretradeRequest::new(
+            client_order_id.clone(),
+            request.side,
+            request.price,
+            request.quantity,
+            purpose,
+            timestamp,
+        );
+        let decision = policy.check(&pretrade);
+        let approved = decision.approved_quantity(request.quantity);
+        if approved <= Decimal::ZERO {
+            return Ok(decision);
+        }
+        let mut approved_request = request.clone();
+        approved_request.quantity = approved;
+        self.register_order(&approved_request, client_order_id, timestamp)?;
+        Ok(decision)
     }
 
     /// Registers a new order before submission.

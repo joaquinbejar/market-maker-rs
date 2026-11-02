@@ -74,6 +74,9 @@ use crate::Decimal;
 use crate::execution::Side;
 use crate::position::inventory::InventoryPosition;
 use crate::position::pnl::PnL;
+use crate::risk::pretrade::{
+    OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
+};
 use crate::strategy::quote::Quote;
 use crate::types::error::{MMError, MMResult};
 
@@ -522,6 +525,23 @@ pub struct BacktestEngine<
     accountant: Option<Box<dyn FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe>>,
     accounting_errors: Vec<(u64, MMError)>,
     next_execution_id: u64,
+    /// Pretrade policy every new order passes before submission.
+    policy: Option<Box<dyn PretradePolicy>>,
+    pretrade_log: Vec<PretradeRecord>,
+}
+
+/// One pretrade decision taken by the engine's policy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PretradeRecord {
+    /// Simulated order the request was for.
+    pub order_id: SimOrderId,
+    /// Request presented to the policy.
+    pub request: PretradeRequest,
+    /// Policy decision.
+    pub decision: PretradeDecision,
+    /// Quantity submitted (zero when nothing was submitted), after the
+    /// clamp to the request and lot rounding.
+    pub submitted: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -619,6 +639,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             accountant: None,
             accounting_errors: Vec::new(),
             next_execution_id: 1,
+            policy: None,
+            pretrade_log: Vec::new(),
         }
     }
 
@@ -654,6 +676,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
             // 2. Market data: match orders that were already active before
             //    this tick.
+            if let Some(policy) = self.policy.as_mut() {
+                policy.on_market_data(tick.mid_price(), tick.timestamp);
+            }
             self.match_active_orders(&tick, now);
 
             // 3. The tick enters the FIFO observation channel; the strategy
@@ -818,6 +843,18 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
             let fill = SimulatedFill::with_fee(side, price, quantity, now, fee);
             let (order_id, cumulative) = (self.orders[index].id, self.orders[index].filled);
+            // The policy books the fill first so a ledger it owns is up to
+            // date when the accountant reads it.
+            self.notify_policy(OrderEvent::Fill {
+                order_id: order_id.to_string(),
+                execution_id: format!("sim-{}", self.next_execution_id),
+                side,
+                price,
+                quantity,
+                cumulative_quantity: cumulative,
+                fee,
+                timestamp: now,
+            });
             self.process_fill(fill.clone(), order_id, cumulative);
             self.queue_delivery(report, Some(fill));
         }
@@ -855,6 +892,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         for id in targets {
             let effective = self.delayed(now, self.latency.cancel_ms);
             self.cancel_targets.insert(id);
+            self.notify_policy(OrderEvent::CancelRequested {
+                order_id: id.to_string(),
+            });
             self.schedule(effective, PendingAction::Cancel(id));
         }
 
@@ -874,11 +914,36 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 self.config.default_order_size
             };
             // A size that rounds to zero is rejected by the venue checks.
-            let size = round_to_step(requested, self.config.lot_size, false);
+            let mut size = round_to_step(requested, self.config.lot_size, false);
             let id = self.next_order_id;
             self.next_order_id += 1;
             let stamp = self.clock.stamp();
-            if crossed {
+            let mut refused = crossed;
+            if !crossed && let Some(policy) = self.policy.as_mut() {
+                let request = PretradeRequest::new(
+                    id.to_string(),
+                    side,
+                    Some(price),
+                    size,
+                    OrderPurpose::Quote,
+                    now,
+                );
+                let decision = policy.check(&request);
+                // Never more than requested, and still a whole lot.
+                size = round_to_step(
+                    decision.approved_quantity(size),
+                    self.config.lot_size,
+                    false,
+                );
+                refused = size <= Decimal::ZERO;
+                self.pretrade_log.push(PretradeRecord {
+                    order_id: id,
+                    request,
+                    decision,
+                    submitted: if refused { Decimal::ZERO } else { size },
+                });
+            }
+            if refused {
                 let mut order = SimOrder::new(id, side, price, size, stamp, now);
                 let _ = order.reject();
                 let stamp = self.clock.stamp();
@@ -991,7 +1056,25 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
     /// Records a venue report and queues it for the strategy.
     fn emit(&mut self, report: ExecutionReport) {
+        let order_id = report.order_id.to_string();
+        let event = match report.kind {
+            ExecutionKind::Accepted => Some(OrderEvent::Accepted { order_id }),
+            ExecutionKind::Rejected => Some(OrderEvent::VenueRejected { order_id }),
+            ExecutionKind::Canceled => Some(OrderEvent::Canceled { order_id }),
+            ExecutionKind::CancelRejected => Some(OrderEvent::CancelRejected { order_id }),
+            // Fills are forwarded with their execution details.
+            ExecutionKind::PartialFill | ExecutionKind::Fill => None,
+        };
+        if let Some(event) = event {
+            self.notify_policy(event);
+        }
         self.queue_delivery(report, None);
+    }
+
+    fn notify_policy(&mut self, event: OrderEvent) {
+        if let Some(policy) = self.policy.as_mut() {
+            policy.on_order_event(&event);
+        }
     }
 
     fn queue_delivery(&mut self, report: ExecutionReport, fill: Option<SimulatedFill>) {
@@ -1150,6 +1233,31 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         &self.fill_model
     }
 
+    /// Passes every new order through `policy` before submission.
+    ///
+    /// A rejection (or a quantity that rounds to zero lots) is reported as a
+    /// local `Rejected` and nothing reaches the venue; a reduction submits the
+    /// smaller quantity and can never increase it. The policy also receives
+    /// the market mark of every tick and every lifecycle event of the orders,
+    /// in venue order. See [`crate::risk::pretrade`].
+    #[must_use]
+    pub fn with_pretrade_policy(mut self, policy: impl PretradePolicy + 'static) -> Self {
+        self.policy = Some(Box::new(policy));
+        self
+    }
+
+    /// Every pretrade decision taken so far, in decision order.
+    #[must_use]
+    pub fn pretrade_decisions(&self) -> &[PretradeRecord] {
+        &self.pretrade_log
+    }
+
+    /// Description of the pretrade policy, if one was selected.
+    #[must_use]
+    pub fn pretrade_policy_description(&self) -> Option<String> {
+        self.policy.as_ref().map(|p| p.description())
+    }
+
     /// Selects `accountant` as the single accounting authority for fills.
     ///
     /// Every fill is posted to it exactly once and the position, PnL, fees
@@ -1241,6 +1349,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         }
         self.accounting_errors.clear();
         self.next_execution_id = 1;
+        if let Some(policy) = self.policy.as_mut() {
+            policy.reset();
+        }
+        self.pretrade_log.clear();
         self.reports.clear();
         self.sync_accounting(0);
     }
@@ -2636,6 +2748,243 @@ mod tests {
             let ledger = Ledger::default();
             let missing = InstrumentId::new("ETH-USDC").unwrap();
             assert!(MarginLedgerAccountant::new(ledger, missing).is_err());
+        }
+    }
+
+    /// Pretrade policy test double returning a fixed decision and logging
+    /// every request it sees.
+    #[derive(Debug)]
+    struct FixedPolicy {
+        decision: PretradeDecision,
+        seen: std::rc::Rc<std::cell::RefCell<Vec<PretradeRequest>>>,
+    }
+
+    impl FixedPolicy {
+        fn new(decision: PretradeDecision) -> Self {
+            Self {
+                decision,
+                seen: Default::default(),
+            }
+        }
+    }
+
+    impl PretradePolicy for FixedPolicy {
+        fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
+            self.seen.borrow_mut().push(request.clone());
+            self.decision.clone()
+        }
+        fn reset(&mut self) {
+            self.seen.borrow_mut().clear();
+        }
+    }
+
+    #[test]
+    fn test_rejecting_policy_prevents_submission() {
+        let policy = FixedPolicy::new(PretradeDecision::Rejected {
+            reason: "no".to_string(),
+        });
+        let mut engine =
+            scripted_engine(queue_ticks(), queue_quotes()).with_pretrade_policy(policy);
+        let result = engine.run();
+        assert_eq!(result.num_trades, 0);
+        assert!(engine.open_orders().is_empty());
+        assert!(
+            engine
+                .execution_reports()
+                .iter()
+                .all(|r| r.kind == ExecutionKind::Rejected)
+        );
+        let decisions = engine.pretrade_decisions();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(|d| d.submitted == Decimal::ZERO));
+    }
+
+    #[test]
+    fn test_reducing_policy_cannot_increase_quantity() {
+        let grow = FixedPolicy::new(PretradeDecision::Reduced {
+            quantity: dec!(10),
+            reason: "bigger".to_string(),
+        });
+        let mut engine = scripted_engine(queue_ticks(), queue_quotes()).with_pretrade_policy(grow);
+        engine.run();
+        assert!(
+            engine
+                .pretrade_decisions()
+                .iter()
+                .all(|d| d.submitted == dec!(2))
+        );
+
+        let shrink = FixedPolicy::new(PretradeDecision::Reduced {
+            quantity: dec!(0.5),
+            reason: "smaller".to_string(),
+        });
+        let mut engine =
+            scripted_engine(queue_ticks(), queue_quotes()).with_pretrade_policy(shrink);
+        let result = engine.run();
+        assert_eq!(result.final_position, dec!(0.5));
+        assert!(
+            engine
+                .pretrade_decisions()
+                .iter()
+                .all(|d| d.submitted == dec!(0.5))
+        );
+    }
+
+    #[test]
+    fn test_quote_and_hedge_paths_use_the_same_seam() {
+        use crate::execution::{OrderManager, OrderRequest};
+        let mut policy = FixedPolicy::new(PretradeDecision::Rejected {
+            reason: "halted".to_string(),
+        });
+        let seen = policy.seen.clone();
+
+        // Hedge through the live order manager.
+        let mut manager = OrderManager::with_defaults();
+        let hedge = OrderRequest::limit_sell("BTC-USD", dec!(100), dec!(1));
+        let decision = manager
+            .register_order_checked(
+                &hedge,
+                "h-1".to_string(),
+                5,
+                OrderPurpose::Hedge,
+                &mut policy,
+            )
+            .unwrap();
+        assert!(decision.is_rejected());
+        assert_eq!(manager.open_order_count(), 0);
+
+        // Quote through the backtest engine.
+        let mut engine =
+            scripted_engine(queue_ticks(), queue_quotes()).with_pretrade_policy(policy);
+        engine.run();
+        assert!(engine.open_orders().is_empty());
+
+        // The engine run does not reset the policy, so both paths are logged.
+        let purposes: Vec<OrderPurpose> = seen.borrow().iter().map(|r| r.purpose).collect();
+        assert_eq!(
+            purposes,
+            vec![
+                OrderPurpose::Hedge,
+                OrderPurpose::Quote,
+                OrderPurpose::Quote
+            ]
+        );
+    }
+
+    #[test]
+    fn test_limits_policy_caps_worst_case_position() {
+        use crate::risk::RiskLimits;
+        use crate::risk::pretrade::LimitsPolicy;
+        // Max position 3: the first bid of 2 fits; after it fills, the
+        // requote bid is reduced to the 1 unit of capacity left.
+        let limits = RiskLimits::new(dec!(3), dec!(1_000_000), dec!(0)).unwrap();
+        let ticks = vec![
+            create_test_tick(1000, dec!(98.0), dec!(102.0)),
+            create_test_tick(1001, dec!(97.0), dec!(99.0)),
+            create_test_tick(1002, dec!(98.0), dec!(102.0)),
+        ];
+        let mut engine = scripted_engine(
+            ticks,
+            vec![
+                Some((dec!(100), dec!(200))),
+                None,
+                Some((dec!(100), dec!(200))),
+            ],
+        )
+        .with_pretrade_policy(LimitsPolicy::new(limits));
+        let result = engine.run();
+        assert_eq!(result.final_position, dec!(2));
+        let bids: Vec<Decimal> = engine
+            .pretrade_decisions()
+            .iter()
+            .filter(|d| d.request.side == Side::Buy)
+            .map(|d| d.submitted)
+            .collect();
+        assert_eq!(bids, vec![dec!(2), dec!(1)]);
+    }
+
+    #[cfg(feature = "margin")]
+    mod margin_gate {
+        use super::*;
+        use crate::backtest::MarginAccount;
+        use margin_rs::ledger::Ledger;
+        use margin_rs::risk::{InstrumentLimits, RiskGate};
+        use margin_rs::{Asset, InstrumentId, SpotInstrument, TransferId};
+
+        fn account(max_position: Option<Decimal>) -> MarginAccount {
+            let usdc = Asset::new("USDC").unwrap();
+            let btc = Asset::new("BTC").unwrap();
+            let pair = InstrumentId::new("BTC-USDC").unwrap();
+            let mut ledger = Ledger::default();
+            ledger.register_asset(usdc.clone(), 6).unwrap();
+            ledger.register_asset(btc.clone(), 8).unwrap();
+            ledger
+                .register_instrument(
+                    SpotInstrument::new(pair.clone(), btc.clone(), usdc.clone(), 2, 2).unwrap(),
+                )
+                .unwrap();
+            let mut gate = RiskGate::new(ledger);
+            gate.deposit(TransferId::new("seed-usdc").unwrap(), usdc, dec!(1000))
+                .unwrap();
+            gate.deposit(TransferId::new("seed-btc").unwrap(), btc, dec!(5))
+                .unwrap();
+            gate.set_limits(
+                &pair,
+                InstrumentLimits {
+                    max_fee_rate: dec!(0.001),
+                    max_position,
+                    ..InstrumentLimits::default()
+                },
+            )
+            .unwrap();
+            MarginAccount::new(gate, pair).unwrap()
+        }
+
+        #[test]
+        fn test_margin_gate_books_and_reconciles_with_builtin() {
+            let builtin = queued_engine_with_fees().run();
+            let account = account(None);
+            let mut engine = queued_engine_with_fees()
+                .with_pretrade_policy(account.policy())
+                .with_accountant(account.accountant());
+            let result = engine.run();
+            assert!(account.errors().is_empty(), "{:?}", account.errors());
+            assert!(engine.accounting_errors().is_empty());
+            assert_eq!(result.final_position, builtin.final_position);
+            assert_eq!(result.total_fees, dec!(0.2));
+            assert_eq!(result.net_pnl, builtin.net_pnl);
+            account.with_gate(|gate| {
+                assert!(gate.ledger().reconcile().unwrap().is_clean());
+                assert_eq!(gate.ledger().journal().len(), 3);
+            });
+        }
+
+        #[test]
+        fn test_margin_gate_reduces_to_its_position_limit() {
+            let account = account(Some(dec!(1)));
+            let mut engine = queued_engine_with_fees()
+                .with_pretrade_policy(account.policy())
+                .with_accountant(account.accountant());
+            let result = engine.run();
+            let bid = &engine.pretrade_decisions()[0];
+            assert_eq!(bid.request.side, Side::Buy);
+            assert_eq!(bid.submitted, dec!(1));
+            assert_eq!(result.final_position, dec!(1));
+            assert!(account.errors().is_empty(), "{:?}", account.errors());
+        }
+
+        #[test]
+        fn test_margin_reset_restores_the_account() {
+            let account = account(None);
+            let mut engine = queued_engine_with_fees()
+                .with_pretrade_policy(account.policy())
+                .with_accountant(account.accountant());
+            let first = engine.run();
+            engine.reset();
+            account.with_gate(|gate| assert!(gate.ledger().journal().is_empty()));
+            let second = engine.run();
+            assert_eq!(first.net_pnl, second.net_pnl);
+            assert!(account.errors().is_empty(), "{:?}", account.errors());
         }
     }
 
