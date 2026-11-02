@@ -3,6 +3,10 @@
 CURRENT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 
 
+# Minimum supported Rust version; keep in sync with `rust-version` in
+# Cargo.toml.
+MSRV := 1.95
+
 # Default target
 .PHONY: all
 all: test fmt lint build
@@ -59,7 +63,14 @@ fix:
 	cargo fix --allow-staged --allow-dirty
 
 .PHONY: pre-push
-pre-push: fix fmt lint-fix test readme doc
+pre-push: fix fmt lint-fix test readme doc msrv
+
+# Check the crate with the minimum supported Rust version, with no features
+# and with all features, against the existing lockfile.
+.PHONY: msrv
+msrv:
+	cargo +$(MSRV) check --locked --all-targets --no-default-features
+	cargo +$(MSRV) check --locked --all-targets --all-features
 
 .PHONY: doc
 doc:
