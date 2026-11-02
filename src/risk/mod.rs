@@ -51,6 +51,9 @@ mod circuit_breaker;
 mod drawdown;
 mod limits;
 
+/// Pretrade risk port: accept, reduce or reject every order before submission.
+pub mod pretrade;
+
 /// Portfolio risk management with correlation-aware calculations.
 pub mod portfolio;
 

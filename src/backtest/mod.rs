@@ -41,6 +41,10 @@
 /// Accounting port at the fill boundary.
 pub mod accounting;
 
+/// `margin-rs` risk gate behind the pretrade and accounting ports.
+#[cfg(feature = "margin")]
+pub mod margin;
+
 /// Data types for market data.
 pub mod data;
 
@@ -62,7 +66,8 @@ pub use accounting::MarginLedgerAccountant;
 pub use accounting::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
 pub use data::{HistoricalDataSource, MarketTick, OHLCVBar, VecDataSource};
 pub use engine::{
-    BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy, SimulatedFill, SlippageModel,
+    BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy, PretradeRecord,
+    SimulatedFill, SlippageModel,
 };
 pub use fill_models::{
     FillModel, FillResult, ImmediateFillModel, MarketImpactFillModel, ProbabilisticFillModel,
@@ -72,4 +77,6 @@ pub use latency::{MAX_SIM_LATENCY_MS, SimLatencyConfig};
 pub use lifecycle::{
     EventStamp, ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId, SimOrderState,
 };
+#[cfg(feature = "margin")]
+pub use margin::{MarginAccount, MarginGateAccountant, MarginRiskPolicy};
 pub use metrics::{EquityPoint, MetricsCalculator, MetricsConfig, PerformanceMetrics, TradeRecord};
