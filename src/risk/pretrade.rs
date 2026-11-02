@@ -17,7 +17,7 @@
 //!
 //! ```rust
 //! use market_maker_rs::dec;
-//! use market_maker_rs::execution::Side;
+//! use market_maker_rs::execution::Action;
 //! use market_maker_rs::risk::RiskLimits;
 //! use market_maker_rs::risk::pretrade::{
 //!     LimitsPolicy, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
@@ -25,7 +25,7 @@
 //!
 //! let limits = RiskLimits::new(dec!(10), dec!(1_000_000), dec!(0)).unwrap();
 //! let mut policy = LimitsPolicy::new(limits);
-//! let request = PretradeRequest::new("o-1", Side::Buy, Some(dec!(100)), dec!(15), OrderPurpose::Quote, 0);
+//! let request = PretradeRequest::new("o-1", Action::Buy, Some(dec!(100)), dec!(15), OrderPurpose::Quote, 0);
 //! let decision = policy.check(&request);
 //! assert_eq!(decision.approved_quantity(request.quantity), dec!(10));
 //! assert!(matches!(decision, PretradeDecision::Reduced { .. }));
@@ -35,7 +35,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::Decimal;
-use crate::execution::Side;
+use crate::execution::Action;
+use crate::types::action::Dir;
+use crate::types::error::MMResult;
 
 use super::{CircuitBreaker, RiskLimits};
 
@@ -58,8 +60,9 @@ pub struct PretradeRequest {
     /// Instrument the order trades, when the caller knows it. Policies bound
     /// to one instrument reject a request for another.
     pub instrument: Option<String>,
-    /// Order side.
-    pub side: Side,
+    /// Order side. Only buy and sell are supported; policies reject any
+    /// other action.
+    pub side: Action,
     /// Limit price; `None` for a market order.
     pub price: Option<Decimal>,
     /// Requested quantity.
@@ -75,7 +78,7 @@ impl PretradeRequest {
     #[must_use]
     pub fn new(
         order_id: impl Into<String>,
-        side: Side,
+        side: Action,
         price: Option<Decimal>,
         quantity: Decimal,
         purpose: OrderPurpose,
@@ -178,8 +181,10 @@ pub enum OrderEvent {
         order_id: String,
         /// Unique execution identifier.
         execution_id: String,
-        /// Order side.
-        side: Side,
+        /// Order side. Only buy and sell are supported; a fill with any other
+        /// action changes nothing in [`LimitsPolicy`], and the `margin`
+        /// feature's `MarginRiskPolicy` records it as an error.
+        side: Action,
         /// Execution price.
         price: Decimal,
         /// Quantity of this execution.
@@ -205,6 +210,9 @@ pub enum OrderEvent {
 /// - [`PretradePolicy::reset`] returns the policy to its initial state.
 pub trait PretradePolicy: fmt::Debug {
     /// Decides on an order before submission.
+    ///
+    /// A request whose side is neither buy nor sell is rejected before any
+    /// state changes.
     fn check(&mut self, request: &PretradeRequest) -> PretradeDecision;
 
     /// Market mark observed at `timestamp`.
@@ -240,7 +248,7 @@ pub struct LimitsPolicy {
     executions: HashSet<String>,
     position: Decimal,
     mark: Option<Decimal>,
-    live: HashMap<String, (Side, Decimal)>,
+    live: HashMap<String, (Dir, Decimal)>,
 }
 
 impl LimitsPolicy {
@@ -287,25 +295,42 @@ impl LimitsPolicy {
     }
 
     /// Remaining quantity of live orders on `side`.
-    #[must_use]
-    pub fn live_quantity(&self, side: Side) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction)
+    /// if `side` is neither buy nor sell.
+    pub fn live_quantity(&self, side: Action) -> MMResult<Decimal> {
+        Ok(self.live_quantity_dir(Dir::try_from(side)?))
+    }
+
+    fn live_quantity_dir(&self, dir: Dir) -> Decimal {
         self.live
             .values()
-            .filter(|(s, _)| *s == side)
+            .filter(|(d, _)| *d == dir)
             .map(|(_, q)| *q)
             .sum()
     }
 
-    fn signed(side: Side, quantity: Decimal) -> Decimal {
-        match side {
-            Side::Buy => quantity,
-            Side::Sell => -quantity,
+    fn signed(dir: Dir, quantity: Decimal) -> Decimal {
+        match dir {
+            Dir::Buy => quantity,
+            Dir::Sell => -quantity,
         }
     }
 }
 
 impl PretradePolicy for LimitsPolicy {
     fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
+        // Before the breaker cooldown below, the first state change.
+        let dir = match Dir::try_from(request.side) {
+            Ok(dir) => dir,
+            Err(error) => {
+                return PretradeDecision::Rejected {
+                    reason: error.to_string(),
+                };
+            }
+        };
         if let Some(breaker) = self.breaker.as_mut() {
             let _ = breaker.check_cooldown(request.timestamp);
             if !breaker.is_trading_allowed() {
@@ -343,19 +368,19 @@ impl PretradePolicy for LimitsPolicy {
         }
 
         // Worst case exposure on the order's side before this order.
-        let worst = self.position + Self::signed(request.side, self.live_quantity(request.side));
+        let worst = self.position + Self::signed(dir, self.live_quantity_dir(dir));
         let mut capacity = request.quantity;
-        let by_position = match request.side {
-            Side::Buy => self.limits.max_position - worst,
-            Side::Sell => self.limits.max_position + worst,
+        let by_position = match dir {
+            Dir::Buy => self.limits.max_position - worst,
+            Dir::Sell => self.limits.max_position + worst,
         };
         capacity = capacity.min(by_position);
         // An unrepresentable quotient (tiny price) means the notional limit
         // does not bind.
         if let Some(units) = self.limits.max_notional.checked_div(price) {
-            let by_notional = match request.side {
-                Side::Buy => units - worst,
-                Side::Sell => units + worst,
+            let by_notional = match dir {
+                Dir::Buy => units - worst,
+                Dir::Sell => units + worst,
             };
             capacity = capacity.min(by_notional);
         }
@@ -374,8 +399,7 @@ impl PretradePolicy for LimitsPolicy {
         };
         let approved = decision.approved_quantity(request.quantity);
         if approved > Decimal::ZERO {
-            self.live
-                .insert(request.order_id.clone(), (request.side, approved));
+            self.live.insert(request.order_id.clone(), (dir, approved));
         }
         decision
     }
@@ -401,11 +425,16 @@ impl PretradePolicy for LimitsPolicy {
                 quantity,
                 ..
             } => {
+                // A fill with an unsupported side changes nothing, not even
+                // the replay set, so a corrected redelivery still applies.
+                let Ok(dir) = Dir::try_from(*side) else {
+                    return;
+                };
                 // A replayed execution changes nothing.
                 if !self.executions.insert(execution_id.clone()) {
                     return;
                 }
-                self.position += Self::signed(*side, *quantity);
+                self.position += Self::signed(dir, *quantity);
                 if let Some((_, remaining)) = self.live.get_mut(order_id) {
                     *remaining -= *quantity;
                     if *remaining <= Decimal::ZERO {
@@ -451,7 +480,7 @@ mod tests {
     fn buy(id: &str, quantity: Decimal) -> PretradeRequest {
         PretradeRequest::new(
             id,
-            Side::Buy,
+            Action::Buy,
             Some(dec!(100)),
             quantity,
             OrderPurpose::Quote,
@@ -492,7 +521,7 @@ mod tests {
         policy.on_order_event(&OrderEvent::Fill {
             order_id: "a".to_string(),
             execution_id: "e1".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             price: dec!(100),
             quantity: dec!(6),
             cumulative_quantity: dec!(6),
@@ -500,7 +529,7 @@ mod tests {
             timestamp: 1,
         });
         assert_eq!(policy.position(), dec!(6));
-        assert_eq!(policy.live_quantity(Side::Buy), Decimal::ZERO);
+        assert_eq!(policy.live_quantity(Action::Buy).unwrap(), Decimal::ZERO);
         assert_eq!(
             policy.check(&buy("d", dec!(9))).approved_quantity(dec!(9)),
             dec!(4)
@@ -512,7 +541,7 @@ mod tests {
         let mut policy = policy(dec!(10));
         let sell = PretradeRequest::new(
             "s",
-            Side::Sell,
+            Action::Sell,
             Some(dec!(100)),
             dec!(10),
             OrderPurpose::Hedge,
@@ -524,7 +553,7 @@ mod tests {
     #[test]
     fn test_market_order_uses_mark_or_is_rejected() {
         let mut policy = policy(dec!(10));
-        let market = PretradeRequest::new("m", Side::Buy, None, dec!(1), OrderPurpose::Hedge, 0);
+        let market = PretradeRequest::new("m", Action::Buy, None, dec!(1), OrderPurpose::Hedge, 0);
         assert!(policy.check(&market).is_rejected());
         policy.on_market_data(dec!(100), 0);
         assert_eq!(policy.check(&market), PretradeDecision::Accepted);
@@ -545,7 +574,7 @@ mod tests {
         let mut policy = policy(dec!(10));
         let tiny = PretradeRequest::new(
             "t",
-            Side::Buy,
+            Action::Buy,
             Some(Decimal::new(1, 28)),
             dec!(1),
             OrderPurpose::Quote,
@@ -561,7 +590,7 @@ mod tests {
         let fill = OrderEvent::Fill {
             order_id: "a".to_string(),
             execution_id: "e1".to_string(),
-            side: Side::Buy,
+            side: Action::Buy,
             price: dec!(100),
             quantity: dec!(5),
             cumulative_quantity: dec!(5),
@@ -573,7 +602,7 @@ mod tests {
         assert_eq!(policy.position(), dec!(5));
         let sell = PretradeRequest::new(
             "s",
-            Side::Sell,
+            Action::Sell,
             Some(dec!(100)),
             dec!(20),
             OrderPurpose::Quote,
@@ -610,5 +639,88 @@ mod tests {
         assert_eq!(policy.check(&buy("a", dec!(1))), PretradeDecision::Accepted);
         assert!(policy.check(&buy("a", dec!(1))).is_rejected());
         assert!(policy.check(&buy("z", Decimal::ZERO)).is_rejected());
+    }
+
+    fn other(id: &str, quantity: Decimal, timestamp: u64) -> PretradeRequest {
+        PretradeRequest::new(
+            id,
+            Action::Other,
+            Some(dec!(100)),
+            quantity,
+            OrderPurpose::Quote,
+            timestamp,
+        )
+    }
+
+    #[test]
+    fn test_check_unsupported_action_is_rejected_without_state_change() {
+        let mut policy = policy(dec!(10));
+        assert_eq!(
+            policy.check(&other("a", dec!(5), 0)),
+            PretradeDecision::Rejected {
+                reason: "unsupported action Other: only buy and sell are supported".to_string(),
+            }
+        );
+        assert_eq!(policy.live_quantity(Action::Buy).unwrap(), Decimal::ZERO);
+        assert_eq!(policy.live_quantity(Action::Sell).unwrap(), Decimal::ZERO);
+        // The id was not reserved.
+        assert_eq!(policy.check(&buy("a", dec!(5))), PretradeDecision::Accepted);
+    }
+
+    #[test]
+    fn test_check_unsupported_action_leaves_the_breaker_untouched() {
+        let config =
+            CircuitBreakerConfig::new(dec!(1000), dec!(0.05), 5, dec!(0.10), 300_000, 60_000)
+                .unwrap();
+        let mut policy = policy(dec!(10)).with_circuit_breaker(CircuitBreaker::new(config));
+        let breaker = policy.circuit_breaker_mut().unwrap();
+        breaker.trigger_manual(0);
+        breaker.start_cooldown(0);
+        let later = 10_000_000;
+
+        assert!(policy.check(&other("a", dec!(1), later)).is_rejected());
+        assert!(policy.circuit_breaker_mut().unwrap().state().is_cooldown());
+
+        // A supported order at the same time runs the cooldown check.
+        let mut request = buy("b", dec!(1));
+        request.timestamp = later;
+        assert_eq!(policy.check(&request), PretradeDecision::Accepted);
+        assert!(!policy.circuit_breaker_mut().unwrap().state().is_cooldown());
+    }
+
+    #[test]
+    fn test_live_quantity_unsupported_action_returns_err() {
+        let policy = policy(dec!(10));
+        assert_eq!(
+            policy.live_quantity(Action::Other),
+            Err(crate::types::error::MMError::UnsupportedAction {
+                action: Action::Other
+            })
+        );
+    }
+
+    #[test]
+    fn test_fill_with_unsupported_action_changes_nothing() {
+        let mut policy = policy(dec!(10));
+        assert_eq!(policy.check(&buy("a", dec!(5))), PretradeDecision::Accepted);
+        let fill = |side| OrderEvent::Fill {
+            order_id: "a".to_string(),
+            execution_id: "e1".to_string(),
+            side,
+            price: dec!(100),
+            quantity: dec!(2),
+            cumulative_quantity: dec!(2),
+            fee: Decimal::ZERO,
+            timestamp: 1,
+        };
+
+        policy.on_order_event(&fill(Action::Other));
+        assert_eq!(policy.position(), Decimal::ZERO);
+        assert_eq!(policy.live_quantity(Action::Buy).unwrap(), dec!(5));
+
+        // The execution id was not consumed: a corrected redelivery applies.
+        policy.on_order_event(&fill(Action::Buy));
+        assert_eq!(policy.position(), dec!(2));
+        assert_eq!(policy.live_quantity(Action::Buy).unwrap(), dec!(3));
     }
 }

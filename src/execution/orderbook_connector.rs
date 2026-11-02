@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use market_maker_rs::execution::{OrderBookConnector, OrderRequest, Side, OrderType};
+//! use market_maker_rs::execution::{OrderBookConnector, OrderRequest, Action, OrderType};
 //! use market_maker_rs::dec;
 //!
 //! // Create connector with an order book
@@ -30,8 +30,9 @@ use orderbook_rs::{
 use crate::Decimal;
 use crate::execution::connector::{
     BookLevel, ExchangeConnector, OrderBookSnapshot, OrderId, OrderRequest, OrderResponse,
-    OrderStatus, OrderType, Side, TimeInForce,
+    OrderStatus, OrderType, TimeInForce,
 };
+use crate::types::action::{Action, Dir};
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -181,20 +182,20 @@ impl OrderBookConnector {
         OBOrderId::sequential(self.order_id_counter.fetch_add(1, Ordering::SeqCst))
     }
 
-    /// Converts our Side to orderbook-rs Side.
-    fn convert_side(side: Side) -> OBSide {
-        match side {
-            Side::Buy => OBSide::Buy,
-            Side::Sell => OBSide::Sell,
+    /// Converts a supported direction to orderbook-rs Side.
+    fn convert_side(dir: Dir) -> OBSide {
+        match dir {
+            Dir::Buy => OBSide::Buy,
+            Dir::Sell => OBSide::Sell,
         }
     }
 
-    /// Converts orderbook-rs Side to our Side.
+    /// Converts orderbook-rs Side to our Action.
     #[allow(dead_code)]
-    fn convert_side_back(side: OBSide) -> Side {
+    fn convert_side_back(side: OBSide) -> Action {
         match side {
-            OBSide::Buy => Side::Buy,
-            OBSide::Sell => Side::Sell,
+            OBSide::Buy => Action::Buy,
+            OBSide::Sell => Action::Sell,
         }
     }
 
@@ -251,8 +252,10 @@ impl OrderBookConnector {
 #[async_trait]
 impl ExchangeConnector for OrderBookConnector {
     async fn submit_order(&self, request: OrderRequest) -> MMResult<OrderResponse> {
+        // Validated before an order id is consumed or the book is touched.
+        let dir = Dir::try_from(request.side)?;
         let (order_id, ob_order_id) = self.next_order_id();
-        let ob_side = Self::convert_side(request.side);
+        let ob_side = Self::convert_side(dir);
         let ob_tif = Self::convert_tif(request.time_in_force);
         let quantity = self.quantity_to_u64(request.quantity);
 
@@ -647,5 +650,38 @@ mod tests {
 
         let open_orders = connector.get_open_orders("BTC-USD").await.unwrap();
         assert!(open_orders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_unsupported_action_returns_err_without_effects() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let fresh = OrderBookConnector::new("BTC-USD");
+
+        for order_type in [OrderType::Limit, OrderType::PostOnly, OrderType::Market] {
+            let mut request = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(1.0));
+            request.order_type = order_type;
+            request.side = Action::Other;
+            assert_eq!(
+                connector.submit_order(request).await,
+                Err(MMError::UnsupportedAction {
+                    action: Action::Other
+                })
+            );
+        }
+        assert!(
+            connector
+                .get_open_orders("BTC-USD")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let book = connector.get_orderbook("BTC-USD", 10).await.unwrap();
+        assert!(book.bids.is_empty() && book.asks.is_empty());
+
+        // No order id was consumed.
+        let valid = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(1.0));
+        let first = connector.submit_order(valid.clone()).await.unwrap();
+        let expected = fresh.submit_order(valid).await.unwrap();
+        assert_eq!(first.order_id, expected.order_id);
     }
 }

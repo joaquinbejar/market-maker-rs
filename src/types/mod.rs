@@ -13,3 +13,6 @@ pub mod decimal;
 
 /// Common type aliases for prices, quantities, and time.
 pub mod primitives;
+
+/// Trade direction and option style shared with the other crates.
+pub mod action;

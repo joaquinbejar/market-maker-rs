@@ -15,7 +15,6 @@
 //!
 //! ```rust
 //! use market_maker_rs::backtest::{AccountingFill, AccountingSnapshot, FillAccountant};
-//! use market_maker_rs::execution::Side;
 //! use market_maker_rs::types::error::MMResult;
 //! use market_maker_rs::Decimal;
 //!
@@ -27,7 +26,7 @@
 //!
 //! impl FillAccountant for Counter {
 //!     fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
-//!         self.snapshot.position += fill.signed_quantity();
+//!         self.snapshot.position += fill.signed_quantity()?;
 //!         self.snapshot.fills_posted += 1;
 //!         Ok(())
 //!     }
@@ -43,7 +42,8 @@
 use std::fmt;
 
 use crate::Decimal;
-use crate::execution::Side;
+use crate::execution::Action;
+use crate::types::action::Dir;
 use crate::types::error::MMResult;
 
 use super::lifecycle::SimOrderId;
@@ -65,8 +65,8 @@ pub struct AccountingFill {
     pub execution_id: u64,
     /// Order that was filled.
     pub order_id: SimOrderId,
-    /// Side of the order.
-    pub side: Side,
+    /// Action of the order. The engine only posts buy and sell fills.
+    pub side: Action,
     /// Execution price, slippage included.
     pub price: Decimal,
     /// Quantity filled by this execution.
@@ -83,18 +83,26 @@ pub struct AccountingFill {
 
 impl AccountingFill {
     /// Quantity with sign: positive for a buy, negative for a sell.
-    #[must_use]
-    pub fn signed_quantity(&self) -> Decimal {
-        match self.side {
-            Side::Buy => self.quantity,
-            Side::Sell => -self.quantity,
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction)
+    /// if the side is neither buy nor sell.
+    pub fn signed_quantity(&self) -> MMResult<Decimal> {
+        Ok(match Dir::try_from(self.side)? {
+            Dir::Buy => self.quantity,
+            Dir::Sell => -self.quantity,
+        })
     }
 
     /// Cash flow of the execution before fees: negative for a buy.
-    #[must_use]
-    pub fn cash_flow(&self) -> Decimal {
-        -self.signed_quantity() * self.price
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction)
+    /// if the side is neither buy nor sell.
+    pub fn cash_flow(&self) -> MMResult<Decimal> {
+        Ok(-self.signed_quantity()? * self.price)
     }
 }
 
@@ -158,7 +166,7 @@ mod margin_ledger {
 
     use super::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
     use crate::Decimal;
-    use crate::execution::Side;
+    use crate::types::action::Dir;
     use crate::types::error::{MMError, MMResult};
     use margin_rs::ledger::{Execution, Ledger, Side as LedgerSide};
     use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId};
@@ -250,9 +258,10 @@ mod margin_ledger {
             }
             let id = ExecutionId::new(format!("sim-{}", fill.execution_id))
                 .map_err(|e| margin_error("execution id", e))?;
-            let side = match fill.side {
-                Side::Buy => LedgerSide::Buy,
-                Side::Sell => LedgerSide::Sell,
+            // Before booking: a rejected post leaves the ledger unchanged.
+            let side = match Dir::try_from(fill.side)? {
+                Dir::Buy => LedgerSide::Buy,
+                Dir::Sell => LedgerSide::Sell,
             };
             let mut execution =
                 Execution::new(id, self.instrument.clone(), side, fill.price, fill.quantity);
@@ -312,7 +321,7 @@ mod tests {
     use super::*;
     use crate::dec;
 
-    fn fill(side: Side, price: Decimal, quantity: Decimal) -> AccountingFill {
+    fn fill(side: Action, price: Decimal, quantity: Decimal) -> AccountingFill {
         AccountingFill {
             execution_id: 1,
             order_id: 1,
@@ -328,11 +337,21 @@ mod tests {
 
     #[test]
     fn test_signed_quantity_and_cash_flow() {
-        let buy = fill(Side::Buy, dec!(100), dec!(2));
-        assert_eq!(buy.signed_quantity(), dec!(2));
-        assert_eq!(buy.cash_flow(), dec!(-200));
-        let sell = fill(Side::Sell, dec!(100), dec!(2));
-        assert_eq!(sell.signed_quantity(), dec!(-2));
-        assert_eq!(sell.cash_flow(), dec!(200));
+        let buy = fill(Action::Buy, dec!(100), dec!(2));
+        assert_eq!(buy.signed_quantity().unwrap(), dec!(2));
+        assert_eq!(buy.cash_flow().unwrap(), dec!(-200));
+        let sell = fill(Action::Sell, dec!(100), dec!(2));
+        assert_eq!(sell.signed_quantity().unwrap(), dec!(-2));
+        assert_eq!(sell.cash_flow().unwrap(), dec!(200));
+    }
+
+    #[test]
+    fn test_signed_quantity_and_cash_flow_unsupported_action_return_err() {
+        let other = fill(Action::Other, dec!(100), dec!(2));
+        let expected = Err(crate::types::error::MMError::UnsupportedAction {
+            action: Action::Other,
+        });
+        assert_eq!(other.signed_quantity(), expected);
+        assert_eq!(other.cash_flow(), expected);
     }
 }

@@ -21,7 +21,7 @@ use market_maker_rs::backtest::{
     SimulatedFill, VecDataSource,
 };
 use market_maker_rs::dec;
-use market_maker_rs::execution::Side;
+use market_maker_rs::execution::Action;
 use market_maker_rs::position::inventory::InventoryPosition;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::risk::pretrade::LimitsPolicy;
@@ -176,10 +176,12 @@ fn quotes_respect_tick_grid_and_never_cross() {
     let decisions = engine.pretrade_decisions();
     assert!(!decisions.is_empty());
     let mut checked = 0;
-    for bid in decisions.iter().filter(|d| d.request.side == Side::Buy) {
+    for bid in decisions.iter().filter(|d| d.request.side == Action::Buy) {
         let ask = decisions
             .iter()
-            .find(|d| d.request.side == Side::Sell && d.request.timestamp == bid.request.timestamp)
+            .find(|d| {
+                d.request.side == Action::Sell && d.request.timestamp == bid.request.timestamp
+            })
             .expect("each decision quotes both sides");
         assert!(bid.request.price < ask.request.price);
         checked += 1;
@@ -216,8 +218,9 @@ fn position_never_exceeds_the_pretrade_limit() {
     let mut position = Decimal::ZERO;
     for fill in &result.trades {
         position += match fill.side {
-            Side::Buy => fill.quantity,
-            Side::Sell => -fill.quantity,
+            Action::Buy => fill.quantity,
+            Action::Sell => -fill.quantity,
+            other => panic!("unsupported action {other}"),
         };
         assert!(position.abs() <= MAX_POSITION);
     }

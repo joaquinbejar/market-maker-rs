@@ -6,8 +6,8 @@
 //! Run with: `cargo run --example orderbook_connector`
 
 use market_maker_rs::execution::{
-    ExchangeConnector, OrderBookConnector, OrderBookConnectorConfig, OrderRequest, OrderType, Side,
-    TimeInForce,
+    Action, ExchangeConnector, OrderBookConnector, OrderBookConnectorConfig, OrderRequest,
+    OrderType, TimeInForce,
 };
 use rust_decimal_macros::dec;
 
@@ -54,7 +54,7 @@ async fn main() {
 
     let buy_order = OrderRequest {
         symbol: "BTC-USD".to_string(),
-        side: Side::Buy,
+        side: Action::Buy,
         order_type: OrderType::Limit,
         quantity: dec!(0.5),
         price: Some(dec!(49000.0)),
@@ -79,7 +79,7 @@ async fn main() {
     // Submit a limit sell order
     let sell_order = OrderRequest {
         symbol: "BTC-USD".to_string(),
-        side: Side::Sell,
+        side: Action::Sell,
         order_type: OrderType::Limit,
         quantity: dec!(0.3),
         price: Some(dec!(51000.0)),

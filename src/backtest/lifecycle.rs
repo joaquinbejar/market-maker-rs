@@ -24,14 +24,14 @@
 //!
 //! ```rust
 //! use market_maker_rs::backtest::{SimClock, SimOrder, SimOrderState};
-//! use market_maker_rs::execution::Side;
+//! use market_maker_rs::execution::Action;
 //! use market_maker_rs::dec;
 //!
 //! let mut clock = SimClock::new();
 //! clock.advance_to(1_000).unwrap();
 //! let stamp = clock.stamp();
 //!
-//! let mut order = SimOrder::new(1, Side::Buy, dec!(100), dec!(1), stamp, 1_000);
+//! let mut order = SimOrder::new(1, Action::Buy, dec!(100), dec!(1), stamp, 1_000);
 //! order.accept().unwrap();
 //! assert!(!order.is_eligible_at(1_000));
 //! assert!(order.is_eligible_at(1_001));
@@ -43,7 +43,7 @@
 //! ```
 
 use crate::Decimal;
-use crate::execution::Side;
+use crate::execution::Action;
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -157,7 +157,7 @@ pub struct SimOrder {
     /// Stable order identifier.
     pub id: SimOrderId,
     /// Order side.
-    pub side: Side,
+    pub side: Action,
     /// Limit price.
     pub price: Decimal,
     /// Original quantity.
@@ -178,7 +178,7 @@ impl SimOrder {
     #[must_use]
     pub fn new(
         id: SimOrderId,
-        side: Side,
+        side: Action,
         price: Decimal,
         quantity: Decimal,
         submitted_at: EventStamp,
@@ -343,7 +343,7 @@ pub struct ExecutionReport {
     /// Order the report refers to.
     pub order_id: SimOrderId,
     /// Order side.
-    pub side: Side,
+    pub side: Action,
     /// Transition kind.
     pub kind: ExecutionKind,
     /// Execution price for fills, limit price otherwise.
@@ -423,7 +423,7 @@ mod tests {
     }
 
     fn live_order(qty: Decimal) -> SimOrder {
-        let mut order = SimOrder::new(7, Side::Sell, dec!(101), qty, stamp(10, 0), 10);
+        let mut order = SimOrder::new(7, Action::Sell, dec!(101), qty, stamp(10, 0), 10);
         order.accept().unwrap();
         order
     }
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_submitted_order_not_eligible() {
-        let order = SimOrder::new(1, Side::Buy, dec!(100), dec!(1), stamp(0, 0), 0);
+        let order = SimOrder::new(1, Action::Buy, dec!(100), dec!(1), stamp(0, 0), 0);
         assert!(!order.is_eligible_at(100));
     }
 
@@ -500,9 +500,9 @@ mod tests {
 
     #[test]
     fn test_validation_rejects_non_positive_values() {
-        let bad_price = SimOrder::new(1, Side::Buy, dec!(0), dec!(1), stamp(0, 0), 0);
+        let bad_price = SimOrder::new(1, Action::Buy, dec!(0), dec!(1), stamp(0, 0), 0);
         assert!(bad_price.validate().is_err());
-        let bad_qty = SimOrder::new(2, Side::Buy, dec!(1), dec!(-1), stamp(0, 0), 0);
+        let bad_qty = SimOrder::new(2, Action::Buy, dec!(1), dec!(-1), stamp(0, 0), 0);
         assert!(bad_qty.validate().is_err());
         let mut rejected = bad_qty.clone();
         rejected.reject().unwrap();

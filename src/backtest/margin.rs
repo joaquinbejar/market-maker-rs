@@ -24,10 +24,10 @@ use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId, OrderId};
 
 use super::accounting::{AccountingFill, AccountingSnapshot, FillAccountant};
 use crate::Decimal;
-use crate::execution::Side;
 use crate::risk::pretrade::{
     OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
 };
+use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
 
 #[derive(Debug)]
@@ -137,10 +137,10 @@ fn order_id(raw: &str) -> margin_rs::Result<OrderId> {
     OrderId::new(format!("sim-order-{raw}"))
 }
 
-fn ledger_side(side: Side) -> LedgerSide {
-    match side {
-        Side::Buy => LedgerSide::Buy,
-        Side::Sell => LedgerSide::Sell,
+fn ledger_side(dir: Dir) -> LedgerSide {
+    match dir {
+        Dir::Buy => LedgerSide::Buy,
+        Dir::Sell => LedgerSide::Sell,
     }
 }
 
@@ -160,6 +160,14 @@ impl MarginRiskPolicy {
 
 impl PretradePolicy for MarginRiskPolicy {
     fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
+        let dir = match Dir::try_from(request.side) {
+            Ok(dir) => dir,
+            Err(error) => {
+                return PretradeDecision::Rejected {
+                    reason: error.to_string(),
+                };
+            }
+        };
         let mut shared = self.account.lock();
         if let Some(asked) = &request.instrument
             && asked != shared.instrument.as_str()
@@ -192,7 +200,7 @@ impl PretradePolicy for MarginRiskPolicy {
         let order = OrderRequest::new(
             id,
             shared.instrument.clone(),
-            ledger_side(request.side),
+            ledger_side(dir),
             price,
             request.quantity,
         )
@@ -269,6 +277,13 @@ impl PretradePolicy for MarginRiskPolicy {
                 fee,
                 ..
             } => {
+                let dir = match Dir::try_from(*side) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        shared.errors.push(format!("fill: {error}"));
+                        return;
+                    }
+                };
                 let execution_id = match ExecutionId::new(execution_id) {
                     Ok(id) => id,
                     Err(error) => {
@@ -279,7 +294,7 @@ impl PretradePolicy for MarginRiskPolicy {
                 let mut execution = Execution::new(
                     execution_id,
                     shared.instrument.clone(),
-                    ledger_side(*side),
+                    ledger_side(dir),
                     *price,
                     *quantity,
                 );

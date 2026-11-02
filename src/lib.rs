@@ -150,6 +150,22 @@
 //! println!("Bid: {}, Ask: {}", bid, ask);
 //! ```
 //!
+//! ## Shared Types
+//!
+//! The order direction and the option style are the shared enums of the
+//! `financial_types` crate, also used by `margin-rs`, `arbitrage-rs` and
+//! OptionStratLib, and re-exported from the [`prelude`]:
+//!
+//! - `Action` (`Buy`/`Sell`) for every order, fill and query side. It also
+//!   has an `Other` variant, which this crate does not support: every entry
+//!   point rejects it with `MMError::UnsupportedAction` before any state
+//!   changes.
+//! - `OptionStyle` (`Call`/`Put`).
+//!
+//! `financial_types` derives `serde` unconditionally, so `serde` is compiled
+//! even with no features enabled; the `serde` feature still gates this
+//! crate's own serialization support.
+//!
 //! ## Feature Flags
 //!
 //! - `prometheus`: Enable Prometheus metrics export (adds `prometheus`, `hyper`, `tokio` dependencies)
@@ -366,7 +382,7 @@
 //! ```rust,ignore
 //! use market_maker_rs::events::{
 //!     EventBroadcaster, EventBroadcasterConfig, EventFilter, EventType,
-//!     MarketMakerEvent, Side,
+//!     MarketMakerEvent, Action,
 //! };
 //! use std::sync::Arc;
 //!
@@ -388,7 +404,7 @@
 //!     order_id: "ORD-001".to_string(),
 //!     symbol: "BTC".to_string(),
 //!     instrument: "BTC-PERP".to_string(),
-//!     side: Side::Buy,
+//!     side: Action::Buy,
 //!     quantity: 10,
 //!     price: 50000,
 //!     fee: 5,

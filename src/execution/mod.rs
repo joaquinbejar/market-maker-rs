@@ -18,14 +18,14 @@
 //!
 //! ```rust
 //! use market_maker_rs::execution::{
-//!     OrderRequest, Side, OrderType, TimeInForce, ExchangeConnector
+//!     OrderRequest, Action, OrderType, TimeInForce, ExchangeConnector
 //! };
 //! use market_maker_rs::dec;
 //!
 //! // Create an order request
 //! let request = OrderRequest::new(
 //!     "BTC-USD",
-//!     Side::Buy,
+//!     Action::Buy,
 //!     OrderType::Limit,
 //!     Some(dec!(50000.0)),
 //!     dec!(0.1),
@@ -51,8 +51,8 @@ pub mod latency;
 pub mod orderbook_connector;
 
 pub use connector::{
-    BookLevel, ExchangeConnector, Fill, MarketDataStream, OrderBookSnapshot, OrderId, OrderRequest,
-    OrderResponse, OrderStatus, OrderType, Side, TimeInForce,
+    Action, BookLevel, ExchangeConnector, Fill, MarketDataStream, OrderBookSnapshot, OrderId,
+    OrderRequest, OrderResponse, OrderStatus, OrderType, TimeInForce,
 };
 pub use latency::{
     Histogram, LatencyMeasurement, LatencyMetric, LatencyStats, LatencyTracker,

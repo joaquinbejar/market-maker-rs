@@ -39,6 +39,6 @@ pub use broadcaster::{
     TimestampedEvent,
 };
 pub use types::{
-    AlertCategory, AlertLevel, CancelReason, CircuitBreakerState, EventFilter, EventType,
-    HedgeReason, MarketMakerEvent, OptionStyle, Side, SystemStatus,
+    Action, AlertCategory, AlertLevel, CancelReason, CircuitBreakerState, EventFilter, EventType,
+    HedgeReason, MarketMakerEvent, OptionStyle, SystemStatus,
 };

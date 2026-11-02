@@ -17,7 +17,7 @@
 //!
 //! ```rust
 //! use market_maker_rs::execution::{
-//!     OrderManager, OrderManagerConfig, OrderRequest, Side
+//!     OrderManager, OrderManagerConfig, OrderRequest, Action
 //! };
 //! use market_maker_rs::dec;
 //!
@@ -42,7 +42,10 @@ use crate::risk::pretrade::{
 };
 use crate::types::error::{MMError, MMResult};
 
-use super::connector::{Fill, OrderId, OrderRequest, OrderResponse, OrderStatus, OrderType, Side};
+use super::connector::{
+    Action, Fill, OrderId, OrderRequest, OrderResponse, OrderStatus, OrderType,
+};
+use crate::types::action::Dir;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -54,14 +57,14 @@ use serde::{Deserialize, Serialize};
 /// # Example
 ///
 /// ```rust
-/// use market_maker_rs::execution::{ManagedOrder, OrderId, Side, OrderType, OrderStatus};
+/// use market_maker_rs::execution::{ManagedOrder, OrderId, Action, OrderType, OrderStatus};
 /// use market_maker_rs::dec;
 ///
 /// let order = ManagedOrder::new(
 ///     OrderId::new("12345"),
 ///     "client-1".to_string(),
 ///     "BTC-USD".to_string(),
-///     Side::Buy,
+///     Action::Buy,
 ///     OrderType::Limit,
 ///     dec!(50000.0),
 ///     dec!(0.1),
@@ -81,7 +84,7 @@ pub struct ManagedOrder {
     /// Trading symbol.
     pub symbol: String,
     /// Order side.
-    pub side: Side,
+    pub side: Action,
     /// Order type.
     pub order_type: OrderType,
     /// Original order price.
@@ -112,7 +115,7 @@ impl ManagedOrder {
         order_id: OrderId,
         client_order_id: String,
         symbol: String,
-        side: Side,
+        side: Action,
         order_type: OrderType,
         price: Decimal,
         quantity: Decimal,
@@ -378,8 +381,9 @@ impl OrderManager {
     ///
     /// # Errors
     ///
-    /// Returns the [`OrderManager::register_order`] errors for an approved
-    /// order.
+    /// Returns [`MMError::UnsupportedAction`] if `request.side` is neither
+    /// buy nor sell, before the policy is asked, and the
+    /// [`OrderManager::register_order`] errors for an approved order.
     pub fn register_order_checked(
         &mut self,
         request: &OrderRequest,
@@ -388,6 +392,8 @@ impl OrderManager {
         purpose: OrderPurpose,
         policy: &mut dyn PretradePolicy,
     ) -> MMResult<PretradeDecision> {
+        // Before the policy reserves anything.
+        Dir::try_from(request.side)?;
         let pretrade = PretradeRequest::new(
             client_order_id.clone(),
             request.side,
@@ -428,6 +434,7 @@ impl OrderManager {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The side is neither buy nor sell ([`MMError::UnsupportedAction`])
     /// - Duplicate client_order_id exists (if detection enabled)
     /// - Maximum open orders exceeded for the symbol
     pub fn register_order(
@@ -436,6 +443,7 @@ impl OrderManager {
         client_order_id: String,
         timestamp: u64,
     ) -> MMResult<()> {
+        Dir::try_from(request.side)?;
         // Check for duplicates
         if self.config.detect_duplicates && self.orders.contains_key(&client_order_id) {
             return Err(MMError::InvalidMarketState(format!(
@@ -526,7 +534,15 @@ impl OrderManager {
     ///
     /// * `fill` - Fill information
     /// * `timestamp` - Current timestamp in milliseconds
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The fill's side is neither buy nor sell
+    ///   ([`MMError::UnsupportedAction`]), before any state changes
+    /// - No order matches the fill's order ID
     pub fn record_fill(&mut self, fill: &Fill, timestamp: u64) -> MMResult<()> {
+        Dir::try_from(fill.side)?;
         // Find order by exchange ID
         let client_id = self
             .orders_by_exchange_id
@@ -611,13 +627,19 @@ impl OrderManager {
     }
 
     /// Gets total open quantity for a side.
-    #[must_use]
-    pub fn get_open_quantity(&self, symbol: &str, side: Side) -> Decimal {
-        self.get_open_orders_for_symbol(symbol)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if `side` is neither buy nor
+    /// sell.
+    pub fn get_open_quantity(&self, symbol: &str, side: Action) -> MMResult<Decimal> {
+        let side = Action::from(Dir::try_from(side)?);
+        Ok(self
+            .get_open_orders_for_symbol(symbol)
             .iter()
             .filter(|o| o.side == side)
             .map(|o| o.remaining_quantity)
-            .sum()
+            .sum())
     }
 
     /// Marks an order as cancelled.
@@ -811,6 +833,10 @@ impl ThreadSafeOrderManager {
     }
 
     /// Records a fill.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`OrderManager::record_fill`] errors.
     pub fn record_fill(&self, fill: &Fill, timestamp: u64) -> MMResult<()> {
         self.write(|m| m.record_fill(fill, timestamp))
     }
@@ -828,8 +854,12 @@ impl ThreadSafeOrderManager {
     }
 
     /// Gets total open quantity for a side.
-    #[must_use]
-    pub fn get_open_quantity(&self, symbol: &str, side: Side) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::UnsupportedAction`] if `side` is neither buy nor
+    /// sell.
+    pub fn get_open_quantity(&self, symbol: &str, side: Action) -> MMResult<Decimal> {
         self.read(|m| m.get_open_quantity(symbol, side))
     }
 
@@ -865,7 +895,7 @@ mod tests {
             trade_id: "trade-1".to_string(),
             price,
             quantity,
-            side: Side::Buy,
+            side: Action::Buy,
             timestamp: 1000,
             fee: dec!(0.01),
             fee_currency: "USD".to_string(),
@@ -878,7 +908,7 @@ mod tests {
             OrderId::new("12345"),
             "client-1".to_string(),
             "BTC-USD".to_string(),
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             dec!(50000.0),
             dec!(0.1),
@@ -899,7 +929,7 @@ mod tests {
             OrderId::new("12345"),
             "client-1".to_string(),
             "BTC-USD".to_string(),
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             dec!(50000.0),
             dec!(1.0),
@@ -1081,10 +1111,10 @@ mod tests {
             .register_order(&sell_request, "sell-1".to_string(), 1002)
             .unwrap();
 
-        let buy_qty = manager.get_open_quantity("BTC-USD", Side::Buy);
+        let buy_qty = manager.get_open_quantity("BTC-USD", Action::Buy).unwrap();
         assert_eq!(buy_qty, dec!(1.0));
 
-        let sell_qty = manager.get_open_quantity("BTC-USD", Side::Sell);
+        let sell_qty = manager.get_open_quantity("BTC-USD", Action::Sell).unwrap();
         assert_eq!(sell_qty, dec!(0.3));
     }
 
@@ -1201,7 +1231,7 @@ mod tests {
             OrderId::new("12345"),
             "client-1".to_string(),
             "BTC-USD".to_string(),
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             dec!(50000.0),
             dec!(0.1),
@@ -1219,7 +1249,7 @@ mod tests {
             OrderId::new("12345"),
             "client-1".to_string(),
             "BTC-USD".to_string(),
-            Side::Buy,
+            Action::Buy,
             OrderType::Limit,
             dec!(50000.0),
             dec!(0.1),
@@ -1237,5 +1267,103 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: OrderManagerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config.order_timeout_ms, deserialized.order_timeout_ms);
+    }
+
+    fn unsupported() -> MMError {
+        MMError::UnsupportedAction {
+            action: Action::Other,
+        }
+    }
+
+    #[test]
+    fn test_register_order_unsupported_action_registers_nothing() {
+        let mut manager = OrderManager::with_defaults();
+        let mut request = create_test_request();
+        request.side = Action::Other;
+
+        assert_eq!(
+            manager.register_order(&request, "client-1".to_string(), 1000),
+            Err(unsupported())
+        );
+        assert_eq!(manager.order_count(), 0);
+        assert_eq!(manager.open_order_count(), 0);
+        assert!(!manager.has_order_by_client_id("client-1"));
+    }
+
+    #[test]
+    fn test_register_order_checked_unsupported_action_skips_the_policy() {
+        use crate::risk::RiskLimits;
+        use crate::risk::pretrade::LimitsPolicy;
+
+        let mut manager = OrderManager::with_defaults();
+        let mut policy =
+            LimitsPolicy::new(RiskLimits::new(dec!(10), dec!(1_000_000), dec!(0)).unwrap());
+        let mut request = create_test_request();
+        request.side = Action::Other;
+
+        assert_eq!(
+            manager.register_order_checked(
+                &request,
+                "client-1".to_string(),
+                1000,
+                OrderPurpose::Quote,
+                &mut policy,
+            ),
+            Err(unsupported())
+        );
+        assert_eq!(manager.order_count(), 0);
+        // The policy reserved nothing.
+        assert_eq!(policy.live_quantity(Action::Buy).unwrap(), Decimal::ZERO);
+        assert_eq!(policy.live_quantity(Action::Sell).unwrap(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_record_fill_unsupported_action_leaves_order_unchanged() {
+        let mut manager = OrderManager::with_defaults();
+        manager
+            .register_order(&create_test_request(), "client-1".to_string(), 1000)
+            .unwrap();
+        let exchange_id = OrderId::new("exchange-123");
+        let response = OrderResponse::new(
+            exchange_id.clone(),
+            OrderStatus::Open {
+                filled_qty: Decimal::ZERO,
+            },
+            1001,
+        );
+        manager.update_order("client-1", &response, 1001).unwrap();
+        let before = manager.get_order_by_client_id("client-1").unwrap().clone();
+
+        let mut fill = create_test_fill(&exchange_id, dec!(50000.0), dec!(0.1));
+        fill.side = Action::Other;
+        assert_eq!(manager.record_fill(&fill, 1002), Err(unsupported()));
+
+        let after = manager.get_order_by_client_id("client-1").unwrap();
+        assert_eq!(after.filled_quantity, before.filled_quantity);
+        assert_eq!(after.status, before.status);
+        assert!(after.fills.is_empty());
+        assert_eq!(manager.open_order_count(), 1);
+    }
+
+    #[test]
+    fn test_get_open_quantity_unsupported_action_returns_err() {
+        let mut manager = OrderManager::with_defaults();
+        manager
+            .register_order(&create_test_request(), "client-1".to_string(), 1000)
+            .unwrap();
+        assert_eq!(
+            manager.get_open_quantity("BTC-USD", Action::Other),
+            Err(unsupported())
+        );
+
+        let shared = ThreadSafeOrderManager::with_defaults();
+        assert_eq!(
+            shared.get_open_quantity("BTC-USD", Action::Other),
+            Err(unsupported())
+        );
+        assert_eq!(
+            shared.get_open_quantity("BTC-USD", Action::Buy).unwrap(),
+            Decimal::ZERO
+        );
     }
 }

@@ -12,7 +12,7 @@
 use market_maker_rs::Decimal;
 use market_maker_rs::dec;
 use market_maker_rs::execution::{
-    Fill, OrderId, OrderManager, OrderRequest, OrderResponse, OrderStatus, Side,
+    Action, Fill, OrderId, OrderManager, OrderRequest, OrderResponse, OrderStatus,
 };
 use market_maker_rs::position::inventory::InventoryPosition;
 
@@ -38,8 +38,9 @@ impl Ledger {
     fn apply(&mut self, fill: &Fill) {
         let notional = fill.price * fill.quantity;
         match fill.side {
-            Side::Buy => self.cash -= notional,
-            Side::Sell => self.cash += notional,
+            Action::Buy => self.cash -= notional,
+            Action::Sell => self.cash += notional,
+            other => panic!("unsupported action {other}"),
         }
         self.cash -= fill.fee;
         self.fees += fill.fee;
@@ -49,7 +50,7 @@ impl Ledger {
 fn fill(
     exchange_id: &str,
     trade_id: &str,
-    side: Side,
+    side: Action,
     price: Decimal,
     qty: Decimal,
     fee: Decimal,
@@ -67,10 +68,11 @@ fn fill(
     }
 }
 
-fn signed(side: Side, qty: Decimal) -> Decimal {
+fn signed(side: Action, qty: Decimal) -> Decimal {
     match side {
-        Side::Buy => qty,
-        Side::Sell => -qty,
+        Action::Buy => qty,
+        Action::Sell => -qty,
+        other => panic!("unsupported action {other}"),
     }
 }
 
@@ -105,13 +107,16 @@ fn partial_fill_then_cancel_reconciles_exactly() {
 
     let request = OrderRequest::limit_buy(SYMBOL, dec!(100), dec!(1.0));
     place(&mut manager, &request, "c-1", "ex-1", 1_000);
-    assert_eq!(manager.get_open_quantity(SYMBOL, Side::Buy), dec!(1.0));
+    assert_eq!(
+        manager.get_open_quantity(SYMBOL, Action::Buy).unwrap(),
+        dec!(1.0)
+    );
 
     // Partial fill of 0.4 at 100 with a 0.04 fee.
     let partial = fill(
         "ex-1",
         "t-1",
-        Side::Buy,
+        Action::Buy,
         dec!(100),
         dec!(0.4),
         dec!(0.04),
@@ -137,7 +142,10 @@ fn partial_fill_then_cancel_reconciles_exactly() {
     assert!(order.is_terminal());
     assert_eq!(order.filled_quantity, dec!(0.4));
     assert_eq!(order.remaining_quantity, dec!(0.6));
-    assert_eq!(manager.get_open_quantity(SYMBOL, Side::Buy), Decimal::ZERO);
+    assert_eq!(
+        manager.get_open_quantity(SYMBOL, Action::Buy).unwrap(),
+        Decimal::ZERO
+    );
     assert_eq!(manager.open_order_count(), 0);
 
     // A cancel never erases the fill that happened before it.
@@ -173,7 +181,7 @@ fn round_trip_with_two_fills_reconciles_exactly() {
         fill(
             "ex-b1",
             "t-1",
-            Side::Buy,
+            Action::Buy,
             dec!(50),
             dec!(1.5),
             dec!(0.075),
@@ -182,7 +190,7 @@ fn round_trip_with_two_fills_reconciles_exactly() {
         fill(
             "ex-b1",
             "t-2",
-            Side::Buy,
+            Action::Buy,
             dec!(50),
             dec!(0.5),
             dec!(0.025),
@@ -210,7 +218,7 @@ fn round_trip_with_two_fills_reconciles_exactly() {
     let sell = fill(
         "ex-a1",
         "t-3",
-        Side::Sell,
+        Action::Sell,
         dec!(51),
         dec!(2.0),
         dec!(0.102),
@@ -250,7 +258,7 @@ fn fill_for_unknown_order_is_rejected() {
     let orphan = fill(
         "ex-missing",
         "t-x",
-        Side::Buy,
+        Action::Buy,
         dec!(10),
         dec!(1),
         Decimal::ZERO,
