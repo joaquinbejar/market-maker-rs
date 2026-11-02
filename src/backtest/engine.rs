@@ -593,16 +593,22 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     ///
     /// The accountant is the only place fills are booked: position, PnL,
     /// fees, the equity curve and the result all come from its snapshot.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] if `context` charges fees in a
+    /// currency other than the quote ([`FillContext::validate`]); nothing
+    /// is simulated or posted in that case.
     pub fn with_accountant(
         mut self,
         accountant: impl Accountant + 'static,
         context: FillContext,
-    ) -> Self {
+    ) -> MMResult<Self> {
+        context.validate()?;
         self.accountant = Box::new(accountant);
         self.fill_context = context;
         self.accounting = self.accountant.snapshot();
-        self
+        Ok(self)
     }
 
     /// Latest accounting results, as reported by the accountant.

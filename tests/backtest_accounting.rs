@@ -130,6 +130,7 @@ fn legacy_default_results_are_unchanged() {
     // Selecting the legacy accountant explicitly changes nothing.
     let explicit = engine()
         .with_accountant(LegacyAccountant::new(), context())
+        .expect("quote fees")
         .run();
     same_result(&result, &explicit);
 }
@@ -139,7 +140,9 @@ fn the_accountant_receives_each_fill_once_with_fee_and_context() {
     let double = Recording::default();
     let fills = Arc::clone(&double.fills);
     let marks = Arc::clone(&double.marks);
-    let mut engine = engine().with_accountant(double, context());
+    let mut engine = engine()
+        .with_accountant(double, context())
+        .expect("quote fees");
     let result = engine.run();
 
     let fills = fills.lock().expect("lock").clone();
@@ -157,6 +160,7 @@ fn the_accountant_receives_each_fill_once_with_fee_and_context() {
     );
     assert!(fills.iter().all(|f| f.context == context()));
     assert_eq!(fills[0].context.fee_currency, "USDC");
+    assert_eq!(fills[0].context.quote_currency, "USDC");
     // Each posting matches a fill report of the same order.
     let reports: Vec<_> = engine
         .execution_reports()
@@ -213,7 +217,9 @@ impl Accountant for FixedFigures {
 
 #[test]
 fn results_come_only_from_the_accountant() {
-    let mut engine = engine().with_accountant(FixedFigures::default(), context());
+    let mut engine = engine()
+        .with_accountant(FixedFigures::default(), context())
+        .expect("quote fees");
     let result = engine.run();
     assert_eq!(result.total_pnl, dec!(10));
     assert_eq!(result.total_fees, dec!(0.5));
@@ -261,7 +267,9 @@ impl Accountant for Failing {
 
 #[test]
 fn posting_errors_are_recorded_and_the_fill_still_happens() {
-    let mut engine = engine().with_accountant(Failing::default(), context());
+    let mut engine = engine()
+        .with_accountant(Failing::default(), context())
+        .expect("quote fees");
     let result = engine.run();
     assert_eq!(result.num_trades, 2);
     assert_eq!(
@@ -279,7 +287,9 @@ fn reset_restarts_the_accountant_and_the_fill_ids() {
     let double = Recording::default();
     let fills = Arc::clone(&double.fills);
     let resets = Arc::clone(&double.resets);
-    let mut engine = engine().with_accountant(double, context());
+    let mut engine = engine()
+        .with_accountant(double, context())
+        .expect("quote fees");
     let first = engine.run();
     engine.reset();
     assert_eq!(*resets.lock().expect("lock"), 1);
@@ -294,4 +304,21 @@ fn reset_restarts_the_accountant_and_the_fill_ids() {
         .map(|f| f.fill_id)
         .collect();
     assert_eq!(ids, vec![1, 2]);
+}
+
+/// Fees are computed in the quote currency, so a context that declares
+/// another fee currency is rejected before anything is simulated.
+#[test]
+fn fees_in_another_currency_are_rejected() {
+    let mut base_fees = context();
+    base_fees.fee_currency = "BTC".into();
+    let double = Recording::default();
+    let fills = Arc::clone(&double.fills);
+    let Err(error) = engine().with_accountant(double, base_fees) else {
+        panic!("base fees are not supported");
+    };
+    assert!(matches!(error, MMError::InvalidConfiguration(_)));
+    assert!(fills.lock().expect("lock").is_empty());
+    assert_eq!(context().validate(), Ok(()));
+    assert_eq!(FillContext::default().validate(), Ok(()));
 }

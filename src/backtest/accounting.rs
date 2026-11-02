@@ -47,7 +47,7 @@ use crate::Decimal;
 use crate::execution::Side;
 use crate::position::inventory::InventoryPosition;
 use crate::position::pnl::PnL;
-use crate::types::error::MMResult;
+use crate::types::error::{MMError, MMResult};
 
 use super::lifecycle::SimOrderId;
 
@@ -64,7 +64,9 @@ pub struct FillContext {
     pub base_currency: String,
     /// Currency paid by a buy, for example `USDC`.
     pub quote_currency: String,
-    /// Currency fees are charged in.
+    /// Currency fees are charged in. The engine computes every fee as
+    /// `price * quantity * fee_rate`, an amount in the quote currency, so
+    /// this must equal `quote_currency` ([`FillContext::validate`]).
     pub fee_currency: String,
 }
 
@@ -85,11 +87,22 @@ impl FillContext {
         }
     }
 
-    /// Charges fees in `currency` instead of the quote currency.
-    #[must_use]
-    pub fn with_fee_currency(mut self, currency: impl Into<String>) -> Self {
-        self.fee_currency = currency.into();
-        self
+    /// Checks that fees are in the quote currency, the only currency the
+    /// engine computes them in. Fees charged in another currency (for
+    /// example the base) are not supported yet.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] if `fee_currency` differs from
+    /// `quote_currency`.
+    pub fn validate(&self) -> MMResult<()> {
+        if self.fee_currency != self.quote_currency {
+            return Err(MMError::InvalidConfiguration(format!(
+                "fee currency {} must be the quote currency {}: fees are computed in quote",
+                self.fee_currency, self.quote_currency
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -209,7 +222,10 @@ pub trait Accountant: fmt::Debug + Send + Sync + UnwindSafe + RefUnwindSafe {
 ///   plus the inventory value.
 /// - Fees accumulate in `total_fees`, apart from the PnL.
 ///
-/// It ignores the currency context and never fails.
+/// It ignores the currency context and never fails. Its arithmetic is the
+/// historical unchecked `Decimal` arithmetic, kept on purpose so legacy
+/// results stay bit for bit identical; an exact, checked ledger plugs in
+/// as another [`Accountant`].
 #[derive(Debug, Clone, Default)]
 pub struct LegacyAccountant {
     state: AccountingSnapshot,
