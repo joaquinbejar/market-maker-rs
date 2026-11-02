@@ -32,6 +32,7 @@ path = "src/lib.rs"
 thiserror = "2.0"
 rust_decimal = "1.43"
 rust_decimal_macros = "1.40"
+margin-rs = { git = "https://github.com/joaquinbejar/margin-rs", rev = "8e10f223f02bbde4cf67e9d3595d16573b9c3746", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 pretty-simple-display = { version = "0.1", optional = true }
@@ -65,6 +66,9 @@ api = ["dep:axum", "dep:tokio", "dep:utoipa", "dep:tower-http", "serde"]
 persistence = ["dep:tokio"]
 multi-underlying = ["serde"]
 events = ["dep:tokio", "serde"]
+# Accounting and pretrade risk through margin-rs (git dependency until it is
+# published on crates.io).
+margin = ["dep:margin-rs"]
 
 [[example]]
 name = "options_greeks"

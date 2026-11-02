@@ -174,6 +174,9 @@ println!("Bid: {}, Ask: {}", bid, ask);
 - `persistence`: Enable persistence layer for market maker data
 - `multi-underlying`: Enable multi-asset management with correlation tracking
 - `events`: Enable event broadcasting system for real-time updates
+- `margin`: Post backtest fills to the `margin-rs` exact ledger
+  (`backtest::MarginLedgerAccountant`); `margin-rs` is a git dependency
+  until it is published
 - `data-feeds`: Enable real-time market data feed abstractions
 
 ### Examples

@@ -12,6 +12,7 @@
 //! - **Strategy trait**: `BacktestStrategy` for strategy integration
 //! - **Engine**: `BacktestEngine` for running simulations
 //! - **Results**: `BacktestResult` with comprehensive metrics
+//! - **Accounting port**: `FillAccountant` to select the accounting authority for fills
 //! - **Fill models**: Realistic fill simulation with queue position and market impact
 //! - **Performance metrics**: Comprehensive metrics calculation (Sharpe, Sortino, etc.)
 //!
@@ -37,6 +38,9 @@
 //! // let result = engine.run();
 //! ```
 
+/// Accounting port at the fill boundary.
+pub mod accounting;
+
 /// Data types for market data.
 pub mod data;
 
@@ -53,6 +57,9 @@ pub mod lifecycle;
 /// Performance metrics calculator.
 pub mod metrics;
 
+#[cfg(feature = "margin")]
+pub use accounting::MarginLedgerAccountant;
+pub use accounting::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
 pub use data::{HistoricalDataSource, MarketTick, OHLCVBar, VecDataSource};
 pub use engine::{
     BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy, SimulatedFill, SlippageModel,
