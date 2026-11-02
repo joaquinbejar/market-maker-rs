@@ -526,7 +526,7 @@ pub struct BacktestEngine<
     accounting_errors: Vec<(u64, MMError)>,
     next_execution_id: u64,
     /// Pretrade policy every new order passes before submission.
-    policy: Option<Box<dyn PretradePolicy + Send + Sync>>,
+    policy: Option<Box<dyn PretradePolicy + Send + Sync + UnwindSafe + RefUnwindSafe>>,
     pretrade_log: Vec<PretradeRecord>,
 }
 
@@ -1253,7 +1253,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     #[must_use]
     pub fn with_pretrade_policy(
         mut self,
-        policy: impl PretradePolicy + Send + Sync + 'static,
+        policy: impl PretradePolicy + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
     ) -> Self {
         self.policy = Some(Box::new(policy));
         self
