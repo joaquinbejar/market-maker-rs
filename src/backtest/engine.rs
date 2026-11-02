@@ -362,6 +362,7 @@ pub struct BacktestResult {
     pub sharpe_ratio: Option<Decimal>,
     /// Accounting status of the run: which accountant booked it and which
     /// venue fills it refused.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub accounting: AccountingStatus,
 }
 
@@ -2698,6 +2699,59 @@ mod tests {
         let refused_total: Decimal = refused.iter().copied().sum();
         assert_eq!(venue, dec!(2.0));
         assert_eq!(venue - refused_total, result.final_position);
+    }
+
+    #[test]
+    fn test_backtest_result_refused_middle_fill_maps_to_its_trade() {
+        // Refuse only execution 2 (quantity 1.0, distinct from 1 and 3).
+        #[derive(Debug, Default)]
+        struct RefuseSecond(RecordingAccountant);
+        impl FillAccountant for RefuseSecond {
+            fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
+                if fill.execution_id == 2 {
+                    return Err(MMError::InvalidPositionUpdate("refused".to_string()));
+                }
+                self.0.post_fill(fill)
+            }
+            fn snapshot(&self) -> AccountingSnapshot {
+                self.0.snapshot()
+            }
+            fn reset(&mut self) {
+                self.0.reset();
+            }
+        }
+        let mut engine = queued_engine_with_fees().with_accountant(RefuseSecond::default());
+        let first = engine.run();
+        let refused: Vec<Decimal> = first.refused_trades().map(|f| f.quantity).collect();
+        assert_eq!(refused, vec![dec!(1.0)]);
+        assert_eq!(first.final_position, dec!(1.0));
+        // Ids stay aligned with the trades after a reset.
+        engine.reset();
+        let second = engine.run();
+        assert_eq!(second.accounting, first.accounting);
+        assert_eq!(second.refused_trades().count(), 1);
+    }
+
+    #[test]
+    fn test_backtest_result_refusals_without_trade_recording_keep_ids() {
+        let accountant = RecordingAccountant {
+            refuse_from: Some(3),
+            ..RecordingAccountant::default()
+        };
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(2))
+                .with_fee_rate(dec!(0.001))
+                .with_record_trades(false),
+            ScriptedStrategy::new(queue_quotes()),
+            VecDataSource::new(queue_ticks()),
+            QueuePositionFillModel::new(dec!(0.5)),
+        )
+        .unwrap()
+        .with_accountant(accountant);
+        let result = engine.run();
+        assert_eq!(result.accounting.refused_executions, vec![3]);
+        assert_eq!(result.refused_trades().count(), 0);
     }
 
     #[test]
