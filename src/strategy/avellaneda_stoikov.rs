@@ -24,6 +24,19 @@
 //! ```
 //! Where:
 //! - `k`: order intensity parameter
+//!
+//! ### Units
+//! - `s`, `r`, `δ`: price units; `q`: base units, signed (long positive)
+//! - `σ`: **absolute** price volatility in price units per √year (not a
+//!   relative or percentage volatility); for a relative volatility `v`, pass
+//!   `σ = v * s`
+//! - `T - t`: milliseconds, converted to years of 365 days
+//! - `γ` and `k`: 1 / price units
+//! - `ln` and powers are evaluated through `f64`. On the validated fixtures
+//!   the relative error is around 1e-15, but precision degrades when `γ / k`
+//!   is tiny: below about 1e-16, `1 + γ / k` rounds to 1 in `f64`, the
+//!   intensity term collapses to zero and quote generation fails. The
+//!   continuous quotes are not rounded to tick here
 
 use crate::Decimal;
 use crate::types::decimal::{decimal_ln, decimal_powi};
@@ -44,7 +57,7 @@ const SECONDS_PER_YEAR: Decimal = Decimal::from_parts(31_536_000, 0, 0, false, 0
 /// * `mid_price` - Current mid-price of the asset
 /// * `inventory` - Current inventory position (positive = long, negative = short)
 /// * `risk_aversion` - Risk aversion parameter (gamma), must be positive
-/// * `volatility` - Volatility estimate (annualized), must be positive
+/// * `volatility` - Absolute price volatility per √year (see module units), must be positive
 /// * `time_to_terminal_ms` - Time remaining until terminal time, in milliseconds
 ///
 /// # Returns
@@ -70,7 +83,7 @@ const SECONDS_PER_YEAR: Decimal = Decimal::from_parts(31_536_000, 0, 0, false, 0
 ///     dec!(100.0),  // mid_price
 ///     dec!(10.0),   // inventory (long)
 ///     dec!(0.1),    // risk_aversion
-///     dec!(0.2),    // volatility (20%)
+///     dec!(0.2),    // absolute volatility, price units per √year
 ///     3600000       // 1 hour in ms
 /// ).unwrap();
 ///
@@ -103,7 +116,7 @@ pub fn calculate_reservation_price(
         ));
     }
 
-    // Convert time to years (volatility is annualized)
+    // Convert time to years (volatility is per √year)
     let time_to_terminal_ms_dec = Decimal::from(time_to_terminal_ms);
     let time_to_terminal_years =
         (time_to_terminal_ms_dec * SECONDS_PER_MILLISECOND) / SECONDS_PER_YEAR;
@@ -125,9 +138,9 @@ pub fn calculate_reservation_price(
 /// # Arguments
 ///
 /// * `risk_aversion` - Risk aversion parameter (gamma), must be positive
-/// * `volatility` - Volatility estimate (annualized), must be positive
+/// * `volatility` - Absolute price volatility per √year (see module units), must be positive
 /// * `time_to_terminal_ms` - Time remaining until terminal time, in milliseconds
-/// * `order_intensity` - Order intensity parameter (k), must be positive
+/// * `order_intensity` - Order intensity decay `k`, in 1 / price units, must be positive
 ///
 /// # Returns
 ///
@@ -145,7 +158,7 @@ pub fn calculate_reservation_price(
 ///
 /// let spread = calculate_optimal_spread(
 ///     dec!(0.1),    // risk_aversion
-///     dec!(0.2),    // volatility (20%)
+///     dec!(0.2),    // absolute volatility, price units per √year
 ///     3600000,      // 1 hour
 ///     dec!(1.5)     // order_intensity
 /// ).unwrap();
@@ -213,9 +226,9 @@ pub fn calculate_optimal_spread(
 /// * `mid_price` - Current mid-price
 /// * `inventory` - Current inventory position
 /// * `risk_aversion` - Risk aversion parameter (gamma)
-/// * `volatility` - Volatility estimate (annualized)
+/// * `volatility` - Absolute price volatility per √year (see module units)
 /// * `time_to_terminal_ms` - Time to terminal in milliseconds
-/// * `order_intensity` - Order intensity parameter (k)
+/// * `order_intensity` - Order intensity decay `k`, in 1 / price units
 ///
 /// # Returns
 ///
