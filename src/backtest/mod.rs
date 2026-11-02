@@ -66,8 +66,8 @@ pub use accounting::MarginLedgerAccountant;
 pub use accounting::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
 pub use data::{HistoricalDataSource, MarketTick, OHLCVBar, VecDataSource};
 pub use engine::{
-    BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy, PretradeRecord,
-    SimulatedFill, SlippageModel,
+    AccountingStatus, BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy,
+    PretradeRecord, SimulatedFill, SlippageModel,
 };
 pub use fill_models::{
     FillModel, FillResult, ImmediateFillModel, MarketImpactFillModel, ProbabilisticFillModel,

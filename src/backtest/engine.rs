@@ -360,9 +360,52 @@ pub struct BacktestResult {
     pub max_drawdown: Decimal,
     /// Sharpe ratio approximation (if enough data).
     pub sharpe_ratio: Option<Decimal>,
+    /// Accounting status of the run: which accountant booked it and which
+    /// venue fills it refused.
+    pub accounting: AccountingStatus,
+}
+
+/// Accounting status of a backtest run.
+///
+/// With a selected [`FillAccountant`], position, PnL and fees follow the
+/// accountant, while [`BacktestResult::trades`] lists every venue fill. A
+/// fill the accountant refused is in `trades` but not in the metrics; this
+/// status makes that divergence visible from the result alone.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct AccountingStatus {
+    /// Description of the selected accountant, or `None` for the built in
+    /// bookkeeping (which never refuses a fill).
+    pub accountant: Option<String>,
+    /// Execution ids whose post the accountant refused, in venue order.
+    ///
+    /// Execution ids start at 1 and follow the order of
+    /// [`BacktestResult::trades`], so with trade recording on, execution
+    /// `id` is `trades[id - 1]` (see [`BacktestResult::refused_trades`]).
+    pub refused_executions: Vec<u64>,
+}
+
+impl AccountingStatus {
+    /// Returns `true` if the accountant booked every venue fill.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.refused_executions.is_empty()
+    }
 }
 
 impl BacktestResult {
+    /// Venue fills the selected accountant refused to book.
+    ///
+    /// Empty when trade recording is off or no post was refused. The
+    /// remaining trades are exactly the ones reflected in the metrics.
+    pub fn refused_trades(&self) -> impl Iterator<Item = &SimulatedFill> + '_ {
+        self.accounting.refused_executions.iter().filter_map(|id| {
+            id.checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| self.trades.get(index))
+        })
+    }
+
     /// Returns the win rate (trades with positive PnL / total trades).
     #[must_use]
     pub fn win_rate(&self) -> Decimal {
@@ -745,6 +788,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             },
             max_drawdown: self.max_drawdown,
             sharpe_ratio: self.calculate_sharpe_ratio(),
+            accounting: AccountingStatus {
+                accountant: self.accountant_description(),
+                refused_executions: self.accounting_errors.iter().map(|(id, _)| *id).collect(),
+            },
         }
     }
 
@@ -2628,6 +2675,37 @@ mod tests {
             .map(|(id, _)| *id)
             .collect();
         assert_eq!(errors, vec![3]);
+    }
+
+    #[test]
+    fn test_backtest_result_refused_post_divergence_visible_from_result() {
+        let accountant = RecordingAccountant {
+            refuse_from: Some(3),
+            ..RecordingAccountant::default()
+        };
+        let mut engine = queued_engine_with_fees().with_accountant(accountant);
+        let result = engine.run();
+        assert_eq!(
+            result.accounting.accountant.as_deref(),
+            Some("recording test double")
+        );
+        assert_eq!(result.accounting.refused_executions, vec![3]);
+        assert!(!result.accounting.is_consistent());
+        let refused: Vec<Decimal> = result.refused_trades().map(|f| f.quantity).collect();
+        assert_eq!(refused, vec![dec!(0.5)]);
+        // Venue fills minus the refused ones add up to the booked position.
+        let venue: Decimal = result.trades.iter().map(|f| f.quantity).sum();
+        let refused_total: Decimal = refused.iter().copied().sum();
+        assert_eq!(venue, dec!(2.0));
+        assert_eq!(venue - refused_total, result.final_position);
+    }
+
+    #[test]
+    fn test_backtest_result_builtin_bookkeeping_status_is_default() {
+        let result = queued_engine_with_fees().run();
+        assert_eq!(result.accounting, AccountingStatus::default());
+        assert!(result.accounting.is_consistent());
+        assert_eq!(result.refused_trades().count(), 0);
     }
 
     #[test]
