@@ -54,12 +54,16 @@ pub mod iv;
 pub mod pipeline;
 /// Cleaning of option quotes before calibration.
 pub mod quotes;
+/// Causal replay of quote snapshots.
+pub mod replay;
 /// Shock scenarios on a surface, each with its own diagnostics.
 pub mod shocks;
 /// Causal availability of calibrated surfaces.
 pub mod store;
 /// Raw SVI slices and surfaces of slices.
 pub mod svi;
+/// Out of sample validation of the SVI fit against a baseline.
+pub mod validation;
 
 pub use calibrate::{
     ActiveConstraint, FitConfig, FitFailure, Residual, SliceFit, SliceObservation, fit_slice,
@@ -76,11 +80,16 @@ pub use quotes::{
     CleanQuote, CleaningConfig, CleaningReport, OptionQuote, QuoteFlag, QuoteVerdict, Rates,
     Rejection, clean_quotes,
 };
+pub use replay::{ReplayReport, ReplayResidual, ReplayStep, Snapshot, replay};
 pub use shocks::{ScenarioReport, ShockedSurface, SurfaceShock, run_scenarios, standard_scenarios};
 pub use store::{
     CalibratedSurface, ServedSurface, SurfaceStatus, SurfaceStore, UsePolicy, YEAR_MS,
 };
 pub use svi::{KRange, Region, ShortExpiryPolicy, SviSlice, SviSurface};
+pub use validation::{
+    BaselineSurface, BucketComparison, BucketStats, HoldoutReport, HoldoutRule, WingRule,
+    validate_holdout,
+};
 
 /// A volatility surface: total implied variance and its derivatives.
 ///
