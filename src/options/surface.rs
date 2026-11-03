@@ -50,6 +50,8 @@ pub mod calibrate;
 pub mod diagnostics;
 /// Shock scenarios on a surface, each with its own diagnostics.
 pub mod shocks;
+/// Causal availability of calibrated surfaces.
+pub mod store;
 /// Raw SVI slices and surfaces of slices.
 pub mod svi;
 
@@ -60,6 +62,9 @@ pub use diagnostics::{
     Check, DiagnosticGrid, DiagnosticPoint, DiagnosticsConfig, SurfaceDiagnostics, diagnose,
 };
 pub use shocks::{ScenarioReport, ShockedSurface, SurfaceShock, run_scenarios, standard_scenarios};
+pub use store::{
+    CalibratedSurface, ServedSurface, SurfaceStatus, SurfaceStore, UsePolicy, YEAR_MS,
+};
 pub use svi::{KRange, Region, ShortExpiryPolicy, SviSlice, SviSurface};
 
 /// A volatility surface: total implied variance and its derivatives.
