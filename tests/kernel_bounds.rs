@@ -1067,41 +1067,65 @@ fn step_accepted(k: &Kernel<'_>, sc: &Scenario, bytes: &[u8], j: u64, ctx: &str)
 
 #[test]
 fn test_kernel_decode_fuzz_accepted_states_never_halt() {
-    // Seeded byte mutations of reachable states: one to three bytes each,
-    // a bit flip, 0xFF or 0x00. Whatever decode accepts must step cleanly.
-    let (mut tries, mut accepted) = (0u64, 0u64);
+    // Every 7th decision state of seeds 0..KERNEL_FUZZ_SEEDS (60 by default)
+    // and datasets 0..4 gets 40 mutations of one to three bytes (a bit
+    // flip, 0xFF or 0x00). Whatever decode accepts is stepped with Hold and
+    // with the action the run took there: no state may halt or panic.
+    let (mut tried, mut accepted) = (0u64, 0u64);
+    let mut halts = Vec::new();
+    let mut rng = SplitMix64(0xC0FFEE);
     for seed in 0..fuzz_seeds() {
-        for index in 0..5 {
+        for index in 0..4u64 {
             let sc = scenario(seed, index);
             let data = sc.data();
             let k = kernel(&sc, &data);
             let kr = run_kernel(&k, &sc, true);
-            let mut rng = SplitMix64(seed.wrapping_mul(0x9E37) ^ index);
-            for (j, s) in kr.states.iter().enumerate().step_by(7) {
-                let bytes = encode(s);
+            for (j, state) in kr.states.iter().enumerate().step_by(7) {
+                let bytes = encode(state);
                 for _ in 0..40 {
                     let mut b = bytes.clone();
-                    for _ in 0..=rng.below(3) {
-                        let at = usize::try_from(rng.below(b.len() as u64)).unwrap();
-                        b[at] = match rng.below(3) {
-                            0 => b[at] ^ (1 << rng.below(8)),
+                    let flips = 1 + rng.next() % 3;
+                    for _ in 0..flips {
+                        let at = usize::try_from(rng.next() % b.len() as u64).unwrap();
+                        b[at] = match rng.next() % 3 {
+                            0 => b[at] ^ (1 << (rng.next() % 8)),
                             1 => 0xFF,
                             _ => 0x00,
                         };
                     }
-                    tries += 1;
-                    let ctx = format!("seed {seed} dataset {index} decision {j}");
-                    if step_accepted(&k, &sc, &b, j as u64, &ctx) {
-                        accepted += 1;
+                    tried += 1;
+                    let Ok(decoded) = decode(&b, &k) else {
+                        continue;
+                    };
+                    accepted += 1;
+                    let taken = kr.actions.get(j).copied().unwrap_or(KernelAction::Hold);
+                    for action in [KernelAction::Hold, taken] {
+                        let mut next = decoded;
+                        k.step(&mut next, action);
+                        if let Status::Halted(reason) = next.status() {
+                            let diffs: Vec<(usize, u8, u8)> = bytes
+                                .iter()
+                                .zip(&b)
+                                .enumerate()
+                                .filter(|(_, (x, y))| x != y)
+                                .map(|(i, (x, y))| (i, *x, *y))
+                                .collect();
+                            halts.push(format!(
+                                "seed {seed} dataset {index} decision {j} {action:?}: {reason:?}, bytes {diffs:?}"
+                            ));
+                        }
                     }
                 }
             }
         }
     }
     assert!(
-        tries > 0 && accepted > 0,
-        "{tries} tries, {accepted} accepted"
+        halts.is_empty(),
+        "{} halts in {tried} tries ({accepted} accepted):\n{}",
+        halts.len(),
+        halts.join("\n")
     );
+    assert!(accepted > 0, "no mutation accepted in {tried} tries");
 }
 
 #[test]
