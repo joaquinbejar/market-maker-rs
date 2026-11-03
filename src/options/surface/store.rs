@@ -10,7 +10,15 @@
 //! a calibration that finishes late is invisible until then, and the age of
 //! a surface is always `t - data_cutoff`, so a late calculation does not
 //! make old data look fresh. The store is append only, with strictly
-//! increasing `available_at`, so a past answer never changes.
+//! increasing `available_at`, so a past answer never changes. A
+//! calibration of older data may finish after a newer one; it is stored,
+//! and served only when nothing with newer data is usable.
+//!
+//! # Which attempt is served
+//!
+//! Among the attempts available at `t`, the one with the newest data cutoff
+//! that the [`UsePolicy`] allows and whose aged surface is usable; between
+//! attempts on the same cutoff, the later available one.
 //!
 //! # Use is a separate decision from quality
 //!
@@ -268,7 +276,8 @@ pub struct ServedSurface {
     /// diagnosis is clean, `Degraded` otherwise (served only under a policy
     /// that allows degraded surfaces).
     pub served_status: SurfaceStatus,
-    /// Whether a later attempt, available at `t`, was passed over.
+    /// Whether an attempt preferred by the serving rule (newer data, or the
+    /// same data available later), available at `t`, was passed over.
     pub fallback: bool,
     /// Diagnosis of the aged surface.
     pub diagnostics: SurfaceDiagnostics,
@@ -312,8 +321,9 @@ impl SurfaceStore {
         &self.entries
     }
 
-    /// The latest attempt available at `t` that `policy` allows, aged to
-    /// `t` and diagnosed.
+    /// The attempt available at `t` with the newest data cutoff that
+    /// `policy` allows (ties go to the later available one), aged to `t` and
+    /// diagnosed. See the [module docs](self).
     ///
     /// # Errors
     ///
@@ -321,17 +331,25 @@ impl SurfaceStore {
     /// attempt available yet, every candidate failed, degraded under a
     /// strict policy, too old, or not alive at `t`.
     pub fn surface_at(&self, t: u64, policy: &UsePolicy) -> MMResult<ServedSurface> {
-        let visible = self.entries.iter().rposition(|e| e.available_at <= t);
-        let Some(latest) = visible else {
+        // Every attempt available at t, by the serving rule: newest data
+        // first, then latest available.
+        let mut candidates: Vec<&CalibratedSurface> = self
+            .entries
+            .iter()
+            .filter(|e| e.available_at <= t)
+            .collect();
+        if candidates.is_empty() {
             return Err(MMError::InvalidMarketState(format!(
                 "no surface is available at {t}"
             )));
-        };
+        }
+        candidates.sort_by(|a, b| {
+            b.data_cutoff
+                .cmp(&a.data_cutoff)
+                .then(b.available_at.cmp(&a.available_at))
+        });
         let mut reasons = Vec::new();
-        for index in (0..=latest).rev() {
-            let Some(entry) = self.entries.get(index) else {
-                continue;
-            };
+        for (rank, entry) in candidates.into_iter().enumerate() {
             match &entry.status {
                 SurfaceStatus::Failed(_) => {
                     reasons.push(format!("{}: failed", entry.available_at));
@@ -350,7 +368,8 @@ impl SurfaceStore {
                 ))
             })?;
             if age_ms > policy.max_age_ms {
-                // Earlier attempts are older still.
+                // Candidates are in decreasing data cutoff order: every one
+                // left is at least as old.
                 reasons.push(format!("{}: {age_ms} ms old", entry.available_at));
                 break;
             }
@@ -385,7 +404,7 @@ impl SurfaceStore {
                 available_at: entry.available_at,
                 status: entry.status.clone(),
                 served_status,
-                fallback: index != latest,
+                fallback: rank != 0,
                 diagnostics,
             });
         }
@@ -480,6 +499,60 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.entries().len(), 1);
+    }
+
+    #[test]
+    fn test_surface_at_older_data_finishing_later_does_not_hide_newer_data() {
+        // Data to 2000 available at 2500, then data to 1000 available at
+        // 3000.
+        let mut store = SurfaceStore::new();
+        store
+            .insert(calibrated(2000, 2500, 0.04, SurfaceStatus::Healthy))
+            .unwrap();
+        let p = UsePolicy {
+            max_age_ms: 1500,
+            ..policy(false)
+        };
+        let before = store.surface_at(3000, &p).unwrap();
+        assert_eq!(before.data_cutoff, 2000);
+        store
+            .insert(calibrated(1000, 3000, 0.04, SurfaceStatus::Healthy))
+            .unwrap();
+        // The newer data is still served, and nothing preferred was passed
+        // over.
+        let after = store.surface_at(3000, &p).unwrap();
+        assert_eq!(after, before);
+        assert!(!after.fallback);
+        // With a looser age limit, still the newer data.
+        let loose = UsePolicy {
+            max_age_ms: 10 * DAY,
+            ..policy(false)
+        };
+        assert_eq!(store.surface_at(3000, &loose).unwrap().data_cutoff, 2000);
+        // The older data is served only when the newer cannot be: a failed
+        // retry on the newest cutoff does not change the answer.
+        store
+            .insert(CalibratedSurface::failed(2000, 3500, vec!["no fit".into()]).unwrap())
+            .unwrap();
+        let ranked = store.surface_at(3500, &loose).unwrap();
+        assert_eq!(
+            (ranked.data_cutoff, ranked.available_at, ranked.fallback),
+            (2000, 2500, true)
+        );
+    }
+
+    #[test]
+    fn test_surface_at_same_cutoff_prefers_the_later_attempt() {
+        let mut store = SurfaceStore::new();
+        store
+            .insert(calibrated(DAY, DAY + 10, 0.04, SurfaceStatus::Healthy))
+            .unwrap();
+        store
+            .insert(calibrated(DAY, DAY + 20, 0.05, SurfaceStatus::Healthy))
+            .unwrap();
+        let served = store.surface_at(2 * DAY, &policy(false)).unwrap();
+        assert_eq!(served.available_at, DAY + 20);
+        assert!(!served.fallback);
     }
 
     #[test]
