@@ -104,6 +104,14 @@ project follows [Semantic Versioning](https://semver.org/).
   errors; `BacktestEngine::fault_count` reports the total. Admission still
   stops at the first fault (#133).
 
+### Fixed
+
+- `ProbabilisticFillModel` draws its uniform number from the top 32 bits
+  of the generator state scaled by 2^32, so it covers [0, 1). The draw used
+  to stay below 0.5, so a fill with probability p happened with
+  probability min(1, 2p). Backtests that use this model now fill less
+  often, and their output for a given seed changes (#143).
+
 ### Breaking
 
 - The `margin` feature depends on margin-rs 0.1 from crates.io instead of

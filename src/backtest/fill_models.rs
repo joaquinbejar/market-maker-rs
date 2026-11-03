@@ -699,15 +699,19 @@ impl ProbabilisticFillModel {
         self.base_probability * depth_component * time_component
     }
 
-    /// Generates a deterministic pseudo-random number between 0 and 1.
+    /// Generates a deterministic pseudo-random number, uniform in [0, 1).
     fn next_random(&self) -> Decimal {
         // Simple LCG for deterministic randomness
         let current = self.state.load(Ordering::Relaxed);
         let next = current.wrapping_mul(6364136223846793005).wrapping_add(1);
         self.state.store(next, Ordering::Relaxed);
-        // `next >> 33` keeps 31 bits, so it always fits in a `u32`.
-        let value = u32::try_from(next >> 33).unwrap_or(u32::MAX);
-        Decimal::from(value) / Decimal::from(u32::MAX)
+        // The top 32 bits of the state, scaled by 2^32, give a uniform draw
+        // in [0, 1). The high bits of an LCG are its best distributed ones.
+        let value = next >> 32;
+        let scale = Decimal::from(1u64 << 32);
+        Decimal::from(value)
+            .checked_div(scale)
+            .unwrap_or(Decimal::ZERO)
     }
 }
 
@@ -1326,6 +1330,49 @@ mod tests {
 
         // After reset, should get same result
         assert_eq!(result1, result2);
+    }
+
+    /// Fills `n` crossed orders whose fill probability is exactly `p` and
+    /// returns the empirical fill rate.
+    fn empirical_fill_rate(p: Decimal, seed: u64, n: u32) -> Decimal {
+        // depth_factor 0 makes the depth component 1; time_factor 1 with a
+        // queue time of 1000 ms saturates the time component at 1.
+        let model = ProbabilisticFillModel::new(p, Decimal::ZERO, Decimal::ONE, seed);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
+        let tick = create_test_tick(dec!(99.9), dec!(99.9));
+        assert_eq!(model.calculate_probability(&order, &tick, 1000).unwrap(), p);
+        let fills = (0..n)
+            .filter(|_| {
+                model
+                    .simulate_fill(&order, &tick, 1000)
+                    .unwrap()
+                    .is_filled()
+            })
+            .count();
+        Decimal::from(fills) / Decimal::from(n)
+    }
+
+    #[test]
+    fn test_probabilistic_fill_rate_matches_probability() {
+        // 20_000 draws: the binomial standard deviation is at most 0.0036, so
+        // a tolerance of 0.02 is more than five standard deviations.
+        let tolerance = dec!(0.02);
+        for p in [dec!(0.1), dec!(0.3), dec!(0.5), dec!(0.7), dec!(0.9)] {
+            for seed in [1u64, 42, 12_345] {
+                let rate = empirical_fill_rate(p, seed, 20_000);
+                assert!(
+                    (rate - p).abs() <= tolerance,
+                    "p {p}, seed {seed}: empirical fill rate {rate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_probabilistic_draw_reaches_upper_half() {
+        // The draw used to stay below 0.5, so p = 0.5 always filled.
+        let rate = empirical_fill_rate(dec!(0.5), 7, 2_000);
+        assert!(rate < dec!(0.6), "empirical fill rate {rate}");
     }
 
     // MarketImpactFillModel tests
