@@ -79,6 +79,10 @@ name = "options_greeks"
 required-features = ["options"]
 
 [[example]]
+name = "vol_surface_validation"
+required-features = ["options"]
+
+[[example]]
 name = "options_market_making"
 required-features = ["options"]
 
