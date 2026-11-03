@@ -67,7 +67,6 @@ project follows [Semantic Versioning](https://semver.org/).
   `GLFTStrategy::{calculate_reservation_price, calculate_optimal_spread,
   calculate_dynamic_gamma}`. The prelude exports `GlftQuotes` instead of
   `PenaltyFunction`. With `serde`, `GLFTConfig` denies unknown fields.
-
 - Chain quotes come from the option pricer instead of a placeholder
   (intrinsic value plus `spot / 50`, which ignored volatility and expiry):
   `ChainMarketMaker::refresh_all_quotes(underlying_price, &ChainPricing)`

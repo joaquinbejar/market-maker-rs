@@ -497,21 +497,54 @@ impl Model {
         // forward's drift cancel analytically, which leaves the carry part
         //   call: q S e^{-q tau} N(d1) - r K e^{-r tau} N(d2)
         //   put:  r K e^{-r tau} N(-d2) - q S e^{-q tau} N(-d1)
-        // and theta = carry - e^{-r tau} Black_w dw/dtau. The carry part is
-        // written on the stable price V, as
-        //   call: q V - (r - q) K e^{-r tau} N(d2)
-        //   put:  q V + (r - q) K e^{-r tau} N(-d2),
-        // the same quantity: exactly q V at r = q, where the first form
-        // would cancel near the money at small w, and exactly the single
-        // rate term at q = 0, where the alternative r V - (r - q) S ... would
-        // cancel deep in the money.
+        // and theta = carry - e^{-r tau} Black_w dw/dtau. With the stable
+        // price V the carry part has two more exact forms,
+        //   call: r V - (r - q) S e^{-q tau} N(d1) = q V - (r - q) K e^{-r tau} N(d2)
+        //   put:  r V + (r - q) S e^{-q tau} N(-d1) = q V + (r - q) K e^{-r tau} N(-d2),
+        // and each one cancels somewhere: the first near the money at r = q
+        // and small w, the second deep in the money for a call (at q = 0
+        // its two terms are r V and r S), the third deep in the money for a
+        // put (at r = 0, q V and q K). The error of each is about eps times the sum of
+        // the absolute values of its two terms, so the one with the smallest
+        // sum is used.
         let black_w = k * n2 / (2.0 * self.vol);
         let dw_dtau = self.w_tau - (self.r - self.q) * self.w_k;
-        let carry_part = if call {
-            self.q * price - (self.r - self.q) * k * self.df_r * norm_cdf(d2)
+        let (r, q, rq) = (self.r, self.q, self.r - self.q);
+        // S e^{-q tau} N(+-d1) and K e^{-r tau} N(+-d2), signed for the side.
+        let (s_term, k_term, sign) = if call {
+            (
+                s * self.df_q * norm_cdf(d1),
+                k * self.df_r * norm_cdf(d2),
+                -1.0,
+            )
         } else {
-            self.q * price + (self.r - self.q) * k * self.df_r * norm_cdf(-d2)
+            (
+                s * self.df_q * norm_cdf(-d1),
+                k * self.df_r * norm_cdf(-d2),
+                1.0,
+            )
         };
+        let forms = [
+            // q S.. - r K.. (call), r K.. - q S.. (put).
+            (
+                -sign * (q * s_term - r * k_term),
+                (q * s_term).abs() + (r * k_term).abs(),
+            ),
+            (
+                r * price + sign * rq * s_term,
+                (r * price).abs() + (rq * s_term).abs(),
+            ),
+            (
+                q * price + sign * rq * k_term,
+                (q * price).abs() + (rq * k_term).abs(),
+            ),
+        ];
+        let carry_part = forms
+            .iter()
+            .fold((f64::NAN, f64::INFINITY), |best, &(value, size)| {
+                if size < best.1 { (value, size) } else { best }
+            })
+            .0;
         let theta = finite("theta", carry_part - self.df_r * black_w * dw_dtau)?;
         Ok(OptionValuation {
             price: to_decimal("price", price)?,
@@ -627,12 +660,24 @@ struct Term {
 
 impl Term {
     /// `sqrt(F K) m e^{e}`, from `scale = sqrt(F) sqrt(K)` and
-    /// `ln_scale = ln sqrt(F K)`.
+    /// `ln_scale = ln sqrt(F K)`, with no intermediate that underflows or
+    /// overflows before the result does: `p = m sqrt(F K)` cannot overflow
+    /// (`m <= 1`); while `p` is normal it is multiplied by `e^{e}`, or, past
+    /// `|e| = DIRECT_EXPONENT`, the exponent takes `ln p`; when `p` itself
+    /// is subnormal the whole product is taken in logs.
     fn scaled(self, scale: f64, ln_scale: f64) -> f64 {
-        if self.e.abs() <= DIRECT_EXPONENT {
-            self.m * self.e.exp() * scale
+        if self.m <= 0.0 {
+            return 0.0;
+        }
+        let p = self.m * scale;
+        if p.is_normal() {
+            if self.e.abs() <= DIRECT_EXPONENT {
+                p * self.e.exp()
+            } else {
+                (self.e + p.ln()).exp()
+            }
         } else {
-            self.m * (self.e + ln_scale).exp()
+            (self.m.ln() + ln_scale + self.e).exp()
         }
     }
 }
@@ -647,8 +692,9 @@ impl Term {
 ///   `e^{-(h^2 + t^2)/2} (erfcx(-d1/sqrt 2) - erfcx(-d2/sqrt 2)) / 2`, which
 ///   has no overflow and no tail cancellation;
 /// - otherwise `e^{ht} N(h + t) - e^{-ht} N(h - t)`, where `t >= SMALL_T`
-///   bounds the cancellation; when `e^{-ht}` would overflow, its term is
-///   `e^{-(h^2 + t^2)/2} erfcx(-(h - t)/sqrt 2) / 2` (`h - t < 0`).
+///   bounds the cancellation, with the second term as
+///   `e^{-(h^2 + t^2)/2} erfcx(-(h - t)/sqrt 2) / 2` (`h - t < 0`), so that
+///   neither `e^{-ht}` overflows nor `N(h - t)` underflows on its own.
 ///
 /// Each term is `m e^{e}` scaled by [`Term::scaled`], so the result is 0
 /// only when the true time value is below half the smallest subnormal.
@@ -678,16 +724,9 @@ fn otm_time_value(x: f64, s: f64, scale: f64, ln_scale: f64) -> f64 {
         m: norm_cdf(h + t),
         e: h * t,
     };
-    let second = if -h * t <= DIRECT_EXPONENT {
-        Term {
-            m: norm_cdf(h - t),
-            e: -h * t,
-        }
-    } else {
-        Term {
-            m: 0.5 * erfcx(-(h - t) * r),
-            e: -0.5 * (h * h + t * t),
-        }
+    let second = Term {
+        m: 0.5 * erfcx(-(h - t) * r),
+        e: -0.5 * (h * h + t * t),
     };
     first.scaled(scale, ln_scale) - second.scaled(scale, ln_scale)
 }
@@ -923,6 +962,15 @@ mod tests {
                 "b({x}, {s}) = {got:e}, want {want:e} (rel {rel:e})"
             );
         }
+    }
+
+    #[test]
+    fn test_normalised_otm_call_direct_branch_keeps_its_second_term() {
+        // h = -19, t = 20: N(h - t) underflows, e^{-ht} N(h - t) does not.
+        // Reference: scripts/black_reference.py ("b -760.0 40.0").
+        let got = normalised_otm_call(-760.0, 40.0);
+        let want = 7.759_941_919_191_629e-166;
+        assert!(((got - want) / want).abs() <= 1e-12, "{got:e} vs {want:e}");
     }
 
     #[test]

@@ -946,10 +946,7 @@ fn test_black_keeps_a_representable_price_whose_normalised_value_underflows() {
     let want = 3.668_096_755_640_983_4e-290;
     assert!(close(call, want, 1e-11, 0.0), "{call:e} vs {want:e}");
     let put = black_undiscounted(1e-50, 1e306, 400.0, OptionStyle::Put).unwrap();
-    assert!(
-        close(put, 1e306, 1e-15, 0.0),
-        "{put:e}"
-    );
+    assert!(close(put, 1e306, 1e-15, 0.0), "{put:e}");
 }
 
 #[test]
@@ -980,4 +977,52 @@ fn test_black_price_below_the_smallest_f64_is_an_error_not_zero() {
         black_undiscounted(1e300, 1.0, 1e-4, OptionStyle::Call).unwrap(),
         1e300 - 1.0
     );
+}
+
+#[test]
+fn test_value_theta_of_a_deep_in_the_money_put_has_no_cancellation() {
+    // The mirror of the deep in-the-money call: S = 100, K = 1e24, r = 0,
+    // q = 5 %: theta is -q S e^{-q tau} N(-d1). Reference:
+    // scripts/black_reference.py ("theta ...").
+    let flat = FlatSurface::new(dec!(0.2)).unwrap();
+    for (spot, want) in [
+        (dec!(100), -4.756_147_122_503_57),
+        (dec!(1), -4.756_147_122_503_57e-2),
+    ] {
+        let i = OptionInputs::european(
+            spot,
+            dec!(1000000000000000000000000),
+            dec!(1),
+            dec!(0),
+            dec!(0.05),
+            OptionStyle::Put,
+        );
+        let v = value(&i, &flat, Dynamics::StickyMoneyness).unwrap();
+        assert!(
+            close(f(v.theta), want, 1e-12, 0.0),
+            "S {spot}: {} vs {want}",
+            v.theta
+        );
+    }
+}
+
+#[test]
+fn test_black_scaling_never_underflows_an_intermediate() {
+    // The mantissa times e^{e} underflows although sqrt(F K) brings the
+    // price back: F = 1e300, K one ulp above, w = 1.58e-35 (h about -37,
+    // series branch).
+    let got = black_undiscounted(
+        1e300,
+        1.0000000000000002e300,
+        1.580842522018662e-35,
+        OptionStyle::Call,
+    )
+    .unwrap();
+    let want = 2.073_992_952_514_446e-25;
+    assert!(close(got, want, 1e-11, 0.0), "{got:e} vs {want:e}");
+    // The direct branch, h = -19 and t = 20: N(h - t) = N(-39) underflows
+    // while e^{-ht} N(h - t) is 0.74 % of the price.
+    let got = black_undiscounted(1e300, 1e-30, 1600.0, OptionStyle::Put).unwrap();
+    let want = 8.360_537_541_944_882e-31;
+    assert!(close(got, want, 1e-11, 0.0), "{got:e} vs {want:e}");
 }
