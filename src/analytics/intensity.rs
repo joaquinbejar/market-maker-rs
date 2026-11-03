@@ -569,7 +569,10 @@ impl OrderIntensityEstimator {
         let time_seconds = Decimal::from(time_horizon_ms).checked_div(Decimal::ONE_THOUSAND)?;
 
         // P(fill) = 1 - exp(-λ * t)
-        let exponent = Decimal::ZERO.checked_sub(lambda.checked_mul(time_seconds)?)?;
+        // An intensity times time too large to represent is a near certain
+        // fill: `exp_approx` clamps the exponent, so the probability is 1.
+        let rate_time = lambda.checked_mul(time_seconds).unwrap_or(Decimal::MAX);
+        let exponent = Decimal::ZERO.checked_sub(rate_time)?;
         let prob = Decimal::ONE.checked_sub(exp_approx(exponent))?;
 
         Some(prob.max(Decimal::ZERO).min(Decimal::ONE))
@@ -985,6 +988,21 @@ mod tests {
         assert!(decimal_sqrt_approx(Decimal::MAX) > Decimal::ZERO);
         let four = decimal_sqrt_approx(dec!(16));
         assert!((four - dec!(4)).abs() < dec!(0.0001), "{four}");
+    }
+
+    #[test]
+    fn test_fill_probability_with_overflowing_rate_times_time_is_one() {
+        let mut estimator = OrderIntensityEstimator::new(OrderIntensityConfig::new(60_000, 10, dec!(0.1)).unwrap());
+        estimator.current_estimate = Some(IntensityEstimate {
+            k: Decimal::ZERO,
+            baseline_rate: Decimal::MAX / dec!(2),
+            confidence: dec!(1),
+            sample_size: 10,
+            r_squared: dec!(1),
+            k_std_error: Decimal::ZERO,
+            timestamp: 0,
+        });
+        assert_eq!(estimator.fill_probability(dec!(1), 10_000), Some(Decimal::ONE));
     }
 
     #[test]
