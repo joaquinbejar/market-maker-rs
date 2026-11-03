@@ -63,7 +63,7 @@ fix:
 	cargo fix --allow-staged --allow-dirty
 
 .PHONY: pre-push
-pre-push: fix fmt lint-fix test readme doc msrv
+pre-push: fix fmt lint-fix lint test readme doc msrv
 
 # Check the crate with the minimum supported Rust version, with no features
 # and with all features, against the existing lockfile.
