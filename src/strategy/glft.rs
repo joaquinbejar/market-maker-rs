@@ -841,10 +841,19 @@ fn apply_operator(
 
 /// Inventory in lots, checked on the lot grid and within `±Q`.
 fn inventory_lots(inventory: Decimal, config: &GLFTConfig) -> MMResult<i64> {
+    let off_grid = inventory
+        .checked_rem(config.lot_size)
+        .is_none_or(|r| !r.is_zero());
     let lots = inventory
         .checked_div(config.lot_size)
         .ok_or_else(|| numerical("inventory / lot_size"))?;
-    if !lots.fract().is_zero() {
+    // The quotient is rounded to 28 digits, so check that it multiplies
+    // back to the inventory exactly.
+    let exact = lots.fract().is_zero()
+        && lots
+            .checked_mul(config.lot_size)
+            .is_some_and(|back| back == inventory);
+    if off_grid || !exact {
         return Err(MMError::InvalidPositionUpdate(format!(
             "inventory {inventory} is not a multiple of lot_size {}",
             config.lot_size
@@ -1227,6 +1236,33 @@ mod tests {
         );
         let closed =
             GLFTStrategy::closed_form_quotes(dec!(1000), inventory, &config, paper_sigma());
+        assert!(
+            matches!(closed, Err(MMError::InvalidPositionUpdate(_))),
+            "{closed:?}"
+        );
+    }
+
+    #[test]
+    fn test_calculate_optimal_quotes_tiny_off_grid_inventory_returns_invalid_position_update() {
+        // Codex repro: 1e-28 / 1e28 rounds to 0 lots, but 1e-28 is off grid.
+        let config = GLFTConfig::new(
+            dec!(0.0000000000000000000000000001),
+            dec!(0.3),
+            dec!(0.9),
+            2,
+            dec!(10000000000000000000000000000),
+            1,
+            dec!(0),
+        )
+        .unwrap();
+        let inventory = dec!(0.0000000000000000000000000001);
+        let exact =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), inventory, &config, dec!(100), 1);
+        assert!(
+            matches!(exact, Err(MMError::InvalidPositionUpdate(_))),
+            "{exact:?}"
+        );
+        let closed = GLFTStrategy::closed_form_quotes(dec!(1000), inventory, &config, dec!(100));
         assert!(
             matches!(closed, Err(MMError::InvalidPositionUpdate(_))),
             "{closed:?}"
