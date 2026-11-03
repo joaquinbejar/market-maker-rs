@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `examples/counterpart.rs` (feature `options`): a batch counterpart for an
+  external harness. `calibrate` builds a surface from a quotes CSV with
+  `calibrate_surface` and writes it as JSON (status, reasons, slices in
+  exact round-trip text, canonical `params`, the report); `price` values a
+  requests CSV on that surface under sticky moneyness or sticky strike and
+  writes one response row per request (`ok` with price, total Greeks and
+  total variance, or `error` with a class and no number); `identity` prints
+  the protocol and the build commit. Its unit tests run with `cargo test`.
 - Surface calibration under `options::surface` (feature `options`, #96):
   quote cleaning with a reason for every rejected quote and a global error
   for future data (`clean_quotes`); implied total variance by safeguarded
