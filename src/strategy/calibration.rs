@@ -344,7 +344,9 @@ impl RiskAversionCalibrator {
         pnl_history: &[(u64, Decimal)],
         volatility: Decimal,
     ) -> MMResult<CalibrationResult<Decimal>> {
-        if inventory_history.len() < self.config.min_samples {
+        // Also guards `min_samples == 0`: the confidence interval divides
+        // by the sample count.
+        if inventory_history.len() < self.config.min_samples.max(1) {
             return Err(MMError::InvalidConfiguration(format!(
                 "Insufficient inventory samples: {} < {}",
                 inventory_history.len(),
@@ -1215,6 +1217,13 @@ impl Default for ParameterOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_calibrate_from_history_empty_with_zero_min_samples_returns_err() {
+        let calibrator = RiskAversionCalibrator::new(CalibrationConfig::new(0, dec!(0.95), false));
+        let result = calibrator.calibrate_from_history(&[], &[], dec!(0.2));
+        assert!(matches!(result, Err(MMError::InvalidConfiguration(_))));
+    }
     use crate::dec;
 
     // CalibrationConfig tests
