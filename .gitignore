@@ -30,3 +30,5 @@ src/.DS_Store
 
 # Issue templates (local only)
 .issues/
+# Python bytecode from scripts/
+__pycache__/

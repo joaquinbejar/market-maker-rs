@@ -13,7 +13,10 @@ use crate::Decimal;
 use crate::chain::risk::{ChainRiskLimits, ChainRiskManager};
 use crate::options::greeks::PortfolioGreeks;
 use crate::options::market_maker::{HedgeOrder, OptionsMarketMakerConfig};
-use crate::types::error::MMResult;
+use crate::options::pricing::{OptionInputs, OptionPricer, OptionValuation};
+use crate::types::error::{MMError, MMResult};
+use rust_decimal::RoundingStrategy;
+use rust_decimal::prelude::ToPrimitive;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -89,6 +92,11 @@ impl ChainMarketMakerConfig {
 }
 
 /// Quote update for a single option.
+///
+/// Every price is in the chain's raw price unit (the unit of the strikes and
+/// the underlying price of the [`ExpirationOrderBook`]); `theo` is the
+/// model value rounded once, half to even, to that unit, and `valuation`
+/// keeps the exact model value and Greeks per unit of underlying.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ChainQuoteUpdate {
@@ -104,15 +112,23 @@ pub struct ChainQuoteUpdate {
     pub bid_size: u64,
     /// Ask size.
     pub ask_size: u64,
-    /// Theoretical value.
+    /// Theoretical value, rounded to the price unit (positive).
     pub theo: u64,
-    /// Spread in basis points.
+    /// Spread in basis points of `theo`, rounded down.
     pub spread_bps: u64,
+    /// The model valuation the quote is built from.
+    pub valuation: OptionValuation,
 }
 
 impl ChainQuoteUpdate {
     /// Creates a new quote update.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidQuoteGeneration`] when `theo` is zero, the book is
+    /// crossed (`bid_price > ask_price`) or the spread in basis points
+    /// overflows.
+    #[allow(clippy::too_many_arguments)] // one field per quote attribute
     pub fn new(
         strike: u64,
         style: OptionStyle,
@@ -121,12 +137,27 @@ impl ChainQuoteUpdate {
         bid_size: u64,
         ask_size: u64,
         theo: u64,
-    ) -> Self {
-        let spread_bps = ((ask_price - bid_price) * 10000)
-            .checked_div(theo)
-            .unwrap_or(0);
-
-        Self {
+        valuation: OptionValuation,
+    ) -> MMResult<Self> {
+        if theo == 0 {
+            return Err(MMError::InvalidQuoteGeneration(format!(
+                "theoretical value of strike {strike} is zero"
+            )));
+        }
+        let spread = ask_price.checked_sub(bid_price).ok_or_else(|| {
+            MMError::InvalidQuoteGeneration(format!(
+                "crossed quote: bid {bid_price} above ask {ask_price}"
+            ))
+        })?;
+        let spread_bps = spread
+            .checked_mul(10_000)
+            .and_then(|x| x.checked_div(theo))
+            .ok_or_else(|| {
+                MMError::InvalidQuoteGeneration(format!(
+                    "spread {spread} in basis points of theo {theo} overflows"
+                ))
+            })?;
+        Ok(Self {
             strike,
             style,
             bid_price,
@@ -135,20 +166,147 @@ impl ChainQuoteUpdate {
             ask_size,
             theo,
             spread_bps,
-        }
+            valuation,
+        })
     }
 
-    /// Returns the mid price.
+    /// Returns the mid price, rounded down; computed without overflow.
     #[must_use]
     pub fn mid_price(&self) -> u64 {
-        (self.bid_price + self.ask_price) / 2
+        let (lo, hi) = if self.bid_price <= self.ask_price {
+            (self.bid_price, self.ask_price)
+        } else {
+            (self.ask_price, self.bid_price)
+        };
+        lo + (hi - lo) / 2
     }
 
-    /// Returns the spread.
+    /// Returns the spread, `ask - bid`, or `None` for a crossed quote.
     #[must_use]
-    pub fn spread(&self) -> u64 {
-        self.ask_price - self.bid_price
+    pub fn spread(&self) -> Option<u64> {
+        self.ask_price.checked_sub(self.bid_price)
     }
+}
+
+/// The outcome of one contract in a chain refresh.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum ChainQuoteOutcome {
+    /// A quote to publish.
+    Quote(ChainQuoteUpdate),
+    /// No quote for this contract: any quote resting from an earlier refresh
+    /// should be withdrawn by the caller.
+    NotQuoted {
+        /// Strike price.
+        strike: u64,
+        /// Option style (Call or Put).
+        style: OptionStyle,
+        /// Why the contract is not quoted (for example a theoretical value
+        /// below one price unit).
+        reason: MMError,
+    },
+}
+
+/// Valuation inputs shared by every contract of the chain's single
+/// expiration.
+///
+/// `tau_years` is the time from the valuation instant to the expiration of
+/// the [`ExpirationOrderBook`], in years of
+/// [`crate::options::pricing::PRICING_YEAR_DAYS`] days, supplied by the
+/// caller (there is no clock here). The pricer holds the surface and its
+/// dynamics; the rates live here only, so they are never duplicated.
+#[derive(Clone)]
+pub struct ChainPricing {
+    pricer: Arc<dyn OptionPricer>,
+    tau_years: Decimal,
+    rate: Decimal,
+    carry: Decimal,
+}
+
+impl std::fmt::Debug for ChainPricing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainPricing")
+            .field("tau_years", &self.tau_years)
+            .field("rate", &self.rate)
+            .field("carry", &self.carry)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChainPricing {
+    /// Shared valuation inputs for one expiration.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidTimestamp`] when `tau_years` is negative.
+    pub fn new(
+        pricer: Arc<dyn OptionPricer>,
+        tau_years: Decimal,
+        rate: Decimal,
+        carry: Decimal,
+    ) -> MMResult<Self> {
+        if tau_years < Decimal::ZERO {
+            return Err(MMError::InvalidTimestamp(format!(
+                "time to expiry must be non-negative, got {tau_years}"
+            )));
+        }
+        Ok(Self {
+            pricer,
+            tau_years,
+            rate,
+            carry,
+        })
+    }
+
+    /// Time to expiry in years.
+    #[must_use]
+    pub fn tau_years(&self) -> Decimal {
+        self.tau_years
+    }
+
+    /// Continuously compounded risk-free rate.
+    #[must_use]
+    pub fn rate(&self) -> Decimal {
+        self.rate
+    }
+
+    /// Continuously compounded carry.
+    #[must_use]
+    pub fn carry(&self) -> Decimal {
+        self.carry
+    }
+
+    fn inputs(&self, underlying: u64, strike: u64, style: OptionStyle) -> OptionInputs {
+        OptionInputs::european(
+            Decimal::from(underlying),
+            Decimal::from(strike),
+            self.tau_years,
+            self.rate,
+            self.carry,
+            style,
+        )
+    }
+}
+
+/// The model price rounded once, half to even, to the chain's price unit.
+fn theo_to_price_unit(strike: u64, valuation: &OptionValuation) -> MMResult<u64> {
+    let rounded = valuation
+        .price
+        .round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
+    let theo = rounded.to_u64().ok_or_else(|| {
+        MMError::InvalidQuoteGeneration(format!(
+            "theoretical value {} of strike {strike} is not a price unit count",
+            valuation.price
+        ))
+    })?;
+    if theo == 0 {
+        return Err(MMError::InvalidQuoteGeneration(format!(
+            "theoretical value {} of strike {strike} rounds to zero price units",
+            valuation.price
+        )));
+    }
+    Ok(theo)
 }
 
 /// Risk status for the chain.
@@ -279,22 +437,39 @@ impl ChainMarketMaker {
     /// * `strike` - Strike price
     /// * `spot_price` - Current underlying price
     /// * `is_atm` - Whether this is the ATM strike
-    #[must_use]
-    pub fn get_spread_multiplier(&self, strike: u64, spot_price: u64, is_atm: bool) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidMarketState`] for a zero spot price, and
+    /// [`MMError::NumericalError`] when the multiplier overflows.
+    pub fn get_spread_multiplier(
+        &self,
+        strike: u64,
+        spot_price: u64,
+        is_atm: bool,
+    ) -> MMResult<Decimal> {
         if is_atm {
-            self.config.atm_spread_multiplier
-        } else {
-            // Calculate moneyness
-            let moneyness = if spot_price > 0 {
-                Decimal::from(strike) / Decimal::from(spot_price)
-            } else {
-                dec!(1.0)
-            };
-
-            // Further OTM options get slightly wider spreads
-            let otm_factor = (moneyness - dec!(1.0)).abs();
-            self.config.otm_spread_multiplier + otm_factor * dec!(0.5)
+            return Ok(self.config.atm_spread_multiplier);
         }
+        if spot_price == 0 {
+            return Err(MMError::InvalidMarketState(
+                "spot price must be positive".to_string(),
+            ));
+        }
+        // Further OTM options get slightly wider spreads.
+        let overflow =
+            || MMError::NumericalError(format!("spread multiplier of strike {strike} overflows"));
+        let moneyness = Decimal::from(strike)
+            .checked_div(Decimal::from(spot_price))
+            .ok_or_else(overflow)?;
+        let otm_factor = moneyness
+            .checked_sub(Decimal::ONE)
+            .ok_or_else(overflow)?
+            .abs();
+        otm_factor
+            .checked_mul(dec!(0.5))
+            .and_then(|x| x.checked_add(self.config.otm_spread_multiplier))
+            .ok_or_else(overflow)
     }
 
     /// Calculates the quote size based on strike characteristics.
@@ -304,110 +479,150 @@ impl ChainMarketMaker {
     /// * `strike` - Strike price
     /// * `spot_price` - Current underlying price
     /// * `is_atm` - Whether this is the ATM strike
-    #[must_use]
-    pub fn calculate_quote_size(&self, _strike: u64, _spot_price: u64, is_atm: bool) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`] when the ATM size overflows.
+    pub fn calculate_quote_size(
+        &self,
+        _strike: u64,
+        _spot_price: u64,
+        is_atm: bool,
+    ) -> MMResult<u64> {
         if is_atm {
             // ATM options typically have more liquidity
-            self.config.base_quote_size * 2
+            self.config.base_quote_size.checked_mul(2).ok_or_else(|| {
+                MMError::NumericalError(format!(
+                    "ATM quote size {} x 2 overflows",
+                    self.config.base_quote_size
+                ))
+            })
         } else {
-            self.config.base_quote_size
+            Ok(self.config.base_quote_size)
         }
     }
 
-    /// Generates a quote for a single option.
+    /// Generates a quote for a single option from its valuation.
+    ///
+    /// The theoretical value is the model price rounded once, half to even,
+    /// to the chain's price unit; the half spread is
+    /// `theo * spread_bps / 20000` rounded down, clamped between the
+    /// configured minimum and maximum spreads.
     ///
     /// # Arguments
     ///
     /// * `strike` - Strike price
     /// * `style` - Option style (Call or Put)
     /// * `spot_price` - Current underlying price
-    /// * `theo_price` - Theoretical price
+    /// * `valuation` - The model valuation of the option
     /// * `is_atm` - Whether this is the ATM strike
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidQuoteGeneration`] when the theoretical value rounds
+    /// to zero or is not a price unit count, or the quote cannot be built;
+    /// [`MMError::NumericalError`] when the spread arithmetic overflows.
     pub fn generate_quote(
         &self,
         strike: u64,
         style: OptionStyle,
         spot_price: u64,
-        theo_price: u64,
+        valuation: OptionValuation,
         is_atm: bool,
-    ) -> ChainQuoteUpdate {
-        let spread_mult = self.get_spread_multiplier(strike, spot_price, is_atm);
-
-        // Calculate spread in basis points
-        let base_spread_bps = Decimal::from(self.config.base_spread_bps);
-        let adjusted_spread_bps = base_spread_bps * spread_mult;
-
-        // Clamp spread
-        let clamped_spread_bps = if adjusted_spread_bps < Decimal::from(self.config.min_spread_bps)
-        {
-            Decimal::from(self.config.min_spread_bps)
-        } else if adjusted_spread_bps > Decimal::from(self.config.max_spread_bps) {
-            Decimal::from(self.config.max_spread_bps)
+    ) -> MMResult<ChainQuoteUpdate> {
+        let theo_price = theo_to_price_unit(strike, &valuation)?;
+        let spread_mult = self.get_spread_multiplier(strike, spot_price, is_atm)?;
+        let overflow = || MMError::NumericalError(format!("spread of strike {strike} overflows"));
+        let adjusted_spread_bps = Decimal::from(self.config.base_spread_bps)
+            .checked_mul(spread_mult)
+            .ok_or_else(overflow)?;
+        let (min_bps, max_bps) = (
+            Decimal::from(self.config.min_spread_bps),
+            Decimal::from(self.config.max_spread_bps),
+        );
+        let clamped_spread_bps = if adjusted_spread_bps < min_bps {
+            min_bps
+        } else if adjusted_spread_bps > max_bps {
+            max_bps
         } else {
             adjusted_spread_bps
         };
-
-        // Calculate half spread
-        let half_spread = crate::types::decimal::decimal_to_u64_saturating(
-            Decimal::from(theo_price) * clamped_spread_bps / dec!(20000.0),
-        );
-
+        let half_spread = Decimal::from(theo_price)
+            .checked_mul(clamped_spread_bps)
+            .and_then(|x| x.checked_div(dec!(20000)))
+            .ok_or_else(overflow)?
+            .trunc()
+            .to_u64()
+            .ok_or_else(overflow)?;
         let bid_price = theo_price.saturating_sub(half_spread);
-        let ask_price = theo_price.saturating_add(half_spread);
-
-        let quote_size = self.calculate_quote_size(strike, spot_price, is_atm);
-
+        let ask_price = theo_price.checked_add(half_spread).ok_or_else(overflow)?;
+        let quote_size = self.calculate_quote_size(strike, spot_price, is_atm)?;
         ChainQuoteUpdate::new(
-            strike, style, bid_price, ask_price, quote_size, quote_size, theo_price,
+            strike, style, bid_price, ask_price, quote_size, quote_size, theo_price, valuation,
         )
     }
 
-    /// Refreshes all quotes based on current underlying price.
+    /// Refreshes all quotes of the chain from the model.
+    ///
+    /// Each contract is valued with `pricing`, then quoted. The result has
+    /// one outcome per contract (strike x call/put): a quote, or the reason
+    /// it is not quoted (for example a theoretical value below one price
+    /// unit, or a strike the surface does not cover); a failed contract
+    /// never gets a substitute value. A failure of what the contracts share
+    /// fails the whole refresh and nothing is returned to publish.
     ///
     /// # Arguments
     ///
-    /// * `underlying_price` - Current price of the underlying (in price units)
+    /// * `underlying_price` - Current price of the underlying, in the
+    ///   chain's price unit
+    /// * `pricing` - Valuation inputs for this expiration
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// A vector of quote updates for all strikes and styles.
-    pub fn refresh_all_quotes(&self, underlying_price: u64) -> MMResult<Vec<ChainQuoteUpdate>> {
+    /// [`MMError::InvalidMarketState`] for a zero underlying price, and the
+    /// error of the at-the-money valuation of the underlying price itself,
+    /// which every contract shares (rates, time to expiry, surface at the
+    /// money).
+    pub fn refresh_all_quotes(
+        &self,
+        underlying_price: u64,
+        pricing: &ChainPricing,
+    ) -> MMResult<Vec<ChainQuoteOutcome>> {
+        if underlying_price == 0 {
+            return Err(MMError::InvalidMarketState(
+                "underlying price must be positive".to_string(),
+            ));
+        }
+        // The shared inputs: an at-the-money valuation that fails would fail
+        // for every contract.
+        pricing.pricer.value(&pricing.inputs(
+            underlying_price,
+            underlying_price,
+            OptionStyle::Call,
+        ))?;
         let atm_strike = self.get_atm_strike(underlying_price).ok();
         let strikes = self.chain.strike_prices();
-        let mut updates = Vec::with_capacity(strikes.len() * 2);
-
+        let mut outcomes = Vec::with_capacity(strikes.len().saturating_mul(2));
         for strike in strikes {
             let is_atm = atm_strike == Some(strike);
-
-            // Generate quotes for both call and put
             for style in [OptionStyle::Call, OptionStyle::Put] {
-                // For now, use a simple theoretical price calculation
-                // In production, this would use the volatility surface
-                let theo_price = self.estimate_theo_price(strike, underlying_price, style);
-
-                let quote =
-                    self.generate_quote(strike, style, underlying_price, theo_price, is_atm);
-                updates.push(quote);
+                let quote = pricing
+                    .pricer
+                    .value(&pricing.inputs(underlying_price, strike, style))
+                    .and_then(|valuation| {
+                        self.generate_quote(strike, style, underlying_price, valuation, is_atm)
+                    });
+                outcomes.push(match quote {
+                    Ok(q) => ChainQuoteOutcome::Quote(q),
+                    Err(reason) => ChainQuoteOutcome::NotQuoted {
+                        strike,
+                        style,
+                        reason,
+                    },
+                });
             }
         }
-
-        Ok(updates)
-    }
-
-    /// Estimates theoretical price (simplified).
-    ///
-    /// In production, this would use the volatility surface and proper pricing.
-    fn estimate_theo_price(&self, strike: u64, spot: u64, style: OptionStyle) -> u64 {
-        let intrinsic = match style {
-            OptionStyle::Call => spot.saturating_sub(strike),
-            OptionStyle::Put => strike.saturating_sub(spot),
-        };
-
-        // Add some time value (simplified)
-        let time_value = spot / 50; // ~2% time value
-
-        intrinsic + time_value
+        Ok(outcomes)
     }
 
     /// Gets the aggregated Greeks for the entire chain.
@@ -508,16 +723,41 @@ mod tests {
         assert_eq!(atm, 50000); // Closest strike
     }
 
+    fn flat_pricing(sigma: Decimal, tau_years: Decimal) -> ChainPricing {
+        use crate::options::pricing::{Dynamics, SurfacePricer};
+        use crate::options::surface::FlatSurface;
+        let pricer = SurfacePricer::new(
+            Arc::new(FlatSurface::new(sigma).unwrap()),
+            Dynamics::StickyMoneyness,
+        )
+        .unwrap();
+        ChainPricing::new(Arc::new(pricer), tau_years, dec!(0.0), dec!(0.0)).unwrap()
+    }
+
+    fn valuation(price: Decimal) -> OptionValuation {
+        OptionValuation {
+            price,
+            delta: dec!(0.5),
+            gamma: dec!(0.0001),
+            vega: dec!(40),
+            theta: dec!(-20),
+        }
+    }
+
     #[test]
     fn test_get_spread_multiplier() {
         let chain = create_test_chain();
         let mm = ChainMarketMaker::with_defaults(chain);
 
         // ATM should have higher multiplier
-        let atm_mult = mm.get_spread_multiplier(50000, 50000, true);
-        let otm_mult = mm.get_spread_multiplier(55000, 50000, false);
+        let atm_mult = mm.get_spread_multiplier(50000, 50000, true).unwrap();
+        let otm_mult = mm.get_spread_multiplier(55000, 50000, false).unwrap();
 
         assert!(atm_mult > otm_mult);
+        assert!(matches!(
+            mm.get_spread_multiplier(55000, 0, false),
+            Err(MMError::InvalidMarketState(_))
+        ));
     }
 
     #[test]
@@ -525,28 +765,132 @@ mod tests {
         let chain = create_test_chain();
         let mm = ChainMarketMaker::with_defaults(chain);
 
-        let quote = mm.generate_quote(50000, OptionStyle::Call, 50000, 1000, true);
+        let quote = mm
+            .generate_quote(
+                50000,
+                OptionStyle::Call,
+                50000,
+                valuation(dec!(1000.4)),
+                true,
+            )
+            .unwrap();
 
         assert_eq!(quote.strike, 50000);
         assert_eq!(quote.style, OptionStyle::Call);
+        assert_eq!(quote.theo, 1000);
+        assert_eq!(quote.valuation, valuation(dec!(1000.4)));
         assert!(quote.bid_price < quote.ask_price);
         assert!(quote.bid_size > 0);
     }
 
     #[test]
+    fn test_generate_quote_theo_rounds_half_to_even_once() {
+        let mm = ChainMarketMaker::with_defaults(create_test_chain());
+        for (price, theo) in [
+            (dec!(1000.5), 1000),
+            (dec!(1001.5), 1002),
+            (dec!(0.5000001), 1),
+        ] {
+            let q = mm
+                .generate_quote(50000, OptionStyle::Put, 50000, valuation(price), false)
+                .unwrap();
+            assert_eq!(q.theo, theo, "{price}");
+        }
+    }
+
+    #[test]
+    fn test_generate_quote_theo_below_one_unit_is_an_error_not_a_quote() {
+        let mm = ChainMarketMaker::with_defaults(create_test_chain());
+        for price in [dec!(0.5), dec!(0.0001), dec!(0), dec!(-1)] {
+            assert!(
+                matches!(
+                    mm.generate_quote(50000, OptionStyle::Call, 50000, valuation(price), false),
+                    Err(MMError::InvalidQuoteGeneration(_))
+                ),
+                "{price}"
+            );
+        }
+    }
+
+    #[test]
     fn test_refresh_all_quotes() {
+        use crate::options::pricing::{Dynamics, value};
+        use crate::options::surface::FlatSurface;
         let chain = create_test_chain();
         let mm = ChainMarketMaker::with_defaults(chain);
+        let pricing = flat_pricing(dec!(0.6), dec!(30) / dec!(365));
 
-        let quotes = mm.refresh_all_quotes(50000).unwrap();
+        let outcomes = mm.refresh_all_quotes(50000, &pricing).unwrap();
 
-        // 3 strikes * 2 styles = 6 quotes
-        assert_eq!(quotes.len(), 6);
-
-        // Check all quotes have valid prices
-        for quote in &quotes {
+        // 3 strikes * 2 styles = 6 outcomes, all quoted.
+        assert_eq!(outcomes.len(), 6);
+        let surface = FlatSurface::new(dec!(0.6)).unwrap();
+        for outcome in &outcomes {
+            let ChainQuoteOutcome::Quote(quote) = outcome else {
+                panic!("not quoted: {outcome:?}");
+            };
             assert!(quote.bid_price < quote.ask_price);
+            // theo is the model price, rounded once.
+            let inputs = pricing.inputs(50000, quote.strike, quote.style);
+            let model = value(&inputs, &surface, Dynamics::StickyMoneyness).unwrap();
+            assert_eq!(model, quote.valuation);
+            assert_eq!(
+                Decimal::from(quote.theo),
+                model
+                    .price
+                    .round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven)
+            );
         }
+    }
+
+    #[test]
+    fn test_refresh_all_quotes_one_failed_contract_does_not_stop_the_others() {
+        let exp = ExpirationDate::Days(pos_or_panic!(30.0));
+        let chain = ExpirationOrderBook::new("BTC", exp);
+        chain.get_or_create_strike(50000);
+        // Far out of the money: the call is worth less than one price unit.
+        chain.get_or_create_strike(500_000);
+        let mm = ChainMarketMaker::with_defaults(Arc::new(chain));
+        let pricing = flat_pricing(dec!(0.6), dec!(30) / dec!(365));
+
+        let outcomes = mm.refresh_all_quotes(50000, &pricing).unwrap();
+
+        assert_eq!(outcomes.len(), 4);
+        let mut not_quoted = Vec::new();
+        for outcome in &outcomes {
+            match outcome {
+                ChainQuoteOutcome::Quote(q) => assert!(q.theo > 0),
+                ChainQuoteOutcome::NotQuoted {
+                    strike,
+                    style,
+                    reason,
+                } => {
+                    assert!(matches!(reason, MMError::InvalidQuoteGeneration(_)));
+                    not_quoted.push((*strike, *style));
+                }
+            }
+        }
+        assert_eq!(not_quoted, vec![(500_000, OptionStyle::Call)]);
+    }
+
+    #[test]
+    fn test_refresh_all_quotes_shared_failure_fails_the_whole_refresh() {
+        use crate::options::pricing::OptionInputs;
+        struct Failing;
+        impl OptionPricer for Failing {
+            fn value(&self, _: &OptionInputs) -> MMResult<OptionValuation> {
+                Err(MMError::NumericalError("surface unavailable".to_string()))
+            }
+        }
+        let mm = ChainMarketMaker::with_defaults(create_test_chain());
+        let failing = ChainPricing::new(Arc::new(Failing), dec!(0.1), dec!(0), dec!(0)).unwrap();
+        assert!(mm.refresh_all_quotes(50000, &failing).is_err());
+        let pricing = flat_pricing(dec!(0.6), dec!(0.1));
+        assert!(matches!(
+            mm.refresh_all_quotes(0, &pricing),
+            Err(MMError::InvalidMarketState(_))
+        ));
+        assert!(ChainPricing::new(Arc::new(Failing), dec!(-0.1), dec!(0), dec!(0)).is_err());
     }
 
     #[test]
@@ -569,10 +913,60 @@ mod tests {
 
     #[test]
     fn test_chain_quote_update() {
-        let quote = ChainQuoteUpdate::new(50000, OptionStyle::Call, 980, 1020, 10, 10, 1000);
+        let quote = ChainQuoteUpdate::new(
+            50000,
+            OptionStyle::Call,
+            980,
+            1020,
+            10,
+            10,
+            1000,
+            valuation(dec!(1000)),
+        )
+        .unwrap();
 
         assert_eq!(quote.mid_price(), 1000);
-        assert_eq!(quote.spread(), 40);
+        assert_eq!(quote.spread(), Some(40));
         assert_eq!(quote.spread_bps, 400); // 4%
+    }
+
+    #[test]
+    fn test_chain_quote_update_invalid_quotes_are_errors() {
+        let v = valuation(dec!(1000));
+        let new =
+            |bid, ask, theo| ChainQuoteUpdate::new(1, OptionStyle::Call, bid, ask, 1, 1, theo, v);
+        assert!(matches!(
+            new(1020, 980, 1000),
+            Err(MMError::InvalidQuoteGeneration(_))
+        ));
+        assert!(matches!(
+            new(980, 1020, 0),
+            Err(MMError::InvalidQuoteGeneration(_))
+        ));
+        assert!(matches!(
+            new(0, u64::MAX, 1),
+            Err(MMError::InvalidQuoteGeneration(_))
+        ));
+    }
+
+    #[test]
+    fn test_chain_quote_update_mid_price_does_not_overflow() {
+        let mut quote = ChainQuoteUpdate::new(
+            1,
+            OptionStyle::Put,
+            980,
+            1020,
+            1,
+            1,
+            1000,
+            valuation(dec!(1000)),
+        )
+        .unwrap();
+        quote.bid_price = u64::MAX - 2;
+        quote.ask_price = u64::MAX;
+        assert_eq!(quote.mid_price(), u64::MAX - 1);
+        quote.bid_price = u64::MAX;
+        quote.ask_price = 0;
+        assert_eq!(quote.spread(), None);
     }
 }

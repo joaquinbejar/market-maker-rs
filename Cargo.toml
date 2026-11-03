@@ -101,3 +101,8 @@ required-features = ["events"]
 [[bench]]
 name = "quote_generation"
 harness = false
+
+[[bench]]
+name = "option_pricing"
+harness = false
+required-features = ["chain"]

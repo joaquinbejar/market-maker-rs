@@ -8,6 +8,17 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `options::pricing` (feature `options`): European option valuation on a
+  `VolSurface`, `value(&OptionInputs, &dyn VolSurface, Dynamics)` with
+  `Dynamics::{StickyMoneyness, StickyStrike { s_ref }}`, returning an
+  `OptionValuation` (price, total delta and gamma, vega per 1.00 of a
+  parallel implied volatility shift, theta per calendar year), the payoff
+  exactly at expiry, `OptionPricer` and `SurfacePricer`, `PRICING_YEAR_DAYS`
+  (365) and `tau_from_days`, and `black_undiscounted` / `black_w` for
+  implied volatility extraction. The normal distribution is a port of
+  fdlibm's `erfc` (#95).
+- `options::adapter::ADAPTER_MS_PER_YEAR`: the 365.25-day year of the
+  adapter's ms helpers, now named; their results are unchanged (#95).
 - `options::surface` (feature `options`): the `VolSurface` trait (total
   implied variance `w(k, tau)` and its derivatives at a log forward
   moneyness and a time to expiry), the validated `TotalVariance` value,
@@ -56,6 +67,24 @@ project follows [Semantic Versioning](https://semver.org/).
   calculate_dynamic_gamma}`. The prelude exports `GlftQuotes` instead of
   `PenaltyFunction`. With `serde`, `GLFTConfig` denies unknown fields.
 
+- Chain quotes come from the option pricer instead of a placeholder
+  (intrinsic value plus `spot / 50`, which ignored volatility and expiry):
+  `ChainMarketMaker::refresh_all_quotes(underlying_price, &ChainPricing)`
+  returns one `ChainQuoteOutcome` per contract, `Quote(ChainQuoteUpdate)`
+  or `NotQuoted { strike, style, reason }` (for example a theoretical value
+  below one price unit), and fails as a whole only when the shared inputs
+  do. `ChainPricing` carries the pricer, the time to expiry and the rates of
+  the chain's expiration. `generate_quote` takes the `OptionValuation`
+  (its theo is the model price rounded half to even to the price unit) and
+  returns `MMResult`; `ChainQuoteUpdate` has a `valuation` field and
+  `ChainQuoteUpdate::new` takes it and returns `MMResult` (zero theo, a
+  crossed quote or an overflowing spread are errors);
+  `ChainQuoteUpdate::spread` returns `Option<u64>` (`None` when crossed);
+  `get_spread_multiplier` and `calculate_quote_size` return `MMResult`. The
+  quote path uses checked arithmetic (#95).
+- `MMError::UnsupportedContract { reason }`: a contract the model cannot
+  value (for example a non-European option given to the
+  Black-Scholes-Merton pricer) (#95).
 - No panics in library code (#135). New `MMError::LockPoisoned`; these now
   return `MMResult` instead of panicking on a poisoned lock:
   `ThreadSafeOrderManager::{read, write, get_stats, open_order_count,

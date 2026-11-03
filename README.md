@@ -342,7 +342,8 @@ if risk_manager.needs_hedge() {
 #### Option Chain Market Making (Feature: `chain`)
 
 ```rust
-use market_maker_rs::chain::{ChainMarketMaker, ChainMarketMakerConfig};
+use market_maker_rs::chain::{ChainMarketMaker, ChainMarketMakerConfig, ChainPricing, ChainQuoteOutcome};
+use market_maker_rs::options::{Dynamics, FlatSurface, SurfacePricer, tau_from_days};
 use option_chain_orderbook::orderbook::ExpirationOrderBook;
 use std::sync::Arc;
 
@@ -351,8 +352,18 @@ let chain = Arc::new(ExpirationOrderBook::new("BTC", expiration));
 let config = ChainMarketMakerConfig::default();
 let mm = ChainMarketMaker::new(chain, config);
 
-// Refresh all quotes across the chain
-let quotes = mm.refresh_all_quotes(underlying_price).unwrap();
+// Valuation inputs for this expiration (surface, dynamics, rates, tau)
+let pricer = SurfacePricer::new(Arc::new(FlatSurface::new(dec!(0.6))?), Dynamics::StickyMoneyness)?;
+let pricing = ChainPricing::new(Arc::new(pricer), tau_from_days(dec!(30))?, dec!(0), dec!(0))?;
+
+// Refresh all quotes across the chain: one outcome per contract
+for outcome in mm.refresh_all_quotes(underlying_price, &pricing)? {
+    match outcome {
+        ChainQuoteOutcome::Quote(quote) => { /* publish */ }
+        ChainQuoteOutcome::NotQuoted { reason, .. } => { /* withdraw any resting quote */ }
+        _ => {}
+    }
+}
 
 // Check chain risk status
 let status = mm.check_chain_risk();

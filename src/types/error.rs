@@ -87,6 +87,18 @@ pub enum MMError {
     /// lock, so the protected state may be inconsistent.
     #[error("lock poisoned: {0}")]
     LockPoisoned(String) = 8,
+
+    /// The contract cannot be valued by the model asked for.
+    ///
+    /// This error occurs when an option has an exercise style or a payoff
+    /// the pricer does not support (for example an American or an exotic
+    /// option given to the European Black-Scholes-Merton pricer). It is
+    /// never replaced by an approximate value.
+    #[error("unsupported contract: {reason}")]
+    UnsupportedContract {
+        /// Why the contract is not supported.
+        reason: String,
+    } = 9,
 }
 
 impl MMError {
@@ -126,6 +138,7 @@ impl MMError {
             | Self::InvalidTimestamp(msg)
             | Self::ConnectionError(msg)
             | Self::LockPoisoned(msg) => msg,
+            Self::UnsupportedContract { reason } => reason,
             Self::UnsupportedAction { .. } => "only buy and sell are supported",
         }
     }
