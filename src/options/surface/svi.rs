@@ -33,8 +33,10 @@
 //!   the first slice at each `k`, marked [`Region::Extrapolated`].
 //! - In `k`, each slice follows its own SVI wings, which tend to straight
 //!   lines of slope at most 2 (Lee) as `|k|` grows; they are not exactly
-//!   linear pieces. A query outside a slice's declared calibrated range is
-//!   [`Region::Extrapolated`].
+//!   linear pieces. A query is [`Region::Calibrated`] only when `k` is inside
+//!   the declared calibrated range of every slice that enters the result:
+//!   both slices of the segment, also on a node, because `dw/dtau` reads
+//!   both.
 //!
 //! # Numbers
 //!
@@ -44,13 +46,16 @@
 //! within the stated tolerances; bit identity across architectures is not
 //! promised.
 
+use super::diagnostics::DiagnosticGrid;
 use super::{TotalVariance, VolSurface, check_point};
 use crate::types::error::{MMError, MMResult};
 
 /// Lee's bound on the asymptotic slope of `w(k)`: `b (1 + |rho|) <= 2`.
 pub const LEE_SLOPE_BOUND: f64 = 2.0;
 
-/// Relative tolerance for matching `tau` to a slice node.
+/// Relative tolerance for matching `tau` to a slice node, relative to that
+/// node's own `tau` and never more than a quarter of the distance to a
+/// neighbouring node.
 const NODE_TOLERANCE: f64 = 1e-12;
 
 /// A declared range of `k`, for example the calibrated range of a slice.
@@ -241,12 +246,40 @@ impl SviSlice {
         let x = k - self.m;
         // sqrt(x^2 + sigma^2) without overflow for a large |x|.
         let r = x.hypot(self.sigma);
-        let w = self.a + self.b * (self.rho * x + r);
-        let w_k = self.b * (self.rho + x / r);
-        let w_kk = self.b * self.sigma * self.sigma / (r * r * r);
+        let u = x / r;
+        let v = self.sigma / r;
+        // 1 - rho^2 without cancellation near |rho| = 1.
+        let one_minus_rho2 = (1.0 - self.rho) * (1.0 + self.rho);
+        // rho x + r and rho + x / r lose every digit in the wing where rho
+        // and x have opposite signs and |rho| is near 1 (with rho = -1 and
+        // x > 0, w tends to a). There they are rationalised with
+        // 1 - u^2 = v^2:
+        //   rho x + r = (x u (1 - rho^2) + sigma v) / (1 - rho u),
+        //   rho + u   = (v^2 - (1 - rho^2)) / (rho - u),
+        // whose denominators add magnitudes.
+        let (level, slope) = if self.rho * x < 0.0 {
+            (
+                (x * u * one_minus_rho2 + self.sigma * v) / (1.0 - self.rho * u),
+                (v * v - one_minus_rho2) / (self.rho - u),
+            )
+        } else {
+            (self.rho * x + r, self.rho + u)
+        };
+        let w = self.a + self.b * level;
+        let w_k = self.b * slope;
+        // b sigma^2 / r^3 as (b / r) (sigma / r)^2: sigma / r <= 1, so no
+        // intermediate overflows where the result is representable.
+        let w_kk = (self.b / r) * v * v;
         if !(w.is_finite() && w_k.is_finite() && w_kk.is_finite()) {
             return Err(MMError::NumericalError(format!(
                 "svi slice at k {k} is not finite: w {w}, w_k {w_k}, w_kk {w_kk}"
+            )));
+        }
+        // With b > 0 the curvature is strictly positive; a zero is an
+        // underflow, never a value.
+        if self.b > 0.0 && w_kk <= 0.0 {
+            return Err(MMError::NumericalError(format!(
+                "svi slice curvature at k {k} underflows to {w_kk}"
             )));
         }
         Ok((w, w_k, w_kk))
@@ -282,8 +315,8 @@ pub enum ShortExpiryPolicy {
 /// Whether a point is backed by calibrated data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Region {
-    /// Inside the calibrated `k` range of every slice used, and inside the
-    /// expiry range.
+    /// Inside the calibrated `k` range of both slices of the segment (which
+    /// `dw/dtau` reads, also on a node), and inside the expiry range.
     Calibrated,
     /// Outside a slice's calibrated `k` range, or below the first expiry
     /// under [`ShortExpiryPolicy::ConstantVol`].
@@ -361,6 +394,37 @@ impl SviSurface {
         format!("svi/1;short_expiry={policy};slices=[{}]", slices.join("|"))
     }
 
+    /// A diagnostic grid on `k` whose `tau` axis holds every node of this
+    /// surface, the midpoint of every segment, and `extra_tau`. On a surface
+    /// linear in `w` between nodes, the calendar checks at the nodes cover
+    /// every segment, so a grid from here sees a decreasing segment that a
+    /// grid without its nodes can miss; the midpoints add a butterfly check
+    /// inside each segment. Use it whenever the report decides whether the
+    /// surface may be used.
+    ///
+    /// # Errors
+    ///
+    /// As [`DiagnosticGrid::new`].
+    pub fn node_grid(&self, k: Vec<f64>, extra_tau: &[f64]) -> MMResult<DiagnosticGrid> {
+        let mut tau: Vec<f64> = self.slices.iter().map(|s| s.tau).collect();
+        tau.extend(self.slices.windows(2).filter_map(|p| match p {
+            [lo, hi] => Some(0.5 * (lo.tau + hi.tau)),
+            _ => None,
+        }));
+        tau.extend_from_slice(extra_tau);
+        tau.sort_by(f64::total_cmp);
+        tau.dedup();
+        DiagnosticGrid::new(k, tau)
+    }
+
+    /// Whether `grid` holds every node of this surface on its `tau` axis.
+    #[must_use]
+    pub fn covers_nodes(&self, grid: &DiagnosticGrid) -> bool {
+        self.slices
+            .iter()
+            .all(|s| grid.tau().iter().any(|t| t.to_bits() == s.tau.to_bits()))
+    }
+
     /// Whether `(k, tau)` is backed by calibrated data.
     ///
     /// # Errors
@@ -369,17 +433,28 @@ impl SviSurface {
     pub fn region(&self, k: f64, tau: f64) -> MMResult<Region> {
         let calibrated = match self.bracket(k, tau)? {
             Bracket::Short(_) => false,
-            Bracket::Segment { lo, hi, x } => {
-                let lo_ok = x >= 1.0 || lo.k_range.contains(k);
-                let hi_ok = x <= 0.0 || hi.k_range.contains(k);
-                lo_ok && hi_ok
-            }
+            // w_tau reads both slices of the segment, even on a node.
+            Bracket::Segment { lo, hi, .. } => lo.k_range.contains(k) && hi.k_range.contains(k),
         };
         Ok(if calibrated {
             Region::Calibrated
         } else {
             Region::Extrapolated
         })
+    }
+
+    /// The matching tolerance of node `i`: [`NODE_TOLERANCE`] relative to its
+    /// `tau`, capped at a quarter of the gap to each neighbour.
+    fn node_tolerance(&self, i: usize) -> Option<f64> {
+        let tau = self.slices.get(i)?.tau;
+        let mut tol = NODE_TOLERANCE * tau;
+        if let Some(prev) = i.checked_sub(1).and_then(|j| self.slices.get(j)) {
+            tol = tol.min(0.25 * (tau - prev.tau));
+        }
+        if let Some(next) = i.checked_add(1).and_then(|j| self.slices.get(j)) {
+            tol = tol.min(0.25 * (next.tau - tau));
+        }
+        Some(tol)
     }
 
     fn bracket(&self, k: f64, tau: f64) -> MMResult<Bracket<'_>> {
@@ -389,45 +464,55 @@ impl SviSurface {
                 "svi surface without slices".to_string(),
             ));
         };
-        let tol = NODE_TOLERANCE * last.tau;
-        if tau > last.tau + tol {
-            return Err(MMError::InvalidMarketState(format!(
-                "tau {tau} is beyond the last expiry {}: no extrapolation",
-                last.tau
-            )));
-        }
-        if tau < first.tau - tol {
-            return match self.short_expiry {
-                ShortExpiryPolicy::Reject => Err(MMError::InvalidMarketState(format!(
-                    "tau {tau} is below the first expiry {}",
-                    first.tau
-                ))),
-                ShortExpiryPolicy::ConstantVol => Ok(Bracket::Short(first)),
-            };
-        }
-        // The first slice at or beyond tau (within the tolerance).
-        let j = self
-            .slices
-            .iter()
-            .position(|s| s.tau >= tau - tol)
-            .unwrap_or(self.slices.len().saturating_sub(1));
-        let node = self
-            .slices
-            .get(j)
-            .is_some_and(|s| (s.tau - tau).abs() <= tol);
-        let (i_lo, i_hi) = if j == 0 { (0, 1) } else { (j - 1, j) };
+        // A node matches within a tolerance local to it.
+        let node = (0..self.slices.len()).find(|&i| {
+            self.node_tolerance(i).is_some_and(|tol| {
+                self.slices
+                    .get(i)
+                    .is_some_and(|s| (s.tau - tau).abs() <= tol)
+            })
+        });
+        let (i_lo, i_hi, x) = match node {
+            // On a node: the value is the node's; the segment is towards
+            // shorter expiries (or the only one, on the first node).
+            Some(0) => (0, 1, Some(0.0)),
+            Some(j) => (j.saturating_sub(1), j, Some(1.0)),
+            None if tau < first.tau => {
+                return match self.short_expiry {
+                    ShortExpiryPolicy::Reject => Err(MMError::InvalidMarketState(format!(
+                        "tau {tau} is below the first expiry {}",
+                        first.tau
+                    ))),
+                    ShortExpiryPolicy::ConstantVol => Ok(Bracket::Short(first)),
+                };
+            }
+            None if tau > last.tau => {
+                return Err(MMError::InvalidMarketState(format!(
+                    "tau {tau} is beyond the last expiry {}: no extrapolation",
+                    last.tau
+                )));
+            }
+            None => {
+                // Strictly inside a segment: the first slice beyond tau.
+                let j = self
+                    .slices
+                    .iter()
+                    .position(|s| s.tau > tau)
+                    .ok_or_else(|| {
+                        MMError::InvalidConfiguration(
+                            "svi surface bracket out of range".to_string(),
+                        )
+                    })?;
+                // j >= 1: tau is above the first node and matches none.
+                (j.saturating_sub(1), j, None)
+            }
+        };
         let (Some(lo), Some(hi)) = (self.slices.get(i_lo), self.slices.get(i_hi)) else {
             return Err(MMError::InvalidConfiguration(
                 "svi surface bracket out of range".to_string(),
             ));
         };
-        let x = if node {
-            // On a node: the value is the node's; the segment is towards
-            // shorter expiries (or the only one, on the first node).
-            if j == 0 { 0.0 } else { 1.0 }
-        } else {
-            (tau - lo.tau) / (hi.tau - lo.tau)
-        };
+        let x = x.unwrap_or((tau - lo.tau) / (hi.tau - lo.tau));
         Ok(Bracket::Segment { lo, hi, x })
     }
 }
@@ -513,6 +598,111 @@ mod tests {
                 "w_kk at {k}"
             );
         }
+    }
+
+    #[test]
+    fn test_svi_slice_curvature_with_huge_sigma_is_not_zero() {
+        // b sigma^2 / r^3 at k = m is b / sigma; r^3 alone would overflow.
+        let s = SviSlice::new(1.0, 1.0, 1.0, 0.0, 0.0, 1e103, range()).unwrap();
+        let (_, _, w_kk) = s.eval(0.0).unwrap();
+        assert!((w_kk / 1e-103 - 1.0).abs() < 1e-12, "w_kk {w_kk}");
+    }
+
+    #[test]
+    fn test_svi_slice_curvature_underflow_returns_err() {
+        let s = SviSlice::new(1.0, 1.0, 1e-300, 0.0, 0.0, 1e-10, range()).unwrap();
+        assert!(s.eval(1e10).is_err());
+    }
+
+    #[test]
+    fn test_svi_slice_flat_wing_at_rho_minus_one_keeps_precision() {
+        // w = a + b sigma^2 / (r + x) at k = 1: 1e-20 + 0.1 * 1e-16 / 2.
+        let s = SviSlice::new(1.0, 1e-20, 0.1, -1.0, 0.0, 1e-8, range()).unwrap();
+        let (w, w_k, _) = s.eval(1.0).unwrap();
+        let r = 1.0_f64.hypot(1e-8);
+        let expected = 1e-20 + 0.1 * 1e-16 / (r + 1.0);
+        assert!(
+            (w / expected - 1.0).abs() < 1e-12,
+            "w {w}, expected {expected}"
+        );
+        // w_k = b (rho + x / r) = -b sigma^2 / (r (r + x)).
+        let expected_k = -0.1 * 1e-16 / (r * (r + 1.0));
+        assert!(
+            (w_k / expected_k - 1.0).abs() < 1e-12,
+            "w_k {w_k}, expected {expected_k}"
+        );
+        // The mirror wing with rho = +1 and x < 0.
+        let m = SviSlice::new(1.0, 1e-20, 0.1, 1.0, 0.0, 1e-8, range()).unwrap();
+        let (w_m, w_mk, _) = m.eval(-1.0).unwrap();
+        assert!((w_m / expected - 1.0).abs() < 1e-12);
+        assert!((w_mk / -expected_k - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_svi_slice_wing_near_rho_minus_one_matches_independent_form() {
+        // rho close to -1, x > 0: rho x + r = (r - |x|) + (1 - |rho|)|x|,
+        // with r - |x| = sigma (sigma / r) / (1 + |x| / r); and
+        // rho + x / r = -((sigma / r)^2 / (1 + |x| / r) - (1 - |rho|)).
+        let (rho, sigma, b, a) = (-1.0 + 1e-10, 1e-8, 0.1, 1e-20);
+        let s = SviSlice::new(1.0, a, b, rho, 0.0, sigma, range()).unwrap();
+        for x in [1.0_f64, 0.01, 30.0] {
+            let (w, w_k, _) = s.eval(x).unwrap();
+            let r = x.hypot(sigma);
+            let (u, v) = (x / r, sigma / r);
+            let level = sigma * v / (1.0 + u) + (1.0 - rho.abs()) * x;
+            let slope = -(v * v / (1.0 + u) - (1.0 - rho.abs()));
+            assert!(((w - a) / (b * level) - 1.0).abs() < 1e-12, "w at {x}");
+            assert!((w_k / (b * slope) - 1.0).abs() < 1e-12, "w_k at {x}");
+        }
+    }
+
+    #[test]
+    fn test_svi_slice_rationalised_and_direct_forms_agree_away_from_the_wing() {
+        let s = SviSlice::new(0.5, 0.02, 0.1, -0.5, 0.0, 0.2, range()).unwrap();
+        for k in [0.05, 0.3, 1.0, 3.0] {
+            let (w, w_k, _) = s.eval(k).unwrap();
+            let x = k;
+            let r = x.hypot(0.2);
+            assert!((w - (0.02 + 0.1 * (-0.5 * x + r))).abs() < 1e-15);
+            assert!((w_k - 0.1 * (-0.5 + x / r)).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn test_svi_surface_region_on_a_node_reads_both_slices() {
+        let narrow = KRange::new(-0.1, 0.1).unwrap();
+        let wide = KRange::new(-0.5, 0.5).unwrap();
+        let s1 = SviSlice::new(0.25, 0.01, 0.1, -0.5, 0.0, 0.2, narrow).unwrap();
+        let s2 = SviSlice::new(0.5, 0.02, 0.1, -0.5, 0.0, 0.2, wide).unwrap();
+        let surface = SviSurface::new(vec![s1, s2], ShortExpiryPolicy::Reject).unwrap();
+        // On the second node w is s2's alone, but w_tau reads s1 too.
+        assert_eq!(surface.region(0.3, 0.5).unwrap(), Region::Extrapolated);
+        assert_eq!(surface.region(0.05, 0.5).unwrap(), Region::Calibrated);
+    }
+
+    #[test]
+    fn test_svi_surface_node_grid_holds_every_node() {
+        let s = surface(ShortExpiryPolicy::Reject);
+        let grid = s
+            .node_grid(vec![-0.5, 0.0, 0.5], &[0.75, 0.5, 0.9])
+            .unwrap();
+        // Nodes, segment midpoints and the extra expiries, once each.
+        assert_eq!(grid.tau(), &[0.25, 0.375, 0.5, 0.75, 0.9, 1.0]);
+        assert!(s.covers_nodes(&grid));
+        let partial = DiagnosticGrid::new(vec![0.0], vec![0.25, 1.0]).unwrap();
+        assert!(!s.covers_nodes(&partial));
+    }
+
+    #[test]
+    fn test_svi_surface_node_tolerance_is_local() {
+        let s = |tau| SviSlice::new(tau, 0.01, 0.0, 0.0, 0.0, 0.2, range()).unwrap();
+        let surface = SviSurface::new(vec![s(1e-6), s(1e8)], ShortExpiryPolicy::Reject).unwrap();
+        // Far below the first node: not that node.
+        assert!(surface.total_variance(0.0, 1e-9).is_err());
+        // Within the first node's own tolerance: the node.
+        assert!(surface.total_variance(0.0, 1e-6 * (1.0 - 1e-14)).is_ok());
+        assert!(surface.total_variance(0.0, 1e8 * (1.0 + 1e-14)).is_ok());
+        assert!(surface.total_variance(0.0, 1e8 * (1.0 + 1e-9)).is_err());
     }
 
     #[test]

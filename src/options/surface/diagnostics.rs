@@ -195,13 +195,18 @@ fn butterfly_g(k: f64, w: f64, w_k: f64, w_kk: f64) -> f64 {
 
 /// Runs the checks of the [module docs](self) on `surface` over `grid`.
 ///
-/// A point the surface cannot evaluate is recorded as a failure, not
-/// skipped; the gap checks next to it are not computed.
+/// A point the surface cannot evaluate, or where `g` is not finite, is
+/// recorded as a failure, not skipped; the gap checks next to it are not
+/// computed.
+///
+/// The calendar checks run at the grid's expiries only. For a surface that
+/// is piecewise in `tau`, use a grid holding every node (for an
+/// [`SviSurface`](super::SviSurface), `node_grid`): the checks at the nodes
+/// then cover every segment.
 ///
 /// # Errors
 ///
-/// [`MMError::InvalidConfiguration`] for invalid tolerances, and
-/// [`MMError::NumericalError`] if a checked value is not finite.
+/// [`MMError::InvalidConfiguration`] for invalid tolerances.
 pub fn diagnose(
     surface: &impl VolSurface,
     grid: &DiagnosticGrid,
@@ -219,9 +224,13 @@ pub fn diagnose(
                 Ok(tv) => {
                     let g = butterfly_g(k, tv.w(), tv.w_k(), tv.w_kk());
                     if !g.is_finite() {
-                        return Err(MMError::NumericalError(format!(
-                            "butterfly g is not finite at k {k}, tau {tau}"
-                        )));
+                        evaluation_failures.push((
+                            k,
+                            tau,
+                            format!("butterfly g is not finite: {g}"),
+                        ));
+                        previous = None;
+                        continue;
                     }
                     butterfly.record(
                         DiagnosticPoint { k, tau, value: g },
@@ -326,6 +335,30 @@ mod tests {
         assert!(!report.calendar_slope.is_clean());
         assert!(!report.calendar_gap.is_clean());
         assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn test_diagnose_inner_decreasing_segment_needs_the_nodes() {
+        // 0.2 -> 0.3 decreases; a grid without those nodes cannot see it.
+        let range = KRange::new(-1.0, 1.0).unwrap();
+        let s = |tau, a| SviSlice::new(tau, a, 0.1, -0.5, 0.0, 0.2, range).unwrap();
+        let surface = SviSurface::new(
+            vec![s(0.1, 0.01), s(0.2, 0.03), s(0.3, 0.02), s(0.4, 0.05)],
+            ShortExpiryPolicy::Reject,
+        )
+        .unwrap();
+        let k = vec![-0.5, 0.0, 0.5];
+        let ends = DiagnosticGrid::new(k.clone(), vec![0.1, 0.4]).unwrap();
+        assert!(!surface.covers_nodes(&ends));
+        let blind = diagnose(&surface, &ends, DiagnosticsConfig::default()).unwrap();
+        assert!(
+            blind.is_clean(),
+            "a grid without the nodes describes only itself"
+        );
+        let nodes = surface.node_grid(k, &[]).unwrap();
+        let report = diagnose(&surface, &nodes, DiagnosticsConfig::default()).unwrap();
+        assert!(!report.calendar_slope.is_clean());
+        assert!(!report.calendar_gap.is_clean());
     }
 
     #[test]

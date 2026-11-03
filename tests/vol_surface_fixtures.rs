@@ -50,12 +50,9 @@ fn grid() -> DiagnosticGrid {
 
 #[test]
 fn test_known_surface_diagnostics_are_clean_including_wings_and_short_expiry() {
-    let report = diagnose(
-        &known_surface(ShortExpiryPolicy::Reject),
-        &grid(),
-        DiagnosticsConfig::default(),
-    )
-    .unwrap();
+    let surface = known_surface(ShortExpiryPolicy::Reject);
+    assert!(surface.covers_nodes(&grid()));
+    let report = diagnose(&surface, &grid(), DiagnosticsConfig::default()).unwrap();
     assert!(report.is_clean(), "{report:?}");
     assert_eq!(report.butterfly.points, 121 * 17);
     // Margins, not just signs: the fixture is well inside the conditions.
