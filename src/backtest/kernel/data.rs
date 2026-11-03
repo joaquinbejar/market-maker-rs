@@ -87,7 +87,8 @@ impl KernelDataset {
     ///
     /// Returns [`MMError::InvalidConfiguration`] if the grid of `cfg` is
     /// invalid, and [`MMError::InvalidMarketState`] for an off-grid price
-    /// or size, a non-positive price, `bid >= ask`, a price above
+    /// or size, a price or size written at a scale above the tick or lot
+    /// scale (trailing zeros), a non-positive price, `bid >= ask`, a price above
     /// `max_price`, a decreasing timestamp, or a timestamp whose events
     /// could overflow `u64` nanoseconds.
     pub fn from_ticks(ticks: &[MarketTick], cfg: &KernelConfig) -> MMResult<Self> {
@@ -98,14 +99,20 @@ impl KernelDataset {
                 data_error(row, format!("timestamp {} ms overflows ns", t.timestamp))
             })?;
             let price = |value: Decimal, what: &str| {
-                tick.count(value)
+                // A raw scale above the grid scale would raise the engine's
+                // mantissas above the bound; it is rejected.
+                (value.scale() <= tick.scale)
+                    .then(|| tick.count(value))
+                    .flatten()
                     .and_then(|v| u64::try_from(v).ok())
                     .ok_or_else(|| {
                         data_error(row, format!("{what} {value} is not on the tick grid"))
                     })
             };
             let size = |value: Decimal, what: &str| {
-                lot.count(value)
+                (value.scale() <= lot.scale)
+                    .then(|| lot.count(value))
+                    .flatten()
                     .and_then(|v| u64::try_from(v).ok())
                     .ok_or_else(|| {
                         data_error(row, format!("{what} {value} is not on the lot grid"))

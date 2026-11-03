@@ -356,6 +356,21 @@ pub(super) fn validate(cfg: &KernelConfig, relax: Relax) -> MMResult<ValidatedCo
     })?;
     let lot = Unit::new(cfg.lot_size)
         .ok_or_else(|| config_error(format!("lot_size must be positive, got {}", cfg.lot_size)))?;
+    // The engine computes with the raw `Decimal` scales: trailing zeros
+    // would raise its mantissas above the ones the bound `B` is computed
+    // for, so they are rejected rather than normalised.
+    for (name, value) in [
+        ("tick_size", cfg.tick_size),
+        ("lot_size", cfg.lot_size),
+        ("fee_rate", cfg.fee_rate),
+    ] {
+        if value.scale() != value.normalize().scale() {
+            return Err(config_error(format!(
+                "{name} {value} has trailing zeros; write it at its normalised scale ({})",
+                value.normalize()
+            )));
+        }
+    }
     match cfg.fee_currency {
         KernelFee::Quote => {}
         KernelFee::Base { scale } => {
@@ -398,6 +413,13 @@ pub(super) fn validate(cfg: &KernelConfig, relax: Relax) -> MMResult<ValidatedCo
         value: Decimal::try_from_i128_with_scale(1, s.min(MAX_SCALE))
             .map_err(|e| config_error(format!("money unit: {e}")))?,
     };
+    if cfg.initial_capital.scale() > s {
+        return Err(config_error(format!(
+            "initial_capital {} has scale {} above the money scale {s}",
+            cfg.initial_capital,
+            cfg.initial_capital.scale()
+        )));
+    }
     let c0_u = money.count(cfg.initial_capital).ok_or_else(|| {
         config_error(format!(
             "initial_capital {} is not a whole number of money units 1e-{s}",
