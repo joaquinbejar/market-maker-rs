@@ -5,7 +5,11 @@
 //! [`black_undiscounted`] and [`black_w`], inside the bracket `[0, w_max]`
 //! (`w_max = max_vol^2 tau`), with bisection whenever the Newton step leaves
 //! the bracket or `black_w` is unavailable (it is singular at `w = 0`).
-//! Every loop is bounded.
+//! Every loop is bounded. Where the Black price at a trial `w` is positive
+//! but below the smallest positive `f64` (an error of
+//! [`black_undiscounted`], never a 0), it is below every positive price, the
+//! target included, so the root lies above that `w` and the bracket moves
+//! there.
 //!
 //! Undiscounted bounds: `max(F - K, 0) <= C <= F` and
 //! `max(K - F, 0) <= P <= K`. A price at its lower bound, within the
@@ -174,11 +178,12 @@ pub fn implied_total_variance(
     if price <= lower + tol {
         return Ok(0.0);
     }
+    // `None`: positive but below the smallest positive f64.
     let black = |w: f64| {
-        black_undiscounted(fwd, strike, w, style).map_err(|e| IvFailure::Numerical(e.to_string()))
+        black_or_underflow(fwd, strike, w, style).map_err(|e| IvFailure::Numerical(e.to_string()))
     };
     let w_max = config.max_vol * config.max_vol * tau;
-    if black(w_max)? < price - tol {
+    if black(w_max)?.is_none_or(|p| p < price - tol) {
         return Err(IvFailure::BracketFailed { w_max });
     }
     let (mut lo, mut hi) = (0.0_f64, w_max);
@@ -189,11 +194,13 @@ pub fn implied_total_variance(
         .max(0.25 * hi * f64::EPSILON)
         .min(0.5 * hi);
     for _ in 0..config.max_iterations {
-        let diff = black(w)? - price;
-        if diff.abs() <= tol {
+        // Here `price > lower + tol >= 0`, so an underflowed Black price is
+        // below it.
+        let diff = black(w)?.map(|p| p - price);
+        if diff.is_some_and(|d| d.abs() <= tol) {
             return Ok(w);
         }
-        if diff < 0.0 {
+        if diff.is_none_or(|d| d < 0.0) {
             lo = w;
         } else {
             hi = w;
@@ -201,10 +208,12 @@ pub fn implied_total_variance(
         if hi - lo <= config.w_tolerance * hi.max(f64::MIN_POSITIVE) {
             return Ok(0.5 * (lo + hi));
         }
-        let newton = black_w(fwd, strike, w)
-            .ok()
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| w - diff / v);
+        let newton = diff.and_then(|d| {
+            black_w(fwd, strike, w)
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| w - d / v)
+        });
         w = match newton {
             Some(next) if next > lo && next < hi => next,
             _ => 0.5 * (lo + hi),
@@ -213,6 +222,30 @@ pub fn implied_total_variance(
     Err(IvFailure::NoConvergence {
         iterations: config.max_iterations,
     })
+}
+
+/// What [`black_undiscounted`] says, in its error, of a positive price below
+/// the smallest positive `f64`.
+const BLACK_UNDERFLOW: &str = "below the smallest positive f64";
+
+/// [`black_undiscounted`], with `None` for a price that is positive but
+/// below the smallest positive `f64`: smaller than every positive `f64`, so
+/// it still orders against one.
+///
+/// # Errors
+///
+/// Every other error of [`black_undiscounted`].
+pub(crate) fn black_or_underflow(
+    fwd: f64,
+    strike: f64,
+    w: f64,
+    style: OptionStyle,
+) -> MMResult<Option<f64>> {
+    match black_undiscounted(fwd, strike, w, style) {
+        Ok(price) => Ok(Some(price)),
+        Err(MMError::NumericalError(why)) if why.contains(BLACK_UNDERFLOW) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// A cleaned quote with its implied total variances.
@@ -343,7 +376,11 @@ mod tests {
         for &strike in &[50.0, 80.0, 99.0, 100.0, 101.0, 120.0, 200.0] {
             for &w in &[1e-4, 0.01, 0.09, 0.5, 2.0] {
                 for style in [OptionStyle::Call, OptionStyle::Put] {
-                    let price = black_undiscounted(fwd, strike, w, style).unwrap();
+                    // A price below the smallest positive f64 has no
+                    // inverse to check.
+                    let Some(price) = black_or_underflow(fwd, strike, w, style).unwrap() else {
+                        continue;
+                    };
                     let lower = if matches!(style, OptionStyle::Call) {
                         (fwd - strike).max(0.0)
                     } else {
@@ -391,6 +428,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_black_or_underflow_reads_the_pricing_underflow() {
+        // Far out of the money at small w: positive, below every f64.
+        assert!(black_undiscounted(100.0, 200.0, 1e-4, OptionStyle::Call).is_err());
+        assert_eq!(
+            black_or_underflow(100.0, 200.0, 1e-4, OptionStyle::Call),
+            Ok(None)
+        );
+        assert!(
+            black_or_underflow(100.0, 100.0, 0.04, OptionStyle::Call)
+                .unwrap()
+                .is_some_and(|p| p > 0.0)
+        );
+        // Other errors stay errors.
+        assert!(black_or_underflow(-1.0, 100.0, 0.04, OptionStyle::Call).is_err());
+    }
+
+    #[test]
+    fn test_implied_total_variance_underflowing_trial_moves_the_bracket() {
+        // Out of the money, a price well above the tolerance whose first
+        // trial, the at the money guess 2 pi (C / F)^2, is a w where the
+        // Black price underflows.
+        let (fwd, strike, w) = (100.0, 130.0, 0.004);
+        let c = config();
+        let price = black_undiscounted(fwd, strike, w, OptionStyle::Call).unwrap();
+        assert!(price > 1e3 * c.price_tolerance * fwd);
+        let guess = 2.0 * std::f64::consts::PI * (price / fwd).powi(2);
+        assert!(
+            black_or_underflow(fwd, strike, guess, OptionStyle::Call)
+                .unwrap()
+                .is_none()
+        );
+        let got = implied_total_variance(price, fwd, strike, 1.0, OptionStyle::Call, &c).unwrap();
+        let allowed = 2.0 * c.price_tolerance * fwd / black_w(fwd, strike, w).unwrap() + 1e-12 * w;
+        assert!((got - w).abs() <= allowed, "{got}");
     }
 
     #[test]

@@ -31,12 +31,11 @@ use super::calibrate::{
     ActiveConstraint, FitConfig, FitFailure, SliceFit, SliceObservation, fit_slice,
 };
 use super::diagnostics::{DiagnosticsConfig, SurfaceDiagnostics, diagnose};
-use super::iv::{Extraction, IvConfig, IvFailure, extract};
+use super::iv::{Extraction, IvConfig, IvFailure, black_or_underflow, extract};
 use super::quotes::{CleaningConfig, CleaningReport, OptionQuote, QuoteFlag, Rates, clean_quotes};
 use super::store::{CalibratedSurface, SurfaceStatus};
 use super::svi::{ShortExpiryPolicy, SviSurface};
 use crate::Decimal;
-use crate::options::pricing::black_undiscounted;
 use crate::types::error::{MMError, MMResult};
 
 /// Thresholds of the stability check against the previous surface.
@@ -199,12 +198,13 @@ pub fn calibrate_surface(
             Ok(f) => {
                 for (o, r) in obs.iter().zip(f.residuals.iter()) {
                     let strike = o.quote.quote.strike.to_f64().unwrap_or(f64::NAN);
-                    let fitted_price = black_undiscounted(
+                    // `None`: positive but below the smallest positive f64.
+                    let fitted_price = black_or_underflow(
                         o.quote.forward,
                         strike,
                         r.w_fitted,
                         o.quote.quote.style,
-                    )? * o.quote.discount;
+                    )?;
                     let mid = o
                         .quote
                         .quote
@@ -224,7 +224,10 @@ pub fn calibrate_surface(
                         vol_fitted: (r.w_fitted / tau).sqrt(),
                         vol_residual: r.vol_residual,
                         vol_half_band: 0.5 * ((o.w_ask / tau).sqrt() - (o.w_bid / tau).sqrt()),
-                        price_residual: mid - fitted_price,
+                        // An underflowed fitted price is below half the
+                        // smallest positive f64: `mid - fitted` rounds to the
+                        // mid.
+                        price_residual: fitted_price.map_or(mid, |p| mid - p * o.quote.discount),
                         k_normalized: o.quote.k
                             / f.slice.eval(0.0).map_or(f64::NAN, |(w, _, _)| w.sqrt()),
                         bid_at_bound: o.bid_at_bound,
@@ -333,6 +336,7 @@ pub fn calibrate_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::pricing::black_undiscounted;
     use crate::options::surface::{KRange, SviSlice, VolSurface, YEAR_MS};
     use optionstratlib::OptionStyle;
     use rust_decimal::prelude::FromPrimitive;
