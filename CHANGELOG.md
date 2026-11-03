@@ -70,7 +70,8 @@ project follows [Semantic Versioning](https://semver.org/).
   `details`.
 - `options::adapter::ADAPTER_MS_PER_YEAR`: the 365.25-day year of the
   adapter's ms helpers, now named; their results are unchanged (#95).
-- `backtest::kernel` (feature `kernel`, no dependencies): `FinancialKernel`,
+- The financial environment kernel: `backtest::kernel` (feature `kernel`,
+  no dependencies) with `FinancialKernel`,
   a deterministic, resumable re-implementation of the backtest engine loop
   over a fixed width, `Copy` `KernelState`, with `reset`, `step`,
   `observe` and `mask`, a canonical state encoding (`encode`, `decode` with

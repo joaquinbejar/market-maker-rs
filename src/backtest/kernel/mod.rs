@@ -1,4 +1,4 @@
-//! Deterministic financial kernel (feature `kernel`).
+//! The financial environment kernel (feature `kernel`).
 //!
 //! [`FinancialKernel`] re-implements the backtest engine's tick loop as a
 //! resumable state machine over a fixed width, `Copy` [`KernelState`]. It is
