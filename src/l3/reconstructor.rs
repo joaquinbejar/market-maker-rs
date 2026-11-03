@@ -1,10 +1,11 @@
 //! Book reconstruction from a snapshot and a sequenced message stream.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use super::book::{Book, PriorityEvidence, Resting};
+use super::book::{Book, PriorityEvidence, Resting, exact_add, exact_sub};
 use super::message::{ChangeReason, DoneReason, L3Event, L3Message, L3Side, L3Snapshot};
 use crate::Decimal;
 
@@ -416,12 +417,37 @@ enum Counter {
 /// sequenced messages, failing closed on any gap or inconsistency.
 ///
 /// See the [module docs](super) for the contract.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// A clone is a separate reconstructor: queue estimates of one are not
+/// valid on the other.
+#[derive(Debug)]
 pub struct BookReconstructor {
     product_id: String,
     rules: VenueRules,
     state: State,
     manifest: QualityManifest,
+    /// Identity of the current segment, unique in the process: a queue
+    /// estimate is valid only on the segment that made it.
+    segment_id: u64,
+}
+
+/// Source of segment identities.
+static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_segment_id() -> u64 {
+    NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Clone for BookReconstructor {
+    fn clone(&self) -> Self {
+        Self {
+            product_id: self.product_id.clone(),
+            rules: self.rules,
+            state: self.state.clone(),
+            manifest: self.manifest.clone(),
+            segment_id: next_segment_id(),
+        }
+    }
 }
 
 fn positive(what: &str, v: Decimal) -> Result<(), Discrepancy> {
@@ -455,6 +481,7 @@ impl BookReconstructor {
             product_id,
             rules,
             state: State::Empty,
+            segment_id: next_segment_id(),
         }
     }
 
@@ -501,6 +528,7 @@ impl BookReconstructor {
             book,
             last_seq: snapshot.sequence,
         };
+        self.segment_id = next_segment_id();
         Ok(())
     }
 
@@ -760,10 +788,8 @@ impl BookReconstructor {
                 what: format!("{} levels", self.rules.max_levels),
             });
         }
-        let new_total = level
-            .map_or(Decimal::ZERO, |l| l.total)
-            .checked_add(remaining)
-            .ok_or_else(|| arithmetic("level total"))?;
+        let new_total = exact_add(level.map_or(Decimal::ZERO, |l| l.total), remaining)
+            .ok_or_else(|| arithmetic("level total is not exact"))?;
         Ok(Plan::Insert {
             id: order_id.to_string(),
             resting: Resting {
@@ -787,9 +813,8 @@ impl BookReconstructor {
             .get(&order.price)
             .map(|l| l.total)
             .ok_or_else(|| arithmetic("resting order without its level"))?;
-        let new_total = total
-            .checked_sub(less)
-            .ok_or_else(|| arithmetic("level total"))?;
+        let new_total =
+            exact_sub(total, less).ok_or_else(|| arithmetic("level total is not exact"))?;
         if new_total < Decimal::ZERO {
             return Err(arithmetic("level total below zero"));
         }
@@ -867,10 +892,8 @@ impl BookReconstructor {
                 size,
             });
         }
-        let remaining = maker
-            .remaining
-            .checked_sub(size)
-            .ok_or_else(|| arithmetic("maker remaining"))?;
+        let remaining = exact_sub(maker.remaining, size)
+            .ok_or_else(|| arithmetic("maker remaining is not exact"))?;
         let new_total = Self::level_total_less(book, maker, size)?;
         Ok(if remaining == Decimal::ZERO {
             Plan::Remove {
@@ -936,10 +959,8 @@ impl BookReconstructor {
         if new_size == order.remaining {
             return Ok(Plan::NoEffect(Counter::NoopChange));
         }
-        let less = order
-            .remaining
-            .checked_sub(new_size)
-            .ok_or_else(|| arithmetic("size decrease"))?;
+        let less = exact_sub(order.remaining, new_size)
+            .ok_or_else(|| arithmetic("size decrease is not exact"))?;
         let new_total = Self::level_total_less(book, order, less)?;
         Ok(if new_size == Decimal::ZERO {
             Plan::Remove {
@@ -995,10 +1016,10 @@ impl BookReconstructor {
                         self.rules.max_levels
                     )));
                 }
-                let new_total = level
-                    .map_or(Decimal::ZERO, |l| l.total)
-                    .checked_add(o.size)
-                    .ok_or_else(|| SnapshotError::Arithmetic(format!("level {}", o.price)))?;
+                let new_total = exact_add(level.map_or(Decimal::ZERO, |l| l.total), o.size)
+                    .ok_or_else(|| {
+                        SnapshotError::Arithmetic(format!("level {} total is not exact", o.price))
+                    })?;
                 book.insert(
                     o.order_id.clone(),
                     Resting {
@@ -1032,6 +1053,10 @@ impl BookReconstructor {
 
     pub(crate) fn rules(&self) -> VenueRules {
         self.rules
+    }
+
+    pub(crate) fn segment_id(&self) -> u64 {
+        self.segment_id
     }
 
     /// The last sequence applied.
@@ -1121,7 +1146,7 @@ impl BookReconstructor {
                 .iter()
                 .filter_map(|id| book.orders.get(id))
                 .filter(|o| o.evidence == PriorityEvidence::Unknown)
-                .try_fold(Decimal::ZERO, |acc, o| acc.checked_add(o.remaining))
+                .try_fold(Decimal::ZERO, |acc, o| exact_add(acc, o.remaining))
                 .ok_or_else(|| ViewError::Arithmetic(format!("unknown volume at {price}")))?;
             Ok(LevelProfile {
                 price: *price,

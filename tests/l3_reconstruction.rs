@@ -757,3 +757,128 @@ fn test_random_valid_stream_keeps_every_invariant() {
     assert_eq!(r.l2(Buy).unwrap(), expected_bids);
     assert_eq!(r.l2(Sell).unwrap(), expected_asks);
 }
+
+#[test]
+fn test_sums_that_decimal_cannot_hold_exactly_are_refused() {
+    // 1e28 + 1e-28 rounds in Decimal: never a silently inexact total.
+    let big = Decimal::from_i128_with_scale(10_i128.pow(28), 0);
+    let tiny = Decimal::new(1, 28);
+    let mixed = L3Snapshot {
+        product_id: P.to_string(),
+        sequence: 1,
+        bids: vec![so("a", dec!(100), big), so("t", dec!(100), tiny)],
+        asks: vec![],
+    };
+    let mut r = BookReconstructor::new(P, VenueRules::default());
+    assert!(matches!(
+        r.bootstrap(&mixed),
+        Err(SnapshotError::Arithmetic(_))
+    ));
+    // The same through messages: the open of the tiny order invalidates,
+    // with nothing changed.
+    let single = L3Snapshot {
+        product_id: P.to_string(),
+        sequence: 1,
+        bids: vec![so("a", dec!(100), big)],
+        asks: vec![],
+    };
+    r.bootstrap(&single).unwrap();
+    let error = r.apply(&m(2, open("t", Buy, dec!(100), tiny))).unwrap_err();
+    assert!(matches!(
+        error,
+        ApplyError::Invalidated(ref inv)
+            if matches!(inv.kind, InvalidationKind::Discrepancy(Discrepancy::Arithmetic { .. }))
+    ));
+    assert_eq!(r.stale_l2(Buy).unwrap(), vec![(dec!(100), big)]);
+    // A match whose remaining Decimal cannot hold exactly invalidates too.
+    r.bootstrap(&single).unwrap();
+    assert!(
+        r.apply(&m(2, trade("a", "x", Buy, dec!(100), tiny)))
+            .is_err()
+    );
+    // Exact mixed scales are fine.
+    r.bootstrap(&snapshot(1)).unwrap();
+    feed(&mut r, &[m(2, open("u", Buy, dec!(100), dec!(0.000001)))]);
+    assert_eq!(r.l2(Buy).unwrap()[0], (dec!(100), dec!(3.000001)));
+}
+
+#[test]
+fn test_own_decrease_under_priority_unknown_refuses_own_estimates() {
+    let rules = VenueRules {
+        size_decrease: SizeDecrease::PriorityUnknown,
+        ..VenueRules::default()
+    };
+    let empty = L3Snapshot {
+        product_id: P.to_string(),
+        sequence: 0,
+        bids: vec![],
+        asks: vec![],
+    };
+    let mut r = BookReconstructor::new(P, rules);
+    r.bootstrap(&empty).unwrap();
+    feed(
+        &mut r,
+        &[
+            m(1, open("own", Buy, dec!(100), dec!(2))),
+            m(2, open("later", Buy, dec!(100), dec!(1))),
+        ],
+    );
+    let estimate = r.queue_estimate_own("own").unwrap();
+    assert_eq!(r.volume_ahead(&estimate).unwrap().volume, dec!(0));
+    feed(
+        &mut r,
+        &[m(3, stp("own", Buy, dec!(100), dec!(2), dec!(1)))],
+    );
+    assert!(matches!(
+        r.volume_ahead(&estimate),
+        Err(QueueError::PriorityUnknown { ref order_id }) if order_id == "own"
+    ));
+    assert!(matches!(
+        r.queue_estimate_own("own"),
+        Err(QueueError::PriorityUnknown { .. })
+    ));
+    // Under KeepsPriority the same decrease is a declared assumption.
+    let mut k = BookReconstructor::new(P, VenueRules::default());
+    k.bootstrap(&empty).unwrap();
+    feed(
+        &mut k,
+        &[
+            m(1, open("own", Buy, dec!(100), dec!(2))),
+            m(2, stp("own", Buy, dec!(100), dec!(2), dec!(1))),
+        ],
+    );
+    let ahead = k
+        .volume_ahead(&k.queue_estimate_own("own").unwrap())
+        .unwrap();
+    assert!(
+        ahead
+            .assumptions
+            .contains(&Assumption::SizeDecreaseKeepsPriority)
+    );
+}
+
+#[test]
+fn test_estimates_belong_to_their_reconstructor_and_segment() {
+    // Two reconstructors of the same product, same sequence, same ids.
+    let a = booted(0);
+    let mut b = BookReconstructor::new(P, VenueRules::default());
+    let mut other = snapshot(0);
+    other.bids[0].size = dec!(9);
+    b.bootstrap(&other).unwrap();
+    let hypothetical = a.queue_estimate(Buy, dec!(100)).unwrap();
+    assert_eq!(
+        b.volume_ahead(&hypothetical),
+        Err(QueueError::StaleEstimate)
+    );
+    let mut a = a;
+    feed(&mut a, &[m(1, open("own", Buy, dec!(100), dec!(1)))]);
+    let own = a.queue_estimate_own("own").unwrap();
+    let mut b2 = BookReconstructor::new(P, VenueRules::default());
+    b2.bootstrap(&snapshot(0)).unwrap();
+    feed(&mut b2, &[m(1, open("own", Buy, dec!(100), dec!(1)))]);
+    assert_eq!(b2.volume_ahead(&own), Err(QueueError::StaleEstimate));
+    // A clone is another reconstructor.
+    let clone = a.clone();
+    assert_eq!(clone.volume_ahead(&own), Err(QueueError::StaleEstimate));
+    assert!(a.volume_ahead(&own).is_ok());
+}

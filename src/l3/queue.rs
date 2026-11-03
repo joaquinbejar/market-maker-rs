@@ -5,7 +5,7 @@
 
 use thiserror::Error;
 
-use super::book::PriorityEvidence;
+use super::book::{PriorityEvidence, exact_add};
 use super::message::L3Side;
 use super::reconstructor::{BookReconstructor, SizeDecrease, ViewError};
 use crate::Decimal;
@@ -31,12 +31,12 @@ pub enum QueueError {
     /// The book itself is unavailable.
     #[error("{0}")]
     View(ViewError),
-    /// The estimate belongs to an earlier segment: a snapshot has replaced
-    /// the book since.
-    #[error("estimate from an earlier segment")]
+    /// The estimate was made on another reconstructor, or on an earlier
+    /// segment of this one (a snapshot has replaced the book since).
+    #[error("estimate from another reconstructor or an earlier segment")]
     StaleEstimate,
     /// An order's place is unknown: our own order came from a snapshot, or
-    /// an order ahead decreased its size under
+    /// it or an order ahead decreased its size under
     /// [`SizeDecrease::PriorityUnknown`].
     #[error("priority of {order_id} unknown")]
     PriorityUnknown {
@@ -75,7 +75,7 @@ enum Anchor {
 pub struct QueueEstimate {
     side: L3Side,
     price: Decimal,
-    segment: usize,
+    segment_id: u64,
     anchor: Anchor,
 }
 
@@ -118,7 +118,7 @@ impl BookReconstructor {
         Ok(QueueEstimate {
             side,
             price,
-            segment: self.manifest().segments.len(),
+            segment_id: self.segment_id(),
             anchor: Anchor::Hypothetical {
                 ahead,
                 created_at: last_seq,
@@ -141,7 +141,10 @@ impl BookReconstructor {
             .ok_or_else(|| QueueError::NotResting {
                 order_id: order_id.to_string(),
             })?;
-        if order.evidence == PriorityEvidence::Unknown {
+        if order.evidence == PriorityEvidence::Unknown
+            || (order.decreased_at.is_some()
+                && self.rules().size_decrease == SizeDecrease::PriorityUnknown)
+        {
             return Err(QueueError::PriorityUnknown {
                 order_id: order_id.to_string(),
             });
@@ -149,7 +152,7 @@ impl BookReconstructor {
         Ok(QueueEstimate {
             side: order.side,
             price: order.price,
-            segment: self.manifest().segments.len(),
+            segment_id: self.segment_id(),
             anchor: Anchor::Own {
                 order_id: order_id.to_string(),
             },
@@ -169,7 +172,7 @@ impl BookReconstructor {
     /// size under [`SizeDecrease::PriorityUnknown`].
     pub fn volume_ahead(&self, estimate: &QueueEstimate) -> Result<QueueAhead, QueueError> {
         let (book, at_seq) = self.valid_book()?;
-        if estimate.segment != self.manifest().segments.len() {
+        if estimate.segment_id != self.segment_id() {
             return Err(QueueError::StaleEstimate);
         }
         let (ahead, since, mut assumptions): (Vec<String>, u64, Vec<Assumption>) =
@@ -191,6 +194,21 @@ impl BookReconstructor {
                             order_id: order_id.clone(),
                         });
                     };
+                    // Our own decrease: later orders may now precede it,
+                    // unless decreases keep priority by declaration.
+                    let mut assumptions = vec![Assumption::EntrySequenceIsPriority];
+                    if own.decreased_at.is_some() {
+                        match self.rules().size_decrease {
+                            SizeDecrease::PriorityUnknown => {
+                                return Err(QueueError::PriorityUnknown {
+                                    order_id: order_id.clone(),
+                                });
+                            }
+                            SizeDecrease::KeepsPriority => {
+                                assumptions.push(Assumption::SizeDecreaseKeepsPriority);
+                            }
+                        }
+                    }
                     let queue = book
                         .levels(estimate.side)
                         .get(&estimate.price)
@@ -201,14 +219,14 @@ impl BookReconstructor {
                         .take_while(|id| *id != order_id)
                         .cloned()
                         .collect();
-                    (before, sequence, vec![Assumption::EntrySequenceIsPriority])
+                    (before, sequence, assumptions)
                 }
             };
         let (mut volume, mut from_snapshot, mut observed, mut orders) =
             (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, 0_usize);
         let add = |acc: Decimal, v: Decimal| {
-            acc.checked_add(v)
-                .ok_or_else(|| QueueError::Arithmetic("volume ahead".to_string()))
+            exact_add(acc, v)
+                .ok_or_else(|| QueueError::Arithmetic("volume ahead is not exact".to_string()))
         };
         for id in &ahead {
             // Gone (filled or canceled): nothing left ahead from it.

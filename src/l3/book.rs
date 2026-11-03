@@ -5,6 +5,19 @@ use std::collections::{BTreeMap, HashMap};
 use super::message::L3Side;
 use crate::Decimal;
 
+/// `a + b`, only when `Decimal` holds it exactly: a sum that overflows or
+/// rounds (`1e28 + 1e-28` loses the small term) is `None`.
+pub(crate) fn exact_add(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let sum = a.checked_add(b)?;
+    (sum.checked_sub(a)? == b && sum.checked_sub(b)? == a).then_some(sum)
+}
+
+/// `a - b`, only when `Decimal` holds it exactly.
+pub(crate) fn exact_sub(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let difference = a.checked_sub(b)?;
+    (difference.checked_add(b)? == a && a.checked_sub(difference)? == b).then_some(difference)
+}
+
 /// What is known of a resting order's place in its level's queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriorityEvidence {
@@ -146,9 +159,8 @@ impl Book {
                     if order.remaining <= Decimal::ZERO {
                         return Err(format!("order {id} has size {}", order.remaining));
                     }
-                    sum = sum
-                        .checked_add(order.remaining)
-                        .ok_or_else(|| format!("level {price} sum overflows"))?;
+                    sum = exact_add(sum, order.remaining)
+                        .ok_or_else(|| format!("level {price} sum is not exact"))?;
                     seen = seen.saturating_add(1);
                 }
                 if sum != level.total {

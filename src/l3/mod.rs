@@ -43,7 +43,9 @@
 //! result lists ([`Assumption`](crate::l3::Assumption)). Aggregated (L2) data is never presented as
 //! order by order data, and none of this validates a fill model.
 //!
-//! Every result is checked decimal arithmetic; nothing saturates or panics.
+//! Every size sum is exact: an addition or subtraction that `Decimal`
+//! cannot hold exactly (it overflows, or rounds, as `1e28 + 1e-28` would) is
+//! refused like any other inconsistency. Nothing saturates or panics.
 
 mod book;
 mod message;
