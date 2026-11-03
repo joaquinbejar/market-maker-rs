@@ -127,6 +127,10 @@ project follows [Semantic Versioning](https://semver.org/).
   `MMError::NumericalError`.
 - `OrderBookSnapshot::mid_price`, `spread` and `spread_bps` (execution)
   return `None` when the arithmetic overflows.
+- Mid prices (`MarketTick`, `Quote`, data feed quotes, the VPIN quote
+  rule) are exact near the `Decimal` bounds instead of saturating the sum,
+  and every book and trade flow imbalance is invariant under a common
+  scale of its sides, even when their sum is not representable.
 
 ### Fixed
 
@@ -147,7 +151,8 @@ project follows [Semantic Versioning](https://semver.org/).
 - Checked arithmetic (#144): these now return `MMResult` and report an
   overflow as `MMError::NumericalError`:
   - `InventoryPosition::update_fill` returns `MMResult<()>` and leaves the
-    position unchanged on overflow;
+    position unchanged when the quantity or the exact average entry price
+    is not representable (it no longer saturates the average);
   - `FillAccountant::snapshot` returns `MMResult<AccountingSnapshot>`
     (implementors change their signature), and
     `BacktestEngine::accounting_snapshot` returns
@@ -159,8 +164,10 @@ project follows [Semantic Versioning](https://semver.org/).
     `max_notional_exposure`;
   - `AdaptiveSpread::bid_price` and `ask_price`, and
     `AdaptiveSpreadCalculator::calculate_spread`,
-    `calculate_spread_with_volatility` and
-    `calculate_weighted_orderbook_imbalance`;
+    `calculate_spread_with_volatility`,
+    `calculate_weighted_orderbook_imbalance`,
+    `calculate_orderbook_imbalance` and `calculate_tradeflow_imbalance`
+    (a saturated depth or volume would distort the signal);
   - `RiskAversionCalibrator::calibrate_from_halflife`,
     `ParameterOptimizer::optimize_quick` and
     `OptimizedParameters::adjusted_gamma`;
