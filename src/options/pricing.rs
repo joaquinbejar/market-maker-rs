@@ -415,20 +415,8 @@ impl Model {
         let df_r = positive("discount factor e^(-r tau)", (-r * tau).exp())?;
         let df_q = positive("carry factor e^(-q tau)", (-q * tau).exp())?;
         let fwd = positive("forward", s * growth.exp())?;
-        // k = ln(K / S) - (r - q) tau, with ln(K / S) taken near the money
-        // as log1p of the exact Decimal (K - S) / S (ln K - ln S would lose
-        // the digits that set d1 and d2 at small w).
-        let k_current = finite(
-            "log moneyness",
-            ln_ratio(inputs.strike, inputs.spot)? - growth,
-        )?;
-        let (sticky_moneyness, k_read) = match dynamics {
-            Dynamics::StickyMoneyness => (true, k_current),
-            Dynamics::StickyStrike { s_ref } => (
-                false,
-                finite("log moneyness", ln_ratio(inputs.strike, s_ref)? - growth)?,
-            ),
-        };
+        let (k_current, k_read) = moneyness(inputs, dynamics, growth)?;
+        let sticky_moneyness = matches!(dynamics, Dynamics::StickyMoneyness);
         let tv = surface.total_variance(k_read, tau)?;
         let w = tv.w();
         let vol = positive("total volatility sqrt(w)", w.sqrt())?;
@@ -554,6 +542,58 @@ impl Model {
             theta: to_decimal("theta", theta)?,
         })
     }
+}
+
+/// `k = ln(K / S) - (r - q) tau` and the `k` the surface is read at under
+/// `dynamics`, with `ln(K / S)` taken near the money as `log1p` of the
+/// exact `Decimal` `(K - S) / S` (`ln K - ln S` would lose the digits that
+/// set `d1` and `d2` at small `w`).
+fn moneyness(inputs: &OptionInputs, dynamics: Dynamics, growth: f64) -> MMResult<(f64, f64)> {
+    let k_current = finite(
+        "log moneyness",
+        ln_ratio(inputs.strike, inputs.spot)? - growth,
+    )?;
+    let k_read = match dynamics {
+        Dynamics::StickyMoneyness => k_current,
+        Dynamics::StickyStrike { s_ref } => {
+            finite("log moneyness", ln_ratio(inputs.strike, s_ref)? - growth)?
+        }
+    };
+    Ok((k_current, k_read))
+}
+
+/// The point `(k, tau)` at which [`value`] reads the surface for `inputs`
+/// under `dynamics`, computed by the same code: `k` is the log forward
+/// moneyness of the strike against the spot (sticky moneyness) or against
+/// `s_ref` (sticky strike), `tau` the time to expiry in years.
+///
+/// # Errors
+///
+/// - [`MMError::InvalidMarketState`] at or after expiry (`tau <= 0`, where
+///   [`value`] reads no surface), for a non-positive spot or strike, and
+///   for invalid dynamics.
+/// - [`MMError::NumericalError`] when an input or an intermediate has no
+///   finite `f64` value.
+pub fn surface_point(inputs: &OptionInputs, dynamics: Dynamics) -> MMResult<(f64, f64)> {
+    dynamics.validate()?;
+    if inputs.spot <= Decimal::ZERO || inputs.strike <= Decimal::ZERO {
+        return Err(invalid(format!(
+            "spot and strike must be positive, got {} and {}",
+            inputs.spot, inputs.strike
+        )));
+    }
+    if inputs.tau_years <= Decimal::ZERO {
+        return Err(invalid(format!(
+            "at expiry (tau {}) the surface is not read",
+            inputs.tau_years
+        )));
+    }
+    let tau = to_f64("time to expiry", inputs.tau_years)?;
+    let r = to_f64("rate", inputs.rate)?;
+    let q = to_f64("carry", inputs.carry)?;
+    let growth = finite("(rate - carry) * tau", (r - q) * tau)?;
+    let (_, k_read) = moneyness(inputs, dynamics, growth)?;
+    Ok((k_read, tau))
 }
 
 /// The undiscounted Black price of a forward `F`, strike `K` and total

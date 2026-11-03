@@ -14,8 +14,12 @@ project follows [Semantic Versioning](https://semver.org/).
   exact round-trip text, canonical `params`, the report); `price` values a
   requests CSV on that surface under sticky moneyness or sticky strike and
   writes one response row per request (`ok` with price, total Greeks and
-  total variance, or `error` with a class and no number); `identity` prints
-  the protocol and the build commit. Its unit tests run with `cargo test`.
+  the total variance read, or `error` with a class, `InvalidInput`,
+  `OutOfDomain`, `Unsupported` or `Numerical`, and no number); `identity`
+  prints the protocol and the build commit. Decimals are read exactly or
+  refused. Its unit tests run with `cargo test`.
+- `options::pricing::surface_point(&OptionInputs, Dynamics)`: the `(k, tau)`
+  at which `value` reads the surface, computed by the same code (#95).
 - Surface calibration under `options::surface` (feature `options`, #96):
   quote cleaning with a reason for every rejected quote and a global error
   for future data (`clean_quotes`); implied total variance by safeguarded

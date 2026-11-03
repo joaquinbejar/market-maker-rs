@@ -33,7 +33,16 @@
 //!     non-finite intermediate).
 //!
 //! Numbers in the CSV files are read from their text as `Decimal`, never
-//! through `f64`, and written as `Decimal` without exponent notation.
+//! through `f64`, and exactly: a decimal with more than 28 fractional digits
+//! or 29 significant ones, which `Decimal` would round, is refused (an
+//! `InvalidInput` row, or a protocol failure in the quotes and the config).
+//! They are written as `Decimal` without exponent notation; `f64` values
+//! (the total variance, the slice parameters) as their shortest round-trip
+//! text.
+//!
+//! `price` does not check the surface file's status, availability or data
+//! cutoff: whoever runs it decides whether that surface may be used at the
+//! requests' time.
 //! Errors in a row become error rows; the exit code is non-zero (2) only on
 //! a protocol failure: arguments, I/O, a header or a row with the wrong
 //! number of fields, or JSON that does not parse.
@@ -49,7 +58,7 @@ use std::sync::Arc;
 
 use market_maker_rs::Decimal;
 use market_maker_rs::options::pricing::{
-    Dynamics, OptionInputs, OptionPricer, SurfacePricer, tau_from_days,
+    Dynamics, OptionInputs, OptionPricer, SurfacePricer, surface_point, tau_from_days,
 };
 use market_maker_rs::options::surface::{
     CleaningConfig, DiagnosticsConfig, FitConfig, IvConfig, KRange, OptionQuote, QualityReport,
@@ -58,7 +67,6 @@ use market_maker_rs::options::surface::{
 };
 use market_maker_rs::types::error::MMError;
 use optionstratlib::{OptionStyle, OptionType};
-use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Value, json};
 
 /// The protocol of the files and of `identity`.
@@ -244,8 +252,22 @@ fn csv_text(s: &str) -> String {
         .collect()
 }
 
+/// A plain decimal (`-?digits[.digits]`) that `Decimal` holds exactly.
 fn decimal(name: &str, s: &str) -> Result<Decimal, String> {
-    Decimal::from_str(s).map_err(|e| format!("{name} {s:?} is not a decimal number: {e}"))
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    let plain = match digits.split_once('.') {
+        Some((int, frac)) => {
+            !int.is_empty()
+                && !frac.is_empty()
+                && int.bytes().all(|b| b.is_ascii_digit())
+                && frac.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+    };
+    if !plain {
+        return Err(format!("{name} {s:?} is not a plain decimal number"));
+    }
+    Decimal::from_str_exact(s).map_err(|e| format!("{name} {s:?} has no exact Decimal value: {e}"))
 }
 
 fn integer(name: &str, s: &str) -> Result<u64, String> {
@@ -333,6 +355,20 @@ impl Config {
             return Err(format!("config: unknown field {k:?}"));
         }
         let cleaning = field(v, "cleaning")?;
+        let known = [
+            "max_age_ms",
+            "max_spot_lag_ms",
+            "max_relative_spread",
+            "parity_tolerance",
+        ];
+        match cleaning.as_object() {
+            Some(c) => {
+                if let Some(k) = c.keys().find(|k| !known.contains(&k.as_str())) {
+                    return Err(format!("config: unknown field cleaning.{k}"));
+                }
+            }
+            None => return Err("config: cleaning must be a JSON object".to_string()),
+        }
         let calibration = SurfaceCalibrationConfig {
             cleaning: CleaningConfig {
                 max_age_ms: json_u64(cleaning, "max_age_ms")?,
@@ -664,11 +700,10 @@ enum Read {
     Surface(MMError),
 }
 
-/// The total variance at the `k` of the dynamics, written as `f64` text
-/// (shortest round trip, no exponent); `0` at expiry, where no surface is
-/// read. `k = ln(K / anchor) - (r - q) tau` is recomputed here in `f64`; the
-/// pricer takes the log ratio near the money as a `log1p` of the exact
-/// `Decimal` ratio, so the two `k` can differ in their last bits.
+/// The total variance the valuation reads, at the point
+/// [`surface_point`] gives (the pricer's own `k` and `tau`), written as
+/// `f64` text (shortest round trip, no exponent); `0` at expiry, where no
+/// surface is read.
 fn total_variance(
     surface: &SviSurface,
     dynamics: Dynamics,
@@ -677,20 +712,7 @@ fn total_variance(
     if i.tau_years <= Decimal::ZERO {
         return Ok("0".to_string());
     }
-    let f = |name: &str, d: Decimal| {
-        d.to_f64().filter(|x| x.is_finite()).ok_or_else(|| {
-            Read::Inputs(MMError::NumericalError(format!(
-                "{name} {d} has no f64 value"
-            )))
-        })
-    };
-    let tau = f("time to expiry", i.tau_years)?;
-    let anchor = match dynamics {
-        Dynamics::StickyStrike { s_ref } => s_ref,
-        _ => i.spot,
-    };
-    let k = (f("strike", i.strike)? / f("anchor spot", anchor)?).ln()
-        - (f("rate", i.rate)? - f("carry", i.carry)?) * tau;
+    let (k, tau) = surface_point(i, dynamics).map_err(Read::Inputs)?;
     let w = surface.total_variance(k, tau).map_err(Read::Surface)?.w();
     Ok(format!("{w}"))
 }
@@ -824,6 +846,74 @@ mod tests {
     }
 
     #[test]
+    fn test_decimals_that_would_round_are_refused() {
+        for text in [
+            // Rounds to 0 (29 fractional digits).
+            "0.00000000000000000000000000001",
+            // Rounds at a nonzero magnitude (30 significant digits).
+            "12345678901234567890.1234567890",
+            "1.00000000000000000000000000001",
+            "1e2",
+            "1_000",
+            ".5",
+            "",
+        ] {
+            assert!(decimal("x", text).is_err(), "{text:?}");
+        }
+        // 29 significant digits that fit are kept exactly.
+        assert_eq!(
+            decimal("x", "1.0000000000000000000000000001")
+                .unwrap()
+                .to_string(),
+            "1.0000000000000000000000000001"
+        );
+        assert_eq!(
+            decimal("x", "-0.0000000000000000000000000001").unwrap(),
+            Decimal::from_str("-0.0000000000000000000000000001").unwrap()
+        );
+        let r = priced(
+            Dynamics::StickyMoneyness,
+            &["tiny,100,45,call,european,0.00000000000000000000000000001,0,0,0"],
+        );
+        assert_eq!(r[0][1], "error");
+        assert!(r[0][9].starts_with("InvalidInput:"), "{}", r[0][9]);
+    }
+
+    #[test]
+    fn test_reported_total_variance_is_the_one_the_pricer_reads() {
+        // Near the money with a tiny smile: k = log1p(1e-18) must come from
+        // the exact Decimal ratio, as in the pricer.
+        let tiny = json!({
+            "format": SURFACE_FORMAT, "short_expiry": "reject",
+            "slices": [
+                {"tau": format!("{:e}", 30.0 / 365.0), "a": "0", "b": "0.1", "rho": "0",
+                 "m": "1e-18", "sigma": "1e-18", "k_lo": "-0.1", "k_hi": "0.1"},
+                {"tau": format!("{:e}", 60.0 / 365.0), "a": "0", "b": "0.1", "rho": "0",
+                 "m": "1e-18", "sigma": "1e-18", "k_lo": "-0.1", "k_hi": "0.1"},
+            ],
+        })
+        .to_string();
+        for d in [
+            Dynamics::StickyMoneyness,
+            Dynamics::StickyStrike {
+                s_ref: Decimal::from(100),
+            },
+        ] {
+            let surface = surface_from_json(&tiny).unwrap();
+            let r = rows(
+                &price(
+                    surface,
+                    d,
+                    &requests(&["n,100.0000000000000001,30,call,european,100,0,0,0"]),
+                )
+                .unwrap(),
+            );
+            let w: f64 = r[0][7].parse().unwrap();
+            assert!((w - 1.0000000000000001e-19).abs() <= 1e-34, "{d:?}: {w:e}");
+        }
+    }
+
+    #[test]
     fn test_protocol_failures_stop_the_run() {
         let surface = || surface_from_json(&surface_json()).unwrap();
         assert!(price(surface(), Dynamics::StickyMoneyness, "id,strike\n1,2").is_err());
@@ -917,6 +1007,9 @@ mod tests {
         assert!(calibrate(&c.to_string(), &synthetic_quotes()).is_err());
         let mut c: Value = serde_json::from_str(&config()).unwrap();
         c["rate"] = json!(0.0);
+        assert!(calibrate(&c.to_string(), &synthetic_quotes()).is_err());
+        let mut c: Value = serde_json::from_str(&config()).unwrap();
+        c["cleaning"]["max_gae_ms"] = json!(0);
         assert!(calibrate(&c.to_string(), &synthetic_quotes()).is_err());
         let mut c: Value = serde_json::from_str(&config()).unwrap();
         c["k_grid"] = json!([0.0]);

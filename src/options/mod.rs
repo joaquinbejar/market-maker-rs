@@ -73,7 +73,7 @@ pub use market_maker::{
 };
 pub use pricing::{
     Dynamics, OptionInputs, OptionPricer, OptionValuation, PRICING_YEAR_DAYS, SurfacePricer,
-    black_undiscounted, black_w, tau_from_days,
+    black_undiscounted, black_w, surface_point, tau_from_days,
 };
 pub use risk_manager::{
     AutoHedger, AutoHedgerConfig, GreeksCircuitBreaker, GreeksCircuitBreakerConfig,
