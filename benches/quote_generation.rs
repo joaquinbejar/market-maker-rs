@@ -68,41 +68,39 @@ fn avellaneda_stoikov(c: &mut Criterion) {
 
 fn glft(c: &mut Criterion) {
     let mid = MID.parse().expect("valid mid");
-    let sigma = dec!(0.2);
-    let config = GLFTConfig::new(
-        dec!(0.1),
-        dec!(1.5),
-        dec!(0.01),
-        TIME_TO_TERMINAL_MS,
-        dec!(0.01),
-    )
-    .expect("valid GLFT config");
-    let now = 0u64;
-
+    // Paper parameters (Figure 1), sigma = 0.3 per sqrt(s) expressed per sqrt(year).
+    let sigma = dec!(1684.7);
     let mut group = c.benchmark_group("glft");
-    for inv in INVENTORIES {
-        let q = market_maker_rs::Decimal::from(inv);
-        group.bench_with_input(BenchmarkId::new("reservation_price", inv), &q, |b, q| {
-            b.iter(|| {
-                GLFTStrategy::calculate_reservation_price(
-                    black_box(mid),
-                    black_box(*q),
-                    black_box(&config),
-                    black_box(sigma),
-                    black_box(now),
-                )
-            })
-        });
+    for q_max in [30_u32, 200] {
+        let config = GLFTConfig::new(
+            dec!(0.01),
+            dec!(0.3),
+            dec!(0.9),
+            q_max,
+            dec!(1),
+            600_000,
+            dec!(0),
+        )
+        .expect("valid GLFT config");
+        for inv in INVENTORIES {
+            let q = market_maker_rs::Decimal::from(inv);
+            group.bench_with_input(
+                BenchmarkId::new(format!("optimal_quotes_q{q_max}"), inv),
+                &q,
+                |b, q| {
+                    b.iter(|| {
+                        GLFTStrategy::calculate_optimal_quotes(
+                            black_box(mid),
+                            black_box(*q),
+                            black_box(&config),
+                            black_box(sigma),
+                            black_box(0),
+                        )
+                    })
+                },
+            );
+        }
     }
-    group.bench_function("optimal_spread", |b| {
-        b.iter(|| {
-            GLFTStrategy::calculate_optimal_spread(
-                black_box(&config),
-                black_box(sigma),
-                black_box(now),
-            )
-        })
-    });
     group.finish();
 }
 

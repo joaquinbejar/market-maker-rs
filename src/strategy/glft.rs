@@ -1,85 +1,126 @@
-//! Guéant-Lehalle-Fernandez-Tapia (GLFT) model extension.
-//!
-//! This module extends the Avellaneda-Stoikov model with terminal inventory penalty
-//! from the GLFT framework, making it more realistic for strategies that must
-//! flatten positions at session end.
+//! Guéant, Lehalle and Fernandez-Tapia (GLFT) optimal market making.
 //!
 //! # Reference
 //!
-//! Guéant, O., Lehalle, C. A., & Fernandez-Tapia, J. (2012).
-//! "Dealing with the inventory risk: a solution to the market making problem."
-//! Mathematics and Financial Economics, 7(4), 477-507.
+//! Guéant, O., Lehalle, C. A., & Fernandez-Tapia, J. (2013). "Dealing with
+//! the inventory risk: a solution to the market making problem."
+//! Mathematics and Financial Economics, 7(4), 477-507. arXiv:1105.3115.
 //!
-//! # Mathematical Model
+//! # Model
 //!
-//! The GLFT model modifies the Avellaneda-Stoikov reservation price:
+//! The reference price follows `dS = σ dW`. Each side is filled at intensity
+//! `A exp(-k δ)` where `δ` is the distance of the quote from `S`. The market
+//! maker has CARA utility with risk aversion `γ` on the P&L at the terminal
+//! time `T`, and the inventory is bounded to `-Q..=Q` lots: at `q = Q` no bid
+//! is posted and at `q = -Q` no ask is posted.
 //!
-//! ## Original A-S Reservation Price
+//! Proposition 2 and Theorem 1 of the paper give the exact solution:
+//!
 //! ```text
-//! r = s - q * γ * σ² * (T - t)
+//! α = k γ σ² / 2
+//! η = A (1 + γ/k)^(-(1 + k/γ))
+//! M = tridiagonal on q = -Q..Q, M_qq = α q², M_q,q±1 = -η
+//! v(t) = exp(-M (T - t)) · (1, ..., 1)'
+//! δ_b(t, q) = (1/k) ln(v_q / v_{q+1}) + (1/γ) ln(1 + γ/k)     q ≠  Q
+//! δ_a(t, q) = (1/k) ln(v_q / v_{q-1}) + (1/γ) ln(1 + γ/k)     q ≠ -Q
+//! bid = S - δ_b, ask = S + δ_a
 //! ```
 //!
-//! ## GLFT Modification
+//! [`GLFTStrategy::closed_form_quotes`] gives the asymptotic approximation
+//! after Proposition 3, valid when `T - t` is large:
+//!
 //! ```text
-//! r = s - q * γ * σ² * (T - t) - q * φ * f(T - t)
+//! C   = sqrt(σ² γ / (2 k A) · (1 + γ/k)^(1 + k/γ))
+//! δ_b ≈ (1/γ) ln(1 + γ/k) + (2q + 1)/2 · C
+//! δ_a ≈ (1/γ) ln(1 + γ/k) - (2q - 1)/2 · C
 //! ```
 //!
-//! Where:
-//! - `φ` (phi): Terminal inventory penalty parameter
-//! - `f(T-t)`: Penalty function that increases as terminal approaches
+//! # Units
 //!
-//! # Dynamic Risk Aversion
+//! - Prices, `δ` and `min_spread` are in the quote currency; `γ` and `k` are
+//!   per unit of price.
+//! - `volatility` is the absolute volatility of the price per √year, with a
+//!   365 day year (`Y = 31 536 000 s`), as in the Avellaneda-Stoikov module.
+//! - `A` is in fills per second; `terminal_time` and `current_time` are in
+//!   milliseconds.
+//! - The model trades one lot per fill. Inventory is given in base units and
+//!   divided by `lot_size` to obtain the lot count `q`. Rescaling prices to
+//!   one lot (`S' = L S`, `σ' = L σ`, `k' = k / L`) turns every formula above
+//!   into the same formula with `γ` replaced by `γ_L = γ · L`, where `L` is
+//!   `lot_size`. That substitution is applied before computing anything.
 //!
-//! The model also supports dynamic gamma scaling:
+//! Dimensional check, with `τ` the time to `T` in seconds:
+//!
 //! ```text
-//! γ_t = γ_0 * (1 + α * (1 - (T-t)/T))
+//! α [1/s] = k [1/price] · γ_L [1/price] · σ² [price²/year] / (2 · Y [s/year])
+//! η [1/s] = A [1/s] · (dimensionless)
+//! M τ     = dimensionless
 //! ```
 //!
-//! Where `α` controls how much gamma increases near terminal time.
+//! # Numerics
 //!
-//! # Scope
+//! Only ratios of `v` enter the quotes, so the computation evaluates
+//! `w = exp(-(M - c I) τ) · 1` with the Gershgorin bound `c = -2η ≤ λ_min(M)`.
+//! `M - c I` is positive semidefinite, so `w` never grows and nothing
+//! overflows at long horizons; the factor `exp(c τ)` cancels in every ratio.
+//! The exponential is applied to the vector directly: `τ` is split into `N`
+//! steps so that each step has infinity norm at most 2, each step is a Taylor
+//! series of the tridiagonal operator applied to the vector, and the vector
+//! is renormalized to a maximum of 1 after every step. This is scaling and
+//! squaring where the squaring is replaced by repeated application to the
+//! vector: it never forms the dense exponential (`(2Q + 1)²` entries, `O(n³)`
+//! per squaring), it costs `O(N · n)` and it does not allocate.
 //!
-//! This is an Avellaneda-Stoikov variant with an ad hoc terminal penalty
-//! `q * φ * f(τ)`; it is not the closed form solution of Guéant, Lehalle and
-//! Fernandez-Tapia (arXiv:1105.3115v5). That model bounds the inventory to
-//! `-Q..=Q` and obtains the quotes from `v(t) = exp(-M (T - t)) * 1`, which
-//! depends on the fill intensity scale `A`; this type has neither `A` nor
-//! `Q`, and its spread is the A-S spread floored at `min_spread`. With
-//! `φ = 0`, dynamic gamma off and the `min_spread` floor inactive (the A-S
-//! spread at or above it) it returns exactly the A-S quotes, which the paper
-//! (footnote 8) obtains as the first order expansion of its solution near
-//! `T`; when the floor binds, the spread is `min_spread` instead. Units follow the A-S
-//! module: absolute volatility per √year and times in milliseconds with a
-//! 365 day year. The comparison with a reference solution of the paper is in
+//! # f64 boundary
+//!
+//! `exp` and `ln` are evaluated in `f64` in the private helpers below. The
+//! inputs `γ`, `k`, `A`, `σ` and `lot_size` are converted from `Decimal`
+//! through a checked path; every intermediate that a quote depends on is
+//! checked finite and every `v` entry used is checked positive. Any failure
+//! is a [`MMError::NumericalError`], never a saturated or substituted value.
+//! The two distances `δ_b` and `δ_a` are converted back to `Decimal` through
+//! a checked conversion and the quotes are built with checked `Decimal`
+//! arithmetic. The validation against an independent reference solution
+//! (eigendecomposition and dense scaling and squaring) is in
 //! `tests/glft_reference.rs`.
 
 use crate::Decimal;
-use crate::types::decimal::{decimal_ln, decimal_powi};
 use crate::types::error::{MMError, MMResult};
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-const SECONDS_PER_MILLISECOND: Decimal = Decimal::from_parts(1, 0, 0, false, 3); // 0.001
-const SECONDS_PER_YEAR: Decimal = Decimal::from_parts(31_536_000, 0, 0, false, 0);
+/// Largest inventory bound `Q` accepted by [`GLFTConfig::new`], in lots.
+///
+/// It bounds the size of the generator to `2 Q + 1 = 401` rows, and
+/// therefore the cost of one quote.
+pub const MAX_INVENTORY_LOTS: u32 = 200;
 
-/// Penalty function type for terminal inventory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum PenaltyFunction {
-    /// Linear penalty: f(τ) = 1 - τ/T (increases linearly as terminal approaches).
-    #[default]
-    Linear,
-    /// Exponential penalty: f(τ) = exp(-τ/T) (faster increase near terminal).
-    ///
-    /// Evaluated as the second order Taylor polynomial `1 - x + x²/2` with
-    /// `x = τ/T`, not as the exponential itself.
-    Exponential,
-    /// Quadratic penalty: f(τ) = (1 - τ/T)² (slower start, faster end).
-    Quadratic,
-}
+/// Size of the stack buffers: `2 * MAX_INVENTORY_LOTS + 1`.
+const MAX_DIM: usize = 401;
 
-/// Configuration for the GLFT strategy.
+/// Seconds in the 365 day year used for the volatility.
+const SECONDS_PER_YEAR: f64 = 31_536_000.0;
+
+/// Milliseconds per second, as a `Decimal` divisor.
+const MILLISECONDS_PER_SECOND: Decimal = Decimal::from_parts(1000, 0, 0, false, 0);
+
+/// Largest infinity norm of one step of the matrix exponential.
+const STEP_NORM: f64 = 2.0;
+
+/// Largest number of steps of the matrix exponential. `N ≈ τ (α Q² + 4η) / 2`;
+/// beyond this the horizon is too stiff for the inventory bound and the
+/// quote is rejected rather than computed for an unbounded time.
+const MAX_EXPM_STEPS: u32 = 100_000;
+
+/// Largest order of the Taylor series of one step.
+const MAX_TAYLOR_ORDER: u32 = 60;
+
+/// Relative size of the last Taylor term at which the series stops.
+const TAYLOR_TOL: f64 = 1e-18;
+
+/// Configuration of the GLFT strategy.
 ///
 /// # Example
 ///
@@ -88,904 +129,930 @@ pub enum PenaltyFunction {
 /// use market_maker_rs::dec;
 ///
 /// let config = GLFTConfig::new(
-///     dec!(0.1),    // risk_aversion (gamma)
-///     dec!(1.5),    // order_intensity (k)
-///     dec!(0.05),   // terminal_penalty (phi)
-///     3_600_000,     // terminal_time (1 hour in ms)
-///     dec!(0.0001), // min_spread
+///     dec!(0.01),  // risk_aversion γ, per unit of price
+///     dec!(0.3),   // order_intensity_k, per unit of price
+///     dec!(0.9),   // intensity_scale_a, fills per second
+///     30,          // max_inventory_lots Q
+///     dec!(1),     // lot_size, base quantity per fill
+///     600_000,     // terminal_time, ms
+///     dec!(0),     // min_spread
 /// ).unwrap();
+/// assert_eq!(config.max_inventory_lots, 30);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct GLFTConfig {
-    /// Base risk aversion parameter (gamma).
+    /// Risk aversion `γ`, per unit of price. Positive.
     pub risk_aversion: Decimal,
 
-    /// Order intensity parameter (k).
-    pub order_intensity: Decimal,
+    /// Decay `k` of the fill intensity `A exp(-k δ)`, per unit of price. Positive.
+    pub order_intensity_k: Decimal,
 
-    /// Terminal inventory penalty parameter (phi).
-    pub terminal_penalty: Decimal,
+    /// Scale `A` of the fill intensity, in fills per second. Positive.
+    pub intensity_scale_a: Decimal,
 
-    /// Terminal time in milliseconds from session start.
+    /// Inventory bound `Q` in lots, `1..=MAX_INVENTORY_LOTS`.
+    pub max_inventory_lots: u32,
+
+    /// Base quantity of one lot (one fill in the model). Positive.
+    pub lot_size: Decimal,
+
+    /// Terminal time `T` in milliseconds from session start. Positive.
     pub terminal_time: u64,
 
-    /// Minimum spread constraint.
+    /// Smallest spread `ask - bid` quoted when both sides are posted. Not negative.
     pub min_spread: Decimal,
-
-    /// Whether to use dynamic gamma scaling.
-    pub dynamic_gamma: bool,
-
-    /// Dynamic gamma scaling factor (alpha).
-    /// Only used if `dynamic_gamma` is true.
-    pub gamma_scaling_factor: Decimal,
-
-    /// Penalty function type.
-    pub penalty_function: PenaltyFunction,
 }
 
 impl GLFTConfig {
-    /// Creates a new `GLFTConfig` with validation.
+    /// Creates a validated `GLFTConfig`.
     ///
     /// # Arguments
     ///
-    /// * `risk_aversion` - Base risk aversion (gamma), must be positive
-    /// * `order_intensity` - Order intensity (k), must be positive
-    /// * `terminal_penalty` - Terminal inventory penalty (phi), must be non-negative
-    /// * `terminal_time` - Terminal time in milliseconds, must be positive
-    /// * `min_spread` - Minimum spread constraint, must be non-negative
+    /// * `risk_aversion` - `γ`, per unit of price, positive
+    /// * `order_intensity_k` - `k`, per unit of price, positive
+    /// * `intensity_scale_a` - `A`, fills per second, positive
+    /// * `max_inventory_lots` - `Q`, in `1..=MAX_INVENTORY_LOTS`
+    /// * `lot_size` - base quantity of one lot, positive
+    /// * `terminal_time` - `T` in milliseconds, positive
+    /// * `min_spread` - smallest quoted spread, not negative
     ///
     /// # Errors
     ///
-    /// Returns `MMError::InvalidConfiguration` if parameters are invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use market_maker_rs::strategy::glft::GLFTConfig;
-    /// use market_maker_rs::dec;
-    ///
-    /// let config = GLFTConfig::new(
-    ///     dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)
-    /// ).unwrap();
-    /// ```
+    /// Returns [`MMError::InvalidConfiguration`] naming the first invalid
+    /// parameter and its value.
     pub fn new(
         risk_aversion: Decimal,
-        order_intensity: Decimal,
-        terminal_penalty: Decimal,
+        order_intensity_k: Decimal,
+        intensity_scale_a: Decimal,
+        max_inventory_lots: u32,
+        lot_size: Decimal,
         terminal_time: u64,
         min_spread: Decimal,
     ) -> MMResult<Self> {
-        if risk_aversion <= Decimal::ZERO {
-            return Err(MMError::InvalidConfiguration(
-                "risk_aversion must be positive".to_string(),
-            ));
-        }
-
-        if order_intensity <= Decimal::ZERO {
-            return Err(MMError::InvalidConfiguration(
-                "order_intensity must be positive".to_string(),
-            ));
-        }
-
-        if terminal_penalty < Decimal::ZERO {
-            return Err(MMError::InvalidConfiguration(
-                "terminal_penalty must be non-negative".to_string(),
-            ));
-        }
-
-        if terminal_time == 0 {
-            return Err(MMError::InvalidConfiguration(
-                "terminal_time must be positive".to_string(),
-            ));
-        }
-
-        if min_spread < Decimal::ZERO {
-            return Err(MMError::InvalidConfiguration(
-                "min_spread must be non-negative".to_string(),
-            ));
-        }
-
-        Ok(Self {
+        let config = Self {
             risk_aversion,
-            order_intensity,
-            terminal_penalty,
+            order_intensity_k,
+            intensity_scale_a,
+            max_inventory_lots,
+            lot_size,
             terminal_time,
             min_spread,
-            dynamic_gamma: false,
-            gamma_scaling_factor: Decimal::ONE,
-            penalty_function: PenaltyFunction::default(),
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
 
-    /// Enables dynamic gamma scaling.
+    /// Checks the invariants of [`GLFTConfig::new`]. The fields are public,
+    /// so every quote calls this again before using them.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `scaling_factor` - Alpha parameter for gamma scaling (typically 0.5 to 2.0)
-    #[must_use]
-    pub fn with_dynamic_gamma(mut self, scaling_factor: Decimal) -> Self {
-        self.dynamic_gamma = true;
-        self.gamma_scaling_factor = scaling_factor;
-        self
-    }
-
-    /// Sets the penalty function type.
-    #[must_use]
-    pub fn with_penalty_function(mut self, penalty_function: PenaltyFunction) -> Self {
-        self.penalty_function = penalty_function;
-        self
+    /// Returns [`MMError::InvalidConfiguration`] naming the first invalid
+    /// parameter and its value.
+    pub fn validate(&self) -> MMResult<()> {
+        let positive = [
+            ("risk_aversion", self.risk_aversion),
+            ("order_intensity_k", self.order_intensity_k),
+            ("intensity_scale_a", self.intensity_scale_a),
+            ("lot_size", self.lot_size),
+        ];
+        for (name, value) in positive {
+            if value <= Decimal::ZERO {
+                return Err(MMError::InvalidConfiguration(format!(
+                    "{name} must be positive, got {value}"
+                )));
+            }
+        }
+        if self.max_inventory_lots == 0 || self.max_inventory_lots > MAX_INVENTORY_LOTS {
+            return Err(MMError::InvalidConfiguration(format!(
+                "max_inventory_lots must be in 1..={MAX_INVENTORY_LOTS}, got {}",
+                self.max_inventory_lots
+            )));
+        }
+        if self.terminal_time == 0 {
+            return Err(MMError::InvalidConfiguration(
+                "terminal_time must be positive, got 0".to_string(),
+            ));
+        }
+        if self.min_spread < Decimal::ZERO {
+            return Err(MMError::InvalidConfiguration(format!(
+                "min_spread must be non-negative, got {}",
+                self.min_spread
+            )));
+        }
+        Ok(())
     }
 }
 
-/// GLFT strategy implementation.
-///
-/// Extends the Avellaneda-Stoikov model with terminal inventory penalty.
+/// GLFT quotes. A side is `None` when the inventory bound forbids it: no bid
+/// at `q = Q` and no ask at `q = -Q`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GlftQuotes {
+    /// Bid price, `None` at the upper inventory bound.
+    pub bid: Option<Decimal>,
+    /// Ask price, `None` at the lower inventory bound.
+    pub ask: Option<Decimal>,
+}
+
+/// GLFT strategy: quotes of Theorem 1 of Guéant, Lehalle and Fernandez-Tapia.
 ///
 /// # Example
 ///
 /// ```rust
-/// use market_maker_rs::strategy::glft::{GLFTStrategy, GLFTConfig};
+/// use market_maker_rs::strategy::glft::{GLFTConfig, GLFTStrategy};
 /// use market_maker_rs::dec;
 ///
 /// let config = GLFTConfig::new(
-///     dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)
+///     dec!(0.01), dec!(0.3), dec!(0.9), 30, dec!(1), 600_000, dec!(0)
 /// ).unwrap();
+/// // sigma = 0.3 per sqrt(second), expressed per sqrt(year).
+/// let sigma = dec!(1684.7);
 ///
-/// let reservation = GLFTStrategy::calculate_reservation_price(
-///     dec!(100.0),  // mid_price
-///     dec!(10.0),   // inventory
-///     &config,
-///     dec!(0.2),    // volatility
-///     1_800_000,     // current_time (halfway through session)
+/// let long = GLFTStrategy::calculate_optimal_quotes(
+///     dec!(1000), dec!(5), &config, sigma, 0
 /// ).unwrap();
-///
-/// // With positive inventory and terminal penalty, reservation < mid_price
-/// assert!(reservation < dec!(100.0));
+/// let flat = GLFTStrategy::calculate_optimal_quotes(
+///     dec!(1000), dec!(0), &config, sigma, 0
+/// ).unwrap();
+/// // A long inventory lowers both quotes.
+/// assert!(long.bid.unwrap() < flat.bid.unwrap());
+/// assert!(long.ask.unwrap() < flat.ask.unwrap());
 /// ```
 pub struct GLFTStrategy;
 
 impl GLFTStrategy {
-    /// Calculates the reservation price with terminal inventory penalty.
+    /// Optimal quotes of Theorem 1 at `current_time`.
     ///
-    /// # Formula
-    ///
-    /// ```text
-    /// r = s - q * γ_t * σ² * τ - q * φ * f(τ)
-    /// ```
-    ///
-    /// Where:
-    /// - `s`: mid price
-    /// - `q`: inventory
-    /// - `γ_t`: effective gamma (possibly dynamic)
-    /// - `σ`: volatility
-    /// - `τ`: time to terminal (T - t)
-    /// - `φ`: terminal penalty
-    /// - `f(τ)`: penalty function
-    ///
-    /// # Arguments
-    ///
-    /// * `mid_price` - Current mid price
-    /// * `inventory` - Current inventory position
-    /// * `config` - GLFT configuration
-    /// * `volatility` - Annualized volatility
-    /// * `current_time` - Current time in milliseconds from session start
+    /// `inventory` is in base units and must be an integer number of lots
+    /// within `±Q` lots. If both sides are posted and `ask - bid` is below
+    /// `min_spread`, both quotes move away from the mid by half the
+    /// difference. After `terminal_time` the time to `T` is zero.
     ///
     /// # Errors
     ///
-    /// Returns error if inputs are invalid.
-    pub fn calculate_reservation_price(
-        mid_price: Decimal,
-        inventory: Decimal,
-        config: &GLFTConfig,
-        volatility: Decimal,
-        current_time: u64,
-    ) -> MMResult<Decimal> {
-        if mid_price <= Decimal::ZERO {
-            return Err(MMError::InvalidMarketState(
-                "mid_price must be positive".to_string(),
-            ));
-        }
-
-        if volatility <= Decimal::ZERO {
-            return Err(MMError::InvalidMarketState(
-                "volatility must be positive".to_string(),
-            ));
-        }
-
-        let time_to_terminal_ms = config.terminal_time.saturating_sub(current_time);
-
-        // Get effective gamma (possibly dynamic)
-        let effective_gamma = Self::calculate_dynamic_gamma(
-            config.risk_aversion,
-            time_to_terminal_ms,
-            config.terminal_time,
-            config.dynamic_gamma,
-            config.gamma_scaling_factor,
-        );
-
-        // Convert time to years
-        let time_to_terminal_years = Self::ms_to_years(time_to_terminal_ms);
-
-        // Standard A-S term: q * γ * σ² * τ
-        let volatility_squared = decimal_powi(volatility, 2)?;
-        let as_adjustment =
-            inventory * effective_gamma * volatility_squared * time_to_terminal_years;
-
-        // Terminal penalty term: q * φ * f(τ)
-        let penalty_value = Self::calculate_penalty_function(
-            time_to_terminal_ms,
-            config.terminal_time,
-            config.penalty_function,
-        );
-        let terminal_adjustment = inventory * config.terminal_penalty * penalty_value;
-
-        // r = s - as_adjustment - terminal_adjustment
-        let reservation_price = mid_price - as_adjustment - terminal_adjustment;
-
-        Ok(reservation_price)
-    }
-
-    /// Calculates the optimal spread with GLFT adjustments.
-    ///
-    /// # Formula
-    ///
-    /// ```text
-    /// δ = max(min_spread, γ_t * σ² * τ + (2/γ_t) * ln(1 + γ_t/k))
-    /// ```
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - GLFT configuration
-    /// * `volatility` - Annualized volatility
-    /// * `current_time` - Current time in milliseconds from session start
-    ///
-    /// # Errors
-    ///
-    /// Returns error if inputs are invalid.
-    pub fn calculate_optimal_spread(
-        config: &GLFTConfig,
-        volatility: Decimal,
-        current_time: u64,
-    ) -> MMResult<Decimal> {
-        if volatility <= Decimal::ZERO {
-            return Err(MMError::InvalidMarketState(
-                "volatility must be positive".to_string(),
-            ));
-        }
-
-        let time_to_terminal_ms = config.terminal_time.saturating_sub(current_time);
-
-        // Get effective gamma
-        let effective_gamma = Self::calculate_dynamic_gamma(
-            config.risk_aversion,
-            time_to_terminal_ms,
-            config.terminal_time,
-            config.dynamic_gamma,
-            config.gamma_scaling_factor,
-        );
-
-        // Convert time to years
-        let time_to_terminal_years = Self::ms_to_years(time_to_terminal_ms);
-
-        // Inventory risk term: γ * σ² * τ
-        let volatility_squared = decimal_powi(volatility, 2)?;
-        let inventory_risk_term = effective_gamma * volatility_squared * time_to_terminal_years;
-
-        // Adverse selection term: (2/γ) * ln(1 + γ/k)
-        let adverse_selection_inner = Decimal::ONE + effective_gamma / config.order_intensity;
-        let adverse_selection_ln = decimal_ln(adverse_selection_inner)?;
-        let adverse_selection_term = (Decimal::TWO / effective_gamma) * adverse_selection_ln;
-
-        let spread = inventory_risk_term + adverse_selection_term;
-
-        // Apply minimum spread constraint
-        Ok(spread.max(config.min_spread))
-    }
-
-    /// Calculates optimal bid and ask quotes.
-    ///
-    /// # Arguments
-    ///
-    /// * `mid_price` - Current mid price
-    /// * `inventory` - Current inventory position
-    /// * `config` - GLFT configuration
-    /// * `volatility` - Annualized volatility
-    /// * `current_time` - Current time in milliseconds from session start
-    ///
-    /// # Returns
-    ///
-    /// Tuple of (bid_price, ask_price).
-    ///
-    /// # Errors
-    ///
-    /// Returns error if inputs are invalid or quotes would be invalid.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use market_maker_rs::strategy::glft::{GLFTStrategy, GLFTConfig};
-    /// use market_maker_rs::dec;
-    ///
-    /// let config = GLFTConfig::new(
-    ///     dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)
-    /// ).unwrap();
-    ///
-    /// let (bid, ask) = GLFTStrategy::calculate_optimal_quotes(
-    ///     dec!(100.0), dec!(0.0), &config, dec!(0.2), 0
-    /// ).unwrap();
-    ///
-    /// assert!(bid < ask);
-    /// ```
+    /// - [`MMError::InvalidConfiguration`] if `config` is invalid.
+    /// - [`MMError::InvalidMarketState`] if `mid_price` or `volatility` is not
+    ///   positive.
+    /// - [`MMError::InvalidPositionUpdate`] if `inventory` is not a multiple of
+    ///   `lot_size` or is outside `±Q` lots.
+    /// - [`MMError::NumericalError`] if a parameter does not convert to a
+    ///   finite `f64`, the value vector underflows or is not finite, the
+    ///   horizon needs more than 100 000 steps, or a result does not convert
+    ///   back to `Decimal`.
+    /// - [`MMError::InvalidQuoteGeneration`] if the bid is not positive or
+    ///   the quotes cross.
+    #[must_use = "the quotes are the result of the computation"]
     pub fn calculate_optimal_quotes(
         mid_price: Decimal,
         inventory: Decimal,
         config: &GLFTConfig,
         volatility: Decimal,
         current_time: u64,
-    ) -> MMResult<(Decimal, Decimal)> {
-        let reservation_price = Self::calculate_reservation_price(
-            mid_price,
-            inventory,
-            config,
-            volatility,
-            current_time,
-        )?;
-
-        let spread = Self::calculate_optimal_spread(config, volatility, current_time)?;
-
-        let half_spread = spread / Decimal::TWO;
-        let bid_price = reservation_price - half_spread;
-        let ask_price = reservation_price + half_spread;
-
-        // Validate quotes
-        if bid_price >= ask_price {
-            return Err(MMError::InvalidQuoteGeneration(
-                "bid price must be less than ask price".to_string(),
-            ));
-        }
-
-        if bid_price <= Decimal::ZERO {
-            return Err(MMError::InvalidQuoteGeneration(
-                "bid price must be positive".to_string(),
-            ));
-        }
-
-        Ok((bid_price, ask_price))
+    ) -> MMResult<GlftQuotes> {
+        let (model, q) = Model::new(mid_price, inventory, config, volatility)?;
+        let tau_s = seconds_to_terminal(config.terminal_time, current_time)?;
+        let mut v = [0.0_f64; MAX_DIM];
+        let n = model.value_vector(tau_s, &mut v)?;
+        let w = v.get(..n).ok_or_else(|| numerical("value vector size"))?;
+        let (bid, ask) = model.exact_distances(w, q)?;
+        build_quotes(mid_price, bid, ask, config.min_spread)
     }
 
-    /// Calculates dynamic gamma based on time to terminal.
+    /// Closed form approximation after Proposition 3, valid for large
+    /// `T - t`; it does not depend on the time.
     ///
-    /// # Formula
+    /// The same inventory rules, bounds and `min_spread` as
+    /// [`GLFTStrategy::calculate_optimal_quotes`] apply.
     ///
-    /// ```text
-    /// γ_t = γ_0 * (1 + α * (1 - τ/T))
-    /// ```
+    /// # Errors
     ///
-    /// Where:
-    /// - `γ_0`: base gamma
-    /// - `α`: scaling factor
-    /// - `τ`: time to terminal
-    /// - `T`: total session time
-    ///
-    /// # Arguments
-    ///
-    /// * `base_gamma` - Base risk aversion parameter
-    /// * `time_to_terminal_ms` - Time remaining until terminal
-    /// * `total_session_ms` - Total session duration
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use market_maker_rs::strategy::glft::GLFTStrategy;
-    /// use market_maker_rs::dec;
-    ///
-    /// // At session start (full time remaining), gamma = base
-    /// let gamma_start = GLFTStrategy::calculate_dynamic_gamma(
-    ///     dec!(0.1), 3_600_000, 3_600_000, true, dec!(1.0)
-    /// );
-    /// assert_eq!(gamma_start, dec!(0.1));
-    ///
-    /// // At session end (no time remaining), gamma = base * (1 + alpha)
-    /// let gamma_end = GLFTStrategy::calculate_dynamic_gamma(
-    ///     dec!(0.1), 0, 3_600_000, true, dec!(1.0)
-    /// );
-    /// assert_eq!(gamma_end, dec!(0.2)); // 0.1 * (1 + 1.0)
-    /// ```
-    #[must_use]
-    pub fn calculate_dynamic_gamma(
-        base_gamma: Decimal,
-        time_to_terminal_ms: u64,
-        total_session_ms: u64,
-        dynamic_enabled: bool,
-        scaling_factor: Decimal,
-    ) -> Decimal {
-        if !dynamic_enabled || total_session_ms == 0 {
-            return base_gamma;
-        }
-
-        let time_ratio = Decimal::from(time_to_terminal_ms) / Decimal::from(total_session_ms);
-        let time_factor = Decimal::ONE - time_ratio;
-
-        // γ_t = γ_0 * (1 + α * (1 - τ/T))
-        base_gamma * (Decimal::ONE + scaling_factor * time_factor)
+    /// The same as [`GLFTStrategy::calculate_optimal_quotes`], except that
+    /// no value vector is computed.
+    #[must_use = "the quotes are the result of the computation"]
+    pub fn closed_form_quotes(
+        mid_price: Decimal,
+        inventory: Decimal,
+        config: &GLFTConfig,
+        volatility: Decimal,
+    ) -> MMResult<GlftQuotes> {
+        let (model, q) = Model::new(mid_price, inventory, config, volatility)?;
+        let (bid, ask) = model.closed_form_distances(q)?;
+        build_quotes(mid_price, bid, ask, config.min_spread)
     }
 
-    /// Calculates the penalty function value.
+    /// GLFT quotes next to the Avellaneda-Stoikov quotes for the same
+    /// `γ`, `k`, volatility and time to `T`.
     ///
-    /// # Arguments
-    ///
-    /// * `time_to_terminal_ms` - Time remaining until terminal
-    /// * `total_session_ms` - Total session duration
-    /// * `penalty_type` - Type of penalty function
-    fn calculate_penalty_function(
-        time_to_terminal_ms: u64,
-        total_session_ms: u64,
-        penalty_type: PenaltyFunction,
-    ) -> Decimal {
-        if total_session_ms == 0 {
-            return Decimal::ONE;
-        }
-
-        let time_ratio = Decimal::from(time_to_terminal_ms) / Decimal::from(total_session_ms);
-
-        match penalty_type {
-            PenaltyFunction::Linear => {
-                // f(τ) = 1 - τ/T
-                Decimal::ONE - time_ratio
-            }
-            PenaltyFunction::Exponential => {
-                // f(τ) = exp(-τ/T) ≈ 1 - τ/T + (τ/T)²/2 for small values
-                // Using approximation to avoid exp function
-                let neg_ratio = -time_ratio;
-                // Simple approximation: e^x ≈ 1 + x + x²/2 for small x
-                Decimal::ONE + neg_ratio + (neg_ratio * neg_ratio) / Decimal::TWO
-            }
-            PenaltyFunction::Quadratic => {
-                // f(τ) = (1 - τ/T)²
-                let factor = Decimal::ONE - time_ratio;
-                factor * factor
-            }
-        }
-    }
-
-    /// Converts milliseconds to years.
-    fn ms_to_years(ms: u64) -> Decimal {
-        let ms_dec = Decimal::from(ms);
-        (ms_dec * SECONDS_PER_MILLISECOND) / SECONDS_PER_YEAR
-    }
-
-    /// Compares GLFT quotes with standard A-S quotes.
-    ///
-    /// Useful for understanding the impact of terminal penalty.
+    /// The A-S quotes come from
+    /// [`avellaneda_stoikov::calculate_optimal_quotes`](crate::strategy::avellaneda_stoikov::calculate_optimal_quotes)
+    /// with `inventory` in base units; the paper (footnote 8) obtains them as
+    /// the first order expansion of the GLFT quotes near `T`.
     ///
     /// # Returns
     ///
-    /// Tuple of ((glft_bid, glft_ask), (as_bid, as_ask)).
+    /// `(glft, (as_bid, as_ask))`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`GLFTStrategy::calculate_optimal_quotes`] or of the A-S
+    /// computation.
+    #[must_use = "the quotes are the result of the computation"]
     pub fn compare_with_avellaneda_stoikov(
         mid_price: Decimal,
         inventory: Decimal,
         config: &GLFTConfig,
         volatility: Decimal,
         current_time: u64,
-    ) -> MMResult<((Decimal, Decimal), (Decimal, Decimal))> {
-        // GLFT quotes
-        let glft_quotes =
+    ) -> MMResult<(GlftQuotes, (Decimal, Decimal))> {
+        let glft =
             Self::calculate_optimal_quotes(mid_price, inventory, config, volatility, current_time)?;
-
-        // A-S quotes (using GLFT config but without terminal penalty)
-        let as_config = GLFTConfig {
-            terminal_penalty: Decimal::ZERO,
-            dynamic_gamma: false,
-            ..config.clone()
-        };
-        let as_quotes = Self::calculate_optimal_quotes(
+        let as_quotes = crate::strategy::avellaneda_stoikov::calculate_optimal_quotes(
             mid_price,
             inventory,
-            &as_config,
+            config.risk_aversion,
             volatility,
-            current_time,
+            config.terminal_time.saturating_sub(current_time),
+            config.order_intensity_k,
         )?;
-
-        Ok((glft_quotes, as_quotes))
+        Ok((glft, as_quotes))
     }
 }
 
+#[cold]
+#[inline(never)]
+fn numerical(what: &str) -> MMError {
+    MMError::NumericalError(format!("glft: {what}"))
+}
+
+/// Checked `Decimal` to finite `f64`.
+fn to_f64(name: &str, value: Decimal) -> MMResult<f64> {
+    value
+        .to_f64()
+        .filter(|x| x.is_finite())
+        .ok_or_else(|| numerical(&format!("{name} {value} does not convert to f64")))
+}
+
+/// Checked finite `f64` to `Decimal`.
+fn to_decimal(name: &str, value: f64) -> MMResult<Decimal> {
+    if !value.is_finite() {
+        return Err(numerical(&format!("{name} is not finite: {value}")));
+    }
+    Decimal::from_f64(value)
+        .ok_or_else(|| numerical(&format!("{name} {value} does not convert to Decimal")))
+}
+
+/// Checks that an `f64` intermediate is finite and positive.
+fn positive_finite(name: &str, value: f64) -> MMResult<f64> {
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(numerical(&format!(
+            "{name} must be finite and positive, got {value}"
+        )))
+    }
+}
+
+/// Time to `T` in seconds, zero after `T`.
+fn seconds_to_terminal(terminal_time: u64, current_time: u64) -> MMResult<f64> {
+    let tau_ms = Decimal::from(terminal_time.saturating_sub(current_time));
+    let tau_s = tau_ms
+        .checked_div(MILLISECONDS_PER_SECOND)
+        .ok_or_else(|| numerical("time to terminal"))?;
+    to_f64("time to terminal", tau_s)
+}
+
+/// Model parameters in `f64`, per second and per lot.
+#[derive(Debug, Clone, Copy)]
+struct Model {
+    /// `k`, per unit of price.
+    k: f64,
+    /// `γ_L = γ · lot_size`, per unit of price.
+    gamma: f64,
+    /// `A`, per second.
+    a: f64,
+    /// `σ²` per second.
+    sigma2: f64,
+    /// `α`, per second.
+    alpha: f64,
+    /// `η`, per second.
+    eta: f64,
+    /// `(1/γ_L) ln(1 + γ_L/k)`.
+    base: f64,
+    /// `Q`.
+    q_max: u32,
+}
+
+impl Model {
+    /// Validates the inputs and returns the model and the inventory in lots.
+    fn new(
+        mid_price: Decimal,
+        inventory: Decimal,
+        config: &GLFTConfig,
+        volatility: Decimal,
+    ) -> MMResult<(Self, i64)> {
+        config.validate()?;
+        if mid_price <= Decimal::ZERO {
+            return Err(MMError::InvalidMarketState(format!(
+                "mid_price must be positive, got {mid_price}"
+            )));
+        }
+        if volatility <= Decimal::ZERO {
+            return Err(MMError::InvalidMarketState(format!(
+                "volatility must be positive, got {volatility}"
+            )));
+        }
+        let q = inventory_lots(inventory, config)?;
+
+        let k = positive_finite("k", to_f64("k", config.order_intensity_k)?)?;
+        let gamma_raw = to_f64("risk_aversion", config.risk_aversion)?;
+        let lot = to_f64("lot_size", config.lot_size)?;
+        let gamma = positive_finite("risk_aversion * lot_size", gamma_raw * lot)?;
+        let a = positive_finite("A", to_f64("A", config.intensity_scale_a)?)?;
+        let sigma = to_f64("volatility", volatility)?;
+        let sigma2 = positive_finite("sigma^2 per second", sigma * sigma / SECONDS_PER_YEAR)?;
+
+        let ratio = gamma / k;
+        let log1p_ratio = positive_finite("ln(1 + gamma/k)", ratio.ln_1p())?;
+        let alpha = positive_finite("alpha", k * gamma * sigma2 / 2.0)?;
+        // η = A (1 + γ/k)^(-(1 + k/γ)) = A exp(-(1 + k/γ) ln(1 + γ/k)).
+        let eta = positive_finite("eta", a * (-(1.0 + k / gamma) * log1p_ratio).exp())?;
+        let base = positive_finite("base distance", log1p_ratio / gamma)?;
+        Ok((
+            Self {
+                k,
+                gamma,
+                a,
+                sigma2,
+                alpha,
+                eta,
+                base,
+                q_max: config.max_inventory_lots,
+            },
+            q,
+        ))
+    }
+
+    /// Number of entries `2 Q + 1`.
+    fn dim(&self) -> MMResult<usize> {
+        let n = self
+            .q_max
+            .checked_mul(2)
+            .and_then(|x| x.checked_add(1))
+            .ok_or_else(|| numerical("dimension"))?;
+        let n = usize::try_from(n).map_err(|_| numerical("dimension"))?;
+        if n > MAX_DIM {
+            return Err(numerical("dimension above MAX_DIM"));
+        }
+        Ok(n)
+    }
+
+    /// Diagonal of `M - c I = M + 2η I`: `α q² + 2η` for `q = -Q..=Q`.
+    fn fill_shifted_diagonal(&self, diag: &mut [f64]) {
+        let mut qf = -f64::from(self.q_max);
+        for d in diag.iter_mut() {
+            *d = self.alpha * qf * qf + 2.0 * self.eta;
+            qf += 1.0;
+        }
+    }
+
+    /// Writes `w = exp(-(M - c I) τ) · 1`, normalized to a maximum of 1, in
+    /// the first `2 Q + 1` entries of `out` and returns that count.
+    fn value_vector(&self, tau_s: f64, out: &mut [f64; MAX_DIM]) -> MMResult<usize> {
+        let n = self.dim()?;
+        let v = out
+            .get_mut(..n)
+            .ok_or_else(|| numerical("value vector size"))?;
+        v.fill(1.0);
+        if tau_s <= 0.0 {
+            return Ok(n);
+        }
+        let q_max = f64::from(self.q_max);
+        // Infinity norm of (M - c I) τ: largest diagonal plus 2η off diagonal.
+        let norm = tau_s * (self.alpha * q_max * q_max + 4.0 * self.eta);
+        let steps_f = positive_finite("expm norm", norm)?;
+        let steps_f = (steps_f / STEP_NORM).ceil().max(1.0);
+        let steps = Decimal::from_f64(steps_f)
+            .and_then(|s| s.to_u32())
+            .filter(|s| *s <= MAX_EXPM_STEPS)
+            .ok_or_else(|| {
+                numerical(&format!(
+                    "horizon too stiff: {steps_f} steps above {MAX_EXPM_STEPS}; reduce max_inventory_lots or terminal_time"
+                ))
+            })?;
+        let dt = tau_s / f64::from(steps);
+
+        let mut diag_buf = [0.0_f64; MAX_DIM];
+        let mut term_buf = [0.0_f64; MAX_DIM];
+        let mut next_buf = [0.0_f64; MAX_DIM];
+        let diag = diag_buf
+            .get_mut(..n)
+            .ok_or_else(|| numerical("diagonal size"))?;
+        self.fill_shifted_diagonal(diag);
+        for d in diag.iter_mut() {
+            *d *= dt;
+        }
+        let eta_dt = self.eta * dt;
+        let term = term_buf
+            .get_mut(..n)
+            .ok_or_else(|| numerical("term size"))?;
+        let next = next_buf
+            .get_mut(..n)
+            .ok_or_else(|| numerical("term size"))?;
+
+        for _ in 0..steps {
+            taylor_step(v, diag, eta_dt, term, next)?;
+            let max = v.iter().copied().fold(0.0_f64, f64::max);
+            let max = positive_finite("value vector maximum", max)?;
+            for x in v.iter_mut() {
+                *x /= max;
+            }
+        }
+        Ok(n)
+    }
+
+    /// `(δ_b, δ_a)` of Theorem 1 from the value vector `w` over `-Q..=Q`.
+    fn exact_distances(&self, w: &[f64], q: i64) -> MMResult<(Option<f64>, Option<f64>)> {
+        let q_max = i64::from(self.q_max);
+        let at = |q: i64| -> MMResult<f64> {
+            let i = q
+                .checked_add(q_max)
+                .and_then(|i| usize::try_from(i).ok())
+                .ok_or_else(|| numerical("inventory index"))?;
+            let x = w
+                .get(i)
+                .copied()
+                .ok_or_else(|| numerical("inventory index"))?;
+            positive_finite("value vector entry", x)
+        };
+        let vq = at(q)?;
+        let distance = |neighbour: f64| -> MMResult<f64> {
+            let d = (vq.ln() - neighbour.ln()) / self.k + self.base;
+            if d.is_finite() {
+                Ok(d)
+            } else {
+                Err(numerical(&format!("quote distance is not finite: {d}")))
+            }
+        };
+        let bid = if q < q_max {
+            Some(distance(at(q + 1)?)?)
+        } else {
+            None
+        };
+        let ask = if q > -q_max {
+            Some(distance(at(q - 1)?)?)
+        } else {
+            None
+        };
+        Ok((bid, ask))
+    }
+
+    /// `(δ_b, δ_a)` of the closed form after Proposition 3.
+    fn closed_form_distances(&self, q: i64) -> MMResult<(Option<f64>, Option<f64>)> {
+        let ratio = self.gamma / self.k;
+        let growth = ((1.0 + self.k / self.gamma) * ratio.ln_1p()).exp();
+        let c = (self.sigma2 * self.gamma / (2.0 * self.k * self.a) * growth).sqrt();
+        let c = positive_finite("closed form slope", c)?;
+        let q_max = i64::from(self.q_max);
+        let qf = to_f64("inventory", Decimal::from(q))?;
+        let bid = (q < q_max).then(|| self.base + (2.0 * qf + 1.0) / 2.0 * c);
+        let ask = (q > -q_max).then(|| self.base - (2.0 * qf - 1.0) / 2.0 * c);
+        for d in [bid, ask].into_iter().flatten() {
+            if !d.is_finite() {
+                return Err(numerical(&format!("quote distance is not finite: {d}")));
+            }
+        }
+        Ok((bid, ask))
+    }
+}
+
+/// One Taylor step `v ← exp(B) v` with `B = -diag + eta_dt (shift up + shift down)`.
+fn taylor_step(
+    v: &mut [f64],
+    diag: &[f64],
+    eta_dt: f64,
+    term: &mut [f64],
+    next: &mut [f64],
+) -> MMResult<()> {
+    term.copy_from_slice(v);
+    for order in 1..=MAX_TAYLOR_ORDER {
+        let inv = 1.0 / f64::from(order);
+        apply_operator(term, diag, eta_dt, next);
+        let mut term_max = 0.0_f64;
+        let mut sum_max = 0.0_f64;
+        for ((t, x), s) in term.iter_mut().zip(next.iter()).zip(v.iter_mut()) {
+            *t = x * inv;
+            *s += *t;
+            term_max = term_max.max(t.abs());
+            sum_max = sum_max.max(s.abs());
+        }
+        if !(term_max.is_finite() && sum_max.is_finite()) {
+            return Err(numerical("taylor series is not finite"));
+        }
+        if term_max <= TAYLOR_TOL * sum_max {
+            return Ok(());
+        }
+    }
+    Err(numerical("taylor series did not converge"))
+}
+
+/// `out = B x` for the tridiagonal `B` with diagonal `-diag` and off diagonals `eta_dt`.
+fn apply_operator(x: &[f64], diag: &[f64], eta_dt: f64, out: &mut [f64]) {
+    for (i, (o, d)) in out.iter_mut().zip(diag).enumerate() {
+        let left = i
+            .checked_sub(1)
+            .and_then(|j| x.get(j))
+            .copied()
+            .unwrap_or(0.0);
+        let right = i
+            .checked_add(1)
+            .and_then(|j| x.get(j))
+            .copied()
+            .unwrap_or(0.0);
+        let centre = x.get(i).copied().unwrap_or(0.0);
+        *o = eta_dt * (left + right) - d * centre;
+    }
+}
+
+/// Inventory in lots, checked on the lot grid and within `±Q`.
+fn inventory_lots(inventory: Decimal, config: &GLFTConfig) -> MMResult<i64> {
+    let lots = inventory
+        .checked_div(config.lot_size)
+        .ok_or_else(|| numerical("inventory / lot_size"))?;
+    if !lots.fract().is_zero() {
+        return Err(MMError::InvalidPositionUpdate(format!(
+            "inventory {inventory} is not a multiple of lot_size {}",
+            config.lot_size
+        )));
+    }
+    let q_max = i64::from(config.max_inventory_lots);
+    match lots.to_i64() {
+        Some(q) if q.abs() <= q_max => Ok(q),
+        Some(_) | None => Err(MMError::InvalidPositionUpdate(format!(
+            "inventory {inventory} is {lots} lots, outside the bound of {q_max} lots"
+        ))),
+    }
+}
+
+/// Builds the quotes from the distances, applies `min_spread` and checks them.
+fn build_quotes(
+    mid_price: Decimal,
+    bid_distance: Option<f64>,
+    ask_distance: Option<f64>,
+    min_spread: Decimal,
+) -> MMResult<GlftQuotes> {
+    let overflow = || numerical("quote overflows Decimal");
+    let mut bid = match bid_distance {
+        Some(d) => Some(
+            mid_price
+                .checked_sub(to_decimal("bid distance", d)?)
+                .ok_or_else(overflow)?,
+        ),
+        None => None,
+    };
+    let mut ask = match ask_distance {
+        Some(d) => Some(
+            mid_price
+                .checked_add(to_decimal("ask distance", d)?)
+                .ok_or_else(overflow)?,
+        ),
+        None => None,
+    };
+    if let (Some(b), Some(a)) = (bid, ask) {
+        let spread = a.checked_sub(b).ok_or_else(overflow)?;
+        if spread < min_spread {
+            let half = min_spread
+                .checked_sub(spread)
+                .and_then(|x| x.checked_div(Decimal::TWO))
+                .ok_or_else(overflow)?;
+            bid = Some(b.checked_sub(half).ok_or_else(overflow)?);
+            ask = Some(a.checked_add(half).ok_or_else(overflow)?);
+        }
+    }
+    if let Some(b) = bid
+        && b <= Decimal::ZERO
+    {
+        return Err(MMError::InvalidQuoteGeneration(format!(
+            "bid price must be positive, got {b}"
+        )));
+    }
+    if let Some(a) = ask
+        && a <= Decimal::ZERO
+    {
+        return Err(MMError::InvalidQuoteGeneration(format!(
+            "ask price must be positive, got {a}"
+        )));
+    }
+    if let (Some(b), Some(a)) = (bid, ask)
+        && b >= a
+    {
+        return Err(MMError::InvalidQuoteGeneration(format!(
+            "bid {b} must be below ask {a}"
+        )));
+    }
+    Ok(GlftQuotes { bid, ask })
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::dec;
 
-    #[test]
-    fn test_config_valid() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001));
-        assert!(config.is_ok());
+    /// σ = 0.3 per √s expressed per √year: 0.3 · √31 536 000.
+    fn paper_sigma() -> Decimal {
+        Decimal::from_f64(0.3 * SECONDS_PER_YEAR.sqrt()).unwrap()
     }
 
-    #[test]
-    fn test_config_invalid_risk_aversion() {
-        let config = GLFTConfig::new(dec!(0.0), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001));
-        assert!(config.is_err());
-
-        let config = GLFTConfig::new(dec!(-0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001));
-        assert!(config.is_err());
-    }
-
-    #[test]
-    fn test_config_invalid_order_intensity() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(0.0), dec!(0.05), 3_600_000, dec!(0.0001));
-        assert!(config.is_err());
-    }
-
-    #[test]
-    fn test_config_invalid_terminal_penalty() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(-0.05), 3_600_000, dec!(0.0001));
-        assert!(config.is_err());
-    }
-
-    #[test]
-    fn test_config_invalid_terminal_time() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 0, dec!(0.0001));
-        assert!(config.is_err());
-    }
-
-    #[test]
-    fn test_config_with_dynamic_gamma() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001))
-            .unwrap()
-            .with_dynamic_gamma(dec!(1.5));
-
-        assert!(config.dynamic_gamma);
-        assert_eq!(config.gamma_scaling_factor, dec!(1.5));
-    }
-
-    #[test]
-    fn test_config_with_penalty_function() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001))
-            .unwrap()
-            .with_penalty_function(PenaltyFunction::Exponential);
-
-        assert_eq!(config.penalty_function, PenaltyFunction::Exponential);
-    }
-
-    #[test]
-    fn test_reservation_price_flat_inventory() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
-
-        let reservation = GLFTStrategy::calculate_reservation_price(
-            dec!(100.0),
-            Decimal::ZERO,
-            &config,
-            dec!(0.2),
-            0,
+    fn paper_config(q_max: u32) -> GLFTConfig {
+        GLFTConfig::new(
+            dec!(0.01),
+            dec!(0.3),
+            dec!(0.9),
+            q_max,
+            dec!(1),
+            600_000,
+            dec!(0),
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        // With flat inventory, reservation should equal mid_price
-        assert!((reservation - dec!(100.0)).abs() < dec!(0.0001));
+    fn distances(quotes: GlftQuotes, mid: Decimal) -> (Decimal, Decimal) {
+        (mid - quotes.bid.unwrap(), quotes.ask.unwrap() - mid)
     }
 
     #[test]
-    fn test_reservation_price_long_inventory() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
-
-        let reservation = GLFTStrategy::calculate_reservation_price(
-            dec!(100.0),
-            dec!(10.0),
-            &config,
-            dec!(0.2),
-            0,
-        )
-        .unwrap();
-
-        // With positive inventory, reservation < mid_price
-        assert!(reservation < dec!(100.0));
-    }
-
-    #[test]
-    fn test_reservation_price_short_inventory() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
-
-        let reservation = GLFTStrategy::calculate_reservation_price(
-            dec!(100.0),
-            dec!(-10.0),
-            &config,
-            dec!(0.2),
-            0,
-        )
-        .unwrap();
-
-        // With negative inventory, reservation > mid_price
-        assert!(reservation > dec!(100.0));
-    }
-
-    #[test]
-    fn test_terminal_penalty_effect() {
-        // Config with terminal penalty
-        let config_with_penalty =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3_600_000, dec!(0.0001)).unwrap();
-
-        // Config without terminal penalty
-        let config_no_penalty =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.0), 3_600_000, dec!(0.0001)).unwrap();
-
-        let reservation_with = GLFTStrategy::calculate_reservation_price(
-            dec!(100.0),
-            dec!(10.0),
-            &config_with_penalty,
-            dec!(0.2),
-            1_800_000, // Halfway through session
-        )
-        .unwrap();
-
-        let reservation_without = GLFTStrategy::calculate_reservation_price(
-            dec!(100.0),
-            dec!(10.0),
-            &config_no_penalty,
-            dec!(0.2),
-            1_800_000,
-        )
-        .unwrap();
-
-        // With penalty, reservation should be lower (more aggressive to sell)
-        assert!(reservation_with < reservation_without);
-    }
-
-    #[test]
-    fn test_terminal_penalty_increases_near_end() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3_600_000, dec!(0.0001)).unwrap();
-
-        // Early in session
-        let reservation_early = GLFTStrategy::calculate_reservation_price(
-            dec!(100.0),
-            dec!(10.0),
-            &config,
-            dec!(0.2),
-            0, // Start of session
-        )
-        .unwrap();
-
-        // Late in session
-        let reservation_late = GLFTStrategy::calculate_reservation_price(
-            dec!(100.0),
-            dec!(10.0),
-            &config,
-            dec!(0.2),
-            3_500_000, // Near end of session
-        )
-        .unwrap();
-
-        // Near terminal, penalty is higher, so reservation should be lower
-        assert!(reservation_late < reservation_early);
-    }
-
-    #[test]
-    fn test_dynamic_gamma_at_start() {
-        let gamma = GLFTStrategy::calculate_dynamic_gamma(
-            dec!(0.1),
-            3_600_000, // Full time remaining
-            3_600_000,
-            true,
-            dec!(1.0),
+    fn test_max_dim_matches_max_inventory_lots() {
+        assert_eq!(
+            MAX_DIM,
+            usize::try_from(2 * MAX_INVENTORY_LOTS + 1).unwrap()
         );
-
-        // At start, gamma = base
-        assert_eq!(gamma, dec!(0.1));
     }
 
     #[test]
-    fn test_dynamic_gamma_at_end() {
-        let gamma = GLFTStrategy::calculate_dynamic_gamma(
-            dec!(0.1),
-            0, // No time remaining
-            3_600_000,
-            true,
-            dec!(1.0),
+    fn test_config_new_paper_parameters_ok() {
+        let config = paper_config(30);
+        assert_eq!(config.max_inventory_lots, 30);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_new_invalid_parameters_return_invalid_configuration() {
+        let ok = (
+            dec!(0.01),
+            dec!(0.3),
+            dec!(0.9),
+            30,
+            dec!(1),
+            600_000,
+            dec!(0),
         );
-
-        // At end, gamma = base * (1 + alpha) = 0.1 * 2 = 0.2
-        assert_eq!(gamma, dec!(0.2));
+        let cases = [
+            (dec!(0), ok.1, ok.2, ok.3, ok.4, ok.5, ok.6),
+            (dec!(-1), ok.1, ok.2, ok.3, ok.4, ok.5, ok.6),
+            (ok.0, dec!(0), ok.2, ok.3, ok.4, ok.5, ok.6),
+            (ok.0, ok.1, dec!(0), ok.3, ok.4, ok.5, ok.6),
+            (ok.0, ok.1, ok.2, 0, ok.4, ok.5, ok.6),
+            (ok.0, ok.1, ok.2, MAX_INVENTORY_LOTS + 1, ok.4, ok.5, ok.6),
+            (ok.0, ok.1, ok.2, ok.3, dec!(0), ok.5, ok.6),
+            (ok.0, ok.1, ok.2, ok.3, ok.4, 0, ok.6),
+            (ok.0, ok.1, ok.2, ok.3, ok.4, ok.5, dec!(-0.1)),
+        ];
+        for (g, k, a, q, lot, t, ms) in cases {
+            let result = GLFTConfig::new(g, k, a, q, lot, t, ms);
+            assert!(
+                matches!(result, Err(MMError::InvalidConfiguration(_))),
+                "{result:?}"
+            );
+        }
+        assert!(GLFTConfig::new(ok.0, ok.1, ok.2, MAX_INVENTORY_LOTS, ok.4, ok.5, ok.6).is_ok());
     }
 
     #[test]
-    fn test_dynamic_gamma_halfway() {
-        let gamma = GLFTStrategy::calculate_dynamic_gamma(
-            dec!(0.1),
-            1_800_000, // Half time remaining
-            3_600_000,
-            true,
-            dec!(1.0),
-        );
-
-        // At halfway, gamma = base * (1 + alpha * 0.5) = 0.1 * 1.5 = 0.15
-        assert_eq!(gamma, dec!(0.15));
+    fn test_calculate_optimal_quotes_tampered_config_returns_invalid_configuration() {
+        let mut config = paper_config(30);
+        config.max_inventory_lots = MAX_INVENTORY_LOTS + 1;
+        let result =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(0), &config, paper_sigma(), 0);
+        assert!(matches!(result, Err(MMError::InvalidConfiguration(_))));
     }
 
     #[test]
-    fn test_dynamic_gamma_disabled() {
-        let gamma = GLFTStrategy::calculate_dynamic_gamma(
-            dec!(0.1),
-            0, // No time remaining
-            3_600_000,
-            false, // Disabled
-            dec!(1.0),
-        );
-
-        // When disabled, gamma = base
-        assert_eq!(gamma, dec!(0.1));
+    fn test_calculate_optimal_quotes_invalid_market_returns_invalid_market_state() {
+        let config = paper_config(30);
+        for (mid, sigma) in [(dec!(0), paper_sigma()), (dec!(1000), dec!(0))] {
+            let result = GLFTStrategy::calculate_optimal_quotes(mid, dec!(0), &config, sigma, 0);
+            assert!(matches!(result, Err(MMError::InvalidMarketState(_))));
+        }
     }
 
     #[test]
-    fn test_optimal_spread_positive() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
-
-        let spread = GLFTStrategy::calculate_optimal_spread(&config, dec!(0.2), 0).unwrap();
-
-        assert!(spread > Decimal::ZERO);
-    }
-
-    #[test]
-    fn test_optimal_spread_min_constraint() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(1.0)).unwrap();
-
-        let spread =
-            GLFTStrategy::calculate_optimal_spread(&config, dec!(0.001), 3_599_999).unwrap();
-
-        // Should be at least min_spread
-        assert!(spread >= dec!(1.0));
-    }
-
-    #[test]
-    fn test_optimal_quotes_valid() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
-
-        let (bid, ask) = GLFTStrategy::calculate_optimal_quotes(
-            dec!(100.0),
-            Decimal::ZERO,
-            &config,
-            dec!(0.2),
-            0,
-        )
-        .unwrap();
-
-        assert!(bid < ask);
-        assert!(bid > Decimal::ZERO);
-    }
-
-    #[test]
-    fn test_optimal_quotes_with_inventory() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
-
-        let (bid_flat, ask_flat) = GLFTStrategy::calculate_optimal_quotes(
-            dec!(100.0),
-            Decimal::ZERO,
-            &config,
-            dec!(0.2),
-            0,
-        )
-        .unwrap();
-
-        let (bid_long, ask_long) =
-            GLFTStrategy::calculate_optimal_quotes(dec!(100.0), dec!(10.0), &config, dec!(0.2), 0)
-                .unwrap();
-
-        // With long inventory, quotes should be lower
-        assert!(bid_long < bid_flat);
-        assert!(ask_long < ask_flat);
-    }
-
-    #[test]
-    fn test_compare_with_as() {
-        let config = GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.1), 3_600_000, dec!(0.0001))
-            .unwrap()
-            .with_dynamic_gamma(dec!(1.0));
-
-        let ((glft_bid, glft_ask), (as_bid, as_ask)) =
-            GLFTStrategy::compare_with_avellaneda_stoikov(
-                dec!(100.0),
-                dec!(10.0),
+    fn test_calculate_optimal_quotes_inventory_off_grid_or_out_of_bound_returns_error() {
+        let mut config = paper_config(30);
+        config.lot_size = dec!(0.5);
+        for inventory in [dec!(0.25), dec!(15.5), dec!(-15.5), dec!(1.1)] {
+            let result = GLFTStrategy::calculate_optimal_quotes(
+                dec!(1000),
+                inventory,
                 &config,
-                dec!(0.2),
-                1_800_000,
+                paper_sigma(),
+                0,
+            );
+            assert!(
+                matches!(result, Err(MMError::InvalidPositionUpdate(_))),
+                "{inventory}: {result:?}"
+            );
+        }
+        // 15 base units = 30 lots of 0.5: at the bound, valid.
+        assert!(
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(15), &config, paper_sigma(), 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_calculate_optimal_quotes_at_bounds_omit_one_side() {
+        let config = paper_config(8);
+        let top =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(8), &config, paper_sigma(), 0)
+                .unwrap();
+        assert!(top.bid.is_none() && top.ask.is_some());
+        let bottom =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(-8), &config, paper_sigma(), 0)
+                .unwrap();
+        assert!(bottom.ask.is_none() && bottom.bid.is_some());
+        let closed =
+            GLFTStrategy::closed_form_quotes(dec!(1000), dec!(8), &config, paper_sigma()).unwrap();
+        assert!(closed.bid.is_none() && closed.ask.is_some());
+    }
+
+    #[test]
+    fn test_calculate_optimal_quotes_zero_inventory_symmetric() {
+        let config = paper_config(30);
+        let quotes =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(0), &config, paper_sigma(), 0)
+                .unwrap();
+        let (b, a) = distances(quotes, dec!(1000));
+        assert!((b - a).abs() < dec!(0.000000001), "{b} vs {a}");
+    }
+
+    #[test]
+    fn test_calculate_optimal_quotes_skew_grows_with_inventory() {
+        let config = paper_config(30);
+        let mut previous: Option<(Decimal, Decimal)> = None;
+        for q in -5..=5 {
+            let quotes = GLFTStrategy::calculate_optimal_quotes(
+                dec!(1000),
+                Decimal::from(q),
+                &config,
+                paper_sigma(),
+                0,
             )
             .unwrap();
-
-        // GLFT should be more aggressive (lower quotes with long inventory)
-        assert!(glft_bid < as_bid);
-        assert!(glft_ask < as_ask);
+            let (bid, ask) = (quotes.bid.unwrap(), quotes.ask.unwrap());
+            if let Some((pb, pa)) = previous {
+                assert!(bid < pb && ask < pa, "q={q}");
+            }
+            previous = Some((bid, ask));
+        }
     }
 
     #[test]
-    fn test_penalty_function_linear() {
-        // At start (full time), penalty = 0
-        let penalty_start =
-            GLFTStrategy::calculate_penalty_function(3_600_000, 3_600_000, PenaltyFunction::Linear);
-        assert_eq!(penalty_start, dec!(0.0));
-
-        // At end (no time), penalty = 1
-        let penalty_end =
-            GLFTStrategy::calculate_penalty_function(0, 3_600_000, PenaltyFunction::Linear);
-        assert_eq!(penalty_end, dec!(1.0));
-
-        // Halfway, penalty = 0.5
-        let penalty_half =
-            GLFTStrategy::calculate_penalty_function(1_800_000, 3_600_000, PenaltyFunction::Linear);
-        assert_eq!(penalty_half, dec!(0.5));
+    fn test_calculate_optimal_quotes_terminal_time_returns_base_distance() {
+        let config = paper_config(16);
+        let base = Decimal::from_f64((1.0_f64 + 0.01 / 0.3).ln() / 0.01).unwrap();
+        for q in [-5, 0, 5] {
+            let quotes = GLFTStrategy::calculate_optimal_quotes(
+                dec!(1000),
+                Decimal::from(q),
+                &config,
+                paper_sigma(),
+                600_000,
+            )
+            .unwrap();
+            let (b, a) = distances(quotes, dec!(1000));
+            assert!((b - base).abs() < dec!(0.000000001), "{b}");
+            assert!((a - base).abs() < dec!(0.000000001), "{a}");
+        }
     }
 
     #[test]
-    fn test_penalty_function_quadratic() {
-        // At start, penalty = 0
-        let penalty_start = GLFTStrategy::calculate_penalty_function(
-            3_600_000,
-            3_600_000,
-            PenaltyFunction::Quadratic,
-        );
-        assert_eq!(penalty_start, dec!(0.0));
-
-        // At end, penalty = 1
-        let penalty_end =
-            GLFTStrategy::calculate_penalty_function(0, 3_600_000, PenaltyFunction::Quadratic);
-        assert_eq!(penalty_end, dec!(1.0));
-
-        // Halfway, penalty = 0.25 (0.5²)
-        let penalty_half = GLFTStrategy::calculate_penalty_function(
-            1_800_000,
-            3_600_000,
-            PenaltyFunction::Quadratic,
-        );
-        assert_eq!(penalty_half, dec!(0.25));
+    fn test_closed_form_quotes_large_horizon_match_exact() {
+        let mut config = paper_config(30);
+        config.terminal_time = 3_600_000;
+        for q in [-3, 0, 2] {
+            let inventory = Decimal::from(q);
+            let exact = GLFTStrategy::calculate_optimal_quotes(
+                dec!(1000),
+                inventory,
+                &config,
+                paper_sigma(),
+                0,
+            )
+            .unwrap();
+            let closed =
+                GLFTStrategy::closed_form_quotes(dec!(1000), inventory, &config, paper_sigma())
+                    .unwrap();
+            let (eb, ea) = distances(exact, dec!(1000));
+            let (cb, ca) = distances(closed, dec!(1000));
+            assert!((eb - cb).abs() < dec!(0.05), "q={q}: {eb} vs {cb}");
+            assert!((ea - ca).abs() < dec!(0.05), "q={q}: {ea} vs {ca}");
+        }
     }
 
     #[test]
-    fn test_invalid_mid_price() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
+    fn test_calculate_optimal_quotes_min_spread_widens_symmetrically() {
+        let mut config = paper_config(30);
+        let raw =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(2), &config, paper_sigma(), 0)
+                .unwrap();
+        let raw_spread = raw.ask.unwrap() - raw.bid.unwrap();
+        config.min_spread = raw_spread + dec!(2);
+        let wide =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(2), &config, paper_sigma(), 0)
+                .unwrap();
+        assert_eq!(wide.bid.unwrap(), raw.bid.unwrap() - dec!(1));
+        assert_eq!(wide.ask.unwrap(), raw.ask.unwrap() + dec!(1));
+    }
 
-        let result = GLFTStrategy::calculate_reservation_price(
-            dec!(0.0),
-            Decimal::ZERO,
+    #[test]
+    fn test_calculate_optimal_quotes_extreme_parameters_return_numerical_error() {
+        // Volatility so large that the horizon is far too stiff.
+        let config = paper_config(MAX_INVENTORY_LOTS);
+        let result = GLFTStrategy::calculate_optimal_quotes(
+            dec!(1000),
+            dec!(0),
             &config,
-            dec!(0.2),
+            dec!(10000000000),
             0,
         );
-
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        // gamma * lot_size overflows f64.
+        let mut config = paper_config(1);
+        config.risk_aversion = Decimal::MAX;
+        config.lot_size = Decimal::MAX;
+        let result =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(0), &config, paper_sigma(), 0);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        // A tiny k with a large gamma makes eta underflow to zero.
+        let mut config = paper_config(1);
+        config.order_intensity_k = dec!(0.0000000001);
+        config.risk_aversion = dec!(1000);
+        let result =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(0), &config, paper_sigma(), 0);
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
-    fn test_invalid_volatility() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
-
-        let result = GLFTStrategy::calculate_reservation_price(
-            dec!(100.0),
-            Decimal::ZERO,
+    fn test_compare_with_avellaneda_stoikov_near_terminal_agree() {
+        let config = paper_config(16);
+        let (glft, (as_bid, as_ask)) = GLFTStrategy::compare_with_avellaneda_stoikov(
+            dec!(1000),
+            dec!(2),
             &config,
-            dec!(0.0),
-            0,
-        );
+            paper_sigma(),
+            599_990,
+        )
+        .unwrap();
+        assert!((glft.bid.unwrap() - as_bid).abs() < dec!(0.001));
+        assert!((glft.ask.unwrap() - as_ask).abs() < dec!(0.001));
+    }
 
-        assert!(result.is_err());
+    #[test]
+    fn test_calculate_optimal_quotes_lot_size_rescales_gamma() {
+        // gamma_L = gamma * lot_size enters the model: gamma 0.02 with lots of
+        // 0.5 is gamma 0.01 with lots of 1, at the same number of lots.
+        let a = paper_config(30);
+        let mut b = paper_config(30);
+        b.risk_aversion = dec!(0.02);
+        b.lot_size = dec!(0.5);
+        let qa = GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(3), &a, paper_sigma(), 0)
+            .unwrap();
+        let qb =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(1.5), &b, paper_sigma(), 0)
+                .unwrap();
+        assert_eq!(qa, qb);
     }
 
     #[cfg(feature = "serde")]
     #[test]
-    fn test_serialization() {
-        let config =
-            GLFTConfig::new(dec!(0.1), dec!(1.5), dec!(0.05), 3_600_000, dec!(0.0001)).unwrap();
-
+    fn test_config_serde_round_trip_equal() {
+        let config = paper_config(30);
         let json = serde_json::to_string(&config).unwrap();
-        let deserialized: GLFTConfig = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(config, deserialized);
+        let back: GLFTConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, back);
     }
 }
