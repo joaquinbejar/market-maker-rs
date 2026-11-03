@@ -564,15 +564,27 @@ impl PortfolioPosition {
     }
 
     /// Returns the total absolute position (sum of |position|).
-    #[must_use]
-    pub fn total_absolute_position(&self) -> Decimal {
-        self.positions.values().map(|p| p.abs()).sum()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the sum overflows.
+    pub fn total_absolute_position(&self) -> MMResult<Decimal> {
+        self.positions
+            .values()
+            .try_fold(Decimal::ZERO, |acc, p| acc.checked_add(p.abs()))
+            .or_overflow("total absolute position")
     }
 
     /// Returns the net position (sum of positions).
-    #[must_use]
-    pub fn net_position(&self) -> Decimal {
-        self.positions.values().copied().sum()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the sum overflows.
+    pub fn net_position(&self) -> MMResult<Decimal> {
+        self.positions
+            .values()
+            .try_fold(Decimal::ZERO, |acc, p| acc.checked_add(*p))
+            .or_overflow("net position")
     }
 }
 
@@ -1001,6 +1013,21 @@ mod tests {
     use crate::dec;
 
     #[test]
+    fn test_portfolio_position_sums_overflow_returns_numerical_error() {
+        let mut portfolio = PortfolioPosition::new();
+        portfolio.set_position(AssetId::new("A"), Decimal::MAX, dec!(1));
+        portfolio.set_position(AssetId::new("B"), Decimal::MAX, dec!(1));
+        assert!(matches!(
+            portfolio.total_absolute_position(),
+            Err(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            portfolio.net_position(),
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[test]
     fn test_portfolio_variance_overflow_returns_numerical_error() {
         let a = AssetId::new("A");
         let matrix = CorrelationMatrix::new(vec![a.clone()]);
@@ -1195,8 +1222,8 @@ mod tests {
         portfolio.set_position(AssetId::new("BTC"), dec!(1.0), dec!(0.05));
         portfolio.set_position(AssetId::new("ETH"), dec!(-2.0), dec!(0.08));
 
-        assert_eq!(portfolio.total_absolute_position(), dec!(3.0));
-        assert_eq!(portfolio.net_position(), dec!(-1.0));
+        assert_eq!(portfolio.total_absolute_position().unwrap(), dec!(3.0));
+        assert_eq!(portfolio.net_position().unwrap(), dec!(-1.0));
     }
 
     // PortfolioRiskCalculator tests

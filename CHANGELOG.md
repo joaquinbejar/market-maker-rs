@@ -120,8 +120,11 @@ project follows [Semantic Versioning](https://semver.org/).
   at the `Decimal` bounds and say so in their docs; an overflowing ratio
   that returns `Option` is `None`. Several former panics on overflow or a
   zero divisor (grid inventory scaling with a zero `max_position`, the
-  weighted book imbalance at a zero mid, Decimal `sum` in analytics) are
-  now errors or saturating values.
+  weighted book imbalance at a zero mid, every Decimal `sum`, which
+  panics on overflow, and the order intensity square root of the smallest
+  positive Decimal) are now errors or saturating values.
+  `OrderManager::get_open_quantity` reports an overflowing total as
+  `MMError::NumericalError`.
 - `OrderBookSnapshot::mid_price`, `spread` and `spread_bps` (execution)
   return `None` when the arithmetic overflows.
 
@@ -163,6 +166,9 @@ project follows [Semantic Versioning](https://semver.org/).
     `OptimizedParameters::adjusted_gamma`;
   - `MultiUnderlyingManager::reallocate_capital` returns `MMResult<()>`
     and computes every allocation before applying any.
+  - `PortfolioPosition::total_absolute_position` and `net_position`
+    return `MMResult<Decimal>`; their Decimal sums used to panic on
+    overflow.
 - `LimitsPolicy` latches a fault and rejects every later check when a fill
   would overflow its position, instead of saturating it.
 - The backtest engine's built in bookkeeping validates each fill's
