@@ -92,6 +92,10 @@ pub struct QuoteResidual {
     pub k_normalized: f64,
     /// The bid's `w = 0` is a declared extreme, not an implied variance.
     pub bid_at_bound: bool,
+    /// Its weight was capped at
+    /// [`FitConfig::max_weight_ratio`](super::FitConfig::max_weight_ratio)
+    /// times its slice's median.
+    pub weight_capped: bool,
 }
 
 /// One expiry's fit.
@@ -199,7 +203,7 @@ pub fn calibrate_surface(
             .and_then(|p| fit_slice(tau, &p, &config.fit));
         match &fit {
             Ok(f) => {
-                for (o, r) in obs.iter().zip(f.residuals.iter()) {
+                for (position, (o, r)) in obs.iter().zip(f.residuals.iter()).enumerate() {
                     let strike = o.quote.quote.strike.to_f64().unwrap_or(f64::NAN);
                     // `None`: positive but below the smallest positive f64.
                     let fitted_price = black_or_underflow(
@@ -234,6 +238,7 @@ pub fn calibrate_surface(
                         k_normalized: o.quote.k
                             / f.slice.eval(0.0).map_or(f64::NAN, |(w, _, _)| w.sqrt()),
                         bid_at_bound: o.bid_at_bound,
+                        weight_capped: f.capped.contains(&position),
                     });
                 }
                 if f.active

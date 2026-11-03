@@ -11,6 +11,7 @@
 //!    surface may be built from it.
 //! 2. **Per quote**: [`Rejection::Invalid`] (negative bid, non-positive ask,
 //!    strike or underlying), [`Rejection::Crossed`] (`bid > ask`),
+//!    [`Rejection::Locked`] (`bid == ask`: no band, so no weight),
 //!    [`Rejection::Expired`] (expiry not after the cutoff),
 //!    [`Rejection::Stale`] (`cutoff - observed_at > max_age_ms`),
 //!    [`Rejection::SpotLag`] (quote and underlying observed more than
@@ -98,6 +99,9 @@ pub enum Rejection {
     Invalid(String),
     /// `bid > ask`.
     Crossed,
+    /// `bid == ask`: a quote with no band, whose weight
+    /// `1 / band^2` would dwarf every other quote of its slice.
+    Locked,
     /// The expiry is not after the cutoff.
     Expired,
     /// Observed `age_ms` before the cutoff, above the maximum.
@@ -219,6 +223,9 @@ fn per_quote(q: &OptionQuote, cutoff: u64, config: &CleaningConfig) -> MMResult<
     }
     if q.bid > q.ask {
         return Ok(Some(Rejection::Crossed));
+    }
+    if q.bid == q.ask {
+        return Ok(Some(Rejection::Locked));
     }
     if q.expiry_at <= cutoff {
         return Ok(Some(Rejection::Expired));
@@ -524,6 +531,7 @@ mod tests {
             stale,
             lagged,
             expired,
+            quote(dec!(135), OptionStyle::Call, dec!(0.2), dec!(0.2)),
         ];
         let report = clean_quotes(&quotes, CUTOFF, rates(), &config()).unwrap();
         assert_eq!(rejection(&report, 0), Some(&Rejection::Crossed));
@@ -541,8 +549,9 @@ mod tests {
             Some(&Rejection::SpotLag { lag_ms: 1_000 })
         );
         assert_eq!(rejection(&report, 5), Some(&Rejection::Expired));
+        assert_eq!(rejection(&report, 6), Some(&Rejection::Locked));
         assert!(report.fit_set.is_empty());
-        assert_eq!(report.verdicts.len(), 6);
+        assert_eq!(report.verdicts.len(), 7);
     }
 
     #[test]

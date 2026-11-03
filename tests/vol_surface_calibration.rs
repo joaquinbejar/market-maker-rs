@@ -8,8 +8,8 @@ use market_maker_rs::options::black_undiscounted;
 use market_maker_rs::options::surface::{
     CleaningConfig, DiagnosticsConfig, FitConfig, HoldoutRule, IvConfig, KRange, OptionQuote,
     Rates, Rejection, ShortExpiryPolicy, Snapshot, SurfaceCalibrationConfig, SurfaceStatus,
-    SviSlice, UsePolicy, WingRule, YEAR_MS, calibrate_surface, clean_quotes, extract, replay,
-    validate_holdout,
+    SviSlice, UsePolicy, VolSurface, WingRule, YEAR_MS, calibrate_surface, clean_quotes, extract,
+    replay, validate_holdout,
 };
 use optionstratlib::OptionStyle;
 use rust_decimal::prelude::FromPrimitive;
@@ -350,4 +350,61 @@ fn test_holdout_keeps_the_targets_of_a_failed_fit() {
         .find(|e| e.expiry_at == first)
         .unwrap();
     assert_eq!((failed.held, failed.comparison.svi.missing), (7, 7));
+}
+
+#[test]
+fn test_locked_and_near_locked_quotes_cannot_dominate_their_slice() {
+    let clean = snapshot_quotes(CUTOFF, &[30, 90, 180], &[30, 90, 180], &STRIKES);
+    // A locked quote at an extra strike: rejected, the fit unchanged.
+    let mut locked = quote(CUTOFF, 90, 90, 102.5, OptionStyle::Call);
+    locked.bid = locked.ask;
+    let mut with_locked = clean.clone();
+    with_locked.push(locked);
+    let (clean_entry, _) =
+        calibrate_surface(&clean, CUTOFF, CUTOFF, rates(), None, &config()).unwrap();
+    let (locked_entry, report) =
+        calibrate_surface(&with_locked, CUTOFF, CUTOFF, rates(), None, &config()).unwrap();
+    assert_eq!(
+        report.cleaning.verdicts[clean.len()].rejection,
+        Some(Rejection::Locked)
+    );
+    assert_eq!(clean_entry.surface(), locked_entry.surface());
+
+    // A near locked quote (a band of 1e-9 in price), its mid one full
+    // spread above the truth: its weight is capped at max_weight_ratio
+    // times the slice's median and reported, and it moves the slice less
+    // than with no cap.
+    let mut tight = quote(CUTOFF, 90, 90, 102.5, OptionStyle::Call);
+    let mid = (tight.bid + tight.ask) / dec!(2) + (tight.ask - tight.bid);
+    tight.bid = mid - dec!(0.0000000005);
+    tight.ask = mid + dec!(0.0000000005);
+    let mut with_tight = clean.clone();
+    with_tight.push(tight);
+    let (capped_entry, report) =
+        calibrate_surface(&with_tight, CUTOFF, CUTOFF, rates(), None, &config()).unwrap();
+    let flagged: Vec<usize> = report
+        .residuals
+        .iter()
+        .filter(|r| r.weight_capped)
+        .map(|r| r.index)
+        .collect();
+    assert_eq!(flagged, vec![clean.len()]);
+    let mut uncapped_config = config();
+    uncapped_config.fit.max_weight_ratio = 1e300;
+    let (uncapped_entry, _) =
+        calibrate_surface(&with_tight, CUTOFF, CUTOFF, rates(), None, &uncapped_config).unwrap();
+    let tau = (90 * DAY) as f64 / YEAR_MS;
+    let shift = |e: &market_maker_rs::options::surface::CalibratedSurface| {
+        (0..=30)
+            .map(|i| {
+                let k = -0.6 + 0.04 * f64::from(i);
+                let v = |s: &market_maker_rs::options::surface::SviSurface| {
+                    (s.total_variance(k, tau).unwrap().w() / tau).sqrt()
+                };
+                (v(e.surface().unwrap()) - v(clean_entry.surface().unwrap())).abs()
+            })
+            .fold(0.0_f64, f64::max)
+    };
+    let (capped, uncapped) = (shift(&capped_entry), shift(&uncapped_entry));
+    assert!(capped < 0.85 * uncapped, "{capped} vs {uncapped}");
 }
