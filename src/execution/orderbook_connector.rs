@@ -122,7 +122,15 @@ fn units_to_decimal(raw: u128, precision: u32) -> MMResult<Decimal> {
         .ok()
         .and_then(|f| Decimal::try_from_i128_with_scale(f, precision).ok())
         .ok_or_else(out_of_range)?;
-    whole.checked_add(fraction).ok_or_else(out_of_range)
+    let value = whole.checked_add(fraction).ok_or_else(out_of_range)?;
+    // The 96 bit mantissa can round a large raw value with a fractional
+    // part; reject anything that does not convert back to the same raw.
+    if decimal_to_units(value, precision).ok() != Some(raw) {
+        return Err(MMError::NumericalError(format!(
+            "raw value {raw} at precision {precision} is not exactly representable"
+        )));
+    }
+    Ok(value)
 }
 
 impl OrderBookConnectorConfig {
@@ -752,6 +760,18 @@ mod tests {
             fine.price_to_u128(Decimal::MAX),
             Err(MMError::NumericalError(_))
         ));
+    }
+
+    #[test]
+    fn test_units_to_decimal_inexact_raw_returns_err_exact_large_raw_converts() {
+        assert!(matches!(
+            units_to_decimal(u128::MAX, 19),
+            Err(MMError::NumericalError(_))
+        ));
+        let raw = 10u128.pow(29);
+        let value = units_to_decimal(raw, 19).unwrap();
+        assert_eq!(value, dec!(10000000000));
+        assert_eq!(decimal_to_units(value, 19).unwrap(), raw);
     }
 
     #[test]

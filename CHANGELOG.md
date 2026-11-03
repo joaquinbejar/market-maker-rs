@@ -45,10 +45,10 @@ project follows [Semantic Versioning](https://semver.org/).
   `MarketImpactFillModel` fills return `NumericalError` when the impact
   overflows. With `max_position` not positive, `RiskLimits::scale_order_size`
   returns zero and `position_utilization` returns `Decimal::MAX`.
-  `AlertManager` records the dedup timestamp only after every handler
-  succeeded, so a retry after a failed delivery is not suppressed.
-  `OrderBookConnector` accepts every raw price that fits a `u128` and the
-  `Decimal` range, and holds the order mapping lock across book updates.
+  `AlertManager` deduplicates per handler: a handler that delivered an
+  alert type inside the window is skipped and one that failed is retried.
+  `OrderBookConnector` accepts every raw price that converts exactly to a
+  `Decimal` and rejects one that would be rounded, and holds the order mapping lock across book updates.
 
 - Backtest fees can be charged in the base asset or a third asset:
   `BacktestConfig::fee_currency` (`FeeCurrency::{Quote, Base, Other}`,
