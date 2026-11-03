@@ -39,6 +39,10 @@ pub(crate) struct Resting {
     pub(crate) price: Decimal,
     pub(crate) remaining: Decimal,
     pub(crate) evidence: PriorityEvidence,
+    /// Its generation: the sequence it entered the book at (the
+    /// snapshot's, or its `open`'s). An id reused after the order left is
+    /// a new generation.
+    pub(crate) entered_at: u64,
     /// Sequence of its last size decrease, if any.
     pub(crate) decreased_at: Option<u64>,
 }

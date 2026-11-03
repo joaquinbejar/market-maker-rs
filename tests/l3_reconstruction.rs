@@ -882,3 +882,73 @@ fn test_estimates_belong_to_their_reconstructor_and_segment() {
     assert_eq!(clone.volume_ahead(&own), Err(QueueError::StaleEstimate));
     assert!(a.volume_ahead(&own).is_ok());
 }
+
+#[test]
+fn test_a_reused_id_is_a_new_order_behind_the_estimate() {
+    // s1 (size 1, ahead of the hypothetical order) is canceled, and its id
+    // reopens later with size 9: that later order is behind.
+    let mut r = booted(10);
+    let estimate = r.queue_estimate(Buy, dec!(100)).unwrap();
+    feed(
+        &mut r,
+        &[
+            m(11, cancel("s1", Buy, dec!(100), dec!(1))),
+            m(12, open("s1", Buy, dec!(100), dec!(9))),
+        ],
+    );
+    let ahead = r.volume_ahead(&estimate).unwrap();
+    assert_eq!((ahead.volume, ahead.orders), (dec!(2), 1));
+    // Our own order canceled, and its id reused: not ours any more.
+    feed(&mut r, &[m(13, open("own", Buy, dec!(100), dec!(1)))]);
+    let own = r.queue_estimate_own("own").unwrap();
+    feed(
+        &mut r,
+        &[
+            m(14, cancel("own", Buy, dec!(100), dec!(1))),
+            m(15, open("own", Buy, dec!(100), dec!(4))),
+        ],
+    );
+    assert!(matches!(
+        r.volume_ahead(&own),
+        Err(QueueError::NotResting { .. })
+    ));
+    // A new estimate on the new order sees what is ahead of it now.
+    let new = r.queue_estimate_own("own").unwrap();
+    assert_eq!(r.volume_ahead(&new).unwrap().volume, dec!(11));
+}
+
+#[test]
+fn test_rounding_open_match_and_stp_invalidate_instead_of_losing_size() {
+    // A resting size whose next digit Decimal cannot hold: adding 1e-9,
+    // matching 1e-9, or decreasing it to 1e-9 would round.
+    let big = dec!(99999999999999999999.99999999);
+    let small = dec!(0.000000001);
+    let base = L3Snapshot {
+        product_id: P.to_string(),
+        sequence: 1,
+        bids: vec![so("a", dec!(100), big)],
+        asks: vec![],
+    };
+    let cases = [
+        open("n", Buy, dec!(100), small),
+        trade("a", "t", Buy, dec!(100), small),
+        // The decrease big - 1e-9 is what Decimal cannot hold.
+        stp("a", Buy, dec!(100), big, small),
+    ];
+    for (i, event) in cases.into_iter().enumerate() {
+        let mut r = BookReconstructor::new(P, VenueRules::default());
+        r.bootstrap(&base).unwrap();
+        let error = r.apply(&m(2, event)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ApplyError::Invalidated(ref inv) if matches!(
+                    inv.kind,
+                    InvalidationKind::Discrepancy(Discrepancy::Arithmetic { .. })
+                )
+            ),
+            "case {i}: {error:?}"
+        );
+        assert_eq!(r.stale_l2(Buy).unwrap(), vec![(dec!(100), big)], "case {i}");
+    }
+}

@@ -62,11 +62,14 @@ impl From<ViewError> for QueueError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Anchor {
-    /// A hypothetical order created at `created_at`, ahead of it the ids
-    /// resting then.
-    Hypothetical { ahead: Vec<String>, created_at: u64 },
-    /// Our own order, seen in the feed.
-    Own { order_id: String },
+    /// A hypothetical order created at `created_at`, ahead of it the orders
+    /// resting then, each with its generation.
+    Hypothetical {
+        ahead: Vec<(String, u64)>,
+        created_at: u64,
+    },
+    /// Our own order, seen in the feed, with its generation.
+    Own { order_id: String, entered_at: u64 },
 }
 
 /// A handle on the volume ahead of one order, read with
@@ -113,7 +116,13 @@ impl BookReconstructor {
         let ahead = book
             .levels(side)
             .get(&price)
-            .map(|level| level.queue.clone())
+            .map(|level| {
+                level
+                    .queue
+                    .iter()
+                    .filter_map(|id| book.orders.get(id).map(|o| (id.clone(), o.entered_at)))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(QueueEstimate {
             side,
@@ -155,6 +164,7 @@ impl BookReconstructor {
             segment_id: self.segment_id(),
             anchor: Anchor::Own {
                 order_id: order_id.to_string(),
+                entered_at: order.entered_at,
             },
         })
     }
@@ -167,7 +177,8 @@ impl BookReconstructor {
     ///
     /// [`QueueError::View`] unless the book is valid,
     /// [`QueueError::StaleEstimate`] after a new snapshot,
-    /// [`QueueError::NotResting`] once our own order has left the book, and
+    /// [`QueueError::NotResting`] once our own order has left the book (an
+    /// order reusing its id later is not ours), and
     /// [`QueueError::PriorityUnknown`] when an order ahead decreased its
     /// size under [`SizeDecrease::PriorityUnknown`].
     pub fn volume_ahead(&self, estimate: &QueueEstimate) -> Result<QueueAhead, QueueError> {
@@ -175,17 +186,22 @@ impl BookReconstructor {
         if estimate.segment_id != self.segment_id() {
             return Err(QueueError::StaleEstimate);
         }
-        let (ahead, since, mut assumptions): (Vec<String>, u64, Vec<Assumption>) =
+        let (ahead, since, mut assumptions): (Vec<(String, u64)>, u64, Vec<Assumption>) =
             match &estimate.anchor {
                 Anchor::Hypothetical { ahead, created_at } => (
                     ahead.clone(),
                     *created_at,
                     vec![Assumption::BackOfVisibleQueueAtCreation],
                 ),
-                Anchor::Own { order_id } => {
+                Anchor::Own {
+                    order_id,
+                    entered_at,
+                } => {
+                    // Our order, not a later one reusing its id.
                     let own = book
                         .orders
                         .get(order_id)
+                        .filter(|o| o.entered_at == *entered_at)
                         .ok_or_else(|| QueueError::NotResting {
                             order_id: order_id.clone(),
                         })?;
@@ -214,10 +230,10 @@ impl BookReconstructor {
                         .get(&estimate.price)
                         .map(|level| level.queue.as_slice())
                         .unwrap_or_default();
-                    let before: Vec<String> = queue
+                    let before: Vec<(String, u64)> = queue
                         .iter()
                         .take_while(|id| *id != order_id)
-                        .cloned()
+                        .filter_map(|id| book.orders.get(id).map(|o| (id.clone(), o.entered_at)))
                         .collect();
                     (before, sequence, assumptions)
                 }
@@ -228,9 +244,10 @@ impl BookReconstructor {
             exact_add(acc, v)
                 .ok_or_else(|| QueueError::Arithmetic("volume ahead is not exact".to_string()))
         };
-        for id in &ahead {
-            // Gone (filled or canceled): nothing left ahead from it.
-            let Some(order) = book.orders.get(id) else {
+        for (id, generation) in &ahead {
+            // Gone (filled or canceled), or its id now names a later order,
+            // which is behind: nothing left ahead from it.
+            let Some(order) = book.orders.get(id).filter(|o| o.entered_at == *generation) else {
                 continue;
             };
             if order.decreased_at.is_some_and(|at| at > since) {
