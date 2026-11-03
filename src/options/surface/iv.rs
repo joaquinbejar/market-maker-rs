@@ -12,7 +12,7 @@
 //! the out of the money price, or when the bracket is narrower than
 //! [`IvConfig::w_tolerance`] relative to its upper end. Every loop is
 //! bounded. Where the Black price at a trial `w` is positive but below the
-//! smallest positive `f64` (an error of [`black_undiscounted`], never a 0),
+//! smallest positive `f64` ([`MMError::PriceUnderflow`], never a 0),
 //! it is below every positive price, the target included, so the root lies
 //! above that `w` and the bracket moves there.
 //!
@@ -27,7 +27,9 @@
 //!
 //! For a cleaned quote, the mid gives the observed `w`, and the bid and ask
 //! give the band `[w_bid, w_ask]` whose width sets the weight,
-//! `1 / max(w_ask - w_bid, eps)^2`. A bid at or below the lower bound, or
+//! `1 / max(w_ask - w_bid, eps)^2`, which must be finite and positive (a
+//! quote whose weight is not is left out with its failure). A bid at or
+//! below the lower bound, or
 //! within the intrinsic value's rounding, is `w_bid = 0`, flagged
 //! [`IvObservation::bid_at_bound`]. A quote whose ask or mid has no implied
 //! variance is left out of the fit with its failure.
@@ -70,7 +72,8 @@ impl IvConfig {
     /// # Errors
     ///
     /// [`MMError::InvalidConfiguration`] unless every value is finite and
-    /// positive and the iteration cap is at least 1.
+    /// positive, the largest weight `1 / weight_eps^2` is finite, and the
+    /// iteration cap is at least 1.
     pub fn validate(&self) -> MMResult<()> {
         for (name, v) in [
             ("max_vol", self.max_vol),
@@ -84,12 +87,36 @@ impl IvConfig {
                 )));
             }
         }
+        if !(1.0 / (self.weight_eps * self.weight_eps)).is_finite() {
+            return Err(MMError::InvalidConfiguration(format!(
+                "iv: weight_eps {} gives an infinite largest weight",
+                self.weight_eps
+            )));
+        }
         if self.max_iterations == 0 {
             return Err(MMError::InvalidConfiguration(
                 "iv: max_iterations must be at least 1".to_string(),
             ));
         }
         Ok(())
+    }
+}
+
+/// `1 / max(w_ask - w_bid, eps)^2`, finite and positive.
+///
+/// # Errors
+///
+/// [`IvFailure::Numerical`] when the weight is not finite and positive: a
+/// band whose square overflows, or one that is not finite.
+fn band_weight(w_bid: f64, w_ask: f64, eps: f64) -> Result<f64, IvFailure> {
+    let band = (w_ask - w_bid).max(eps);
+    let weight = 1.0 / (band * band);
+    if weight.is_finite() && weight > 0.0 {
+        Ok(weight)
+    } else {
+        Err(IvFailure::Numerical(format!(
+            "weight {weight} of the band [{w_bid}, {w_ask}] is not finite and positive"
+        )))
     }
 }
 
@@ -275,17 +302,13 @@ pub fn implied_total_variance(
     })
 }
 
-/// What [`black_undiscounted`] says, in its error, of a positive price below
-/// the smallest positive `f64`.
-const BLACK_UNDERFLOW: &str = "below the smallest positive f64";
-
-/// [`black_undiscounted`], with `None` for a price that is positive but
-/// below the smallest positive `f64`: smaller than every positive `f64`, so
-/// it still orders against one.
+/// [`black_undiscounted`], with `None` for [`MMError::PriceUnderflow`], a
+/// price that is positive but below the smallest positive `f64`: smaller
+/// than every positive `f64`, so it still orders against one.
 ///
 /// # Errors
 ///
-/// Every other error of [`black_undiscounted`].
+/// Every other error of [`black_undiscounted`], unchanged.
 pub(crate) fn black_or_underflow(
     fwd: f64,
     strike: f64,
@@ -294,7 +317,7 @@ pub(crate) fn black_or_underflow(
 ) -> MMResult<Option<f64>> {
     match black_undiscounted(fwd, strike, w, style) {
         Ok(price) => Ok(Some(price)),
-        Err(MMError::NumericalError(why)) if why.contains(BLACK_UNDERFLOW) => Ok(None),
+        Err(MMError::PriceUnderflow) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -401,14 +424,20 @@ pub fn extract(report: &CleaningReport, config: &IvConfig) -> MMResult<Extractio
                 continue;
             }
         };
-        let band = (w_ask - w_bid).max(config.weight_eps);
+        let weight = match band_weight(w_bid, w_ask, config.weight_eps) {
+            Ok(weight) => weight,
+            Err(e) => {
+                failures.push((c.index, "weight", e));
+                continue;
+            }
+        };
         observations.push(IvObservation {
             quote: c.clone(),
             w_mid,
             w_bid,
             bid_at_bound,
             w_ask,
-            weight: 1.0 / (band * band),
+            weight,
         });
     }
     Ok(Extraction {
@@ -586,7 +615,10 @@ mod tests {
     #[test]
     fn test_black_or_underflow_reads_the_pricing_underflow() {
         // Far out of the money at small w: positive, below every f64.
-        assert!(black_undiscounted(100.0, 200.0, 1e-4, OptionStyle::Call).is_err());
+        assert_eq!(
+            black_undiscounted(100.0, 200.0, 1e-4, OptionStyle::Call),
+            Err(MMError::PriceUnderflow)
+        );
         assert_eq!(
             black_or_underflow(100.0, 200.0, 1e-4, OptionStyle::Call),
             Ok(None)
@@ -596,8 +628,11 @@ mod tests {
                 .unwrap()
                 .is_some_and(|p| p > 0.0)
         );
-        // Other errors stay errors.
-        assert!(black_or_underflow(-1.0, 100.0, 0.04, OptionStyle::Call).is_err());
+        // Other errors stay errors, unchanged.
+        assert!(matches!(
+            black_or_underflow(-1.0, 100.0, 0.04, OptionStyle::Call),
+            Err(MMError::InvalidMarketState(_))
+        ));
     }
 
     #[test]
@@ -683,5 +718,39 @@ mod tests {
             .validate()
             .is_err()
         );
+        // 1 / eps^2 overflows: a bid equal to the ask would weigh infinity.
+        assert!(
+            IvConfig {
+                weight_eps: 1e-200,
+                ..config()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_band_weight_is_finite_and_positive_or_a_failure() {
+        assert!(
+            band_weight(0.01, 0.03, 1e-8).is_ok_and(|w| (w - 2500.0).abs() < 1e-9),
+            "{:?}",
+            band_weight(0.01, 0.03, 1e-8)
+        );
+        // A zero band takes eps.
+        assert!(band_weight(0.02, 0.02, 1e-8).is_ok_and(|w| (w / 1e16 - 1.0).abs() < 1e-15));
+        // A band whose square overflows gives weight 0: a failure.
+        assert!(matches!(
+            band_weight(0.0, 1e200, 1e-8),
+            Err(IvFailure::Numerical(_))
+        ));
+        assert!(matches!(
+            band_weight(0.0, f64::INFINITY, 1e-8),
+            Err(IvFailure::Numerical(_))
+        ));
+        // eps below the validated range: an infinite weight is a failure.
+        assert!(matches!(
+            band_weight(0.02, 0.02, 1e-200),
+            Err(IvFailure::Numerical(_))
+        ));
     }
 }

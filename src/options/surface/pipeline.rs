@@ -193,7 +193,10 @@ pub fn calibrate_surface(
             .iter()
             .map(|o| SliceObservation::new(o.quote.k, o.w_mid, o.weight))
             .collect();
-        let fit = fit_slice(tau, &points?, &config.fit);
+        // An observation the fit refuses fails its slice, not the surface.
+        let fit = points
+            .map_err(|e| FitFailure::Invalid(e.to_string()))
+            .and_then(|p| fit_slice(tau, &p, &config.fit));
         match &fit {
             Ok(f) => {
                 for (o, r) in obs.iter().zip(f.residuals.iter()) {
