@@ -429,13 +429,22 @@ impl QueuePositionFillModel {
     /// Updates queue depth estimates from market data.
     ///
     /// Uses the bid/ask sizes as estimates of queue depth at those levels.
+    /// A negative size is not a queue depth: that level is left out, so it
+    /// reads as an empty queue, and the queue ahead of an order is never
+    /// negative.
     pub fn update_queue(&mut self, tick: &MarketTick) {
         // Normalized string keys: 100, 100.0 and 100.00 are the same level.
-        let bid_key = tick.bid_price.normalize().to_string();
-        let ask_key = tick.ask_price.normalize().to_string();
-
-        self.queue_depth.insert(bid_key, tick.bid_size);
-        self.queue_depth.insert(ask_key, tick.ask_size);
+        for (price, size) in [
+            (tick.bid_price, tick.bid_size),
+            (tick.ask_price, tick.ask_size),
+        ] {
+            let key = price.normalize().to_string();
+            if size.is_sign_negative() {
+                self.queue_depth.remove(&key);
+            } else {
+                self.queue_depth.insert(key, size);
+            }
+        }
     }
 
     /// Returns the estimated queue depth at a price level.
@@ -1193,6 +1202,37 @@ mod tests {
 
         assert_eq!(model.get_queue_depth(dec!(100.0)), dec!(50.0));
         assert_eq!(model.get_queue_depth(dec!(100.1)), dec!(30.0));
+    }
+
+    #[test]
+    fn test_queue_position_negative_size_is_an_empty_queue() {
+        let mut model = QueuePositionFillModel::new(dec!(0.1));
+        model.update_queue(&MarketTick::new(
+            1000,
+            dec!(100.0),
+            dec!(50.0),
+            dec!(100.1),
+            dec!(30.0),
+        ));
+        model.update_queue(&MarketTick::new(
+            1001,
+            dec!(100.0),
+            dec!(-50.0),
+            dec!(100.1),
+            dec!(30.0),
+        ));
+        assert_eq!(model.get_queue_depth(dec!(100.0)), Decimal::ZERO);
+        // At touch with nothing ahead: 1 ms clears 0.1 of the order.
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.1), dec!(1.0), 1000);
+        let tick = MarketTick::new(1002, dec!(100.0), dec!(-5.0), dec!(100.1), dec!(-5.0));
+        model.update_queue(&tick);
+        assert_eq!(
+            model.simulate_fill(&order, &tick, 1).unwrap(),
+            FillResult::PartialFill {
+                filled_quantity: dec!(0.1),
+                fill_price: dec!(100.1),
+            }
+        );
     }
 
     #[test]

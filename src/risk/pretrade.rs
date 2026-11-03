@@ -563,7 +563,7 @@ impl PretradePolicy for LimitsPolicy {
                     }
                 };
                 // A replayed execution changes nothing.
-                if !self.executions.insert(execution_id.clone()) {
+                if self.executions.contains(execution_id) {
                     return Ok(());
                 }
                 // A fee paid in base reduces the base held, like the
@@ -573,9 +573,22 @@ impl PretradePolicy for LimitsPolicy {
                     FeeAsset::Base => *fee,
                     FeeAsset::Quote | FeeAsset::Other(_) => Decimal::ZERO,
                 };
-                self.position = self
-                    .position
-                    .saturating_add(Self::signed(dir, *quantity).saturating_sub(base_fee));
+                // The position is a running balance: an overflow is unknown
+                // exposure, so it latches the fault like an unsupported
+                // side and changes nothing.
+                let position = Self::signed(dir, *quantity)
+                    .checked_sub(base_fee)
+                    .and_then(|delta| self.position.checked_add(delta));
+                let Some(position) = position else {
+                    let error = MMError::NumericalError(format!(
+                        "position overflows: {} after a fill of {} on execution {}",
+                        self.position, quantity, execution_id
+                    ));
+                    self.fault = Some(error.clone());
+                    return Err(error);
+                };
+                self.executions.insert(execution_id.clone());
+                self.position = position;
                 if let Some((_, remaining)) = self.live.get_mut(order_id) {
                     *remaining = remaining.saturating_sub(*quantity);
                     if *remaining <= Decimal::ZERO {
@@ -659,6 +672,32 @@ mod tests {
             OrderPurpose::Quote,
             0,
         )
+    }
+
+    #[test]
+    fn test_fill_position_overflow_latches_fault() {
+        let mut policy = unbounded_short_policy();
+        let fill = OrderEvent::Fill {
+            order_id: "more".to_string(),
+            execution_id: "e1".to_string(),
+            side: Action::Sell,
+            price: dec!(1),
+            quantity: dec!(1),
+            cumulative_quantity: dec!(1),
+            fee: Decimal::ZERO,
+            fee_asset: crate::types::fee::FeeAsset::Quote,
+            timestamp: 0,
+        };
+        let result = policy.on_order_event(&fill);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        assert_eq!(policy.position(), -Decimal::MAX);
+        assert!(matches!(
+            policy.check(&buy_at_one("a", dec!(1))),
+            PretradeDecision::Rejected { .. }
+        ));
     }
 
     #[test]

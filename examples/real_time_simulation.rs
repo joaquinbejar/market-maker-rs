@@ -62,7 +62,9 @@ impl MarketMaker {
             self.pnl.add_realized(realized);
         }
 
-        self.inventory.update_fill(quantity, price, timestamp);
+        self.inventory
+            .update_fill(quantity, price, timestamp)
+            .unwrap();
         self.pnl
             .set_unrealized(self.inventory.unrealized_pnl(self.market_state.mid_price));
     }

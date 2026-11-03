@@ -32,7 +32,9 @@ fn main() {
     println!("=== Scenario 1: Building Long Position ===\n");
 
     println!("Trade 1: Buy 10 units at $100.00");
-    inventory.update_fill(dec!(10.0), dec!(100.0), 1000);
+    inventory
+        .update_fill(dec!(10.0), dec!(100.0), 1000)
+        .unwrap();
     println!("  Position: {:.1} units", inventory.quantity);
     println!("  Avg Entry: ${:.2}", inventory.avg_entry_price);
     println!(
@@ -42,7 +44,7 @@ fn main() {
     println!();
 
     println!("Trade 2: Buy 5 units at $101.00");
-    inventory.update_fill(dec!(5.0), dec!(101.0), 2000);
+    inventory.update_fill(dec!(5.0), dec!(101.0), 2000).unwrap();
     println!("  Position: {:.1} units", inventory.quantity);
     println!("  Avg Entry: ${:.2}", inventory.avg_entry_price);
     println!(
@@ -73,7 +75,7 @@ fn main() {
 
     // Calculate realized PnL for this trade
     let realized_this_trade = sell_qty * (sell_price - inventory.avg_entry_price);
-    inventory.update_fill(-sell_qty, sell_price, 3000);
+    inventory.update_fill(-sell_qty, sell_price, 3000).unwrap();
     pnl.add_realized(realized_this_trade);
     pnl.set_unrealized(inventory.unrealized_pnl(current_price));
 
@@ -96,7 +98,7 @@ fn main() {
     let closing_qty = inventory.quantity;
     let realized_close = closing_qty * (flip_price - inventory.avg_entry_price);
 
-    inventory.update_fill(flip_qty, flip_price, 4000);
+    inventory.update_fill(flip_qty, flip_price, 4000).unwrap();
     pnl.add_realized(realized_close);
     pnl.set_unrealized(inventory.unrealized_pnl(current_price));
 
@@ -133,7 +135,7 @@ fn main() {
     let close_price = dec!(103.0);
     let realized_final = -inventory.quantity * (close_price - inventory.avg_entry_price);
 
-    inventory.update_fill(close_qty, close_price, 5000);
+    inventory.update_fill(close_qty, close_price, 5000).unwrap();
     pnl.add_realized(realized_final);
     pnl.set_unrealized(Decimal::ZERO);
 

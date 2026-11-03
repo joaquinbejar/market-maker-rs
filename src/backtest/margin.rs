@@ -41,6 +41,7 @@ use crate::risk::pretrade::{
     OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
 };
 use crate::types::action::{Action, Dir};
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 
 #[derive(Debug)]
@@ -447,7 +448,7 @@ impl FillAccountant for MarginGateAccountant {
         Ok(())
     }
 
-    fn snapshot(&self) -> AccountingSnapshot {
+    fn snapshot(&self) -> MMResult<AccountingSnapshot> {
         let shared = self.account.lock();
         let ledger = shared.gate.ledger();
         let position = ledger.position(&shared.instrument);
@@ -460,27 +461,29 @@ impl FillAccountant for MarginGateAccountant {
         let total = ledger
             .balance(&shared.quote)
             .map_or(Decimal::ZERO, |b| b.total);
-        // A snapshot cannot fail, so the sums saturate at the `Decimal`
-        // bounds instead of panicking.
-        let deposits =
-            ledger
-                .transfers()
-                .filter(|t| t.asset == shared.quote)
-                .fold(Decimal::ZERO, |acc, t| match t.kind {
-                    TransferKind::Deposit => acc.saturating_add(t.amount),
-                    TransferKind::Withdrawal => acc.saturating_sub(t.amount),
-                });
-        AccountingSnapshot {
+        let deposits = ledger
+            .transfers()
+            .filter(|t| t.asset == shared.quote)
+            .try_fold(Decimal::ZERO, |acc, t| match t.kind {
+                TransferKind::Deposit => acc.checked_add(t.amount),
+                TransferKind::Withdrawal => acc.checked_sub(t.amount),
+            })
+            .or_overflow("margin account deposits")?;
+        Ok(AccountingSnapshot {
             position: position
                 .as_ref()
                 .map_or(Decimal::ZERO, |p| p.quantity)
-                .saturating_sub(base_fees),
+                .checked_sub(base_fees)
+                .or_overflow("margin account position")?,
             average_entry_price: position.as_ref().and_then(|p| p.average_price()),
-            cash_flow: total.saturating_sub(deposits).saturating_add(quote_fees),
+            cash_flow: total
+                .checked_sub(deposits)
+                .and_then(|x| x.checked_add(quote_fees))
+                .or_overflow("margin account cash flow")?,
             fees: quote_fees,
             base_fees,
             fills_posted: crate::types::decimal::saturating_u64(ledger.journal().len()),
-        }
+        })
     }
 
     fn reset(&mut self) {

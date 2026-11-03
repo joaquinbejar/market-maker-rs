@@ -1392,10 +1392,15 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.strategy.on_execution_report(&delivery.report);
         if let Some((_, fill)) = delivery.fill {
             // The fill was produced by the engine, so its side is buy or
-            // sell; an error leaves the known position unchanged.
-            if let Ok(base_delta) = fill.base_delta() {
-                self.agent_position
-                    .update_fill(base_delta, fill.price, fill.timestamp);
+            // sell, and a base delta error was already recorded when the
+            // venue applied it. A position overflow leaves the known
+            // position unchanged and is recorded as a fault.
+            if let Ok(base_delta) = fill.base_delta()
+                && let Err(error) =
+                    self.agent_position
+                        .update_fill(base_delta, fill.price, fill.timestamp)
+            {
+                self.record_fault(error);
             }
             self.strategy.on_fill(&fill);
         }
@@ -1498,8 +1503,13 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 return;
             }
         };
-        self.position
-            .update_fill(base_delta, fill.price, fill.timestamp);
+        if let Err(error) = self
+            .position
+            .update_fill(base_delta, fill.price, fill.timestamp)
+        {
+            self.record_fault(error);
+            return;
+        }
 
         // Update realized PnL for closing trades
         // Simplified: just track the cash flow
@@ -1611,8 +1621,11 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     }
 
     /// Snapshot of the selected accountant, if one was selected.
+    ///
+    /// The inner result is the accountant's: an error if a sum over its
+    /// bookings overflows.
     #[must_use]
-    pub fn accounting_snapshot(&self) -> Option<AccountingSnapshot> {
+    pub fn accounting_snapshot(&self) -> Option<MMResult<AccountingSnapshot>> {
         self.accountant.as_ref().map(|a| a.snapshot())
     }
 
@@ -1724,12 +1737,19 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
     /// Copies the selected accountant's state into the engine's position,
     /// PnL and fee fields, so runs start from the accountant's initial
-    /// state (also with no fills at all).
+    /// state (also with no fills at all). A snapshot that fails is
+    /// recorded as a fault and leaves those fields unchanged.
     fn sync_accounting(&mut self, timestamp: u64) {
         let Some(accountant) = self.accountant.as_ref() else {
             return;
         };
-        let snapshot = accountant.snapshot();
+        let snapshot = match accountant.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.record_fault(error);
+                return;
+            }
+        };
         self.position.quantity = snapshot.position;
         self.position.avg_entry_price = snapshot.average_entry_price.unwrap_or(Decimal::ZERO);
         self.position.last_update = timestamp;
@@ -3133,8 +3153,8 @@ mod tests {
             self.snapshot.fills_posted += 1;
             Ok(())
         }
-        fn snapshot(&self) -> AccountingSnapshot {
-            self.snapshot.clone()
+        fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+            Ok(self.snapshot.clone())
         }
         fn reset(&mut self) {
             self.log.lock().unwrap().clear();
@@ -3205,7 +3225,7 @@ mod tests {
         assert_eq!(selected.total_pnl, builtin.total_pnl);
         assert_eq!(selected.net_pnl, builtin.net_pnl);
         assert_eq!(selected.max_position, builtin.max_position);
-        let snapshot = engine.accounting_snapshot().unwrap();
+        let snapshot = engine.accounting_snapshot().unwrap().unwrap();
         assert_eq!(snapshot.fills_posted, 3);
         assert_eq!(snapshot.cash_flow, dec!(-200));
         assert_eq!(snapshot.fees, dec!(0.2));
@@ -3267,7 +3287,7 @@ mod tests {
                 }
                 self.0.post_fill(fill)
             }
-            fn snapshot(&self) -> AccountingSnapshot {
+            fn snapshot(&self) -> MMResult<AccountingSnapshot> {
                 self.0.snapshot()
             }
             fn reset(&mut self) {
@@ -3284,6 +3304,33 @@ mod tests {
         let second = engine.run();
         assert_eq!(second.accounting, first.accounting);
         assert_eq!(second.refused_trades().count(), 1);
+    }
+
+    #[test]
+    fn test_failed_accounting_snapshot_is_recorded_as_fault() {
+        #[derive(Debug, Default)]
+        struct FailingSnapshot;
+        impl FillAccountant for FailingSnapshot {
+            fn post_fill(&mut self, _fill: &AccountingFill) -> MMResult<()> {
+                Ok(())
+            }
+            fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+                Err(MMError::NumericalError(
+                    "ledger cash flow overflows".to_string(),
+                ))
+            }
+            fn reset(&mut self) {}
+        }
+        let engine = queued_engine_with_fees().with_accountant(FailingSnapshot);
+        assert_eq!(engine.fault_count(), 1);
+        assert!(matches!(
+            engine.faults().first(),
+            Some(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            engine.accounting_snapshot(),
+            Some(Err(MMError::NumericalError(_)))
+        ));
     }
 
     #[test]
@@ -3327,7 +3374,7 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
         assert_eq!(
             engine.accounting_snapshot(),
-            Some(AccountingSnapshot::default())
+            Some(Ok(AccountingSnapshot::default()))
         );
         let second = engine.run();
         assert_eq!(*log.lock().unwrap(), first_log);
@@ -3368,7 +3415,7 @@ mod tests {
             assert_eq!(result.final_position, builtin.final_position);
             assert_eq!(result.total_fees, dec!(0.2));
             assert_eq!(result.net_pnl, builtin.net_pnl);
-            let snapshot = engine.accounting_snapshot().unwrap();
+            let snapshot = engine.accounting_snapshot().unwrap().unwrap();
             assert_eq!(snapshot.cash_flow, dec!(-200));
             assert_eq!(snapshot.average_entry_price, Some(dec!(100)));
             assert_eq!(snapshot.fills_posted, 3);
@@ -3397,7 +3444,7 @@ mod tests {
                 })
             );
             assert!(acc.ledger().journal().is_empty());
-            assert_eq!(acc.snapshot().fills_posted, 0);
+            assert_eq!(acc.snapshot().unwrap().fills_posted, 0);
         }
 
         #[test]
@@ -3405,12 +3452,12 @@ mod tests {
             let mut acc = accountant(dec!(1000));
             acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(0.1)))
                 .unwrap();
-            let before = acc.snapshot();
+            let before = acc.snapshot().unwrap();
             let mut fill = ask_fill(2, dec!(100), dec!(1), dec!(0.1));
             fill.side = Action::Other;
             assert!(acc.post_fill(&fill).is_err());
             assert_eq!(acc.ledger().journal().len(), 1);
-            assert_eq!(acc.snapshot(), before);
+            assert_eq!(acc.snapshot().unwrap(), before);
         }
 
         fn ask_fill(id: u64, price: Decimal, quantity: Decimal, fee: Decimal) -> AccountingFill {
@@ -3432,7 +3479,7 @@ mod tests {
             let mut acc = accountant(dec!(1000));
             acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(0.1)))
                 .unwrap();
-            let snapshot = acc.snapshot();
+            let snapshot = acc.snapshot().unwrap();
             assert_eq!(snapshot.position, dec!(-1));
             assert_eq!(snapshot.cash_flow, dec!(100));
             assert_eq!(snapshot.fees, dec!(0.1));
@@ -3447,7 +3494,7 @@ mod tests {
             let mut acc = accountant(dec!(1000));
             acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(-0.05)))
                 .unwrap();
-            assert_eq!(acc.snapshot().fees, dec!(-0.05));
+            assert_eq!(acc.snapshot().unwrap().fees, dec!(-0.05));
         }
 
         #[test]
@@ -3464,13 +3511,13 @@ mod tests {
             assert_eq!(acc.overdrafts().get(&btc), Some(&dec!(1.001)));
             // The account delivered 1.001 BTC; the fee is reported in base
             // for the engine to mark.
-            let snapshot = acc.snapshot();
+            let snapshot = acc.snapshot().unwrap();
             assert_eq!(snapshot.position, dec!(-1.001));
             assert_eq!(snapshot.cash_flow, dec!(100));
             assert_eq!(snapshot.fees, Decimal::ZERO);
             assert_eq!(snapshot.base_fees, dec!(0.001));
             acc.reset();
-            assert_eq!(acc.snapshot().base_fees, Decimal::ZERO);
+            assert_eq!(acc.snapshot().unwrap().base_fees, Decimal::ZERO);
         }
 
         #[test]
@@ -3479,7 +3526,7 @@ mod tests {
             let mut fill = ask_fill(1, dec!(100), dec!(1), dec!(0.5));
             fill.fee_asset = FeeAsset::Other("BNB".to_string());
             assert!(acc.post_fill(&fill).is_err());
-            assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+            assert_eq!(acc.snapshot().unwrap(), AccountingSnapshot::default());
         }
 
         #[test]
@@ -3541,7 +3588,7 @@ mod tests {
             ledger.book_execution(&eth_buy).unwrap();
             let acc = MarginLedgerAccountant::new(ledger, InstrumentId::new("BTC-USDC").unwrap())
                 .unwrap();
-            assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+            assert_eq!(acc.snapshot().unwrap(), AccountingSnapshot::default());
         }
 
         #[test]
