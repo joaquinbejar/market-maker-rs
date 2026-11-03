@@ -447,9 +447,11 @@ impl QueuePositionFillModel {
     }
 
     /// Calculates volume cleared based on time in queue.
-    fn volume_cleared(&self, time_in_queue_ms: u64) -> Decimal {
-        self.fill_rate
-            .saturating_mul(Decimal::from(time_in_queue_ms))
+    ///
+    /// Returns `None` when the product overflows: a saturated value is not a
+    /// real volume, so the caller treats it conservatively as no fill.
+    fn volume_cleared(&self, time_in_queue_ms: u64) -> Option<Decimal> {
+        self.fill_rate.checked_mul(Decimal::from(time_in_queue_ms))
     }
 }
 
@@ -491,28 +493,27 @@ impl QueuePositionFillModel {
         };
 
         // Calculate how much volume has cleared
-        let cleared = self.volume_cleared(time_in_queue_ms);
-
-        if cleared >= queue_ahead.saturating_add(order.quantity) {
+        let Some(cleared) = self.volume_cleared(time_in_queue_ms) else {
+            // Overflowed volume is not real volume: fail conservative.
+            return FillResult::NoFill;
+        };
+        if cleared <= queue_ahead {
+            // Still waiting in queue
+            return FillResult::NoFill;
+        }
+        // Cannot overflow: cleared > queue_ahead >= 0 here.
+        let remainder = cleared.saturating_sub(queue_ahead);
+        if remainder >= order.quantity {
             // Full fill - we've cleared the queue plus our order
             FillResult::FullFill {
                 fill_price: order.price,
             }
-        } else if cleared > queue_ahead {
-            // Partial fill - some of our order filled
-            // Cannot overflow: cleared > queue_ahead >= 0 here.
-            let filled = cleared.saturating_sub(queue_ahead);
-            if filled > Decimal::ZERO {
-                FillResult::PartialFill {
-                    filled_quantity: filled.min(order.quantity),
-                    fill_price: order.price,
-                }
-            } else {
-                FillResult::NoFill
-            }
         } else {
-            // Still waiting in queue
-            FillResult::NoFill
+            // Partial fill - some of our order filled
+            FillResult::PartialFill {
+                filled_quantity: remainder,
+                fill_price: order.price,
+            }
         }
     }
 }
@@ -1182,6 +1183,27 @@ mod tests {
         let tick = create_test_tick(dec!(99.9), dec!(100.1));
         let result = model.simulate_fill(&order, &tick, 1000).unwrap();
 
+        assert!(!result.is_filled());
+    }
+
+    #[test]
+    fn test_queue_position_max_queue_and_max_cleared_returns_no_fill() {
+        let mut model = QueuePositionFillModel::new(Decimal::MAX);
+        let tick = MarketTick::new(1000, dec!(1), dec!(1), dec!(2), Decimal::MAX);
+        model.update_queue(&tick);
+        let order = SimulatedOrder::new(Action::Buy, dec!(2), dec!(1), 1000);
+        // cleared == queue_ahead == MAX: only the queue ahead cleared.
+        let result = model.simulate_fill(&order, &tick, 1).unwrap();
+        assert!(!result.is_filled());
+    }
+
+    #[test]
+    fn test_queue_position_overflowing_cleared_volume_returns_no_fill() {
+        let mut model = QueuePositionFillModel::new(Decimal::MAX);
+        let tick = MarketTick::new(1000, dec!(99.9), dec!(10), dec!(100), dec!(5));
+        model.update_queue(&tick);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100), dec!(1), 1000);
+        let result = model.simulate_fill(&order, &tick, 2).unwrap();
         assert!(!result.is_filled());
     }
 
