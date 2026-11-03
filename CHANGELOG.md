@@ -20,6 +20,20 @@ project follows [Semantic Versioning](https://semver.org/).
   refused. Its unit tests run with `cargo test`.
 - `options::pricing::surface_point(&OptionInputs, Dynamics)`: the `(k, tau)`
   at which `value` reads the surface, computed by the same code (#95).
+- Order by order book reconstruction under `l3` (new feature `l3`, no
+  dependencies, #77): `BookReconstructor` rebuilds the visible book of one
+  product from an `L3Snapshot` and its sequenced `L3Message`s, modelled on
+  the Coinbase Exchange `full` channel, with the snapshot handshake. It fails
+  closed and transactionally: a gap, an out of order sequence or any
+  `Discrepancy` (unknown maker, missing match, size increase or price
+  change, crossed book, capacity, checked arithmetic) ends the segment, and
+  views error until the next validated snapshot. A `QualityManifest`
+  records segments and counters; `priority_profile` the volume of unknown
+  priority per level; `volume_ahead` the size ahead of an own or
+  hypothetical order under declared `Assumption`s. The
+  `l3_reconstruction` example replays a synthetic stream with injected
+  faults. Replaying captured segments waits for #76.
+
 - Surface calibration under `options::surface` (feature `options`, #96):
   quote cleaning with a reason for every rejected quote and a global error
   for future data (`clean_quotes`); implied total variance by safeguarded

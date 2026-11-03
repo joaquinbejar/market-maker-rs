@@ -67,6 +67,8 @@ prometheus = ["dep:prometheus", "dep:hyper", "dep:http-body-util", "dep:hyper-ut
 options = ["dep:optionstratlib", "dep:chrono"]
 chain = ["dep:option-chain-orderbook", "options"]
 data-feeds = ["dep:tokio"]
+# Order by order (L3) book reconstruction; no dependencies.
+l3 = []
 api = ["dep:axum", "dep:tokio", "dep:utoipa", "dep:tower-http", "serde"]
 persistence = ["dep:tokio"]
 multi-underlying = ["serde"]
@@ -77,6 +79,10 @@ margin = ["dep:margin-rs"]
 [[example]]
 name = "options_greeks"
 required-features = ["options"]
+
+[[example]]
+name = "l3_reconstruction"
+required-features = ["l3"]
 
 [[example]]
 name = "vol_surface_validation"
