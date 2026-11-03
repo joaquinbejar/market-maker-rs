@@ -17,7 +17,9 @@ project follows [Semantic Versioning](https://semver.org/).
   the total variance read, or `error` with a class, `InvalidInput`,
   `OutOfDomain`, `Unsupported` or `Numerical`, and no number); `identity`
   prints the protocol and the build commit. Decimals are read exactly or
-  refused. Its unit tests run with `cargo test`.
+  refused. `price --vol-shift X` prices on the surface with its implied
+  volatility moved by `X` (a parallel `ShockedSurface`), for finite
+  differences in volatility. Its unit tests run with `cargo test`.
 - `options::pricing::surface_point(&OptionInputs, Dynamics)`: the `(k, tau)`
   at which `value` reads the surface, computed by the same code (#95).
 - Order by order book reconstruction under `l3` (new feature `l3`, no

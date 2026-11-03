@@ -9,6 +9,7 @@
 //!     --requests requests.csv --responses responses.csv
 //! counterpart price --surface surface.json --dynamics sticky-strike --s-ref S \
 //!     --requests requests.csv --responses responses.csv
+//! (either form of price takes an optional --vol-shift X)
 //! ```
 //!
 //! - `identity` prints, as JSON, the protocol, the crate version and the
@@ -24,7 +25,10 @@
 //! - `price` values every request row on the surface and writes one
 //!   response row per request: `ok` with the price, the total Greeks, the
 //!   total variance read and the dynamics, or `error` with a class and a
-//!   reason and no number. The classes are:
+//!   reason and no number. `--vol-shift X` prices on the surface with its
+//!   implied volatility moved by `X` everywhere (`ShockedSurface`, a
+//!   parallel shock), for finite differences in volatility. The classes
+//!   are:
 //!   - `InvalidInput`: the row itself (a field that is not a number, an
 //!     unknown kind or style, a non-positive spot or strike, `as_of_days`
 //!     after `expiry_days`);
@@ -65,8 +69,8 @@ use market_maker_rs::options::pricing::{
 };
 use market_maker_rs::options::surface::{
     CleaningConfig, DiagnosticsConfig, FitConfig, IvConfig, KRange, OptionQuote, QualityReport,
-    Rates, ShortExpiryPolicy, SurfaceCalibrationConfig, SurfaceStatus, SviSlice, SviSurface,
-    VolSurface, calibrate_surface,
+    Rates, ShockedSurface, ShortExpiryPolicy, SurfaceCalibrationConfig, SurfaceShock,
+    SurfaceStatus, SviSlice, SviSurface, VolSurface, calibrate_surface,
 };
 use market_maker_rs::types::error::MMError;
 use optionstratlib::{OptionStyle, OptionType};
@@ -148,9 +152,10 @@ fn run(args: &[String]) -> Protocol<()> {
             let o = options(
                 rest,
                 &["surface", "dynamics", "requests", "responses"],
-                &["s-ref"],
+                &["s-ref", "vol-shift"],
             )?;
-            let surface = surface_from_json(&read(&o, "surface")?)?;
+            let base = surface_from_json(&read(&o, "surface")?)?;
+            let surface = shifted(base, o.get("vol-shift").map(String::as_str))?;
             let dynamics = dynamics(get(&o, "dynamics")?, o.get("s-ref").map(String::as_str))?;
             let out = price(surface, dynamics, &read(&o, "requests")?)?;
             write(&o, "responses", &out)
@@ -636,9 +641,23 @@ fn class(e: &MMError) -> &'static str {
     }
 }
 
-fn price(surface: SviSurface, dynamics: Dynamics, requests: &str) -> Protocol<String> {
-    let surface = Arc::new(surface);
-    let pricer = SurfacePricer::new(Arc::clone(&surface) as Arc<dyn VolSurface>, dynamics)
+/// The surface, or the surface with its implied volatility moved by a
+/// parallel shift (a finite `f64` written as text).
+fn shifted(base: SviSurface, shift: Option<&str>) -> Protocol<Arc<dyn VolSurface>> {
+    let Some(text) = shift else {
+        return Ok(Arc::new(base));
+    };
+    let x = f64::from_str(text)
+        .ok()
+        .filter(|x| x.is_finite())
+        .ok_or_else(|| format!("--vol-shift {text:?} is not a finite number"))?;
+    let shock = SurfaceShock::new("vol-shift", x, 0.0, 0.0, 1.0)
+        .map_err(|e| format!("--vol-shift: {e}"))?;
+    Ok(Arc::new(ShockedSurface::new(base, shock)))
+}
+
+fn price(surface: Arc<dyn VolSurface>, dynamics: Dynamics, requests: &str) -> Protocol<String> {
+    let pricer = SurfacePricer::new(Arc::clone(&surface), dynamics)
         .map_err(|e| format!("invalid dynamics: {e}"))?;
     let mut out = RESPONSE_COLUMNS.join(",");
     out.push('\n');
@@ -661,7 +680,7 @@ fn price(surface: SviSurface, dynamics: Dynamics, requests: &str) -> Protocol<St
 /// class and reason of the row's error.
 fn value_row(
     f: &[&str],
-    surface: &SviSurface,
+    surface: &dyn VolSurface,
     pricer: &SurfacePricer,
     dynamics: Dynamics,
 ) -> Result<String, (&'static str, String)> {
@@ -735,7 +754,7 @@ enum Read {
 /// `f64` text (shortest round trip, no exponent); `0` at expiry, where no
 /// surface is read.
 fn total_variance(
-    surface: &SviSurface,
+    surface: &dyn VolSurface,
     dynamics: Dynamics,
     i: &OptionInputs,
 ) -> Result<String, Read> {
@@ -786,7 +805,7 @@ mod tests {
 
     fn priced(dynamics: Dynamics, req: &[&str]) -> Vec<Vec<String>> {
         let surface = surface_from_json(&surface_json()).unwrap();
-        rows(&price(surface, dynamics, &requests(req)).unwrap())
+        rows(&price(Arc::new(surface), dynamics, &requests(req)).unwrap())
     }
 
     #[test]
@@ -861,7 +880,7 @@ mod tests {
         let surface = surface_from_json(&overflow).unwrap();
         let r = rows(
             &price(
-                surface,
+                Arc::new(surface),
                 Dynamics::StickyMoneyness,
                 &requests(&["inf,100,36.5,call,european,100,0,0,0"]),
             )
@@ -874,6 +893,36 @@ mod tests {
             &["far,100,90,call,american,100,0,0,0"],
         );
         assert!(r[0][9].starts_with("Unsupported:"), "{}", r[0][9]);
+    }
+
+    #[test]
+    fn test_vol_shift_moves_the_implied_volatility_in_parallel() {
+        let req = requests(&["a,100,45,call,european,100,0,0,0"]);
+        let base = rows(
+            &price(
+                shifted(surface_from_json(&surface_json()).unwrap(), None).unwrap(),
+                Dynamics::StickyMoneyness,
+                &req,
+            )
+            .unwrap(),
+        );
+        let up = rows(
+            &price(
+                shifted(surface_from_json(&surface_json()).unwrap(), Some("0.01")).unwrap(),
+                Dynamics::StickyMoneyness,
+                &req,
+            )
+            .unwrap(),
+        );
+        let (w0, w1): (f64, f64) = (base[0][7].parse().unwrap(), up[0][7].parse().unwrap());
+        let tau = 45.0 / 365.0;
+        let shifted_w = ((w0 / tau).sqrt() + 0.01).powi(2) * tau;
+        assert!((w1 - shifted_w).abs() <= 1e-15, "{w1} vs {shifted_w}");
+        let (p0, p1): (f64, f64) = (base[0][2].parse().unwrap(), up[0][2].parse().unwrap());
+        assert!(p1 > p0);
+        for bad in ["x", "inf", "NaN", ""] {
+            assert!(shifted(surface_from_json(&surface_json()).unwrap(), Some(bad)).is_err());
+        }
     }
 
     #[test]
@@ -965,7 +1014,7 @@ mod tests {
             let surface = surface_from_json(&tiny).unwrap();
             let r = rows(
                 &price(
-                    surface,
+                    Arc::new(surface),
                     d,
                     &requests(&["n,100.0000000000000001,30,call,european,100,0,0,0"]),
                 )
@@ -979,10 +1028,17 @@ mod tests {
     #[test]
     fn test_protocol_failures_stop_the_run() {
         let surface = || surface_from_json(&surface_json()).unwrap();
-        assert!(price(surface(), Dynamics::StickyMoneyness, "id,strike\n1,2").is_err());
         assert!(
             price(
-                surface(),
+                Arc::new(surface()),
+                Dynamics::StickyMoneyness,
+                "id,strike\n1,2"
+            )
+            .is_err()
+        );
+        assert!(
+            price(
+                Arc::new(surface()),
                 Dynamics::StickyMoneyness,
                 &requests(&["a,100,45,call,european,100,0,0"])
             )
