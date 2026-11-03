@@ -240,7 +240,7 @@ impl MultiUnderlyingManager {
 
     /// Gets the unified Greeks across all underlyings.
     ///
-    /// An aggregate report: its sums saturate at the `Decimal` bounds.
+    /// Report only: its sums saturate at the `Decimal` bounds.
     #[must_use]
     pub fn get_unified_greeks(&self) -> UnifiedGreeks {
         let mut greeks = UnifiedGreeks::new();
@@ -266,7 +266,7 @@ impl MultiUnderlyingManager {
 
     /// Gets the unified risk view across all underlyings.
     ///
-    /// An aggregate report: its sums and utilizations saturate at the
+    /// Report only: its sums and utilizations saturate at the
     /// `Decimal` bounds.
     #[must_use]
     pub fn get_unified_risk(&self) -> UnifiedRisk {
@@ -316,7 +316,7 @@ impl MultiUnderlyingManager {
 
     /// Gets cross-asset hedge suggestions.
     ///
-    /// Derived suggestions: a hedge ratio that overflows saturates.
+    /// Report only suggestions: a hedge ratio that overflows saturates.
     #[must_use]
     pub fn get_cross_asset_hedges(&self) -> Vec<CrossAssetHedge> {
         let mut hedges = Vec::new();
@@ -533,20 +533,30 @@ impl MultiUnderlyingManager {
 
     fn allocate_performance_based(&self) -> MMResult<Vec<(String, Decimal)>> {
         // Allocate more to underlyings with positive P&L
-        let winners = || {
-            self.states.iter().filter(|(_, s)| {
-                s.status == UnderlyingStatus::Active && s.total_pnl() > Decimal::ZERO
-            })
-        };
-        let total_pnl = winners()
-            .try_fold(Decimal::ZERO, |acc, (_, s)| acc.checked_add(s.total_pnl()))
+        // The exact PnL of each active underlying: the report only
+        // `total_pnl` saturates, which would skew the allocation.
+        let mut winners = Vec::new();
+        for (symbol, state) in &self.states {
+            if state.status != UnderlyingStatus::Active {
+                continue;
+            }
+            let pnl = state
+                .unrealized_pnl
+                .checked_add(state.realized_pnl)
+                .or_overflow("underlying pnl")?;
+            if pnl > Decimal::ZERO {
+                winners.push((symbol, pnl));
+            }
+        }
+        let total_pnl = winners
+            .iter()
+            .try_fold(Decimal::ZERO, |acc, (_, pnl)| acc.checked_add(*pnl))
             .or_overflow("total pnl")?;
 
         if total_pnl > Decimal::ZERO {
-            winners()
-                .map(|(symbol, state)| {
-                    Ok((symbol.clone(), self.share(state.total_pnl(), total_pnl)?))
-                })
+            winners
+                .into_iter()
+                .map(|(symbol, pnl)| Ok((symbol.clone(), self.share(pnl, total_pnl)?)))
                 .collect()
         } else {
             // Fall back to equal allocation if no positive P&L
@@ -554,7 +564,7 @@ impl MultiUnderlyingManager {
         }
     }
 
-    /// A derived report value: its sums saturate at the `Decimal` bounds.
+    /// Report only: its sums saturate at the `Decimal` bounds.
     fn calculate_portfolio_volatility(&self) -> Decimal {
         // Simplified portfolio volatility calculation
         // In a full implementation, this would use the full correlation matrix

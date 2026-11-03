@@ -356,7 +356,7 @@ impl DrawdownTracker {
     /// assert_eq!(tracker.distance_to_max_drawdown(), dec!(0.10));
     /// ```
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn distance_to_max_drawdown(&self) -> Decimal {
         let distance = self
@@ -380,7 +380,7 @@ impl DrawdownTracker {
     /// assert_eq!(tracker.equity_at_max_drawdown(), dec!(9600.0));
     /// ```
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn equity_at_max_drawdown(&self) -> Decimal {
         self.peak_equity

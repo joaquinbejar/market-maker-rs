@@ -208,7 +208,7 @@ impl Trade {
 
     /// Returns the notional value of the trade.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn notional(&self) -> Decimal {
         self.price.saturating_mul(self.size)
@@ -325,7 +325,7 @@ pub struct AdaptiveSpread {
 impl AdaptiveSpread {
     /// Creates a new `AdaptiveSpread`.
     ///
-    /// `total_spread` is a derived value: it saturates at the `Decimal`
+    /// `total_spread` is report only: it saturates at the `Decimal`
     /// bounds.
     #[must_use]
     pub fn new(bid_spread: Decimal, ask_spread: Decimal) -> Self {

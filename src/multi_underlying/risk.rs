@@ -102,7 +102,7 @@ impl UnifiedRisk {
 
     /// Returns the total P&L.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn total_pnl(&self) -> Decimal {
         self.total_unrealized_pnl
@@ -111,7 +111,7 @@ impl UnifiedRisk {
 
     /// Returns the capital utilization percentage.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn capital_utilization(&self) -> Decimal {
         if self.total_capital > Decimal::ZERO {

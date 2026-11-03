@@ -155,7 +155,7 @@ impl TradeRecord {
 
     /// Returns the net PnL after fees.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn net_pnl(&self) -> Decimal {
         self.pnl.saturating_sub(self.fees)
@@ -181,7 +181,7 @@ impl TradeRecord {
 
     /// Returns the return percentage for this trade.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn return_pct(&self) -> Decimal {
         if self.entry_price == Decimal::ZERO {
@@ -344,7 +344,7 @@ impl PerformanceMetrics {
 
     /// Returns the risk-reward ratio (average winner / average loser).
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn risk_reward_ratio(&self) -> Decimal {
         if self.average_loser == Decimal::ZERO {
@@ -356,7 +356,7 @@ impl PerformanceMetrics {
     /// Returns the expectancy per trade.
     /// Formula: (win_rate * avg_winner) - ((1 - win_rate) * abs(avg_loser))
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn expectancy(&self) -> Decimal {
         let win_component = self.win_rate.saturating_mul(self.average_winner);
@@ -420,7 +420,7 @@ impl MetricsCalculator {
     /// * `trades` - List of completed trades
     /// * `initial_capital` - Starting capital
     ///
-    /// Every metric is a derived report value: a sum, product or ratio
+    /// Every metric is report only: a sum, product or ratio
     /// beyond the `Decimal` bounds saturates instead of failing.
     ///
     /// # Errors
@@ -858,7 +858,7 @@ fn saturating_sum(values: impl Iterator<Item = Decimal>) -> Decimal {
 }
 
 /// Approximate square root using Newton's method, saturating at the
-/// `Decimal` bounds (a derived report value).
+/// `Decimal` bounds (report only).
 fn decimal_sqrt(n: Decimal) -> Decimal {
     if n <= Decimal::ZERO {
         return Decimal::ZERO;
@@ -905,7 +905,7 @@ fn decimal_ln(n: Decimal) -> Decimal {
 }
 
 /// Approximate exponential function, saturating at the `Decimal` bounds
-/// for a large argument (a derived report value).
+/// for a large argument (report only).
 fn decimal_exp(x: Decimal) -> Decimal {
     // Taylor series: e^x = sum(x^n / n!)
     let mut result = Decimal::ONE;

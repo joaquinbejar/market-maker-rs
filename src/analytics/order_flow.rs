@@ -105,7 +105,7 @@ impl Trade {
 
     /// Returns the notional value of the trade (price * size).
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn notional(&self) -> Decimal {
         self.price.saturating_mul(self.size)
@@ -171,7 +171,7 @@ pub struct OrderFlowStats {
 impl OrderFlowStats {
     /// Returns the total volume (buy + sell).
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn total_volume(&self) -> Decimal {
         self.buy_volume.saturating_add(self.sell_volume)
@@ -364,7 +364,7 @@ impl OrderFlowAnalyzer {
     /// # Returns
     ///
     /// `OrderFlowStats` containing all calculated metrics. These are
-    /// derived report values: sums saturate at the `Decimal` bounds and a
+    /// report only values: sums saturate at the `Decimal` bounds and a
     /// ratio that overflows is `None` (or zero for the imbalance).
     #[must_use]
     pub fn get_stats(&self, current_time: u64) -> OrderFlowStats {
@@ -525,7 +525,7 @@ impl OrderFlowAnalyzer {
     ///
     /// # Returns
     ///
-    /// Total volume per second in the current window. A derived report
+    /// Total volume per second in the current window. A report only
     /// value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn volume_intensity(&self, current_time: u64) -> Decimal {

@@ -113,7 +113,7 @@ impl MarketTick {
 
     /// Returns the bid-ask spread.
     ///
-    /// A derived value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread(&self) -> Decimal {
         self.ask_price.saturating_sub(self.bid_price)
@@ -121,7 +121,7 @@ impl MarketTick {
 
     /// Returns the spread as a percentage of mid price.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();
@@ -137,7 +137,7 @@ impl MarketTick {
 
     /// Returns the total available liquidity (bid + ask size).
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn total_liquidity(&self) -> Decimal {
         self.bid_size.saturating_add(self.ask_size)
@@ -145,7 +145,7 @@ impl MarketTick {
 
     /// Returns the imbalance ratio: (bid_size - ask_size) / (bid_size + ask_size).
     ///
-    /// A derived report value; zero when there is no liquidity.
+    /// Scale invariant: exact even when the sides sum beyond the `Decimal` bounds; zero when there is no liquidity.
     #[must_use]
     pub fn imbalance(&self) -> Decimal {
         let total = self.total_liquidity();
@@ -217,7 +217,7 @@ impl OHLCVBar {
 
     /// Returns the price range (high - low).
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn range(&self) -> Decimal {
         self.high.saturating_sub(self.low)
@@ -225,7 +225,7 @@ impl OHLCVBar {
 
     /// Returns the body size (|close - open|).
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn body(&self) -> Decimal {
         if self.close > self.open {
@@ -249,7 +249,7 @@ impl OHLCVBar {
 
     /// Returns the typical price (high + low + close) / 3.
     ///
-    /// A derived report value: a sum beyond the `Decimal` bounds saturates.
+    /// Report only: a sum beyond the `Decimal` bounds saturates, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn typical_price(&self) -> Decimal {
         self.high

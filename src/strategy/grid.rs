@@ -197,7 +197,7 @@ impl GridOrder {
 
     /// Returns the notional value of this order.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn notional(&self) -> Decimal {
         self.price.saturating_mul(self.size)

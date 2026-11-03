@@ -785,7 +785,7 @@ impl OrderIntensityCalibrator {
 
     /// Calculates quality score.
     ///
-    /// A derived score: it saturates at the `Decimal` bounds before the
+    /// A report only score: it saturates at the `Decimal` bounds before the
     /// clamp to 1.
     fn calculate_quality(&self, r_squared: Decimal, sample_size: usize) -> Decimal {
         let mut quality = r_squared.saturating_mul(dec!(0.6));

@@ -103,7 +103,7 @@ impl UnderlyingState {
 
     /// Returns the total P&L.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn total_pnl(&self) -> Decimal {
         self.unrealized_pnl.saturating_add(self.realized_pnl)
@@ -111,7 +111,7 @@ impl UnderlyingState {
 
     /// Returns the capital utilization percentage.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn capital_utilization(&self) -> Decimal {
         if self.allocated_capital > Decimal::ZERO {
@@ -126,7 +126,7 @@ impl UnderlyingState {
 
     /// Returns the dollar delta.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn dollar_delta(&self) -> Decimal {
         self.delta.saturating_mul(self.price)

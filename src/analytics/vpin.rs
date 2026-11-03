@@ -469,7 +469,7 @@ impl VPINCalculator {
 
     /// Gets the fill percentage of the current bucket.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn current_bucket_fill_pct(&self) -> Decimal {
         if self.config.bucket_volume > Decimal::ZERO {

@@ -76,7 +76,7 @@ impl Fill {
 
     /// Returns the notional value.
     ///
-    /// A derived record value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn notional(&self) -> Decimal {
         self.price.saturating_mul(self.quantity)
@@ -84,7 +84,7 @@ impl Fill {
 
     /// Returns the net value after fees.
     ///
-    /// A derived record value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn net_value(&self) -> Decimal {
         match self.side {
@@ -135,7 +135,7 @@ impl PositionSnapshot {
         avg_price: Decimal,
         market_price: Decimal,
     ) -> Self {
-        // A derived record value: it saturates at the `Decimal` bounds.
+        // Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
         let unrealized_pnl = market_price
             .saturating_sub(avg_price)
             .saturating_mul(quantity);
@@ -167,7 +167,7 @@ impl PositionSnapshot {
 
     /// Returns the total P&L.
     ///
-    /// A derived record value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn total_pnl(&self) -> Decimal {
         self.unrealized_pnl.saturating_add(self.realized_pnl)
@@ -213,7 +213,7 @@ impl DailyPnL {
             symbol: symbol.into(),
             realized_pnl,
             unrealized_pnl,
-            // A derived record value: it saturates at the `Decimal` bounds.
+            // Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
             total_pnl: realized_pnl.saturating_add(unrealized_pnl),
             trade_count: 0,
             volume: Decimal::ZERO,

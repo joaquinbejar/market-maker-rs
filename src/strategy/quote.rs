@@ -34,7 +34,7 @@ pub struct Quote {
 impl Quote {
     /// Returns the spread (difference between ask and bid).
     ///
-    /// A derived display value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread(&self) -> Decimal {
         self.ask_price.saturating_sub(self.bid_price)

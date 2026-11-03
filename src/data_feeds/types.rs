@@ -102,7 +102,7 @@ impl Trade {
 
     /// Returns the notional value of the trade.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn notional(&self) -> Decimal {
         self.price.saturating_mul(self.quantity)
@@ -348,7 +348,7 @@ impl MarketSnapshot {
 
     /// Returns the spread.
     ///
-    /// A derived value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread(&self) -> Decimal {
         self.ask.saturating_sub(self.bid)
@@ -356,7 +356,7 @@ impl MarketSnapshot {
 
     /// Returns the spread in basis points.
     ///
-    /// A derived report value: it saturates at the `Decimal` bounds.
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();

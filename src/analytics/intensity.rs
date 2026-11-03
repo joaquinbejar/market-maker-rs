@@ -645,7 +645,7 @@ impl OrderIntensityEstimator {
             .map(|o| o.time_to_fill_ms)
             .collect();
 
-        // A derived statistic: the sum saturates at the `Decimal` bounds.
+        // Report only: the sum saturates at the `Decimal` bounds.
         let mean_spread = spreads
             .iter()
             .fold(Decimal::ZERO, |acc, &x| acc.saturating_add(x))

@@ -193,7 +193,7 @@ fn overflow_error(what: &str) -> MMError {
 /// `numerator / denominator`, saturating at the `Decimal` bound of the
 /// quotient's sign when it overflows, and zero for a zero denominator.
 ///
-/// Used only for derived report values.
+/// Used only for report only values.
 #[must_use]
 #[inline]
 pub(crate) fn saturating_div(numerator: Decimal, denominator: Decimal) -> Decimal {
