@@ -156,6 +156,9 @@ impl OrderBookConnectorConfig {
 }
 
 /// Maps a poisoned lock to [`MMError::LockPoisoned`].
+/// Times `cancel_all_orders` follows a re-mapped order before giving up.
+const MAX_CANCEL_REMAPS: usize = 8;
+
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> MMError {
     MMError::LockPoisoned("orderbook connector".to_string())
 }
@@ -381,7 +384,11 @@ impl OrderBookConnector {
     /// An order leaves the mapping only when it is no longer resting: its
     /// cancel succeeded, it was already gone, or the book removed it and then
     /// reported a level fault. An order whose cancel failed while it still
-    /// rests stays tracked, so it can be cancelled again.
+    /// rests stays tracked, so it can be cancelled again. An entry is
+    /// removed only while it still maps to the book order just cancelled: if
+    /// a concurrent modify re-mapped it, the new book order is cancelled
+    /// instead, and an entry that vanished meanwhile is left to the call
+    /// that settled it.
     ///
     /// # Errors
     ///
@@ -399,20 +406,43 @@ impl OrderBookConnector {
         let mut responses = Vec::new();
         let mut first_error = None;
 
-        for (id_str, ob_id) in order_ids {
-            let outcome = cancel(ob_id);
-            let removed = match &outcome {
-                Ok(()) | Err(OrderBookError::OrderRemovedWithLevelFault { .. }) => true,
-                Err(_) => false,
+        for (id_str, snapshot_id) in order_ids {
+            let mut ob_id = snapshot_id;
+            let mut remaps = 0usize;
+            let outcome = loop {
+                let outcome = cancel(ob_id);
+                let removed = match &outcome {
+                    Ok(()) | Err(OrderBookError::OrderRemovedWithLevelFault { .. }) => true,
+                    Err(_) => false,
+                };
+                let mut mapping = self.order_mapping.write().map_err(poisoned)?;
+                match mapping.get(id_str.as_str()).copied() {
+                    // Still mapped to the order just cancelled: settle it.
+                    Some(current) if current == ob_id => {
+                        if removed {
+                            mapping.remove(id_str.as_str());
+                        }
+                        break Some(outcome.map_err(|e| e.to_string()));
+                    }
+                    // Re-mapped meanwhile (a modify replaced the book order):
+                    // the live order is the new one, so cancel that instead.
+                    Some(current) => {
+                        drop(mapping);
+                        remaps = remaps.saturating_add(1);
+                        if remaps > MAX_CANCEL_REMAPS {
+                            break Some(Err(format!(
+                                "order kept being replaced while cancelling ({remaps} times)"
+                            )));
+                        }
+                        ob_id = current;
+                    }
+                    // No longer tracked: another call settled it.
+                    None => break None,
+                }
             };
-            if removed {
-                self.order_mapping
-                    .write()
-                    .map_err(poisoned)?
-                    .remove(id_str.as_str());
-            }
             match outcome {
-                Ok(()) => responses.push(OrderResponse {
+                None => {}
+                Some(Ok(())) => responses.push(OrderResponse {
                     order_id: OrderId::new(id_str),
                     client_order_id: None,
                     status: OrderStatus::Cancelled {
@@ -420,13 +450,12 @@ impl OrderBookConnector {
                     },
                     timestamp: Self::current_timestamp(),
                 }),
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(MMError::InvalidPositionUpdate(format!(
-                            "cancel of order {id_str} failed: {e}"
-                        )));
-                    }
+                Some(Err(e)) if first_error.is_none() => {
+                    first_error = Some(MMError::InvalidPositionUpdate(format!(
+                        "cancel of order {id_str} failed: {e}"
+                    )));
                 }
+                Some(Err(_)) => {}
             }
         }
 
@@ -1007,6 +1036,53 @@ mod tests {
         let mapping = connector.order_mapping.read().unwrap();
         assert_eq!(mapping.len(), 1);
         assert!(mapping.contains_key(stale.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_follows_a_remapped_order() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let a = connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(1.0)))
+            .await
+            .unwrap()
+            .order_id;
+        // A second book order that a modify would map `a` to.
+        let replacement = connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(49000.0), dec!(1.0)))
+            .await
+            .unwrap()
+            .order_id;
+        let ob2 = connector
+            .order_mapping
+            .write()
+            .unwrap()
+            .remove(replacement.as_str())
+            .unwrap();
+        let ob1 = connector.order_mapping.read().unwrap()[a.as_str()];
+        let order_ids = vec![(a.as_str().to_string(), ob1)];
+        let calls = std::sync::Mutex::new(Vec::new());
+        let result = connector.cancel_tracked(order_ids, |ob_id| {
+            calls.lock().unwrap().push(ob_id);
+            if ob_id == ob1 {
+                // The modify lands between the snapshot and this cancel.
+                connector.order_book.cancel_order(ob1).map(|_| ())?;
+                connector
+                    .order_mapping
+                    .write()
+                    .unwrap()
+                    .insert(a.as_str().to_string(), ob2);
+                Ok(())
+            } else {
+                connector.order_book.cancel_order(ob_id).map(|_| ())
+            }
+        });
+        let responses = result.unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![ob1, ob2]);
+        assert_eq!(responses.len(), 1);
+        assert!(connector.order_mapping.read().unwrap().is_empty());
+        // Nothing is left resting untracked.
+        let book = connector.order_book.create_snapshot(10).unwrap();
+        assert!(book.bids.is_empty(), "{:?}", book.bids);
     }
 
     #[tokio::test]
