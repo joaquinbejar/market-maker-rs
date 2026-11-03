@@ -856,3 +856,29 @@ fn test_kernel_decode_rejects_tampered_states() {
         let _ = decode(&b, &k);
     }
 }
+
+#[test]
+fn test_kernel_step_after_termination_is_idempotent_and_uncounted() {
+    let sc = scenario(5, 2);
+    let data = sc.data();
+    let k = kernel(&sc, &data);
+    let mut s = run_kernel(&k, &sc, false).last;
+    assert!(!s.status().is_running());
+    let bytes = encode(&s);
+    let (steps, actions, rejected) = (s.step_count(), s.counters().actions, s.counters().rejected);
+    for i in 0..1000u64 {
+        let action = if i % 2 == 0 {
+            KernelAction::Hold
+        } else {
+            quote(10, 20)
+        };
+        let out = k.step(&mut s, action);
+        assert_eq!(out.applied, ActionStatus::Rejected(RejectReason::Terminal));
+        assert_eq!(out.events, 0);
+    }
+    assert_eq!(encode(&s), bytes, "terminal state must stay byte-identical");
+    assert_eq!(
+        (s.step_count(), s.counters().actions, s.counters().rejected),
+        (steps, actions, rejected)
+    );
+}
