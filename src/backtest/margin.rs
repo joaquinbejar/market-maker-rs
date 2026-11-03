@@ -128,10 +128,10 @@ impl MarginAccount {
     /// clears both.
     #[must_use]
     pub fn fault(&self) -> Option<MMError> {
-        if self.shared.is_poisoned() {
-            return Some(Self::poisoned());
+        match self.shared.lock() {
+            Ok(shared) => shared.fault.clone(),
+            Err(_) => Some(Self::poisoned()),
         }
-        self.lock().fault.clone()
     }
 
     fn poisoned() -> MMError {
@@ -161,7 +161,8 @@ impl MarginAccount {
         shared.gate = shared.initial.clone();
         shared.errors.clear();
         shared.fault = None;
-        drop(shared);
+        // Cleared while the guard is held, so no other thread can observe
+        // the restored state as poisoned or a poisoned state as clean.
         self.shared.clear_poison();
     }
 }
