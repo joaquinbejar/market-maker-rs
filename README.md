@@ -140,6 +140,9 @@ Where:
 - `data_feeds`: Real-time market data feeds (feature: `data-feeds`)
 - `l3`: Order by order book reconstruction with a quality manifest and
   declared queue limits (feature: `l3`)
+- `instruments`: Contract specifications shared with `margin-rs` and
+  `arbitrage-rs`, and their conversion into `margin-rs` instruments
+  (feature: `instruments`, with `margin` for the conversion)
 
 ### Quick Start
 
@@ -202,6 +205,10 @@ crate's own serialization support.
 - `l3`: Enable order by order (L3) book reconstruction: snapshot and
   sequenced messages, fail closed on gaps and inconsistencies, a quality
   manifest, and volume ahead under declared hypotheses (no dependencies)
+- `instruments`: Contract specifications from `financial_types`
+  (`instruments` module): validated specifications, exact money and
+  dated venue snapshots; with `margin` too, their conversion into
+  `margin-rs` instruments (`instruments::margin`)
 - `kernel`: The financial environment kernel (`backtest::kernel`): the
   backtest engine's loop as a resumable, `Copy` state machine with a
   canonical encoding, an agent-safe observation and an admission mask,
