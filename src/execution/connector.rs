@@ -803,6 +803,12 @@ pub trait ExchangeConnector: Send + Sync {
     /// # Returns
     ///
     /// A list of cancelled order responses.
+    ///
+    /// # Errors
+    ///
+    /// Every open order is attempted. If any cancel fails, the first error
+    /// is returned after the others were attempted; the orders whose cancel
+    /// failed stay open and tracked, so calling again retries them.
     async fn cancel_all_orders(&self, symbol: &str) -> MMResult<Vec<OrderResponse>>;
 
     /// Gets the current order book snapshot.

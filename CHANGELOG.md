@@ -111,6 +111,12 @@ project follows [Semantic Versioning](https://semver.org/).
   to stay below 0.5, so a fill with probability p happened with
   probability min(1, 2p). Backtests that use this model now fill less
   often, and their output for a given seed changes (#143).
+- `OrderBookConnector::cancel_all_orders` no longer clears the whole order
+  mapping when some cancels fail: an order whose cancel failed while it
+  still rests stays tracked, and the first failure is returned after every
+  order was attempted. `MockExchangeConnector::cancel_all_orders` returns
+  the first cancel error, `LockPoisoned` included, instead of dropping it.
+  Calling again retries the orders that failed (#146).
 
 ### Breaking
 

@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use orderbook_rs::{
-    DefaultOrderBook, OrderBook, OrderBookSnapshot as OBSnapshot, OrderId as OBOrderId,
-    Side as OBSide, TimeInForce as OBTimeInForce,
+    DefaultOrderBook, OrderBook, OrderBookError, OrderBookSnapshot as OBSnapshot,
+    OrderId as OBOrderId, Side as OBSide, TimeInForce as OBTimeInForce,
 };
 
 use crate::Decimal;
@@ -375,6 +375,68 @@ impl OrderBookConnector {
     }
 }
 
+impl OrderBookConnector {
+    /// Cancels every tracked order in `order_ids` with `cancel`.
+    ///
+    /// An order leaves the mapping only when it is no longer resting: its
+    /// cancel succeeded, it was already gone, or the book removed it and then
+    /// reported a level fault. An order whose cancel failed while it still
+    /// rests stays tracked, so it can be cancelled again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first cancel failure as
+    /// [`MMError::InvalidPositionUpdate`] after every order was attempted,
+    /// or [`MMError::LockPoisoned`] if the mapping lock is poisoned.
+    fn cancel_tracked<F>(
+        &self,
+        order_ids: Vec<(String, OBOrderId)>,
+        cancel: F,
+    ) -> MMResult<Vec<OrderResponse>>
+    where
+        F: Fn(OBOrderId) -> Result<(), OrderBookError>,
+    {
+        let mut responses = Vec::new();
+        let mut first_error = None;
+
+        for (id_str, ob_id) in order_ids {
+            let outcome = cancel(ob_id);
+            let removed = match &outcome {
+                Ok(()) | Err(OrderBookError::OrderRemovedWithLevelFault { .. }) => true,
+                Err(_) => false,
+            };
+            if removed {
+                self.order_mapping
+                    .write()
+                    .map_err(poisoned)?
+                    .remove(id_str.as_str());
+            }
+            match outcome {
+                Ok(()) => responses.push(OrderResponse {
+                    order_id: OrderId::new(id_str),
+                    client_order_id: None,
+                    status: OrderStatus::Cancelled {
+                        filled_qty: Decimal::ZERO,
+                    },
+                    timestamp: Self::current_timestamp(),
+                }),
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(MMError::InvalidPositionUpdate(format!(
+                            "cancel of order {id_str} failed: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(responses),
+        }
+    }
+}
+
 #[async_trait]
 impl ExchangeConnector for OrderBookConnector {
     async fn submit_order(&self, request: OrderRequest) -> MMResult<OrderResponse> {
@@ -629,28 +691,9 @@ impl ExchangeConnector for OrderBookConnector {
                 .collect()
         };
 
-        let mut responses = Vec::new();
-
-        for (id_str, ob_id) in order_ids {
-            if self.order_book.cancel_order(ob_id).is_ok() {
-                responses.push(OrderResponse {
-                    order_id: OrderId::new(id_str),
-                    client_order_id: None,
-                    status: OrderStatus::Cancelled {
-                        filled_qty: Decimal::ZERO,
-                    },
-                    timestamp: Self::current_timestamp(),
-                });
-            }
-        }
-
-        // Clear mapping
-        {
-            let mut mapping = self.order_mapping.write().map_err(poisoned)?;
-            mapping.clear();
-        }
-
-        Ok(responses)
+        self.cancel_tracked(order_ids, |ob_id| {
+            self.order_book.cancel_order(ob_id).map(|_| ())
+        })
     }
 
     async fn get_orderbook(&self, _symbol: &str, depth: usize) -> MMResult<OrderBookSnapshot> {
@@ -925,6 +968,67 @@ mod tests {
         connector.set_balance("BTC", dec!(10.0)).unwrap();
         let balance = connector.get_balance("BTC").await.unwrap();
         assert_eq!(balance, dec!(10.0));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_keeps_failed_cancels_tracked() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let price = dec!(50000.0) - Decimal::from(i * 100);
+            let request = OrderRequest::limit_buy("BTC-USD", price, dec!(1.0));
+            ids.push(connector.submit_order(request).await.unwrap().order_id);
+        }
+        // The cancel of the middle order fails while it still rests.
+        let stale = ids[1].clone();
+        let stale_ob_id = connector.order_mapping.read().unwrap()[stale.as_str()];
+        let order_ids: Vec<(String, OBOrderId)> = connector
+            .order_mapping
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let result = connector.cancel_tracked(order_ids, |ob_id| {
+            if ob_id == stale_ob_id {
+                Err(OrderBookError::OrderNotFound("level refused".to_string()))
+            } else {
+                connector.order_book.cancel_order(ob_id).map(|_| ())
+            }
+        });
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, MMError::InvalidPositionUpdate(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains(stale.as_str()), "{error}");
+
+        // The two cancelled orders left the mapping; the failed one stays.
+        let mapping = connector.order_mapping.read().unwrap();
+        assert_eq!(mapping.len(), 1);
+        assert!(mapping.contains_key(stale.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_poisoned_mapping() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let request = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(1.0));
+        connector.submit_order(request).await.unwrap();
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = connector.order_mapping.write().unwrap();
+                panic!("poison the order mapping");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        let error = connector.cancel_all_orders("BTC-USD").await.unwrap_err();
+        assert!(matches!(error, MMError::LockPoisoned(_)), "{error}");
+        // The order is still resting in the book.
+        assert_eq!(
+            connector.order_book.create_snapshot(10).unwrap().bids.len(),
+            1
+        );
     }
 
     #[tokio::test]

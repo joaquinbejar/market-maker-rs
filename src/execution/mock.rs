@@ -498,13 +498,22 @@ impl ExchangeConnector for MockExchangeConnector {
         };
 
         let mut responses = Vec::new();
+        let mut first_error = None;
         for order_id in order_ids {
-            if let Ok(response) = self.cancel_order(&order_id).await {
-                responses.push(response);
+            match self.cancel_order(&order_id).await {
+                Ok(response) => responses.push(response),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
 
-        Ok(responses)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(responses),
+        }
     }
 
     async fn get_orderbook(&self, symbol: &str, depth: usize) -> MMResult<OrderBookSnapshot> {
@@ -682,6 +691,49 @@ mod tests {
 
         let open = connector.get_open_orders("BTC-USD").await.unwrap();
         assert!(open.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_reports_failed_cancels() {
+        let mut connector = MockExchangeConnector::with_defaults();
+        connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1)))
+            .await
+            .unwrap();
+        connector
+            .submit_order(OrderRequest::limit_sell(
+                "BTC-USD",
+                dec!(51000.0),
+                dec!(0.1),
+            ))
+            .await
+            .unwrap();
+        // Every later exchange call fails.
+        connector.config.failure_rate = 1.0;
+
+        let error = connector.cancel_all_orders("BTC-USD").await.unwrap_err();
+        assert!(matches!(error, MMError::InvalidMarketState(_)), "{error}");
+        // Nothing was cancelled, so both orders are still open.
+        assert_eq!(connector.get_open_orders("BTC-USD").await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_poisoned_lock() {
+        let connector = MockExchangeConnector::with_defaults();
+        connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1)))
+            .await
+            .unwrap();
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = connector.orders.write().unwrap();
+                panic!("poison the order table");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        let error = connector.cancel_all_orders("BTC-USD").await.unwrap_err();
+        assert!(matches!(error, MMError::LockPoisoned(_)), "{error}");
     }
 
     #[tokio::test]
