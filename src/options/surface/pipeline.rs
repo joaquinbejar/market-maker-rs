@@ -14,8 +14,10 @@
 //!
 //! - **Failed** when fewer than two slices could be fitted (no surface);
 //! - **Degraded** when a slice failed, the diagnosis is not clean, a quote
-//!   used the in the money side, or the surface moved more than the
-//!   stability thresholds since the previous one;
+//!   used the in the money side, a fit sits on Lee's bound, or the surface
+//!   moved more than the stability thresholds since the previous one, which
+//!   is compared at the same instant: aged to this cutoff (the store's
+//!   roll-down), on the expiries both have;
 //! - **Healthy** otherwise.
 //!
 //! A clean diagnosis describes the grid only; it is not a proof that the
@@ -25,7 +27,6 @@ use std::collections::BTreeMap;
 
 use rust_decimal::prelude::ToPrimitive;
 
-use super::VolSurface;
 use super::calibrate::{
     ActiveConstraint, FitConfig, FitFailure, SliceFit, SliceObservation, fit_slice,
 };
@@ -100,9 +101,12 @@ pub struct SliceReport {
     pub fit: Result<SliceFit, FitFailure>,
 }
 
-/// The change of one expiry since the previous surface.
+/// The change of one expiry since the previous surface, aged to this
+/// cutoff.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StabilityPoint {
+    /// Expiry, ms.
+    pub expiry_at: u64,
     /// Years to expiry at this calibration.
     pub tau: f64,
     /// Relative change of the at the money `w`.
@@ -154,7 +158,7 @@ pub fn calibrate_surface(
     cutoff: u64,
     available_at: u64,
     rates: Rates,
-    previous: Option<&SviSurface>,
+    previous: Option<&CalibratedSurface>,
     config: &SurfaceCalibrationConfig,
 ) -> MMResult<(CalibratedSurface, QualityReport)> {
     config.fit.validate()?;
@@ -258,25 +262,29 @@ pub fn calibrate_surface(
     }
     report.diagnostics = Some(diagnostics);
     if let (Some(prev), Some(stability)) = (previous, config.stability) {
-        for slice in surface.slices() {
-            let tau = slice.tau();
-            let (Ok(now), Ok(before)) = (
-                surface.total_variance(0.0, tau),
-                prev.total_variance(0.0, tau),
-            ) else {
+        // The previous surface aged to this cutoff, on common expiries.
+        let aged = prev.aged_slices(cutoff).unwrap_or_default();
+        for (slice, &expiry_at) in surface.slices().iter().zip(expiries.iter()) {
+            let Some((_, before)) = aged.iter().find(|(e, _)| *e == expiry_at) else {
                 continue;
             };
-            let atm_change = (now.w() - before.w()).abs() / before.w();
-            let skew_change = (now.w_k() - before.w_k()).abs();
+            let (Ok((w_now, k_now, _)), Ok((w_before, k_before, _))) =
+                (slice.eval(0.0), before.eval(0.0))
+            else {
+                continue;
+            };
+            let atm_change = (w_now - w_before).abs() / w_before;
+            let skew_change = (k_now - k_before).abs();
             let unstable =
                 atm_change > stability.max_atm_change || skew_change > stability.max_skew_change;
             if unstable {
-                report
-                    .reasons
-                    .push(format!("tau {tau}: unstable since the previous surface"));
+                report.reasons.push(format!(
+                    "expiry {expiry_at}: unstable since the previous surface"
+                ));
             }
             report.stability.push(StabilityPoint {
-                tau,
+                expiry_at,
+                tau: slice.tau(),
                 atm_change,
                 skew_change,
                 unstable,
@@ -295,7 +303,7 @@ pub fn calibrate_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::surface::{KRange, SviSlice, YEAR_MS};
+    use crate::options::surface::{KRange, SviSlice, VolSurface, YEAR_MS};
     use optionstratlib::OptionStyle;
     use rust_decimal::prelude::FromPrimitive;
     use rust_decimal_macros::dec;
@@ -323,6 +331,42 @@ mod tests {
     /// (at least 0.01), both sides at every strike.
     fn quotes(days: &[u64], strikes: &[f64]) -> Vec<OptionQuote> {
         quotes_scaled(days, strikes, 1.0)
+    }
+
+    /// Quotes at `cutoff` on expiries `days` ahead, priced at the implied
+    /// volatility per k of the truth slices of `truth_days`.
+    fn quotes_at(
+        cutoff: u64,
+        days: &[u64],
+        strikes: &[f64],
+        truth_days: &[u64],
+    ) -> Vec<OptionQuote> {
+        let mut out = Vec::new();
+        for (&d, &td) in days.iter().zip(truth_days) {
+            let truth = truth_slice(td);
+            let tau = (d * DAY) as f64 / YEAR_MS;
+            for &strike in strikes {
+                let k = (strike / 100.0_f64).ln();
+                let w = truth.eval(k).unwrap().0 / truth.tau() * tau;
+                for style in [OptionStyle::Call, OptionStyle::Put] {
+                    let price = black_undiscounted(100.0, strike, w, style).unwrap();
+                    let half = (price * 0.005).max(0.005);
+                    out.push(OptionQuote {
+                        strike: Decimal::from_f64(strike).unwrap(),
+                        expiry_at: cutoff + d * DAY,
+                        style,
+                        bid: Decimal::from_f64(price - half).unwrap().max(Decimal::ZERO),
+                        ask: Decimal::from_f64(price + half).unwrap(),
+                        observed_at: cutoff - 1000,
+                        received_at: cutoff - 900,
+                        underlying: dec!(100),
+                        underlying_observed_at: cutoff - 1000,
+                        underlying_received_at: cutoff - 900,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// As [`quotes`], with every implied volatility of the truth times
@@ -474,15 +518,40 @@ mod tests {
     }
 
     #[test]
+    fn test_calibrate_surface_same_vols_a_day_later_are_stable() {
+        // The previous surface, aged one day at constant vol, matches the
+        // new one on the common expiries: ageing is not instability.
+        let q = quotes(&[30, 90, 180], &STRIKES);
+        let (first, _) = calibrate_surface(&q, CUTOFF, CUTOFF, rates(), None, &config()).unwrap();
+        let later = quotes_at(CUTOFF + DAY, &[29, 89, 179], &STRIKES, &[30, 90, 180]);
+        let (_, report) = calibrate_surface(
+            &later,
+            CUTOFF + DAY,
+            CUTOFF + DAY,
+            rates(),
+            Some(&first),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(report.stability.len(), 3);
+        assert!(
+            report.stability.iter().all(|p| !p.unstable),
+            "{:?}",
+            report.stability
+        );
+    }
+
+    #[test]
     fn test_calibrate_surface_large_move_is_unstable() {
         let q = quotes(&[30, 90, 180], &STRIKES);
         let (first, _) = calibrate_surface(&q, CUTOFF, CUTOFF, rates(), None, &config()).unwrap();
-        let previous = first.surface().unwrap().clone();
+        let previous = first.clone();
         // Every implied volatility 30% higher, parity intact.
         let bumped = quotes_scaled(&[30, 90, 180], &STRIKES, 1.3);
         let (second, report) =
             calibrate_surface(&bumped, CUTOFF, CUTOFF, rates(), Some(&previous), &config())
                 .unwrap();
+        assert_eq!(report.stability.len(), 3);
         assert!(report.stability.iter().any(|p| p.unstable));
         assert!(matches!(second.status(), SurfaceStatus::Degraded(_)));
     }

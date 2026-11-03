@@ -171,6 +171,25 @@ impl CalibratedSurface {
                 "a failed calibration has no surface".to_string(),
             ));
         };
+        let slices = self.aged_slices(t)?.into_iter().map(|(_, s)| s).collect();
+        SviSurface::new(slices, surface.short_expiry()).map_err(|e| {
+            MMError::InvalidMarketState(format!("surface aged to {t} is not usable: {e}"))
+        })
+    }
+
+    /// The slices alive at `t`, rolled down to `t`, with their expiries.
+    /// Each keeps its `k` range; its `tau` becomes `tau(t)`.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidMarketState`] when `t` is before the cutoff or
+    /// there is no surface.
+    pub fn aged_slices(&self, t: u64) -> MMResult<Vec<(u64, SviSlice)>> {
+        let Some(surface) = self.surface.as_ref() else {
+            return Err(MMError::InvalidMarketState(
+                "a failed calibration has no surface".to_string(),
+            ));
+        };
         if t < self.data_cutoff {
             return Err(MMError::InvalidMarketState(format!(
                 "valuation time {t} is before the data cutoff {}",
@@ -184,19 +203,20 @@ impl CalibratedSurface {
             }
             let tau_t = tau_between(t, expiry)?;
             let scale = tau_t / slice.tau();
-            slices.push(SviSlice::new(
-                tau_t,
-                slice.a() * scale,
-                slice.b() * scale,
-                slice.rho(),
-                slice.m(),
-                slice.sigma(),
-                slice.k_range(),
-            )?);
+            slices.push((
+                expiry,
+                SviSlice::new(
+                    tau_t,
+                    slice.a() * scale,
+                    slice.b() * scale,
+                    slice.rho(),
+                    slice.m(),
+                    slice.sigma(),
+                    slice.k_range(),
+                )?,
+            ));
         }
-        SviSurface::new(slices, surface.short_expiry()).map_err(|e| {
-            MMError::InvalidMarketState(format!("surface aged to {t} is not usable: {e}"))
-        })
+        Ok(slices)
     }
 }
 
