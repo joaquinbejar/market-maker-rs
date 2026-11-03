@@ -38,7 +38,7 @@ liquidity to the market.
 #### Strategy Models
 
 - **Avellaneda-Stoikov**: Classic optimal market making with reservation price
-- **GLFT Extension**: Guéant-Lehalle-Fernandez-Tapia with terminal penalties
+- **GLFT**: Guéant-Lehalle-Fernandez-Tapia optimal quotes with a bounded inventory (exact solution and closed form)
 - **Grid Trading**: Multi-level order placement with geometric/arithmetic spacing
 - **Adaptive Spread**: Dynamic spread adjustment based on order book imbalance
 - **Depth-Based Offering**: Size adjustment based on market depth

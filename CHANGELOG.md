@@ -33,6 +33,27 @@ project follows [Semantic Versioning](https://semver.org/).
   `MarginAccount` or `MarginLedgerAccountant` use margin-rs 0.1, whose
   order and execution direction is `financial_types::Action`, the type
   market-maker-rs already uses.
+- `GLFTStrategy` computes the published model of Guéant, Lehalle and
+  Fernandez-Tapia (arXiv:1105.3115) instead of an Avellaneda-Stoikov variant
+  (#134). `GLFTConfig::new` takes `(risk_aversion, order_intensity_k,
+  intensity_scale_a, max_inventory_lots, lot_size, terminal_time,
+  min_spread)`: the fill intensity scale `A` per second, the inventory bound
+  `Q` in lots (`1..=MAX_INVENTORY_LOTS`, 200) and the lot size are new, and
+  `order_intensity` is renamed `order_intensity_k`. New `GLFTConfig::validate`.
+  `GLFTStrategy::calculate_optimal_quotes` returns `MMResult<GlftQuotes>`
+  (`bid` and `ask` are `Option<Decimal>`: no bid at `+Q`, no ask at `-Q`),
+  requires the inventory to be a whole number of lots within `±Q` (otherwise
+  `InvalidPositionUpdate`), returns `NumericalError` on any non finite or
+  non convertible intermediate, and widens a spread below `min_spread`
+  symmetrically. New `GLFTStrategy::closed_form_quotes` (Proposition 3).
+  `GLFTStrategy::compare_with_avellaneda_stoikov` returns
+  `(GlftQuotes, (Decimal, Decimal))`. Removed: `PenaltyFunction`,
+  `GLFTConfig::{terminal_penalty, dynamic_gamma, gamma_scaling_factor,
+  penalty_function, with_dynamic_gamma, with_penalty_function}` and
+  `GLFTStrategy::{calculate_reservation_price, calculate_optimal_spread,
+  calculate_dynamic_gamma}`. The prelude exports `GlftQuotes` instead of
+  `PenaltyFunction`. With `serde`, `GLFTConfig` denies unknown fields.
+
 - No panics in library code (#135). New `MMError::LockPoisoned`; these now
   return `MMResult` instead of panicking on a poisoned lock:
   `ThreadSafeOrderManager::{read, write, get_stats, open_order_count,

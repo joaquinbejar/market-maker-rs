@@ -24,7 +24,7 @@
 //! ### Strategy Models
 //!
 //! - **Avellaneda-Stoikov**: Classic optimal market making with reservation price
-//! - **GLFT Extension**: Guéant-Lehalle-Fernandez-Tapia with terminal penalties
+//! - **GLFT**: Guéant-Lehalle-Fernandez-Tapia optimal quotes with a bounded inventory (exact solution and closed form)
 //! - **Grid Trading**: Multi-level order placement with geometric/arithmetic spacing
 //! - **Adaptive Spread**: Dynamic spread adjustment based on order book imbalance
 //! - **Depth-Based Offering**: Size adjustment based on market depth
@@ -444,7 +444,7 @@ pub mod position;
 ///
 /// Implements multiple market making strategies:
 /// - **Avellaneda-Stoikov**: Optimal quotes using stochastic control
-/// - **GLFT**: Extension with terminal inventory penalties
+/// - **GLFT**: Guéant-Lehalle-Fernandez-Tapia quotes with a bounded inventory
 /// - **Grid Trading**: Multi-level orders with configurable spacing
 /// - **Adaptive Spread**: Dynamic adjustment based on order book imbalance
 /// - **Depth-Based**: Size adjustment based on market depth
