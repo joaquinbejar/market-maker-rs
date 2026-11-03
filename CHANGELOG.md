@@ -16,8 +16,16 @@ project follows [Semantic Versioning](https://semver.org/).
   exactly at expiry, `OptionPricer` and `SurfacePricer`, `PRICING_YEAR_DAYS`
   (365) and `tau_from_days`, and `black_undiscounted` / `black_w` for
   implied volatility extraction (on every finite positive `F`, `K`; a
-  positive price below the smallest `f64` is an error, never 0). The normal distribution is a port of
+  positive price below the smallest `f64` is `MMError::PriceUnderflow`,
+  never 0). The normal distribution is a port of
   fdlibm's `erfc` (#95).
+- `MMError::PriceUnderflow` (discriminant 10): a price that is positive in
+  exact arithmetic but below the smallest positive `f64`, returned by
+  `black_undiscounted` instead of a `NumericalError` with that message. Its
+  `Display` is the former text ("numerical error: Black price is positive
+  but below the smallest positive f64"), `is_numerical_error()` is true for
+  it, and with `serde` it serializes as `{"type":"PriceUnderflow"}`, with no
+  `details`.
 - `options::adapter::ADAPTER_MS_PER_YEAR`: the 365.25-day year of the
   adapter's ms helpers, now named; their results are unchanged (#95).
 - `options::surface` (feature `options`): the `VolSurface` trait (total
