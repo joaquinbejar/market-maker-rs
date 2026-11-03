@@ -324,6 +324,11 @@ impl ValidatedConfig {
     pub(super) fn half_bound(&self) -> u128 {
         self.bound_b.saturating_mul(2)
     }
+
+    /// Largest drawdown, in half-U: `peak - equity <= 2B` U, so `4B`.
+    pub(super) fn drawdown_bound(&self) -> u128 {
+        self.bound_b.saturating_mul(4)
+    }
 }
 
 /// Splits a fee rate into mantissa and scale.

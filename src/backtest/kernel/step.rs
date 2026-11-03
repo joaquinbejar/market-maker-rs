@@ -643,7 +643,7 @@ fn row_end<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usiz
     let half = cfg.half_bound();
     if half_units_decimal(equity, cfg.s) != Some(decimal_equity)
         || equity.unsigned_abs() > half
-        || v.max_dd_h.unsigned_abs() > half
+        || v.max_dd_h.unsigned_abs() > cfg.drawdown_bound()
         || v.peak_h.unsigned_abs() > half
     {
         return Err(overflow);

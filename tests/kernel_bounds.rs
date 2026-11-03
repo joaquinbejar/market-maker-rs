@@ -1037,3 +1037,84 @@ fn test_kernel_decode_reset_state_with_max_stamp_seq_rejected() {
     k.step(&mut next, quote(97, 103));
     assert!(!matches!(next.status(), Status::Halted(_)));
 }
+
+/// Number of fuzz seeds: `KERNEL_FUZZ_SEEDS` or 60.
+fn fuzz_seeds() -> u64 {
+    std::env::var("KERNEL_FUZZ_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60)
+}
+
+/// Decodes `bytes` and, if accepted, steps the state with Hold and with the
+/// scenario's action: neither may halt (or panic).
+fn step_accepted(k: &Kernel<'_>, sc: &Scenario, bytes: &[u8], j: u64, ctx: &str) -> bool {
+    let Ok(s) = decode(bytes, k) else {
+        return false;
+    };
+    let obs = k.observe(&s);
+    for action in [KernelAction::Hold, sc.action(j, obs.bid, obs.ask)] {
+        let mut next = s;
+        k.step(&mut next, action);
+        assert!(
+            !matches!(next.status(), Status::Halted(_)),
+            "{ctx}: accepted state halts on {action:?}: {:?}",
+            next.status()
+        );
+    }
+    true
+}
+
+#[test]
+fn test_kernel_decode_fuzz_accepted_states_never_halt() {
+    // Seeded byte mutations of reachable states: one to three bytes each,
+    // a bit flip, 0xFF or 0x00. Whatever decode accepts must step cleanly.
+    let (mut tries, mut accepted) = (0u64, 0u64);
+    for seed in 0..fuzz_seeds() {
+        for index in 0..5 {
+            let sc = scenario(seed, index);
+            let data = sc.data();
+            let k = kernel(&sc, &data);
+            let kr = run_kernel(&k, &sc, true);
+            let mut rng = SplitMix64(seed.wrapping_mul(0x9E37) ^ index);
+            for (j, s) in kr.states.iter().enumerate().step_by(7) {
+                let bytes = encode(s);
+                for _ in 0..40 {
+                    let mut b = bytes.clone();
+                    for _ in 0..=rng.below(3) {
+                        let at = usize::try_from(rng.below(b.len() as u64)).unwrap();
+                        b[at] = match rng.below(3) {
+                            0 => b[at] ^ (1 << rng.below(8)),
+                            1 => 0xFF,
+                            _ => 0x00,
+                        };
+                    }
+                    tries += 1;
+                    let ctx = format!("seed {seed} dataset {index} decision {j}");
+                    if step_accepted(&k, &sc, &b, j as u64, &ctx) {
+                        accepted += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        tries > 0 && accepted > 0,
+        "{tries} tries, {accepted} accepted"
+    );
+}
+
+#[test]
+fn test_kernel_decode_fuzz_regression_fee_byte_halts_never() {
+    // Seed 55, dataset 0, decision 21: byte 320 from 0xFF to 0x7F moved
+    // the venue fees far from the fills; decode must not accept a state
+    // whose next step halts.
+    let sc = scenario(55, 0);
+    let data = sc.data();
+    let k = kernel(&sc, &data);
+    let kr = run_kernel(&k, &sc, true);
+    let mut bytes = encode(&kr.states[21]);
+    assert_eq!(bytes[320], 0xFF);
+    bytes[320] = 0x7F;
+    step_accepted(&k, &sc, &bytes, 21, "seed 55 regression");
+}

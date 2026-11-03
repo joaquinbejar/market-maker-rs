@@ -7,7 +7,9 @@
 //! point, [`FinancialKernel::step`] applies one [`KernelAction`] and advances
 //! to the next decision point, [`FinancialKernel::observe`] and
 //! [`FinancialKernel::mask`] give what the agent may see. A copy of the state
-//! is a snapshot; [`encode`] and [`decode`] give its canonical bytes.
+//! is a snapshot; [`encode`] and [`decode`] give its canonical bytes, and
+//! `decode` accepts only states that satisfy every invariant `step` relies
+//! on (it does not prove a state was reached by stepping).
 //!
 //! # Contract
 //!

@@ -554,8 +554,15 @@ pub fn fingerprint<const ORD: usize, const MSG: usize, const DLV: usize, const O
     fnv1a128(&encode(s))
 }
 
-/// Decodes a state for `kernel`, rejecting any state that fails the
-/// structural checks a reachable state satisfies.
+/// Decodes a state for `kernel`, rejecting any state that breaks an
+/// invariant `step` relies on.
+///
+/// The guarantee: an accepted state satisfies every invariant `step`
+/// relies on (grid ranges, queue and capacity bounds, counter and sequence
+/// relations, time clamps, and the ledger relations behind the exactness
+/// bound), so `step` never halts or panics from it. Decoding does not prove
+/// the state was reached by `reset` and `step`: a mutated encoding that
+/// keeps every invariant can be accepted.
 ///
 /// # Errors
 ///
@@ -1048,7 +1055,8 @@ fn validate_state<const ORD: usize, const MSG: usize, const DLV: usize, const OB
         )?;
     }
     check(v.base_fee_units == 0, "base fees in a quote fee kernel")?;
-    for (name, value) in [("peak", v.peak_h), ("drawdown", v.max_dd_h)] {
+    {
+        let (name, value) = ("peak", v.peak_h);
         check(
             value.unsigned_abs() <= cfg.half_bound(),
             &format!("{name} beyond the half-U bound"),
@@ -1089,13 +1097,13 @@ fn validate_state<const ORD: usize, const MSG: usize, const DLV: usize, const OB
         decimal_ok(v.realized) && decimal_ok(s.agent.pos.quantity),
         "decimal scale beyond 28",
     )?;
-    validate_reachability(s, k, &activations, &cancels)
+    validate_invariants(s, k, &activations, &cancels)
 }
 
-/// Checks that only states `step` can reach pass: grid ranges, agent view
+/// Invariants `step` relies on: grid ranges, agent view
 /// against the venue counters, account coverage, step and time limits.
 #[allow(clippy::too_many_lines)] // One linear list of invariants.
-fn validate_reachability<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+fn validate_invariants<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
     s: &KernelState<ORD, MSG, DLV, OBS>,
     k: &FinancialKernel<'_, ORD, MSG, DLV, OBS>,
     activations: &[VenueOrder],
@@ -1233,6 +1241,7 @@ fn validate_reachability<const ORD: usize, const MSG: usize, const DLV: usize, c
         "maximum position beyond the position bound",
     )?;
     validate_counters(s, k)?;
+    validate_ledger(s, k)?;
     // Time: between the previous and the current row.
     match s.cur_row {
         None => check(s.now_ns == 0, "time advanced before the first row")?,
@@ -1354,7 +1363,24 @@ fn validate_counters<const ORD: usize, const MSG: usize, const DLV: usize, const
     if s.stamp_seq == 0 {
         check(s.last_delivery_ns == 0, "delivery time without any report")?;
     }
+    // Every queued observation is within its row's delay, so the
+    // observation capacity required by `new` covers it.
+    for o in s.observed.as_slice() {
+        let row = k
+            .data
+            .row(o.row)
+            .ok_or_else(|| err("observation of a row outside the dataset"))?;
+        let t = wide(o.ready_ns);
+        check(
+            wide(row.ts_ns) + wide(obs_min) <= t && t <= wide(row.ts_ns) + wide(obs_delay),
+            "observation time outside its row's delay",
+        )?;
+    }
     if s.phase == Phase::AwaitDecision {
+        check(
+            s.observed.as_slice().iter().all(|o| o.ready_ns >= s.now_ns),
+            "observation due before the decision not delivered",
+        )?;
         check(
             s.msgs.as_slice().iter().all(|m| m.eff_ns > s.now_ns),
             "venue message due at the decision not applied",
@@ -1383,6 +1409,72 @@ fn validate_counters<const ORD: usize, const MSG: usize, const DLV: usize, const
             )?;
         }
     }
+    Ok(())
+}
+
+/// The ledger against the fills that built it, so the bound argument of
+/// `B` holds for every state `decode` accepts: with `f` venue fills (each at
+/// most `P` ticks and `Q` lots), `|cash| <= f * N`, `|fees| <= f * Fee`
+/// with the fee rate's sign and at least the smallest fee per fill,
+/// `|position| <= f * Q`, the peak at least the initial equity and the
+/// equity at the last mark within its bound. Step's cross-checks (cash
+/// against realized, lots against the position, equity and drawdown within
+/// their bounds) then cannot fail on this state or any later one.
+fn validate_ledger<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+    s: &KernelState<ORD, MSG, DLV, OBS>,
+    k: &FinancialKernel<'_, ORD, MSG, DLV, OBS>,
+) -> MMResult<()> {
+    let cfg = &k.cfg;
+    let v = &s.venue;
+    let fills = u128::from(s.counters.venue_fills);
+    let f = cfg
+        .fee_scale()
+        .and_then(|f| u128::try_from(f).ok())
+        .ok_or_else(|| err("fee scale"))?;
+    let unit = u128::from(cfg.tick.mantissa) * u128::from(cfg.lot.mantissa);
+    let per_fill = u128::from(cfg.p) * u128::from(cfg.q) * unit;
+    let r = cfg.rate_num.unsigned_abs();
+    check(
+        v.cash_u.unsigned_abs() <= fills * per_fill * f,
+        "cash beyond the fills' notional",
+    )?;
+    let fees = v.fixed_fees_u;
+    check(
+        fees.unsigned_abs() <= fills * per_fill * r,
+        "fees beyond the fills' largest fees",
+    )?;
+    check(
+        fees.unsigned_abs() >= fills * unit * r,
+        "fees below the fills' smallest fees",
+    )?;
+    let sign_ok = match cfg.rate_num.signum() {
+        0 => fees == 0,
+        1 => fees >= 0,
+        _ => fees <= 0,
+    };
+    check(sign_ok, "fees with the wrong sign for the fee rate")?;
+    let lots = u128::from(cfg.q) * fills;
+    check(
+        u128::from(s.gate.venue_pos_lots.unsigned_abs()) <= lots
+            && u128::from(v.max_abs_pos) <= lots,
+        "position beyond the fills' quantity",
+    )?;
+    let initial = cfg
+        .c0_u
+        .checked_mul(2)
+        .ok_or_else(|| err("initial equity"))?;
+    check(v.peak_h >= initial, "peak below the initial equity")?;
+    if let Some(mark2) = v.last_mark2 {
+        let equity = super::step::equity_h(cfg, s, mark2).ok_or_else(|| err("equity overflows"))?;
+        check(
+            equity.unsigned_abs() <= cfg.half_bound(),
+            "equity beyond the bound",
+        )?;
+    }
+    check(
+        v.max_dd_h.unsigned_abs() <= cfg.drawdown_bound(),
+        "drawdown beyond the bound",
+    )?;
     Ok(())
 }
 

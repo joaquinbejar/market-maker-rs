@@ -74,8 +74,9 @@ project follows [Semantic Versioning](https://semver.org/).
   no dependencies) with `FinancialKernel`,
   a deterministic, resumable re-implementation of the backtest engine loop
   over a fixed width, `Copy` `KernelState`, with `reset`, `step`,
-  `observe` and `mask`, a canonical state encoding (`encode`, `decode` with
-  full validation, `fingerprint`), validated `KernelDataset`s, event sinks
+  `observe` and `mask`, a canonical state encoding (`encode`; `decode`,
+  which accepts only states satisfying every invariant `step` relies on;
+  `fingerprint`), validated `KernelDataset`s, event sinks
   and a `QuoteAdapter` for Avellaneda-Stoikov and GLFT quotes (bound to one
   kernel; GLFT at an inventory bound posts a one-sided action). Inside its
   subset (immediate fills, quote fees, optional `LimitsPolicy` limits,
