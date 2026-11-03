@@ -141,7 +141,7 @@ pub struct FitConfig {
     /// Largest weight a quote may have, as a multiple of its slice's median
     /// weight; a larger one is capped there and reported
     /// ([`SliceFit::capped`]), so one very tight quote cannot decide the
-    /// slice alone.
+    /// slice alone. A cap beyond the largest `f64` binds no weight.
     pub max_weight_ratio: f64,
 }
 
@@ -583,10 +583,13 @@ pub fn fit_slice(
     sorted.sort_by(f64::total_cmp);
     let half = sorted.len() / 2;
     let median = match (sorted.get(half.wrapping_sub(1)), sorted.get(half)) {
-        (Some(lo), Some(hi)) if sorted.len().is_multiple_of(2) => 0.5 * (lo + hi),
+        // lo + (hi - lo) / 2: no overflow for weights near f64::MAX.
+        (Some(lo), Some(hi)) if sorted.len().is_multiple_of(2) => lo + 0.5 * (hi - lo),
         (_, Some(mid)) => *mid,
         _ => f64::NAN,
     };
+    // A cap that overflows to infinity is above every representable weight,
+    // so it binds none, as in exact arithmetic.
     let cap = config.max_weight_ratio * median;
     let capped: Vec<usize> = observations
         .iter()
@@ -1124,6 +1127,33 @@ mod tests {
             miss(&fit),
             miss(&uncapped)
         );
+    }
+
+    #[test]
+    fn test_fit_slice_weight_cap_survives_weights_near_f64_max() {
+        // An even count of weights near f64::MAX: the median (1e308) must
+        // not overflow, so the larger weight is still capped at ratio 1.
+        let range = KRange::new(-1.0, 1.0).unwrap();
+        let truth = SviSlice::new(0.5, 0.02, 0.1, -0.4, 0.0, 0.2, range).unwrap();
+        let obs: Vec<SliceObservation> = ks(-0.6, 0.6, 16)
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| {
+                let weight = if i == 7 { 1.7e308 } else { 1e308 };
+                SliceObservation::new(k, truth.eval(k).unwrap().0, weight).unwrap()
+            })
+            .collect();
+        let config = FitConfig {
+            max_weight_ratio: 1.0,
+            ..FitConfig::default()
+        };
+        assert_eq!(fit_slice(0.5, &obs, &config).unwrap().capped, vec![7]);
+        // A cap that overflows binds nothing.
+        let wide = FitConfig {
+            max_weight_ratio: 10.0,
+            ..FitConfig::default()
+        };
+        assert!(fit_slice(0.5, &obs, &wide).unwrap().capped.is_empty());
     }
 
     #[test]
