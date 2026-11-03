@@ -143,21 +143,24 @@ impl LatencyStats {
         let (Some(&min_us), Some(&max_us)) = (values.first(), values.last()) else {
             return Self::default();
         };
+        let count = saturating_u64(values.len());
         // Non zero: `values` is not empty.
-        let count = saturating_u64(values.len()).max(1);
-        let sum: u64 = values.iter().fold(0u64, |acc, &v| acc.saturating_add(v));
-        let avg_us = sum / count;
+        let n = u128::from(count).max(1);
+        // A sum of at most 2^64 values below 2^64 always fits in a u128,
+        // and the mean is at most the largest value, so it narrows back.
+        let sum: u128 = values.iter().map(|&v| u128::from(v)).sum();
+        let avg_us = u64::try_from(sum / n).unwrap_or(u64::MAX);
 
-        // Calculate standard deviation
-        let variance: u64 = values
-            .iter()
-            .map(|&v| {
-                let diff = v.abs_diff(avg_us);
-                diff.saturating_mul(diff)
-            })
-            .fold(0u64, u64::saturating_add)
-            / count;
-        let std_dev_us = integer_sqrt(variance);
+        // Population variance, floor(sum(d^2) / n), without overflowing:
+        // each squared deviation fits in a u128, and summing the per term
+        // quotients and remainders separately keeps both sums in range.
+        let (quotients, remainders) = values.iter().fold((0u128, 0u128), |(q, r), &v| {
+            let diff = u128::from(v.abs_diff(avg_us));
+            let square = diff.saturating_mul(diff);
+            (q.saturating_add(square / n), r.saturating_add(square % n))
+        });
+        let variance = quotients.saturating_add(remainders / n);
+        let std_dev_us = u64::try_from(variance.isqrt()).unwrap_or(u64::MAX);
 
         // Calculate percentiles
         let p50_us = percentile(&values, 50.0);
@@ -622,23 +625,6 @@ fn percentile(sorted_values: &[u64], p: f64) -> u64 {
     sorted_values.get(idx.min(last)).copied().unwrap_or(0)
 }
 
-/// Integer square root using Newton's method.
-fn integer_sqrt(n: u64) -> u64 {
-    if n == 0 {
-        return 0;
-    }
-
-    let mut x = n;
-    let mut y = x.div_ceil(2);
-
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-
-    x
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +776,20 @@ mod tests {
         let stats = LatencyStats::from_measurements(&measurements);
         assert_eq!(stats.count, 2);
         assert_eq!(stats.max_us, u64::MAX);
+        assert_eq!(stats.avg_us, u64::MAX);
+        assert_eq!(stats.std_dev_us, 0);
+    }
+
+    #[test]
+    fn test_latency_stats_extreme_spread_mean_and_std_are_exact() {
+        let measurements = [
+            LatencyMeasurement::new(0, 1),
+            LatencyMeasurement::new(u64::MAX, 2),
+        ];
+        let stats = LatencyStats::from_measurements(&measurements);
+        assert_eq!(stats.avg_us, u64::MAX / 2);
+        // Both deviations are about 2^63, so the population std is too.
+        assert_eq!(stats.std_dev_us, u64::MAX / 2);
     }
 
     #[test]
@@ -959,17 +959,6 @@ mod tests {
 
         assert_eq!(tracker.measurement_count(LatencyMetric::OrderToAck), 0);
         assert_eq!(tracker.measurement_count(LatencyMetric::OrderToFill), 1);
-    }
-
-    #[test]
-    fn test_integer_sqrt() {
-        assert_eq!(integer_sqrt(0), 0);
-        assert_eq!(integer_sqrt(1), 1);
-        assert_eq!(integer_sqrt(4), 2);
-        assert_eq!(integer_sqrt(9), 3);
-        assert_eq!(integer_sqrt(10), 3);
-        assert_eq!(integer_sqrt(100), 10);
-        assert_eq!(integer_sqrt(10000), 100);
     }
 
     #[test]

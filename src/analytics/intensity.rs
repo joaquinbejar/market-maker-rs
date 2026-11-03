@@ -622,11 +622,14 @@ impl OrderIntensityEstimator {
             .collect();
 
         let mean_spread = spreads.iter().copied().sum::<Decimal>() / Decimal::from(spreads.len());
+        // Summed in u128 (cannot overflow for fewer than 2^64 values); the
+        // mean is at most the largest time, so it narrows back to u64.
         let mean_time = times
             .iter()
-            .fold(0u64, |acc, &t| acc.saturating_add(t))
-            .checked_div(saturating_u64(times.len()))
-            .unwrap_or(0);
+            .map(|&t| u128::from(t))
+            .sum::<u128>()
+            .checked_div(u128::from(saturating_u64(times.len())))
+            .map_or(0, |mean| u64::try_from(mean).unwrap_or(u64::MAX));
 
         let min_spread = spreads.iter().copied().min().unwrap_or(Decimal::ZERO);
         let max_spread = spreads.iter().copied().max().unwrap_or(Decimal::ZERO);
@@ -1030,6 +1033,18 @@ mod tests {
         assert_eq!(stats.max_spread, dec!(0.003));
         assert_eq!(stats.min_time_to_fill_ms, 200);
         assert_eq!(stats.max_time_to_fill_ms, 600);
+    }
+
+    #[test]
+    fn test_observation_stats_huge_times_mean_is_exact() {
+        let config = OrderIntensityConfig::new(60_000, 5, dec!(0.1)).unwrap();
+        let mut estimator = OrderIntensityEstimator::new(config);
+
+        estimator.record_fill(FillObservation::new(dec!(0.001), u64::MAX, 1000));
+        estimator.record_fill(FillObservation::new(dec!(0.002), u64::MAX - 2, 2000));
+
+        let stats = estimator.observation_stats().unwrap();
+        assert_eq!(stats.mean_time_to_fill_ms, u64::MAX - 1);
     }
 
     #[test]
