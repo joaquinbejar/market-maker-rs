@@ -104,9 +104,11 @@ impl Trade {
     }
 
     /// Returns the notional value of the trade (price * size).
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.size
+        self.price.saturating_mul(self.size)
     }
 
     /// Returns true if this is a buy trade.
@@ -168,15 +170,17 @@ pub struct OrderFlowStats {
 
 impl OrderFlowStats {
     /// Returns the total volume (buy + sell).
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn total_volume(&self) -> Decimal {
-        self.buy_volume + self.sell_volume
+        self.buy_volume.saturating_add(self.sell_volume)
     }
 
-    /// Returns the total trade count.
+    /// Returns the total trade count, saturating at `u64::MAX`.
     #[must_use]
     pub fn total_count(&self) -> u64 {
-        self.buy_count + self.sell_count
+        self.buy_count.saturating_add(self.sell_count)
     }
 
     /// Returns true if flow is bullish (positive imbalance).
@@ -192,11 +196,11 @@ impl OrderFlowStats {
     }
 
     /// Returns the buy/sell volume ratio.
-    /// Returns None if sell_volume is zero.
+    /// Returns None if sell_volume is zero or the ratio overflows.
     #[must_use]
     pub fn volume_ratio(&self) -> Option<Decimal> {
         if self.sell_volume > Decimal::ZERO {
-            Some(self.buy_volume / self.sell_volume)
+            self.buy_volume.checked_div(self.sell_volume)
         } else {
             None
         }
@@ -359,7 +363,9 @@ impl OrderFlowAnalyzer {
     ///
     /// # Returns
     ///
-    /// `OrderFlowStats` containing all calculated metrics.
+    /// `OrderFlowStats` containing all calculated metrics. These are
+    /// derived report values: sums saturate at the `Decimal` bounds and a
+    /// ratio that overflows is `None` (or zero for the imbalance).
     #[must_use]
     pub fn get_stats(&self, current_time: u64) -> OrderFlowStats {
         let window_start = current_time.saturating_sub(self.window_ms);
@@ -376,35 +382,35 @@ impl OrderFlowAnalyzer {
                 let notional = trade.notional();
                 match trade.side {
                     TradeSide::Buy => {
-                        buy_volume += trade.size;
-                        buy_notional += notional;
-                        buy_count += 1;
+                        buy_volume = buy_volume.saturating_add(trade.size);
+                        buy_notional = buy_notional.saturating_add(notional);
+                        buy_count = buy_count.saturating_add(1);
                     }
                     TradeSide::Sell => {
-                        sell_volume += trade.size;
-                        sell_notional += notional;
-                        sell_count += 1;
+                        sell_volume = sell_volume.saturating_add(trade.size);
+                        sell_notional = sell_notional.saturating_add(notional);
+                        sell_count = sell_count.saturating_add(1);
                     }
                 }
             }
         }
 
-        let total_volume = buy_volume + sell_volume;
-        let net_flow = buy_volume - sell_volume;
+        let total_volume = buy_volume.saturating_add(sell_volume);
+        let net_flow = buy_volume.saturating_sub(sell_volume);
         let imbalance = if total_volume > Decimal::ZERO {
-            net_flow / total_volume
+            net_flow.checked_div(total_volume).unwrap_or(Decimal::ZERO)
         } else {
             Decimal::ZERO
         };
 
         let buy_vwap = if buy_volume > Decimal::ZERO {
-            Some(buy_notional / buy_volume)
+            buy_notional.checked_div(buy_volume)
         } else {
             None
         };
 
         let sell_vwap = if sell_volume > Decimal::ZERO {
-            Some(sell_notional / sell_volume)
+            sell_notional.checked_div(sell_volume)
         } else {
             None
         };
@@ -418,7 +424,7 @@ impl OrderFlowAnalyzer {
             net_flow,
             buy_vwap,
             sell_vwap,
-            total_notional: buy_notional + sell_notional,
+            total_notional: buy_notional.saturating_add(sell_notional),
             window_start,
             window_end: current_time,
         }
@@ -500,9 +506,12 @@ impl OrderFlowAnalyzer {
     #[must_use]
     pub fn trade_intensity(&self, current_time: u64) -> Decimal {
         let stats = self.get_stats(current_time);
-        let window_seconds = Decimal::from(self.window_ms) / Decimal::from(1000);
+        let window_seconds = window_seconds(self.window_ms);
         if window_seconds > Decimal::ZERO {
-            Decimal::from(stats.total_count()) / window_seconds
+            // A `u64` count over at least 0.001 seconds cannot overflow.
+            Decimal::from(stats.total_count())
+                .checked_div(window_seconds)
+                .unwrap_or(Decimal::MAX)
         } else {
             Decimal::ZERO
         }
@@ -516,13 +525,17 @@ impl OrderFlowAnalyzer {
     ///
     /// # Returns
     ///
-    /// Total volume per second in the current window.
+    /// Total volume per second in the current window. A derived report
+    /// value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn volume_intensity(&self, current_time: u64) -> Decimal {
         let stats = self.get_stats(current_time);
-        let window_seconds = Decimal::from(self.window_ms) / Decimal::from(1000);
+        let window_seconds = window_seconds(self.window_ms);
         if window_seconds > Decimal::ZERO {
-            stats.total_volume() / window_seconds
+            stats
+                .total_volume()
+                .checked_div(window_seconds)
+                .unwrap_or(Decimal::MAX)
         } else {
             Decimal::ZERO
         }
@@ -607,6 +620,14 @@ impl Default for OrderFlowAnalyzerBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A window length in milliseconds as seconds.
+fn window_seconds(window_ms: u64) -> Decimal {
+    // Dividing by the nonzero constant 1000 shrinks the value: it cannot fail.
+    Decimal::from(window_ms)
+        .checked_div(Decimal::ONE_THOUSAND)
+        .unwrap_or(Decimal::ZERO)
 }
 
 #[cfg(test)]

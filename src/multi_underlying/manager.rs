@@ -6,6 +6,7 @@ use crate::Decimal;
 use crate::multi_underlying::config::{CapitalAllocationStrategy, UnderlyingConfig};
 use crate::multi_underlying::risk::{CrossAssetHedge, UnifiedGreeks, UnifiedRisk};
 use crate::multi_underlying::types::{CorrelationEntry, UnderlyingState, UnderlyingStatus};
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 
 /// Manager for multiple underlying assets.
@@ -94,7 +95,8 @@ impl MultiUnderlyingManager {
     /// # Errors
     ///
     /// Returns an error if the maximum number of underlyings is reached
-    /// or if the underlying already exists.
+    /// or if the underlying already exists, or [`MMError::NumericalError`]
+    /// if its capital allocation overflows.
     pub fn add_underlying(&mut self, config: UnderlyingConfig) -> MMResult<()> {
         if self.configs.len() >= self.max_underlyings {
             return Err(MMError::InvalidConfiguration(format!(
@@ -110,7 +112,7 @@ impl MultiUnderlyingManager {
             )));
         }
 
-        let allocated_capital = self.calculate_allocation(&config);
+        let allocated_capital = self.calculate_allocation(&config)?;
         let state = UnderlyingState::new(&config.symbol, allocated_capital);
 
         self.states.insert(config.symbol.clone(), state);
@@ -237,16 +239,22 @@ impl MultiUnderlyingManager {
     }
 
     /// Gets the unified Greeks across all underlyings.
+    ///
+    /// An aggregate report: its sums saturate at the `Decimal` bounds.
     #[must_use]
     pub fn get_unified_greeks(&self) -> UnifiedGreeks {
         let mut greeks = UnifiedGreeks::new();
 
         for state in self.states.values() {
             if state.status == UnderlyingStatus::Active {
-                greeks.total_dollar_delta += state.dollar_delta();
-                greeks.total_dollar_gamma += state.gamma * state.price;
-                greeks.total_dollar_vega += state.vega;
-                greeks.underlying_count += 1;
+                greeks.total_dollar_delta = greeks
+                    .total_dollar_delta
+                    .saturating_add(state.dollar_delta());
+                greeks.total_dollar_gamma = greeks
+                    .total_dollar_gamma
+                    .saturating_add(state.gamma.saturating_mul(state.price));
+                greeks.total_dollar_vega = greeks.total_dollar_vega.saturating_add(state.vega);
+                greeks.underlying_count = greeks.underlying_count.saturating_add(1);
             }
         }
 
@@ -257,6 +265,9 @@ impl MultiUnderlyingManager {
     }
 
     /// Gets the unified risk view across all underlyings.
+    ///
+    /// An aggregate report: its sums and utilizations saturate at the
+    /// `Decimal` bounds.
     #[must_use]
     pub fn get_unified_risk(&self) -> UnifiedRisk {
         let mut risk = UnifiedRisk::new();
@@ -264,36 +275,48 @@ impl MultiUnderlyingManager {
         risk.greeks = self.get_unified_greeks();
 
         for state in self.states.values() {
-            risk.total_position_value += state.position_value;
-            risk.total_unrealized_pnl += state.unrealized_pnl;
-            risk.total_realized_pnl += state.realized_pnl;
+            risk.total_position_value = risk
+                .total_position_value
+                .saturating_add(state.position_value);
+            risk.total_unrealized_pnl = risk
+                .total_unrealized_pnl
+                .saturating_add(state.unrealized_pnl);
+            risk.total_realized_pnl = risk.total_realized_pnl.saturating_add(state.realized_pnl);
 
             match state.status {
-                UnderlyingStatus::Active => risk.active_underlyings += 1,
-                UnderlyingStatus::Halted => risk.halted_underlyings += 1,
+                UnderlyingStatus::Active => {
+                    risk.active_underlyings = risk.active_underlyings.saturating_add(1);
+                }
+                UnderlyingStatus::Halted => {
+                    risk.halted_underlyings = risk.halted_underlyings.saturating_add(1);
+                }
                 _ => {}
             }
         }
 
         // Calculate utilization percentages
+        let utilization = |value: Decimal, limit: Decimal| {
+            value
+                .checked_div(limit)
+                .unwrap_or(Decimal::MAX)
+                .saturating_mul(Decimal::ONE_HUNDRED)
+        };
         if self.max_total_delta > Decimal::ZERO {
             risk.delta_utilization =
-                risk.greeks.abs_dollar_delta() / self.max_total_delta * Decimal::from(100);
+                utilization(risk.greeks.abs_dollar_delta(), self.max_total_delta);
         }
 
         if self.max_total_vega > Decimal::ZERO {
-            let abs_vega = if risk.greeks.total_dollar_vega < Decimal::ZERO {
-                -risk.greeks.total_dollar_vega
-            } else {
-                risk.greeks.total_dollar_vega
-            };
-            risk.vega_utilization = abs_vega / self.max_total_vega * Decimal::from(100);
+            let abs_vega = risk.greeks.total_dollar_vega.abs();
+            risk.vega_utilization = utilization(abs_vega, self.max_total_vega);
         }
 
         risk
     }
 
     /// Gets cross-asset hedge suggestions.
+    ///
+    /// Derived suggestions: a hedge ratio that overflows saturates.
     #[must_use]
     pub fn get_cross_asset_hedges(&self) -> Vec<CrossAssetHedge> {
         let mut hedges = Vec::new();
@@ -321,13 +344,17 @@ impl MultiUnderlyingManager {
 
                     // Calculate hedge ratio based on correlation and prices
                     let hedge_ratio = if state_b.price > Decimal::ZERO {
-                        (state_a.price / state_b.price) * correlation.abs()
+                        state_a
+                            .price
+                            .checked_div(state_b.price)
+                            .unwrap_or(Decimal::MAX)
+                            .saturating_mul(correlation.abs())
                     } else {
                         Decimal::ZERO
                     };
 
                     // Estimate risk reduction
-                    let risk_reduction = correlation.abs() * Decimal::from(100);
+                    let risk_reduction = correlation.abs().saturating_mul(Decimal::ONE_HUNDRED);
 
                     if risk_reduction > Decimal::from(10) {
                         hedges.push(CrossAssetHedge::new(
@@ -346,14 +373,27 @@ impl MultiUnderlyingManager {
     }
 
     /// Reallocates capital based on the current strategy.
-    pub fn reallocate_capital(&mut self) {
-        match self.allocation_strategy {
-            CapitalAllocationStrategy::Equal => self.allocate_equal(),
-            CapitalAllocationStrategy::TargetWeight => self.allocate_by_weight(),
-            CapitalAllocationStrategy::RiskParity => self.allocate_risk_parity(),
-            CapitalAllocationStrategy::VolatilityWeighted => self.allocate_volatility_weighted(),
-            CapitalAllocationStrategy::PerformanceBased => self.allocate_performance_based(),
+    ///
+    /// Every allocation is computed before any is applied, so a failure
+    /// leaves the allocations unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if an allocation overflows.
+    pub fn reallocate_capital(&mut self) -> MMResult<()> {
+        let allocations = match self.allocation_strategy {
+            CapitalAllocationStrategy::Equal => self.allocate_equal()?,
+            CapitalAllocationStrategy::TargetWeight => self.allocate_by_weight()?,
+            CapitalAllocationStrategy::RiskParity => self.allocate_risk_parity()?,
+            CapitalAllocationStrategy::VolatilityWeighted => self.allocate_volatility_weighted()?,
+            CapitalAllocationStrategy::PerformanceBased => self.allocate_performance_based()?,
+        };
+        for (symbol, allocation) in allocations {
+            if let Some(state) = self.states.get_mut(&symbol) {
+                state.allocated_capital = allocation;
+            }
         }
+        Ok(())
     }
 
     /// Returns the total capital.
@@ -380,106 +420,141 @@ impl MultiUnderlyingManager {
 
     // Private helper methods
 
-    fn calculate_allocation(&self, config: &UnderlyingConfig) -> Decimal {
+    fn calculate_allocation(&self, config: &UnderlyingConfig) -> MMResult<Decimal> {
         match self.allocation_strategy {
             CapitalAllocationStrategy::Equal => {
-                let count = self.configs.len() + 1;
-                self.total_capital / Decimal::from(count)
+                let count = self.configs.len().saturating_add(1);
+                self.total_capital.checked_div(Decimal::from(count))
             }
-            CapitalAllocationStrategy::TargetWeight => self.total_capital * config.target_weight,
-            _ => self.total_capital * config.target_weight,
+            CapitalAllocationStrategy::TargetWeight => {
+                self.total_capital.checked_mul(config.target_weight)
+            }
+            _ => self.total_capital.checked_mul(config.target_weight),
         }
+        .or_overflow("capital allocation")
     }
 
-    fn allocate_equal(&mut self) {
+    /// `total_capital * weight / total_weight`.
+    fn share(&self, weight: Decimal, total_weight: Decimal) -> MMResult<Decimal> {
+        self.total_capital
+            .checked_mul(weight)
+            .and_then(|x| x.checked_div(total_weight))
+            .or_overflow("capital allocation")
+    }
+
+    fn allocate_equal(&self) -> MMResult<Vec<(String, Decimal)>> {
         let count = self.states.len();
         if count == 0 {
-            return;
+            return Ok(Vec::new());
         }
 
-        let allocation = self.total_capital / Decimal::from(count);
-        for state in self.states.values_mut() {
-            state.allocated_capital = allocation;
-        }
+        let allocation = self
+            .total_capital
+            .checked_div(Decimal::from(count))
+            .or_overflow("capital allocation")?;
+        Ok(self
+            .states
+            .keys()
+            .map(|symbol| (symbol.clone(), allocation))
+            .collect())
     }
 
-    fn allocate_by_weight(&mut self) {
-        for (symbol, config) in &self.configs {
-            if let Some(state) = self.states.get_mut(symbol) {
-                state.allocated_capital = self.total_capital * config.target_weight;
-            }
-        }
+    fn allocate_by_weight(&self) -> MMResult<Vec<(String, Decimal)>> {
+        self.configs
+            .iter()
+            .filter(|(symbol, _)| self.states.contains_key(*symbol))
+            .map(|(symbol, config)| {
+                let allocation = self
+                    .total_capital
+                    .checked_mul(config.target_weight)
+                    .or_overflow("capital allocation")?;
+                Ok((symbol.clone(), allocation))
+            })
+            .collect()
     }
 
-    fn allocate_risk_parity(&mut self) {
+    fn allocate_risk_parity(&self) -> MMResult<Vec<(String, Decimal)>> {
         // Simplified risk parity: allocate inversely proportional to volatility
         // In a full implementation, this would use the correlation matrix
-        let total_inverse_vol: Decimal = self
-            .states
-            .values()
-            .filter(|s| s.status == UnderlyingStatus::Active)
-            .map(|s| {
-                if s.vega > Decimal::ZERO {
-                    Decimal::ONE / s.vega
-                } else {
-                    Decimal::ONE
-                }
+        let inverse_vol = |vega: Decimal| {
+            if vega > Decimal::ZERO {
+                Decimal::ONE
+                    .checked_div(vega)
+                    .or_overflow("inverse volatility")
+            } else {
+                Ok(Decimal::ONE)
+            }
+        };
+        let active = || {
+            self.states
+                .iter()
+                .filter(|(_, s)| s.status == UnderlyingStatus::Active)
+        };
+        let mut total_inverse_vol = Decimal::ZERO;
+        for (_, state) in active() {
+            total_inverse_vol = total_inverse_vol
+                .checked_add(inverse_vol(state.vega)?)
+                .or_overflow("total inverse volatility")?;
+        }
+
+        if total_inverse_vol <= Decimal::ZERO {
+            return Ok(Vec::new());
+        }
+        active()
+            .map(|(symbol, state)| {
+                let allocation = self
+                    .total_capital
+                    .checked_mul(inverse_vol(state.vega)?)
+                    .and_then(|x| x.checked_div(total_inverse_vol))
+                    .or_overflow("capital allocation")?;
+                Ok((symbol.clone(), allocation))
             })
-            .sum();
-
-        if total_inverse_vol > Decimal::ZERO {
-            for state in self.states.values_mut() {
-                if state.status == UnderlyingStatus::Active {
-                    let inverse_vol = if state.vega > Decimal::ZERO {
-                        Decimal::ONE / state.vega
-                    } else {
-                        Decimal::ONE
-                    };
-                    state.allocated_capital = self.total_capital * inverse_vol / total_inverse_vol;
-                }
-            }
-        }
+            .collect()
     }
 
-    fn allocate_volatility_weighted(&mut self) {
+    fn allocate_volatility_weighted(&self) -> MMResult<Vec<(String, Decimal)>> {
         // Allocate proportionally to volatility (vega as proxy)
-        let total_vol: Decimal = self
-            .states
-            .values()
-            .filter(|s| s.status == UnderlyingStatus::Active)
-            .map(|s| s.vega.abs())
-            .sum();
+        let active = || {
+            self.states
+                .iter()
+                .filter(|(_, s)| s.status == UnderlyingStatus::Active)
+        };
+        let total_vol = active()
+            .try_fold(Decimal::ZERO, |acc, (_, s)| acc.checked_add(s.vega.abs()))
+            .or_overflow("total volatility")?;
 
-        if total_vol > Decimal::ZERO {
-            for state in self.states.values_mut() {
-                if state.status == UnderlyingStatus::Active {
-                    state.allocated_capital = self.total_capital * state.vega.abs() / total_vol;
-                }
-            }
+        if total_vol <= Decimal::ZERO {
+            return Ok(Vec::new());
         }
+        active()
+            .map(|(symbol, state)| Ok((symbol.clone(), self.share(state.vega.abs(), total_vol)?)))
+            .collect()
     }
 
-    fn allocate_performance_based(&mut self) {
+    fn allocate_performance_based(&self) -> MMResult<Vec<(String, Decimal)>> {
         // Allocate more to underlyings with positive P&L
-        let total_pnl: Decimal = self
-            .states
-            .values()
-            .filter(|s| s.status == UnderlyingStatus::Active && s.total_pnl() > Decimal::ZERO)
-            .map(|s| s.total_pnl())
-            .sum();
+        let winners = || {
+            self.states.iter().filter(|(_, s)| {
+                s.status == UnderlyingStatus::Active && s.total_pnl() > Decimal::ZERO
+            })
+        };
+        let total_pnl = winners()
+            .try_fold(Decimal::ZERO, |acc, (_, s)| acc.checked_add(s.total_pnl()))
+            .or_overflow("total pnl")?;
 
         if total_pnl > Decimal::ZERO {
-            for state in self.states.values_mut() {
-                if state.status == UnderlyingStatus::Active && state.total_pnl() > Decimal::ZERO {
-                    state.allocated_capital = self.total_capital * state.total_pnl() / total_pnl;
-                }
-            }
+            winners()
+                .map(|(symbol, state)| {
+                    Ok((symbol.clone(), self.share(state.total_pnl(), total_pnl)?))
+                })
+                .collect()
         } else {
             // Fall back to equal allocation if no positive P&L
-            self.allocate_equal();
+            self.allocate_equal()
         }
     }
 
+    /// A derived report value: its sums saturate at the `Decimal` bounds.
     fn calculate_portfolio_volatility(&self) -> Decimal {
         // Simplified portfolio volatility calculation
         // In a full implementation, this would use the full correlation matrix
@@ -488,7 +563,8 @@ impl MultiUnderlyingManager {
         for state in self.states.values() {
             if state.status == UnderlyingStatus::Active {
                 // Add individual variance (vega squared as proxy)
-                total_variance += state.vega * state.vega;
+                total_variance =
+                    total_variance.saturating_add(state.vega.saturating_mul(state.vega));
             }
         }
 
@@ -503,18 +579,27 @@ impl MultiUnderlyingManager {
                     && state_b.status == UnderlyingStatus::Active
                 {
                     // 2 * correlation * vega_a * vega_b
-                    total_variance += Decimal::from(2) * correlation * state_a.vega * state_b.vega;
+                    let term = Decimal::TWO
+                        .saturating_mul(correlation)
+                        .saturating_mul(state_a.vega)
+                        .saturating_mul(state_b.vega);
+                    total_variance = total_variance.saturating_add(term);
                 }
             }
         }
 
         // Return sqrt approximation (simplified)
         if total_variance > Decimal::ZERO {
+            let half = |v: Decimal| v.checked_div(Decimal::TWO).unwrap_or(v);
             // Newton-Raphson approximation for sqrt
-            let mut x = total_variance / Decimal::from(2);
+            let mut x = half(total_variance);
             for _ in 0..10 {
                 if x > Decimal::ZERO {
-                    x = (x + total_variance / x) / Decimal::from(2);
+                    x = half(
+                        total_variance
+                            .checked_div(x)
+                            .map_or(Decimal::MAX, |q| x.saturating_add(q)),
+                    );
                 }
             }
             x
@@ -653,6 +738,46 @@ mod tests {
     }
 
     #[test]
+    fn test_add_underlying_overflowing_allocation_returns_numerical_error() {
+        let mut manager = MultiUnderlyingManager::new(Decimal::MAX)
+            .with_allocation_strategy(CapitalAllocationStrategy::TargetWeight);
+        let result = manager.add_underlying(UnderlyingConfig::new("BTC", dec!(2)));
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        assert_eq!(manager.underlying_count(), 0);
+    }
+
+    #[test]
+    fn test_reallocate_overflow_returns_error_and_keeps_allocations() {
+        let mut manager = MultiUnderlyingManager::new(dec!(100))
+            .with_allocation_strategy(CapitalAllocationStrategy::TargetWeight);
+        manager
+            .add_underlying(UnderlyingConfig::new("BTC", dec!(0.5)))
+            .unwrap();
+        manager
+            .add_underlying(UnderlyingConfig::new("ETH", dec!(0.5)))
+            .unwrap();
+        manager.set_total_capital(Decimal::MAX);
+        manager.configs.get_mut("ETH").unwrap().target_weight = dec!(2);
+
+        let result = manager.reallocate_capital();
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            manager.get_state("BTC").unwrap().allocated_capital,
+            dec!(50)
+        );
+        assert_eq!(
+            manager.get_state("ETH").unwrap().allocated_capital,
+            dec!(50)
+        );
+    }
+
+    #[test]
     fn test_reallocate_equal() {
         let mut manager = MultiUnderlyingManager::new(dec!(1000000.0))
             .with_allocation_strategy(CapitalAllocationStrategy::Equal);
@@ -664,7 +789,7 @@ mod tests {
             .add_underlying(UnderlyingConfig::new("ETH", dec!(0.3)))
             .unwrap();
 
-        manager.reallocate_capital();
+        manager.reallocate_capital().unwrap();
 
         let btc_state = manager.get_state("BTC").unwrap();
         let eth_state = manager.get_state("ETH").unwrap();
