@@ -66,6 +66,7 @@ jobs:
           - multi-underlying
           - events
           - margin
+          - kernel
 
     steps:
       - uses: actions/checkout@v4

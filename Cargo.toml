@@ -75,6 +75,8 @@ multi-underlying = ["serde"]
 events = ["dep:tokio", "serde"]
 # Accounting and pretrade risk through margin-rs.
 margin = ["dep:margin-rs"]
+# Deterministic financial kernel for external RL trainers; no dependencies.
+kernel = []
 
 [[example]]
 name = "options_greeks"
@@ -112,6 +114,14 @@ required-features = ["multi-underlying"]
 [[example]]
 name = "event_system"
 required-features = ["events"]
+
+[[example]]
+name = "kernel_avellaneda"
+required-features = ["kernel"]
+
+[[example]]
+name = "kernel_glft"
+required-features = ["kernel"]
 
 [[bench]]
 name = "quote_generation"

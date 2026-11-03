@@ -202,6 +202,12 @@ crate's own serialization support.
 - `l3`: Enable order by order (L3) book reconstruction: snapshot and
   sequenced messages, fail closed on gaps and inconsistencies, a quality
   manifest, and volume ahead under declared hypotheses (no dependencies)
+- `kernel`: The financial environment kernel (`backtest::kernel`): the
+  backtest engine's loop as a resumable, `Copy` state machine with a
+  canonical encoding, an agent-safe observation and an admission mask,
+  exactly equivalent to the engine inside its documented subset. Meant to
+  be stepped by an external RL trainer through a bridge crate. No extra
+  dependencies.
 
 ### Examples
 

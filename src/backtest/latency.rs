@@ -140,6 +140,19 @@ impl SimLatencyConfig {
     }
 }
 
+/// One xorshift64* step: returns `(next_state, output)`.
+///
+/// Shared by [`JitterRng`] and the financial kernel's generator so both
+/// produce bit-identical streams.
+#[must_use]
+pub(crate) const fn xorshift_step(state: u64) -> (u64, u64) {
+    let mut x = state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    (x, x.wrapping_mul(0x2545_F491_4F6C_DD1D))
+}
+
 /// Deterministic jitter source (xorshift64*), seeded per run.
 #[derive(Debug, Clone)]
 pub(crate) struct JitterRng {
@@ -170,12 +183,8 @@ impl JitterRng {
         if max == 0 {
             return 0;
         }
-        let mut x = self.state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.state = x;
-        let value = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let (state, value) = xorshift_step(self.state);
+        self.state = state;
         // `max + 1` overflows only for `u64::MAX`, where every value is in range.
         match max.checked_add(1) {
             Some(bound) => value % bound,

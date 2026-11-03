@@ -1759,7 +1759,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 /// Works on the remainder, so it never divides into a huge quotient and
 /// never loses precision; if the rounded value would overflow, the value is
 /// returned unrounded and the venue checks decide.
-fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
+#[must_use]
+pub(crate) fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
     if step <= Decimal::ZERO {
         return value;
     }
