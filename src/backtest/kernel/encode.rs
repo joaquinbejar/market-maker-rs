@@ -1232,6 +1232,7 @@ fn validate_reachability<const ORD: usize, const MSG: usize, const DLV: usize, c
         s.venue.max_abs_pos <= cfg.x_eff,
         "maximum position beyond the position bound",
     )?;
+    validate_counters(s, k)?;
     // Time: between the previous and the current row.
     match s.cur_row {
         None => check(s.now_ns == 0, "time advanced before the first row")?,
@@ -1258,6 +1259,128 @@ fn validate_reachability<const ORD: usize, const MSG: usize, const DLV: usize, c
                     "time differs from the current row after matching",
                 )?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Counters and sequences against their call-site relations, and the time
+/// clamps against the clock and the rows.
+///
+/// With `created = next_order_id - 1` orders (each admitted quote creates
+/// two, a one-sided action one):
+/// - `created <= 2 * step`;
+/// - stamps: an order takes one at submission, a local reject a second one,
+///   a venue order at most three more (activation, fill, cancel outcome),
+///   so `created + local_rejects + venue_fills <= stamp_seq <= 4 * created`;
+/// - messages: an activation per order not rejected locally and at most one
+///   cancel per order, so `next_msg_seq <= 2 * created - local_rejects`;
+/// - `local_rejects + venue_fills <= created`, `quote_errors` equals the
+///   `QuoteError` reject count, and the end-of-data drops are zero before
+///   the end and bounded by the messages and rows;
+/// - at a decision every venue message and delivery due by `now_ns` was
+///   applied, and every scheduled time is within the largest delay of it.
+#[allow(clippy::too_many_lines)] // One linear list of relations.
+fn validate_counters<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+    s: &KernelState<ORD, MSG, DLV, OBS>,
+    k: &FinancialKernel<'_, ORD, MSG, DLV, OBS>,
+) -> MMResult<()> {
+    let cfg = &k.cfg;
+    let c = &s.counters;
+    let created = s
+        .next_order_id
+        .checked_sub(1)
+        .ok_or_else(|| err("next_order_id below 1"))?;
+    let wide = u128::from;
+    check(
+        wide(created) <= wide(s.step) * 2,
+        "more orders than two per step",
+    )?;
+    let floor = wide(created) + wide(c.local_rejects) + wide(c.venue_fills);
+    check(
+        floor <= wide(s.stamp_seq) && wide(s.stamp_seq) <= wide(created) * 4,
+        "stamp_seq outside its call-site bounds",
+    )?;
+    check(
+        wide(s.next_msg_seq) + wide(c.local_rejects) <= wide(created) * 2,
+        "next_msg_seq beyond two messages per order",
+    )?;
+    check(
+        wide(c.local_rejects) + wide(c.venue_fills) <= wide(created),
+        "more local rejects and fills than orders",
+    )?;
+    let quote_rejects = c.rejected.get(RejectReason::QuoteError.index()).copied();
+    check(
+        quote_rejects == Some(c.quote_errors),
+        "quote errors differ from their reject count",
+    )?;
+    let eof = s.status == Status::Terminal(TermReason::EndOfData);
+    if eof {
+        check(
+            wide(c.eof_dropped_msgs) <= wide(created) * 2 && c.eof_dropped_obs <= k.data.id.len,
+            "end-of-data drops beyond the messages and rows",
+        )?;
+    } else {
+        check(
+            c.eof_dropped_msgs == 0 && c.eof_dropped_obs == 0,
+            "drops before the end of the data",
+        )?;
+    }
+    // Scheduled times.
+    let lat = &cfg.latency;
+    let span = |base: u64| {
+        base.checked_add(lat.jitter_q)
+            .and_then(|q| lat.ns(q))
+            .ok_or_else(|| err("delay overflows"))
+    };
+    let venue_delay = span(lat.submit_q.max(lat.cancel_q))?;
+    let ack_delay = span(lat.ack_q)?;
+    let obs_delay = span(lat.observation_q)?;
+    let obs_min = lat
+        .ns(lat.observation_q)
+        .ok_or_else(|| err("delay overflows"))?;
+    let now = wide(s.now_ns);
+    check(
+        s.msgs
+            .as_slice()
+            .iter()
+            .all(|m| wide(m.eff_ns) <= now + wide(venue_delay)),
+        "venue message beyond the largest delay",
+    )?;
+    check(
+        wide(s.last_delivery_ns) <= now + wide(ack_delay),
+        "last delivery time beyond the acknowledgement delay",
+    )?;
+    if s.stamp_seq == 0 {
+        check(s.last_delivery_ns == 0, "delivery time without any report")?;
+    }
+    if s.phase == Phase::AwaitDecision {
+        check(
+            s.msgs.as_slice().iter().all(|m| m.eff_ns > s.now_ns),
+            "venue message due at the decision not applied",
+        )?;
+        check(
+            s.deliveries.as_slice().iter().all(|d| d.at_ns > s.now_ns),
+            "delivery due at the decision not applied",
+        )?;
+    }
+    // The last observation time belongs to the last row queued.
+    let queued_upto = match (s.phase, s.resume) {
+        (Phase::BeforeMatch, _) | (Phase::AwaitDecision, Phase::BeforeMatch) => {
+            s.cur_row.and_then(|r| r.checked_sub(1))
+        }
+        (Phase::ObsQueued | Phase::AwaitDecision | Phase::Terminal, _) => s.cur_row,
+    };
+    match queued_upto.and_then(|r| k.data.row(r)) {
+        None => check(s.last_observed_ns == 0, "observation time before any row")?,
+        Some(row) => {
+            let low = wide(row.ts_ns) + wide(obs_min);
+            let high = wide(row.ts_ns) + wide(obs_delay);
+            let t = wide(s.last_observed_ns);
+            check(
+                low <= t && t <= high,
+                "last observation time outside its row's delay",
+            )?;
         }
     }
     Ok(())

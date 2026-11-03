@@ -18,8 +18,8 @@ mod harness;
 
 use harness::*;
 use market_maker_rs::backtest::kernel::{
-    ActionGrid, ActionStatus, GateVerdict, KernelAction, KernelEvent, Phase, RejectReason, decode,
-    encode,
+    ActionGrid, ActionStatus, GateVerdict, KernelAction, KernelEvent, Phase, RejectReason, Status,
+    decode, encode,
 };
 
 /// Bytes at the end of a state encoding: last outcome (3), actions (8),
@@ -124,11 +124,25 @@ fn test_kernel_properties_replay_decode_and_reject_equals_hold() {
             // decode(encode(s)) == s at every decision and at the end, and
             // the queue bounds hold.
             for s in kr.states.iter().chain(std::iter::once(&kr.last)) {
-                assert_eq!(
-                    &decode(&encode(s), &k).unwrap(),
-                    s,
-                    "{ctx}: decode round trip"
-                );
+                let decoded = decode(&encode(s), &k).unwrap();
+                assert_eq!(&decoded, s, "{ctx}: decode round trip");
+                // A valid decoded state never halts on its next step.
+                for action in [
+                    KernelAction::Hold,
+                    KernelAction::Quote {
+                        bid: 1,
+                        ask: 2,
+                        bid_lots: 1,
+                        ask_lots: 1,
+                    },
+                ] {
+                    let mut next = decoded;
+                    k.step(&mut next, action);
+                    assert!(
+                        !matches!(next.status(), Status::Halted(_)),
+                        "{ctx}: halt after decode"
+                    );
+                }
                 let q = s.queue_lengths();
                 assert!(q.orders + q.awaiting <= q.held, "{ctx}: slots {q:?}");
                 assert!(q.msgs <= 2 * q.held, "{ctx}: messages {q:?}");

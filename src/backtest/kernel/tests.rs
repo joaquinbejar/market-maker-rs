@@ -514,7 +514,68 @@ fn test_kernel_decode_rejects_each_unreachable_state() {
     for s in &states {
         assert_eq!(&decode(&encode(s), &k).unwrap(), s);
     }
-    let mutations: [(&str, Mutation); 14] = [
+    let mutations: [(&str, Mutation); 27] = [
+        ("stamp_seq at u64::MAX", |s, _| {
+            s.stamp_seq = u64::MAX;
+            true
+        }),
+        ("stamp_seq below its floor", |s, _| {
+            if s.stamp_seq == 0 {
+                return false;
+            }
+            s.stamp_seq =
+                s.next_order_id - 1 + s.counters.local_rejects + s.counters.venue_fills - 1;
+            true
+        }),
+        ("next_msg_seq beyond two per order", |s, _| {
+            s.next_msg_seq = 2 * s.next_order_id + 1;
+            true
+        }),
+        ("next_order_id beyond two per step", |s, _| {
+            s.next_order_id = 2 * s.step + 2;
+            true
+        }),
+        ("next_exec_id beyond the fills", |s, _| {
+            s.next_exec_id += 1;
+            true
+        }),
+        ("local rejects beyond the orders", |s, _| {
+            s.counters.local_rejects = s.next_order_id;
+            true
+        }),
+        ("quote errors without rejects", |s, _| {
+            s.counters.quote_errors += 1;
+            true
+        }),
+        ("drops before the end of the data", |s, _| {
+            s.counters.eof_dropped_msgs = 1;
+            true
+        }),
+        ("last delivery far in the future", |s, _| {
+            s.last_delivery_ns = u64::MAX;
+            true
+        }),
+        ("last observation far in the future", |s, _| {
+            s.last_observed_ns = u64::MAX;
+            true
+        }),
+        ("venue message far in the future", |s, _| {
+            s.msgs.get_mut(0).map(|m| m.eff_ns = u64::MAX).is_some()
+        }),
+        ("venue average entry Decimal::MAX", |s, _| {
+            if s.venue.pos.quantity.is_zero() {
+                return false;
+            }
+            s.venue.pos.avg_entry = Decimal::MAX;
+            true
+        }),
+        ("agent average entry negative", |s, _| {
+            if s.agent.pos.quantity.is_zero() {
+                return false;
+            }
+            s.agent.pos.avg_entry = dec!(-1);
+            true
+        }),
         ("venue average entry zero on a position", |s, _| {
             if s.venue.pos.quantity.is_zero() {
                 return false;
@@ -1051,4 +1112,37 @@ fn test_kernel_adapter_rejects_lot_and_size_mismatch_and_foreign_kernel() {
         adapter.act(&other, &observation_at(10, dec!(0))),
         KernelAction::QuoteError(ERR_KERNEL_MISMATCH)
     );
+}
+
+#[test]
+fn test_kernel_decode_rejects_counters_out_of_range_on_a_reset_state() {
+    let cfg = config(KernelLatency::zero(MS));
+    let data =
+        KernelDataset::from_kernel_ticks((0..4).map(|i| tick(1 + i, 98, 102)).collect(), &cfg)
+            .unwrap();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    let s = k.reset(0);
+    assert_eq!(decode(&encode(&s), &k).unwrap(), s);
+    let fields: [fn(&mut KernelState<16, 64, 128, 64>); 8] = [
+        |s| s.stamp_seq = u64::MAX,
+        |s| s.next_msg_seq = u64::MAX,
+        |s| s.next_order_id = u64::MAX,
+        |s| s.next_exec_id = u64::MAX,
+        |s| s.counters.local_rejects = u64::MAX,
+        |s| s.counters.venue_fills = u64::MAX,
+        |s| s.last_delivery_ns = u64::MAX,
+        |s| s.last_observed_ns = u64::MAX,
+    ];
+    for (i, mutate) in fields.iter().enumerate() {
+        let mut t = s;
+        mutate(&mut t);
+        assert!(
+            decode(&encode(&t), &k).is_err(),
+            "field {i} out of range decoded"
+        );
+    }
+    // Every valid state steps without a halt.
+    let mut next = decode(&encode(&s), &k).unwrap();
+    k.step(&mut next, quote(97, 103));
+    assert!(!matches!(next.status(), Status::Halted(_)));
 }
