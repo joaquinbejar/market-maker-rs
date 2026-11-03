@@ -439,10 +439,9 @@ impl MetricsCalculator {
         };
 
         // Calculate time span for annualization
-        let time_span_ms = if equity_curve.len() >= 2 {
-            equity_curve.last().unwrap().timestamp - equity_curve.first().unwrap().timestamp
-        } else {
-            0
+        let time_span_ms = match (equity_curve.first(), equity_curve.last()) {
+            (Some(first), Some(last)) => last.timestamp.saturating_sub(first.timestamp),
+            _ => 0,
         };
         let years = self.ms_to_years(time_span_ms);
 

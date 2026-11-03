@@ -43,6 +43,7 @@
 //! ```
 
 use crate::Decimal;
+use crate::types::error::{MMError, MMResult};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -582,27 +583,49 @@ impl CollectingAlertHandler {
         }
     }
 
+    fn lock(&self) -> MMResult<std::sync::MutexGuard<'_, Vec<Alert>>> {
+        self.alerts
+            .lock()
+            .map_err(|_| MMError::LockPoisoned("collected alerts".to_string()))
+    }
+
     /// Returns collected alerts.
-    #[must_use]
-    pub fn alerts(&self) -> Vec<Alert> {
-        self.alerts.lock().unwrap().clone()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn alerts(&self) -> MMResult<Vec<Alert>> {
+        Ok(self.lock()?.clone())
     }
 
     /// Returns the number of collected alerts.
-    #[must_use]
-    pub fn count(&self) -> usize {
-        self.alerts.lock().unwrap().len()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn count(&self) -> MMResult<usize> {
+        Ok(self.lock()?.len())
     }
 
     /// Clears collected alerts.
-    pub fn clear(&self) {
-        self.alerts.lock().unwrap().clear();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn clear(&self) -> MMResult<()> {
+        self.lock()?.clear();
+        Ok(())
     }
 }
 
 impl AlertHandler for CollectingAlertHandler {
     fn handle(&self, alert: &Alert) {
-        self.alerts.lock().unwrap().push(alert.clone());
+        // `AlertHandler::handle` cannot return an error, so a poisoned lock
+        // is recovered: a pushed alert cannot leave the Vec inconsistent.
+        self.alerts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(alert.clone());
     }
 
     fn accepts_severity(&self, severity: AlertSeverity) -> bool {
@@ -1057,13 +1080,13 @@ mod tests {
         handler.handle(&alert);
         handler.handle(&alert);
 
-        assert_eq!(handler.count(), 2);
+        assert_eq!(handler.count().unwrap(), 2);
 
-        let alerts = handler.alerts();
+        let alerts = handler.alerts().unwrap();
         assert_eq!(alerts.len(), 2);
 
-        handler.clear();
-        assert_eq!(handler.count(), 0);
+        handler.clear().unwrap();
+        assert_eq!(handler.count().unwrap(), 0);
     }
 
     // AlertManager tests
@@ -1105,7 +1128,7 @@ mod tests {
         );
 
         assert_eq!(manager.history_count(), 1);
-        assert_eq!(collector.count(), 1);
+        assert_eq!(collector.count().unwrap(), 1);
     }
 
     #[test]
@@ -1365,7 +1388,7 @@ mod tests {
         // Both in history
         assert_eq!(manager.history_count(), 2);
         // Only error collected by handler
-        assert_eq!(collector.count(), 1);
+        assert_eq!(collector.count().unwrap(), 1);
     }
 
     #[test]

@@ -338,18 +338,22 @@ impl CorrelationMatrix {
         }
 
         // Calculate correlations for each pair
-        for i in 0..self.assets.len() {
-            for j in i..self.assets.len() {
-                if i == j {
-                    continue; // Diagonal stays 1.0
-                }
-
-                let returns_i = returns.get(&self.assets[i]).unwrap();
-                let returns_j = returns.get(&self.assets[j]).unwrap();
+        let missing = |asset: &AssetId| {
+            MMError::InvalidConfiguration(format!("missing returns for {asset:?}"))
+        };
+        let n = self.assets.len();
+        for (i, asset_i) in self.assets.iter().enumerate() {
+            for (j, asset_j) in self.assets.iter().enumerate().skip(i + 1) {
+                // The diagonal stays 1.0.
+                let returns_i = returns.get(asset_i).ok_or_else(|| missing(asset_i))?;
+                let returns_j = returns.get(asset_j).ok_or_else(|| missing(asset_j))?;
 
                 let correlation = Self::calculate_correlation(returns_i, returns_j)?;
-                let idx = Self::index_for(i, j, self.assets.len());
-                self.correlations[idx] = correlation;
+                let idx = Self::index_for(i, j, n);
+                let slot = self.correlations.get_mut(idx).ok_or_else(|| {
+                    MMError::NumericalError(format!("correlation index {idx} out of range"))
+                })?;
+                *slot = correlation;
             }
         }
 

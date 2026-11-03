@@ -94,7 +94,7 @@ fn main() {
     println!("--- Alert Statistics ---\n");
     println!("  Total in History: {}", manager.history_count());
     println!("  Unacknowledged: {}", manager.unacknowledged_count());
-    println!("  Collected by Handler: {}", collector.count());
+    println!("  Collected by Handler: {}", collector.count().unwrap());
 
     // Get alerts by severity
     let critical = manager.get_alerts_by_severity(AlertSeverity::Critical);

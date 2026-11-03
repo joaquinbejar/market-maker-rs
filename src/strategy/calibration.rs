@@ -469,8 +469,12 @@ impl RiskAversionCalibrator {
         }
 
         // Average time between crossings approximates half-life
-        let total_time = crossings.last().unwrap() - crossings.first().unwrap();
-        let avg_crossing_time = total_time / (crossings.len() as u64 - 1);
+        let (Some(first), Some(last)) = (crossings.first(), crossings.last()) else {
+            return 300_000; // Default
+        };
+        let total_time = last.saturating_sub(*first);
+        let intervals = u64::try_from(crossings.len().saturating_sub(1)).unwrap_or(u64::MAX);
+        let avg_crossing_time = total_time.checked_div(intervals).unwrap_or(0);
 
         avg_crossing_time.max(1000) // At least 1 second
     }

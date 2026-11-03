@@ -80,6 +80,13 @@ pub enum MMError {
         /// The action given.
         action: Action,
     } = 7,
+
+    /// A lock guarding shared state was poisoned.
+    ///
+    /// This error occurs when another thread panicked while holding the
+    /// lock, so the protected state may be inconsistent.
+    #[error("lock poisoned: {0}")]
+    LockPoisoned(String) = 8,
 }
 
 impl MMError {
@@ -117,7 +124,8 @@ impl MMError {
             | Self::InvalidPositionUpdate(msg)
             | Self::InvalidQuoteGeneration(msg)
             | Self::InvalidTimestamp(msg)
-            | Self::ConnectionError(msg) => msg,
+            | Self::ConnectionError(msg)
+            | Self::LockPoisoned(msg) => msg,
             Self::UnsupportedAction { .. } => "only buy and sell are supported",
         }
     }

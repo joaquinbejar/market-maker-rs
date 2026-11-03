@@ -799,28 +799,34 @@ impl ThreadSafeOrderManager {
 
     /// Executes a read operation on the order manager.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the lock is poisoned.
-    pub fn read<F, R>(&self, f: F) -> R
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn read<F, R>(&self, f: F) -> MMResult<R>
     where
         F: FnOnce(&OrderManager) -> R,
     {
-        let guard = self.inner.read().unwrap();
-        f(&guard)
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| MMError::LockPoisoned("order manager".to_string()))?;
+        Ok(f(&guard))
     }
 
     /// Executes a write operation on the order manager.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the lock is poisoned.
-    pub fn write<F, R>(&self, f: F) -> R
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn write<F, R>(&self, f: F) -> MMResult<R>
     where
         F: FnOnce(&mut OrderManager) -> R,
     {
-        let mut guard = self.inner.write().unwrap();
-        f(&mut guard)
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| MMError::LockPoisoned("order manager".to_string()))?;
+        Ok(f(&mut guard))
     }
 
     /// Registers a new order.
@@ -830,7 +836,7 @@ impl ThreadSafeOrderManager {
         client_order_id: String,
         timestamp: u64,
     ) -> MMResult<()> {
-        self.write(|m| m.register_order(request, client_order_id, timestamp))
+        self.write(|m| m.register_order(request, client_order_id, timestamp))?
     }
 
     /// Updates an order with exchange response.
@@ -840,7 +846,7 @@ impl ThreadSafeOrderManager {
         response: &OrderResponse,
         timestamp: u64,
     ) -> MMResult<()> {
-        self.write(|m| m.update_order(client_order_id, response, timestamp))
+        self.write(|m| m.update_order(client_order_id, response, timestamp))?
     }
 
     /// Records a fill.
@@ -849,18 +855,22 @@ impl ThreadSafeOrderManager {
     ///
     /// Returns the [`OrderManager::record_fill`] errors.
     pub fn record_fill(&self, fill: &Fill, timestamp: u64) -> MMResult<()> {
-        self.write(|m| m.record_fill(fill, timestamp))
+        self.write(|m| m.record_fill(fill, timestamp))?
     }
 
     /// Gets order statistics.
-    #[must_use]
-    pub fn get_stats(&self) -> OrderManagerStats {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn get_stats(&self) -> MMResult<OrderManagerStats> {
         self.read(|m| m.get_stats())
     }
 
     /// Gets the number of open orders.
-    #[must_use]
-    pub fn open_order_count(&self) -> usize {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn open_order_count(&self) -> MMResult<usize> {
         self.read(|m| m.open_order_count())
     }
 
@@ -871,23 +881,28 @@ impl ThreadSafeOrderManager {
     /// Returns [`MMError::UnsupportedAction`] if `side` is neither buy nor
     /// sell.
     pub fn get_open_quantity(&self, symbol: &str, side: Action) -> MMResult<Decimal> {
-        self.read(|m| m.get_open_quantity(symbol, side))
+        self.read(|m| m.get_open_quantity(symbol, side))?
     }
 
     /// Checks for timed out orders.
-    #[must_use]
-    pub fn check_timeouts(&self, current_time: u64) -> Vec<String> {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn check_timeouts(&self, current_time: u64) -> MMResult<Vec<String>> {
         self.read(|m| m.check_timeouts(current_time))
     }
 
     /// Marks an order as cancelled.
     pub fn mark_cancelled(&self, client_order_id: &str, timestamp: u64) -> MMResult<()> {
-        self.write(|m| m.mark_cancelled(client_order_id, timestamp))
+        self.write(|m| m.mark_cancelled(client_order_id, timestamp))?
     }
 
     /// Cleans up old orders.
-    pub fn cleanup(&self, retention_ms: u64, current_time: u64) {
-        self.write(|m| m.cleanup(retention_ms, current_time));
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn cleanup(&self, retention_ms: u64, current_time: u64) -> MMResult<()> {
+        self.write(|m| m.cleanup(retention_ms, current_time))
     }
 }
 
@@ -1229,9 +1244,9 @@ mod tests {
             .register_order(&request, "client-1".to_string(), 1000)
             .unwrap();
 
-        assert_eq!(manager.open_order_count(), 1);
+        assert_eq!(manager.open_order_count().unwrap(), 1);
 
-        let stats = manager.get_stats();
+        let stats = manager.get_stats().unwrap();
         assert_eq!(stats.total_orders, 1);
         assert_eq!(stats.pending_orders, 1);
     }
