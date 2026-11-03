@@ -247,6 +247,90 @@ pub trait PretradePolicy: fmt::Debug {
     }
 }
 
+/// Outcome of [`limits_capacity`] for one order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapacityVerdict {
+    /// The whole requested quantity fits.
+    Accept,
+    /// Only this smaller, positive quantity fits.
+    Reduce(Decimal),
+    /// Nothing fits.
+    Reject(RejectCode),
+}
+
+/// Why [`limits_capacity`] rejected an order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectCode {
+    /// A position or notional limit leaves no room.
+    LimitReached,
+}
+
+/// Room left before one limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitCap {
+    /// The limit leaves this much room (possibly negative).
+    Binding(Decimal),
+    /// The room is not representable: the limit cannot bind.
+    NonBinding,
+}
+
+/// The worst case exposure `position + live` is not representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GateNumericError;
+
+/// Capacity of a new order under `limits`, as [`LimitsPolicy::check`]
+/// decides it.
+///
+/// `position` is the filled position, `live_same_side` the remaining
+/// quantity of the live orders on the order's side, `price` the order price
+/// (positive) and `qty` the requested quantity (positive). A limit whose
+/// room overflows, or a notional limit whose `max_notional / price` is not
+/// representable, is [`LimitCap::NonBinding`].
+///
+/// # Errors
+///
+/// Returns [`GateNumericError`] if `position + live` (signed by side) is
+/// not representable.
+pub(crate) fn limits_capacity(
+    limits: &RiskLimits,
+    position: Decimal,
+    live_same_side: Decimal,
+    dir: Dir,
+    price: Decimal,
+    qty: Decimal,
+) -> Result<CapacityVerdict, GateNumericError> {
+    let worst = position
+        .checked_add(LimitsPolicy::signed(dir, live_same_side))
+        .ok_or(GateNumericError)?;
+    let room = |limit: Option<Decimal>| match limit {
+        None => LimitCap::NonBinding,
+        Some(limit) => {
+            let room = match dir {
+                Dir::Buy => limit.checked_sub(worst),
+                Dir::Sell => limit.checked_add(worst),
+            };
+            room.map_or(LimitCap::NonBinding, LimitCap::Binding)
+        }
+    };
+    let mut capacity = qty;
+    for cap in [
+        room(Some(limits.max_position)),
+        room(limits.max_notional.checked_div(price)),
+    ] {
+        match cap {
+            LimitCap::Binding(room) => capacity = capacity.min(room),
+            LimitCap::NonBinding => {}
+        }
+    }
+    Ok(if capacity >= qty {
+        CapacityVerdict::Accept
+    } else if capacity > Decimal::ZERO {
+        CapacityVerdict::Reduce(capacity)
+    } else {
+        CapacityVerdict::Reject(RejectCode::LimitReached)
+    })
+}
+
 /// Local [`PretradePolicy`] over [`RiskLimits`] and an optional
 /// [`CircuitBreaker`].
 ///
@@ -408,40 +492,32 @@ impl PretradePolicy for LimitsPolicy {
 
         // Worst case exposure on the order's side before this order. An
         // exposure that cannot be represented is rejected, never approved.
-        let Some(worst) = self
+        let verdict = self
             .live_quantity_dir(dir)
-            .and_then(|live| self.position.checked_add(Self::signed(dir, live)))
-        else {
-            return PretradeDecision::Rejected {
-                reason: "exposure overflows decimal range".to_string(),
-            };
-        };
-        let mut capacity = request.quantity;
-        // Room left before a limit on the order's side. Overflow only
-        // happens when the limit is so far away that it cannot bind.
-        let room = |limit: Decimal| match dir {
-            Dir::Buy => limit.checked_sub(worst),
-            Dir::Sell => limit.checked_add(worst),
-        };
-        if let Some(by_position) = room(self.limits.max_position) {
-            capacity = capacity.min(by_position);
-        }
-        // An unrepresentable quotient (tiny price) means the notional limit
-        // does not bind.
-        if let Some(by_notional) = self.limits.max_notional.checked_div(price).and_then(room) {
-            capacity = capacity.min(by_notional);
-        }
-
-        let decision = if capacity >= request.quantity {
-            PretradeDecision::Accepted
-        } else if capacity > Decimal::ZERO {
-            PretradeDecision::Reduced {
-                quantity: capacity,
+            .ok_or(GateNumericError)
+            .and_then(|live| {
+                limits_capacity(
+                    &self.limits,
+                    self.position,
+                    live,
+                    dir,
+                    price,
+                    request.quantity,
+                )
+            });
+        let decision = match verdict {
+            Ok(CapacityVerdict::Accept) => PretradeDecision::Accepted,
+            Ok(CapacityVerdict::Reduce(quantity)) => PretradeDecision::Reduced {
+                quantity,
                 reason: "position or notional limit".to_string(),
-            }
-        } else {
-            PretradeDecision::Rejected {
+            },
+            Ok(CapacityVerdict::Reject(RejectCode::LimitReached)) => PretradeDecision::Rejected {
                 reason: "position or notional limit reached".to_string(),
+            },
+            Err(GateNumericError) => {
+                return PretradeDecision::Rejected {
+                    reason: "exposure overflows decimal range".to_string(),
+                };
             }
         };
         let approved = decision.approved_quantity(request.quantity);
