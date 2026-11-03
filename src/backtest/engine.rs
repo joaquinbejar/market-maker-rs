@@ -1534,53 +1534,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
     /// Calculates an approximate Sharpe ratio from the equity curve.
     fn calculate_sharpe_ratio(&self) -> Option<Decimal> {
-        if self.equity_curve.len() < 2 {
-            return None;
-        }
-
-        // Calculate returns
-        let returns: Vec<Decimal> = self
-            .equity_curve
-            .windows(2)
-            .filter_map(|w| match w {
-                [prev, next] if prev.1 > Decimal::ZERO => {
-                    next.1.checked_sub(prev.1)?.checked_div(prev.1)
-                }
-                _ => None,
-            })
-            .collect();
-
-        if returns.is_empty() {
-            return None;
-        }
-
-        let n = Decimal::from(returns.len());
-        let mean = returns
-            .iter()
-            .try_fold(Decimal::ZERO, |acc, r| acc.checked_add(*r))?
-            .checked_div(n)?;
-
-        // Calculate standard deviation
-        let variance = returns
-            .iter()
-            .try_fold(Decimal::ZERO, |acc, r| {
-                let diff = r.checked_sub(mean)?;
-                acc.checked_add(diff.checked_mul(diff)?)
-            })?
-            .checked_div(n)?;
-
-        if variance <= Decimal::ZERO {
-            return None;
-        }
-
-        // Approximate sqrt using Newton's method
-        let std_dev = decimal_sqrt(variance)?;
-
-        if std_dev > Decimal::ZERO {
-            mean.checked_div(std_dev)
-        } else {
-            None
-        }
+        sharpe_ratio(&self.equity_curve)
     }
 
     /// Returns the current state (position and PnL).
@@ -1832,6 +1786,57 @@ fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
     rounded.unwrap_or(value)
 }
 
+/// Approximate Sharpe ratio of an equity curve (mean over standard
+/// deviation of per step returns), or `None` when it is undefined or a
+/// step overflows.
+fn sharpe_ratio(equity_curve: &[(u64, Decimal)]) -> Option<Decimal> {
+    // A window whose previous equity is not positive has no return and is
+    // skipped; a return that overflows makes the whole ratio `None`.
+    let returns: Vec<Decimal> = equity_curve
+        .windows(2)
+        .filter_map(|w| match w {
+            [prev, next] if prev.1 > Decimal::ZERO => Some(
+                next.1
+                    .checked_sub(prev.1)
+                    .and_then(|d| d.checked_div(prev.1)),
+            ),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+
+    if returns.is_empty() {
+        return None;
+    }
+
+    let n = Decimal::from(returns.len());
+    let mean = returns
+        .iter()
+        .try_fold(Decimal::ZERO, |acc, r| acc.checked_add(*r))?
+        .checked_div(n)?;
+
+    // Calculate standard deviation
+    let variance = returns
+        .iter()
+        .try_fold(Decimal::ZERO, |acc, r| {
+            let diff = r.checked_sub(mean)?;
+            acc.checked_add(diff.checked_mul(diff)?)
+        })?
+        .checked_div(n)?;
+
+    if variance <= Decimal::ZERO {
+        return None;
+    }
+
+    // Approximate sqrt using Newton's method
+    let std_dev = decimal_sqrt(variance)?;
+
+    if std_dev > Decimal::ZERO {
+        mean.checked_div(std_dev)
+    } else {
+        None
+    }
+}
+
 /// Approximate square root using Newton's method.
 fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
     if n < Decimal::ZERO {
@@ -1858,6 +1863,25 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sharpe_ratio_overflowing_return_is_none() {
+        let tiny = dec!(0.0000000000000000000000000001);
+        let curve = [(0, dec!(100)), (1, dec!(110)), (2, tiny), (3, Decimal::MAX)];
+        assert_eq!(sharpe_ratio(&curve), None);
+    }
+
+    #[test]
+    fn test_sharpe_ratio_non_positive_previous_equity_is_skipped() {
+        let curve = [
+            (0, dec!(100)),
+            (1, dec!(-5)),
+            (2, dec!(110)),
+            (3, dec!(121)),
+            (4, dec!(120)),
+        ];
+        assert!(sharpe_ratio(&curve).is_some());
+    }
     use crate::backtest::VecDataSource;
     use crate::backtest::{
         MarketImpactFillModel, ProbabilisticFillModel, QueuePositionFillModel, SimLatencyConfig,
