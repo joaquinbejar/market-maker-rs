@@ -496,6 +496,17 @@ mod tests {
         let mut spot_late = ok.clone();
         spot_late.underlying_observed_at = CUTOFF + 1;
         assert!(clean_quotes(&[spot_late], CUTOFF, rates(), &config()).is_err());
+        let mut spot_received_late = ok.clone();
+        spot_received_late.underlying_received_at = CUTOFF + 1;
+        assert!(clean_quotes(&[spot_received_late], CUTOFF, rates(), &config()).is_err());
+        // A future copy of a quote is not hidden by de-duplication: the
+        // causality check runs first, on every quote.
+        let mut future_copy = ok.clone();
+        future_copy.observed_at = CUTOFF + 5;
+        assert!(matches!(
+            clean_quotes(&[ok, future_copy], CUTOFF, rates(), &config()),
+            Err(MMError::InvalidTimestamp(_))
+        ));
     }
 
     #[test]

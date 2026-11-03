@@ -88,6 +88,11 @@ pub struct QuoteResidual {
     pub vol_half_band: f64,
     /// Observed mid minus the fitted price, discounted.
     pub price_residual: f64,
+    /// `k / sqrt(w_atm)`, with `w_atm` the fitted slice's `w(0)`: the
+    /// moneyness in at the money standard deviations.
+    pub k_normalized: f64,
+    /// The bid's `w = 0` is a declared extreme, not an implied variance.
+    pub bid_at_bound: bool,
 }
 
 /// One expiry's fit.
@@ -132,6 +137,8 @@ pub struct QualityReport {
     pub diagnostics: Option<SurfaceDiagnostics>,
     /// Stability against the previous surface, when checked.
     pub stability: Vec<StabilityPoint>,
+    /// Why stability was not checked, when a previous surface was given.
+    pub stability_skipped: Option<String>,
     /// Why the status is not Healthy.
     pub reasons: Vec<String>,
 }
@@ -218,6 +225,9 @@ pub fn calibrate_surface(
                         vol_residual: r.vol_residual,
                         vol_half_band: 0.5 * ((o.w_ask / tau).sqrt() - (o.w_bid / tau).sqrt()),
                         price_residual: mid - fitted_price,
+                        k_normalized: o.quote.k
+                            / f.slice.eval(0.0).map_or(f64::NAN, |(w, _, _)| w.sqrt()),
+                        bid_at_bound: o.bid_at_bound,
                     });
                 }
                 if f.active
@@ -245,6 +255,7 @@ pub fn calibrate_surface(
         residuals,
         diagnostics: None,
         stability: Vec::new(),
+        stability_skipped: None,
         reasons,
     };
     let surface = match SviSurface::new(fitted, config.short_expiry) {
@@ -261,9 +272,28 @@ pub fn calibrate_surface(
         report.reasons.push("diagnosis not clean".to_string());
     }
     report.diagnostics = Some(diagnostics);
+    // A previous calibration counts only if it was available at this cutoff;
+    // otherwise it is ignored with its reason, and changes no flag.
+    let previous = match previous {
+        Some(prev) if prev.available_at() > cutoff => {
+            report.stability_skipped = Some(format!(
+                "previous calibration available at {}, after the cutoff {cutoff}",
+                prev.available_at()
+            ));
+            None
+        }
+        other => other,
+    };
     if let (Some(prev), Some(stability)) = (previous, config.stability) {
         // The previous surface aged to this cutoff, on common expiries.
-        let aged = prev.aged_slices(cutoff).unwrap_or_default();
+        let aged = match prev.aged_slices(cutoff) {
+            Ok(aged) => aged,
+            Err(error) => {
+                report.stability_skipped =
+                    Some(format!("previous calibration not usable: {error}"));
+                Vec::new()
+            }
+        };
         for (slice, &expiry_at) in surface.slices().iter().zip(expiries.iter()) {
             let Some((_, before)) = aged.iter().find(|(e, _)| *e == expiry_at) else {
                 continue;
@@ -538,6 +568,24 @@ mod tests {
             report.stability.iter().all(|p| !p.unstable),
             "{:?}",
             report.stability
+        );
+    }
+
+    #[test]
+    fn test_calibrate_surface_previous_from_the_future_is_ignored() {
+        let q = quotes(&[30, 90, 180], &STRIKES);
+        let (late, _) =
+            calibrate_surface(&q, CUTOFF, CUTOFF + DAY, rates(), None, &config()).unwrap();
+        let bumped = quotes_scaled(&[30, 90, 180], &STRIKES, 1.3);
+        let (entry, report) =
+            calibrate_surface(&bumped, CUTOFF, CUTOFF, rates(), Some(&late), &config()).unwrap();
+        assert!(report.stability.is_empty());
+        assert!(report.stability_skipped.is_some());
+        assert_eq!(
+            entry.status(),
+            &SurfaceStatus::Healthy,
+            "{:?}",
+            report.reasons
         );
     }
 

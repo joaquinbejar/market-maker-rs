@@ -224,6 +224,9 @@ pub struct IvObservation {
     pub w_mid: f64,
     /// From the bid (0 for a zero bid or one at the lower bound).
     pub w_bid: f64,
+    /// The bid is at or below its lower bound: `w_bid = 0` is a declared
+    /// extreme of the band, not an implied variance read from the bid.
+    pub bid_at_bound: bool,
     /// From the ask.
     pub w_ask: f64,
     /// `1 / max(w_ask - w_bid, eps)^2`.
@@ -302,9 +305,9 @@ pub fn extract(report: &CleaningReport, config: &IvConfig) -> MMResult<Extractio
             }
         };
         // A bid at or below the lower bound (a zero bid) is w = 0.
-        let w_bid = match solve(c.quote.bid) {
-            Ok(w) => w,
-            Err(IvFailure::BelowLowerBound { .. }) => 0.0,
+        let (w_bid, bid_at_bound) = match solve(c.quote.bid) {
+            Ok(w) => (w, w == 0.0),
+            Err(IvFailure::BelowLowerBound { .. }) => (0.0, true),
             Err(e) => {
                 failures.push((c.index, "bid", e));
                 continue;
@@ -315,6 +318,7 @@ pub fn extract(report: &CleaningReport, config: &IvConfig) -> MMResult<Extractio
             quote: c.clone(),
             w_mid,
             w_bid,
+            bid_at_bound,
             w_ask,
             weight: 1.0 / (band * band),
         });

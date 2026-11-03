@@ -213,8 +213,17 @@ pub struct Residual {
 pub struct SliceFit {
     /// The slice, with the observed `k` range as its calibrated range.
     pub slice: SviSlice,
-    /// Weighted sum of squared residuals in `w`.
+    /// Weighted sum of squared residuals in `w` of the KKT solution, with
+    /// the weights scaled so the largest is 1.
     pub objective: f64,
+    /// The same sum for the slice's parameters, which come from the active
+    /// constraints where one is active: within the tolerances of
+    /// `objective`, or the fit fails.
+    pub objective_params: f64,
+    /// `2 - b (1 + |rho|)`: the distance to Lee's bound.
+    pub lee_margin: f64,
+    /// `a - a_min`.
+    pub a_margin: f64,
     /// Root mean square residual in implied volatility.
     pub rmse_vol: f64,
     /// Constraints active at the fit.
@@ -522,6 +531,29 @@ pub fn fit_slice(
         .iter()
         .map(|o| o.w)
         .fold(config.a_min, f64::max);
+    // Weights scaled so the largest is 1: the normal equations stay far
+    // from overflow whatever the bid/ask widths were.
+    let max_weight = observations
+        .iter()
+        .map(|o| o.weight)
+        .fold(0.0_f64, f64::max);
+    let scaled: Vec<SliceObservation> = observations
+        .iter()
+        .map(|o| SliceObservation {
+            k: o.k,
+            w: o.w,
+            weight: o.weight / max_weight,
+        })
+        .collect();
+    if scaled
+        .iter()
+        .any(|o| !(o.weight.is_finite() && o.weight > 0.0))
+    {
+        return Err(FitFailure::Invalid(
+            "weights do not scale to finite positive values".to_string(),
+        ));
+    }
+    let observations = scaled.as_slice();
     let n = config.grid;
     let (mut m_lo, mut m_hi) = (k_min - span, k_max + span);
     let (mut s_lo, mut s_hi) = ((config.sigma_lo * span).ln(), (config.sigma_hi * span).ln());
@@ -644,6 +676,22 @@ pub fn fit_slice(
             vol_residual,
         });
     }
+    // The parameters taken from the active constraints must reproduce the
+    // KKT solution of the face; a face is never projected into a success.
+    let objective_params: f64 = observations
+        .iter()
+        .zip(residuals.iter())
+        .map(|(o, r)| o.weight * (r.w_fitted - o.w) * (r.w_fitted - o.w))
+        .sum();
+    let total_weight: f64 = observations.iter().map(|o| o.weight).sum();
+    let allowed =
+        1e-9 * res.objective + config.feasibility_tolerance * total_weight * a_max * a_max;
+    if !(objective_params.is_finite() && objective_params <= res.objective + allowed) {
+        return Err(FitFailure::OutOfDomain(format!(
+            "parameters from the active constraints give {objective_params}, the face solution {}",
+            res.objective
+        )));
+    }
     let rmse_vol = (sum_sq / observations.len() as f64).sqrt();
     if !(rmse_vol.is_finite() && rmse_vol <= config.max_rmse_vol) {
         return Err(FitFailure::RmseAboveMax {
@@ -652,8 +700,11 @@ pub fn fit_slice(
         });
     }
     Ok(SliceFit {
+        lee_margin: LEE_SLOPE_BOUND - slice.lee_slope(),
+        a_margin: slice.a() - config.a_min,
         slice,
         objective: res.objective,
+        objective_params,
         rmse_vol,
         active,
         residuals,
@@ -746,6 +797,49 @@ mod tests {
         );
         assert_eq!(fit.slice.rho(), -1.0);
         assert!(fit.slice.minimum() > 0.0);
+    }
+
+    #[test]
+    fn test_fit_slice_lee_bound_is_reported_active() {
+        // Wings of slope 3 ask for more than Lee's bound allows (slope 2).
+        let obs: Vec<SliceObservation> = ks(-1.0, 1.0, 21)
+            .iter()
+            .map(|&k| SliceObservation::new(k, 0.01 + 3.0 * k.abs(), 1.0).unwrap())
+            .collect();
+        let config = FitConfig {
+            max_rmse_vol: 10.0,
+            ..FitConfig::default()
+        };
+        let fit = fit_slice(1.0, &obs, &config).unwrap();
+        assert!(
+            fit.active
+                .iter()
+                .any(|c| matches!(c, ActiveConstraint::LeeUpper | ActiveConstraint::LeeLower)),
+            "{:?}",
+            fit.active
+        );
+        assert!(fit.lee_margin.abs() < 1e-12, "{}", fit.lee_margin);
+        assert!(fit.objective_params <= fit.objective * (1.0 + 1e-9) + 1e-12);
+    }
+
+    #[test]
+    fn test_fit_slice_a_min_is_reported_active() {
+        // A truth with a < 0 (valid raw SVI) wants a below the fit's a_min.
+        let range = KRange::new(-1.0, 1.0).unwrap();
+        let truth = SviSlice::new(0.5, -0.02, 0.2, -0.3, 0.0, 0.3, range).unwrap();
+        let obs = observe(&truth, &ks(-0.8, 0.8, 17));
+        let config = FitConfig {
+            max_rmse_vol: 1.0,
+            ..FitConfig::default()
+        };
+        let fit = fit_slice(0.5, &obs, &config).unwrap();
+        assert!(
+            fit.active.contains(&ActiveConstraint::AMin),
+            "{:?}",
+            fit.active
+        );
+        assert_eq!(fit.slice.a(), config.a_min);
+        assert_eq!(fit.a_margin, 0.0);
     }
 
     #[test]

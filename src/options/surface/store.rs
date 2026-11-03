@@ -25,7 +25,12 @@
 //! down at constant implied volatility per `k`:
 //! `w_i(k; t) = w_i(k) tau_i(t) / tau_i(data_cutoff)`, which scales `a` and
 //! `b` and keeps `rho`, `m` and `sigma`. Slices expired by `t` are dropped.
-//! This is an explicit ageing policy, not a guarantee: the aged surface is
+//! For slices with absolute expiries calibrated at the same cutoff and
+//! `t >= cutoff`, the factor `tau_i(t) / tau_i(cutoff)` is positive and grows
+//! with the expiry, so `w_i <= w_j` at each `k` before ageing stays true
+//! after it; nothing more (no butterfly property, nothing for a surface
+//! that was not ordered) is claimed. This is an explicit ageing policy,
+//! not a guarantee: the aged surface is
 //! diagnosed again on a grid holding all its nodes, and under a policy that
 //! rejects degraded surfaces it is served only if that diagnosis is clean.
 //! An old expiry is never read as a new one.
@@ -257,8 +262,12 @@ pub struct ServedSurface {
     pub data_cutoff: u64,
     /// When that calibration became available, ms.
     pub available_at: u64,
-    /// Its status, unchanged.
+    /// The stored calibration's status, unchanged.
     pub status: SurfaceStatus,
+    /// The status of what is served: the stored one when the aged surface's
+    /// diagnosis is clean, `Degraded` otherwise (served only under a policy
+    /// that allows degraded surfaces).
+    pub served_status: SurfaceStatus,
     /// Whether a later attempt, available at `t`, was passed over.
     pub fallback: bool,
     /// Diagnosis of the aged surface.
@@ -358,6 +367,16 @@ impl SurfaceStore {
                 reasons.push(format!("{}: aged surface not clean", entry.available_at));
                 continue;
             }
+            let served_status = if diagnostics.is_clean() {
+                entry.status.clone()
+            } else {
+                let mut reasons = match &entry.status {
+                    SurfaceStatus::Degraded(r) => r.clone(),
+                    _ => Vec::new(),
+                };
+                reasons.push(format!("aged to {t}: diagnosis not clean"));
+                SurfaceStatus::Degraded(reasons)
+            };
             return Ok(ServedSurface {
                 surface,
                 valuation_at: t,
@@ -365,6 +384,7 @@ impl SurfaceStore {
                 data_cutoff: entry.data_cutoff,
                 available_at: entry.available_at,
                 status: entry.status.clone(),
+                served_status,
                 fallback: index != latest,
                 diagnostics,
             });
@@ -595,6 +615,9 @@ mod tests {
         wide.k_grid = (0..=60).map(|i| -1.5 + 0.05 * f64::from(i)).collect();
         let lenient = store.surface_at(5 * DAY, &wide).unwrap();
         assert!(!lenient.diagnostics.butterfly.is_clean());
+        // Stored as Healthy, served as Degraded: the two are not confused.
+        assert_eq!(lenient.status, SurfaceStatus::Healthy);
+        assert!(matches!(lenient.served_status, SurfaceStatus::Degraded(_)));
         wide.allow_degraded = false;
         assert!(store.surface_at(5 * DAY, &wide).is_err());
     }
