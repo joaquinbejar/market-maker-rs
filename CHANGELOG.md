@@ -107,6 +107,22 @@ project follows [Semantic Versioning](https://semver.org/).
   place of the archived `actions-rs/toolchain`; toolchains, components and
   matrices are unchanged. `make lint` also runs clippy with
   `--no-default-features` (#155).
+- The crate denies `clippy::unwrap_used`, `expect_used`,
+  `indexing_slicing`, `panic` and `arithmetic_side_effects` outside tests
+  (#145). The option pricing under `options` and `chain` is exempt from
+  the arithmetic lint until its rewrite (#95, #96).
+- Arithmetic outside the option pricing is checked (#135, #144): a function
+  that returns `MMResult` reports an overflow or a zero divisor as
+  `MMError::NumericalError`; derived display and report values (mid
+  prices, spreads, notionals, imbalances, analytics statistics, backtest
+  metrics, persisted record totals, multi underlying aggregates) saturate
+  at the `Decimal` bounds and say so in their docs; an overflowing ratio
+  that returns `Option` is `None`. Several former panics on overflow or a
+  zero divisor (grid inventory scaling with a zero `max_position`, the
+  weighted book imbalance at a zero mid, Decimal `sum` in analytics) are
+  now errors or saturating values.
+- `OrderBookSnapshot::mid_price`, `spread` and `spread_bps` (execution)
+  return `None` when the arithmetic overflows.
 
 ### Fixed
 
@@ -123,6 +139,34 @@ project follows [Semantic Versioning](https://semver.org/).
   Calling again retries the orders that failed (#146).
 
 ### Breaking
+
+- Checked arithmetic (#144): these now return `MMResult` and report an
+  overflow as `MMError::NumericalError`:
+  - `InventoryPosition::update_fill` returns `MMResult<()>` and leaves the
+    position unchanged on overflow;
+  - `FillAccountant::snapshot` returns `MMResult<AccountingSnapshot>`
+    (implementors change their signature), and
+    `BacktestEngine::accounting_snapshot` returns
+    `Option<MMResult<AccountingSnapshot>>`; a failed snapshot is recorded
+    as an engine fault;
+  - `DepthBasedOffering::calculate_ask_size` and `calculate_bid_size`;
+  - `GridStrategy::generate_grid`, `generate_grid_with_inventory`,
+    `calculate_price`, `calculate_level_size`, `price_range` and
+    `max_notional_exposure`;
+  - `AdaptiveSpread::bid_price` and `ask_price`, and
+    `AdaptiveSpreadCalculator::calculate_spread`,
+    `calculate_spread_with_volatility` and
+    `calculate_weighted_orderbook_imbalance`;
+  - `RiskAversionCalibrator::calibrate_from_halflife`,
+    `ParameterOptimizer::optimize_quick` and
+    `OptimizedParameters::adjusted_gamma`;
+  - `MultiUnderlyingManager::reallocate_capital` returns `MMResult<()>`
+    and computes every allocation before applying any.
+- `LimitsPolicy` latches a fault and rejects every later check when a fill
+  would overflow its position, instead of saturating it.
+- `SimulatedFill::base_delta`, `ProbabilisticFillModel` probabilities and
+  `MarginLedgerAccountant` base fees report overflow instead of
+  saturating.
 
 - The `margin` feature depends on margin-rs 0.1 from crates.io instead of
   a git revision. Callers that build the `RiskGate` or `Ledger` passed to
