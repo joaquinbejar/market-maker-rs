@@ -3,6 +3,9 @@
 //! This module provides the `ChainMarketMaker` for multi-strike quoting
 //! across an entire option chain.
 
+// TODO(#166): legacy pricing arithmetic, converted in #166
+#![allow(clippy::arithmetic_side_effects)]
+
 use std::sync::Arc;
 
 use option_chain_orderbook::orderbook::ExpirationOrderBook;

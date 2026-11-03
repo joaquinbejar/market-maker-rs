@@ -29,11 +29,6 @@
 //! let outcomes = mm.refresh_all_quotes(underlying_price, &pricing)?;
 //! ```
 
-// TODO(#95, #96): this pricing arithmetic is being rewritten with checked
-// operations there; until then it is exempt from the crate's
-// arithmetic_side_effects gate.
-#![allow(clippy::arithmetic_side_effects)]
-
 /// Chain market maker implementation.
 pub mod market_maker;
 

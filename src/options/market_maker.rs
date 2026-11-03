@@ -20,6 +20,9 @@
 //! )?;
 //! ```
 
+// TODO(#166): legacy pricing arithmetic, converted in #166
+#![allow(clippy::arithmetic_side_effects)]
+
 use crate::Decimal;
 use crate::options::adapter::OptionsAdapter;
 use crate::options::greeks::{PortfolioGreeks, PositionGreeks};

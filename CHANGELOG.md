@@ -109,9 +109,10 @@ project follows [Semantic Versioning](https://semver.org/).
   `--no-default-features` (#155).
 - The crate denies `clippy::unwrap_used`, `expect_used`,
   `indexing_slicing`, `panic` and `arithmetic_side_effects` outside tests
-  (#145). The option pricing under `options` and `chain` is exempt from
-  the arithmetic lint until its rewrite (#95, #96).
-- Arithmetic outside the option pricing is checked (#135, #144): a function
+  (#145). Five legacy option files (`options::greeks`, `risk_manager`,
+  `market_maker`, `adapter` and `chain::market_maker`) are exempt from the
+  arithmetic lint until #166 converts them.
+- Arithmetic outside those legacy option files is checked (#135, #144): a function
   that returns `MMResult` reports an overflow or a zero divisor as
   `MMError::NumericalError`; derived display and report values (mid
   prices, spreads, notionals, imbalances, analytics statistics, backtest

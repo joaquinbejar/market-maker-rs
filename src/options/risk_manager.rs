@@ -20,6 +20,9 @@
 //! let decision = risk_manager.check_order(&option_greeks, quantity);
 //! ```
 
+// TODO(#166): legacy pricing arithmetic, converted in #166
+#![allow(clippy::arithmetic_side_effects)]
+
 use crate::Decimal;
 use crate::options::greeks::{PortfolioGreeks, PositionGreeks};
 use crate::options::market_maker::{GreeksLimits, HedgeOrder, HedgeType};
