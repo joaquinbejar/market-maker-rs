@@ -601,13 +601,20 @@ pub struct AccountingStatus {
     /// [`SimulatedFill::execution_id`] (see
     /// [`BacktestResult::refused_trades`]).
     pub refused_executions: Vec<u64>,
+    /// Execution ids after whose post the accountant's snapshot failed, in
+    /// venue order (`0` for the snapshot taken when the accountant was
+    /// selected or reset). The engine then kept its previous balances, so
+    /// they may be stale.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub snapshot_failures: Vec<u64>,
 }
 
 impl AccountingStatus {
-    /// Returns `true` if the accountant booked every venue fill.
+    /// Returns `true` if the accountant booked every venue fill and every
+    /// snapshot of it succeeded.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
-        self.refused_executions.is_empty()
+        self.refused_executions.is_empty() && self.snapshot_failures.is_empty()
     }
 }
 
@@ -805,6 +812,8 @@ pub struct BacktestEngine<
     /// Selected accountant; `None` keeps the built in bookkeeping.
     accountant: Option<Box<dyn FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe>>,
     accounting_errors: Vec<(u64, MMError)>,
+    /// Execution ids after which the accountant's snapshot failed.
+    snapshot_failures: Vec<u64>,
     next_execution_id: u64,
     /// Pretrade policy every new order passes before submission.
     policy: Option<Box<dyn PretradePolicy + Send + Sync + UnwindSafe + RefUnwindSafe>>,
@@ -927,6 +936,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             last_observed_at: 0,
             accountant: None,
             accounting_errors: Vec::new(),
+            snapshot_failures: Vec::new(),
             next_execution_id: 1,
             policy: None,
             pretrade_log: Vec::new(),
@@ -1042,6 +1052,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             accounting: AccountingStatus {
                 accountant: self.accountant_description(),
                 refused_executions: self.accounting_errors.iter().map(|(id, _)| *id).collect(),
+                snapshot_failures: self.snapshot_failures.clone(),
             },
         }
     }
@@ -1513,7 +1524,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             if let Err(error) = accountant.post_fill(&posted) {
                 self.accounting_errors.push((execution_id, error));
             }
-            self.sync_accounting(fill.timestamp);
+            self.sync_accounting(fill.timestamp, execution_id);
             self.track_fill(fill);
             return;
         }
@@ -1671,7 +1682,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         accountant: impl FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
     ) -> Self {
         self.accountant = Some(Box::new(accountant));
-        self.sync_accounting(0);
+        self.sync_accounting(0, 0);
         self
     }
 
@@ -1779,6 +1790,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             accountant.reset();
         }
         self.accounting_errors.clear();
+        self.snapshot_failures.clear();
         self.next_execution_id = 1;
         if let Some(policy) = self.policy.as_mut() {
             policy.reset();
@@ -1787,20 +1799,21 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.faults.clear();
         self.fault_count = 0;
         self.reports.clear();
-        self.sync_accounting(0);
+        self.sync_accounting(0, 0);
     }
 
     /// Copies the selected accountant's state into the engine's position,
     /// PnL and fee fields, so runs start from the accountant's initial
     /// state (also with no fills at all). A snapshot that fails is
     /// recorded as a fault and leaves those fields unchanged.
-    fn sync_accounting(&mut self, timestamp: u64) {
+    fn sync_accounting(&mut self, timestamp: u64, execution_id: u64) {
         let Some(accountant) = self.accountant.as_ref() else {
             return;
         };
         let snapshot = match accountant.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                self.snapshot_failures.push(execution_id);
                 self.record_fault(error);
                 return;
             }
@@ -3376,7 +3389,7 @@ mod tests {
             }
             fn reset(&mut self) {}
         }
-        let engine = queued_engine_with_fees().with_accountant(FailingSnapshot);
+        let mut engine = queued_engine_with_fees().with_accountant(FailingSnapshot);
         assert_eq!(engine.fault_count(), 1);
         assert!(matches!(
             engine.faults().first(),
@@ -3386,6 +3399,38 @@ mod tests {
             engine.accounting_snapshot(),
             Some(Err(MMError::NumericalError(_)))
         ));
+        let result = engine.run();
+        assert_eq!(result.accounting.snapshot_failures.first(), Some(&0));
+        assert!(!result.accounting.is_consistent());
+    }
+
+    #[test]
+    fn test_snapshot_failure_after_a_booked_fill_is_inconsistent() {
+        // Books every fill, but its snapshot fails once anything is booked.
+        #[derive(Debug, Default)]
+        struct FailAfterFirst(RecordingAccountant);
+        impl FillAccountant for FailAfterFirst {
+            fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
+                self.0.post_fill(fill)
+            }
+            fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+                let snapshot = self.0.snapshot()?;
+                if snapshot.fills_posted > 0 {
+                    return Err(MMError::NumericalError(
+                        "ledger cash flow overflows".to_string(),
+                    ));
+                }
+                Ok(snapshot)
+            }
+            fn reset(&mut self) {
+                self.0.reset();
+            }
+        }
+        let mut engine = queued_engine_with_fees().with_accountant(FailAfterFirst::default());
+        let result = engine.run();
+        assert!(result.accounting.refused_executions.is_empty());
+        assert_eq!(result.accounting.snapshot_failures.first(), Some(&1));
+        assert!(!result.accounting.is_consistent());
     }
 
     #[test]
