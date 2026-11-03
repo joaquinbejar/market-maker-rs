@@ -544,6 +544,23 @@ impl MetricsServer {
     }
 }
 
+/// Builds a response without the fallible `Response::builder`.
+fn text_response(
+    status: StatusCode,
+    content_type: Option<&'static str>,
+    body: String,
+) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = status;
+    if let Some(content_type) = content_type {
+        response.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static(content_type),
+        );
+    }
+    response
+}
+
 /// Handles HTTP requests to the metrics server.
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
@@ -551,46 +568,28 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let response = match req.uri().path() {
         "/metrics" => match metrics.encode() {
-            Ok(body) => Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/plain; charset=utf-8")
-                .body(Full::new(Bytes::from(body)))
-                .unwrap_or_else(|_| {
-                    Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::from("Failed to build response")))
-                        .unwrap()
-                }),
-            Err(e) => Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from(format!(
-                    "Error encoding metrics: {}",
-                    e
-                ))))
-                .unwrap(),
+            Ok(body) => text_response(StatusCode::OK, Some("text/plain; charset=utf-8"), body),
+            Err(e) => text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                format!("Error encoding metrics: {}", e),
+            ),
         },
-        "/health" => Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("OK")))
-            .unwrap(),
-        "/" => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/html")
-            .body(Full::new(Bytes::from(
-                r#"<html>
+        "/health" => text_response(StatusCode::OK, None, "OK".to_string()),
+        "/" => text_response(
+            StatusCode::OK,
+            Some("text/html"),
+            r#"<html>
 <head><title>Market Maker Metrics</title></head>
 <body>
 <h1>Market Maker Metrics</h1>
 <p><a href="/metrics">Metrics</a></p>
 <p><a href="/health">Health</a></p>
 </body>
-</html>"#,
-            )))
-            .unwrap(),
-        _ => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from("Not Found")))
-            .unwrap(),
+</html>"#
+                .to_string(),
+        ),
+        _ => text_response(StatusCode::NOT_FOUND, None, "Not Found".to_string()),
     };
 
     Ok(response)
