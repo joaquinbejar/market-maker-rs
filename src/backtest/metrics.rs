@@ -906,7 +906,15 @@ fn decimal_ln(n: Decimal) -> Decimal {
 
 /// Approximate exponential function, saturating at the `Decimal` bounds
 /// for a large argument (report only).
+///
+/// A negative argument is computed as `1 / exp(-x)`, so the result stays in
+/// (0, 1] and underflows toward zero instead of following an alternating
+/// series between the bounds.
 fn decimal_exp(x: Decimal) -> Decimal {
+    if x.is_sign_negative() {
+        // `exp(-x) >= 1`, so the quotient is in (0, 1].
+        return saturating_div(Decimal::ONE, decimal_exp(x.abs()));
+    }
     // Taylor series: e^x = sum(x^n / n!)
     let mut result = Decimal::ONE;
     let mut term = Decimal::ONE;
@@ -955,6 +963,20 @@ mod tests {
             .unwrap();
         assert_eq!(metrics.total_return, Decimal::MAX);
         assert_eq!(metrics.total_return_pct, Decimal::MAX);
+    }
+
+    #[test]
+    fn test_short_losing_backtest_cagr_stays_above_minus_one() {
+        // A 50% loss over one hour annualizes toward -100%, never below.
+        let curve = create_equity_curve(&[(0, dec!(100)), (3_600_000, dec!(50))]);
+        let metrics = MetricsCalculator::with_defaults()
+            .calculate(&curve, &[], dec!(100))
+            .unwrap();
+        assert!(metrics.cagr >= Decimal::NEGATIVE_ONE, "{}", metrics.cagr);
+        assert!(metrics.cagr < Decimal::ZERO, "{}", metrics.cagr);
+        let small = decimal_exp(dec!(-1));
+        assert!((small - dec!(0.3678794)).abs() < dec!(0.000001), "{small}");
+        assert!(decimal_exp(dec!(-1000)) >= Decimal::ZERO);
     }
 
     #[test]
