@@ -91,7 +91,9 @@ impl SliceObservation {
 pub struct FitConfig {
     /// Points per axis of the outer `(m, sigma)` grid, at least 5.
     pub grid: usize,
-    /// Times the grid is refined around its best point.
+    /// Times the grid is refined around its best point to a window smaller
+    /// than any before (a refinement that only wins back the size a
+    /// recentre doubled does not count).
     pub refinements: usize,
     /// Times the grid may be moved when its best point is on the edge.
     pub max_recentres: usize,
@@ -564,15 +566,26 @@ pub fn fit_slice(
     let n = config.grid;
     let (mut m_lo, mut m_hi) = (k_min - span, k_max + span);
     let (mut s_lo, mut s_hi) = ((config.sigma_lo * span).ln(), (config.sigma_hi * span).ln());
+    // The declared search domain: every window stays inside it, and a
+    // recentred window never grows beyond it.
+    let (dm_lo, dm_hi, ds_lo, ds_hi) = (m_lo, m_hi, s_lo, s_hi);
+    let (hm_max, hs_max) = (0.5 * (m_hi - m_lo), 0.5 * (s_hi - s_lo));
     let mut best: Option<(Inner, f64, f64)> = None;
     let mut best_on_edge = true;
     let mut shrinks = 0_usize;
     let mut recentres = 0_usize;
-    // Bounded: each pass either recentres (at most max_recentres times) or
-    // shrinks (at most refinements times), and the last pass stops.
+    // The smallest window in m so far: a shrink counts as a refinement only
+    // below it.
+    let mut smallest = m_hi - m_lo;
+    // Bounded: each pass recentres (at most max_recentres times, each at
+    // most doubling the window), shrinks to a new smallest window (at most
+    // refinements times), or shrinks back what recentres doubled (a shrink
+    // divides the window by (grid - 1) / 4 >= 5 at the default grid, so at
+    // most one such shrink per recentre there); the pass count caps it
+    // whatever the grid.
     let passes = config
         .refinements
-        .saturating_add(config.max_recentres)
+        .saturating_add(config.max_recentres.saturating_mul(2))
         .saturating_add(1);
     for _ in 0..passes {
         let ms = linspace(m_lo, m_hi, n);
@@ -593,7 +606,14 @@ pub fn fit_slice(
             return Err(FitFailure::NoFeasibleFace);
         };
         let last = n.saturating_sub(1);
-        let on_edge = i == 0 || i == last || j == 0 || j == last;
+        // On an edge of the window: open when the domain goes on beyond
+        // it (a recentre can look there), closed on the domain's boundary.
+        let (m_low, m_high) = (i == 0, i == last);
+        let (s_low, s_high) = (j == 0, j == last);
+        let m_edge = (m_low && m_lo > dm_lo) || (m_high && m_hi < dm_hi);
+        let s_edge = (s_low && s_lo > ds_lo) || (s_high && s_hi < ds_hi);
+        let on_edge = m_edge || s_edge;
+        let on_any_edge = m_low || m_high || s_low || s_high;
         let (m_best, ls_best) = (
             ms.get(i).copied().unwrap_or(f64::NAN),
             ss.get(j).copied().unwrap_or(f64::NAN),
@@ -603,33 +623,53 @@ pub fn fit_slice(
             .is_none_or(|(b, _, _)| res.objective <= b.objective);
         if improves {
             best = Some((res, m_best, ls_best));
-            best_on_edge = on_edge;
+            best_on_edge = on_any_edge;
         }
         let dm = ms.get(1).copied().unwrap_or(m_hi) - m_lo;
         let ds = ss.get(1).copied().unwrap_or(s_hi) - s_lo;
         if on_edge && improves && recentres < config.max_recentres {
-            // Move the window to the edge point without shrinking it.
+            // Centre the window on the edge point, and double it (up to the
+            // first window) along each axis whose edge the point is on:
+            // along a narrow valley of (m, sigma) the minimum can lie many
+            // shrunk windows away, and a window that only moved by half its
+            // width would crawl there one step per recentre. Doubling
+            // covers that distance in a few; the other axis keeps its
+            // resolution, and the shrinks that follow recover the rest.
             recentres = recentres.saturating_add(1);
-            let (hm, hs) = (0.5 * (m_hi - m_lo), 0.5 * (s_hi - s_lo));
-            (m_lo, m_hi) = (m_best - hm, m_best + hm);
-            (s_lo, s_hi) = (ls_best - hs, ls_best + hs);
+            let grow = |edge: bool, lo: f64, hi: f64, max: f64| {
+                if edge {
+                    (hi - lo).min(max)
+                } else {
+                    0.5 * (hi - lo)
+                }
+            };
+            let (hm, hs) = (
+                grow(m_edge, m_lo, m_hi, hm_max),
+                grow(s_edge, s_lo, s_hi, hs_max),
+            );
+            (m_lo, m_hi) = ((m_best - hm).max(dm_lo), (m_best + hm).min(dm_hi));
+            (s_lo, s_hi) = ((ls_best - hs).max(ds_lo), (ls_best + hs).min(ds_hi));
             continue;
         }
         if shrinks >= config.refinements {
             break;
         }
-        shrinks = shrinks.saturating_add(1);
         let (Some((_, mb, lb)), true) = (best.as_ref(), dm > 0.0 && ds > 0.0) else {
             break;
         };
-        (m_lo, m_hi) = (mb - 2.0 * dm, mb + 2.0 * dm);
-        (s_lo, s_hi) = (lb - 2.0 * ds, lb + 2.0 * ds);
+        (m_lo, m_hi) = ((mb - 2.0 * dm).max(dm_lo), (mb + 2.0 * dm).min(dm_hi));
+        (s_lo, s_hi) = ((lb - 2.0 * ds).max(ds_lo), (lb + 2.0 * ds).min(ds_hi));
+        if m_hi - m_lo < smallest {
+            smallest = m_hi - m_lo;
+            shrinks = shrinks.saturating_add(1);
+        }
     }
     let Some((res, m, ls)) = best else {
         return Err(FitFailure::NoFeasibleFace);
     };
-    // The best point on the edge of its window, with no recentre left to
-    // move the window there: the minimum may lie outside the search.
+    // The best point on the edge of its window: on the domain's boundary,
+    // or with no recentre left to look beyond it. The minimum may lie
+    // outside the search.
     if best_on_edge {
         return Err(FitFailure::GridEdge);
     }
@@ -782,6 +822,100 @@ mod tests {
         );
     }
 
+    /// 15 exact points of `truth` evenly over `[-r, r]`.
+    fn exact_points(truth: &SviSlice, r: f64) -> Vec<SliceObservation> {
+        (0..15)
+            .map(|i| {
+                let k = -r + 2.0 * r * f64::from(i) / 14.0;
+                SliceObservation::new(k, truth.eval(k).unwrap().0, 1.0).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_fit_slice_small_sigma_valleys_converge() {
+        // sigma / r of 0.03 and 0.018: a long, curved (m, sigma) valley
+        // that a window moving half its width per recentre crawled along
+        // until the recentres ran out (GridEdge).
+        for (tau, a, b, rho, m, sigma, r) in [
+            (0.2455, 0.13811, 0.12710, -0.48052, 0.0560, 0.0207, 0.6753),
+            (1.5588, 1.30139, 0.62300, -0.999, -0.0955, 0.0369, 2.0715),
+        ] {
+            let range = KRange::new(-r - 1.0, r + 1.0).unwrap();
+            let truth = SviSlice::new(tau, a, b, rho, m, sigma, range).unwrap();
+            let fit = fit_slice(tau, &exact_points(&truth, r), &FitConfig::default()).unwrap();
+            assert!(fit.rmse_vol < 1e-8, "tau {tau}: {}", fit.rmse_vol);
+            assert!(
+                (fit.slice.m() - m).abs() < 1e-6,
+                "tau {tau}: m {}",
+                fit.slice.m()
+            );
+            assert!(
+                (fit.slice.sigma() / sigma - 1.0).abs() < 1e-5,
+                "tau {tau}: sigma {}",
+                fit.slice.sigma()
+            );
+        }
+    }
+
+    /// A fixed linear congruential sequence in [0, 1).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    }
+
+    /// Fits `cases` random slices and returns the worst rmse_vol: tau in
+    /// [0.02, 2], rho in [-0.999, 0.999], sigma / r log uniform in
+    /// [0.01, 1], m within 0.3 r, b up to 95% of the Lee bound, a positive
+    /// (inside the fit's a >= a_min; a < 0 has its own test); 15 exact
+    /// points over [-r, r].
+    fn recovery_sweep(cases: usize, seed: u64) -> f64 {
+        let mut rng = Lcg(seed);
+        let mut worst = 0.0_f64;
+        for case in 0..cases {
+            let tau = 0.02 + 1.98 * rng.next();
+            let r = 0.3 + 2.2 * rng.next();
+            let rho = 1.998 * rng.next() - 0.999;
+            let sigma = r * f64::exp(f64::ln(0.01) * rng.next());
+            let m = 0.3 * r * (2.0 * rng.next() - 1.0);
+            let b = (0.05 + 0.9 * rng.next()) * LEE_SLOPE_BOUND / (1.0 + rho.abs());
+            let a = tau * (0.005 + 0.2 * rng.next());
+            let range = KRange::new(-r - 1.0, r + 1.0).unwrap();
+            let truth = SviSlice::new(tau, a, b, rho, m, sigma, range).unwrap();
+            let fit = fit_slice(tau, &exact_points(&truth, r), &FitConfig::default())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "case {case}: tau {tau} a {a} b {b} rho {rho} m {m} sigma {sigma} r {r}: {e}"
+                    )
+                });
+            worst = worst.max(fit.rmse_vol);
+        }
+        worst
+    }
+
+    #[test]
+    fn test_fit_slice_recovers_random_slices_down_to_small_sigma() {
+        let worst = recovery_sweep(25, 11);
+        assert!(worst < 1e-7, "{worst}");
+    }
+
+    /// The full sweep; slow unoptimised, so run it with
+    /// `cargo test --release --features options -- --ignored recovery_sweep_300`.
+    #[test]
+    #[ignore = "300 fits: run in release"]
+    fn test_fit_slice_recovery_sweep_300() {
+        // Observed: all 300 recovered, worst rmse_vol 2.2e-9.
+        let worst = recovery_sweep(300, 11);
+        assert!(worst < 1e-7, "{worst}");
+    }
+
     #[test]
     fn test_fit_slice_recovers_a_known_slice() {
         let range = KRange::new(-1.0, 1.0).unwrap();
@@ -819,10 +953,12 @@ mod tests {
 
     #[test]
     fn test_fit_slice_lee_bound_is_reported_active() {
-        // Wings of slope 3 ask for more than Lee's bound allows (slope 2).
+        // Wings of slope 2.2 ask for more than Lee's bound allows (slope 2),
+        // around a smooth vertex (sigma 0.5). Steeper wings pull the
+        // constrained optimum to sigma -> 0, below the search: GridEdge.
         let obs: Vec<SliceObservation> = ks(-1.0, 1.0, 21)
             .iter()
-            .map(|&k| SliceObservation::new(k, 0.01 + 3.0 * k.abs(), 1.0).unwrap())
+            .map(|&k| SliceObservation::new(k, 0.01 + 2.2 * k.hypot(0.5), 1.0).unwrap())
             .collect();
         let config = FitConfig {
             max_rmse_vol: 10.0,
@@ -838,6 +974,16 @@ mod tests {
         );
         assert!(fit.lee_margin.abs() < 1e-12, "{}", fit.lee_margin);
         assert!(fit.objective_params <= fit.objective * (1.0 + 1e-9) + 1e-12);
+        // A sharp V of slope 3 wants sigma -> 0, below the search: a
+        // GridEdge failure, never a sigma outside the declared range.
+        let v: Vec<SliceObservation> = ks(-1.0, 1.0, 21)
+            .iter()
+            .map(|&k| SliceObservation::new(k, 0.01 + 3.0 * k.abs(), 1.0).unwrap())
+            .collect();
+        assert_eq!(
+            fit_slice(1.0, &v, &config).map(|f| f.slice.sigma()),
+            Err(FitFailure::GridEdge)
+        );
     }
 
     #[test]
