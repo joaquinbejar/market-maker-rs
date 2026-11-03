@@ -4,6 +4,7 @@
 //! market microstructure signals like order book depth imbalance and trade flow.
 
 use crate::Decimal;
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -54,11 +55,16 @@ impl OrderBookImbalance {
     /// * `bid_depth` - Total bid depth in units
     /// * `ask_depth` - Total ask depth in units
     /// * `levels` - Number of price levels analyzed
+    ///
+    /// A derived signal: depths beyond the `Decimal` bounds saturate.
     #[must_use]
     pub fn new(bid_depth: Decimal, ask_depth: Decimal, levels: u32) -> Self {
-        let total = bid_depth + ask_depth;
+        let total = bid_depth.saturating_add(ask_depth);
         let imbalance = if total > Decimal::ZERO {
-            (bid_depth - ask_depth) / total
+            bid_depth
+                .saturating_sub(ask_depth)
+                .checked_div(total)
+                .unwrap_or(Decimal::ZERO)
         } else {
             Decimal::ZERO
         };
@@ -71,10 +77,11 @@ impl OrderBookImbalance {
         }
     }
 
-    /// Returns the total depth (bid + ask).
+    /// Returns the total depth (bid + ask), saturating at the `Decimal`
+    /// bounds.
     #[must_use]
     pub fn total_depth(&self) -> Decimal {
-        self.bid_depth + self.ask_depth
+        self.bid_depth.saturating_add(self.ask_depth)
     }
 
     /// Returns true if the book is bid-heavy (positive imbalance).
@@ -135,12 +142,14 @@ impl TradeFlowImbalance {
     ///
     /// * `buy_volume` - Total buy volume in window
     /// * `sell_volume` - Total sell volume in window
+    ///
+    /// A derived signal: volumes beyond the `Decimal` bounds saturate.
     #[must_use]
     pub fn new(buy_volume: Decimal, sell_volume: Decimal) -> Self {
-        let net_flow = buy_volume - sell_volume;
-        let total = buy_volume + sell_volume;
+        let net_flow = buy_volume.saturating_sub(sell_volume);
+        let total = buy_volume.saturating_add(sell_volume);
         let imbalance = if total > Decimal::ZERO {
-            net_flow / total
+            net_flow.checked_div(total).unwrap_or(Decimal::ZERO)
         } else {
             Decimal::ZERO
         };
@@ -153,10 +162,11 @@ impl TradeFlowImbalance {
         }
     }
 
-    /// Returns the total volume (buy + sell).
+    /// Returns the total volume (buy + sell), saturating at the `Decimal`
+    /// bounds.
     #[must_use]
     pub fn total_volume(&self) -> Decimal {
-        self.buy_volume + self.sell_volume
+        self.buy_volume.saturating_add(self.sell_volume)
     }
 
     /// Returns true if flow is buy-dominated.
@@ -199,9 +209,11 @@ impl Trade {
     }
 
     /// Returns the notional value of the trade.
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.size
+        self.price.saturating_mul(self.size)
     }
 }
 
@@ -314,12 +326,15 @@ pub struct AdaptiveSpread {
 
 impl AdaptiveSpread {
     /// Creates a new `AdaptiveSpread`.
+    ///
+    /// `total_spread` is a derived value: it saturates at the `Decimal`
+    /// bounds.
     #[must_use]
     pub fn new(bid_spread: Decimal, ask_spread: Decimal) -> Self {
         Self {
             bid_spread,
             ask_spread,
-            total_spread: bid_spread + ask_spread,
+            total_spread: bid_spread.saturating_add(ask_spread),
         }
     }
 
@@ -330,21 +345,34 @@ impl AdaptiveSpread {
     }
 
     /// Returns the bid price given a mid price.
-    #[must_use]
-    pub fn bid_price(&self, mid_price: Decimal) -> Decimal {
-        mid_price * (Decimal::ONE - self.bid_spread)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the price overflows.
+    pub fn bid_price(&self, mid_price: Decimal) -> MMResult<Decimal> {
+        Decimal::ONE
+            .checked_sub(self.bid_spread)
+            .and_then(|f| mid_price.checked_mul(f))
+            .or_overflow("adaptive bid price")
     }
 
     /// Returns the ask price given a mid price.
-    #[must_use]
-    pub fn ask_price(&self, mid_price: Decimal) -> Decimal {
-        mid_price * (Decimal::ONE + self.ask_spread)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the price overflows.
+    pub fn ask_price(&self, mid_price: Decimal) -> MMResult<Decimal> {
+        Decimal::ONE
+            .checked_add(self.ask_spread)
+            .and_then(|f| mid_price.checked_mul(f))
+            .or_overflow("adaptive ask price")
     }
 
-    /// Returns the skew (positive = wider ask, negative = wider bid).
+    /// Returns the skew (positive = wider ask, negative = wider bid),
+    /// saturating at the `Decimal` bounds.
     #[must_use]
     pub fn skew(&self) -> Decimal {
-        self.ask_spread - self.bid_spread
+        self.ask_spread.saturating_sub(self.bid_spread)
     }
 
     /// Returns true if the spread is symmetric.
@@ -379,12 +407,12 @@ impl AdaptiveSpread {
 ///
 /// // Balanced book → symmetric spread
 /// let balanced = OrderBookImbalance::new(dec!(100.0), dec!(100.0), 5);
-/// let spread = calculator.calculate_spread(&balanced, None);
+/// let spread = calculator.calculate_spread(&balanced, None).unwrap();
 /// assert!(spread.is_symmetric());
 ///
 /// // Bid-heavy book → wider ask spread
 /// let bid_heavy = OrderBookImbalance::new(dec!(150.0), dec!(50.0), 5);
-/// let spread = calculator.calculate_spread(&bid_heavy, None);
+/// let spread = calculator.calculate_spread(&bid_heavy, None).unwrap();
 /// assert!(spread.ask_spread > spread.bid_spread);
 /// ```
 #[derive(Debug, Clone)]
@@ -447,17 +475,15 @@ impl AdaptiveSpreadCalculator {
             usize::try_from(levels).unwrap_or(usize::MAX)
         };
 
-        let bid_depth: Decimal = bid_depths
-            .iter()
-            .take(levels_usize)
-            .map(|(_, size)| *size)
-            .sum();
-
-        let ask_depth: Decimal = ask_depths
-            .iter()
-            .take(levels_usize)
-            .map(|(_, size)| *size)
-            .sum();
+        // Derived depths: they saturate at the `Decimal` bounds.
+        let depth = |levels: &[(Decimal, Decimal)]| {
+            levels
+                .iter()
+                .take(levels_usize)
+                .fold(Decimal::ZERO, |acc, (_, size)| acc.saturating_add(*size))
+        };
+        let bid_depth = depth(bid_depths);
+        let ask_depth = depth(ask_depths);
 
         let actual_levels = u32::try_from(bid_depths.len().min(ask_depths.len()).min(levels_usize))
             .unwrap_or(u32::MAX);
@@ -476,44 +502,48 @@ impl AdaptiveSpreadCalculator {
     /// * `ask_depths` - Ask levels as (price, size) pairs
     /// * `mid_price` - Current mid price for weighting
     /// * `levels` - Number of levels to consider
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if `mid_price` is zero or a
+    /// weighted depth overflows.
     pub fn calculate_weighted_orderbook_imbalance(
         bid_depths: &[(Decimal, Decimal)],
         ask_depths: &[(Decimal, Decimal)],
         mid_price: Decimal,
         levels: u32,
-    ) -> OrderBookImbalance {
+    ) -> MMResult<OrderBookImbalance> {
         let levels_usize = if levels == 0 {
             usize::MAX
         } else {
             usize::try_from(levels).unwrap_or(usize::MAX)
         };
 
-        // Weight by inverse distance from mid
-        let bid_depth: Decimal = bid_depths
-            .iter()
-            .take(levels_usize)
-            .map(|(price, size)| {
-                let distance = (mid_price - *price).abs() / mid_price;
-                let weight = Decimal::ONE / (Decimal::ONE + distance * Decimal::TEN);
-                *size * weight
-            })
-            .sum();
-
-        let ask_depth: Decimal = ask_depths
-            .iter()
-            .take(levels_usize)
-            .map(|(price, size)| {
-                let distance = (*price - mid_price).abs() / mid_price;
-                let weight = Decimal::ONE / (Decimal::ONE + distance * Decimal::TEN);
-                *size * weight
-            })
-            .sum();
+        // Weight by inverse distance from mid: size / (1 + 10 * |p - mid| / mid)
+        let weighted = |levels: &[(Decimal, Decimal)]| {
+            levels
+                .iter()
+                .take(levels_usize)
+                .try_fold(Decimal::ZERO, |acc, (price, size)| {
+                    let distance = mid_price
+                        .checked_sub(*price)?
+                        .abs()
+                        .checked_div(mid_price)?;
+                    let weight = distance
+                        .checked_mul(Decimal::TEN)
+                        .and_then(|x| Decimal::ONE.checked_add(x))
+                        .and_then(|x| Decimal::ONE.checked_div(x))?;
+                    acc.checked_add(size.checked_mul(weight)?)
+                })
+                .or_overflow("weighted depth")
+        };
+        let bid_depth = weighted(bid_depths)?;
+        let ask_depth = weighted(ask_depths)?;
 
         let actual_levels = u32::try_from(bid_depths.len().min(ask_depths.len()).min(levels_usize))
             .unwrap_or(u32::MAX);
 
-        OrderBookImbalance::new(bid_depth, ask_depth, actual_levels)
+        Ok(OrderBookImbalance::new(bid_depth, ask_depth, actual_levels))
     }
 
     /// Calculates trade flow imbalance from recent trades.
@@ -540,6 +570,8 @@ impl AdaptiveSpreadCalculator {
     /// // buy_volume = 18, sell_volume = 5
     /// assert!(flow.is_buy_dominated());
     /// ```
+    ///
+    /// The volumes are derived values: they saturate at the `Decimal` bounds.
     #[must_use]
     pub fn calculate_tradeflow_imbalance(
         trades: &[Trade],
@@ -553,10 +585,10 @@ impl AdaptiveSpreadCalculator {
             |(buy, sell), trade| {
                 if trade.is_buyer_maker {
                     // Seller was aggressor (market sell)
-                    (buy, sell + trade.size)
+                    (buy, sell.saturating_add(trade.size))
                 } else {
                     // Buyer was aggressor (market buy)
-                    (buy + trade.size, sell)
+                    (buy.saturating_add(trade.size), sell)
                 }
             },
         );
@@ -579,50 +611,78 @@ impl AdaptiveSpreadCalculator {
     ///
     /// - Positive imbalance (bid-heavy): Widen ask spread, tighten bid
     /// - Negative imbalance (ask-heavy): Widen bid spread, tighten ask
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the spread overflows.
     pub fn calculate_spread(
         &self,
         orderbook_imbalance: &OrderBookImbalance,
         tradeflow_imbalance: Option<&TradeFlowImbalance>,
-    ) -> AdaptiveSpread {
-        let half_spread = self.config.base_spread / Decimal::TWO;
+    ) -> MMResult<AdaptiveSpread> {
+        let half_spread = self
+            .config
+            .base_spread
+            .checked_div(Decimal::TWO)
+            .or_overflow("adaptive half spread")?;
 
         // Calculate combined imbalance signal
-        let mut combined_imbalance =
-            orderbook_imbalance.imbalance * self.config.orderbook_sensitivity;
+        let mut combined_imbalance = orderbook_imbalance
+            .imbalance
+            .checked_mul(self.config.orderbook_sensitivity)
+            .or_overflow("combined imbalance")?;
 
         if let Some(flow) = tradeflow_imbalance {
-            combined_imbalance += flow.imbalance * self.config.tradeflow_sensitivity;
+            combined_imbalance = flow
+                .imbalance
+                .checked_mul(self.config.tradeflow_sensitivity)
+                .and_then(|x| combined_imbalance.checked_add(x))
+                .or_overflow("combined imbalance")?;
         }
 
         // Clamp combined imbalance to [-1, 1]
-        let combined_imbalance = combined_imbalance.max(-Decimal::ONE).min(Decimal::ONE);
+        let combined_imbalance = combined_imbalance
+            .max(Decimal::NEGATIVE_ONE)
+            .min(Decimal::ONE);
 
         // Calculate adjustment factor (0 to max_adjustment - 1)
-        let adjustment_range = self.config.max_adjustment - Decimal::ONE;
-        let adjustment = combined_imbalance.abs() * adjustment_range;
+        let adjustment = self
+            .config
+            .max_adjustment
+            .checked_sub(Decimal::ONE)
+            .and_then(|range| combined_imbalance.abs().checked_mul(range))
+            .or_overflow("spread adjustment")?;
+        let half = Decimal::new(5, 1); // 0.5
+        let widen = Decimal::ONE
+            .checked_add(adjustment)
+            .or_overflow("spread adjustment")?;
+        let tighten = adjustment
+            .checked_mul(half)
+            .and_then(|x| Decimal::ONE.checked_sub(x))
+            .or_overflow("spread adjustment")?
+            .max(half); // Min 0.5x on tighten side
 
         // Apply asymmetric adjustment
         // Positive imbalance → widen ask, tighten bid
         // Negative imbalance → widen bid, tighten ask
         let (bid_adjustment, ask_adjustment) = if combined_imbalance > Decimal::ZERO {
             // Bid-heavy: expect price rise, widen ask
-            let tighten = Decimal::ONE - adjustment * Decimal::new(5, 1); // 0.5
-            let widen = Decimal::ONE + adjustment;
-            (tighten.max(Decimal::new(5, 1)), widen) // Min 0.5x on tighten side
+            (tighten, widen)
         } else if combined_imbalance < Decimal::ZERO {
             // Ask-heavy: expect price fall, widen bid
-            let widen = Decimal::ONE + adjustment;
-            let tighten = Decimal::ONE - adjustment * Decimal::new(5, 1);
-            (widen, tighten.max(Decimal::new(5, 1)))
+            (widen, tighten)
         } else {
             (Decimal::ONE, Decimal::ONE)
         };
 
-        let bid_spread = half_spread * bid_adjustment;
-        let ask_spread = half_spread * ask_adjustment;
+        let bid_spread = half_spread
+            .checked_mul(bid_adjustment)
+            .or_overflow("adaptive bid spread")?;
+        let ask_spread = half_spread
+            .checked_mul(ask_adjustment)
+            .or_overflow("adaptive ask spread")?;
 
-        AdaptiveSpread::new(bid_spread, ask_spread)
+        Ok(AdaptiveSpread::new(bid_spread, ask_spread))
     }
 
     /// Calculates spread with volatility adjustment.
@@ -635,17 +695,23 @@ impl AdaptiveSpreadCalculator {
     /// * `tradeflow_imbalance` - Optional trade flow imbalance
     /// * `current_volatility` - Current volatility estimate
     /// * `baseline_volatility` - Normal/baseline volatility
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the spread overflows.
     pub fn calculate_spread_with_volatility(
         &self,
         orderbook_imbalance: &OrderBookImbalance,
         tradeflow_imbalance: Option<&TradeFlowImbalance>,
         current_volatility: Decimal,
         baseline_volatility: Decimal,
-    ) -> AdaptiveSpread {
-        // Adjust base spread by volatility ratio
+    ) -> MMResult<AdaptiveSpread> {
+        // Adjust base spread by volatility ratio; a ratio too large to
+        // represent is clamped to the 2x cap below like any large ratio.
         let vol_ratio = if baseline_volatility > Decimal::ZERO {
-            current_volatility / baseline_volatility
+            current_volatility
+                .checked_div(baseline_volatility)
+                .unwrap_or(Decimal::TWO)
         } else {
             Decimal::ONE
         };
@@ -655,7 +721,11 @@ impl AdaptiveSpreadCalculator {
 
         // Create temporary config with adjusted base spread
         let adjusted_config = AdaptiveSpreadConfig {
-            base_spread: self.config.base_spread * vol_adjustment,
+            base_spread: self
+                .config
+                .base_spread
+                .checked_mul(vol_adjustment)
+                .or_overflow("volatility adjusted spread")?,
             ..self.config.clone()
         };
 
@@ -668,6 +738,47 @@ impl AdaptiveSpreadCalculator {
 mod tests {
     use super::*;
     use crate::dec;
+
+    #[test]
+    fn test_weighted_imbalance_zero_mid_returns_numerical_error() {
+        let bids = [(dec!(99), dec!(1))];
+        let asks = [(dec!(101), dec!(1))];
+        let result = AdaptiveSpreadCalculator::calculate_weighted_orderbook_imbalance(
+            &bids,
+            &asks,
+            Decimal::ZERO,
+            1,
+        );
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_spread_overflow_returns_numerical_error() {
+        let config = AdaptiveSpreadConfig::new(Decimal::MAX, dec!(4), dec!(1), dec!(1)).unwrap();
+        let calculator = AdaptiveSpreadCalculator::new(config);
+        let book = OrderBookImbalance::new(dec!(10), dec!(0), 1);
+        let result = calculator.calculate_spread(&book, None);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_prices_overflow_returns_numerical_error() {
+        let spread = AdaptiveSpread::new(dec!(-1), dec!(1));
+        assert!(matches!(
+            spread.bid_price(Decimal::MAX),
+            Err(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            spread.ask_price(Decimal::MAX),
+            Err(MMError::NumericalError(_))
+        ));
+    }
 
     #[test]
     fn test_orderbook_imbalance_balanced() {
@@ -785,8 +896,8 @@ mod tests {
         let spread = AdaptiveSpread::new(dec!(0.001), dec!(0.001));
         let mid = dec!(100.0);
 
-        assert_eq!(spread.bid_price(mid), dec!(99.9));
-        assert_eq!(spread.ask_price(mid), dec!(100.1));
+        assert_eq!(spread.bid_price(mid).unwrap(), dec!(99.9));
+        assert_eq!(spread.ask_price(mid).unwrap(), dec!(100.1));
     }
 
     #[test]
@@ -858,7 +969,7 @@ mod tests {
         let calculator = AdaptiveSpreadCalculator::new(config);
 
         let imbalance = OrderBookImbalance::new(dec!(100.0), dec!(100.0), 5);
-        let spread = calculator.calculate_spread(&imbalance, None);
+        let spread = calculator.calculate_spread(&imbalance, None).unwrap();
 
         assert!(spread.is_symmetric());
         assert_eq!(spread.bid_spread, dec!(0.001));
@@ -873,7 +984,7 @@ mod tests {
 
         // Strong bid imbalance
         let imbalance = OrderBookImbalance::new(dec!(200.0), dec!(0.0), 5);
-        let spread = calculator.calculate_spread(&imbalance, None);
+        let spread = calculator.calculate_spread(&imbalance, None).unwrap();
 
         // Should widen ask, tighten bid
         assert!(spread.ask_spread > spread.bid_spread);
@@ -887,7 +998,7 @@ mod tests {
 
         // Strong ask imbalance
         let imbalance = OrderBookImbalance::new(dec!(0.0), dec!(200.0), 5);
-        let spread = calculator.calculate_spread(&imbalance, None);
+        let spread = calculator.calculate_spread(&imbalance, None).unwrap();
 
         // Should widen bid, tighten ask
         assert!(spread.bid_spread > spread.ask_spread);
@@ -902,7 +1013,9 @@ mod tests {
         let orderbook = OrderBookImbalance::new(dec!(100.0), dec!(100.0), 5);
         let tradeflow = TradeFlowImbalance::new(dec!(100.0), dec!(0.0)); // All buys
 
-        let spread = calculator.calculate_spread(&orderbook, Some(&tradeflow));
+        let spread = calculator
+            .calculate_spread(&orderbook, Some(&tradeflow))
+            .unwrap();
 
         // Buy-dominated flow should widen ask
         assert!(spread.ask_spread > spread.bid_spread);
@@ -917,14 +1030,16 @@ mod tests {
         let imbalance = OrderBookImbalance::new(dec!(100.0), dec!(100.0), 5);
 
         // High volatility should increase spread
-        let spread_high_vol = calculator.calculate_spread_with_volatility(
-            &imbalance,
-            None,
-            dec!(0.02), // 2% current vol
-            dec!(0.01), // 1% baseline
-        );
+        let spread_high_vol = calculator
+            .calculate_spread_with_volatility(
+                &imbalance,
+                None,
+                dec!(0.02), // 2% current vol
+                dec!(0.01), // 1% baseline
+            )
+            .unwrap();
 
-        let spread_normal = calculator.calculate_spread(&imbalance, None);
+        let spread_normal = calculator.calculate_spread(&imbalance, None).unwrap();
 
         assert!(spread_high_vol.total_spread > spread_normal.total_spread);
     }
