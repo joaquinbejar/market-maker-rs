@@ -381,7 +381,7 @@ impl FillModel for ImmediateFillModel {
 /// let tick = MarketTick::new(1001, dec!(99.9), dec!(10.0), dec!(100.1), dec!(10.0));
 ///
 /// // Update queue from market data
-/// model.update_queue(&tick);
+/// model.update_queue(&tick).unwrap();
 ///
 /// // Simulate fill after some time in queue
 /// let result = model.simulate_fill(&order, &tick, 100);
@@ -429,22 +429,21 @@ impl QueuePositionFillModel {
     /// Updates queue depth estimates from market data.
     ///
     /// Uses the bid/ask sizes as estimates of queue depth at those levels.
-    /// A negative size is not a queue depth: that level is left out, so it
-    /// reads as an empty queue, and the queue ahead of an order is never
-    /// negative.
-    pub fn update_queue(&mut self, tick: &MarketTick) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidMarketState`] if a size is negative; the
+    /// estimates are then unchanged. Invalid data is never read as an empty
+    /// queue, which would fill orders at once.
+    pub fn update_queue(&mut self, tick: &MarketTick) -> MMResult<()> {
+        check_queue_sizes(tick)?;
         // Normalized string keys: 100, 100.0 and 100.00 are the same level.
-        for (price, size) in [
-            (tick.bid_price, tick.bid_size),
-            (tick.ask_price, tick.ask_size),
-        ] {
-            let key = price.normalize().to_string();
-            if size.is_sign_negative() {
-                self.queue_depth.remove(&key);
-            } else {
-                self.queue_depth.insert(key, size);
-            }
-        }
+        let bid_key = tick.bid_price.normalize().to_string();
+        let ask_key = tick.ask_price.normalize().to_string();
+
+        self.queue_depth.insert(bid_key, tick.bid_size);
+        self.queue_depth.insert(ask_key, tick.ask_size);
+        Ok(())
     }
 
     /// Returns the estimated queue depth at a price level.
@@ -536,6 +535,8 @@ impl FillModel for QueuePositionFillModel {
         time_in_queue_ms: u64,
     ) -> MMResult<FillResult> {
         let dir = order.dir()?;
+        // A tick with a negative size has no valid queue estimate.
+        check_queue_sizes(tick)?;
         Ok(self.fill_for(dir, order, tick, time_in_queue_ms))
     }
 
@@ -549,9 +550,14 @@ impl FillModel for QueuePositionFillModel {
 
     /// Keeps only the current top of book levels, so memory stays bounded
     /// on long streams and no stale depth survives a price move.
+    ///
+    /// A tick with a negative size leaves no estimate; `simulate_fill`
+    /// rejects that tick, so it never fills against an empty queue.
     fn on_tick(&mut self, tick: &MarketTick) {
         self.queue_depth.clear();
-        self.update_queue(tick);
+        if self.update_queue(tick).is_err() {
+            self.queue_depth.clear();
+        }
     }
 
     fn validate(&self) -> MMResult<()> {
@@ -712,10 +718,16 @@ impl ProbabilisticFillModel {
 
         // Time component: 1 - exp(-time_factor * time_ms)
         // Approximated as min(1, time_factor * time_ms) for simplicity
+        // Clamped to 1 anyway, so a product too large to represent is 1;
+        // a negative factor (rejected by `validate`) stays below zero.
         let time_component = self
             .time_factor
             .checked_mul(Decimal::from(time_in_queue_ms))
-            .or_overflow("time component")?
+            .unwrap_or(if self.time_factor.is_sign_negative() {
+                Decimal::MIN
+            } else {
+                Decimal::ONE
+            })
             .min(Decimal::ONE);
 
         // Final probability
@@ -1053,6 +1065,17 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
     Some(x)
 }
 
+/// Rejects a tick whose bid or ask size is negative.
+fn check_queue_sizes(tick: &MarketTick) -> MMResult<()> {
+    if tick.bid_size.is_sign_negative() || tick.ask_size.is_sign_negative() {
+        return Err(MMError::InvalidMarketState(format!(
+            "negative queue size at {}: bid {} ask {}",
+            tick.timestamp, tick.bid_size, tick.ask_size
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,40 +1221,34 @@ mod tests {
         let mut model = QueuePositionFillModel::new(dec!(0.1));
         let tick = MarketTick::new(1000, dec!(100.0), dec!(50.0), dec!(100.1), dec!(30.0));
 
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
 
         assert_eq!(model.get_queue_depth(dec!(100.0)), dec!(50.0));
         assert_eq!(model.get_queue_depth(dec!(100.1)), dec!(30.0));
     }
 
     #[test]
-    fn test_queue_position_negative_size_is_an_empty_queue() {
+    fn test_queue_position_negative_size_is_rejected() {
         let mut model = QueuePositionFillModel::new(dec!(0.1));
-        model.update_queue(&MarketTick::new(
-            1000,
-            dec!(100.0),
-            dec!(50.0),
-            dec!(100.1),
-            dec!(30.0),
-        ));
-        model.update_queue(&MarketTick::new(
-            1001,
-            dec!(100.0),
-            dec!(-50.0),
-            dec!(100.1),
-            dec!(30.0),
-        ));
-        assert_eq!(model.get_queue_depth(dec!(100.0)), Decimal::ZERO);
-        // At touch with nothing ahead: 1 ms clears 0.1 of the order.
+        let valid = MarketTick::new(1000, dec!(100.0), dec!(50.0), dec!(100.1), dec!(30.0));
+        model.update_queue(&valid).unwrap();
+        let invalid = MarketTick::new(1001, dec!(100.0), dec!(-50.0), dec!(100.1), dec!(30.0));
+        let result = model.update_queue(&invalid);
+        assert!(
+            matches!(result, Err(MMError::InvalidMarketState(_))),
+            "{result:?}"
+        );
+        // The estimates are unchanged.
+        assert_eq!(model.get_queue_depth(dec!(100.0)), dec!(50.0));
+
+        // Through the engine hook the invalid tick never fills: it is
+        // rejected, not read as an empty queue.
+        model.on_tick(&invalid);
         let order = SimulatedOrder::new(Action::Buy, dec!(100.1), dec!(1.0), 1000);
-        let tick = MarketTick::new(1002, dec!(100.0), dec!(-5.0), dec!(100.1), dec!(-5.0));
-        model.update_queue(&tick);
-        assert_eq!(
-            model.simulate_fill(&order, &tick, 1).unwrap(),
-            FillResult::PartialFill {
-                filled_quantity: dec!(0.1),
-                fill_price: dec!(100.1),
-            }
+        let result = model.simulate_fill(&order, &invalid, 1_000_000);
+        assert!(
+            matches!(result, Err(MMError::InvalidMarketState(_))),
+            "{result:?}"
         );
     }
 
@@ -1251,7 +1268,7 @@ mod tests {
     fn test_queue_position_max_queue_and_max_cleared_returns_no_fill() {
         let mut model = QueuePositionFillModel::new(Decimal::MAX);
         let tick = MarketTick::new(1000, dec!(1), dec!(1), dec!(2), Decimal::MAX);
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
         let order = SimulatedOrder::new(Action::Buy, dec!(2), dec!(1), 1000);
         // cleared == queue_ahead == MAX: only the queue ahead cleared.
         let result = model.simulate_fill(&order, &tick, 1).unwrap();
@@ -1262,7 +1279,7 @@ mod tests {
     fn test_queue_position_overflowing_cleared_volume_returns_no_fill() {
         let mut model = QueuePositionFillModel::new(Decimal::MAX);
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10), dec!(100), dec!(5));
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
         let order = SimulatedOrder::new(Action::Buy, dec!(100), dec!(1), 1000);
         let result = model.simulate_fill(&order, &tick, 2).unwrap();
         assert!(!result.is_filled());
@@ -1275,7 +1292,7 @@ mod tests {
 
         // Set up queue with 5 units ahead
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(5.0));
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
 
         // After 60ms: cleared 6 units, queue was 5, order is 1 -> full fill
         let result = model.simulate_fill(&order, &tick, 60).unwrap();
@@ -1289,7 +1306,7 @@ mod tests {
 
         // Set up queue with 5 units ahead
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(5.0));
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
 
         // After 60ms: cleared 6 units, queue was 5, partial fill of 1 unit
         let result = model.simulate_fill(&order, &tick, 60).unwrap();
@@ -1316,7 +1333,7 @@ mod tests {
     fn test_queue_position_reset() {
         let mut model = QueuePositionFillModel::new(dec!(0.1));
         let tick = create_test_tick(dec!(100.0), dec!(100.1));
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
 
         assert!(model.get_queue_depth(dec!(100.0)) > Decimal::ZERO);
 
@@ -1326,6 +1343,15 @@ mod tests {
     }
 
     // ProbabilisticFillModel tests
+    #[test]
+    fn test_probabilistic_huge_time_factor_saturates_the_time_component() {
+        let model = ProbabilisticFillModel::new(dec!(0.5), Decimal::ZERO, Decimal::MAX, 42);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
+        let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(10.0));
+        let prob = model.calculate_probability(&order, &tick, 1_000).unwrap();
+        assert_eq!(prob, dec!(0.5));
+    }
+
     #[test]
     fn test_probabilistic_overflowing_probability_returns_numerical_error() {
         let model = ProbabilisticFillModel::new(dec!(0.5), Decimal::MAX, dec!(0.01), 42);
