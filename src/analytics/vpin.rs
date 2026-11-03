@@ -565,8 +565,8 @@ fn decimal_sqrt_approx(x: Decimal) -> Decimal {
     let epsilon = dec!(0.0000001);
 
     for _ in 0..20 {
-        // `guess > 0` throughout: it starts at x / 2 and Newton steps on a
-        // positive x stay positive.
+        // Checked: a guess that rounds to zero ends the iteration instead
+        // of dividing by zero.
         let Some(new_guess) = x
             .checked_div(guess)
             .and_then(|q| guess.checked_add(q))

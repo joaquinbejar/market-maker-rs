@@ -918,21 +918,32 @@ fn arrival_rate(estimate: &IntensityEstimate, spread: Decimal) -> Option<Decimal
 }
 
 /// Approximate square root using Newton's method.
-// For `x > 0` the first guess is `x / 2` and each Newton step
-// `(g + x / g) / 2` stays in (0, max(x, 2)], so nothing overflows or
-// divides by zero.
-#[allow(clippy::arithmetic_side_effects)]
+///
+/// Every step is checked: a guess that rounds to zero (`x / 2` for the
+/// smallest positive Decimal) or a step that overflows ends the iteration
+/// with the best guess so far, never a division by zero.
 fn decimal_sqrt_approx(x: Decimal) -> Decimal {
     if x <= Decimal::ZERO {
         return Decimal::ZERO;
     }
 
-    let mut guess = x / Decimal::from(2);
+    // Start from x / 2, or from x itself when halving rounds to zero.
+    let mut guess = x
+        .checked_div(Decimal::TWO)
+        .filter(|g| !g.is_zero())
+        .unwrap_or(x);
     let epsilon = dec!(0.0000001);
 
     for _ in 0..20 {
-        let new_guess = (guess + x / guess) / Decimal::from(2);
-        if (new_guess - guess).abs() < epsilon {
+        let Some(new_guess) = x
+            .checked_div(guess)
+            .and_then(|q| guess.checked_add(q))
+            .and_then(|sum| sum.checked_div(Decimal::TWO))
+            .filter(|g| !g.is_zero())
+        else {
+            return guess;
+        };
+        if new_guess.saturating_sub(guess).abs() < epsilon {
             return new_guess;
         }
         guess = new_guess;
@@ -964,6 +975,16 @@ mod tests {
             calculate_slope_std_error(&x3, &y3, Decimal::MAX, Decimal::MAX),
             Err(MMError::NumericalError(_))
         ));
+    }
+
+    #[test]
+    fn test_sqrt_approx_smallest_positive_does_not_panic() {
+        let tiny = dec!(0.0000000000000000000000000001);
+        let root = decimal_sqrt_approx(tiny);
+        assert!(root > Decimal::ZERO);
+        assert!(decimal_sqrt_approx(Decimal::MAX) > Decimal::ZERO);
+        let four = decimal_sqrt_approx(dec!(16));
+        assert!((four - dec!(4)).abs() < dec!(0.0001), "{four}");
     }
 
     #[test]
