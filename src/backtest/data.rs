@@ -249,14 +249,11 @@ impl OHLCVBar {
 
     /// Returns the typical price (high + low + close) / 3.
     ///
-    /// Report only: a sum beyond the `Decimal` bounds saturates, so it must not feed a quote, a mark or state.
+    /// Overflow safe: the mean stays within the bar's range even when the
+    /// sum is beyond the `Decimal` bounds.
     #[must_use]
     pub fn typical_price(&self) -> Decimal {
-        self.high
-            .saturating_add(self.low)
-            .saturating_add(self.close)
-            .checked_div(Decimal::from(3))
-            .unwrap_or(Decimal::ZERO)
+        crate::types::decimal::mean3(self.high, self.low, self.close)
     }
 
     /// Returns the VWAP approximation using typical price.
@@ -544,6 +541,23 @@ mod tests {
         );
         assert!(!bearish.is_bullish());
         assert!(bearish.is_bearish());
+    }
+
+    #[test]
+    fn test_ohlcv_bar_typical_price_near_the_bounds() {
+        let bar = OHLCVBar::new(
+            0,
+            Decimal::MAX,
+            Decimal::MAX,
+            Decimal::MAX,
+            Decimal::MAX,
+            dec!(1),
+        );
+        assert_eq!(bar.typical_price(), Decimal::MAX);
+        assert_eq!(bar.vwap(), Decimal::MAX);
+        let low = Decimal::MAX - dec!(3);
+        let bar = OHLCVBar::new(0, low, Decimal::MAX, low, low, dec!(1));
+        assert_eq!(bar.typical_price(), Decimal::MAX - dec!(2));
     }
 
     #[test]

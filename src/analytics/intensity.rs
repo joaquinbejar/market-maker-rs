@@ -992,7 +992,8 @@ mod tests {
 
     #[test]
     fn test_fill_probability_with_overflowing_rate_times_time_is_one() {
-        let mut estimator = OrderIntensityEstimator::new(OrderIntensityConfig::new(60_000, 10, dec!(0.1)).unwrap());
+        let mut estimator =
+            OrderIntensityEstimator::new(OrderIntensityConfig::new(60_000, 10, dec!(0.1)).unwrap());
         estimator.current_estimate = Some(IntensityEstimate {
             k: Decimal::ZERO,
             baseline_rate: Decimal::MAX / dec!(2),
@@ -1002,7 +1003,10 @@ mod tests {
             k_std_error: Decimal::ZERO,
             timestamp: 0,
         });
-        assert_eq!(estimator.fill_probability(dec!(1), 10_000), Some(Decimal::ONE));
+        assert_eq!(
+            estimator.fill_probability(dec!(1), 10_000),
+            Some(Decimal::ONE)
+        );
     }
 
     #[test]

@@ -227,6 +227,35 @@ pub(crate) fn midpoint(a: Decimal, b: Decimal) -> Decimal {
     .unwrap_or(a)
 }
 
+/// The mean `(a + b + c) / 3` of three decimals, never saturated.
+///
+/// When the sum overflows, the mean is computed as the smallest value plus
+/// a third of the (non negative) excesses over it, which keeps it within
+/// the inputs' range; a range too wide for that sums thirds instead.
+#[must_use]
+pub(crate) fn mean3(a: Decimal, b: Decimal, c: Decimal) -> Decimal {
+    let three = Decimal::from(3);
+    let direct = || a.checked_add(b)?.checked_add(c)?.checked_div(three);
+    let from_min = || {
+        let low = a.min(b).min(c);
+        let excess = a
+            .checked_sub(low)?
+            .checked_add(b.checked_sub(low)?)?
+            .checked_add(c.checked_sub(low)?)?;
+        low.checked_add(excess.checked_div(three)?)
+    };
+    let thirds = || {
+        a.checked_div(three)?
+            .checked_add(b.checked_div(three)?)?
+            .checked_add(c.checked_div(three)?)
+    };
+    direct()
+        .or_else(from_min)
+        .or_else(thirds)
+        // Unreachable: thirds of representable values sum within bounds.
+        .unwrap_or(a)
+}
+
 /// The imbalance `(a - b) / (a + b)`, invariant under a common scale of
 /// `a` and `b`, and zero when `a + b` is zero.
 ///
