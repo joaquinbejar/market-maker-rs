@@ -674,7 +674,11 @@ pub struct AlertManager {
     alert_history: VecDeque<Alert>,
     max_history: usize,
     dedup_window_ms: u64,
-    recent_alerts: HashMap<String, u64>,
+    /// Last successful delivery per alert type and handler index; `None`
+    /// keys the type when no handler accepts its severity.
+    recent_alerts: HashMap<(String, Option<usize>), u64>,
+    /// When each alert type was last recorded in the history.
+    recorded_alerts: HashMap<String, u64>,
 }
 
 impl AlertManager {
@@ -692,6 +696,7 @@ impl AlertManager {
             max_history,
             dedup_window_ms,
             recent_alerts: HashMap::new(),
+            recorded_alerts: HashMap::new(),
         }
     }
 
@@ -754,40 +759,74 @@ impl AlertManager {
     ) -> MMResult<()> {
         let type_key = alert_type.type_key();
 
-        // Check for deduplication
-        if let Some(&last_time) = self.recent_alerts.get(&type_key)
-            && timestamp.saturating_sub(last_time) < self.dedup_window_ms
-        {
-            // Duplicate within window, skip
+        let window = self.dedup_window_ms;
+        let recent = |key: &(String, Option<usize>)| {
+            self.recent_alerts
+                .get(key)
+                .is_some_and(|&last| timestamp.saturating_sub(last) < window)
+        };
+
+        // Deduplicate per handler: a handler that already delivered this
+        // alert type inside the window is skipped, one that failed is retried.
+        let accepting: Vec<Option<usize>> = {
+            let indices: Vec<Option<usize>> = self
+                .handlers
+                .iter()
+                .enumerate()
+                .filter(|(_, handler)| handler.accepts_severity(severity))
+                .map(|(index, _)| Some(index))
+                .collect();
+            if indices.is_empty() {
+                vec![None]
+            } else {
+                indices
+            }
+        };
+        let pending: Vec<Option<usize>> = accepting
+            .into_iter()
+            .filter(|slot| !recent(&(type_key.clone(), *slot)))
+            .collect();
+        let seen_before = self
+            .recorded_alerts
+            .get(&type_key)
+            .is_some_and(|&last| timestamp.saturating_sub(last) < window);
+        if pending.is_empty() {
+            // Duplicate within window for every handler, skip
             return Ok(());
         }
 
         // Create alert
         let alert = Alert::new(alert_type, severity, message, timestamp);
 
-        // Dispatch to every handler; a failing one does not silence the rest.
+        // Dispatch to every pending handler; a failing one does not silence
+        // the rest, and only successful deliveries are recorded for dedup.
         let mut first_error = None;
-        for handler in &self.handlers {
-            if handler.accepts_severity(severity)
-                && let Err(error) = handler.handle(&alert)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+        for slot in pending {
+            let result = match slot.and_then(|index| self.handlers.get(index)) {
+                Some(handler) => handler.handle(&alert),
+                None => Ok(()),
+            };
+            match result {
+                Ok(()) => {
+                    self.recent_alerts
+                        .insert((type_key.clone(), slot), timestamp);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
 
-        // Update dedup tracking only after a fully successful delivery, so
-        // a retry after a handler failure is not suppressed as a duplicate.
-        if first_error.is_none() {
-            self.recent_alerts.insert(type_key, timestamp);
-        }
-
-        // Add to history
-        self.alert_history.push_back(alert);
-
-        // Trim history if needed
-        while self.alert_history.len() > self.max_history {
-            self.alert_history.pop_front();
+        // A retry for a failed handler is not a new alert: the history keeps
+        // only the first occurrence inside the window.
+        if !seen_before {
+            self.recorded_alerts.insert(type_key, timestamp);
+            self.alert_history.push_back(alert);
+            while self.alert_history.len() > self.max_history {
+                self.alert_history.pop_front();
+            }
         }
 
         first_error.map_or(Ok(()), Err)
@@ -873,6 +912,7 @@ impl AlertManager {
 
         // Clean up dedup tracking
         self.recent_alerts.retain(|_, &mut ts| ts >= cutoff);
+        self.recorded_alerts.retain(|_, &mut ts| ts >= cutoff);
     }
 
     /// Returns the total number of alerts in history.
@@ -891,6 +931,7 @@ impl AlertManager {
     pub fn clear_history(&mut self) {
         self.alert_history.clear();
         self.recent_alerts.clear();
+        self.recorded_alerts.clear();
     }
 }
 
@@ -1824,11 +1865,49 @@ mod tests {
                 .alert(alert_type(), AlertSeverity::Error, 1)
                 .is_err()
         );
-        // The retry inside the window is delivered, not suppressed.
+        // The retry inside the window is delivered, not suppressed, and is
+        // not recorded as a second alert.
         assert!(manager.alert(alert_type(), AlertSeverity::Error, 2).is_ok());
-        assert_eq!(manager.get_recent_alerts(10).len(), 2);
+        assert_eq!(manager.get_recent_alerts(10).len(), 1);
         // After a successful delivery, a duplicate is suppressed again.
         assert!(manager.alert(alert_type(), AlertSeverity::Error, 3).is_ok());
-        assert_eq!(manager.get_recent_alerts(10).len(), 2);
+        assert_eq!(manager.get_recent_alerts(10).len(), 1);
+    }
+
+    #[test]
+    fn test_alert_manager_persistent_failure_does_not_redeliver_to_healthy_handlers() {
+        struct Failing;
+        impl AlertHandler for Failing {
+            fn handle(&self, _alert: &Alert) -> MMResult<()> {
+                Err(MMError::ConnectionError("webhook down".to_string()))
+            }
+        }
+        struct Shared(std::sync::Arc<CollectingAlertHandler>);
+        impl AlertHandler for Shared {
+            fn handle(&self, alert: &Alert) -> MMResult<()> {
+                self.0.handle(alert)
+            }
+        }
+        let alert_type = || AlertType::Custom {
+            name: "x".to_string(),
+            message: "m".to_string(),
+        };
+        let collector = std::sync::Arc::new(CollectingAlertHandler::new(AlertSeverity::Info));
+        let mut manager = AlertManager::new(10, 60_000);
+        manager.add_handler(Box::new(Failing));
+        manager.add_handler(Box::new(Shared(std::sync::Arc::clone(&collector))));
+
+        assert!(
+            manager
+                .alert(alert_type(), AlertSeverity::Error, 1)
+                .is_err()
+        );
+        assert!(
+            manager
+                .alert(alert_type(), AlertSeverity::Error, 2)
+                .is_err()
+        );
+        assert_eq!(collector.count().unwrap(), 1);
+        assert_eq!(manager.get_recent_alerts(10).len(), 1);
     }
 }

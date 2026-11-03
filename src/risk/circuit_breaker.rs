@@ -466,7 +466,8 @@ impl CircuitBreaker {
     pub fn start_cooldown(&mut self, timestamp: u64) {
         if self.state.is_triggered() {
             self.state = CircuitBreakerState::Cooldown {
-                resume_at: timestamp + self.config.cooldown_duration_ms,
+                // Saturates: an overflowing cooldown never resumes (fails closed).
+                resume_at: timestamp.saturating_add(self.config.cooldown_duration_ms),
             };
         }
     }
@@ -832,6 +833,23 @@ mod tests {
         if let CircuitBreakerState::Cooldown { resume_at } = breaker.state() {
             assert_eq!(*resume_at, 2000 + 60_000); // cooldown is 60_000ms
         }
+    }
+
+    #[test]
+    fn test_start_cooldown_max_duration_saturates_and_stays_closed() {
+        let mut config = default_config();
+        config.cooldown_duration_ms = u64::MAX;
+        let mut breaker = CircuitBreaker::new(config);
+        breaker.trigger_manual(1000);
+        breaker.start_cooldown(2000);
+        assert_eq!(
+            breaker.state(),
+            &CircuitBreakerState::Cooldown {
+                resume_at: u64::MAX
+            }
+        );
+        breaker.check_cooldown(u64::MAX - 1);
+        assert!(!breaker.is_trading_allowed());
     }
 
     #[test]
