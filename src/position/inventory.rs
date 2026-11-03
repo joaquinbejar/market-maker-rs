@@ -82,13 +82,14 @@ impl InventoryPosition {
     /// // Weighted average: (10*100 + 5*102) / 15 = 100.666...
     /// ```
     ///
-    /// The average entry price is a derived value: when even its
-    /// overflow safe form fails it saturates toward the fill price.
+    /// Any price is accepted, negative ones included (some instruments
+    /// trade below zero). The average entry price is the exact weighted
+    /// mean, computed in an overflow safe form.
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::NumericalError`] if the position quantity
-    /// overflows; the position is then left unchanged.
+    /// Returns [`MMError::NumericalError`] if the position quantity or the
+    /// average entry price overflows; the position is then left unchanged.
     pub fn update_fill(
         &mut self,
         fill_quantity: Decimal,
@@ -114,19 +115,26 @@ impl InventoryPosition {
             // the inputs, unlike the total cost. `new_quantity` is non zero
             // here (its magnitude grew), so only an overflow can fail.
             let old_avg = self.avg_entry_price;
-            let weighted = fill_price.checked_sub(old_avg).and_then(|diff| {
-                diff.checked_mul(fill_quantity)
-                    .and_then(|v| v.checked_div(new_quantity))
-                    // `fill / new` is in (0, 1] here, so this form cannot
-                    // overflow where the product above did.
-                    .or_else(|| diff.checked_mul(fill_quantity.checked_div(new_quantity)?))
-            });
-            self.avg_entry_price = match weighted.and_then(|w| old_avg.checked_add(w)) {
-                Some(avg) => avg,
-                // Last resort: the price difference itself overflows, so the
-                // average saturates toward the fill price.
-                None => old_avg.saturating_add(fill_price.saturating_sub(old_avg)),
-            };
+            let weighted = fill_price
+                .checked_sub(old_avg)
+                .and_then(|diff| {
+                    diff.checked_mul(fill_quantity)
+                        .and_then(|v| v.checked_div(new_quantity))
+                        // `fill / new` is in (0, 1] here, so this form cannot
+                        // overflow where the product above did.
+                        .or_else(|| diff.checked_mul(fill_quantity.checked_div(new_quantity)?))
+                })
+                .and_then(|w| old_avg.checked_add(w));
+            // Only prices of opposite sign near the bounds reach here (their
+            // difference overflows); no form without that difference keeps
+            // the rounding of the exact mean, so this is an error rather
+            // than an approximate average.
+            self.avg_entry_price = weighted.ok_or_else(|| {
+                MMError::NumericalError(format!(
+                    "average entry price overflows: {} at {} plus {} at {}",
+                    self.quantity, old_avg, fill_quantity, fill_price
+                ))
+            })?;
         }
         // If reducing position, keep same avg price
         // (realized PnL is calculated separately)
@@ -187,6 +195,22 @@ impl Default for InventoryPosition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_fill_unrepresentable_average_returns_error_and_keeps_position() {
+        let mut position = InventoryPosition {
+            quantity: dec!(1),
+            avg_entry_price: Decimal::MIN,
+            last_update: 0,
+        };
+        let before = position.clone();
+        let result = position.update_fill(dec!(3), Decimal::MAX, 1);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        assert_eq!(position, before);
+    }
 
     #[test]
     fn test_update_fill_quantity_overflow_returns_error_and_keeps_position() {
