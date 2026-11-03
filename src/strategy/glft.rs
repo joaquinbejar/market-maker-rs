@@ -66,7 +66,14 @@
 //! The exponential is applied to the vector directly: `τ` is split into `N`
 //! steps so that each step has infinity norm at most 2, each step is a Taylor
 //! series of the tridiagonal operator applied to the vector, and the vector
-//! is renormalized to a maximum of 1 after every step. This is scaling and
+//! is renormalized to a maximum of 1 after every step. With a large `Q` and
+//! a stiff `α` the entries near `±Q` can fall below the `f64` range relative
+//! to the centre; when an entry drops below `1e-200` of the largest one,
+//! every entry is moved into a per entry log offset (`v_i ∝ w_i exp(l_i)`,
+//! `w_i = 1`) and the remaining steps use the similar operator `D⁻¹ B D`,
+//! `D = diag(exp(l))`, whose exponential is the same up to that scaling.
+//! When no entry reaches the floor the offsets stay zero and the
+//! computation is the plain one. This is scaling and
 //! squaring where the squaring is replaced by repeated application to the
 //! vector: it never forms the dense exponential (`(2Q + 1)²` entries, `O(n³)`
 //! per squaring), it costs `O(N · n)` and it does not allocate.
@@ -109,10 +116,16 @@ const MILLISECONDS_PER_SECOND: Decimal = Decimal::from_parts(1000, 0, 0, false, 
 /// Largest infinity norm of one step of the matrix exponential.
 const STEP_NORM: f64 = 2.0;
 
-/// Largest number of steps of the matrix exponential. `N ≈ τ (α Q² + 4η) / 2`;
-/// beyond this the horizon is too stiff for the inventory bound and the
-/// quote is rejected rather than computed for an unbounded time.
-const MAX_EXPM_STEPS: u32 = 100_000;
+/// Largest number of steps of the matrix exponential in one quote.
+/// `N ≈ τ (α Q² + 4η) / 2`, and up to about twice that after a rebalance;
+/// beyond the cap the horizon is too stiff for the inventory bound and the
+/// quote is a [`MMError::NumericalError`] that points to
+/// [`GLFTStrategy::closed_form_quotes`]. See [`GLFTStrategy`] for the cost.
+const MAX_EXPM_STEPS: u32 = 15_000;
+
+/// An entry of the normalized value vector below this fraction of the
+/// largest one triggers a rebalance into the per entry log offsets.
+const REBALANCE_FLOOR: f64 = 1e-200;
 
 /// Largest order of the Taylor series of one step.
 const MAX_TAYLOR_ORDER: u32 = 60;
@@ -259,6 +272,17 @@ pub struct GlftQuotes {
 
 /// GLFT strategy: quotes of Theorem 1 of Guéant, Lehalle and Fernandez-Tapia.
 ///
+/// # Cost
+///
+/// One step of the matrix exponential on the largest grid (`Q = 200`,
+/// 401 entries) costs about 3.4 µs (release build, Apple silicon, measured
+/// over full quotes). A quote takes `N ≈ τ (α Q² + 4η) / 2` steps, up to
+/// about twice that after a rebalance of a stiff tail, and is capped at
+/// 15 000 steps, about 50 ms; beyond the cap it returns
+/// [`MMError::NumericalError`] and [`GLFTStrategy::closed_form_quotes`]
+/// should be used. With the paper parameters a quote takes about 7 ms at
+/// `Q = 200` and `T - t = 600 s`, and well under 1 ms at `Q = 30`.
+///
 /// # Example
 ///
 /// ```rust
@@ -300,8 +324,9 @@ impl GLFTStrategy {
     ///   `lot_size` or is outside `±Q` lots.
     /// - [`MMError::NumericalError`] if a parameter does not convert to a
     ///   finite `f64`, the value vector underflows or is not finite, the
-    ///   horizon needs more than 100 000 steps, or a result does not convert
-    ///   back to `Decimal`.
+    ///   horizon needs more than 15 000 steps (use
+    ///   [`GLFTStrategy::closed_form_quotes`] there), or a result does not
+    ///   convert back to `Decimal`.
     /// - [`MMError::InvalidQuoteGeneration`] if the bid is not positive or
     ///   the quotes cross.
     #[must_use = "the quotes are the result of the computation"]
@@ -314,10 +339,9 @@ impl GLFTStrategy {
     ) -> MMResult<GlftQuotes> {
         let (model, q) = Model::new(mid_price, inventory, config, volatility)?;
         let tau_s = seconds_to_terminal(config.terminal_time, current_time)?;
-        let mut v = [0.0_f64; MAX_DIM];
-        let n = model.value_vector(tau_s, &mut v)?;
-        let w = v.get(..n).ok_or_else(|| numerical("value vector size"))?;
-        let (bid, ask) = model.exact_distances(w, q)?;
+        let mut vv = ValueVector::new();
+        model.value_vector(tau_s, &mut vv)?;
+        let (bid, ask) = model.exact_distances(&vv, q)?;
         build_quotes(mid_price, bid, ask, config.min_spread)
     }
 
@@ -348,7 +372,8 @@ impl GLFTStrategy {
     ///
     /// The A-S quotes come from
     /// [`avellaneda_stoikov::calculate_optimal_quotes`](crate::strategy::avellaneda_stoikov::calculate_optimal_quotes)
-    /// with `inventory` in base units; the paper (footnote 8) obtains them as
+    /// in the same one lot model: inventory `inventory / lot_size` lots and
+    /// risk aversion `γ_L = γ · lot_size`; the paper (footnote 8) obtains them as
     /// the first order expansion of the GLFT quotes near `T`.
     ///
     /// # Returns
@@ -369,10 +394,18 @@ impl GLFTStrategy {
     ) -> MMResult<(GlftQuotes, (Decimal, Decimal))> {
         let glft =
             Self::calculate_optimal_quotes(mid_price, inventory, config, volatility, current_time)?;
+        // The A-S side sees the same one lot model: q in lots and γ_L = γ L.
+        let lots = inventory
+            .checked_div(config.lot_size)
+            .ok_or_else(|| numerical("inventory / lot_size"))?;
+        let gamma_lot = config
+            .risk_aversion
+            .checked_mul(config.lot_size)
+            .ok_or_else(|| numerical("risk_aversion * lot_size"))?;
         let as_quotes = crate::strategy::avellaneda_stoikov::calculate_optimal_quotes(
             mid_price,
-            inventory,
-            config.risk_aversion,
+            lots,
+            gamma_lot,
             volatility,
             config.terminal_time.saturating_sub(current_time),
             config.order_intensity_k,
@@ -518,78 +551,140 @@ impl Model {
         }
     }
 
-    /// Writes `w = exp(-(M - c I) τ) · 1`, normalized to a maximum of 1, in
-    /// the first `2 Q + 1` entries of `out` and returns that count.
-    fn value_vector(&self, tau_s: f64, out: &mut [f64; MAX_DIM]) -> MMResult<usize> {
-        let n = self.dim()?;
-        let v = out
-            .get_mut(..n)
-            .ok_or_else(|| numerical("value vector size"))?;
-        v.fill(1.0);
-        if tau_s <= 0.0 {
-            return Ok(n);
+    /// Per second diagonal of `M - c I` and the step plan for `tau_s`:
+    /// `(steps, dt)` with `dt (largest row sum of the scaled operator) <= STEP_NORM`.
+    fn plan(
+        tau_s: f64,
+        diag_s: &[f64],
+        eta: f64,
+        factors: &Factors<'_>,
+        budget: u32,
+    ) -> MMResult<(u32, f64)> {
+        let mut norm = 0.0_f64;
+        for (i, d) in diag_s.iter().enumerate() {
+            let left = factors.left.get(i).copied().unwrap_or(0.0);
+            let right = factors.right.get(i).copied().unwrap_or(0.0);
+            norm = norm.max(d + eta * (left + right));
         }
-        let q_max = f64::from(self.q_max);
-        // Infinity norm of (M - c I) τ: largest diagonal plus 2η off diagonal.
-        let norm = tau_s * (self.alpha * q_max * q_max + 4.0 * self.eta);
-        let steps_f = positive_finite("expm norm", norm)?;
+        let steps_f = positive_finite("expm norm", tau_s * norm)?;
         let steps_f = (steps_f / STEP_NORM).ceil().max(1.0);
         let steps = Decimal::from_f64(steps_f)
             .and_then(|s| s.to_u32())
-            .filter(|s| *s <= MAX_EXPM_STEPS)
+            .filter(|s| *s <= budget)
             .ok_or_else(|| {
                 numerical(&format!(
-                    "horizon too stiff: {steps_f} steps above {MAX_EXPM_STEPS}; reduce max_inventory_lots or terminal_time"
+                    "horizon too stiff: more than {MAX_EXPM_STEPS} steps of the matrix exponential \
+                     ({steps_f} needed for the rest of the horizon, {budget} left); \
+                     use GLFTStrategy::closed_form_quotes, or reduce max_inventory_lots or terminal_time"
                 ))
             })?;
-        let dt = tau_s / f64::from(steps);
-
-        let mut diag_buf = [0.0_f64; MAX_DIM];
-        let mut term_buf = [0.0_f64; MAX_DIM];
-        let mut next_buf = [0.0_f64; MAX_DIM];
-        let diag = diag_buf
-            .get_mut(..n)
-            .ok_or_else(|| numerical("diagonal size"))?;
-        self.fill_shifted_diagonal(diag);
-        for d in diag.iter_mut() {
-            *d *= dt;
-        }
-        let eta_dt = self.eta * dt;
-        let term = term_buf
-            .get_mut(..n)
-            .ok_or_else(|| numerical("term size"))?;
-        let next = next_buf
-            .get_mut(..n)
-            .ok_or_else(|| numerical("term size"))?;
-
-        for _ in 0..steps {
-            taylor_step(v, diag, eta_dt, term, next)?;
-            let max = v.iter().copied().fold(0.0_f64, f64::max);
-            let max = positive_finite("value vector maximum", max)?;
-            for x in v.iter_mut() {
-                *x /= max;
-            }
-        }
-        Ok(n)
+        Ok((steps, tau_s / f64::from(steps)))
     }
 
-    /// `(δ_b, δ_a)` of Theorem 1 from the value vector `w` over `-Q..=Q`.
-    fn exact_distances(&self, w: &[f64], q: i64) -> MMResult<(Option<f64>, Option<f64>)> {
+    /// Computes `v = exp(-(M - c I) τ) · 1` up to a positive factor, as
+    /// `v_i ∝ w_i exp(l_i)`. The offsets `l` stay zero, and the computation
+    /// is the plain normalized vector, unless an entry falls below
+    /// `REBALANCE_FLOOR` of the largest one; then every entry is moved into
+    /// its offset (`l_i += ln w_i`, `w_i = 1`) and the operator becomes the
+    /// diagonal similarity `D⁻¹ B D`, which has the same exponential.
+    fn value_vector(&self, tau_s: f64, out: &mut ValueVector) -> MMResult<()> {
+        let n = self.dim()?;
+        out.n = n;
+        let (w_all, l_all) = (&mut out.w, &mut out.log_offset);
+        let w = w_all
+            .get_mut(..n)
+            .ok_or_else(|| numerical("value vector size"))?;
+        let l = l_all.get_mut(..n).ok_or_else(|| numerical("offset size"))?;
+        w.fill(1.0);
+        l.fill(0.0);
+        if tau_s <= 0.0 {
+            return Ok(());
+        }
+
+        let mut diag_s_buf = [0.0_f64; MAX_DIM];
+        let mut diag_buf = [0.0_f64; MAX_DIM];
+        let mut left_buf = [0.0_f64; MAX_DIM];
+        let mut right_buf = [0.0_f64; MAX_DIM];
+        let mut term_buf = [0.0_f64; MAX_DIM];
+        let mut next_buf = [0.0_f64; MAX_DIM];
+        let size = || numerical("buffer size");
+        let diag_s = diag_s_buf.get_mut(..n).ok_or_else(size)?;
+        let diag = diag_buf.get_mut(..n).ok_or_else(size)?;
+        let left = left_buf.get_mut(..n).ok_or_else(size)?;
+        let right = right_buf.get_mut(..n).ok_or_else(size)?;
+        let term = term_buf.get_mut(..n).ok_or_else(size)?;
+        let next = next_buf.get_mut(..n).ok_or_else(size)?;
+        self.fill_shifted_diagonal(diag_s);
+        set_factors(l, left, right)?;
+
+        let mut budget = MAX_EXPM_STEPS;
+        let mut remaining = tau_s;
+        let (mut steps, mut dt) = Self::plan(
+            remaining,
+            diag_s,
+            self.eta,
+            &Factors { left, right },
+            budget,
+        )?;
+        scale_diagonal(diag_s, dt, diag);
+        while steps > 0 {
+            taylor_step(w, diag, self.eta * dt, left, right, term, next)?;
+            steps -= 1;
+            budget = budget.saturating_sub(1);
+            remaining -= dt;
+            let max = w.iter().copied().fold(0.0_f64, f64::max);
+            let max = positive_finite("value vector maximum", max)?;
+            let mut min = f64::INFINITY;
+            for x in w.iter_mut() {
+                *x /= max;
+                min = min.min(*x);
+            }
+            if steps > 0 && min < REBALANCE_FLOOR {
+                for (x, off) in w.iter_mut().zip(l.iter_mut()) {
+                    let x_pos = positive_finite("value vector entry", *x)?;
+                    *off += x_pos.ln();
+                    *x = 1.0;
+                }
+                set_factors(l, left, right)?;
+                let remaining_s = positive_finite("remaining horizon", remaining)?;
+                (steps, dt) = Self::plan(
+                    remaining_s,
+                    diag_s,
+                    self.eta,
+                    &Factors { left, right },
+                    budget,
+                )?;
+                scale_diagonal(diag_s, dt, diag);
+            }
+        }
+        Ok(())
+    }
+
+    /// `(δ_b, δ_a)` of Theorem 1 from the value vector over `-Q..=Q`.
+    fn exact_distances(&self, vv: &ValueVector, q: i64) -> MMResult<(Option<f64>, Option<f64>)> {
         let q_max = i64::from(self.q_max);
-        let at = |q: i64| -> MMResult<f64> {
+        // ln v_q up to a common constant: ln w_q, and the offset separately
+        // so that a zero offset leaves the plain computation unchanged.
+        let at = |q: i64| -> MMResult<(f64, f64)> {
             let i = q
                 .checked_add(q_max)
                 .and_then(|i| usize::try_from(i).ok())
+                .filter(|i| *i < vv.n)
                 .ok_or_else(|| numerical("inventory index"))?;
-            let x = w
+            let x =
+                vv.w.get(i)
+                    .copied()
+                    .ok_or_else(|| numerical("inventory index"))?;
+            let off = vv
+                .log_offset
                 .get(i)
                 .copied()
                 .ok_or_else(|| numerical("inventory index"))?;
-            positive_finite("value vector entry", x)
+            Ok((positive_finite("value vector entry", x)?.ln(), off))
         };
-        let vq = at(q)?;
-        let distance = |neighbour: f64| -> MMResult<f64> {
-            let d = (vq.ln() - neighbour.ln()) / self.k + self.base;
+        let (lw_q, off_q) = at(q)?;
+        let distance = |(lw_n, off_n): (f64, f64)| -> MMResult<f64> {
+            let d = ((lw_q - lw_n) + (off_q - off_n)) / self.k + self.base;
             if d.is_finite() {
                 Ok(d)
             } else {
@@ -628,18 +723,74 @@ impl Model {
     }
 }
 
-/// One Taylor step `v ← exp(B) v` with `B = -diag + eta_dt (shift up + shift down)`.
+/// Value vector `v_i ∝ w_i exp(log_offset_i)` over the first `n` entries.
+struct ValueVector {
+    w: [f64; MAX_DIM],
+    log_offset: [f64; MAX_DIM],
+    n: usize,
+}
+
+impl ValueVector {
+    fn new() -> Self {
+        Self {
+            w: [0.0; MAX_DIM],
+            log_offset: [0.0; MAX_DIM],
+            n: 0,
+        }
+    }
+}
+
+/// Off diagonal factors of the scaled operator `D⁻¹ B D`:
+/// `left_i = exp(l_{i-1} - l_i)` and `right_i = exp(l_{i+1} - l_i)`, zero
+/// past the ends.
+struct Factors<'a> {
+    left: &'a [f64],
+    right: &'a [f64],
+}
+
+fn set_factors(l: &[f64], left: &mut [f64], right: &mut [f64]) -> MMResult<()> {
+    for (i, (lf, rf)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+        let li = l.get(i).copied().unwrap_or(0.0);
+        let factor = |j: Option<usize>| -> MMResult<f64> {
+            match j.and_then(|j| l.get(j)) {
+                Some(lj) => {
+                    let f = (lj - li).exp();
+                    if f.is_finite() {
+                        Ok(f)
+                    } else {
+                        Err(numerical("scaled operator factor is not finite"))
+                    }
+                }
+                None => Ok(0.0),
+            }
+        };
+        *lf = factor(i.checked_sub(1))?;
+        *rf = factor(i.checked_add(1))?;
+    }
+    Ok(())
+}
+
+fn scale_diagonal(diag_s: &[f64], dt: f64, diag: &mut [f64]) {
+    for (d, ds) in diag.iter_mut().zip(diag_s) {
+        *d = ds * dt;
+    }
+}
+
+/// One Taylor step `w ← exp(B) w` with
+/// `(B x)_i = eta_dt (left_i x_{i-1} + right_i x_{i+1}) - diag_i x_i`.
 fn taylor_step(
     v: &mut [f64],
     diag: &[f64],
     eta_dt: f64,
+    left: &[f64],
+    right: &[f64],
     term: &mut [f64],
     next: &mut [f64],
 ) -> MMResult<()> {
     term.copy_from_slice(v);
     for order in 1..=MAX_TAYLOR_ORDER {
         let inv = 1.0 / f64::from(order);
-        apply_operator(term, diag, eta_dt, next);
+        apply_operator(term, diag, eta_dt, left, right, next);
         let mut term_max = 0.0_f64;
         let mut sum_max = 0.0_f64;
         for ((t, x), s) in term.iter_mut().zip(next.iter()).zip(v.iter_mut()) {
@@ -658,21 +809,33 @@ fn taylor_step(
     Err(numerical("taylor series did not converge"))
 }
 
-/// `out = B x` for the tridiagonal `B` with diagonal `-diag` and off diagonals `eta_dt`.
-fn apply_operator(x: &[f64], diag: &[f64], eta_dt: f64, out: &mut [f64]) {
-    for (i, (o, d)) in out.iter_mut().zip(diag).enumerate() {
-        let left = i
+/// `out = B x` for the tridiagonal scaled operator of [`taylor_step`].
+fn apply_operator(
+    x: &[f64],
+    diag: &[f64],
+    eta_dt: f64,
+    left: &[f64],
+    right: &[f64],
+    out: &mut [f64],
+) {
+    for (i, ((o, d), (lf, rf))) in out
+        .iter_mut()
+        .zip(diag)
+        .zip(left.iter().zip(right))
+        .enumerate()
+    {
+        let xl = i
             .checked_sub(1)
             .and_then(|j| x.get(j))
             .copied()
             .unwrap_or(0.0);
-        let right = i
+        let xr = i
             .checked_add(1)
             .and_then(|j| x.get(j))
             .copied()
             .unwrap_or(0.0);
         let centre = x.get(i).copied().unwrap_or(0.0);
-        *o = eta_dt * (left + right) - d * centre;
+        *o = eta_dt * (lf * xl + rf * xr) - d * centre;
     }
 }
 
@@ -689,7 +852,7 @@ fn inventory_lots(inventory: Decimal, config: &GLFTConfig) -> MMResult<i64> {
     }
     let q_max = i64::from(config.max_inventory_lots);
     match lots.to_i64() {
-        Some(q) if q.abs() <= q_max => Ok(q),
+        Some(q) if q.unsigned_abs() <= u64::from(config.max_inventory_lots) => Ok(q),
         Some(_) | None => Err(MMError::InvalidPositionUpdate(format!(
             "inventory {inventory} is {lots} lots, outside the bound of {q_max} lots"
         ))),
@@ -1045,6 +1208,144 @@ mod tests {
             GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(1.5), &b, paper_sigma(), 0)
                 .unwrap();
         assert_eq!(qa, qb);
+    }
+
+    #[test]
+    fn test_quotes_inventory_i64_min_returns_invalid_position_update() {
+        let config = paper_config(30);
+        let inventory = Decimal::from(i64::MIN);
+        let exact = GLFTStrategy::calculate_optimal_quotes(
+            dec!(1000),
+            inventory,
+            &config,
+            paper_sigma(),
+            0,
+        );
+        assert!(
+            matches!(exact, Err(MMError::InvalidPositionUpdate(_))),
+            "{exact:?}"
+        );
+        let closed =
+            GLFTStrategy::closed_form_quotes(dec!(1000), inventory, &config, paper_sigma());
+        assert!(
+            matches!(closed, Err(MMError::InvalidPositionUpdate(_))),
+            "{closed:?}"
+        );
+    }
+
+    #[test]
+    fn test_compare_with_avellaneda_stoikov_half_lots_near_terminal_agree() {
+        // gamma 0.02 per unit with lots of 0.5: gamma_L = 0.01, 1.5 = 3 lots.
+        let mut config = paper_config(16);
+        config.risk_aversion = dec!(0.02);
+        config.lot_size = dec!(0.5);
+        let (glft, (as_bid, as_ask)) = GLFTStrategy::compare_with_avellaneda_stoikov(
+            dec!(1000),
+            dec!(1.5),
+            &config,
+            paper_sigma(),
+            599_990,
+        )
+        .unwrap();
+        assert!(
+            (glft.bid.unwrap() - as_bid).abs() < dec!(0.001),
+            "{glft:?} {as_bid}"
+        );
+        assert!(
+            (glft.ask.unwrap() - as_ask).abs() < dec!(0.001),
+            "{glft:?} {as_ask}"
+        );
+    }
+
+    /// σ = 2 tick/√s with Q = 200: without rebalancing `v_{±Q}` is about
+    /// `e^-930` of `v_0` and underflows.
+    fn stiff_config() -> (GLFTConfig, Decimal) {
+        let mut config = paper_config(MAX_INVENTORY_LOTS);
+        config.terminal_time = 60_000;
+        (
+            config,
+            Decimal::from_f64(2.0 * SECONDS_PER_YEAR.sqrt()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_calculate_optimal_quotes_stiff_tail_near_bound_is_finite_and_symmetric() {
+        let (config, sigma) = stiff_config();
+        let q_max = i64::from(MAX_INVENTORY_LOTS);
+        let quote = |q: i64| {
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), Decimal::from(q), &config, sigma, 0)
+                .unwrap()
+        };
+        let top = quote(q_max);
+        let below_top = quote(q_max - 1);
+        let bottom = quote(-q_max);
+        let above_bottom = quote(-(q_max - 1));
+        assert!(top.bid.is_none() && bottom.ask.is_none());
+        let mid = dec!(1000);
+        // Symmetry q -> -q swaps the sides.
+        assert_eq!(top.ask.unwrap() - mid, mid - bottom.bid.unwrap());
+        assert_eq!(
+            below_top.ask.unwrap() - mid,
+            mid - above_bottom.bid.unwrap()
+        );
+        assert_eq!(
+            mid - below_top.bid.unwrap(),
+            above_bottom.ask.unwrap() - mid
+        );
+        // Near +Q the ask is far inside the mid (eager to sell), the bid far out.
+        assert!(top.ask.unwrap() < mid);
+        assert!(below_top.bid.unwrap() < below_top.ask.unwrap());
+        // ln(v_{Q-1} / v_Q) is about ln(d_Q / eta) in the quasi steady tail.
+        let model = Model::new(mid, dec!(0), &config, sigma).unwrap().0;
+        let qf = f64::from(MAX_INVENTORY_LOTS);
+        let expected = ((model.alpha * qf * qf + 2.0 * model.eta) / model.eta).ln() / model.k;
+        let ask_distance = (top.ask.unwrap() - mid).to_f64().unwrap() - model.base;
+        assert!(
+            (ask_distance + expected).abs() < 0.05 * expected,
+            "{ask_distance} vs -{expected}"
+        );
+    }
+
+    #[test]
+    fn test_calculate_optimal_quotes_stiff_tail_interior_matches_smaller_bound() {
+        // Far from the bound the stiff tail does not change the quotes: the
+        // rebalanced Q = 200 quotes match Q = 40, which never rebalances.
+        let (config, sigma) = stiff_config();
+        let mut small = config.clone();
+        small.max_inventory_lots = 40;
+        for q in [-3, 0, 5] {
+            let inventory = Decimal::from(q);
+            let a =
+                GLFTStrategy::calculate_optimal_quotes(dec!(1000), inventory, &config, sigma, 0)
+                    .unwrap();
+            let b = GLFTStrategy::calculate_optimal_quotes(dec!(1000), inventory, &small, sigma, 0)
+                .unwrap();
+            assert!(
+                (a.bid.unwrap() - b.bid.unwrap()).abs() < dec!(0.000000001),
+                "q={q}"
+            );
+            assert!(
+                (a.ask.unwrap() - b.ask.unwrap()).abs() < dec!(0.000000001),
+                "q={q}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_calculate_optimal_quotes_beyond_step_cap_returns_numerical_error_naming_closed_form() {
+        let mut config = paper_config(MAX_INVENTORY_LOTS);
+        config.terminal_time = 36_000_000;
+        let result =
+            GLFTStrategy::calculate_optimal_quotes(dec!(1000), dec!(0), &config, paper_sigma(), 0);
+        match result {
+            Err(MMError::NumericalError(msg)) => {
+                assert!(msg.contains("closed_form_quotes"), "{msg}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            GLFTStrategy::closed_form_quotes(dec!(1000), dec!(0), &config, paper_sigma()).is_ok()
+        );
     }
 
     #[cfg(feature = "serde")]

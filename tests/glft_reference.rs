@@ -1,5 +1,7 @@
 //! Validation of `GLFTStrategy` against a reference solution of the
-//! Gueant, Lehalle and Fernandez-Tapia model (#86).
+//! Gueant, Lehalle and Fernandez-Tapia model. The reference was written for
+//! #86 to document the gap; since #134 `GLFTStrategy` implements the model
+//! and these tests assert that it matches.
 //!
 //! # Declared before comparing
 //!
