@@ -3953,6 +3953,54 @@ mod tests {
         }
 
         #[test]
+        fn test_margin_policy_poisoned_account_fails_closed_until_reset() {
+            let account = account(None);
+            let mut policy = account.policy();
+            let mut accountant = account.accountant();
+            let request = PretradeRequest::new(
+                "o-1",
+                Action::Buy,
+                Some(dec!(100)),
+                dec!(1),
+                OrderPurpose::Quote,
+                0,
+            );
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                account.with_gate(|_| panic!("poison the account"))
+            }));
+            assert!(poisoned.is_err());
+
+            assert!(matches!(account.fault(), Some(MMError::LockPoisoned(_))));
+            assert!(policy.check(&request).is_rejected());
+            let event = OrderEvent::Accepted {
+                order_id: "o-1".to_string(),
+            };
+            assert!(matches!(
+                policy.on_order_event(&event),
+                Err(MMError::LockPoisoned(_))
+            ));
+            let fill = AccountingFill {
+                execution_id: 1,
+                order_id: 1,
+                side: Action::Buy,
+                price: dec!(100),
+                quantity: dec!(1),
+                cumulative_quantity: dec!(1),
+                fee: Decimal::ZERO,
+                fee_asset: crate::types::fee::FeeAsset::Quote,
+                timestamp: 0,
+            };
+            assert!(matches!(
+                accountant.post_fill(&fill),
+                Err(MMError::LockPoisoned(_))
+            ));
+
+            policy.reset();
+            assert!(account.fault().is_none());
+            assert!(!policy.check(&request).is_rejected());
+        }
+
+        #[test]
         fn test_margin_policy_fee_assets_book_base_and_refuse_third_asset() {
             let account = account(None);
             let mut policy = account.policy();
