@@ -583,8 +583,14 @@ impl LiveMetrics {
 
         // Read Decimal values
         let position = self.get_position()?;
-        let realized = self.get_realized_pnl()?;
-        let unrealized = self.get_unrealized_pnl()?;
+        // Both PnL read locks are held together, in the same order as
+        // `update_pnl` (realized, then unrealized), so the snapshot never
+        // mixes the two halves of different updates and cannot deadlock.
+        let (realized, unrealized) = {
+            let realized = read_guard(&self.realized_pnl, "realized pnl")?;
+            let unrealized = read_guard(&self.unrealized_pnl, "unrealized pnl")?;
+            (*realized, *unrealized)
+        };
         let current_pnl = realized.checked_add(unrealized).ok_or_else(|| {
             MMError::NumericalError(format!("total pnl overflow: {realized} + {unrealized}"))
         })?;
@@ -692,8 +698,15 @@ impl Default for LiveMetrics {
 
 /// Reads a value behind a lock, mapping poison to [`MMError::LockPoisoned`].
 fn read(lock: &RwLock<Decimal>, name: &str) -> MMResult<Decimal> {
+    read_guard(lock, name).map(|value| *value)
+}
+
+/// Read guard over a value, mapping poison to [`MMError::LockPoisoned`].
+fn read_guard<'a>(
+    lock: &'a RwLock<Decimal>,
+    name: &str,
+) -> MMResult<std::sync::RwLockReadGuard<'a, Decimal>> {
     lock.read()
-        .map(|value| *value)
         .map_err(|_| MMError::LockPoisoned(format!("live metrics {name}")))
 }
 
@@ -714,6 +727,23 @@ pub type SharedLiveMetrics = Arc<LiveMetrics>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_snapshot_concurrent_pnl_updates_are_consistent() {
+        let metrics = LiveMetrics::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..2_000 {
+                    let value = Decimal::from(i);
+                    metrics.update_pnl(value, -value).unwrap();
+                }
+            });
+            for _ in 0..2_000 {
+                // Every update keeps realized + unrealized at zero.
+                assert_eq!(metrics.snapshot(0).unwrap().current_pnl, Decimal::ZERO);
+            }
+        });
+    }
 
     fn poison(lock: &Arc<RwLock<Decimal>>) {
         let lock = Arc::clone(lock);
