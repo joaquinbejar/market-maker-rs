@@ -181,8 +181,7 @@
 //! - `events`: Enable event broadcasting system for real-time updates
 //! - `margin`: Use `margin-rs` in the backtest: its exact ledger as the fill
 //!   accountant (`backtest::MarginLedgerAccountant`) and its risk gate as the
-//!   pretrade policy (`backtest::MarginAccount`); `margin-rs` is a git
-//!   dependency until it is published
+//!   pretrade policy (`backtest::MarginAccount`)
 //! - `data-feeds`: Enable real-time market data feed abstractions
 //!
 //! ## Examples

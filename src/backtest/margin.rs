@@ -12,11 +12,24 @@
 //! Gate errors on lifecycle events are kept in [`MarginAccount::errors`];
 //! the gate trips itself on accounting breaches and execution anomalies, and
 //! then rejects every new order.
+//!
+//! Fees in the base asset: the gate reserves and checks them only when its
+//! limits declare `fee_asset: margin_rs::risk::FeeAsset::Base`; with the
+//! default (quote) declaration a base fee is booked from the free balance.
+//! The declaration that matches the backtest's
+//! `FeeCurrency::Base { scale }`, which rounds each fill half to even at
+//! `scale`, is `fee_rounding: FeeRounding::PerFill { mode:
+//! Rounding::HalfEven, min_fill: None }`, with `max_fee_rate` at least the
+//! fee rate and the base asset registered at `scale`. The default rounding
+//! (every fill rounded up) also never breaches, at the cost of a larger
+//! reservation. A fill outside the declaration is booked, recorded in
+//! [`MarginAccount::errors`] as a fee breach, and the gate rejects new
+//! orders on the instrument until `RiskGate::reset_fee_declaration`.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use margin_rs::ledger::{Execution, Side as LedgerSide, TransferKind};
+use margin_rs::ledger::{Execution, TransferKind};
 use margin_rs::risk::{
     FillReport, OrderPurpose as GateOrderPurpose, OrderRequest, RiskDecision, RiskGate,
 };
@@ -27,7 +40,7 @@ use crate::Decimal;
 use crate::risk::pretrade::{
     OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
 };
-use crate::types::action::Dir;
+use crate::types::action::{Action, Dir};
 use crate::types::error::{MMError, MMResult};
 
 #[derive(Debug)]
@@ -171,13 +184,6 @@ fn order_id(raw: &str) -> margin_rs::Result<OrderId> {
     OrderId::new(format!("sim-order-{raw}"))
 }
 
-fn ledger_side(dir: Dir) -> LedgerSide {
-    match dir {
-        Dir::Buy => LedgerSide::Buy,
-        Dir::Sell => LedgerSide::Sell,
-    }
-}
-
 /// [`PretradePolicy`] over a shared [`MarginAccount`].
 ///
 /// A fill whose side is neither buy nor sell latches a fault on the account
@@ -249,7 +255,7 @@ impl PretradePolicy for MarginRiskPolicy {
         let order = OrderRequest::new(
             id,
             shared.instrument.clone(),
-            ledger_side(dir),
+            Action::from(dir),
             price,
             request.quantity,
         )
@@ -366,7 +372,7 @@ impl PretradePolicy for MarginRiskPolicy {
                 let mut execution = Execution::new(
                     execution_id,
                     shared.instrument.clone(),
-                    ledger_side(dir),
+                    Action::from(dir),
                     *price,
                     *quantity,
                 );
@@ -383,10 +389,21 @@ impl PretradePolicy for MarginRiskPolicy {
                 let report = FillReport::new(execution, *cumulative_quantity);
                 let result = shared.gate.on_fill(&id, &report);
                 match result {
-                    Ok(outcome) if !outcome.is_clean() => shared
-                        .errors
-                        .push(format!("fill anomalies: {:?}", outcome.anomalies)),
-                    Ok(_) => {}
+                    Ok(outcome) => {
+                        if !outcome.is_clean() {
+                            shared.errors.push(format!(
+                                "fill anomalies: {:?}, shortfalls: {:?}",
+                                outcome.anomalies, outcome.shortfalls
+                            ));
+                        }
+                        // Not part of `is_clean`: the fill is booked, but
+                        // the gate now rejects new orders on the instrument.
+                        if !outcome.fee_breaches.is_empty() {
+                            shared
+                                .errors
+                                .push(format!("fee breaches: {:?}", outcome.fee_breaches));
+                        }
+                    }
                     Err(error) => shared.errors.push(format!("fill: {error}")),
                 }
             }

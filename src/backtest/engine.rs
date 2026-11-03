@@ -3379,6 +3379,19 @@ mod tests {
             assert_eq!(acc.snapshot().fills_posted, 0);
         }
 
+        #[test]
+        fn test_margin_ledger_unsupported_action_leaves_snapshot_unchanged() {
+            let mut acc = accountant(dec!(1000));
+            acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(0.1)))
+                .unwrap();
+            let before = acc.snapshot();
+            let mut fill = ask_fill(2, dec!(100), dec!(1), dec!(0.1));
+            fill.side = Action::Other;
+            assert!(acc.post_fill(&fill).is_err());
+            assert_eq!(acc.ledger().journal().len(), 1);
+            assert_eq!(acc.snapshot(), before);
+        }
+
         fn ask_fill(id: u64, price: Decimal, quantity: Decimal, fee: Decimal) -> AccountingFill {
             AccountingFill {
                 execution_id: id,
@@ -3499,7 +3512,7 @@ mod tests {
             let eth_buy = margin_rs::ledger::Execution::new(
                 margin_rs::ExecutionId::new("eth-1").unwrap(),
                 eth_pair,
-                margin_rs::ledger::Side::Buy,
+                margin_rs::Action::Buy,
                 dec!(100),
                 dec!(1),
             )
@@ -3944,10 +3957,18 @@ mod tests {
         use super::*;
         use crate::backtest::MarginAccount;
         use margin_rs::ledger::Ledger;
-        use margin_rs::risk::{InstrumentLimits, RiskGate};
-        use margin_rs::{Asset, InstrumentId, SpotInstrument, TransferId};
+        use margin_rs::risk::{FeeAsset as GateFeeAsset, FeeRounding, InstrumentLimits, RiskGate};
+        use margin_rs::{Asset, InstrumentId, Rounding, SpotInstrument, TransferId};
 
         fn account(max_position: Option<Decimal>) -> MarginAccount {
+            account_with(InstrumentLimits {
+                max_fee_rate: dec!(0.001),
+                max_position,
+                ..InstrumentLimits::default()
+            })
+        }
+
+        fn account_with(limits: InstrumentLimits) -> MarginAccount {
             let usdc = Asset::new("USDC").unwrap();
             let btc = Asset::new("BTC").unwrap();
             let pair = InstrumentId::new("BTC-USDC").unwrap();
@@ -3964,16 +3985,101 @@ mod tests {
                 .unwrap();
             gate.deposit(TransferId::new("seed-btc").unwrap(), btc, dec!(5))
                 .unwrap();
-            gate.set_limits(
-                &pair,
-                InstrumentLimits {
-                    max_fee_rate: dec!(0.001),
-                    max_position,
-                    ..InstrumentLimits::default()
-                },
-            )
-            .unwrap();
+            gate.set_limits(&pair, limits).unwrap();
             MarginAccount::new(gate, pair).unwrap()
+        }
+
+        /// Limits with fees declared in base, rounded per fill in `mode`,
+        /// at a rate whose fee on 1 BTC (1.5e-8) is not on the 8 digit grid.
+        fn base_fee_limits(mode: Rounding) -> InstrumentLimits {
+            InstrumentLimits {
+                max_fee_rate: dec!(0.000000015),
+                fee_asset: GateFeeAsset::Base,
+                fee_rounding: FeeRounding::PerFill {
+                    mode,
+                    min_fill: None,
+                },
+                ..InstrumentLimits::default()
+            }
+        }
+
+        fn base_fee_sell(policy: &mut impl PretradePolicy, id: &str) {
+            let request = PretradeRequest::new(
+                id,
+                Action::Sell,
+                Some(dec!(100)),
+                dec!(1),
+                OrderPurpose::Quote,
+                0,
+            );
+            assert!(!policy.check(&request).is_rejected());
+            // `FeeCurrency::Base { scale: 8 }` charges 1.5e-8 rounded half
+            // to even: 2e-8.
+            let fee = FeeCurrency::Base { scale: 8 }
+                .charge(dec!(100), dec!(1), dec!(0.000000015))
+                .unwrap()
+                .amount;
+            assert_eq!(fee, dec!(0.00000002));
+            policy
+                .on_order_event(&OrderEvent::Fill {
+                    order_id: id.to_string(),
+                    execution_id: format!("e-{id}"),
+                    side: Action::Sell,
+                    price: dec!(100),
+                    quantity: dec!(1),
+                    cumulative_quantity: dec!(1),
+                    fee,
+                    fee_asset: crate::types::fee::FeeAsset::Base,
+                    timestamp: 1,
+                })
+                .unwrap();
+        }
+
+        #[test]
+        fn test_margin_policy_base_fee_breach_is_recorded_and_rejects_next_order() {
+            // Declared toward zero (bound 1e-8), charged half to even (2e-8).
+            let account = account_with(base_fee_limits(Rounding::TowardZero));
+            let mut policy = account.policy();
+            base_fee_sell(&mut policy, "o-1");
+            let btc = Asset::new("BTC").unwrap();
+            assert!(account.with_gate(|gate| gate.ledger().fees_paid(&btc) == dec!(0.00000002)));
+            let errors = account.errors();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(errors[0].starts_with("fee breaches: "), "{errors:?}");
+            let pair = InstrumentId::new("BTC-USDC").unwrap();
+            assert_eq!(
+                account.with_gate(|gate| gate.fee_declaration_breaches(&pair).len()),
+                1
+            );
+            let next = PretradeRequest::new(
+                "o-2",
+                Action::Sell,
+                Some(dec!(100)),
+                dec!(1),
+                OrderPurpose::Quote,
+                0,
+            );
+            assert!(policy.check(&next).is_rejected());
+        }
+
+        #[test]
+        fn test_margin_policy_base_fee_matching_declaration_records_nothing() {
+            // Declared half to even, as `FeeCurrency::Base` charges.
+            let account = account_with(base_fee_limits(Rounding::HalfEven));
+            let mut policy = account.policy();
+            base_fee_sell(&mut policy, "o-1");
+            assert!(account.errors().is_empty(), "{:?}", account.errors());
+            let pair = InstrumentId::new("BTC-USDC").unwrap();
+            assert!(account.with_gate(|gate| gate.fee_declaration_breaches(&pair).is_empty()));
+            let next = PretradeRequest::new(
+                "o-2",
+                Action::Sell,
+                Some(dec!(100)),
+                dec!(1),
+                OrderPurpose::Quote,
+                0,
+            );
+            assert!(!policy.check(&next).is_rejected());
         }
 
         #[test]
