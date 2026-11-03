@@ -95,15 +95,23 @@ impl InventoryPosition {
         }
         // If increasing position, calculate weighted average
         else if new_quantity.abs() > self.quantity.abs() {
-            let total_cost = self
-                .quantity
-                .saturating_mul(self.avg_entry_price)
-                .saturating_add(fill_quantity.saturating_mul(fill_price));
-            // `new_quantity` is non zero here (its magnitude grew), so only
-            // an overflow can fail; keep the previous average in that case.
-            if let Some(avg) = total_cost.checked_div(new_quantity) {
-                self.avg_entry_price = avg;
-            }
+            // avg + (price - avg) * fill / new: no intermediate grows past
+            // the inputs, unlike the total cost. `new_quantity` is non zero
+            // here (its magnitude grew), so only an overflow can fail.
+            let old_avg = self.avg_entry_price;
+            let weighted = fill_price.checked_sub(old_avg).and_then(|diff| {
+                diff.checked_mul(fill_quantity)
+                    .and_then(|v| v.checked_div(new_quantity))
+                    // `fill / new` is in (0, 1] here, so this form cannot
+                    // overflow where the product above did.
+                    .or_else(|| diff.checked_mul(fill_quantity.checked_div(new_quantity)?))
+            });
+            self.avg_entry_price = match weighted.and_then(|w| old_avg.checked_add(w)) {
+                Some(avg) => avg,
+                // Last resort: the price difference itself overflows, so the
+                // average saturates toward the fill price.
+                None => old_avg.saturating_add(fill_price.saturating_sub(old_avg)),
+            };
         }
         // If reducing position, keep same avg price
         // (realized PnL is calculated separately)
@@ -163,6 +171,17 @@ impl Default for InventoryPosition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_fill_huge_values_average_without_overflow() {
+        // quantity * price overflows the total cost form, but the average
+        // of two fills at the same huge price is that price.
+        let mut position = InventoryPosition::new();
+        position.update_fill(dec!(1_000_000_000_000), Decimal::MAX / dec!(2), 1);
+        position.update_fill(dec!(1_000_000_000_000), Decimal::MAX / dec!(2), 2);
+        assert_eq!(position.avg_entry_price, Decimal::MAX / dec!(2));
+        assert_eq!(position.quantity, dec!(2_000_000_000_000));
+    }
     use crate::dec;
 
     #[test]
