@@ -4,7 +4,7 @@
 //! market microstructure signals like order book depth imbalance and trade flow.
 
 use crate::Decimal;
-use crate::types::decimal::OrOverflow;
+use crate::types::decimal::{OrOverflow, imbalance_ratio};
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -56,15 +56,12 @@ impl OrderBookImbalance {
     /// * `ask_depth` - Total ask depth in units
     /// * `levels` - Number of price levels analyzed
     ///
-    /// A derived signal: depths beyond the `Decimal` bounds saturate.
+    /// The imbalance is invariant under a common scale of the depths, even
+    /// when their sum is beyond the `Decimal` bounds.
     #[must_use]
     pub fn new(bid_depth: Decimal, ask_depth: Decimal, levels: u32) -> Self {
-        let total = bid_depth.saturating_add(ask_depth);
-        let imbalance = if total > Decimal::ZERO {
-            bid_depth
-                .saturating_sub(ask_depth)
-                .checked_div(total)
-                .unwrap_or(Decimal::ZERO)
+        let imbalance = if bid_depth.saturating_add(ask_depth) > Decimal::ZERO {
+            imbalance_ratio(bid_depth, ask_depth)
         } else {
             Decimal::ZERO
         };
@@ -143,13 +140,14 @@ impl TradeFlowImbalance {
     /// * `buy_volume` - Total buy volume in window
     /// * `sell_volume` - Total sell volume in window
     ///
-    /// A derived signal: volumes beyond the `Decimal` bounds saturate.
+    /// The imbalance is invariant under a common scale of the volumes, even
+    /// when their sum is beyond the `Decimal` bounds; `net_flow` is a
+    /// report value that saturates.
     #[must_use]
     pub fn new(buy_volume: Decimal, sell_volume: Decimal) -> Self {
         let net_flow = buy_volume.saturating_sub(sell_volume);
-        let total = buy_volume.saturating_add(sell_volume);
-        let imbalance = if total > Decimal::ZERO {
-            net_flow.checked_div(total).unwrap_or(Decimal::ZERO)
+        let imbalance = if buy_volume.saturating_add(sell_volume) > Decimal::ZERO {
+            imbalance_ratio(buy_volume, sell_volume)
         } else {
             Decimal::ZERO
         };
@@ -458,37 +456,42 @@ impl AdaptiveSpreadCalculator {
     ///     (dec!(102.0), dec!(25.0)),
     /// ];
     ///
-    /// let imbalance = AdaptiveSpreadCalculator::calculate_orderbook_imbalance(&bids, &asks, 2);
+    /// let imbalance = AdaptiveSpreadCalculator::calculate_orderbook_imbalance(&bids, &asks, 2).unwrap();
     /// // bid_depth = 30, ask_depth = 40
     /// // imbalance = (30 - 40) / (30 + 40) = -0.142...
     /// assert!(imbalance.imbalance < dec!(0.0));
     /// ```
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if a side's depth overflows: a
+    /// saturated depth would distort the signal.
     pub fn calculate_orderbook_imbalance(
         bid_depths: &[(Decimal, Decimal)],
         ask_depths: &[(Decimal, Decimal)],
         levels: u32,
-    ) -> OrderBookImbalance {
+    ) -> MMResult<OrderBookImbalance> {
         let levels_usize = if levels == 0 {
             usize::MAX
         } else {
             usize::try_from(levels).unwrap_or(usize::MAX)
         };
 
-        // Derived depths: they saturate at the `Decimal` bounds.
+        // A saturated depth would distort the signal, so the sums are checked.
         let depth = |levels: &[(Decimal, Decimal)]| {
             levels
                 .iter()
                 .take(levels_usize)
-                .fold(Decimal::ZERO, |acc, (_, size)| acc.saturating_add(*size))
+                .try_fold(Decimal::ZERO, |acc, (_, size)| acc.checked_add(*size))
+                .or_overflow("book depth")
         };
-        let bid_depth = depth(bid_depths);
-        let ask_depth = depth(ask_depths);
+        let bid_depth = depth(bid_depths)?;
+        let ask_depth = depth(ask_depths)?;
 
         let actual_levels = u32::try_from(bid_depths.len().min(ask_depths.len()).min(levels_usize))
             .unwrap_or(u32::MAX);
 
-        OrderBookImbalance::new(bid_depth, ask_depth, actual_levels)
+        Ok(OrderBookImbalance::new(bid_depth, ask_depth, actual_levels))
     }
 
     /// Calculates volume-weighted order book imbalance.
@@ -566,34 +569,37 @@ impl AdaptiveSpreadCalculator {
     ///     Trade::new(dec!(100.0), dec!(8.0), false, 2000),  // buy
     /// ];
     ///
-    /// let flow = AdaptiveSpreadCalculator::calculate_tradeflow_imbalance(&trades, 5000, 3000);
+    /// let flow = AdaptiveSpreadCalculator::calculate_tradeflow_imbalance(&trades, 5000, 3000).unwrap();
     /// // buy_volume = 18, sell_volume = 5
     /// assert!(flow.is_buy_dominated());
     /// ```
     ///
-    /// The volumes are derived values: they saturate at the `Decimal` bounds.
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if a side's volume overflows:
+    /// a saturated volume would distort the signal.
     pub fn calculate_tradeflow_imbalance(
         trades: &[Trade],
         window_ms: u64,
         current_time: u64,
-    ) -> TradeFlowImbalance {
+    ) -> MMResult<TradeFlowImbalance> {
         let cutoff = current_time.saturating_sub(window_ms);
 
-        let (buy_volume, sell_volume) = trades.iter().filter(|t| t.timestamp >= cutoff).fold(
-            (Decimal::ZERO, Decimal::ZERO),
-            |(buy, sell), trade| {
-                if trade.is_buyer_maker {
+        let (buy_volume, sell_volume) = trades
+            .iter()
+            .filter(|t| t.timestamp >= cutoff)
+            .try_fold((Decimal::ZERO, Decimal::ZERO), |(buy, sell), trade| {
+                Some(if trade.is_buyer_maker {
                     // Seller was aggressor (market sell)
-                    (buy, sell.saturating_add(trade.size))
+                    (buy, sell.checked_add(trade.size)?)
                 } else {
                     // Buyer was aggressor (market buy)
-                    (buy.saturating_add(trade.size), sell)
-                }
-            },
-        );
+                    (buy.checked_add(trade.size)?, sell)
+                })
+            })
+            .or_overflow("trade flow volume")?;
 
-        TradeFlowImbalance::new(buy_volume, sell_volume)
+        Ok(TradeFlowImbalance::new(buy_volume, sell_volume))
     }
 
     /// Calculates adaptive spread based on imbalances.
@@ -905,7 +911,8 @@ mod tests {
         let bids = vec![(dec!(100.0), dec!(10.0)), (dec!(99.0), dec!(20.0))];
         let asks = vec![(dec!(101.0), dec!(15.0)), (dec!(102.0), dec!(25.0))];
 
-        let imbalance = AdaptiveSpreadCalculator::calculate_orderbook_imbalance(&bids, &asks, 2);
+        let imbalance =
+            AdaptiveSpreadCalculator::calculate_orderbook_imbalance(&bids, &asks, 2).unwrap();
 
         assert_eq!(imbalance.bid_depth, dec!(30.0));
         assert_eq!(imbalance.ask_depth, dec!(40.0));
@@ -926,7 +933,8 @@ mod tests {
             (dec!(103.0), dec!(35.0)),
         ];
 
-        let imbalance = AdaptiveSpreadCalculator::calculate_orderbook_imbalance(&bids, &asks, 1);
+        let imbalance =
+            AdaptiveSpreadCalculator::calculate_orderbook_imbalance(&bids, &asks, 1).unwrap();
 
         assert_eq!(imbalance.bid_depth, dec!(10.0));
         assert_eq!(imbalance.ask_depth, dec!(15.0));
@@ -940,7 +948,8 @@ mod tests {
             Trade::new(dec!(100.0), dec!(8.0), false, 2000),  // buy
         ];
 
-        let flow = AdaptiveSpreadCalculator::calculate_tradeflow_imbalance(&trades, 5000, 3000);
+        let flow =
+            AdaptiveSpreadCalculator::calculate_tradeflow_imbalance(&trades, 5000, 3000).unwrap();
 
         assert_eq!(flow.buy_volume, dec!(18.0));
         assert_eq!(flow.sell_volume, dec!(5.0));
@@ -955,7 +964,8 @@ mod tests {
             Trade::new(dec!(100.0), dec!(8.0), false, 2800),  // inside window
         ];
 
-        let flow = AdaptiveSpreadCalculator::calculate_tradeflow_imbalance(&trades, 1000, 3000);
+        let flow =
+            AdaptiveSpreadCalculator::calculate_tradeflow_imbalance(&trades, 1000, 3000).unwrap();
 
         // Only trades from 2000-3000 should be included
         assert_eq!(flow.buy_volume, dec!(8.0));

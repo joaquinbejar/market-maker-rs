@@ -720,10 +720,7 @@ impl OrderBookSnapshot {
         let ask_depth = self.ask_depth();
         let total = bid_depth.saturating_add(ask_depth);
         if total > Decimal::ZERO {
-            bid_depth
-                .saturating_sub(ask_depth)
-                .checked_div(total)
-                .unwrap_or(Decimal::ZERO)
+            crate::types::decimal::imbalance_ratio(bid_depth, ask_depth)
         } else {
             Decimal::ZERO
         }

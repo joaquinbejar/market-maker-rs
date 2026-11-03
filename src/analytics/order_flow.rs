@@ -398,7 +398,7 @@ impl OrderFlowAnalyzer {
         let total_volume = buy_volume.saturating_add(sell_volume);
         let net_flow = buy_volume.saturating_sub(sell_volume);
         let imbalance = if total_volume > Decimal::ZERO {
-            net_flow.checked_div(total_volume).unwrap_or(Decimal::ZERO)
+            crate::types::decimal::imbalance_ratio(buy_volume, sell_volume)
         } else {
             Decimal::ZERO
         };
