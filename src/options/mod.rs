@@ -52,6 +52,12 @@ pub mod greeks;
 /// Options-specific market making functionality.
 pub mod market_maker;
 
+/// European option valuation on a volatility surface.
+pub mod pricing;
+
+/// The complementary error function and the normal distribution.
+mod special;
+
 /// Greeks-based risk management.
 pub mod risk_manager;
 
@@ -64,6 +70,10 @@ pub use greeks::{PortfolioGreeks, PositionGreeks};
 pub use market_maker::{
     GreeksLimits, HedgeOrder, HedgeType, OptionsMarketMaker, OptionsMarketMakerConfig,
     OptionsMarketMakerImpl,
+};
+pub use pricing::{
+    Dynamics, OptionInputs, OptionPricer, OptionValuation, PRICING_YEAR_DAYS, SurfacePricer,
+    black_undiscounted, black_w, tau_from_days,
 };
 pub use risk_manager::{
     AutoHedger, AutoHedgerConfig, GreeksCircuitBreaker, GreeksCircuitBreakerConfig,

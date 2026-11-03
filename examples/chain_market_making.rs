@@ -6,9 +6,12 @@
 //! Run with: `cargo run --example chain_market_making --features chain`
 
 use market_maker_rs::chain::{
-    ChainMarketMaker, ChainMarketMakerConfig, ChainRiskLimits, ChainRiskManager,
+    ChainMarketMaker, ChainMarketMakerConfig, ChainPricing, ChainQuoteOutcome, ChainRiskLimits,
+    ChainRiskManager,
 };
-use market_maker_rs::options::PositionGreeks;
+use market_maker_rs::options::{
+    Dynamics, FlatSurface, PositionGreeks, SurfacePricer, tau_from_days,
+};
 use option_chain_orderbook::orderbook::ExpirationOrderBook;
 use optionstratlib::model::ExpirationDate;
 use optionstratlib::prelude::pos_or_panic;
@@ -82,29 +85,48 @@ fn main() {
     println!("  Strike Count: {}", market_maker.strike_count());
     println!();
 
+    // Valuation inputs for this expiration: a flat 60 % implied volatility,
+    // sticky moneyness, no rates, 30 days to expiry.
+    let surface = FlatSurface::new(dec!(0.6)).expect("valid volatility");
+    let pricer =
+        SurfacePricer::new(Arc::new(surface), Dynamics::StickyMoneyness).expect("valid dynamics");
+    let tau = tau_from_days(dec!(30)).expect("valid time to expiry");
+    let pricing = ChainPricing::new(Arc::new(pricer), tau, dec!(0.0), dec!(0.0))
+        .expect("valid pricing inputs");
+
     // Refresh all quotes
     println!("=== Quote Generation ===\n");
 
-    let quotes = market_maker
-        .refresh_all_quotes(underlying_price)
+    let outcomes = market_maker
+        .refresh_all_quotes(underlying_price, &pricing)
         .expect("Failed to refresh quotes");
 
-    println!("Generated {} quotes:", quotes.len());
+    println!("Generated {} outcomes:", outcomes.len());
     println!();
 
-    for quote in &quotes {
-        let is_atm = quote.strike == atm_strike;
-        let atm_marker = if is_atm { " (ATM)" } else { "" };
+    for outcome in &outcomes {
+        match outcome {
+            ChainQuoteOutcome::Quote(quote) => {
+                let is_atm = quote.strike == atm_strike;
+                let atm_marker = if is_atm { " (ATM)" } else { "" };
 
-        println!("  ${} {:?}{}:", quote.strike, quote.style, atm_marker);
-        println!(
-            "    Bid: ${} x {}  |  Ask: ${} x {}",
-            quote.bid_price, quote.bid_size, quote.ask_price, quote.ask_size
-        );
-        println!(
-            "    Theo: ${}  |  Spread: {} bps",
-            quote.theo, quote.spread_bps
-        );
+                println!("  ${} {:?}{}:", quote.strike, quote.style, atm_marker);
+                println!(
+                    "    Bid: ${} x {}  |  Ask: ${} x {}",
+                    quote.bid_price, quote.bid_size, quote.ask_price, quote.ask_size
+                );
+                println!(
+                    "    Theo: ${} (model {:.4})  |  Spread: {} bps  |  Delta: {:.4}",
+                    quote.theo, quote.valuation.price, quote.spread_bps, quote.valuation.delta
+                );
+            }
+            ChainQuoteOutcome::NotQuoted {
+                strike,
+                style,
+                reason,
+            } => println!("  ${strike} {style:?}: not quoted ({reason})"),
+            _ => println!("  unknown outcome"),
+        }
     }
     println!();
 
@@ -113,7 +135,9 @@ fn main() {
 
     for strike in &strikes {
         let is_atm = *strike == atm_strike;
-        let multiplier = market_maker.get_spread_multiplier(*strike, underlying_price, is_atm);
+        let multiplier = market_maker
+            .get_spread_multiplier(*strike, underlying_price, is_atm)
+            .expect("valid spread multiplier");
         println!(
             "  ${}: {:.2}x {}",
             strike,

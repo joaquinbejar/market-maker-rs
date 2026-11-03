@@ -23,8 +23,10 @@
 //! let chain = ExpirationOrderBook::new("BTC", expiration);
 //! let mm = ChainMarketMaker::new(chain, config);
 //!
-//! // Refresh all quotes
-//! let updates = mm.refresh_all_quotes(underlying_price)?;
+//! // Valuation inputs for this expiration, then one outcome per contract
+//! let pricer = SurfacePricer::new(Arc::new(FlatSurface::new(dec!(0.6))?), Dynamics::StickyMoneyness)?;
+//! let pricing = ChainPricing::new(Arc::new(pricer), tau_from_days(dec!(30))?, dec!(0), dec!(0))?;
+//! let outcomes = mm.refresh_all_quotes(underlying_price, &pricing)?;
 //! ```
 
 /// Chain market maker implementation.
@@ -33,5 +35,8 @@ pub mod market_maker;
 /// Chain risk management.
 pub mod risk;
 
-pub use market_maker::{ChainMarketMaker, ChainMarketMakerConfig, ChainQuoteUpdate, RiskStatus};
+pub use market_maker::{
+    ChainMarketMaker, ChainMarketMakerConfig, ChainPricing, ChainQuoteOutcome, ChainQuoteUpdate,
+    RiskStatus,
+};
 pub use risk::{ChainRiskLimits, ChainRiskManager};

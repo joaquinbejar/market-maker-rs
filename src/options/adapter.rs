@@ -13,6 +13,12 @@ use optionstratlib::model::option::Options;
 use optionstratlib::pricing::black_scholes_model::black_scholes;
 use rust_decimal_macros::dec;
 
+/// Milliseconds in the year used by the ms helpers of [`OptionsAdapter`]
+/// (365.25 days). Option valuation in [`crate::options::pricing`] uses
+/// [`crate::options::pricing::PRICING_YEAR_DAYS`] (365 days) instead; the
+/// two are different conventions and are not interchangeable.
+pub const ADAPTER_MS_PER_YEAR: Decimal = dec!(31557600000);
+
 /// Adapter for OptionStratLib integration.
 ///
 /// Provides static methods for calculating Greeks, theoretical values,
@@ -103,12 +109,12 @@ impl OptionsAdapter {
             Ok(y) => y.to_dec(),
             Err(_) => return 0,
         };
-        // Convert years to milliseconds: years * 365.25 * 24 * 60 * 60 * 1000
-        let ms_per_year = dec!(31557600000.0); // 365.25 * 24 * 60 * 60 * 1000
-        let ms = years * ms_per_year;
-
-        // Convert to u64, handling potential overflow
-        crate::types::decimal::decimal_to_u64_saturating(ms)
+        // Years to milliseconds at 365.25 days a year; an overflow saturates,
+        // like the conversion to u64.
+        match years.checked_mul(ADAPTER_MS_PER_YEAR) {
+            Some(ms) => crate::types::decimal::decimal_to_u64_saturating(ms),
+            None => u64::MAX,
+        }
     }
 
     /// Converts milliseconds to years for use with OptionStratLib.
@@ -122,9 +128,8 @@ impl OptionsAdapter {
     /// Time in years as Decimal.
     #[must_use]
     pub fn ms_to_years(ms: u64) -> Decimal {
-        let ms_decimal = Decimal::from(ms);
-        let ms_per_year = dec!(31557600000.0); // 365.25 * 24 * 60 * 60 * 1000
-        ms_decimal / ms_per_year
+        // A u64 divided by a positive constant above 1 cannot overflow.
+        Decimal::from(ms) / ADAPTER_MS_PER_YEAR
     }
 
     /// Calculates the moneyness of an option.
