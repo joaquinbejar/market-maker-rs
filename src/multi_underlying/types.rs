@@ -50,11 +50,7 @@ impl CorrelationEntry {
     /// Returns the absolute correlation value.
     #[must_use]
     pub fn abs_correlation(&self) -> Decimal {
-        if self.correlation < Decimal::ZERO {
-            -self.correlation
-        } else {
-            self.correlation
-        }
+        self.correlation.abs()
     }
 }
 
@@ -106,25 +102,34 @@ impl UnderlyingState {
     }
 
     /// Returns the total P&L.
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn total_pnl(&self) -> Decimal {
-        self.unrealized_pnl + self.realized_pnl
+        self.unrealized_pnl.saturating_add(self.realized_pnl)
     }
 
     /// Returns the capital utilization percentage.
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn capital_utilization(&self) -> Decimal {
         if self.allocated_capital > Decimal::ZERO {
-            self.position_value / self.allocated_capital * Decimal::from(100)
+            self.position_value
+                .checked_div(self.allocated_capital)
+                .unwrap_or(Decimal::MAX)
+                .saturating_mul(Decimal::ONE_HUNDRED)
         } else {
             Decimal::ZERO
         }
     }
 
     /// Returns the dollar delta.
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn dollar_delta(&self) -> Decimal {
-        self.delta * self.price
+        self.delta.saturating_mul(self.price)
     }
 
     /// Updates the price.

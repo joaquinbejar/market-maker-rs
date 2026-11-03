@@ -433,6 +433,8 @@ impl LimitsPolicy {
     fn signed(dir: Dir, quantity: Decimal) -> Decimal {
         match dir {
             Dir::Buy => quantity,
+            // Negating a Decimal flips its sign bit: it cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
             Dir::Sell => -quantity,
         }
     }

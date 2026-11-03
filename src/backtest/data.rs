@@ -22,6 +22,7 @@
 //! ```
 
 use crate::Decimal;
+use crate::types::decimal::saturating_midpoint;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -103,40 +104,56 @@ impl MarketTick {
     }
 
     /// Returns the mid price.
+    ///
+    /// A derived value: a sum beyond the `Decimal` bounds saturates.
     #[must_use]
     pub fn mid_price(&self) -> Decimal {
-        (self.bid_price + self.ask_price) / Decimal::TWO
+        saturating_midpoint(self.bid_price, self.ask_price)
     }
 
     /// Returns the bid-ask spread.
+    ///
+    /// A derived value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn spread(&self) -> Decimal {
-        self.ask_price - self.bid_price
+        self.ask_price.saturating_sub(self.bid_price)
     }
 
     /// Returns the spread as a percentage of mid price.
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();
         if mid > Decimal::ZERO {
-            (self.spread() / mid) * Decimal::from(10000)
+            self.spread()
+                .checked_div(mid)
+                .unwrap_or(Decimal::ZERO)
+                .saturating_mul(Decimal::from(10000))
         } else {
             Decimal::ZERO
         }
     }
 
     /// Returns the total available liquidity (bid + ask size).
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn total_liquidity(&self) -> Decimal {
-        self.bid_size + self.ask_size
+        self.bid_size.saturating_add(self.ask_size)
     }
 
     /// Returns the imbalance ratio: (bid_size - ask_size) / (bid_size + ask_size).
+    ///
+    /// A derived report value; zero when there is no liquidity.
     #[must_use]
     pub fn imbalance(&self) -> Decimal {
         let total = self.total_liquidity();
         if total > Decimal::ZERO {
-            (self.bid_size - self.ask_size) / total
+            self.bid_size
+                .saturating_sub(self.ask_size)
+                .checked_div(total)
+                .unwrap_or(Decimal::ZERO)
         } else {
             Decimal::ZERO
         }
@@ -202,18 +219,22 @@ impl OHLCVBar {
     }
 
     /// Returns the price range (high - low).
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn range(&self) -> Decimal {
-        self.high - self.low
+        self.high.saturating_sub(self.low)
     }
 
     /// Returns the body size (|close - open|).
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn body(&self) -> Decimal {
         if self.close > self.open {
-            self.close - self.open
+            self.close.saturating_sub(self.open)
         } else {
-            self.open - self.close
+            self.open.saturating_sub(self.close)
         }
     }
 
@@ -230,9 +251,15 @@ impl OHLCVBar {
     }
 
     /// Returns the typical price (high + low + close) / 3.
+    ///
+    /// A derived report value: a sum beyond the `Decimal` bounds saturates.
     #[must_use]
     pub fn typical_price(&self) -> Decimal {
-        (self.high + self.low + self.close) / Decimal::from(3)
+        self.high
+            .saturating_add(self.low)
+            .saturating_add(self.close)
+            .checked_div(Decimal::from(3))
+            .unwrap_or(Decimal::ZERO)
     }
 
     /// Returns the VWAP approximation using typical price.

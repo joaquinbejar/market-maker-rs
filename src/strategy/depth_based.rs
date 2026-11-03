@@ -23,6 +23,8 @@
 //! ```
 
 use crate::Decimal;
+use crate::types::decimal::OrOverflow;
+use crate::types::error::MMResult;
 
 /// Type alias for price.
 pub type Price = Decimal;
@@ -96,12 +98,17 @@ impl DepthBasedOffering {
     /// use market_maker_rs::dec;
     ///
     /// let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
-    /// let ask_size = strategy.calculate_ask_size(dec!(20.0)); // Long 20 units
+    /// let ask_size = strategy.calculate_ask_size(dec!(20.0)).unwrap(); // Long 20 units
     /// assert_eq!(ask_size, dec!(120.0)); // Sell more to reduce position
     /// ```
-    #[must_use]
-    pub fn calculate_ask_size(&self, inventory_position: Decimal) -> Amount {
-        self.max_exposure + inventory_position
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::types::error::MMError::NumericalError`] if the size overflows.
+    pub fn calculate_ask_size(&self, inventory_position: Decimal) -> MMResult<Amount> {
+        self.max_exposure
+            .checked_add(inventory_position)
+            .or_overflow("depth-based ask size")
     }
 
     /// Calculates order size for bids based on inventory.
@@ -121,12 +128,17 @@ impl DepthBasedOffering {
     /// use market_maker_rs::dec;
     ///
     /// let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
-    /// let bid_size = strategy.calculate_bid_size(dec!(20.0)); // Long 20 units
+    /// let bid_size = strategy.calculate_bid_size(dec!(20.0)).unwrap(); // Long 20 units
     /// assert_eq!(bid_size, dec!(80.0)); // Buy less to avoid increasing position
     /// ```
-    #[must_use]
-    pub fn calculate_bid_size(&self, inventory_position: Decimal) -> Amount {
-        self.max_exposure - inventory_position
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::types::error::MMError::NumericalError`] if the size overflows.
+    pub fn calculate_bid_size(&self, inventory_position: Decimal) -> MMResult<Amount> {
+        self.max_exposure
+            .checked_sub(inventory_position)
+            .or_overflow("depth-based bid size")
     }
 
     /// Suggests optimal price adjustment based on target depth.
@@ -152,7 +164,10 @@ impl DepthBasedOffering {
     ) -> Decimal {
         if cumulative_depth_at_level >= self.target_depth {
             if is_ask {
-                -tick_size // Place inside (lower) for asks
+                // Negating a Decimal flips its sign bit: it cannot overflow.
+                #[allow(clippy::arithmetic_side_effects)]
+                let inside = -tick_size; // Place inside (lower) for asks
+                inside
             } else {
                 tick_size // Place inside (higher) for bids
             }
@@ -168,6 +183,21 @@ mod tests {
     use crate::dec;
 
     #[test]
+    fn test_sizes_overflow_returns_numerical_error() {
+        let strategy = DepthBasedOffering::new(Decimal::MAX, dec!(50.0));
+        let ask = strategy.calculate_ask_size(Decimal::ONE);
+        assert!(
+            matches!(ask, Err(crate::types::error::MMError::NumericalError(_))),
+            "{ask:?}"
+        );
+        let bid = strategy.calculate_bid_size(Decimal::NEGATIVE_ONE);
+        assert!(
+            matches!(bid, Err(crate::types::error::MMError::NumericalError(_))),
+            "{bid:?}"
+        );
+    }
+
+    #[test]
     fn test_depth_based_offering_creation() {
         let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
         assert_eq!(strategy.max_exposure(), dec!(100.0));
@@ -177,14 +207,14 @@ mod tests {
     #[test]
     fn test_calculate_ask_size_flat_inventory() {
         let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
-        let ask_size = strategy.calculate_ask_size(Decimal::ZERO);
+        let ask_size = strategy.calculate_ask_size(Decimal::ZERO).unwrap();
         assert_eq!(ask_size, dec!(100.0));
     }
 
     #[test]
     fn test_calculate_ask_size_long_inventory() {
         let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
-        let ask_size = strategy.calculate_ask_size(dec!(20.0));
+        let ask_size = strategy.calculate_ask_size(dec!(20.0)).unwrap();
         // With long position, ask size increases to reduce exposure
         assert_eq!(ask_size, dec!(120.0));
     }
@@ -192,7 +222,7 @@ mod tests {
     #[test]
     fn test_calculate_ask_size_short_inventory() {
         let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
-        let ask_size = strategy.calculate_ask_size(dec!(-20.0));
+        let ask_size = strategy.calculate_ask_size(dec!(-20.0)).unwrap();
         // With short position, ask size decreases
         assert_eq!(ask_size, dec!(80.0));
     }
@@ -200,14 +230,14 @@ mod tests {
     #[test]
     fn test_calculate_bid_size_flat_inventory() {
         let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
-        let bid_size = strategy.calculate_bid_size(Decimal::ZERO);
+        let bid_size = strategy.calculate_bid_size(Decimal::ZERO).unwrap();
         assert_eq!(bid_size, dec!(100.0));
     }
 
     #[test]
     fn test_calculate_bid_size_long_inventory() {
         let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
-        let bid_size = strategy.calculate_bid_size(dec!(20.0));
+        let bid_size = strategy.calculate_bid_size(dec!(20.0)).unwrap();
         // With long position, bid size decreases to avoid increasing exposure
         assert_eq!(bid_size, dec!(80.0));
     }
@@ -215,7 +245,7 @@ mod tests {
     #[test]
     fn test_calculate_bid_size_short_inventory() {
         let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
-        let bid_size = strategy.calculate_bid_size(dec!(-20.0));
+        let bid_size = strategy.calculate_bid_size(dec!(-20.0)).unwrap();
         // With short position, bid size increases to reduce exposure
         assert_eq!(bid_size, dec!(120.0));
     }
@@ -251,13 +281,13 @@ mod tests {
         let strategy = DepthBasedOffering::new(dec!(100.0), dec!(50.0));
 
         // Ask size + Bid size should equal 2 * max_exposure when flat
-        let ask = strategy.calculate_ask_size(Decimal::ZERO);
-        let bid = strategy.calculate_bid_size(Decimal::ZERO);
+        let ask = strategy.calculate_ask_size(Decimal::ZERO).unwrap();
+        let bid = strategy.calculate_bid_size(Decimal::ZERO).unwrap();
         assert_eq!(ask + bid, dec!(200.0));
 
         // Should still hold with inventory
-        let ask = strategy.calculate_ask_size(dec!(30.0));
-        let bid = strategy.calculate_bid_size(dec!(30.0));
+        let ask = strategy.calculate_ask_size(dec!(30.0)).unwrap();
+        let bid = strategy.calculate_bid_size(dec!(30.0)).unwrap();
         assert_eq!(ask + bid, dec!(200.0));
     }
 }

@@ -262,7 +262,10 @@ impl MetricsSnapshot {
         if self.orders_submitted == 0 {
             return Decimal::ZERO;
         }
-        Decimal::from(self.orders_rejected) / Decimal::from(self.orders_submitted)
+        // A `u64` count over a nonzero `u64` count cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
+        let rate = Decimal::from(self.orders_rejected) / Decimal::from(self.orders_submitted);
+        rate
     }
 
     /// Returns the partial fill rate (partial fills / total fills).
@@ -271,7 +274,10 @@ impl MetricsSnapshot {
         if self.orders_filled == 0 {
             return Decimal::ZERO;
         }
-        Decimal::from(self.partial_fills) / Decimal::from(self.orders_filled)
+        // A `u64` count over a nonzero `u64` count cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
+        let rate = Decimal::from(self.partial_fills) / Decimal::from(self.orders_filled);
+        rate
     }
 }
 
@@ -557,13 +563,16 @@ impl LiveMetrics {
         let orders_filled = self.orders_filled.get();
         let orders_cancelled = self.orders_cancelled.get();
 
-        // Calculate rates
+        // Calculate rates. A `u64` count over a nonzero `u64` count cannot
+        // overflow, and every divisor below is checked nonzero first.
+        #[allow(clippy::arithmetic_side_effects)]
         let fill_rate = if quotes_generated > 0 {
             Decimal::from(orders_filled) / Decimal::from(quotes_generated)
         } else {
             Decimal::ZERO
         };
 
+        #[allow(clippy::arithmetic_side_effects)]
         let cancel_rate = if orders_submitted > 0 {
             Decimal::from(orders_cancelled) / Decimal::from(orders_submitted)
         } else {
@@ -572,11 +581,17 @@ impl LiveMetrics {
 
         // Per-second rates (uptime in ms, so multiply by 1000)
         let (quotes_per_second, fills_per_second) = if uptime_ms > 0 {
-            let seconds = Decimal::from(uptime_ms) / Decimal::from(1000u64);
-            (
-                Decimal::from(quotes_generated) / seconds,
-                Decimal::from(orders_filled) / seconds,
-            )
+            // `uptime_ms >= 1`, so `seconds >= 0.001` and a `u64` count over
+            // it stays below `Decimal::MAX`.
+            #[allow(clippy::arithmetic_side_effects)]
+            let rates = {
+                let seconds = Decimal::from(uptime_ms) / Decimal::from(1000u64);
+                (
+                    Decimal::from(quotes_generated) / seconds,
+                    Decimal::from(orders_filled) / seconds,
+                )
+            };
+            rates
         } else {
             (Decimal::ZERO, Decimal::ZERO)
         };

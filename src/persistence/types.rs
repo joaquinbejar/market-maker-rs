@@ -75,17 +75,21 @@ impl Fill {
     }
 
     /// Returns the notional value.
+    ///
+    /// A derived record value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.quantity
+        self.price.saturating_mul(self.quantity)
     }
 
     /// Returns the net value after fees.
+    ///
+    /// A derived record value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn net_value(&self) -> Decimal {
         match self.side {
-            FillSide::Buy => self.notional() + self.fee,
-            FillSide::Sell => self.notional() - self.fee,
+            FillSide::Buy => self.notional().saturating_add(self.fee),
+            FillSide::Sell => self.notional().saturating_sub(self.fee),
         }
     }
 }
@@ -131,7 +135,10 @@ impl PositionSnapshot {
         avg_price: Decimal,
         market_price: Decimal,
     ) -> Self {
-        let unrealized_pnl = (market_price - avg_price) * quantity;
+        // A derived record value: it saturates at the `Decimal` bounds.
+        let unrealized_pnl = market_price
+            .saturating_sub(avg_price)
+            .saturating_mul(quantity);
         Self {
             id: generate_id(),
             symbol: symbol.into(),
@@ -159,9 +166,11 @@ impl PositionSnapshot {
     }
 
     /// Returns the total P&L.
+    ///
+    /// A derived record value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn total_pnl(&self) -> Decimal {
-        self.unrealized_pnl + self.realized_pnl
+        self.unrealized_pnl.saturating_add(self.realized_pnl)
     }
 }
 
@@ -204,7 +213,8 @@ impl DailyPnL {
             symbol: symbol.into(),
             realized_pnl,
             unrealized_pnl,
-            total_pnl: realized_pnl + unrealized_pnl,
+            // A derived record value: it saturates at the `Decimal` bounds.
+            total_pnl: realized_pnl.saturating_add(unrealized_pnl),
             trade_count: 0,
             volume: Decimal::ZERO,
             timestamp: current_timestamp(),

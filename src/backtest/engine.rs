@@ -79,6 +79,7 @@ use crate::risk::pretrade::{
 };
 use crate::strategy::quote::Quote;
 use crate::types::action::Dir;
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal_macros::dec;
 
@@ -166,17 +167,20 @@ impl SimulatedFill {
 
     /// Change of the base asset held: the signed quantity minus the base
     /// fee (a buy receives `quantity - base_fee`, a sell delivers
-    /// `quantity + base_fee`). Saturates instead of overflowing.
+    /// `quantity + base_fee`).
     ///
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`] if the side is neither buy
-    /// nor sell.
+    /// nor sell, or [`MMError::NumericalError`] if the delta overflows.
     pub fn base_delta(&self) -> MMResult<Decimal> {
-        Ok(match Dir::try_from(self.side)? {
-            Dir::Buy => self.quantity.saturating_sub(self.base_fee),
-            Dir::Sell => -self.quantity.saturating_add(self.base_fee),
-        })
+        let delta = match Dir::try_from(self.side)? {
+            Dir::Buy => self.quantity.checked_sub(self.base_fee),
+            Dir::Sell => Decimal::ZERO
+                .checked_sub(self.quantity)
+                .and_then(|q| q.checked_sub(self.base_fee)),
+        };
+        delta.or_overflow("fill base delta")
     }
 
     /// Sets the engine execution id.
@@ -1500,6 +1504,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         // Update realized PnL for closing trades
         // Simplified: just track the cash flow
         let cash_flow = match dir {
+            // Negating a Decimal flips its sign bit: it cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
             Dir::Buy => -fill.notional(),
             Dir::Sell => fill.notional(),
         };
@@ -1864,6 +1870,20 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_base_delta_overflow_returns_numerical_error() {
+        let mut fill = SimulatedFill::new(Action::Sell, dec!(1), Decimal::MAX, 0);
+        fill.base_fee = dec!(1);
+        let result = fill.base_delta();
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        let mut fill = SimulatedFill::new(Action::Buy, dec!(1), Decimal::MIN, 0);
+        fill.base_fee = dec!(1);
+        assert!(matches!(fill.base_delta(), Err(MMError::NumericalError(_))));
+    }
 
     #[test]
     fn test_sharpe_ratio_overflowing_return_is_none() {

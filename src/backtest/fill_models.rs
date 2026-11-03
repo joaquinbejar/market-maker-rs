@@ -40,6 +40,7 @@
 use crate::Decimal;
 use crate::execution::Action;
 use crate::types::action::Dir;
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -656,14 +657,15 @@ impl ProbabilisticFillModel {
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`] if the order's side is neither
-    /// buy nor sell.
+    /// buy nor sell, or [`MMError::NumericalError`] if the probability
+    /// overflows.
     pub fn calculate_probability(
         &self,
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
     ) -> MMResult<Decimal> {
-        Ok(self.probability_for(order.dir()?, order, tick, time_in_queue_ms))
+        self.probability_for(order.dir()?, order, tick, time_in_queue_ms)
     }
 
     /// The fill probability of a supported order.
@@ -673,7 +675,7 @@ impl ProbabilisticFillModel {
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
-    ) -> Decimal {
+    ) -> MMResult<Decimal> {
         // Get available liquidity at our side
         let available_liquidity = match dir {
             Dir::Buy => tick.ask_size,
@@ -682,21 +684,36 @@ impl ProbabilisticFillModel {
 
         // Calculate relative depth (order size / available liquidity)
         let relative_depth = if available_liquidity > Decimal::ZERO {
-            order.quantity / available_liquidity
+            order
+                .quantity
+                .checked_div(available_liquidity)
+                .or_overflow("relative depth")?
         } else {
             Decimal::ONE // Max depth if no liquidity
         };
 
         // Depth component: exp(-depth_factor * relative_depth)
         // Approximated as 1 / (1 + depth_factor * relative_depth) for simplicity
-        let depth_component = Decimal::ONE / (Decimal::ONE + self.depth_factor * relative_depth);
+        let depth_component = self
+            .depth_factor
+            .checked_mul(relative_depth)
+            .and_then(|x| Decimal::ONE.checked_add(x))
+            .and_then(|x| Decimal::ONE.checked_div(x))
+            .or_overflow("depth component")?;
 
         // Time component: 1 - exp(-time_factor * time_ms)
         // Approximated as min(1, time_factor * time_ms) for simplicity
-        let time_component = (self.time_factor * Decimal::from(time_in_queue_ms)).min(Decimal::ONE);
+        let time_component = self
+            .time_factor
+            .checked_mul(Decimal::from(time_in_queue_ms))
+            .or_overflow("time component")?
+            .min(Decimal::ONE);
 
         // Final probability
-        self.base_probability * depth_component * time_component
+        self.base_probability
+            .checked_mul(depth_component)
+            .and_then(|x| x.checked_mul(time_component))
+            .or_overflow("fill probability")
     }
 
     /// Generates a deterministic pseudo-random number, uniform in [0, 1).
@@ -723,7 +740,7 @@ impl ProbabilisticFillModel {
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
-    ) -> FillResult {
+    ) -> MMResult<FillResult> {
         // First check if market has crossed our price
         let market_crossed = match dir {
             Dir::Buy => tick.ask_price <= order.price,
@@ -731,22 +748,22 @@ impl ProbabilisticFillModel {
         };
 
         if !market_crossed {
-            return FillResult::NoFill;
+            return Ok(FillResult::NoFill);
         }
 
         // Calculate fill probability
-        let prob = self.probability_for(dir, order, tick, time_in_queue_ms);
+        let prob = self.probability_for(dir, order, tick, time_in_queue_ms)?;
 
         // Generate random number and compare
         let random = self.next_random();
 
-        if random < prob {
+        Ok(if random < prob {
             FillResult::FullFill {
                 fill_price: order.price,
             }
         } else {
             FillResult::NoFill
-        }
+        })
     }
 }
 
@@ -759,7 +776,7 @@ impl FillModel for ProbabilisticFillModel {
     ) -> MMResult<FillResult> {
         // Before the random draw, so the generator state is untouched.
         let dir = order.dir()?;
-        Ok(self.fill_for(dir, order, tick, time_in_queue_ms))
+        self.fill_for(dir, order, tick, time_in_queue_ms)
     }
 
     fn reset(&mut self) {
@@ -1269,6 +1286,24 @@ mod tests {
     }
 
     // ProbabilisticFillModel tests
+    #[test]
+    fn test_probabilistic_overflowing_probability_returns_numerical_error() {
+        let model = ProbabilisticFillModel::new(dec!(0.5), Decimal::MAX, dec!(0.01), 42);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(10.0), 1000);
+        let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(1.0));
+        let result = model.calculate_probability(&order, &tick, 100);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        let crossed = create_test_tick(dec!(99.9), dec!(99.9));
+        let result = model.simulate_fill(&order, &crossed, 100);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
     #[test]
     fn test_probabilistic_new() {
         let model = ProbabilisticFillModel::new(dec!(0.5), dec!(1.0), dec!(0.001), 42);

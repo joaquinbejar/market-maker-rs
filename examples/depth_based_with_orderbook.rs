@@ -144,8 +144,8 @@ fn main() {
     println!();
 
     // Calculate order sizes
-    let ask_size = strategy.calculate_ask_size(current_inventory);
-    let bid_size = strategy.calculate_bid_size(current_inventory);
+    let ask_size = strategy.calculate_ask_size(current_inventory).unwrap();
+    let bid_size = strategy.calculate_bid_size(current_inventory).unwrap();
 
     println!("Calculated Order Sizes:");
     println!(

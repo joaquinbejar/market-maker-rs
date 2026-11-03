@@ -84,6 +84,8 @@ impl AccountingFill {
     pub fn signed_quantity(&self) -> MMResult<Decimal> {
         Ok(match Dir::try_from(self.side)? {
             Dir::Buy => self.quantity,
+            // Negating a Decimal flips its sign bit: it cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
             Dir::Sell => -self.quantity,
         })
     }
@@ -105,6 +107,8 @@ impl AccountingFill {
             ))
         })?;
         Ok(match dir {
+            // Negating a Decimal flips its sign bit: it cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
             Dir::Buy => -notional,
             Dir::Sell => notional,
         })

@@ -160,7 +160,8 @@ impl EventHistory {
 
     /// Prunes old events based on retention time.
     pub fn prune(&mut self) {
-        let cutoff = current_timestamp_ms().saturating_sub(self.retention_secs * 1000);
+        let retention_ms = self.retention_secs.saturating_mul(1000);
+        let cutoff = current_timestamp_ms().saturating_sub(retention_ms);
         while let Some(front) = self.events.front() {
             if front.received_at < cutoff {
                 self.events.pop_front();

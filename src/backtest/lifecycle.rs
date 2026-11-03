@@ -198,9 +198,12 @@ impl SimOrder {
     }
 
     /// Quantity still open.
+    ///
+    /// `fill` keeps `filled <= quantity`, so this never saturates for an
+    /// order built by this crate.
     #[must_use]
     pub fn remaining(&self) -> Decimal {
-        self.quantity - self.filled
+        self.quantity.saturating_sub(self.filled)
     }
 
     /// Returns true if the order is live and may match a market event at
@@ -298,8 +301,10 @@ impl SimOrder {
                 self.id, quantity, remaining
             )));
         }
-        // Cannot overflow: 0 < quantity <= remaining was checked above.
-        self.filled += quantity;
+        // 0 < quantity <= remaining was checked above, so this cannot fail.
+        self.filled = self.filled.checked_add(quantity).ok_or_else(|| {
+            MMError::NumericalError(format!("order {} filled quantity overflows", self.id))
+        })?;
         self.state = if self.remaining() == Decimal::ZERO {
             SimOrderState::Filled
         } else {

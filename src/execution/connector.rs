@@ -659,20 +659,22 @@ impl OrderBookSnapshot {
         self.asks.first().map(|l| l.price)
     }
 
-    /// Returns the mid price.
+    /// Returns the mid price, or `None` if a side is empty or the sum of
+    /// the best prices overflows.
     #[must_use]
     pub fn mid_price(&self) -> Option<Decimal> {
         match (self.best_bid(), self.best_ask()) {
-            (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::from(2)),
+            (Some(bid), Some(ask)) => bid.checked_add(ask)?.checked_div(Decimal::TWO),
             _ => None,
         }
     }
 
-    /// Returns the spread (best ask - best bid).
+    /// Returns the spread (best ask - best bid), or `None` if a side is
+    /// empty or the difference overflows.
     #[must_use]
     pub fn spread(&self) -> Option<Decimal> {
         match (self.best_bid(), self.best_ask()) {
-            (Some(bid), Some(ask)) => Some(ask - bid),
+            (Some(bid), Some(ask)) => ask.checked_sub(bid),
             _ => None,
         }
     }
@@ -682,32 +684,46 @@ impl OrderBookSnapshot {
     pub fn spread_bps(&self) -> Option<Decimal> {
         match (self.spread(), self.mid_price()) {
             (Some(spread), Some(mid)) if mid > Decimal::ZERO => {
-                Some(spread / mid * Decimal::from(10000))
+                spread.checked_div(mid)?.checked_mul(Decimal::from(10000))
             }
             _ => None,
         }
     }
 
     /// Returns total bid depth (sum of all bid quantities).
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn bid_depth(&self) -> Decimal {
-        self.bids.iter().map(|l| l.quantity).sum()
+        self.bids
+            .iter()
+            .fold(Decimal::ZERO, |acc, l| acc.saturating_add(l.quantity))
     }
 
     /// Returns total ask depth (sum of all ask quantities).
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn ask_depth(&self) -> Decimal {
-        self.asks.iter().map(|l| l.quantity).sum()
+        self.asks
+            .iter()
+            .fold(Decimal::ZERO, |acc, l| acc.saturating_add(l.quantity))
     }
 
     /// Returns the imbalance ratio: (bid_depth - ask_depth) / (bid_depth + ask_depth).
+    ///
+    /// A derived report value computed from saturating depths; zero when
+    /// the book is empty.
     #[must_use]
     pub fn imbalance(&self) -> Decimal {
         let bid_depth = self.bid_depth();
         let ask_depth = self.ask_depth();
-        let total = bid_depth + ask_depth;
+        let total = bid_depth.saturating_add(ask_depth);
         if total > Decimal::ZERO {
-            (bid_depth - ask_depth) / total
+            bid_depth
+                .saturating_sub(ask_depth)
+                .checked_div(total)
+                .unwrap_or(Decimal::ZERO)
         } else {
             Decimal::ZERO
         }
@@ -875,6 +891,17 @@ mod tests {
     use super::*;
     use crate::dec;
     use crate::types::error::MMError;
+
+    #[test]
+    fn test_snapshot_overflowing_mid_and_spread_are_none() {
+        let mut snapshot = OrderBookSnapshot::new("X", 0);
+        snapshot.bids.push(BookLevel::new(Decimal::MAX, dec!(1)));
+        snapshot.asks.push(BookLevel::new(Decimal::MAX, dec!(1)));
+        assert_eq!(snapshot.mid_price(), None);
+        assert_eq!(snapshot.spread_bps(), None);
+        snapshot.bids[0].price = Decimal::MIN;
+        assert_eq!(snapshot.spread(), None);
+    }
 
     #[test]
     fn test_order_id() {

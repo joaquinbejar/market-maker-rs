@@ -101,9 +101,11 @@ impl Trade {
     }
 
     /// Returns the notional value of the trade.
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.quantity
+        self.price.saturating_mul(self.quantity)
     }
 
     /// Returns true if this is a buy trade.
@@ -337,23 +339,32 @@ impl MarketSnapshot {
     }
 
     /// Returns the mid price.
+    ///
+    /// A derived value: a sum beyond the `Decimal` bounds saturates.
     #[must_use]
     pub fn mid_price(&self) -> Decimal {
-        (self.bid + self.ask) / Decimal::from(2)
+        crate::types::decimal::saturating_midpoint(self.bid, self.ask)
     }
 
     /// Returns the spread.
+    ///
+    /// A derived value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn spread(&self) -> Decimal {
-        self.ask - self.bid
+        self.ask.saturating_sub(self.bid)
     }
 
     /// Returns the spread in basis points.
+    ///
+    /// A derived report value: it saturates at the `Decimal` bounds.
     #[must_use]
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();
         if mid > Decimal::ZERO {
-            self.spread() / mid * Decimal::from(10000)
+            self.spread()
+                .checked_div(mid)
+                .unwrap_or(Decimal::ZERO)
+                .saturating_mul(Decimal::from(10000))
         } else {
             Decimal::ZERO
         }

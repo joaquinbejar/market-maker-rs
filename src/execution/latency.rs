@@ -149,16 +149,22 @@ impl LatencyStats {
         // A sum of at most 2^64 values below 2^64 always fits in a u128,
         // and the mean is at most the largest value, so it narrows back.
         let sum: u128 = values.iter().map(|&v| u128::from(v)).sum();
+        // `n >= 1`, so the division cannot fail.
+        #[allow(clippy::arithmetic_side_effects)]
         let avg_us = u64::try_from(sum / n).unwrap_or(u64::MAX);
 
         // Population variance, floor(sum(d^2) / n), without overflowing:
         // each squared deviation fits in a u128, and summing the per term
         // quotients and remainders separately keeps both sums in range.
+        // `n >= 1`, so the divisions and remainders cannot fail.
+        #[allow(clippy::arithmetic_side_effects)]
         let (quotients, remainders) = values.iter().fold((0u128, 0u128), |(q, r), &v| {
             let diff = u128::from(v.abs_diff(avg_us));
             let square = diff.saturating_mul(diff);
             (q.saturating_add(square / n), r.saturating_add(square % n))
         });
+        // `n >= 1`, so the division cannot fail.
+        #[allow(clippy::arithmetic_side_effects)]
         let variance = quotients.saturating_add(remainders / n);
         let std_dev_us = u64::try_from(variance.isqrt()).unwrap_or(u64::MAX);
 

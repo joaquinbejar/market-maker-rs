@@ -165,6 +165,43 @@ pub(crate) fn saturating_u64<T: TryInto<u64>>(value: T) -> u64 {
     value.try_into().unwrap_or(u64::MAX)
 }
 
+/// Maps the `None` of a failed checked operation to
+/// [`MMError::NumericalError`] naming the quantity that overflowed.
+pub(crate) trait OrOverflow<T> {
+    /// Returns the value, or a numerical error saying `what` overflows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] when `self` is `None`.
+    fn or_overflow(self, what: &str) -> MMResult<T>;
+}
+
+impl<T> OrOverflow<T> for Option<T> {
+    #[inline]
+    fn or_overflow(self, what: &str) -> MMResult<T> {
+        self.ok_or_else(|| overflow_error(what))
+    }
+}
+
+/// The error of a checked operation that overflowed or divided by zero.
+#[cold]
+#[inline(never)]
+fn overflow_error(what: &str) -> MMError {
+    MMError::NumericalError(format!("{what} overflows"))
+}
+
+/// The midpoint of two decimals, saturating at the `Decimal` bounds.
+///
+/// Used only for derived display and report values; a sum beyond
+/// `Decimal::MAX` saturates before the halving.
+#[must_use]
+#[inline]
+pub(crate) fn saturating_midpoint(a: Decimal, b: Decimal) -> Decimal {
+    a.saturating_add(b)
+        .checked_div(Decimal::TWO)
+        .unwrap_or(Decimal::ZERO)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +212,25 @@ mod tests {
         assert_eq!(decimal_to_u64_saturating(dec!(-3.5)), 0);
         assert_eq!(decimal_to_u64_saturating(dec!(-0.5)), 0);
         assert_eq!(decimal_to_u64_saturating(Decimal::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn test_or_overflow_maps_none_to_numerical_error() {
+        let err = Decimal::MAX
+            .checked_add(Decimal::ONE)
+            .or_overflow("sum")
+            .unwrap_err();
+        assert_eq!(err, MMError::NumericalError("sum overflows".to_string()));
+        assert_eq!(Some(Decimal::ONE).or_overflow("sum").unwrap(), Decimal::ONE);
+    }
+
+    #[test]
+    fn test_saturating_midpoint() {
+        assert_eq!(saturating_midpoint(dec!(1), dec!(2)), dec!(1.5));
+        assert_eq!(
+            saturating_midpoint(Decimal::MAX, Decimal::MAX),
+            Decimal::MAX.checked_div(Decimal::TWO).unwrap()
+        );
     }
 
     #[test]

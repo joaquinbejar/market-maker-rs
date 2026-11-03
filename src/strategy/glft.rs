@@ -629,7 +629,8 @@ impl Model {
         scale_diagonal(diag_s, dt, diag);
         while steps > 0 {
             taylor_step(w, diag, self.eta * dt, left, right, term, next)?;
-            steps -= 1;
+            // The loop runs only while `steps > 0`.
+            steps = steps.saturating_sub(1);
             budget = budget.saturating_sub(1);
             remaining -= dt;
             let max = w.iter().copied().fold(0.0_f64, f64::max);
@@ -692,12 +693,21 @@ impl Model {
             }
         };
         let bid = if q < q_max {
-            Some(distance(at(q + 1)?)?)
+            let up = q
+                .checked_add(1)
+                .ok_or_else(|| numerical("inventory index"))?;
+            Some(distance(at(up)?)?)
         } else {
             None
         };
-        let ask = if q > -q_max {
-            Some(distance(at(q - 1)?)?)
+        // `q_max` comes from a `u32`, so its negation fits in an `i64`.
+        #[allow(clippy::arithmetic_side_effects)]
+        let min_q = -q_max;
+        let ask = if q > min_q {
+            let down = q
+                .checked_sub(1)
+                .ok_or_else(|| numerical("inventory index"))?;
+            Some(distance(at(down)?)?)
         } else {
             None
         };
@@ -713,7 +723,10 @@ impl Model {
         let q_max = i64::from(self.q_max);
         let qf = to_f64("inventory", Decimal::from(q))?;
         let bid = (q < q_max).then(|| self.base + (2.0 * qf + 1.0) / 2.0 * c);
-        let ask = (q > -q_max).then(|| self.base - (2.0 * qf - 1.0) / 2.0 * c);
+        // `q_max` comes from a `u32`, so its negation fits in an `i64`.
+        #[allow(clippy::arithmetic_side_effects)]
+        let min_q = -q_max;
+        let ask = (q > min_q).then(|| self.base - (2.0 * qf - 1.0) / 2.0 * c);
         for d in [bid, ask].into_iter().flatten() {
             if !d.is_finite() {
                 return Err(numerical(&format!("quote distance is not finite: {d}")));

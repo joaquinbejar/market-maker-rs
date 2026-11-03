@@ -230,7 +230,7 @@ impl AlertType {
                     "Daily loss limit: {} / {} ({:.1}%)",
                     current,
                     limit,
-                    pct * Decimal::from(100)
+                    pct.saturating_mul(Decimal::ONE_HUNDRED)
                 )
             }
             Self::PositionLimit {
@@ -242,7 +242,7 @@ impl AlertType {
                     "Position limit: {} / {} ({:.1}%)",
                     current,
                     limit,
-                    pct * Decimal::from(100)
+                    pct.saturating_mul(Decimal::ONE_HUNDRED)
                 )
             }
             Self::MaxDrawdown {
@@ -251,8 +251,8 @@ impl AlertType {
             } => {
                 format!(
                     "Max drawdown reached: {:.2}% (threshold: {:.2}%)",
-                    drawdown * Decimal::from(100),
-                    threshold * Decimal::from(100)
+                    drawdown.saturating_mul(Decimal::ONE_HUNDRED),
+                    threshold.saturating_mul(Decimal::ONE_HUNDRED)
                 )
             }
             Self::ConnectivityIssue { exchange, error } => {
