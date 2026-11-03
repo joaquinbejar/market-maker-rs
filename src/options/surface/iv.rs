@@ -366,6 +366,34 @@ mod tests {
     }
 
     #[test]
+    fn test_implied_total_variance_round_trips_small_w_near_the_money() {
+        // Short expiries near the money: w in [1e-8, 1e-4], strikes within
+        // two standard deviations, tau of one day.
+        let (fwd, tau) = (100.0, 1.0 / 365.0);
+        let c = config();
+        for &w in &[1e-8, 3e-8, 1e-7, 1e-6, 1e-5, 1e-4] {
+            let sd: f64 = f64::sqrt(w);
+            for &z in &[-2.0, -1.0, -0.25, 0.0, 0.25, 1.0, 2.0] {
+                let strike = fwd * f64::exp(z * sd);
+                for style in [OptionStyle::Call, OptionStyle::Put] {
+                    let price = black_undiscounted(fwd, strike, w, style).unwrap();
+                    let got = implied_total_variance(price, fwd, strike, tau, style, &c).unwrap();
+                    // The solver stops when the price matches to
+                    // price_tolerance * fwd; the matching w error is that
+                    // over the vega in w, plus round-off.
+                    let vega = black_w(fwd, strike, w).unwrap();
+                    let allowed = 2.0 * c.price_tolerance * fwd / vega + 1e-12 * w;
+                    assert!(
+                        (got - w).abs() <= allowed,
+                        "w {w} z {z} {style:?}: got {got}, allowed {allowed}"
+                    );
+                    assert!((got - w).abs() <= 1e-7 * w, "w {w} z {z} {style:?}: {got}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_implied_total_variance_bounds_and_bracket() {
         let c = config();
         // Intrinsic is w = 0.
