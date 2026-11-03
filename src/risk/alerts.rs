@@ -776,8 +776,11 @@ impl AlertManager {
             }
         }
 
-        // Update dedup tracking
-        self.recent_alerts.insert(type_key, timestamp);
+        // Update dedup tracking only after a fully successful delivery, so
+        // a retry after a handler failure is not suppressed as a duplicate.
+        if first_error.is_none() {
+            self.recent_alerts.insert(type_key, timestamp);
+        }
 
         // Add to history
         self.alert_history.push_back(alert);
@@ -1795,5 +1798,37 @@ mod tests {
         assert!(matches!(result, Err(MMError::ConnectionError(_))));
         assert_eq!(collector.count().unwrap(), 1);
         assert_eq!(manager.get_recent_alerts(10).len(), 1);
+    }
+
+    #[test]
+    fn test_alert_manager_failed_delivery_is_not_deduplicated() {
+        struct FailOnce(std::sync::atomic::AtomicBool);
+        impl AlertHandler for FailOnce {
+            fn handle(&self, _alert: &Alert) -> MMResult<()> {
+                if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    Err(MMError::ConnectionError("down".to_string()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let alert_type = || AlertType::Custom {
+            name: "x".to_string(),
+            message: "m".to_string(),
+        };
+        let mut manager = AlertManager::new(10, 60_000);
+        manager.add_handler(Box::new(FailOnce(std::sync::atomic::AtomicBool::new(true))));
+
+        assert!(
+            manager
+                .alert(alert_type(), AlertSeverity::Error, 1)
+                .is_err()
+        );
+        // The retry inside the window is delivered, not suppressed.
+        assert!(manager.alert(alert_type(), AlertSeverity::Error, 2).is_ok());
+        assert_eq!(manager.get_recent_alerts(10).len(), 2);
+        // After a successful delivery, a duplicate is suppressed again.
+        assert!(manager.alert(alert_type(), AlertSeverity::Error, 3).is_ok());
+        assert_eq!(manager.get_recent_alerts(10).len(), 2);
     }
 }
