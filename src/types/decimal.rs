@@ -190,6 +190,24 @@ fn overflow_error(what: &str) -> MMError {
     MMError::NumericalError(format!("{what} overflows"))
 }
 
+/// `numerator / denominator`, saturating at the `Decimal` bound of the
+/// quotient's sign when it overflows, and zero for a zero denominator.
+///
+/// Used only for derived report values.
+#[must_use]
+#[inline]
+pub(crate) fn saturating_div(numerator: Decimal, denominator: Decimal) -> Decimal {
+    numerator.checked_div(denominator).unwrap_or_else(|| {
+        if denominator.is_zero() {
+            Decimal::ZERO
+        } else if numerator.is_sign_negative() == denominator.is_sign_negative() {
+            Decimal::MAX
+        } else {
+            Decimal::MIN
+        }
+    })
+}
+
 /// The midpoint of two decimals, saturating at the `Decimal` bounds.
 ///
 /// Used only for derived display and report values; a sum beyond
@@ -222,6 +240,16 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, MMError::NumericalError("sum overflows".to_string()));
         assert_eq!(Some(Decimal::ONE).or_overflow("sum").unwrap(), Decimal::ONE);
+    }
+
+    #[test]
+    fn test_saturating_div() {
+        assert_eq!(saturating_div(dec!(1), dec!(4)), dec!(0.25));
+        assert_eq!(saturating_div(dec!(1), Decimal::ZERO), Decimal::ZERO);
+        let tiny = dec!(0.0000000000000000000000000001);
+        assert_eq!(saturating_div(Decimal::MAX, tiny), Decimal::MAX);
+        assert_eq!(saturating_div(Decimal::MIN, tiny), Decimal::MIN);
+        assert_eq!(saturating_div(Decimal::MAX, -tiny), Decimal::MIN);
     }
 
     #[test]
