@@ -153,6 +153,15 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `options::surface` (feature `options`): raw SVI slices and surfaces
+  (`SviSlice`, `SviSurface`), linear in total variance between expiries,
+  with a declared extrapolation policy (none beyond the last expiry, an
+  opt-in constant volatility below the first, SVI wings in `k` marked
+  `Region::Extrapolated`); static diagnostics on a declared grid
+  (`diagnose`: butterfly `g(k)`, calendar slope and gaps); and named shock
+  scenarios (`SurfaceShock`, `ShockedSurface`, `run_scenarios`), each with
+  its own diagnostics. The model is evaluated in `f64`, an explicit
+  exception for option models: every value is checked finite (#96).
 - `BacktestEngine::faults`, `LimitsPolicy::fault` and
   `MarginAccount::fault`.
 - Dependency `financial_types = "0.3"`. It derives `serde` unconditionally,
