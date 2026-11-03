@@ -44,6 +44,8 @@ use crate::Decimal;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal::prelude::ToPrimitive;
 
+/// Calibration of raw SVI slices to observed total variances.
+pub mod calibrate;
 /// Static diagnostics of a surface on a declared grid.
 pub mod diagnostics;
 /// Shock scenarios on a surface, each with its own diagnostics.
@@ -51,6 +53,9 @@ pub mod shocks;
 /// Raw SVI slices and surfaces of slices.
 pub mod svi;
 
+pub use calibrate::{
+    ActiveConstraint, FitConfig, FitFailure, Residual, SliceFit, SliceObservation, fit_slice,
+};
 pub use diagnostics::{
     Check, DiagnosticGrid, DiagnosticPoint, DiagnosticsConfig, SurfaceDiagnostics, diagnose,
 };
