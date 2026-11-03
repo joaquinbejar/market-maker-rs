@@ -22,7 +22,7 @@
 //! ```
 
 use crate::Decimal;
-use crate::types::decimal::saturating_midpoint;
+use crate::types::decimal::midpoint;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -105,10 +105,10 @@ impl MarketTick {
 
     /// Returns the mid price.
     ///
-    /// A derived value: a sum beyond the `Decimal` bounds saturates.
+    /// Exact: computed without overflow, never saturated.
     #[must_use]
     pub fn mid_price(&self) -> Decimal {
-        saturating_midpoint(self.bid_price, self.ask_price)
+        midpoint(self.bid_price, self.ask_price)
     }
 
     /// Returns the bid-ask spread.
@@ -150,10 +150,7 @@ impl MarketTick {
     pub fn imbalance(&self) -> Decimal {
         let total = self.total_liquidity();
         if total > Decimal::ZERO {
-            self.bid_size
-                .saturating_sub(self.ask_size)
-                .checked_div(total)
-                .unwrap_or(Decimal::ZERO)
+            crate::types::decimal::imbalance_ratio(self.bid_size, self.ask_size)
         } else {
             Decimal::ZERO
         }

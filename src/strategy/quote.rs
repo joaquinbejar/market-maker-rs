@@ -42,10 +42,10 @@ impl Quote {
 
     /// Returns the mid-price (average of bid and ask).
     ///
-    /// A derived display value: a sum beyond the `Decimal` bounds saturates.
+    /// Exact: computed without overflow, never saturated.
     #[must_use]
     pub fn mid_price(&self) -> Decimal {
-        crate::types::decimal::saturating_midpoint(self.bid_price, self.ask_price)
+        crate::types::decimal::midpoint(self.bid_price, self.ask_price)
     }
 }
 

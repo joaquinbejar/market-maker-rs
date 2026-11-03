@@ -340,10 +340,10 @@ impl MarketSnapshot {
 
     /// Returns the mid price.
     ///
-    /// A derived value: a sum beyond the `Decimal` bounds saturates.
+    /// Exact: computed without overflow, never saturated.
     #[must_use]
     pub fn mid_price(&self) -> Decimal {
-        crate::types::decimal::saturating_midpoint(self.bid, self.ask)
+        crate::types::decimal::midpoint(self.bid, self.ask)
     }
 
     /// Returns the spread.

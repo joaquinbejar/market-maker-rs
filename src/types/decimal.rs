@@ -208,15 +208,46 @@ pub(crate) fn saturating_div(numerator: Decimal, denominator: Decimal) -> Decima
     })
 }
 
-/// The midpoint of two decimals, saturating at the `Decimal` bounds.
+/// The midpoint `(a + b) / 2` of two decimals, never saturated.
 ///
-/// Used only for derived display and report values; a sum beyond
-/// `Decimal::MAX` saturates before the halving.
+/// The mean of two representable values is always representable: when
+/// `a + b` overflows, both share a sign, so `a + (b - a) / 2` is computed
+/// instead. The halving rounds like `Decimal` division in both forms.
 #[must_use]
 #[inline]
-pub(crate) fn saturating_midpoint(a: Decimal, b: Decimal) -> Decimal {
-    a.saturating_add(b)
-        .checked_div(Decimal::TWO)
+pub(crate) fn midpoint(a: Decimal, b: Decimal) -> Decimal {
+    match a.checked_add(b) {
+        Some(sum) => sum.checked_div(Decimal::TWO),
+        None => b
+            .checked_sub(a)
+            .and_then(|d| d.checked_div(Decimal::TWO))
+            .and_then(|half| a.checked_add(half)),
+    }
+    // Unreachable: both forms above are exact for representable inputs.
+    .unwrap_or(a)
+}
+
+/// The imbalance `(a - b) / (a + b)`, invariant under a common scale of
+/// `a` and `b`, and zero when `a + b` is zero.
+///
+/// When the direct form overflows, both sides are first divided by the
+/// larger magnitude, so a sum beyond the `Decimal` bounds never distorts
+/// the ratio.
+#[must_use]
+pub(crate) fn imbalance_ratio(a: Decimal, b: Decimal) -> Decimal {
+    let ratio = |a: Decimal, b: Decimal| {
+        let total = a.checked_add(b)?;
+        if total.is_zero() {
+            return Some(Decimal::ZERO);
+        }
+        a.checked_sub(b)?.checked_div(total)
+    };
+    ratio(a, b)
+        .or_else(|| {
+            let scale = a.abs().max(b.abs());
+            ratio(a.checked_div(scale)?, b.checked_div(scale)?)
+        })
+        // Unreachable: scaled sides are in [-1, 1].
         .unwrap_or(Decimal::ZERO)
 }
 
@@ -253,12 +284,21 @@ mod tests {
     }
 
     #[test]
-    fn test_saturating_midpoint() {
-        assert_eq!(saturating_midpoint(dec!(1), dec!(2)), dec!(1.5));
-        assert_eq!(
-            saturating_midpoint(Decimal::MAX, Decimal::MAX),
-            Decimal::MAX.checked_div(Decimal::TWO).unwrap()
-        );
+    fn test_midpoint_is_exact_near_the_bounds() {
+        assert_eq!(midpoint(dec!(1), dec!(2)), dec!(1.5));
+        assert_eq!(midpoint(Decimal::MAX, Decimal::MAX), Decimal::MAX);
+        assert_eq!(midpoint(Decimal::MIN, Decimal::MIN), Decimal::MIN);
+        assert_eq!(midpoint(Decimal::MIN, Decimal::MAX), Decimal::ZERO);
+        let near = Decimal::MAX - dec!(2);
+        assert_eq!(midpoint(near, Decimal::MAX), Decimal::MAX - dec!(1));
+    }
+
+    #[test]
+    fn test_imbalance_ratio_is_scale_invariant() {
+        assert_eq!(imbalance_ratio(dec!(3), dec!(1)), dec!(0.5));
+        assert_eq!(imbalance_ratio(Decimal::ZERO, Decimal::ZERO), Decimal::ZERO);
+        let huge = imbalance_ratio(Decimal::MAX, Decimal::MAX / dec!(3));
+        assert!((huge - dec!(0.5)).abs() < dec!(0.00000001), "{huge}");
     }
 
     #[test]

@@ -638,7 +638,7 @@ impl TradeClassifier {
     ///
     /// The classified trade side.
     pub fn classify_quote_rule(&mut self, price: Decimal, bid: Decimal, ask: Decimal) -> TradeSide {
-        let mid = crate::types::decimal::saturating_midpoint(bid, ask);
+        let mid = crate::types::decimal::midpoint(bid, ask);
 
         let side = if price > mid {
             TradeSide::Buy
