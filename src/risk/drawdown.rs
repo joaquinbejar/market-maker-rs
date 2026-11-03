@@ -190,7 +190,7 @@ impl DrawdownTracker {
             self.peak_timestamp = timestamp;
         } else if self.peak_equity > Decimal::ZERO {
             // Calculate current drawdown
-            let drawdown = (self.peak_equity - equity) / self.peak_equity;
+            let drawdown = drawdown_from(self.peak_equity, equity);
 
             // Update max historical drawdown
             if drawdown > self.max_historical_drawdown {
@@ -241,8 +241,7 @@ impl DrawdownTracker {
             return Decimal::ZERO;
         }
 
-        let drawdown = (self.peak_equity - self.current_equity) / self.peak_equity;
-        drawdown.max(Decimal::ZERO)
+        drawdown_from(self.peak_equity, self.current_equity).max(Decimal::ZERO)
     }
 
     /// Returns the current drawdown as a percentage (0.0 to 100.0).
@@ -423,9 +422,29 @@ impl DrawdownTracker {
     }
 }
 
+/// Relative drawdown `(peak - equity) / peak` for a positive `peak`.
+///
+/// Callers cannot return errors, so the arithmetic saturates: a drawdown
+/// beyond the `Decimal` range reads as `Decimal::MAX`, which breaches any
+/// limit (fail closed).
+fn drawdown_from(peak: Decimal, equity: Decimal) -> Decimal {
+    peak.saturating_sub(equity)
+        .checked_div(peak)
+        .unwrap_or(Decimal::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_extreme_loss_saturates_and_breaches() {
+        let mut tracker =
+            DrawdownTracker::new(dec!(0.0000000000000000000000000001), dec!(0.20)).unwrap();
+        tracker.update(Decimal::MIN, 1000);
+        assert_eq!(tracker.current_drawdown(), Decimal::MAX);
+        assert!(tracker.is_max_drawdown_reached());
+    }
     use crate::dec;
 
     #[test]

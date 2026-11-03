@@ -390,16 +390,17 @@ impl CircuitBreaker {
             return self.state.clone();
         }
 
-        // Update daily loss
+        // Update daily loss. This method cannot fail, so the sums saturate
+        // at the `Decimal` bounds; a saturated loss trips the limits.
         if pnl < Decimal::ZERO {
-            self.daily_loss += pnl.abs();
-            self.consecutive_losses += 1;
+            self.daily_loss = self.daily_loss.saturating_add(pnl.abs());
+            self.consecutive_losses = self.consecutive_losses.saturating_add(1);
         } else {
             self.consecutive_losses = 0;
         }
 
         // Update equity
-        self.current_equity += pnl;
+        self.current_equity = self.current_equity.saturating_add(pnl);
         if self.current_equity > self.peak_equity {
             self.peak_equity = self.current_equity;
         }
@@ -572,7 +573,12 @@ impl CircuitBreaker {
             return false;
         }
 
-        let drawdown = (window_peak - self.current_equity) / window_peak;
+        // This check cannot fail, so the arithmetic saturates; a drawdown
+        // beyond the `Decimal` range trips the breaker (fail closed).
+        let drawdown = window_peak
+            .saturating_sub(self.current_equity)
+            .checked_div(window_peak)
+            .unwrap_or(Decimal::MAX);
         drawdown >= self.config.rapid_drawdown_threshold
     }
 
@@ -772,6 +778,20 @@ mod tests {
         if let CircuitBreakerState::Triggered { reason, .. } = state {
             assert_eq!(reason, TriggerReason::RapidDrawdown);
         }
+    }
+
+    #[test]
+    fn test_record_trade_extreme_loss_saturates_and_triggers() {
+        let config =
+            CircuitBreakerConfig::new(Decimal::MAX, dec!(1.0), 100, dec!(0.10), 300_000, 60_000)
+                .unwrap();
+        let mut breaker =
+            CircuitBreaker::with_initial_equity(config, dec!(0.0000000000000000000000000001), 0);
+
+        breaker.record_trade(Decimal::MIN, 1000);
+        let state = breaker.record_trade(Decimal::MIN, 2000);
+
+        assert!(state.is_triggered());
     }
 
     #[test]

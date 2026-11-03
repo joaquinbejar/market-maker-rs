@@ -139,6 +139,12 @@ impl RiskLimits {
     /// - `Ok(false)` if the order would violate limits
     /// - `Err` if price is invalid
     ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidMarketState`] if `price` is not positive,
+    /// or [`MMError::NumericalError`] if the new position or its notional
+    /// overflows.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -165,7 +171,11 @@ impl RiskLimits {
             ));
         }
 
-        let new_position = current_position + order_size;
+        let new_position = current_position.checked_add(order_size).ok_or_else(|| {
+            MMError::NumericalError(format!(
+                "position overflow: {current_position} + {order_size}"
+            ))
+        })?;
 
         // Check position limit
         if new_position.abs() > self.max_position {
@@ -173,7 +183,9 @@ impl RiskLimits {
         }
 
         // Check notional limit
-        let new_notional = new_position.abs() * price;
+        let new_notional = new_position.abs().checked_mul(price).ok_or_else(|| {
+            MMError::NumericalError(format!("notional overflow: {new_position} * {price}"))
+        })?;
         if new_notional > self.max_notional {
             return Ok(false);
         }
@@ -198,6 +210,8 @@ impl RiskLimits {
     /// - Equal to `desired_size` when position is zero
     /// - Reduced as position approaches limit
     /// - Zero when position is at or beyond limit
+    /// - Zero when `max_position` is not positive (the fields are public, so
+    ///   `RiskLimits::new` can be bypassed): no limit room means no size
     ///
     /// # Example
     ///
@@ -222,20 +236,30 @@ impl RiskLimits {
             return Decimal::ZERO;
         }
 
-        let position_ratio = current_position.abs() / self.max_position;
+        if self.max_position <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        // An unrepresentable ratio is far beyond the limit.
+        let Some(position_ratio) = current_position.abs().checked_div(self.max_position) else {
+            return Decimal::ZERO;
+        };
 
         // If already at or beyond limit, return zero
         if position_ratio >= Decimal::ONE {
             return Decimal::ZERO;
         }
 
-        // Calculate scaling multiplier: 1 - (position_ratio * scaling_factor)
-        let scale_multiplier = Decimal::ONE - (position_ratio * self.scaling_factor);
+        // Calculate scaling multiplier: 1 - (position_ratio * scaling_factor).
+        // The ratio is below one here; a scaling factor outside [0, 1] can
+        // only push the product to the Decimal bounds, so saturate.
+        let scale_multiplier =
+            Decimal::ONE.saturating_sub(position_ratio.saturating_mul(self.scaling_factor));
 
         // Ensure multiplier is non-negative
         let scale_multiplier = scale_multiplier.max(Decimal::ZERO);
 
-        desired_size * scale_multiplier
+        // This method cannot return an error, so the product saturates.
+        desired_size.saturating_mul(scale_multiplier)
     }
 
     /// Checks if the current position breaches the position limit.
@@ -293,8 +317,11 @@ impl RiskLimits {
     /// ```
     #[must_use]
     pub fn is_notional_limit_breached(&self, position: Decimal, price: Decimal) -> bool {
-        let notional = position.abs() * price;
-        notional > self.max_notional
+        // A notional beyond the Decimal range breaches any limit.
+        position
+            .abs()
+            .checked_mul(price)
+            .is_none_or(|notional| notional > self.max_notional)
     }
 
     /// Returns the remaining position capacity before hitting the limit.
@@ -321,7 +348,7 @@ impl RiskLimits {
     /// ```
     #[must_use]
     pub fn remaining_position_capacity(&self, current_position: Decimal) -> Decimal {
-        let remaining = self.max_position - current_position.abs();
+        let remaining = self.max_position.saturating_sub(current_position.abs());
         remaining.max(Decimal::ZERO)
     }
 
@@ -333,7 +360,10 @@ impl RiskLimits {
     ///
     /// # Returns
     ///
-    /// Position utilization ratio. Values > 1.0 indicate limit breach.
+    /// Position utilization ratio. Values > 1.0 indicate limit breach. When
+    /// `max_position` is not positive (the fields are public) or the ratio
+    /// overflows, any position counts as fully breached: the result
+    /// saturates to `Decimal::MAX`.
     ///
     /// # Example
     ///
@@ -349,13 +379,63 @@ impl RiskLimits {
     /// ```
     #[must_use]
     pub fn position_utilization(&self, current_position: Decimal) -> Decimal {
-        current_position.abs() / self.max_position
+        if self.max_position <= Decimal::ZERO {
+            return Decimal::MAX;
+        }
+        current_position
+            .abs()
+            .checked_div(self.max_position)
+            .unwrap_or(Decimal::MAX)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zero_position_limits() -> RiskLimits {
+        RiskLimits {
+            max_position: Decimal::ZERO,
+            max_notional: dec!(1000),
+            scaling_factor: dec!(0.5),
+        }
+    }
+
+    #[test]
+    fn test_check_order_position_overflow_returns_err() {
+        let limits = RiskLimits::new(dec!(100), dec!(10000), dec!(0.5)).unwrap();
+        let result = limits.check_order(Decimal::MAX, Decimal::MAX, dec!(1));
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
+    }
+
+    #[test]
+    fn test_check_order_notional_overflow_returns_err() {
+        let limits = RiskLimits::new(Decimal::MAX, Decimal::MAX, dec!(0.5)).unwrap();
+        let result = limits.check_order(dec!(10), dec!(10), Decimal::MAX);
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
+    }
+
+    #[test]
+    fn test_scale_order_size_zero_max_position_returns_zero() {
+        assert_eq!(
+            zero_position_limits().scale_order_size(dec!(0), dec!(10)),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn test_position_utilization_zero_max_position_saturates() {
+        assert_eq!(
+            zero_position_limits().position_utilization(dec!(5)),
+            Decimal::MAX
+        );
+    }
+
+    #[test]
+    fn test_is_notional_limit_breached_overflow_is_breach() {
+        let limits = RiskLimits::new(dec!(100), Decimal::MAX, dec!(0.5)).unwrap();
+        assert!(limits.is_notional_limit_breached(Decimal::MAX, dec!(2)));
+    }
     use crate::dec;
 
     #[test]

@@ -858,18 +858,54 @@ impl<M: FillModel> MarketImpactFillModel<M> {
     /// Calculates price impact for a given order size.
     ///
     /// Uses the square-root model: `impact = coeff * sqrt(size / ADV)`
+    ///
+    /// An impact beyond the `Decimal` range saturates to `Decimal::MAX`;
+    /// fills report it as [`MMError::NumericalError`] instead.
     #[must_use]
     pub fn calculate_impact(&self, size: Decimal) -> Decimal {
+        self.checked_impact(size).unwrap_or(Decimal::MAX)
+    }
+
+    /// Square root impact with checked arithmetic.
+    fn checked_impact(&self, size: Decimal) -> MMResult<Decimal> {
         if self.average_daily_volume <= Decimal::ZERO {
-            return Decimal::ZERO;
+            return Ok(Decimal::ZERO);
+        }
+        let overflow = || {
+            MMError::NumericalError(format!(
+                "market impact of size {size} over volume {} overflows",
+                self.average_daily_volume
+            ))
+        };
+
+        let size_ratio = size
+            .checked_div(self.average_daily_volume)
+            .ok_or_else(overflow)?;
+        // A negative size has no impact.
+        if size_ratio < Decimal::ZERO {
+            return Ok(Decimal::ZERO);
         }
 
-        let size_ratio = size / self.average_daily_volume;
-
         // Approximate sqrt using Newton's method
-        let sqrt_ratio = decimal_sqrt(size_ratio).unwrap_or(Decimal::ZERO);
+        let sqrt_ratio = decimal_sqrt(size_ratio).ok_or_else(overflow)?;
 
-        self.impact_coefficient * sqrt_ratio
+        self.impact_coefficient
+            .checked_mul(sqrt_ratio)
+            .ok_or_else(overflow)
+    }
+
+    /// Moves `fill_price` against the order by the impact of `size`.
+    fn impacted_price(&self, dir: Dir, fill_price: Decimal, size: Decimal) -> MMResult<Decimal> {
+        let impact = self.checked_impact(size)?;
+        match dir {
+            Dir::Buy => fill_price.checked_add(impact),
+            Dir::Sell => fill_price.checked_sub(impact),
+        }
+        .ok_or_else(|| {
+            MMError::NumericalError(format!(
+                "fill price {fill_price} with impact {impact} overflows"
+            ))
+        })
     }
 
     /// Returns a reference to the base model.
@@ -906,22 +942,14 @@ impl<M: FillModel> FillModel for MarketImpactFillModel<M> {
                 filled_quantity,
                 fill_price,
             } => {
-                let impact = self.calculate_impact(filled_quantity);
-                let adjusted_price = match dir {
-                    Dir::Buy => fill_price + impact,
-                    Dir::Sell => fill_price - impact,
-                };
+                let adjusted_price = self.impacted_price(dir, fill_price, filled_quantity)?;
                 FillResult::PartialFill {
                     filled_quantity,
                     fill_price: adjusted_price,
                 }
             }
             FillResult::FullFill { fill_price } => {
-                let impact = self.calculate_impact(order.quantity);
-                let adjusted_price = match dir {
-                    Dir::Buy => fill_price + impact,
-                    Dir::Sell => fill_price - impact,
-                };
+                let adjusted_price = self.impacted_price(dir, fill_price, order.quantity)?;
                 FillResult::FullFill {
                     fill_price: adjusted_price,
                 }
@@ -967,7 +995,8 @@ impl<M: FillModel> FillModel for MarketImpactFillModel<M> {
     }
 }
 
-/// Approximate square root using Newton's method.
+/// Approximate square root using Newton's method; `None` for a negative
+/// input or a step that overflows.
 fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
     if n < Decimal::ZERO {
         return None;
@@ -980,8 +1009,8 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
     let two = Decimal::TWO;
 
     for _ in 0..20 {
-        let next = (x + n / x) / two;
-        if (next - x).abs() < dec!(0.0000001) {
+        let next = x.checked_add(n.checked_div(x)?)?.checked_div(two)?;
+        if next.checked_sub(x)?.abs() < dec!(0.0000001) {
             return Some(next);
         }
         x = next;
@@ -1318,6 +1347,31 @@ mod tests {
         } else {
             panic!("Expected full fill");
         }
+    }
+
+    #[test]
+    fn test_market_impact_ratio_overflow_returns_err() {
+        let model = MarketImpactFillModel::new(
+            dec!(1.0),
+            dec!(0.0000000000000000000000000001),
+            ImmediateFillModel::new(),
+        );
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(10000000000), 1000);
+        let tick = create_test_tick(dec!(99.9), dec!(99.9));
+
+        let result = model.simulate_fill(&order, &tick, 0);
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
+        assert_eq!(model.calculate_impact(dec!(10000000000)), Decimal::MAX);
+    }
+
+    #[test]
+    fn test_market_impact_coefficient_overflow_returns_err() {
+        let model = MarketImpactFillModel::new(Decimal::MAX, dec!(1.0), ImmediateFillModel::new());
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(4.0), 1000);
+        let tick = create_test_tick(dec!(99.9), dec!(99.9));
+
+        let result = model.simulate_fill(&order, &tick, 0);
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
     }
 
     #[test]
