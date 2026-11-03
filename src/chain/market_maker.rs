@@ -554,7 +554,14 @@ impl ChainMarketMaker {
             .trunc()
             .to_u64()
             .ok_or_else(overflow)?;
-        let bid_price = theo_price.saturating_sub(half_spread);
+        let bid_price = theo_price
+            .checked_sub(half_spread)
+            .filter(|bid| *bid > 0)
+            .ok_or_else(|| {
+                MMError::InvalidQuoteGeneration(format!(
+                    "half spread {half_spread} of strike {strike} reaches its theo {theo_price}: no positive bid"
+                ))
+            })?;
         let ask_price = theo_price.checked_add(half_spread).ok_or_else(overflow)?;
         let quote_size = self.calculate_quote_size(strike, spot_price, is_atm)?;
         ChainQuoteUpdate::new(
@@ -580,9 +587,8 @@ impl ChainMarketMaker {
     /// # Errors
     ///
     /// [`MMError::InvalidMarketState`] for a zero underlying price, and the
-    /// error of the at-the-money valuation of the underlying price itself,
-    /// which every contract shares (rates, time to expiry, surface at the
-    /// money).
+    /// error of [`OptionPricer::check_market`] for the inputs every contract
+    /// shares (spot, rates, time to expiry, the surface at this expiry).
     pub fn refresh_all_quotes(
         &self,
         underlying_price: u64,
@@ -593,13 +599,13 @@ impl ChainMarketMaker {
                 "underlying price must be positive".to_string(),
             ));
         }
-        // The shared inputs: an at-the-money valuation that fails would fail
-        // for every contract.
-        pricing.pricer.value(&pricing.inputs(
-            underlying_price,
-            underlying_price,
-            OptionStyle::Call,
-        ))?;
+        // The inputs every contract shares, checked without valuing any.
+        pricing.pricer.check_market(
+            Decimal::from(underlying_price),
+            pricing.tau_years,
+            pricing.rate,
+            pricing.carry,
+        )?;
         let atm_strike = self.get_atm_strike(underlying_price).ok();
         let strikes = self.chain.strike_prices();
         let mut outcomes = Vec::with_capacity(strikes.len().saturating_mul(2));
@@ -876,21 +882,105 @@ mod tests {
     #[test]
     fn test_refresh_all_quotes_shared_failure_fails_the_whole_refresh() {
         use crate::options::pricing::OptionInputs;
-        struct Failing;
-        impl OptionPricer for Failing {
+        struct NoMarket;
+        impl OptionPricer for NoMarket {
             fn value(&self, _: &OptionInputs) -> MMResult<OptionValuation> {
+                Ok(valuation(dec!(1000)))
+            }
+            fn check_market(&self, _: Decimal, _: Decimal, _: Decimal, _: Decimal) -> MMResult<()> {
                 Err(MMError::NumericalError("surface unavailable".to_string()))
             }
         }
         let mm = ChainMarketMaker::with_defaults(create_test_chain());
-        let failing = ChainPricing::new(Arc::new(Failing), dec!(0.1), dec!(0), dec!(0)).unwrap();
-        assert!(mm.refresh_all_quotes(50000, &failing).is_err());
+        let no_market = ChainPricing::new(Arc::new(NoMarket), dec!(0.1), dec!(0), dec!(0)).unwrap();
+        assert!(mm.refresh_all_quotes(50000, &no_market).is_err());
         let pricing = flat_pricing(dec!(0.6), dec!(0.1));
         assert!(matches!(
             mm.refresh_all_quotes(0, &pricing),
             Err(MMError::InvalidMarketState(_))
         ));
-        assert!(ChainPricing::new(Arc::new(Failing), dec!(-0.1), dec!(0), dec!(0)).is_err());
+        assert!(ChainPricing::new(Arc::new(NoMarket), dec!(-0.1), dec!(0), dec!(0)).is_err());
+        // A flat surface priced at a time to expiry its pricer accepts, but
+        // a surface error at this expiry is shared: it fails the refresh.
+        struct NoExpiry;
+        impl crate::options::surface::VolSurface for NoExpiry {
+            fn total_variance_at(
+                &self,
+                _: f64,
+                _: f64,
+            ) -> MMResult<crate::options::surface::TotalVariance> {
+                Err(MMError::InvalidMarketState(
+                    "tau outside the slices".to_string(),
+                ))
+            }
+        }
+        let pricer = crate::options::pricing::SurfacePricer::new(
+            Arc::new(NoExpiry),
+            crate::options::pricing::Dynamics::StickyMoneyness,
+        )
+        .unwrap();
+        let pricing = ChainPricing::new(Arc::new(pricer), dec!(0.1), dec!(0), dec!(0)).unwrap();
+        assert!(matches!(
+            mm.refresh_all_quotes(50000, &pricing),
+            Err(MMError::InvalidMarketState(_))
+        ));
+    }
+
+    #[test]
+    fn test_refresh_all_quotes_does_not_value_a_contract_outside_the_chain() {
+        use crate::options::pricing::{Dynamics, OptionInputs, SurfacePricer};
+        use crate::options::surface::FlatSurface;
+        // A pricer that refuses only spot == strike (a strike the chain
+        // below does not list) and values everything else.
+        struct NoAtm(SurfacePricer);
+        impl OptionPricer for NoAtm {
+            fn value(&self, inputs: &OptionInputs) -> MMResult<OptionValuation> {
+                if inputs.spot == inputs.strike {
+                    return Err(MMError::InvalidMarketState("spot == strike".to_string()));
+                }
+                self.0.value(inputs)
+            }
+        }
+        let flat = SurfacePricer::new(
+            Arc::new(FlatSurface::new(dec!(0.3)).unwrap()),
+            Dynamics::StickyMoneyness,
+        )
+        .unwrap();
+        let exp = ExpirationDate::Days(pos_or_panic!(30.0));
+        let chain = ExpirationOrderBook::new("X", exp);
+        chain.get_or_create_strike(90);
+        chain.get_or_create_strike(110);
+        let mm = ChainMarketMaker::with_defaults(Arc::new(chain));
+        let pricing =
+            ChainPricing::new(Arc::new(NoAtm(flat)), dec!(0.25), dec!(0), dec!(0)).unwrap();
+        let outcomes = mm.refresh_all_quotes(100, &pricing).unwrap();
+        assert_eq!(outcomes.len(), 4);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, ChainQuoteOutcome::Quote(_))),
+            "{outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn test_generate_quote_spread_reaching_theo_is_an_error_not_a_zero_bid() {
+        let config = ChainMarketMakerConfig {
+            base_spread_bps: 30_000,
+            max_spread_bps: 30_000,
+            ..Default::default()
+        };
+        let mm = ChainMarketMaker::new(create_test_chain(), config);
+        assert!(matches!(
+            mm.generate_quote(
+                50000,
+                OptionStyle::Call,
+                50000,
+                valuation(dec!(1000)),
+                false
+            ),
+            Err(MMError::InvalidQuoteGeneration(_))
+        ));
     }
 
     #[test]

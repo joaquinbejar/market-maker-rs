@@ -61,7 +61,7 @@
 use std::sync::Arc;
 
 use crate::Decimal;
-use crate::options::special::{norm_cdf, norm_pdf};
+use crate::options::special::{erfcx, norm_cdf, norm_pdf};
 use crate::options::surface::VolSurface;
 use crate::types::error::{MMError, MMResult};
 use optionstratlib::{OptionStyle, OptionType};
@@ -203,6 +203,24 @@ pub trait OptionPricer: Send + Sync {
     ///
     /// The errors of [`value`].
     fn value(&self, inputs: &OptionInputs) -> MMResult<OptionValuation>;
+
+    /// Checks the inputs every contract of one expiration shares, without
+    /// valuing any contract: a failure here fails for all of them. The
+    /// default accepts anything; a strike-specific failure is never reported
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the pricer considers a shared failure.
+    fn check_market(
+        &self,
+        _spot: Decimal,
+        _tau_years: Decimal,
+        _rate: Decimal,
+        _carry: Decimal,
+    ) -> MMResult<()> {
+        Ok(())
+    }
 }
 
 /// [`value`] on a shared surface with fixed dynamics.
@@ -241,6 +259,34 @@ impl SurfacePricer {
 impl OptionPricer for SurfacePricer {
     fn value(&self, inputs: &OptionInputs) -> MMResult<OptionValuation> {
         value(inputs, self.surface.as_ref(), self.dynamics)
+    }
+
+    /// A positive spot, a non-negative time to expiry, rates with a finite
+    /// f64 value, and a surface that answers at this expiry at the money
+    /// forward (`k = 0`). No contract is valued.
+    fn check_market(
+        &self,
+        spot: Decimal,
+        tau_years: Decimal,
+        rate: Decimal,
+        carry: Decimal,
+    ) -> MMResult<()> {
+        if spot <= Decimal::ZERO {
+            return Err(invalid(format!("spot must be positive, got {spot}")));
+        }
+        if tau_years < Decimal::ZERO {
+            return Err(invalid(format!(
+                "time to expiry must be non-negative, got {tau_years}"
+            )));
+        }
+        to_f64("spot", spot)?;
+        to_f64("rate", rate)?;
+        to_f64("carry", carry)?;
+        let tau = to_f64("time to expiry", tau_years)?;
+        if tau > 0.0 {
+            self.surface.total_variance(0.0, tau)?;
+        }
+        Ok(())
     }
 }
 
@@ -325,6 +371,7 @@ struct Model {
     df_r: f64,
     df_q: f64,
     sticky_moneyness: bool,
+    k_current: f64,
     sig: f64,
     s1: f64,
     s2: f64,
@@ -351,20 +398,19 @@ impl Model {
         let df_r = positive("discount factor e^(-r tau)", (-r * tau).exp())?;
         let df_q = positive("carry factor e^(-q tau)", (-q * tau).exp())?;
         let fwd = positive("forward", s * growth.exp())?;
-        // k = ln K - ln F, without forming K / F (which could overflow).
-        let ln_k = k_strike.ln();
-        let k_current = finite("log moneyness", ln_k - s.ln() - growth)?;
+        // k = ln(K / S) - (r - q) tau, with ln(K / S) taken near the money
+        // as log1p of the exact Decimal (K - S) / S (ln K - ln S would lose
+        // the digits that set d1 and d2 at small w).
+        let k_current = finite(
+            "log moneyness",
+            ln_ratio(inputs.strike, inputs.spot)? - growth,
+        )?;
         let (sticky_moneyness, k_read) = match dynamics {
             Dynamics::StickyMoneyness => (true, k_current),
-            Dynamics::StickyStrike { s_ref } => {
-                let s_ref = to_f64("reference spot", s_ref)?;
-                if s_ref <= 0.0 {
-                    return Err(numerical(
-                        "reference spot underflows to zero as f64".to_string(),
-                    ));
-                }
-                (false, finite("log moneyness", ln_k - s_ref.ln() - growth)?)
-            }
+            Dynamics::StickyStrike { s_ref } => (
+                false,
+                finite("log moneyness", ln_ratio(inputs.strike, s_ref)? - growth)?,
+            ),
         };
         let tv = surface.total_variance(k_read, tau)?;
         let w = tv.w();
@@ -386,6 +432,7 @@ impl Model {
             df_r,
             df_q,
             sticky_moneyness,
+            k_current,
             sig,
             s1,
             s2,
@@ -402,12 +449,13 @@ impl Model {
         let (d1, d2) = (self.d1, self.d2);
         let n1 = norm_pdf(d1);
         let n2 = norm_pdf(d2);
-        let (bs_delta, black_f) = if call {
-            (self.df_q * norm_cdf(d1), norm_cdf(d1))
+        let bs_delta = if call {
+            self.df_q * norm_cdf(d1)
         } else {
-            (-self.df_q * norm_cdf(-d1), -norm_cdf(-d1))
+            -self.df_q * norm_cdf(-d1)
         };
-        let price = finite("price", self.df_r * black_from_d(fwd, k, d1, d2, call))?;
+        let black = black_price(fwd, k, self.k_current, self.vol, call)?;
+        let price = finite("price", self.df_r * black)?;
         let sqrt_tau = self.tau.sqrt();
         // Partial derivatives at fixed implied volatility.
         let vega_s = finite("vega", self.df_q * s * n1 * sqrt_tau)?;
@@ -427,12 +475,20 @@ impl Model {
             gamma_s + 2.0 * vanna_s * ds + volga_s * ds * ds + vega_s * dss,
         )?;
         // theta = -dV/dtau, V = e^{-r tau} Black(F(tau), K, w(k(tau), tau)),
-        // dk/dtau = -(r - q), dBlack/dw = K n(d2) / (2 sqrt w).
+        // dk/dtau = -(r - q), dBlack/dw = K n(d2) / (2 sqrt w). With
+        // e^{-r tau} F = e^{-q tau} S the F N(d1) terms of -r V and of the
+        // forward's drift cancel analytically, which leaves
+        //   call: q S e^{-q tau} N(d1) - r K e^{-r tau} N(d2) - e^{-r tau} Black_w dw/dtau,
+        //   put:  r K e^{-r tau} N(-d2) - q S e^{-q tau} N(-d1) - e^{-r tau} Black_w dw/dtau,
+        // with no difference of terms of the order of S.
         let black_w = k * n2 / (2.0 * self.vol);
-        let dw_dtau = self.w_k * (-(self.r - self.q)) + self.w_tau;
-        let dv_dtau =
-            -self.r * price + self.df_r * (black_f * fwd * (self.r - self.q) + black_w * dw_dtau);
-        let theta = finite("theta", -dv_dtau)?;
+        let dw_dtau = self.w_tau - (self.r - self.q) * self.w_k;
+        let carry_part = if call {
+            self.q * s * self.df_q * norm_cdf(d1) - self.r * k * self.df_r * norm_cdf(d2)
+        } else {
+            self.r * k * self.df_r * norm_cdf(-d2) - self.q * s * self.df_q * norm_cdf(-d1)
+        };
+        let theta = finite("theta", carry_part - self.df_r * black_w * dw_dtau)?;
         Ok(OptionValuation {
             price: to_decimal("price", price)?,
             delta: to_decimal("delta", delta)?,
@@ -459,25 +515,104 @@ pub fn black_undiscounted(fwd: f64, strike: f64, w: f64, style: OptionStyle) -> 
         let intrinsic = if call { fwd - strike } else { strike - fwd };
         return Ok(intrinsic.max(0.0));
     }
-    let vol = w.sqrt();
-    let d1 = finite("d1", ((fwd.ln() - strike.ln()) + 0.5 * w) / vol)?;
-    let d2 = d1 - vol;
-    finite("Black price", black_from_d(fwd, strike, d1, d2, call))
+    let vol = positive("total volatility sqrt(w)", w.sqrt())?;
+    let k = finite("log moneyness", ln_ratio_f64(strike, fwd))?;
+    black_price(fwd, strike, k, vol, call)
 }
 
-/// The undiscounted Black price from `d1` and `d2`. The out-of-the-money
-/// option is computed directly and the in-the-money one by parity,
-/// `intrinsic + out-of-the-money`, so a deep in-the-money price does not
-/// carry the cancellation of `F N(d1) - K N(d2)` and stays increasing in `w`.
-fn black_from_d(fwd: f64, strike: f64, d1: f64, d2: f64, call: bool) -> f64 {
-    let otm_call = || fwd * norm_cdf(d1) - strike * norm_cdf(d2);
-    let otm_put = || strike * norm_cdf(-d2) - fwd * norm_cdf(-d1);
-    match (call, fwd > strike) {
-        (true, true) => (fwd - strike) + otm_put(),
-        (true, false) => otm_call(),
-        (false, true) => otm_put(),
-        (false, false) => (strike - fwd) + otm_call(),
+/// Below this `t = sqrt(w) / 2` the out-of-the-money price is the Taylor
+/// series in `t` (Jaeckel, 2015, "Let's be rational", section 3).
+const SMALL_T: f64 = 0.21;
+/// Below this `h = x / sqrt(w)` the density `n(h)` is below the smallest
+/// subnormal, so the normalised price underflows to zero (its true value).
+const UNDERFLOW_H: f64 = -40.0;
+/// Highest odd order of the small-`t` series.
+const SERIES_ORDER: usize = 17;
+
+/// The undiscounted Black price with `k = ln(K / F)` and `vol = sqrt(w) > 0`:
+/// the intrinsic value (`K expm1(-k)` near the money, `F - K` away from it, or
+/// their negatives for a put) plus the time value `sqrt(F K) b(-|k|, vol)`,
+/// where `b(x, s) = e^{x/2} N(x/s + s/2) - e^{-x/2} N(x/s - s/2)` is the
+/// normalised out-of-the-money call (Jaeckel, 2015, "Let's be rational"; by
+/// put-call symmetry the out-of-the-money put of the pair has the same
+/// normalised value). The time value is computed directly and stably, so no
+/// price carries the cancellation of `F N(d1) - K N(d2)`, which near the
+/// money at small `w` loses every digit.
+fn black_price(fwd: f64, strike: f64, k: f64, vol: f64, call: bool) -> MMResult<f64> {
+    let otm = finite("normalised Black price", normalised_otm_call(-k.abs(), vol))?;
+    let scale = fwd.sqrt() * strike.sqrt();
+    let time_value = finite("Black time value", scale * otm)?;
+    // Near the money F - K is K (e^{x} - 1) = K expm1(x), x = -k, which keeps
+    // the precision of the log ratio (F - K in f64 would carry the rounding
+    // of F and K); away from it the direct difference has no cancellation.
+    let forward_minus_strike = if k.abs() <= std::f64::consts::LN_2 {
+        strike * (-k).exp_m1()
+    } else {
+        fwd - strike
+    };
+    let intrinsic = if call {
+        forward_minus_strike
+    } else {
+        -forward_minus_strike
+    };
+    finite("Black price", intrinsic.max(0.0) + time_value)
+}
+
+/// `b(x, s)` for `x <= 0`, with `h = x / s` and `t = s / 2`:
+/// - `t < SMALL_T`: `2 n(h) sum_{odd j} G_j(h) t^j / j!`, the Taylor series
+///   of `e^{ht} N(h + t) - e^{-ht} N(h - t)` in `t` (see `small_t_sum`);
+/// - otherwise, with `d1 = h + t <= 0`:
+///   `e^{-(h^2 + t^2)/2} (erfcx(-d1/sqrt 2) - erfcx(-d2/sqrt 2)) / 2`, which
+///   has no overflow and no tail cancellation;
+/// - otherwise `e^{ht} N(h + t) - e^{-ht} N(h - t)`, where `t >= SMALL_T`
+///   bounds the cancellation.
+fn normalised_otm_call(x: f64, s: f64) -> f64 {
+    let h = x / s;
+    let t = 0.5 * s;
+    if h < UNDERFLOW_H {
+        return 0.0;
     }
+    if t < SMALL_T {
+        return 2.0 * norm_pdf(h) * small_t_sum(h, t);
+    }
+    if h + t <= 0.0 {
+        let r = std::f64::consts::FRAC_1_SQRT_2;
+        let e = (-0.5 * (h * h + t * t)).exp();
+        return 0.5 * e * (erfcx(-(h + t) * r) - erfcx(-(h - t) * r));
+    }
+    (h * t).exp() * norm_cdf(h + t) - (-h * t).exp() * norm_cdf(h - t)
+}
+
+/// `sum_{odd j <= SERIES_ORDER} G_j(h) t^j / j!`, where `G_j` is the j-th
+/// derivative at `t = 0` of `g(t) = e^{ht} N(h + t)` divided by `n(h)`.
+///
+/// Since `g' = h g + e^{ht} n(h + t)` and `e^{ht} n(h + t) = n(h) e^{-t^2/2}`,
+/// `G_0 = Y(h) = N(h) / n(h)` and `G_j = h G_{j-1} + U_{j-1}`, with `U_m`
+/// the derivatives of `e^{-t^2/2}` at 0: `U_0 = 1`, `U_{m+2} = -(m + 1) U_m`,
+/// zero for odd `m`. The odd part of `g(t) - g(-t)` gives the factor 2 in
+/// `normalised_otm_call`.
+fn small_t_sum(h: f64, t: f64) -> f64 {
+    // Y(h) = sqrt(pi/2) erfcx(-h / sqrt 2), for h <= 0.
+    let mut g = (0.5 * std::f64::consts::PI).sqrt() * erfcx(-h * std::f64::consts::FRAC_1_SQRT_2);
+    // U_{j-1} for the current j, and the index m = j - 1 as f64.
+    let mut u_even = 1.0; // U_0, U_2, ... in turn
+    let mut m = 0.0_f64;
+    let mut t_pow = 1.0;
+    let mut factorial = 1.0;
+    let mut total = 0.0;
+    for j in 1..=SERIES_ORDER {
+        let u = if j % 2 == 1 { u_even } else { 0.0 };
+        g = h * g + u;
+        t_pow *= t;
+        factorial *= m + 1.0;
+        if j % 2 == 1 {
+            total += g * t_pow / factorial;
+            // Next even index: U_{m+2} = -(m + 1) U_m.
+            u_even *= -(m + 1.0);
+        }
+        m += 1.0;
+    }
+    total
 }
 
 /// `d Black / dw = K n(d2) / (2 sqrt w)`, the same for calls and puts.
@@ -493,7 +628,7 @@ pub fn black_w(fwd: f64, strike: f64, w: f64) -> MMResult<f64> {
         return Err(numerical("d Black / dw is singular at w = 0".to_string()));
     }
     let vol = w.sqrt();
-    let d2 = finite("d2", ((fwd.ln() - strike.ln()) - 0.5 * w) / vol)?;
+    let d2 = finite("d2", (-ln_ratio_f64(strike, fwd) - 0.5 * w) / vol)?;
     finite("d Black / dw", strike * norm_pdf(d2) / (2.0 * vol))
 }
 
@@ -511,6 +646,41 @@ fn check_black(fwd: f64, strike: f64, w: f64) -> MMResult<()> {
         )));
     }
     Ok(())
+}
+
+/// `ln(num / den)` for positive Decimals: near 1 (`|num/den - 1| <= 1/2`) as
+/// `log1p` of the exact Decimal `(num - den) / den`, elsewhere as
+/// `ln num - ln den` (which never forms a ratio that could overflow).
+fn ln_ratio(num: Decimal, den: Decimal) -> MMResult<f64> {
+    let rel = num
+        .checked_sub(den)
+        .and_then(|d| d.checked_div(den))
+        .and_then(|r| r.to_f64());
+    match rel {
+        Some(r) if r.is_finite() && r.abs() <= 0.5 => Ok(r.ln_1p()),
+        _ => {
+            let (n, d) = (
+                to_f64("ratio numerator", num)?,
+                to_f64("ratio denominator", den)?,
+            );
+            if !(n > 0.0 && d > 0.0) {
+                return Err(numerical(format!(
+                    "{num} / {den} has no positive f64 terms"
+                )));
+            }
+            finite("log ratio", n.ln() - d.ln())
+        }
+    }
+}
+
+/// `ln(num / den)` for positive finite f64: near 1 as `log1p((num - den) /
+/// den)`, where `num - den` is exact (Sterbenz), elsewhere `ln num - ln den`.
+fn ln_ratio_f64(num: f64, den: f64) -> f64 {
+    if num >= 0.5 * den && num <= 2.0 * den {
+        ((num - den) / den).ln_1p()
+    } else {
+        num.ln() - den.ln()
+    }
 }
 
 fn to_f64(name: &str, v: Decimal) -> MMResult<f64> {
@@ -551,4 +721,98 @@ fn invalid(msg: String) -> MMError {
 #[inline(never)]
 fn numerical(msg: String) -> MMError {
     MMError::NumericalError(msg)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    // The normalised out-of-the-money Black call b(x, s) in 400-digit
+    // decimal arithmetic (`scripts/black_reference.py`), on a grid that
+    // crosses every branch: the small-t series (s < 0.42), the erfcx form
+    // and the direct form, from the money (x = 0) to h = x / s = -40, and
+    // s down to 1e-28. Tolerance 2e-11 relative (the series loses digits as
+    // h grows negative, where the value itself is below 1e-25).
+    const B_TABLE: &[(f64, f64, f64)] = &[
+        (0.0, 1e-28, 3.989422804014327e-29),
+        (-1e-30, 1e-28, 3.9396222734922846e-29),
+        (0.0, 1e-14, 3.9894228040143265e-15),
+        (-1e-30, 1e-14, 3.9894228040143265e-15),
+        (0.0, 1e-08, 3.989422804014327e-09),
+        (-1e-30, 1e-08, 3.989422804014327e-09),
+        (-1e-10, 1e-08, 3.939622273492285e-09),
+        (0.0, 0.0001, 3.989422802352067e-05),
+        (-1e-30, 0.0001, 3.989422802352067e-05),
+        (-1e-10, 0.0001, 3.989417802354062e-05),
+        (-0.001, 0.0001, 7.474560245421083e-29),
+        (0.0, 0.01, 0.003989406181481645),
+        (-1e-30, 0.01, 0.003989406181481645),
+        (-1e-10, 0.01, 0.003989406131481645),
+        (-0.001, 0.01, 0.003509336918642542),
+        (-0.1, 0.01, 7.474468572496729e-27),
+        (0.0, 0.1, 0.039877611676744924),
+        (-1e-30, 0.1, 0.039877611676744924),
+        (-1e-10, 0.1, 0.03987761162674493),
+        (-0.001, 0.1, 0.03937960884362347),
+        (-0.1, 0.1, 0.008324939376702142),
+        (-1.0, 0.1, 7.465397611568617e-26),
+        (0.0, 0.41, 0.1624278749748963),
+        (-1e-30, 0.41, 0.1624278749748963),
+        (-1e-10, 0.41, 0.1624278749248963),
+        (-0.001, 0.41, 0.16192837165605764),
+        (-0.1, 0.41, 0.1173516170807252),
+        (-1.0, 0.41, 0.0009739269112510348),
+        (-5.0, 0.41, 5.3628497718814674e-36),
+        (0.0, 0.43, 0.1702326814403915),
+        (-1e-30, 0.43, 0.1702326814403915),
+        (-1e-10, 0.43, 0.1702326813903915),
+        (-0.001, 0.43, 0.16973315598619984),
+        (-0.1, 0.43, 0.12493818147677391),
+        (-1.0, 0.43, 0.001433091524446669),
+        (-5.0, 0.43, 5.296500261826388e-33),
+        (0.0, 1.0, 0.3829249225480262),
+        (-1e-30, 1.0, 0.3829249225480262),
+        (-1e-10, 1.0, 0.38292492249802623),
+        (-0.001, 1.0, 0.38242514642546155),
+        (-0.1, 1.0, 0.3351420702955817),
+        (-1.0, 1.0, 0.07699102314167414),
+        (-5.0, 1.0, 4.755776371084643e-08),
+        (0.0, 3.0, 0.8663855974622838),
+        (-1e-30, 3.0, 0.8663855974622838),
+        (-1e-10, 3.0, 0.8663855974122838),
+        (-0.001, 3.0, 0.8658857273259186),
+        (-0.1, 3.0, 0.8176638568093587),
+        (-1.0, 3.0, 0.4777039972474732),
+        (-5.0, 3.0, 0.02621728202255927),
+        (0.0, 10.0, 0.9999994266968563),
+        (-1e-30, 10.0, 0.9999994266968563),
+        (-1e-10, 10.0, 0.9999994266468563),
+        (-0.001, 10.0, 0.9994995516760282),
+        (-0.1, 10.0, 0.9512288512243005),
+        (-1.0, 10.0, 0.6065300890763248),
+        (-5.0, 10.0, 0.08208448838567498),
+    ];
+
+    #[test]
+    fn test_normalised_otm_call_matches_high_precision_on_every_branch() {
+        for &(x, s, want) in B_TABLE {
+            let got = normalised_otm_call(x, s);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 2e-11,
+                "b({x}, {s}) = {got:e}, want {want:e} (rel {rel:e})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalised_otm_call_below_the_density_underflow_is_zero() {
+        assert_eq!(normalised_otm_call(-1.0, 0.01), 0.0); // h = -100
+    }
 }

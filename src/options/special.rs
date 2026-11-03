@@ -86,16 +86,9 @@ const SB7: f64 = -2.244_095_244_658_582e1;
 /// `1 / sqrt(2 pi)`.
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
-/// erfc(|x|) for 0.84375 <= |x| < 28.
-fn erfc_tail(ax: f64) -> f64 {
-    if ax < 1.25 {
-        let s = ax - 1.0;
-        let p = PA0 + s * (PA1 + s * (PA2 + s * (PA3 + s * (PA4 + s * (PA5 + s * PA6)))));
-        let q = 1.0 + s * (QA1 + s * (QA2 + s * (QA3 + s * (QA4 + s * (QA5 + s * QA6)))));
-        return 1.0 - ERX - p / q;
-    }
-    let s = 1.0 / (ax * ax);
-    let (r, big_s) = if ax < 1.0 / 0.35 {
+/// fdlibm's `R/S` pair for `1.25 <= ax < 28`, with `s = 1 / ax^2`.
+fn tail_rational(ax: f64, s: f64) -> (f64, f64) {
+    if ax < 1.0 / 0.35 {
         (
             RA0 + s * (RA1 + s * (RA2 + s * (RA3 + s * (RA4 + s * (RA5 + s * (RA6 + s * RA7)))))),
             1.0 + s
@@ -108,7 +101,19 @@ fn erfc_tail(ax: f64) -> f64 {
             RB0 + s * (RB1 + s * (RB2 + s * (RB3 + s * (RB4 + s * (RB5 + s * RB6))))),
             1.0 + s * (SB1 + s * (SB2 + s * (SB3 + s * (SB4 + s * (SB5 + s * (SB6 + s * SB7)))))),
         )
-    };
+    }
+}
+
+/// erfc(|x|) for 0.84375 <= |x| < 28.
+fn erfc_tail(ax: f64) -> f64 {
+    if ax < 1.25 {
+        let s = ax - 1.0;
+        let p = PA0 + s * (PA1 + s * (PA2 + s * (PA3 + s * (PA4 + s * (PA5 + s * PA6)))));
+        let q = 1.0 + s * (QA1 + s * (QA2 + s * (QA3 + s * (QA4 + s * (QA5 + s * QA6)))));
+        return 1.0 - ERX - p / q;
+    }
+    let s = 1.0 / (ax * ax);
+    let (r, big_s) = tail_rational(ax, s);
     // z is ax with its 32 low bits cleared, so z * z is exact and
     // exp(-x^2) is computed as exp(-z^2) * exp((z - x)(z + x)) (fdlibm).
     let z = f64::from_bits(ax.to_bits() & 0xffff_ffff_0000_0000);
@@ -141,6 +146,44 @@ pub(crate) fn erfc(x: f64) -> f64 {
         return if x < 0.0 { 2.0 - tail } else { tail };
     }
     if x < 0.0 { 2.0 } else { 0.0 }
+}
+
+/// The scaled complementary error function `erfcx(x) = e^{x^2} erfc(x)`, for
+/// `x >= 0` (the only arguments the pricer needs).
+///
+/// On `[1.25, 28)` it reuses fdlibm's rational approximations: there
+/// `erfc(x) = e^{-x^2 - 0.5625 + R/S} / x` exactly in the approximation, so
+/// `erfcx(x) = e^{R/S - 0.5625} / x` with no `e^{x^2}` to overflow. Beyond 28
+/// it is the asymptotic series `sum_n (-1)^n (2n - 1)!! / (2x^2)^n / (x sqrt pi)`
+/// to `n = 7` (Abramowitz and Stegun, 7.1.23), whose next term is below
+/// 1e-17 relative at `x = 28`. Below 1.25,
+/// `e^{x^2} erfc(x)` directly. NaN and negative arguments give NaN.
+#[must_use]
+pub(crate) fn erfcx(x: f64) -> f64 {
+    if x.is_nan() || x < 0.0 {
+        return f64::NAN;
+    }
+    if x < 1.25 {
+        return (x * x).exp() * erfc(x);
+    }
+    if x < 28.0 {
+        let s = 1.0 / (x * x);
+        let (r, big_s) = tail_rational(x, s);
+        return (r / big_s - 0.5625).exp() / x;
+    }
+    if x.is_infinite() {
+        return 0.0;
+    }
+    let z = 1.0 / (2.0 * x * x);
+    let series = 1.0
+        - z * (1.0
+            - 3.0
+                * z
+                * (1.0
+                    - 5.0
+                        * z
+                        * (1.0 - 7.0 * z * (1.0 - 9.0 * z * (1.0 - 11.0 * z * (1.0 - 13.0 * z))))));
+    series / (x * std::f64::consts::PI.sqrt())
 }
 
 /// The standard normal distribution function, `N(x) = erfc(-x / sqrt 2) / 2`.
@@ -244,6 +287,36 @@ mod tests {
         for x in [-3.0, -1.0, -0.1, 0.0, 0.3, 2.0] {
             assert!((norm_cdf(x) + norm_cdf(-x) - 1.0).abs() <= 2e-16, "x = {x}");
         }
+    }
+
+    // erfcx(x) = e^(x^2) erfc(x) in 400-digit decimal arithmetic
+    // (`scripts/black_reference.py`); tolerance 1e-15 relative.
+    const ERFCX_TABLE: &[(f64, f64)] = &[
+        (0.0, 1.0),
+        (0.5, 0.6156903441929259),
+        (1.0, 0.427583576155807),
+        (1.25, 0.3678229164523611),
+        (2.0, 0.25539567631050575),
+        (5.0, 0.11070463773306863),
+        (10.0, 0.05614099274382259),
+        (27.0, 0.02088160799042094),
+        (28.0, 0.020136801964214277),
+        (30.0, 0.01879588886141675),
+        (100.0, 0.005641613782989433),
+        (10000000000.0, 5.641895835477563e-11),
+    ];
+
+    #[test]
+    fn test_erfcx_tabulated_values_within_declared_tolerance() {
+        for &(x, want) in ERFCX_TABLE {
+            let got = erfcx(x);
+            assert!(
+                rel(got, want) <= 1e-15,
+                "erfcx({x}) = {got:e}, want {want:e}"
+            );
+        }
+        assert!(erfcx(-1.0).is_nan() && erfcx(f64::NAN).is_nan());
+        assert_eq!(erfcx(f64::INFINITY), 0.0);
     }
 
     #[test]

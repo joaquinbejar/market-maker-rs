@@ -724,3 +724,125 @@ fn test_tau_from_days_uses_the_365_day_pricing_year() {
         Err(MMError::InvalidTimestamp(_))
     ));
 }
+
+#[test]
+fn test_black_near_the_money_at_tiny_variance_keeps_its_digits() {
+    // C = F b(0, s) with b(0, 1e-28) = 3.98942280401432666e-29 (400-digit
+    // reference, scripts/black_reference.py): F N(d1) - K N(d2) would give 0.
+    let c = black_undiscounted(100.0, 100.0, 1e-56, OptionStyle::Call).unwrap();
+    assert!(close(c, 3.989_422_804_014_327e-27, 1e-14, 0.0), "{c:e}");
+    let p = black_undiscounted(100.0, 100.0, 1e-56, OptionStyle::Put).unwrap();
+    assert_eq!(c, p);
+    // The pricer keeps it, to the resolution of Decimal (28 places).
+    let flat = FlatSurface::new(Decimal::new(1, 28)).unwrap();
+    let i = OptionInputs::european(
+        dec!(100),
+        dec!(100),
+        dec!(1),
+        dec!(0),
+        dec!(0),
+        OptionStyle::Call,
+    );
+    let v = value(&i, &flat, Dynamics::StickyMoneyness).unwrap();
+    assert!(v.price > Decimal::ZERO);
+    assert!(
+        (f(v.price) - 3.989_422_804_014_327e-27).abs() <= 1e-28,
+        "{}",
+        v.price
+    );
+}
+
+#[test]
+fn test_black_time_value_is_continuous_across_the_series_boundary() {
+    // sqrt(w) = 0.42 is where the small-t series hands over (t = 0.21).
+    for &(fwd, strike) in &[(100.0_f64, 100.0_f64), (95.0, 100.0), (100.0, 80.0)] {
+        let below =
+            black_undiscounted(fwd, strike, (0.42_f64 - 1e-12).powi(2), OptionStyle::Call).unwrap();
+        let above =
+            black_undiscounted(fwd, strike, (0.42_f64 + 1e-12).powi(2), OptionStyle::Call).unwrap();
+        assert!(
+            (above - below).abs() <= 1e-9 * above,
+            "{fwd} {strike}: {below} {above}"
+        );
+    }
+}
+
+#[test]
+fn test_black_near_the_money_at_small_variance_uses_the_exact_log_ratio() {
+    // F = 100, w = 1e-28 (s = 1e-14), calls; references in 400-digit
+    // arithmetic at the exact f64 inputs (scripts/black_reference.py):
+    // ln F - ln K would lose the digits that set h = ln(F/K) / s.
+    for (strike, want) in [
+        (100.000_000_000_000_01, 3.918_771_352_418_849_3e-13),
+        (99.999_999_999_999_99, 4.060_879_899_570_869e-13),
+        (100.0, 3.989_422_804_014_326_7e-13),
+    ] {
+        let got = black_undiscounted(100.0, strike, 1e-28, OptionStyle::Call).unwrap();
+        assert!(
+            close(got, want, 1e-13, 0.0),
+            "K = {strike}: {got:e} vs {want:e}"
+        );
+    }
+    // The pricer at the same inputs given exactly as Decimals.
+    let flat = FlatSurface::new(dec!(0.00000000000001)).unwrap();
+    for (strike, want) in [
+        (dec!(100.00000000000001), 3.939_622_273_492_284_7e-13),
+        (dec!(99.99999999999999), 4.039_622_273_492_284_3e-13),
+    ] {
+        let i = OptionInputs::european(
+            dec!(100),
+            strike,
+            dec!(1),
+            dec!(0),
+            dec!(0),
+            OptionStyle::Call,
+        );
+        let got = f(value(&i, &flat, Dynamics::StickyMoneyness).unwrap().price);
+        assert!(
+            close(got, want, 1e-13, 0.0),
+            "K = {strike}: {got:e} vs {want:e}"
+        );
+    }
+}
+
+#[test]
+fn test_value_theta_of_a_deep_in_the_money_call_has_no_cancellation() {
+    // S = 1e24, K = 1, tau = 1, r = 5 %, q = 0, sigma = 0.2: theta is
+    // -r K e^{-r tau} N(d2) = -0.05 e^{-0.05} to double precision.
+    let flat = FlatSurface::new(dec!(0.2)).unwrap();
+    let i = OptionInputs::european(
+        dec!(1000000000000000000000000),
+        dec!(1),
+        dec!(1),
+        dec!(0.05),
+        dec!(0),
+        OptionStyle::Call,
+    );
+    let v = value(&i, &flat, Dynamics::StickyMoneyness).unwrap();
+    let want = -0.05 * (-0.05_f64).exp();
+    assert!(close(f(v.theta), want, 1e-12, 0.0), "{} vs {want}", v.theta);
+}
+
+#[test]
+fn test_surface_pricer_check_market_needs_no_contract() {
+    let flat = Arc::new(FlatSurface::new(dec!(0.2)).unwrap());
+    let pricer = SurfacePricer::new(flat, Dynamics::StickyMoneyness).unwrap();
+    assert!(
+        pricer
+            .check_market(dec!(100), dec!(0.1), dec!(0.02), dec!(0))
+            .is_ok()
+    );
+    assert!(
+        pricer
+            .check_market(dec!(100), dec!(0), dec!(0.02), dec!(0))
+            .is_ok()
+    );
+    assert!(matches!(
+        pricer.check_market(dec!(0), dec!(0.1), dec!(0), dec!(0)),
+        Err(MMError::InvalidMarketState(_))
+    ));
+    assert!(matches!(
+        pricer.check_market(dec!(100), dec!(-0.1), dec!(0), dec!(0)),
+        Err(MMError::InvalidMarketState(_))
+    ));
+}
