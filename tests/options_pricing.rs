@@ -845,4 +845,34 @@ fn test_surface_pricer_check_market_needs_no_contract() {
         pricer.check_market(dec!(100), dec!(-0.1), dec!(0), dec!(0)),
         Err(MMError::InvalidMarketState(_))
     ));
+    // The shared factors: a discount factor or a forward that is not
+    // finite and positive fails for every contract.
+    assert!(matches!(
+        pricer.check_market(dec!(100), dec!(1), dec!(1000), dec!(0)),
+        Err(MMError::NumericalError(_))
+    ));
+    assert!(matches!(
+        pricer.check_market(dec!(100), dec!(1), dec!(0), dec!(-1000)),
+        Err(MMError::NumericalError(_))
+    ));
+}
+
+#[test]
+fn test_surface_pricer_check_market_does_not_evaluate_the_surface() {
+    struct Nowhere;
+    impl VolSurface for Nowhere {
+        fn total_variance_at(
+            &self,
+            _: f64,
+            _: f64,
+        ) -> market_maker_rs::types::error::MMResult<TotalVariance> {
+            Err(MMError::InvalidMarketState("no answer".to_string()))
+        }
+    }
+    let pricer = SurfacePricer::new(Arc::new(Nowhere), Dynamics::StickyMoneyness).unwrap();
+    assert!(
+        pricer
+            .check_market(dec!(100), dec!(0.25), dec!(0.02), dec!(0))
+            .is_ok()
+    );
 }

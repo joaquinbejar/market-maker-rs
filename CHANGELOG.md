@@ -73,7 +73,9 @@ project follows [Semantic Versioning](https://semver.org/).
   returns one `ChainQuoteOutcome` per contract, `Quote(ChainQuoteUpdate)`
   or `NotQuoted { strike, style, reason }` (for example a theoretical value
   below one price unit), and fails as a whole only when the shared inputs
-  do. `ChainPricing` carries the pricer, the time to expiry and the rates of
+  do (`OptionPricer::check_market`: spot, time to expiry, rates and their
+  derived factors; the surface is never evaluated there, so a surface error
+  at a contract's own `k` is that contract's `NotQuoted`). `ChainPricing` carries the pricer, the time to expiry and the rates of
   the chain's expiration. `generate_quote` takes the `OptionValuation`
   (its theo is the model price rounded half to even to the price unit) and
   returns `MMResult`; `ChainQuoteUpdate` has a `valuation` field and

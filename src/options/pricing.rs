@@ -262,8 +262,11 @@ impl OptionPricer for SurfacePricer {
     }
 
     /// A positive spot, a non-negative time to expiry, rates with a finite
-    /// f64 value, and a surface that answers at this expiry at the money
-    /// forward (`k = 0`). No contract is valued.
+    /// f64 value and, before expiry, the factors every contract shares: a
+    /// finite growth `(r - q) tau`, positive discount and carry factors and
+    /// a positive forward. The surface is not evaluated: its answer depends
+    /// on each contract's `k`, so a surface error is that contract's own
+    /// failure. No contract is valued.
     fn check_market(
         &self,
         spot: Decimal,
@@ -279,12 +282,21 @@ impl OptionPricer for SurfacePricer {
                 "time to expiry must be non-negative, got {tau_years}"
             )));
         }
-        to_f64("spot", spot)?;
-        to_f64("rate", rate)?;
-        to_f64("carry", carry)?;
+        let s = to_f64("spot", spot)?;
+        let r = to_f64("rate", rate)?;
+        let q = to_f64("carry", carry)?;
         let tau = to_f64("time to expiry", tau_years)?;
-        if tau > 0.0 {
-            self.surface.total_variance(0.0, tau)?;
+        if tau_years > Decimal::ZERO {
+            // The same shared factors, with the same errors, as `value`.
+            if !(s > 0.0 && tau > 0.0) {
+                return Err(numerical(
+                    "spot or time to expiry underflows to zero as f64".to_string(),
+                ));
+            }
+            let growth = finite("(rate - carry) * tau", (r - q) * tau)?;
+            positive("discount factor e^(-r tau)", (-r * tau).exp())?;
+            positive("carry factor e^(-q tau)", (-q * tau).exp())?;
+            positive("forward", s * growth.exp())?;
         }
         Ok(())
     }

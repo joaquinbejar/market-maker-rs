@@ -588,7 +588,9 @@ impl ChainMarketMaker {
     ///
     /// [`MMError::InvalidMarketState`] for a zero underlying price, and the
     /// error of [`OptionPricer::check_market`] for the inputs every contract
-    /// shares (spot, rates, time to expiry, the surface at this expiry).
+    /// shares (spot, rates, time to expiry and the factors derived from
+    /// them). The surface is never evaluated for the shared check: a surface
+    /// error at a contract's own `k` is that contract's `NotQuoted`.
     pub fn refresh_all_quotes(
         &self,
         underlying_price: u64,
@@ -900,8 +902,8 @@ mod tests {
             Err(MMError::InvalidMarketState(_))
         ));
         assert!(ChainPricing::new(Arc::new(NoMarket), dec!(-0.1), dec!(0), dec!(0)).is_err());
-        // A flat surface priced at a time to expiry its pricer accepts, but
-        // a surface error at this expiry is shared: it fails the refresh.
+        // A surface error is never shared: a surface that answers nowhere
+        // leaves every contract NotQuoted with its own error.
         struct NoExpiry;
         impl crate::options::surface::VolSurface for NoExpiry {
             fn total_variance_at(
@@ -920,10 +922,59 @@ mod tests {
         )
         .unwrap();
         let pricing = ChainPricing::new(Arc::new(pricer), dec!(0.1), dec!(0), dec!(0)).unwrap();
+        let outcomes = mm.refresh_all_quotes(50000, &pricing).unwrap();
+        assert!(!outcomes.is_empty());
+        assert!(
+            outcomes.iter().all(|o| matches!(
+                o,
+                ChainQuoteOutcome::NotQuoted {
+                    reason: MMError::InvalidMarketState(_),
+                    ..
+                }
+            )),
+            "{outcomes:?}"
+        );
+        // Rates whose discount factor underflows are shared: the refresh fails.
+        let pricing = flat_pricing(dec!(0.6), dec!(1));
+        let pricing =
+            ChainPricing::new(Arc::clone(&pricing.pricer), dec!(1), dec!(1000), dec!(0)).unwrap();
         assert!(matches!(
             mm.refresh_all_quotes(50000, &pricing),
-            Err(MMError::InvalidMarketState(_))
+            Err(MMError::NumericalError(_))
         ));
+    }
+
+    #[test]
+    fn test_refresh_all_quotes_surface_error_at_k_zero_only_is_not_shared() {
+        use crate::options::pricing::{Dynamics, SurfacePricer};
+        use crate::options::surface::{TotalVariance, VolSurface};
+        // A valid surface that refuses exactly k = 0 (the forward of a
+        // strike the chain does not list) and answers at every other k.
+        struct NoForwardPoint;
+        impl VolSurface for NoForwardPoint {
+            fn total_variance_at(&self, k: f64, tau: f64) -> MMResult<TotalVariance> {
+                if k == 0.0 {
+                    return Err(MMError::InvalidMarketState("k = 0".to_string()));
+                }
+                TotalVariance::new(0.09 * tau, 0.0, 0.0, 0.09)
+            }
+        }
+        let pricer =
+            SurfacePricer::new(Arc::new(NoForwardPoint), Dynamics::StickyMoneyness).unwrap();
+        let exp = ExpirationDate::Days(pos_or_panic!(30.0));
+        let chain = ExpirationOrderBook::new("X", exp);
+        chain.get_or_create_strike(90);
+        chain.get_or_create_strike(110);
+        let mm = ChainMarketMaker::with_defaults(Arc::new(chain));
+        let pricing = ChainPricing::new(Arc::new(pricer), dec!(0.25), dec!(0), dec!(0)).unwrap();
+        let outcomes = mm.refresh_all_quotes(100, &pricing).unwrap();
+        assert_eq!(outcomes.len(), 4);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, ChainQuoteOutcome::Quote(_))),
+            "{outcomes:?}"
+        );
     }
 
     #[test]
