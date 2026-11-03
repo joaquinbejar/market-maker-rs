@@ -84,7 +84,7 @@ const SB6: f64 = 4.745_285_412_069_553_7e2;
 const SB7: f64 = -2.244_095_244_658_582e1;
 
 /// `1 / sqrt(2 pi)`.
-const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+pub(crate) const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /// fdlibm's `R/S` pair for `1.25 <= ax < 28`, with `s = 1 / ax^2`.
 fn tail_rational(ax: f64, s: f64) -> (f64, f64) {

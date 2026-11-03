@@ -61,7 +61,7 @@
 use std::sync::Arc;
 
 use crate::Decimal;
-use crate::options::special::{erfcx, norm_cdf, norm_pdf};
+use crate::options::special::{INV_SQRT_2PI, erfcx, norm_cdf, norm_pdf};
 use crate::options::surface::VolSurface;
 use crate::types::error::{MMError, MMResult};
 use optionstratlib::{OptionStyle, OptionType};
@@ -304,6 +304,11 @@ impl OptionPricer for SurfacePricer {
 
 /// Values a European option on `surface` under `dynamics`.
 ///
+/// The price is a `Decimal` with 28 decimal places: a model price below that
+/// resolution, including one below the smallest positive `f64`, is 0 (its
+/// rounding), unlike [`black_undiscounted`], which reports the latter as an
+/// error.
+///
 /// # Errors
 ///
 /// - [`MMError::UnsupportedContract`] for any exercise other than European.
@@ -489,16 +494,23 @@ impl Model {
         // theta = -dV/dtau, V = e^{-r tau} Black(F(tau), K, w(k(tau), tau)),
         // dk/dtau = -(r - q), dBlack/dw = K n(d2) / (2 sqrt w). With
         // e^{-r tau} F = e^{-q tau} S the F N(d1) terms of -r V and of the
-        // forward's drift cancel analytically, which leaves
-        //   call: q S e^{-q tau} N(d1) - r K e^{-r tau} N(d2) - e^{-r tau} Black_w dw/dtau,
-        //   put:  r K e^{-r tau} N(-d2) - q S e^{-q tau} N(-d1) - e^{-r tau} Black_w dw/dtau,
-        // with no difference of terms of the order of S.
+        // forward's drift cancel analytically, which leaves the carry part
+        //   call: q S e^{-q tau} N(d1) - r K e^{-r tau} N(d2)
+        //   put:  r K e^{-r tau} N(-d2) - q S e^{-q tau} N(-d1)
+        // and theta = carry - e^{-r tau} Black_w dw/dtau. The carry part is
+        // written on the stable price V, as
+        //   call: q V - (r - q) K e^{-r tau} N(d2)
+        //   put:  q V + (r - q) K e^{-r tau} N(-d2),
+        // the same quantity: exactly q V at r = q, where the first form
+        // would cancel near the money at small w, and exactly the single
+        // rate term at q = 0, where the alternative r V - (r - q) S ... would
+        // cancel deep in the money.
         let black_w = k * n2 / (2.0 * self.vol);
         let dw_dtau = self.w_tau - (self.r - self.q) * self.w_k;
         let carry_part = if call {
-            self.q * s * self.df_q * norm_cdf(d1) - self.r * k * self.df_r * norm_cdf(d2)
+            self.q * price - (self.r - self.q) * k * self.df_r * norm_cdf(d2)
         } else {
-            self.r * k * self.df_r * norm_cdf(-d2) - self.q * s * self.df_q * norm_cdf(-d1)
+            self.q * price + (self.r - self.q) * k * self.df_r * norm_cdf(-d2)
         };
         let theta = finite("theta", carry_part - self.df_r * black_w * dw_dtau)?;
         Ok(OptionValuation {
@@ -515,11 +527,17 @@ impl Model {
 /// variance `w` (Black, 1976). Increasing in `w`. At `w = 0` it is the
 /// intrinsic value of the forward, `max(F - K, 0)` or `max(K - F, 0)`.
 ///
+/// The domain is every finite positive `F` and `K` and finite `w >= 0`. For
+/// `w > 0` the true price is strictly positive; a price below the smallest
+/// positive `f64` (about 4.9e-324) is an error, never a 0. Prices in the
+/// subnormal range keep only the precision that range has.
+///
 /// # Errors
 ///
 /// [`MMError::InvalidMarketState`] when `F` or `K` is not finite and
 /// positive, or `w` is negative or not finite; [`MMError::NumericalError`]
-/// for a non-finite result.
+/// for a non-finite result or a positive price below the smallest positive
+/// `f64`.
 pub fn black_undiscounted(fwd: f64, strike: f64, w: f64, style: OptionStyle) -> MMResult<f64> {
     check_black(fwd, strike, w)?;
     let call = matches!(style, OptionStyle::Call);
@@ -529,15 +547,35 @@ pub fn black_undiscounted(fwd: f64, strike: f64, w: f64, style: OptionStyle) -> 
     }
     let vol = positive("total volatility sqrt(w)", w.sqrt())?;
     let k = finite("log moneyness", ln_ratio_f64(strike, fwd))?;
-    black_price(fwd, strike, k, vol, call)
+    let price = black_price(fwd, strike, k, vol, call)?;
+    if price == 0.0 {
+        // The true price is positive for w > 0: never report it as 0.
+        return Err(numerical(
+            "Black price is positive but below the smallest positive f64".to_string(),
+        ));
+    }
+    Ok(price)
 }
 
 /// Below this `t = sqrt(w) / 2` the out-of-the-money price is the Taylor
 /// series in `t` (Jaeckel, 2015, "Let's be rational", section 3).
 const SMALL_T: f64 = 0.21;
-/// Below this `h = x / sqrt(w)` the density `n(h)` is below the smallest
-/// subnormal, so the normalised price underflows to zero (its true value).
-const UNDERFLOW_H: f64 = -40.0;
+/// A factor `e^{e}` is evaluated directly while `|e|` is at most this; beyond
+/// it the scale `sqrt(F K)` is folded into the exponent, `e^{e + ln sqrt(F K)}`,
+/// so a normalised term that underflows, or a factor `e^{-ht}` that
+/// overflows, never loses a price that `f64` can represent.
+const DIRECT_EXPONENT: f64 = 700.0;
+/// A term `m e^{e}` with `m <= 1` whose exponent, scale included, is below
+/// this is below half the smallest positive subnormal: it rounds to 0.
+const UNDERFLOW_EXPONENT: f64 = -746.0;
+/// The small-`t` series is used only while `|h t| = |x| / 2` is at most this.
+/// Its terms grow like `|h t|^j / j!` before they fall, so its error grows
+/// with `|h t|`: against a 400-digit reference on `h` in [-50, -1] and `t` in
+/// [1e-4, 0.21) it is within 4e-13 relative up to `|h t| = 1` but reaches
+/// 6.6e-11 at `h = -40, t = 0.21` and 5.6e-10 at `h = -50, t = 0.21`, where
+/// the erfcx form is within 3e-14. Beyond the bound the erfcx form (within
+/// 1.2e-13 there) is used instead.
+const SERIES_MAX_HT: f64 = 1.0;
 /// Highest odd order of the small-`t` series.
 const SERIES_ORDER: usize = 17;
 
@@ -551,9 +589,17 @@ const SERIES_ORDER: usize = 17;
 /// price carries the cancellation of `F N(d1) - K N(d2)`, which near the
 /// money at small `w` loses every digit.
 fn black_price(fwd: f64, strike: f64, k: f64, vol: f64, call: bool) -> MMResult<f64> {
-    let otm = finite("normalised Black price", normalised_otm_call(-k.abs(), vol))?;
     let scale = fwd.sqrt() * strike.sqrt();
-    let time_value = finite("Black time value", scale * otm)?;
+    let ln_scale = 0.5 * (fwd.ln() + strike.ln());
+    let time_value = finite(
+        "Black time value",
+        otm_time_value(-k.abs(), vol, scale, ln_scale),
+    )?;
+    if time_value < 0.0 {
+        return Err(numerical(format!(
+            "Black time value is negative: {time_value}"
+        )));
+    }
     // Near the money F - K is K (e^{x} - 1) = K expm1(x), x = -k, which keeps
     // the precision of the log ratio (F - K in f64 would carry the rounding
     // of F and K); away from it the direct difference has no cancellation.
@@ -567,32 +613,89 @@ fn black_price(fwd: f64, strike: f64, k: f64, vol: f64, call: bool) -> MMResult<
     } else {
         -forward_minus_strike
     };
+    // 0 here only when the true price, positive for vol > 0, is below half
+    // the smallest subnormal; each caller decides what that means.
     finite("Black price", intrinsic.max(0.0) + time_value)
 }
 
-/// `b(x, s)` for `x <= 0`, with `h = x / s` and `t = s / 2`:
-/// - `t < SMALL_T`: `2 n(h) sum_{odd j} G_j(h) t^j / j!`, the Taylor series
-///   of `e^{ht} N(h + t) - e^{-ht} N(h - t)` in `t` (see `small_t_sum`);
-/// - otherwise, with `d1 = h + t <= 0`:
+/// One term `m e^{e}` of the normalised price, with `0 <= m <= 1`.
+#[derive(Clone, Copy)]
+struct Term {
+    m: f64,
+    e: f64,
+}
+
+impl Term {
+    /// `sqrt(F K) m e^{e}`, from `scale = sqrt(F) sqrt(K)` and
+    /// `ln_scale = ln sqrt(F K)`.
+    fn scaled(self, scale: f64, ln_scale: f64) -> f64 {
+        if self.e.abs() <= DIRECT_EXPONENT {
+            self.m * self.e.exp() * scale
+        } else {
+            self.m * (self.e + ln_scale).exp()
+        }
+    }
+}
+
+/// The time value `sqrt(F K) b(x, s)` for `x <= 0`, with `h = x / s` and
+/// `t = s / 2`:
+/// - `t < SMALL_T` and `|h t| <= SERIES_MAX_HT`:
+///   `2 n(h) sum_{odd j} G_j(h) t^j / j!`, the Taylor series of
+///   `e^{ht} N(h + t) - e^{-ht} N(h - t)` in `t` (see `small_t_sum`);
+/// - otherwise, with `d1 = h + t <= 0` (always the case for `t < SMALL_T`
+///   once `|h t| > SERIES_MAX_HT`, since then `|h| > 4.7 > t`):
 ///   `e^{-(h^2 + t^2)/2} (erfcx(-d1/sqrt 2) - erfcx(-d2/sqrt 2)) / 2`, which
 ///   has no overflow and no tail cancellation;
 /// - otherwise `e^{ht} N(h + t) - e^{-ht} N(h - t)`, where `t >= SMALL_T`
-///   bounds the cancellation.
-fn normalised_otm_call(x: f64, s: f64) -> f64 {
+///   bounds the cancellation; when `e^{-ht}` would overflow, its term is
+///   `e^{-(h^2 + t^2)/2} erfcx(-(h - t)/sqrt 2) / 2` (`h - t < 0`).
+///
+/// Each term is `m e^{e}` scaled by [`Term::scaled`], so the result is 0
+/// only when the true time value is below half the smallest subnormal.
+fn otm_time_value(x: f64, s: f64, scale: f64, ln_scale: f64) -> f64 {
     let h = x / s;
     let t = 0.5 * s;
-    if h < UNDERFLOW_H {
-        return 0.0;
+    let r = std::f64::consts::FRAC_1_SQRT_2;
+    if t < SMALL_T || h + t <= 0.0 {
+        let series = t < SMALL_T && (h * t).abs() <= SERIES_MAX_HT;
+        let e = if series {
+            -0.5 * h * h
+        } else {
+            -0.5 * (h * h + t * t)
+        };
+        if e + ln_scale < UNDERFLOW_EXPONENT {
+            return 0.0;
+        }
+        let m = if series {
+            // 2 n(h) S = 2 S e^{-h^2/2} / sqrt(2 pi).
+            2.0 * INV_SQRT_2PI * small_t_sum(h, t)
+        } else {
+            0.5 * (erfcx(-(h + t) * r) - erfcx(-(h - t) * r))
+        };
+        return Term { m, e }.scaled(scale, ln_scale);
     }
-    if t < SMALL_T {
-        return 2.0 * norm_pdf(h) * small_t_sum(h, t);
-    }
-    if h + t <= 0.0 {
-        let r = std::f64::consts::FRAC_1_SQRT_2;
-        let e = (-0.5 * (h * h + t * t)).exp();
-        return 0.5 * e * (erfcx(-(h + t) * r) - erfcx(-(h - t) * r));
-    }
-    (h * t).exp() * norm_cdf(h + t) - (-h * t).exp() * norm_cdf(h - t)
+    let first = Term {
+        m: norm_cdf(h + t),
+        e: h * t,
+    };
+    let second = if -h * t <= DIRECT_EXPONENT {
+        Term {
+            m: norm_cdf(h - t),
+            e: -h * t,
+        }
+    } else {
+        Term {
+            m: 0.5 * erfcx(-(h - t) * r),
+            e: -0.5 * (h * h + t * t),
+        }
+    };
+    first.scaled(scale, ln_scale) - second.scaled(scale, ln_scale)
+}
+
+/// The normalised out-of-the-money call `b(x, s)`, for the unit tests.
+#[cfg(test)]
+fn normalised_otm_call(x: f64, s: f64) -> f64 {
+    otm_time_value(x, s, 1.0, 0.0)
 }
 
 /// `sum_{odd j <= SERIES_ORDER} G_j(h) t^j / j!`, where `G_j` is the j-th
@@ -749,8 +852,7 @@ mod tests {
     // decimal arithmetic (`scripts/black_reference.py`), on a grid that
     // crosses every branch: the small-t series (s < 0.42), the erfcx form
     // and the direct form, from the money (x = 0) to h = x / s = -40, and
-    // s down to 1e-28. Tolerance 2e-11 relative (the series loses digits as
-    // h grows negative, where the value itself is below 1e-25).
+    // s down to 1e-28. Tolerance 1e-12 relative.
     const B_TABLE: &[(f64, f64, f64)] = &[
         (0.0, 1e-28, 3.989422804014327e-29),
         (-1e-30, 1e-28, 3.9396222734922846e-29),
@@ -817,7 +919,7 @@ mod tests {
             let got = normalised_otm_call(x, s);
             let rel = ((got - want) / want).abs();
             assert!(
-                rel <= 2e-11,
+                rel <= 1e-12,
                 "b({x}, {s}) = {got:e}, want {want:e} (rel {rel:e})"
             );
         }
@@ -825,6 +927,130 @@ mod tests {
 
     #[test]
     fn test_normalised_otm_call_below_the_density_underflow_is_zero() {
-        assert_eq!(normalised_otm_call(-1.0, 0.01), 0.0); // h = -100
+        // h = -100: b = e^{-5000}...; unscaled, it rounds to 0. The scaled
+        // time value is what `black_price` uses.
+        assert_eq!(normalised_otm_call(-1.0, 0.01), 0.0);
+    }
+
+    /// `(x, s, b(x, s) e^{h^2 / 2})` on `h` in [-50, -1] and `t` in [1e-4,
+    /// 0.21), 400-digit references (scripts/black_reference.py, `b` scaled
+    /// by `e^{h^2/2}` so that every point is representable).
+    #[rustfmt::skip]
+    const SCALED_TABLE: &[(f64, f64, f64)] = &[
+        (-0.0002, 0.0002, 2.747_279_762_006_909_8e-5),
+        (-0.002, 0.002, 2.747_278_898_798_702_6e-4),
+        (-0.02, 0.02, 2.747_192_579_520_959e-3),
+        (-0.06, 0.06, 8.239_485_486_283_62e-3),
+        (-0.1, 0.1, 1.372_550_462_765_788_7e-2),
+        (-0.2, 0.2, 2.738_576_061_791_531e-2),
+        (-0.3, 0.3, 4.091_610_124_106_861e-2),
+        (-0.4, 0.4, 5.425_301_575_362_282e-2),
+        (-0.4198, 0.4198, 5.686_537_834_606_875e-2),
+        (-0.0004, 0.0002, 1.254_765_554_168_857_1e-5),
+        (-0.004, 0.002, 1.254_765_065_804_701_6e-4),
+        (-0.04, 0.02, 1.254_716_230_387_071_7e-3),
+        (-0.12, 0.06, 3.762_965_019_729_742_6e-3),
+        (-0.2, 0.1, 6.267_664_729_412_239e-3),
+        (-0.4, 0.2, 1.249_842_653_855_006_2e-2),
+        (-0.6, 0.3, 1.865_575_869_963_861_6e-2),
+        (-0.8, 0.4, 2.470_388_134_489_693_8e-2),
+        (-0.8396, 0.4198, 2.588_542_102_898_626e-2),
+        (-0.0006000000000000001, 0.0002, 6.880_087_037_169_781e-6),
+        (-0.006, 0.002, 6.880_084_089_004_478e-5),
+        (-0.06, 0.02, 6.879_789_278_954_203e-4),
+        (-0.18, 0.06, 2.063_222_233_878_559_3e-3),
+        (-0.30000000000000004, 0.1, 3.436_323_146_686_759e-3),
+        (-0.6000000000000001, 0.2, 6.850_372_979_339_059e-3),
+        (-0.8999999999999999, 0.3, 1.022_012_040_059_736_2e-2),
+        (-1.2000000000000002, 0.4, 1.352_402_095_188_351e-2),
+        (-1.2594, 0.4198, 1.416_855_890_346_062e-2),
+        (-0.001, 0.0002, 2.869_151_091_847_442_6e-6),
+        (-0.01, 0.002, 2.869_149_762_000_814e-5),
+        (-0.1, 0.02, 2.869_016_780_462_169_3e-4),
+        (-0.3, 0.06, 8.603_827_227_367_018e-4),
+        (-0.5, 0.1, 1.432_897_438_862_639e-3),
+        (-1.0, 0.2, 2.855_749_819_496_033e-3),
+        (-1.5, 0.3, 4.258_629_789_063_769e-3),
+        (-2.0, 0.4, 5.631_843_469_687_397e-3),
+        (-2.099, 0.4198, 5.899_401_730_739_755e-3),
+        (-0.0016, 0.0002, 1.192_382_134_613_312_4e-6),
+        (-0.016, 0.002, 1.192_381_561_073_602_7e-5),
+        (-0.16, 0.02, 1.192_324_208_496_835_9e-4),
+        (-0.48, 0.06, 3.575_582_563_831_440_5e-4),
+        (-0.8, 0.1, 5.954_673_436_882_413e-4),
+        (-1.6, 0.2, 1.186_602_870_288_139e-3),
+        (-2.4, 0.3, 1.769_127_280_791_907_4e-3),
+        (-3.2, 0.4, 2.338_865_421_026_799_2e-3),
+        (-3.3584, 0.4198, 2.449_804_454_919_873_3e-3),
+        (-0.002, 0.0002, 7.750_678_737_117_492e-7),
+        (-0.02, 0.002, 7.750_674_972_365_682e-6),
+        (-0.2, 0.02, 7.750_298_506_422_452e-5),
+        (-0.6, 0.06, 2.324_177_108_532_557_7e-4),
+        (-1.0, 0.1, 3.870_588_826_980_032e-4),
+        (-2.0, 0.2, 7.712_744_138_255_237e-4),
+        (-3.0, 0.3, 1.149_838_037_428_288e-3),
+        (-4.0, 0.4, 1.520_010_192_939_746_2e-3),
+        (-4.198, 0.4198, 1.592_077_710_610_184_5e-3),
+        (-0.003, 0.0002, 3.499_890_808_620_16e-7),
+        (-0.03, 0.002, 3.499_889_091_114_971_7e-6),
+        (-0.3, 0.02, 3.499_717_344_852_679e-5),
+        (-0.8999999999999999, 0.06, 1.049_498_941_643_022_5e-4),
+        (-1.5, 0.1, 1.747_778_188_494_138_8e-4),
+        (-3.0, 0.2, 3.482_585_213_869_155e-4),
+        (-4.5, 0.3, 5.191_610_235_144_611e-4),
+        (-6.0, 0.4, 6.862_360_283_517_318e-4),
+        (-6.297, 0.4198, 7.187_574_730_652_603e-4),
+        (-0.004, 0.0002, 1.979_934_859_933_071e-7),
+        (-0.04, 0.002, 1.979_933_884_682_189_3e-6),
+        (-0.4, 0.02, 1.979_836_362_019_941_7e-5),
+        (-1.2, 0.06, 5.937_145_428_985_906e-5),
+        (-2.0, 0.1, 9.887_368_227_363_891e-5),
+        (-4.0, 0.2, 1.970_108_314_811_780_3e-4),
+        (-6.0, 0.3, 2.936_840_515_465_377e-4),
+        (-8.0, 0.4, 3.881_840_618_140_016e-4),
+        (-8.396, 0.4198, 4.065_774_506_233_981e-4),
+        (-0.006, 0.0002, 8.835_995_594_294_44e-8),
+        (-0.06, 0.002, 8.835_991_230_122_514e-7),
+        (-0.6, 0.02, 8.835_554_823_815_047e-6),
+        (-1.7999999999999998, 0.06, 2.649_608_729_678_372_6e-5),
+        (-3.0, 0.1, 4.412_490_934_655_286e-5),
+        (-6.0, 0.2, 8.792_022_863_821_512e-5),
+        (-9.0, 0.3, 1.310_604_675_430_643e-4),
+        (-12.0, 0.4, 1.732_282_638_398_106_4e-4),
+        (-12.594, 0.4198, 1.814_353_693_676_332e-4),
+        (-0.008, 0.0002, 4.977_457_362_749_259_5e-8),
+        (-0.08, 0.002, 4.977_454_901_974_882e-7),
+        (-0.8, 0.02, 4.977_208_830_680_827e-6),
+        (-2.4, 0.06, 1.492_566_246_619_795e-5),
+        (-4.0, 0.1, 2.485_623_593_344_115_3e-5),
+        (-8.0, 0.2, 4.952_663_034_864_463e-5),
+        (-12.0, 0.3, 7.382_765_559_492_492e-5),
+        (-16.0, 0.4, 9.758_037_145_697_627e-5),
+        (-16.792, 0.4198, 1.022_032_769_805_390_7e-4),
+        (-0.01, 0.0002, 3.187_716_019_715_261_6e-8),
+        (-0.1, 0.002, 3.187_714_443_055_036e-7),
+        (-1.0, 0.02, 3.187_556_780_970_588_5e-6),
+        (-3.0, 0.06, 9.558_849_089_986_94e-6),
+        (-5.0, 0.1, 1.591_868_527_409_974e-5),
+        (-10.0, 0.2, 3.171_829_887_519_909e-5),
+        (-15.0, 0.3, 4.728_125_232_282_76e-5),
+        (-20.0, 0.4, 6.249_289_767_792_289e-5),
+        (-20.990000000000002, 0.4198, 6.545_346_205_350_432e-5),
+    ];
+
+    #[test]
+    fn test_otm_time_value_is_accurate_on_both_sides_of_the_series_bound() {
+        for &(x, s, want) in SCALED_TABLE {
+            let h = x / s;
+            // ln_scale = h^2 / 2 cancels the exponent; `scale`, its exp, is
+            // used only on the direct path (|exponent| <= DIRECT_EXPONENT).
+            let ln_scale = 0.5 * h * h;
+            let got = otm_time_value(x, s, ln_scale.exp(), ln_scale);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 1e-12,
+                "x {x} s {s} (h {h}): {got:e} vs {want:e} (rel {rel:e})"
+            );
+        }
     }
 }

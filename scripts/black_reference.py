@@ -40,8 +40,31 @@ def erfcx(x):
             f = x + (D(k)/2)/f
         return 1/SQRTPI/f
     return (x*x).exp()*erfc(x)
+def n(z): z = D(z); return (-z*z/2).exp()/(2*PI).sqrt()
+def black(f, k, w, call):
+    # Undiscounted Black at the exact values of the f64 arguments.
+    f, k, w = D(f), D(k), D(w); v = w.sqrt()
+    d1 = ((f/k).ln() + w/2)/v; d2 = d1 - v
+    return f*N(d1) - k*N(d2) if call else k*N(-d2) - f*N(-d1)
+def theta(s, k, tau, r, q, sigma, call):
+    # theta = -dV/dtau of Black-Scholes-Merton at fixed sigma, per year;
+    # strike, rates and sigma are decimal strings (the Decimal inputs).
+    s, k, tau, r, q, sigma = (D(x) for x in (s, k, tau, r, q, sigma))
+    v = sigma*tau.sqrt(); d1 = ((s/k).ln() + (r - q + sigma*sigma/2)*tau)/v; d2 = d1 - v
+    dfr, dfq = (-r*tau).exp(), (-q*tau).exp()
+    diffusion = s*dfq*n(d1)*sigma/(2*tau.sqrt())
+    if call: return q*s*dfq*N(d1) - r*k*dfr*N(d2) - diffusion
+    return r*k*dfr*N(-d2) - q*s*dfq*N(-d1) - diffusion
 if __name__ == "__main__":
+    # Lines: "b x s", "bscaled x s", "erfcx x", "black F K w call|put" (f64 arguments) or
+    # "theta S K tau r q sigma call|put" (decimal strings).
     for line in sys.stdin:
         kind, *args = line.split()
         if kind == "b": print(format(b(float(args[0]), float(args[1])), '.25e'))
+        elif kind == "bscaled":
+            # b(x, s) e^{h^2/2}, h = x / s: representable for every h.
+            x, s = D(float(args[0])), D(float(args[1])); h = x/s
+            print(format(b(float(args[0]), float(args[1]))*(h*h/2).exp(), '.20e'))
+        elif kind == "black": print(format(black(*(float(a) for a in args[:3]), args[3] == "call"), '.25e'))
+        elif kind == "theta": print(format(theta(*args[:6], args[6] == "call"), '.25e'))
         else: print(format(erfcx(float(args[0])), '.25e'))

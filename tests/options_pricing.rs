@@ -544,10 +544,23 @@ fn test_black_is_increasing_in_w_from_the_intrinsic_value() {
                 intrinsic
             );
             let mut last = intrinsic;
+            let mut representable = false;
             for i in 1..=200 {
                 let w = 1e-6 * 1.1_f64.powi(i);
-                let p = black_undiscounted(fwd, strike, w, style).unwrap();
-                assert!(p >= last, "{fwd} {strike} {style:?} w={w}: {p} < {last}");
+                // Out of the money at the smallest w the true price is below
+                // the smallest f64: an error, never 0, and never again once
+                // the price is representable.
+                let p = match black_undiscounted(fwd, strike, w, style) {
+                    Err(MMError::NumericalError(_)) if intrinsic == 0.0 && !representable => {
+                        continue;
+                    }
+                    other => other.unwrap(),
+                };
+                representable = true;
+                assert!(
+                    p > 0.0 && p >= last,
+                    "{fwd} {strike} {style:?} w={w}: {p} < {last}"
+                );
                 // Bounds: intrinsic <= C <= F, intrinsic <= P <= K.
                 let cap = if matches!(style, OptionStyle::Call) {
                     fwd
@@ -874,5 +887,97 @@ fn test_surface_pricer_check_market_does_not_evaluate_the_surface() {
         pricer
             .check_market(dec!(100), dec!(0.25), dec!(0.02), dec!(0))
             .is_ok()
+    );
+}
+
+#[test]
+fn test_value_theta_at_equal_rate_and_carry_and_tiny_vol_has_no_cancellation() {
+    // r = q (futures options): the carry part is exactly r V, so theta keeps
+    // its digits as sigma falls. References: scripts/black_reference.py
+    // ("theta ..."), 400 digits, at the exact decimal inputs.
+    let cases = [
+        (
+            dec!(0.00000000000001),
+            dec!(100.000000000001),
+            OptionStyle::Put,
+            -6.356_075_893_319_161e-14,
+        ),
+        (
+            dec!(0.00000000000001),
+            dec!(100),
+            OptionStyle::Call,
+            -1.707_685_361_078_657_9e-13,
+        ),
+        (
+            dec!(0.00000000000001),
+            dec!(100),
+            OptionStyle::Put,
+            -1.707_685_361_078_657_9e-13,
+        ),
+        (
+            dec!(0.000000000001),
+            dec!(100.000000000001),
+            OptionStyle::Call,
+            -1.709_959_078_540_878_7e-11,
+        ),
+    ];
+    for (sigma, strike, style, want) in cases {
+        let flat = FlatSurface::new(sigma).unwrap();
+        let i = OptionInputs::european(dec!(100), strike, dec!(1), dec!(0.05), dec!(0.05), style);
+        let v = value(&i, &flat, Dynamics::StickyMoneyness).unwrap();
+        let rel = ((f(v.theta) - want) / want).abs();
+        assert!(
+            rel <= 1e-11,
+            "sigma {sigma} K {strike} {style:?}: {} vs {want:e} (rel {rel:e})",
+            v.theta
+        );
+    }
+}
+
+#[test]
+fn test_black_keeps_a_representable_price_whose_normalised_value_underflows() {
+    // F = 1e-50, K = 1e306, w = 400: h = -41, b underflows, sqrt(F K) b does
+    // not. Reference: scripts/black_reference.py ("black ..."), 400 digits.
+    let call = black_undiscounted(1e-50, 1e306, 400.0, OptionStyle::Call).unwrap();
+    let want = 1.629_959_562_806_11e-261;
+    assert!(close(call, want, 1e-11, 0.0), "{call:e} vs {want:e}");
+    // The small-t series branch: t = 0.2, h = -45.
+    let call = black_undiscounted(1e150, 6.5e157, 0.16, OptionStyle::Call).unwrap();
+    let want = 3.668_096_755_640_983_4e-290;
+    assert!(close(call, want, 1e-11, 0.0), "{call:e} vs {want:e}");
+    let put = black_undiscounted(1e-50, 1e306, 400.0, OptionStyle::Put).unwrap();
+    assert!(
+        close(put, 1e306, 1e-15, 0.0),
+        "{put:e}"
+    );
+}
+
+#[test]
+fn test_black_at_the_edges_of_the_f64_range_has_no_overflow() {
+    // F = 1e308, K = 5e-324, w = 1e4: e^{-ht} = e^{|x|/2} overflows while
+    // N(h - t) underflows; the price is the intrinsic value for the call and
+    // K (the smallest subnormal) for the put.
+    let call = black_undiscounted(1e308, 5e-324, 1e4, OptionStyle::Call).unwrap();
+    assert_eq!(call, 1e308);
+    let put = black_undiscounted(1e308, 5e-324, 1e4, OptionStyle::Put).unwrap();
+    assert_eq!(put, f64::from_bits(1), "{put:e}");
+}
+
+#[test]
+fn test_black_price_below_the_smallest_f64_is_an_error_not_zero() {
+    // h = ln(1e-300) / 0.01 = -69078: the true price is positive and far below
+    // the smallest subnormal.
+    assert!(matches!(
+        black_undiscounted(1.0, 1e300, 1e-4, OptionStyle::Call),
+        Err(MMError::NumericalError(_))
+    ));
+    assert!(matches!(
+        black_undiscounted(1e300, 1.0, 1e-4, OptionStyle::Put),
+        Err(MMError::NumericalError(_))
+    ));
+    // The in-the-money side of the same pair is its intrinsic value.
+    assert_eq!(
+        black_undiscounted(1e300, 1.0, 1e-4, OptionStyle::Call).unwrap(),
+        1e300 - 1.0
     );
 }

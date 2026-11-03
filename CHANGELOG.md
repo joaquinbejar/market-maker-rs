@@ -15,7 +15,8 @@ project follows [Semantic Versioning](https://semver.org/).
   parallel implied volatility shift, theta per calendar year), the payoff
   exactly at expiry, `OptionPricer` and `SurfacePricer`, `PRICING_YEAR_DAYS`
   (365) and `tau_from_days`, and `black_undiscounted` / `black_w` for
-  implied volatility extraction. The normal distribution is a port of
+  implied volatility extraction (on every finite positive `F`, `K`; a
+  positive price below the smallest `f64` is an error, never 0). The normal distribution is a port of
   fdlibm's `erfc` (#95).
 - `options::adapter::ADAPTER_MS_PER_YEAR`: the 365.25-day year of the
   adapter's ms helpers, now named; their results are unchanged (#95).
