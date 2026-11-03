@@ -1084,6 +1084,166 @@ fn validate_state<const ORD: usize, const MSG: usize, const DLV: usize, const OB
         decimal_ok(v.realized) && decimal_ok(s.agent.pos.quantity),
         "decimal scale beyond 28",
     )?;
+    validate_reachability(s, k, &activations, &cancels)
+}
+
+/// Checks that only states `step` can reach pass: grid ranges, agent view
+/// against the venue counters, account coverage, step and time limits.
+#[allow(clippy::too_many_lines)] // One linear list of invariants.
+fn validate_reachability<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+    s: &KernelState<ORD, MSG, DLV, OBS>,
+    k: &FinancialKernel<'_, ORD, MSG, DLV, OBS>,
+    activations: &[VenueOrder],
+    cancels: &[u64],
+) -> MMResult<()> {
+    let cfg = &k.cfg;
+    let price_ok = |p: u64| p >= cfg.min_price && p <= cfg.p;
+    let qty_ok = |q: u64| q >= 1 && q <= cfg.q;
+    // Grid ranges of every order, report and fill.
+    let venue = s
+        .orders
+        .as_slice()
+        .iter()
+        .chain(activations.iter())
+        .chain(s.awaiting.as_slice().iter());
+    for o in venue {
+        check(price_ok(o.price), "order price outside the price range")?;
+        check(qty_ok(o.qty), "order quantity outside the size range")?;
+    }
+    let dl = s.deliveries.as_slice();
+    for d in dl {
+        let r = &d.report;
+        check(price_ok(r.price), "report price outside the price range")?;
+        check(
+            qty_ok(r.qty) && r.last <= r.qty && r.cum <= r.qty,
+            "report quantity outside the size range",
+        )?;
+        match (r.kind, &d.fill) {
+            (ExecKind::Fill | ExecKind::PartialFill, Some(f)) => {
+                check(
+                    price_ok(f.price) && qty_ok(f.qty),
+                    "fill outside the grid ranges",
+                )?;
+                check(
+                    f.order_id == r.order_id
+                        && f.side == r.side
+                        && f.qty == r.last
+                        && f.price == r.price,
+                    "fill differs from its report",
+                )?;
+            }
+            (ExecKind::Fill | ExecKind::PartialFill, None) => {
+                return Err(err("fill report without a fill"));
+            }
+            (
+                ExecKind::Accepted
+                | ExecKind::Rejected
+                | ExecKind::Canceled
+                | ExecKind::CancelRejected,
+                Some(_),
+            ) => return Err(err("fill attached to a status report")),
+            (
+                ExecKind::Accepted
+                | ExecKind::Rejected
+                | ExecKind::Canceled
+                | ExecKind::CancelRejected,
+                None,
+            ) => {}
+        }
+        if r.origin == Origin::Local {
+            check(
+                r.kind == ExecKind::Rejected && r.cum == 0,
+                "local report that is not a reject",
+            )?;
+        }
+    }
+    // The agent view is the venue minus the queued deliveries.
+    let queued_fills = dl.iter().filter(|d| d.fill.is_some()).count();
+    let queued_local = dl
+        .iter()
+        .filter(|d| d.report.kind == ExecKind::Rejected && d.report.origin == Origin::Local)
+        .count();
+    let as_u64 = |n: usize| u64::try_from(n).ok();
+    check(
+        as_u64(queued_fills).and_then(|q| q.checked_add(s.agent.delivered_fills))
+            == Some(s.counters.venue_fills),
+        "delivered fills differ from the venue fills",
+    )?;
+    check(
+        as_u64(queued_local).and_then(|q| q.checked_add(s.agent.delivered_local_rejects))
+            == Some(s.counters.local_rejects),
+        "delivered local rejects differ from the local rejects",
+    )?;
+    let queued_lots = dl.iter().filter_map(|d| d.fill).try_fold(0i128, |acc, f| {
+        let lots = i128::from(f.qty);
+        match Dir::try_from(f.side).ok()? {
+            Dir::Buy => acc.checked_add(lots),
+            Dir::Sell => acc.checked_sub(lots),
+        }
+    });
+    let agent_lots = queued_lots.and_then(|q| i128::from(s.gate.venue_pos_lots).checked_sub(q));
+    check(
+        agent_lots.and_then(|l| cfg.lot.to_decimal(l)) == Some(s.agent.pos.quantity),
+        "agent position differs from the venue position minus queued fills",
+    )?;
+    for pos in [&s.agent.pos, &s.venue.pos] {
+        check(
+            !pos.quantity.is_zero() || pos.avg_entry.is_zero(),
+            "flat position with an entry price",
+        )?;
+    }
+    // Every open order has a counterpart at the venue or in the deliveries
+    // (at the end of the data dropped activations leave none).
+    if s.status != Status::Terminal(TermReason::EndOfData) {
+        for open in s.account.as_slice() {
+            let id = open.order_id;
+            let found = s.orders.as_slice().iter().any(|o| o.id == id)
+                || activations.iter().any(|o| o.id == id)
+                || s.awaiting.as_slice().iter().any(|o| o.id == id)
+                || cancels.contains(&id)
+                || dl.iter().any(|d| d.report.order_id == id);
+            check(found, "open order without a venue or delivery counterpart")?;
+        }
+    }
+    // Step limit: a running state waits at a decision below max_steps.
+    if s.status.is_running() {
+        check(
+            s.phase == Phase::AwaitDecision && s.step < cfg.s_max,
+            "running state not at a decision below max_steps",
+        )?;
+    }
+    check(
+        s.venue.max_abs_pos <= cfg.x_eff,
+        "maximum position beyond the position bound",
+    )?;
+    // Time: between the previous and the current row.
+    match s.cur_row {
+        None => check(s.now_ns == 0, "time advanced before the first row")?,
+        Some(row) => {
+            let ts = |r: u64| k.data.row(r).map(|t| t.ts_ns);
+            let current = ts(row).ok_or_else(|| err("current row outside the dataset"))?;
+            let previous = match row.checked_sub(1) {
+                Some(r) => ts(r).ok_or_else(|| err("previous row outside the dataset"))?,
+                None => 0,
+            };
+            check(
+                previous <= s.now_ns && s.now_ns <= current,
+                "time outside the current row window",
+            )?;
+            let after_match = match s.phase {
+                Phase::ObsQueued => true,
+                Phase::AwaitDecision => s.resume == Phase::ObsQueued,
+                Phase::BeforeMatch => false,
+                Phase::Terminal => s.status == Status::Terminal(TermReason::EndOfData),
+            };
+            if after_match {
+                check(
+                    s.now_ns == current,
+                    "time differs from the current row after matching",
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
