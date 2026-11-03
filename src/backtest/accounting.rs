@@ -8,7 +8,7 @@
 //! PnL, fees, equity) are read back from its [`AccountingSnapshot`]. Only one
 //! accountant is ever active, so the engine never books a fill twice.
 //!
-//! With the `margin` feature, [`MarginLedgerAccountant`] posts fills to the
+//! With the `margin` feature, `MarginLedgerAccountant` posts fills to the
 //! exact ledger of the `margin-rs` crate.
 //!
 //! # Example
