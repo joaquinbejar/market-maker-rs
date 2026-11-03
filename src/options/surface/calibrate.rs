@@ -29,11 +29,17 @@
 //! every constraint within the feasibility tolerance wins. This is the
 //! solution of each face within those tolerances, not exact arithmetic.
 //!
-//! The outer grid spans `m` in `[k_min - R, k_max + R]` and `sigma` in
-//! `[sigma_lo R, sigma_hi R]` (log spaced), `R = k_max - k_min`; it is
-//! recentred when the best point is on its edge, then refined around the
-//! best point a fixed number of times. Every loop is bounded and nothing is
-//! random.
+//! The search domain is `m` in `[k_min - R, k_max + R]` and `sigma` in
+//! `[sigma_lo R, sigma_hi R]` (log spaced), `R = k_max - k_min`, and no
+//! window leaves it. The outer grid starts on the whole domain. When its
+//! best point is on an edge of the window inside the domain, the window is
+//! recentred there and doubled along that axis (up to the domain), so a
+//! minimum along a long `(m, sigma)` valley is reached in a few moves; once
+//! the best point is interior, the window is refined around it, a
+//! refinement counting only when it reaches a window smaller than any
+//! before. A best point on an edge at the end, on the domain's boundary
+//! or with no recentre left, is [`FitFailure::GridEdge`]: the minimum may
+//! lie outside the search. Every loop is bounded and nothing is random.
 //!
 //! The parameters at an active bound are set from the constraint itself
 //! (`rho = ±1`, `b (1 + |rho|) = 2`, `a = a_min` or `a_max`), and the
@@ -121,7 +127,7 @@ impl Default for FitConfig {
             refinements: 12,
             max_recentres: 40,
             sigma_lo: 0.005,
-            sigma_hi: 2.0,
+            sigma_hi: 10.0,
             a_min: 1e-8,
             min_observations: 5,
             max_rmse_vol: 0.02,
@@ -806,7 +812,7 @@ mod tests {
         assert!(FitConfig { a_min: 0.0, ..base }.validate().is_err());
         assert!(
             FitConfig {
-                sigma_lo: 3.0,
+                sigma_lo: 11.0,
                 ..base
             }
             .validate()
@@ -838,8 +844,24 @@ mod tests {
         // that a window moving half its width per recentre crawled along
         // until the recentres ran out (GridEdge).
         for (tau, a, b, rho, m, sigma, r) in [
-            (0.2455, 0.13811, 0.12710, -0.48052, 0.0560, 0.0207, 0.6753),
-            (1.5588, 1.30139, 0.62300, -0.999, -0.0955, 0.0369, 2.0715),
+            (
+                0.245_503_128_527_049,
+                0.138_105_455_658_577_74,
+                0.127_101_243_666_189_2,
+                -0.480_524_832_248_707_7,
+                0.056_011_479_397_551_65,
+                0.020_706_953_356_863_105,
+                0.675_269_550_618_257_9,
+            ),
+            (
+                1.558_819_531_357_679_1,
+                1.301_394_575_596_217_3,
+                0.622_997_868_208_636_5,
+                -0.999,
+                -0.095_519_970_621_644,
+                0.036_904_243_318_094_71,
+                2.071_475_349_420_415,
+            ),
         ] {
             let range = KRange::new(-r - 1.0, r + 1.0).unwrap();
             let truth = SviSlice::new(tau, a, b, rho, m, sigma, range).unwrap();
