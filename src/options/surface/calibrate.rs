@@ -367,7 +367,6 @@ fn inner(
     // Normal equations of the weighted least squares.
     let mut q = [[0.0_f64; 3]; 3];
     let mut lin = [0.0_f64; 3];
-    let mut yy = 0.0_f64;
     for o in obs {
         let y = (o.k - m) / sigma;
         let row = [1.0, y, y.hypot(1.0)];
@@ -381,7 +380,6 @@ fn inner(
                 }
             }
         }
-        yy += o.weight * o.w * o.w;
     }
     let rows = constraints(sigma, config.a_min, a_max);
     let h_scale = rows.iter().fold(1.0_f64, |acc, (_, h)| acc.max(h.abs()));
@@ -431,9 +429,18 @@ fn inner(
             if !feasible {
                 continue;
             }
-            // sum weight (row . x - w)^2 = x' Q x - 2 lin . x + sum weight w^2.
-            let quad: f64 = q.iter().zip(x.iter()).map(|(row, xi)| xi * dot(row)).sum();
-            let objective = (quad - 2.0 * dot(&lin) + yy).max(0.0);
+            // sum weight (row . x - w)^2, summed directly: the expanded
+            // x' Q x - 2 lin . x + sum weight w^2 cancels when the fit is
+            // nearly exact, which would turn the choice between grid points
+            // into rounding noise.
+            let objective: f64 = obs
+                .iter()
+                .map(|o| {
+                    let y = (o.k - m) / sigma;
+                    let r = x[0] + x[1] * y + x[2] * y.hypot(1.0) - o.w;
+                    o.weight * r * r
+                })
+                .sum();
             if !objective.is_finite() {
                 continue;
             }
@@ -627,10 +634,21 @@ pub fn fit_slice(
         return Err(FitFailure::GridEdge);
     }
     let sigma = ls.exp();
-    let active: Vec<ActiveConstraint> = res
-        .active
+    // Active: the face's constraints, and any other at its bound within
+    // the feasibility tolerance (a face may meet a bound it does not hold
+    // to rounding); each gives its parameter below.
+    let rows = constraints(sigma, config.a_min, a_max);
+    let h_scale = rows.iter().fold(1.0_f64, |acc, (_, h)| acc.max(h.abs()));
+    let active: Vec<ActiveConstraint> = rows
         .iter()
-        .filter_map(|&c| CONSTRAINTS.get(c).copied())
+        .enumerate()
+        .filter(|(i, (g, h))| {
+            res.active.contains(i) || {
+                let gx: f64 = g.iter().zip(res.x.iter()).map(|(a, b)| a * b).sum();
+                gx - h >= -config.feasibility_tolerance * h_scale
+            }
+        })
+        .filter_map(|(i, _)| CONSTRAINTS.get(i).copied())
         .collect();
     let [a_raw, d, c] = res.x;
     let has = |c: ActiveConstraint| active.contains(&c);
