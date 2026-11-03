@@ -48,6 +48,8 @@ use rust_decimal::prelude::ToPrimitive;
 pub mod calibrate;
 /// Static diagnostics of a surface on a declared grid.
 pub mod diagnostics;
+/// Cleaning of option quotes before calibration.
+pub mod quotes;
 /// Shock scenarios on a surface, each with its own diagnostics.
 pub mod shocks;
 /// Causal availability of calibrated surfaces.
@@ -60,6 +62,10 @@ pub use calibrate::{
 };
 pub use diagnostics::{
     Check, DiagnosticGrid, DiagnosticPoint, DiagnosticsConfig, SurfaceDiagnostics, diagnose,
+};
+pub use quotes::{
+    CleanQuote, CleaningConfig, CleaningReport, OptionQuote, QuoteFlag, QuoteVerdict, Rates,
+    Rejection, clean_quotes,
 };
 pub use shocks::{ScenarioReport, ShockedSurface, SurfaceShock, run_scenarios, standard_scenarios};
 pub use store::{
