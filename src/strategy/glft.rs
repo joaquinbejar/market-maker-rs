@@ -1270,6 +1270,32 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_with_avellaneda_stoikov_overflow_returns_numerical_error() {
+        // Codex repro: q gamma sigma^2 overflows Decimal on the A-S side.
+        let config = GLFTConfig::new(
+            dec!(1),
+            dec!(0.3),
+            dec!(0.9),
+            MAX_INVENTORY_LOTS,
+            dec!(1),
+            1,
+            dec!(0),
+        )
+        .unwrap();
+        let result = GLFTStrategy::compare_with_avellaneda_stoikov(
+            dec!(1000),
+            dec!(200),
+            &config,
+            dec!(100000000000000),
+            1,
+        );
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn test_compare_with_avellaneda_stoikov_half_lots_near_terminal_agree() {
         // gamma 0.02 per unit with lots of 0.5: gamma_L = 0.01, 1.5 = 3 lots.
         let mut config = paper_config(16);
