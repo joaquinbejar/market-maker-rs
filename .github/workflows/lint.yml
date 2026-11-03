@@ -24,11 +24,9 @@ jobs:
           sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
-          profile: minimal
           toolchain: stable
-          override: true
           components: clippy
 
       - name: Lint

@@ -103,6 +103,10 @@ project follows [Semantic Versioning](https://semver.org/).
 - `BacktestEngine::faults` keeps only the first `MAX_RECORDED_FAULTS` (16)
   errors; `BacktestEngine::fault_count` reports the total. Admission still
   stops at the first fault (#133).
+- CI installs Rust with `dtolnay/rust-toolchain`, pinned by commit, in
+  place of the archived `actions-rs/toolchain`; toolchains, components and
+  matrices are unchanged. `make lint` also runs clippy with
+  `--no-default-features` (#155).
 
 ### Fixed
 
