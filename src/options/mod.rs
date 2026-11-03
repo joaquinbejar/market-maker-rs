@@ -55,7 +55,8 @@ pub mod market_maker;
 /// Greeks-based risk management.
 pub mod risk_manager;
 
-/// Volatility surfaces as total implied variance.
+/// Volatility surfaces as total implied variance: the shared surface
+/// trait, raw SVI slices, static diagnostics and shock scenarios.
 pub mod surface;
 
 pub use adapter::OptionsAdapter;

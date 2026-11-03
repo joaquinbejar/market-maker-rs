@@ -44,6 +44,19 @@ use crate::Decimal;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal::prelude::ToPrimitive;
 
+/// Static diagnostics of a surface on a declared grid.
+pub mod diagnostics;
+/// Shock scenarios on a surface, each with its own diagnostics.
+pub mod shocks;
+/// Raw SVI slices and surfaces of slices.
+pub mod svi;
+
+pub use diagnostics::{
+    Check, DiagnosticGrid, DiagnosticPoint, DiagnosticsConfig, SurfaceDiagnostics, diagnose,
+};
+pub use shocks::{ScenarioReport, ShockedSurface, SurfaceShock, run_scenarios, standard_scenarios};
+pub use svi::{KRange, Region, ShortExpiryPolicy, SviSlice, SviSurface};
+
 /// A volatility surface: total implied variance and its derivatives.
 ///
 /// Implementations provide [`VolSurface::total_variance_at`]; callers use
