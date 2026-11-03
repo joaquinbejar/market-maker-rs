@@ -388,7 +388,9 @@ impl OrderBookConnector {
     /// removed only while it still maps to the book order just cancelled: if
     /// a concurrent modify re-mapped it, the new book order is cancelled
     /// instead, and an entry that vanished meanwhile is left to the call
-    /// that settled it.
+    /// that settled it. An order the book no longer knows (filled or
+    /// cancelled outside the connector) is settled too: it is unmapped and
+    /// left out of the cancelled responses, never reported as a failure.
     ///
     /// # Errors
     ///
@@ -412,15 +414,22 @@ impl OrderBookConnector {
             let outcome = loop {
                 let outcome = cancel(ob_id);
                 let removed = match &outcome {
-                    Ok(()) | Err(OrderBookError::OrderRemovedWithLevelFault { .. }) => true,
+                    Ok(())
+                    | Err(OrderBookError::OrderRemovedWithLevelFault { .. })
+                    | Err(OrderBookError::OrderNotFound(_)) => true,
                     Err(_) => false,
                 };
+                // Filled or cancelled outside the connector: settled.
+                let not_found = matches!(outcome, Err(OrderBookError::OrderNotFound(_)));
                 let mut mapping = self.order_mapping.write().map_err(poisoned)?;
                 match mapping.get(id_str.as_str()).copied() {
                     // Still mapped to the order just cancelled: settle it.
                     Some(current) if current == ob_id => {
                         if removed {
                             mapping.remove(id_str.as_str());
+                        }
+                        if not_found {
+                            break None;
                         }
                         break Some(outcome.map_err(|e| e.to_string()));
                     }
@@ -1020,7 +1029,7 @@ mod tests {
             .collect();
         let result = connector.cancel_tracked(order_ids, |ob_id| {
             if ob_id == stale_ob_id {
-                Err(OrderBookError::OrderNotFound("level refused".to_string()))
+                Err(OrderBookError::InvalidPriceLevel(0))
             } else {
                 connector.order_book.cancel_order(ob_id).map(|_| ())
             }
@@ -1083,6 +1092,50 @@ mod tests {
         // Nothing is left resting untracked.
         let book = connector.order_book.create_snapshot(10).unwrap();
         assert!(book.bids.is_empty(), "{:?}", book.bids);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_unmaps_an_order_the_book_lost() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let gone = connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(1.0)))
+            .await
+            .unwrap()
+            .order_id;
+        let live = connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(49000.0), dec!(1.0)))
+            .await
+            .unwrap()
+            .order_id;
+        let gone_ob = connector.order_mapping.read().unwrap()[gone.as_str()];
+        let order_ids: Vec<(String, OBOrderId)> = connector
+            .order_mapping
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let responses = connector
+            .cancel_tracked(order_ids, |ob_id| {
+                if ob_id == gone_ob {
+                    Err(OrderBookError::OrderNotFound(ob_id.to_string()))
+                } else {
+                    connector.order_book.cancel_order(ob_id).map(|_| ())
+                }
+            })
+            .unwrap();
+        // Settled, not a failure: only the live order is reported cancelled.
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].order_id, live);
+        assert!(connector.order_mapping.read().unwrap().is_empty());
+        // A later call does not keep failing on it.
+        assert!(
+            connector
+                .cancel_all_orders("BTC-USD")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
