@@ -5,7 +5,8 @@
 //! price itself for an out of the money option, and the price less the
 //! intrinsic value for an in the money one (undiscounted put-call parity,
 //! `C - P = F - K`). The inversion is a safeguarded Newton on
-//! [`black_undiscounted`] and [`black_w`], inside the bracket `[0, w_max]`
+//! [`black_undiscounted`](crate::options::black_undiscounted) and
+//! [`black_w`](crate::options::black_w), inside the bracket `[0, w_max]`
 //! (`w_max = max_vol^2 tau`), with bisection whenever the Newton step leaves
 //! the bracket or `black_w` is unavailable (it is singular at `w = 0`). It
 //! stops when the price matches to [`IvConfig::price_tolerance`] relative to
@@ -53,6 +54,8 @@ pub struct IvConfig {
     /// Iteration cap.
     pub max_iterations: usize,
     /// Smallest band width in the weight `1 / max(w_ask - w_bid, eps)^2`.
+    /// A slice's weights are also capped relative to its median by
+    /// [`FitConfig::max_weight_ratio`](super::FitConfig::max_weight_ratio).
     pub weight_eps: f64,
 }
 
