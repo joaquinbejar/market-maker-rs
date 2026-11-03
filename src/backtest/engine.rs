@@ -198,6 +198,15 @@ impl SimulatedFill {
     }
 }
 
+/// A fill's built in bookkeeping, validated before the engine applies it.
+#[derive(Debug, Clone)]
+struct Booking {
+    position: InventoryPosition,
+    cash_flow: Decimal,
+    base_fee_quantity: Decimal,
+    fixed_fees: Decimal,
+}
+
 /// Slippage model for simulating execution costs.
 ///
 /// # Example
@@ -1160,21 +1169,35 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                         continue;
                     }
                 };
+            // Reports and result metrics carry the fee valued in quote.
+            let fee = charge.quote_value;
+            let mut fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
+                .with_execution_id(self.next_execution_id);
+            if charge.asset == FeeAsset::Base {
+                fill.base_fee = charge.amount;
+            }
+            // The built in bookkeeping is validated before anything is
+            // mutated: a booking that overflows is a fault that leaves the
+            // order, the policy and the engine unchanged.
+            let booking = if self.accountant.is_some() {
+                None
+            } else {
+                match self.plan_booking(&fill, dir, &charge) {
+                    Ok(booking) => Some(booking),
+                    Err(error) => {
+                        self.record_fault(error);
+                        continue;
+                    }
+                }
+            };
             let Some(order) = self.orders.get_mut(index) else {
                 continue;
             };
             if order.apply_fill(quantity).is_err() {
                 continue;
             }
-            // Reports and result metrics carry the fee valued in quote.
-            let fee = charge.quote_value;
             let stamp = self.clock.stamp();
             let report = ExecutionReport::fill(stamp, order, price, quantity, fee);
-            let mut fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
-                .with_execution_id(self.next_execution_id);
-            if charge.asset == FeeAsset::Base {
-                fill.base_fee = charge.amount;
-            }
             let (order_id, cumulative) = (order.id, order.filled);
             // The policy books the fill first so a ledger it owns is up to
             // date when the accountant reads it.
@@ -1189,7 +1212,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 fee_asset: charge.asset.clone(),
                 timestamp: now,
             });
-            self.process_fill(fill.clone(), dir, order_id, cumulative, charge);
+            self.process_fill(fill.clone(), booking, order_id, cumulative, charge);
             self.queue_delivery(report, Some((dir, fill)));
         }
         let targets = &self.cancel_targets;
@@ -1468,7 +1491,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     fn process_fill(
         &mut self,
         fill: SimulatedFill,
-        dir: Dir,
+        booking: Option<Booking>,
         order_id: SimOrderId,
         cumulative: Decimal,
         charge: FeeCharge,
@@ -1495,43 +1518,75 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             return;
         }
 
-        // Update position: the net base held (base fees deducted).
-        let base_delta = match fill.base_delta() {
-            Ok(delta) => delta,
-            Err(error) => {
-                self.record_fault(error);
-                return;
-            }
-        };
-        if let Err(error) = self
-            .position
-            .update_fill(base_delta, fill.price, fill.timestamp)
-        {
-            self.record_fault(error);
+        // Validated by `plan_booking` before the order was filled.
+        let Some(booking) = booking else {
+            self.record_fault(MMError::InvalidMarketState(format!(
+                "fill {execution_id} reached the built in bookkeeping without a booking"
+            )));
             return;
-        }
-
-        // Update realized PnL for closing trades
-        // Simplified: just track the cash flow
-        let cash_flow = match dir {
-            // Negating a Decimal flips its sign bit: it cannot overflow.
-            #[allow(clippy::arithmetic_side_effects)]
-            Dir::Buy => -fill.notional(),
-            Dir::Sell => fill.notional(),
         };
-        self.pnl.add_realized(cash_flow);
-
-        // Track fees: base fees are kept in base units and marked.
-        match charge.asset {
-            FeeAsset::Base => {
-                self.base_fee_quantity = self.base_fee_quantity.saturating_add(charge.amount);
-            }
-            FeeAsset::Quote | FeeAsset::Other(_) => {
-                self.fixed_fees = self.fixed_fees.saturating_add(charge.quote_value);
-            }
-        }
+        self.position = booking.position;
+        self.pnl.add_realized(booking.cash_flow);
+        self.base_fee_quantity = booking.base_fee_quantity;
+        self.fixed_fees = booking.fixed_fees;
         self.mark_to(fill.price);
         self.track_fill(fill);
+    }
+
+    /// The built in bookkeeping of one fill, computed without mutating the
+    /// engine: the position after it (base fees deducted), the cash flow
+    /// (negative for a buy) and the fee totals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the position, the notional,
+    /// the realized PnL or a fee total overflows.
+    fn plan_booking(
+        &self,
+        fill: &SimulatedFill,
+        dir: Dir,
+        charge: &FeeCharge,
+    ) -> MMResult<Booking> {
+        let base_delta = fill.base_delta()?;
+        let mut position = self.position.clone();
+        position.update_fill(base_delta, fill.price, fill.timestamp)?;
+
+        // Simplified realized PnL: the cash flow of the fill.
+        let notional = fill
+            .price
+            .checked_mul(fill.quantity)
+            .or_overflow("fill notional")?;
+        let cash_flow = match dir {
+            Dir::Buy => Decimal::ZERO.checked_sub(notional),
+            Dir::Sell => Some(notional),
+        }
+        .or_overflow("fill cash flow")?;
+        self.pnl
+            .realized
+            .checked_add(cash_flow)
+            .or_overflow("realized pnl")?;
+
+        // Base fees are kept in base units and marked.
+        let (base_fee_quantity, fixed_fees) = match charge.asset {
+            FeeAsset::Base => (
+                self.base_fee_quantity
+                    .checked_add(charge.amount)
+                    .or_overflow("base fee total")?,
+                self.fixed_fees,
+            ),
+            FeeAsset::Quote | FeeAsset::Other(_) => (
+                self.base_fee_quantity,
+                self.fixed_fees
+                    .checked_add(charge.quote_value)
+                    .or_overflow("fee total")?,
+            ),
+        };
+        Ok(Booking {
+            position,
+            cash_flow,
+            base_fee_quantity,
+            fixed_fees,
+        })
     }
 
     /// Updates the position high water mark and records the trade.
@@ -3662,6 +3717,68 @@ mod tests {
         fn reset(&mut self) {
             self.seen.lock().unwrap().clear();
         }
+    }
+
+    /// Fills every sell in full at a fixed price, so two fills of size 2
+    /// at a third of `Decimal::MAX` overflow the realized cash.
+    #[derive(Debug)]
+    struct HugeSellModel;
+
+    impl FillModel for HugeSellModel {
+        fn simulate_fill(
+            &self,
+            order: &SimulatedOrder,
+            _tick: &MarketTick,
+            _time_in_queue_ms: u64,
+        ) -> MMResult<FillResult> {
+            Ok(if order.side == Action::Sell {
+                FillResult::FullFill {
+                    fill_price: Decimal::MAX / dec!(3),
+                }
+            } else {
+                FillResult::NoFill
+            })
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &'static str {
+            "HugeSell"
+        }
+    }
+
+    #[test]
+    fn test_overflowing_booking_faults_before_any_state_changes() {
+        let quotes = vec![Some((dec!(100), dec!(200))); 5];
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(2))
+                .with_fee_rate(Decimal::ZERO),
+            ScriptedStrategy::new(quotes),
+            VecDataSource::new(queue_ticks()),
+            HugeSellModel,
+        )
+        .unwrap();
+        let result = engine.run();
+
+        // The first sell books; the second would overflow the realized cash.
+        assert!(
+            engine
+                .faults()
+                .iter()
+                .any(|f| *f == MMError::NumericalError("realized pnl overflows".to_string())),
+            "{:?}",
+            engine.faults()
+        );
+        let first = (Decimal::MAX / dec!(3)) * dec!(2);
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.final_position, dec!(-2));
+        assert_eq!(engine.pnl.realized, first);
+        // The refused fill left its order unfilled and reported nothing.
+        let fills = engine
+            .execution_reports()
+            .iter()
+            .filter(|r| r.kind == ExecutionKind::Fill || r.kind == ExecutionKind::PartialFill)
+            .count();
+        assert_eq!(fills, 1);
     }
 
     /// Fill model that fails on every order.

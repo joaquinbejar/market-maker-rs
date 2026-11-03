@@ -165,6 +165,10 @@ project follows [Semantic Versioning](https://semver.org/).
     and computes every allocation before applying any.
 - `LimitsPolicy` latches a fault and rejects every later check when a fill
   would overflow its position, instead of saturating it.
+- The backtest engine's built in bookkeeping validates each fill's
+  position, cash flow, realized PnL and fee totals before it touches the
+  order, the policy or itself; a fill that would overflow any of them is
+  recorded as a fault and changes nothing, instead of saturating.
 - `SimulatedFill::base_delta`, `ProbabilisticFillModel` probabilities and
   `MarginLedgerAccountant` base fees report overflow instead of
   saturating.
