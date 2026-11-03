@@ -53,6 +53,7 @@
 //! }
 //! ```
 
+use rust_decimal_macros::dec;
 use std::collections::VecDeque;
 
 use crate::Decimal;
@@ -146,9 +147,9 @@ impl OrderIntensityConfig {
             estimation_window_ms,
             min_trades,
             smoothing_factor,
-            default_k: Decimal::from_str_exact("1.5").unwrap(),
-            max_k: Decimal::from_str_exact("10.0").unwrap(),
-            min_k: Decimal::from_str_exact("0.1").unwrap(),
+            default_k: dec!(1.5),
+            max_k: dec!(10.0),
+            min_k: dec!(0.1),
         })
     }
 
@@ -288,13 +289,13 @@ impl IntensityEstimate {
     /// Returns true if this is a high-confidence estimate.
     #[must_use]
     pub fn is_high_confidence(&self) -> bool {
-        self.confidence >= Decimal::from_str_exact("0.7").unwrap()
+        self.confidence >= dec!(0.7)
     }
 
     /// Returns true if this is a low-confidence estimate.
     #[must_use]
     pub fn is_low_confidence(&self) -> bool {
-        self.confidence < Decimal::from_str_exact("0.3").unwrap()
+        self.confidence < dec!(0.3)
     }
 }
 
@@ -448,7 +449,7 @@ impl OrderIntensityEstimator {
 
         // Check for spread variance (can't estimate k if all same spread)
         let spread_variance = calculate_variance(&spreads);
-        if spread_variance < Decimal::from_str_exact("0.0000001").unwrap() {
+        if spread_variance < dec!(0.0000001) {
             return Err(MMError::InvalidMarketState(
                 "insufficient spread variance for estimation".to_string(),
             ));
@@ -472,9 +473,7 @@ impl OrderIntensityEstimator {
         // Calculate confidence based on sample size and R²
         let sample_factor = Decimal::from(self.observations.len().min(100)) / Decimal::from(100);
         let r2_factor = r_squared.max(Decimal::ZERO);
-        let confidence = (sample_factor * Decimal::from_str_exact("0.5").unwrap()
-            + r2_factor * Decimal::from_str_exact("0.5").unwrap())
-        .min(Decimal::ONE);
+        let confidence = (sample_factor * dec!(0.5) + r2_factor * dec!(0.5)).min(Decimal::ONE);
 
         // Apply EWMA smoothing
         let smoothed_k = match self.ewma_k {
@@ -676,7 +675,7 @@ fn ln_approx(x: Decimal) -> Decimal {
 
     // Use ln(x) = ln(a * 10^n) = ln(a) + n * ln(10)
     // where 1 <= a < 10
-    let ln_10 = Decimal::from_str_exact("2.302585").unwrap();
+    let ln_10 = dec!(2.302585);
 
     // Normalize x to [1, 10)
     let mut normalized = x;
@@ -717,7 +716,7 @@ fn exp_approx(x: Decimal) -> Decimal {
     for i in 1..20 {
         term = term * x_clamped / Decimal::from(i);
         result += term;
-        if term.abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+        if term.abs() < dec!(0.0000001) {
             break;
         }
     }
@@ -746,7 +745,7 @@ fn linear_regression(x: &[Decimal], y: &[Decimal]) -> (Decimal, Decimal, Decimal
     let ss_xx = sum_x2 - n * mean_x * mean_x;
     let ss_yy = sum_y2 - n * mean_y * mean_y;
 
-    if ss_xx.abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+    if ss_xx.abs() < dec!(0.0000001) {
         return (mean_y, Decimal::ZERO, Decimal::ZERO);
     }
 
@@ -754,7 +753,7 @@ fn linear_regression(x: &[Decimal], y: &[Decimal]) -> (Decimal, Decimal, Decimal
     let intercept = mean_y - slope * mean_x;
 
     // R² = (SS_xy)² / (SS_xx * SS_yy)
-    let r_squared = if ss_yy.abs() > Decimal::from_str_exact("0.0000001").unwrap() {
+    let r_squared = if ss_yy.abs() > dec!(0.0000001) {
         (ss_xy * ss_xy) / (ss_xx * ss_yy)
     } else {
         Decimal::ONE
@@ -808,7 +807,7 @@ fn calculate_slope_std_error(
     let mean_x = x.iter().copied().sum::<Decimal>() / n;
     let ss_xx: Decimal = x.iter().map(|xi| (*xi - mean_x) * (*xi - mean_x)).sum();
 
-    if ss_xx.abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+    if ss_xx.abs() < dec!(0.0000001) {
         return Decimal::ZERO;
     }
 
@@ -827,7 +826,7 @@ fn decimal_sqrt_approx(x: Decimal) -> Decimal {
     }
 
     let mut guess = x / Decimal::from(2);
-    let epsilon = Decimal::from_str_exact("0.0000001").unwrap();
+    let epsilon = dec!(0.0000001);
 
     for _ in 0..20 {
         let new_guess = (guess + x / guess) / Decimal::from(2);

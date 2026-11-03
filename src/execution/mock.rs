@@ -26,6 +26,7 @@
 //! ```
 
 use async_trait::async_trait;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,7 +88,7 @@ impl Default for MockConfig {
             initial_balances: balances,
             default_depth: 10,
             base_price: Decimal::from(50_000),
-            spread: Decimal::from_str_exact("0.001").unwrap(),
+            spread: dec!(0.001),
         }
     }
 }
@@ -266,21 +267,19 @@ impl MockExchangeConnector {
         let mut bids = Vec::with_capacity(depth);
         let mut asks = Vec::with_capacity(depth);
 
-        let tick_size = base_price * Decimal::from_str_exact("0.0001").unwrap();
+        let tick_size = base_price * dec!(0.0001);
 
         for i in 0..depth {
             let offset = tick_size * Decimal::from(i);
 
             // Bid prices descending from mid - half_spread
             let bid_price = base_price - half_spread - offset;
-            let bid_qty =
-                Decimal::from(1) + Decimal::from(i) * Decimal::from_str_exact("0.5").unwrap();
+            let bid_qty = Decimal::from(1) + Decimal::from(i) * dec!(0.5);
             bids.push(BookLevel::new(bid_price, bid_qty));
 
             // Ask prices ascending from mid + half_spread
             let ask_price = base_price + half_spread + offset;
-            let ask_qty =
-                Decimal::from(1) + Decimal::from(i) * Decimal::from_str_exact("0.5").unwrap();
+            let ask_qty = Decimal::from(1) + Decimal::from(i) * dec!(0.5);
             asks.push(BookLevel::new(ask_price, ask_qty));
         }
 
@@ -536,10 +535,10 @@ impl MarketDataStream for MockExchangeConnector {
             order_id: OrderId::new("mock-trade"),
             trade_id: format!("trade-{}", self.current_time()),
             price: self.config.base_price,
-            quantity: Decimal::from_str_exact("0.1").unwrap(),
+            quantity: dec!(0.1),
             side: Action::Buy,
             timestamp: self.current_time(),
-            fee: Decimal::from_str_exact("0.001").unwrap(),
+            fee: dec!(0.001),
             fee_currency: "USD".to_string(),
         })
     }

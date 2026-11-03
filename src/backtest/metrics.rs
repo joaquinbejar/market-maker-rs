@@ -47,6 +47,7 @@
 use crate::Decimal;
 use crate::execution::Action;
 use crate::types::error::{MMError, MMResult};
+use rust_decimal_macros::dec;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -452,8 +453,8 @@ impl MetricsCalculator {
         // Calculate risk metrics
         let volatility = self.calculate_volatility(&returns);
         let downside_volatility = self.calculate_downside_volatility(&returns);
-        let var_95 = self.var(&returns, Decimal::from_str_exact("0.95").unwrap());
-        let var_99 = self.var(&returns, Decimal::from_str_exact("0.99").unwrap());
+        let var_95 = self.var(&returns, dec!(0.95));
+        let var_99 = self.var(&returns, dec!(0.99));
 
         // Calculate risk-adjusted metrics
         let sharpe = self.sharpe_ratio(&returns);
@@ -848,7 +849,7 @@ fn decimal_sqrt(n: Decimal) -> Decimal {
 
     for _ in 0..20 {
         let next = (x + n / x) / two;
-        if (next - x).abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+        if (next - x).abs() < dec!(0.0000001) {
             return next;
         }
         x = next;
@@ -888,7 +889,7 @@ fn decimal_exp(x: Decimal) -> Decimal {
     for n in 1..30 {
         term *= x / Decimal::from(n);
         result += term;
-        if term.abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+        if term.abs() < dec!(0.0000001) {
             break;
         }
     }

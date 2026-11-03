@@ -80,6 +80,7 @@ use crate::risk::pretrade::{
 use crate::strategy::quote::Quote;
 use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
+use rust_decimal_macros::dec;
 
 use super::accounting::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
 use super::data::{HistoricalDataSource, MarketTick};
@@ -428,8 +429,8 @@ impl Default for BacktestConfig {
             initial_capital: Decimal::from(100_000),
             fee_rate: Decimal::ZERO,
             fee_currency: FeeCurrency::Quote,
-            tick_size: Decimal::from_str_exact("0.01").unwrap(),
-            lot_size: Decimal::from_str_exact("0.001").unwrap(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.001),
             slippage: SlippageModel::None,
             default_order_size: Decimal::ONE,
             record_equity_curve: true,
@@ -1809,7 +1810,7 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 
     for _ in 0..20 {
         let next = (x + n / x) / two;
-        if (next - x).abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+        if (next - x).abs() < dec!(0.0000001) {
             return Some(next);
         }
         x = next;

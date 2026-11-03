@@ -41,6 +41,7 @@ use crate::Decimal;
 use crate::execution::Action;
 use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -560,7 +561,7 @@ impl FillModel for QueuePositionFillModel {
 
 impl Default for QueuePositionFillModel {
     fn default() -> Self {
-        Self::new(Decimal::from_str_exact("0.01").unwrap())
+        Self::new(dec!(0.01))
     }
 }
 
@@ -786,12 +787,7 @@ impl FillModel for ProbabilisticFillModel {
 
 impl Default for ProbabilisticFillModel {
     fn default() -> Self {
-        Self::new(
-            Decimal::from_str_exact("0.5").unwrap(),
-            Decimal::ONE,
-            Decimal::from_str_exact("0.001").unwrap(),
-            42,
-        )
+        Self::new(dec!(0.5), Decimal::ONE, dec!(0.001), 42)
     }
 }
 
@@ -984,7 +980,7 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 
     for _ in 0..20 {
         let next = (x + n / x) / two;
-        if (next - x).abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+        if (next - x).abs() < dec!(0.0000001) {
             return Some(next);
         }
         x = next;

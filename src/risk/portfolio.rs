@@ -70,6 +70,7 @@
 use crate::Decimal;
 use crate::types::decimal::decimal_sqrt;
 use crate::types::error::{MMError, MMResult};
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
@@ -672,16 +673,16 @@ impl PortfolioRiskCalculator {
     /// Converts confidence level to z-score.
     fn confidence_to_z_score(&self, confidence: Decimal) -> Decimal {
         // Common z-scores for standard confidence levels
-        let conf_90 = Decimal::from_str_exact("0.90").unwrap();
-        let conf_95 = Decimal::from_str_exact("0.95").unwrap();
-        let conf_99 = Decimal::from_str_exact("0.99").unwrap();
+        let conf_90 = dec!(0.90);
+        let conf_95 = dec!(0.95);
+        let conf_99 = dec!(0.99);
 
         if confidence >= conf_99 {
-            Decimal::from_str_exact("2.326").unwrap() // 99%
+            dec!(2.326) // 99%
         } else if confidence >= conf_95 {
-            Decimal::from_str_exact("1.645").unwrap() // 95%
+            dec!(1.645) // 95%
         } else if confidence >= conf_90 {
-            Decimal::from_str_exact("1.282").unwrap() // 90%
+            dec!(1.282) // 90%
         } else {
             Decimal::ONE // Default
         }
