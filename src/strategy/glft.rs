@@ -1244,7 +1244,7 @@ mod tests {
 
     #[test]
     fn test_calculate_optimal_quotes_tiny_off_grid_inventory_returns_invalid_position_update() {
-        // Codex repro: 1e-28 / 1e28 rounds to 0 lots, but 1e-28 is off grid.
+        // 1e-28 / 1e28 rounds to 0 lots, but 1e-28 is off the lot grid.
         let config = GLFTConfig::new(
             dec!(0.0000000000000000000000000001),
             dec!(0.3),
@@ -1271,7 +1271,7 @@ mod tests {
 
     #[test]
     fn test_compare_with_avellaneda_stoikov_overflow_returns_numerical_error() {
-        // Codex repro: q gamma sigma^2 overflows Decimal on the A-S side.
+        // q gamma sigma^2 overflows Decimal on the A-S side.
         let config = GLFTConfig::new(
             dec!(1),
             dec!(0.3),
