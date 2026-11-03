@@ -28,8 +28,9 @@
 //!   - `InvalidInput`: the row itself (a field that is not a number, an
 //!     unknown kind or style, a non-positive spot or strike, `as_of_days`
 //!     after `expiry_days`);
-//!   - `OutOfDomain`: a valid row the surface does not answer, for example a
-//!     time to expiry outside its slices;
+//!   - `OutOfDomain`: a valid row the surface refuses, for example a time
+//!     to expiry outside its slices (a numerical failure inside the surface
+//!     is `Numerical`, not this);
 //!   - `Unsupported`: a contract the pricer does not value (American);
 //!   - `Numerical`: a numerical limit (a factor that under- or overflows, a
 //!     non-finite intermediate).
@@ -690,13 +691,19 @@ fn value_row(
     if strike <= Decimal::ZERO {
         return Err(invalid(format!("strike must be positive, got {strike}")));
     }
-    // The row's own inputs first (spot, time to expiry, rates and the
-    // factors derived from them), then the surface's domain, then the value.
+    // The request first (its contract, spot, time to expiry, rates and the
+    // factors derived from them), then the surface, then the value.
+    if !matches!(exercise, OptionType::European) {
+        return Err((
+            "Unsupported",
+            format!("only European options are valued, got {exercise:?}"),
+        ));
+    }
     pricer.check_market(spot, tau, rate, carry).map_err(model)?;
     let mut inputs = OptionInputs::european(spot, strike, tau, rate, carry, style);
     inputs.exercise = exercise;
     let w = total_variance(surface, dynamics, &inputs).map_err(|e| match e {
-        Read::Surface(e) => ("OutOfDomain", e.to_string()),
+        Read::Surface(e) => (surface_class(&e), e.to_string()),
         Read::Inputs(e) => model(e),
     })?;
     let v = pricer.value(&inputs).map_err(model)?;
@@ -704,6 +711,15 @@ fn value_row(
         "{},{},{},{},{},{w}",
         v.price, v.delta, v.gamma, v.vega, v.theta
     ))
+}
+
+/// The class of a surface error: a numerical failure inside the surface
+/// stays `Numerical`; any other refusal is the surface's domain.
+fn surface_class(e: &MMError) -> &'static str {
+    match e {
+        MMError::NumericalError(_) | MMError::PriceUnderflow => "Numerical",
+        _ => "OutOfDomain",
+    }
 }
 
 /// Why the total variance could not be read.
@@ -825,6 +841,39 @@ mod tests {
                 "InvalidInput"
             ]
         );
+    }
+
+    #[test]
+    fn test_surface_errors_are_classed_by_kind() {
+        // w_tau overflows on the first segment: a numerical failure, not a
+        // point outside the surface. And an American option past the last
+        // slice is Unsupported: the contract is checked first.
+        let overflow = json!({
+            "format": SURFACE_FORMAT, "short_expiry": "reject",
+            "slices": [
+                {"tau": "0.1", "a": "1", "b": "0", "rho": "0", "m": "0", "sigma": "0.1",
+                 "k_lo": "-0.1", "k_hi": "0.1"},
+                {"tau": "0.2", "a": "1e308", "b": "0", "rho": "0", "m": "0", "sigma": "0.1",
+                 "k_lo": "-0.1", "k_hi": "0.1"},
+            ],
+        })
+        .to_string();
+        let surface = surface_from_json(&overflow).unwrap();
+        let r = rows(
+            &price(
+                surface,
+                Dynamics::StickyMoneyness,
+                &requests(&["inf,100,36.5,call,european,100,0,0,0"]),
+            )
+            .unwrap(),
+        );
+        assert!(r[0][9].starts_with("Numerical:"), "{}", r[0][9]);
+        assert!(r[0][2..8].iter().all(String::is_empty));
+        let r = priced(
+            Dynamics::StickyMoneyness,
+            &["far,100,90,call,american,100,0,0,0"],
+        );
+        assert!(r[0][9].starts_with("Unsupported:"), "{}", r[0][9]);
     }
 
     #[test]
