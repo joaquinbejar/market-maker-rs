@@ -43,6 +43,11 @@
 //! println!("Delta: {}", greeks.delta);
 //! ```
 
+// TODO(#95, #96): this pricing arithmetic is being rewritten with checked
+// operations there; until then it is exempt from the crate's
+// arithmetic_side_effects gate.
+#![allow(clippy::arithmetic_side_effects)]
+
 /// Adapter functions for OptionStratLib integration.
 pub mod adapter;
 

@@ -443,6 +443,19 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![deny(unsafe_code)]
+// Zero panics in library code: no unwrap, expect, unchecked indexing or
+// panic, and no arithmetic that can overflow or divide by zero. Tests are
+// exempt.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 // Re-export Decimal for use throughout the library
 pub use rust_decimal::Decimal;
