@@ -48,7 +48,7 @@ project follows [Semantic Versioning](https://semver.org/).
   symmetrically. New `GLFTStrategy::closed_form_quotes` (Proposition 3).
   `GLFTStrategy::compare_with_avellaneda_stoikov` returns
   `(GlftQuotes, (Decimal, Decimal))`, its A-S side in lots with
-  `γ · lot_size`. A quote needing more than 15 000 steps of the matrix
+  `γ · lot_size`. A quote needing more than 11 000 steps of the matrix
   exponential (about 50 ms at `Q = 200`) returns `NumericalError`. Removed: `PenaltyFunction`,
   `GLFTConfig::{terminal_penalty, dynamic_gamma, gamma_scaling_factor,
   penalty_function, with_dynamic_gamma, with_penalty_function}` and

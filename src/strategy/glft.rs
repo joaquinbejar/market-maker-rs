@@ -121,17 +121,17 @@ const STEP_NORM: f64 = 2.0;
 /// beyond the cap the horizon is too stiff for the inventory bound and the
 /// quote is a [`MMError::NumericalError`] that points to
 /// [`GLFTStrategy::closed_form_quotes`]. See [`GLFTStrategy`] for the cost.
-const MAX_EXPM_STEPS: u32 = 15_000;
+const MAX_EXPM_STEPS: u32 = 11_000;
 
 /// An entry of the normalized value vector below this fraction of the
 /// largest one triggers a rebalance into the per entry log offsets.
 const REBALANCE_FLOOR: f64 = 1e-200;
 
 /// Largest order of the Taylor series of one step.
-const MAX_TAYLOR_ORDER: u32 = 60;
+const MAX_TAYLOR_ORDER: u32 = 100;
 
-/// Relative size of the last Taylor term at which the series stops.
-const TAYLOR_TOL: f64 = 1e-18;
+/// Size of the last Taylor term, relative to each entry, at which the series stops.
+const TAYLOR_TOL: f64 = 1e-16;
 
 /// Configuration of the GLFT strategy.
 ///
@@ -275,12 +275,12 @@ pub struct GlftQuotes {
 /// # Cost
 ///
 /// One step of the matrix exponential on the largest grid (`Q = 200`,
-/// 401 entries) costs about 3.4 µs (release build, Apple silicon, measured
+/// 401 entries) costs about 4.4 µs (release build, Apple silicon, measured
 /// over full quotes). A quote takes `N ≈ τ (α Q² + 4η) / 2` steps, up to
 /// about twice that after a rebalance of a stiff tail, and is capped at
-/// 15 000 steps, about 50 ms; beyond the cap it returns
+/// 11 000 steps, about 50 ms; beyond the cap it returns
 /// [`MMError::NumericalError`] and [`GLFTStrategy::closed_form_quotes`]
-/// should be used. With the paper parameters a quote takes about 7 ms at
+/// should be used. With the paper parameters a quote takes about 11 ms at
 /// `Q = 200` and `T - t = 600 s`, and well under 1 ms at `Q = 30`.
 ///
 /// # Example
@@ -324,7 +324,7 @@ impl GLFTStrategy {
     ///   `lot_size` or is outside `±Q` lots.
     /// - [`MMError::NumericalError`] if a parameter does not convert to a
     ///   finite `f64`, the value vector underflows or is not finite, the
-    ///   horizon needs more than 15 000 steps (use
+    ///   horizon needs more than 11 000 steps (use
     ///   [`GLFTStrategy::closed_form_quotes`] there), or a result does not
     ///   convert back to `Decimal`.
     /// - [`MMError::InvalidQuoteGeneration`] if the bid is not positive or
@@ -791,22 +791,30 @@ fn taylor_step(
     for order in 1..=MAX_TAYLOR_ORDER {
         let inv = 1.0 / f64::from(order);
         apply_operator(term, diag, eta_dt, left, right, next);
-        let mut term_max = 0.0_f64;
-        let mut sum_max = 0.0_f64;
+        // Converged when every entry's last term is small relative to that
+        // entry, so small tail entries are resolved as well as the largest.
+        let mut converged = true;
+        let mut finite = true;
         for ((t, x), s) in term.iter_mut().zip(next.iter()).zip(v.iter_mut()) {
             *t = x * inv;
             *s += *t;
-            term_max = term_max.max(t.abs());
-            sum_max = sum_max.max(s.abs());
+            finite &= t.is_finite() && s.is_finite();
+            converged &= t.abs() <= TAYLOR_TOL * s.abs();
         }
-        if !(term_max.is_finite() && sum_max.is_finite()) {
+        if !finite {
             return Err(numerical("taylor series is not finite"));
         }
-        if term_max <= TAYLOR_TOL * sum_max {
-            return Ok(());
+        if converged {
+            return if v.iter().all(|x| *x > 0.0) {
+                Ok(())
+            } else {
+                Err(numerical("taylor step produced a non positive entry"))
+            };
         }
     }
-    Err(numerical("taylor series did not converge"))
+    Err(numerical(&format!(
+        "taylor series did not converge in {MAX_TAYLOR_ORDER} terms"
+    )))
 }
 
 /// `out = B x` for the tridiagonal scaled operator of [`taylor_step`].
@@ -1296,6 +1304,70 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_with_avellaneda_stoikov_huge_gamma_at_terminal_returns_numerical_error() {
+        // gamma = 1e28, sigma = 10: gamma sigma^2 overflows Decimal on the
+        // A-S side even with a zero horizon; it must be an error, not a panic.
+        let config = GLFTConfig::new(
+            dec!(10000000000000000000000000000),
+            dec!(1),
+            dec!(1),
+            1,
+            dec!(1),
+            1,
+            dec!(1),
+        )
+        .unwrap();
+        let result = GLFTStrategy::compare_with_avellaneda_stoikov(
+            dec!(1000),
+            dec!(0),
+            &config,
+            dec!(10),
+            1,
+        );
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_calculate_optimal_quotes_tiny_coupling_tail_matches_two_state_solution() {
+        // Q = 1, alpha = 0.5 /s, eta = 2.5e-29 /s, tau = 100 s: v_{+-1} is
+        // about e^-50 of v_0, far below the largest Taylor term. With
+        // v_0 = 1 + O(eta / alpha) and
+        // v_{+-1} = e^{-alpha tau} + (eta / alpha)(1 - e^{-alpha tau}) + O(eta^2 tau^2),
+        // the quotes are known to far better than 1e-9.
+        let config = GLFTConfig::new(
+            dec!(1),
+            dec!(1),
+            dec!(0.0000000000000000000000000001),
+            1,
+            dec!(1),
+            100_000,
+            dec!(0),
+        )
+        .unwrap();
+        let sigma = Decimal::from_f64(SECONDS_PER_YEAR.sqrt()).unwrap();
+        let (alpha, tau) = (0.5_f64, 100.0_f64);
+        let eta = 1e-28 * 0.25;
+        let decay = (-alpha * tau).exp();
+        let tail = decay + eta / alpha * (1.0 - decay);
+        let base = 2.0_f64.ln();
+        let mid = dec!(1000);
+        let flat = GLFTStrategy::calculate_optimal_quotes(mid, dec!(0), &config, sigma, 0).unwrap();
+        let (b, a) = distances(flat, mid);
+        let expected = -tail.ln() + base;
+        for d in [b, a] {
+            let d = d.to_f64().unwrap();
+            assert!((d - expected).abs() < 1e-9, "{d} vs {expected}");
+        }
+        let top = GLFTStrategy::calculate_optimal_quotes(mid, dec!(1), &config, sigma, 0).unwrap();
+        assert!(top.bid.is_none());
+        let ask = (top.ask.unwrap() - mid).to_f64().unwrap();
+        assert!((ask - (tail.ln() + base)).abs() < 1e-9, "{ask}");
+    }
+
+    #[test]
     fn test_compare_with_avellaneda_stoikov_half_lots_near_terminal_agree() {
         // gamma 0.02 per unit with lots of 0.5: gamma_L = 0.01, 1.5 = 3 lots.
         let mut config = paper_config(16);
@@ -1323,7 +1395,7 @@ mod tests {
     /// `e^-930` of `v_0` and underflows.
     fn stiff_config() -> (GLFTConfig, Decimal) {
         let mut config = paper_config(MAX_INVENTORY_LOTS);
-        config.terminal_time = 60_000;
+        config.terminal_time = 40_000;
         (
             config,
             Decimal::from_f64(2.0 * SECONDS_PER_YEAR.sqrt()).unwrap(),
