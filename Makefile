@@ -75,6 +75,8 @@ msrv:
 .PHONY: doc
 doc:
 	cargo clippy -- -W missing-docs
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 .PHONY: doc-open
 doc-open:
