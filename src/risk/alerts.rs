@@ -43,6 +43,7 @@
 //! ```
 
 use crate::Decimal;
+use crate::types::error::{MMError, MMResult};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -395,12 +396,14 @@ impl fmt::Display for Alert {
 ///
 /// ```rust
 /// use market_maker_rs::risk::alerts::{Alert, AlertHandler, AlertSeverity};
+/// use market_maker_rs::types::error::MMResult;
 ///
 /// struct MyHandler;
 ///
 /// impl AlertHandler for MyHandler {
-///     fn handle(&self, alert: &Alert) {
+///     fn handle(&self, alert: &Alert) -> MMResult<()> {
 ///         println!("Custom handler: {}", alert);
+///         Ok(())
 ///     }
 ///
 ///     fn accepts_severity(&self, severity: AlertSeverity) -> bool {
@@ -410,7 +413,12 @@ impl fmt::Display for Alert {
 /// ```
 pub trait AlertHandler: Send + Sync {
     /// Handle an alert.
-    fn handle(&self, alert: &Alert);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the handler could not process the alert. The
+    /// [`AlertManager`] still delivers the alert to every other handler.
+    fn handle(&self, alert: &Alert) -> MMResult<()>;
 
     /// Check if this handler accepts the given severity level.
     ///
@@ -468,7 +476,7 @@ impl Default for LogAlertHandler {
 }
 
 impl AlertHandler for LogAlertHandler {
-    fn handle(&self, alert: &Alert) {
+    fn handle(&self, alert: &Alert) -> MMResult<()> {
         match alert.severity {
             AlertSeverity::Info => {
                 // Using eprintln for now since we don't have a logging dependency
@@ -484,6 +492,7 @@ impl AlertHandler for LogAlertHandler {
                 eprintln!("[CRITICAL] Alert {}: {}", alert.id, alert.message);
             }
         }
+        Ok(())
     }
 
     fn accepts_severity(&self, severity: AlertSeverity) -> bool {
@@ -539,8 +548,9 @@ impl<F> AlertHandler for CallbackAlertHandler<F>
 where
     F: Fn(&Alert) + Send + Sync,
 {
-    fn handle(&self, alert: &Alert) {
+    fn handle(&self, alert: &Alert) -> MMResult<()> {
         (self.callback)(alert);
+        Ok(())
     }
 
     fn accepts_severity(&self, severity: AlertSeverity) -> bool {
@@ -582,27 +592,45 @@ impl CollectingAlertHandler {
         }
     }
 
+    fn lock(&self) -> MMResult<std::sync::MutexGuard<'_, Vec<Alert>>> {
+        self.alerts
+            .lock()
+            .map_err(|_| MMError::LockPoisoned("collected alerts".to_string()))
+    }
+
     /// Returns collected alerts.
-    #[must_use]
-    pub fn alerts(&self) -> Vec<Alert> {
-        self.alerts.lock().unwrap().clone()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn alerts(&self) -> MMResult<Vec<Alert>> {
+        Ok(self.lock()?.clone())
     }
 
     /// Returns the number of collected alerts.
-    #[must_use]
-    pub fn count(&self) -> usize {
-        self.alerts.lock().unwrap().len()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn count(&self) -> MMResult<usize> {
+        Ok(self.lock()?.len())
     }
 
     /// Clears collected alerts.
-    pub fn clear(&self) {
-        self.alerts.lock().unwrap().clear();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn clear(&self) -> MMResult<()> {
+        self.lock()?.clear();
+        Ok(())
     }
 }
 
 impl AlertHandler for CollectingAlertHandler {
-    fn handle(&self, alert: &Alert) {
-        self.alerts.lock().unwrap().push(alert.clone());
+    fn handle(&self, alert: &Alert) -> MMResult<()> {
+        self.lock()?.push(alert.clone());
+        Ok(())
     }
 
     fn accepts_severity(&self, severity: AlertSeverity) -> bool {
@@ -646,7 +674,11 @@ pub struct AlertManager {
     alert_history: VecDeque<Alert>,
     max_history: usize,
     dedup_window_ms: u64,
-    recent_alerts: HashMap<String, u64>,
+    /// Last successful delivery per alert type and handler index; `None`
+    /// keys the type when no handler accepts its severity.
+    recent_alerts: HashMap<(String, Option<usize>), u64>,
+    /// When each alert type was last recorded in the history.
+    recorded_alerts: HashMap<String, u64>,
 }
 
 impl AlertManager {
@@ -664,6 +696,7 @@ impl AlertManager {
             max_history,
             dedup_window_ms,
             recent_alerts: HashMap::new(),
+            recorded_alerts: HashMap::new(),
         }
     }
 
@@ -687,9 +720,18 @@ impl AlertManager {
     /// * `alert_type` - Type of alert
     /// * `severity` - Severity level
     /// * `timestamp` - Current timestamp in milliseconds
-    pub fn alert(&mut self, alert_type: AlertType, severity: AlertSeverity, timestamp: u64) {
+    ///
+    /// # Errors
+    ///
+    /// See [`AlertManager::alert_with_message`].
+    pub fn alert(
+        &mut self,
+        alert_type: AlertType,
+        severity: AlertSeverity,
+        timestamp: u64,
+    ) -> MMResult<()> {
         let message = alert_type.default_message();
-        self.alert_with_message(alert_type, severity, message, timestamp);
+        self.alert_with_message(alert_type, severity, message, timestamp)
     }
 
     /// Raises an alert with a custom message.
@@ -700,43 +742,94 @@ impl AlertManager {
     /// * `severity` - Severity level
     /// * `message` - Custom message
     /// * `timestamp` - Current timestamp in milliseconds
+    ///
+    /// The alert is delivered to every accepting handler even when one of
+    /// them fails, and it is recorded in the history either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error reported by a handler, after all handlers
+    /// have been called.
     pub fn alert_with_message(
         &mut self,
         alert_type: AlertType,
         severity: AlertSeverity,
         message: String,
         timestamp: u64,
-    ) {
+    ) -> MMResult<()> {
         let type_key = alert_type.type_key();
 
-        // Check for deduplication
-        if let Some(&last_time) = self.recent_alerts.get(&type_key)
-            && timestamp.saturating_sub(last_time) < self.dedup_window_ms
-        {
-            // Duplicate within window, skip
-            return;
+        let window = self.dedup_window_ms;
+        let recent = |key: &(String, Option<usize>)| {
+            self.recent_alerts
+                .get(key)
+                .is_some_and(|&last| timestamp.saturating_sub(last) < window)
+        };
+
+        // Deduplicate per handler: a handler that already delivered this
+        // alert type inside the window is skipped, one that failed is retried.
+        let accepting: Vec<Option<usize>> = {
+            let indices: Vec<Option<usize>> = self
+                .handlers
+                .iter()
+                .enumerate()
+                .filter(|(_, handler)| handler.accepts_severity(severity))
+                .map(|(index, _)| Some(index))
+                .collect();
+            if indices.is_empty() {
+                vec![None]
+            } else {
+                indices
+            }
+        };
+        let pending: Vec<Option<usize>> = accepting
+            .into_iter()
+            .filter(|slot| !recent(&(type_key.clone(), *slot)))
+            .collect();
+        let seen_before = self
+            .recorded_alerts
+            .get(&type_key)
+            .is_some_and(|&last| timestamp.saturating_sub(last) < window);
+        if pending.is_empty() {
+            // Duplicate within window for every handler, skip
+            return Ok(());
         }
 
         // Create alert
         let alert = Alert::new(alert_type, severity, message, timestamp);
 
-        // Dispatch to handlers
-        for handler in &self.handlers {
-            if handler.accepts_severity(severity) {
-                handler.handle(&alert);
+        // Dispatch to every pending handler; a failing one does not silence
+        // the rest, and only successful deliveries are recorded for dedup.
+        let mut first_error = None;
+        for slot in pending {
+            let result = match slot.and_then(|index| self.handlers.get(index)) {
+                Some(handler) => handler.handle(&alert),
+                None => Ok(()),
+            };
+            match result {
+                Ok(()) => {
+                    self.recent_alerts
+                        .insert((type_key.clone(), slot), timestamp);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
 
-        // Update dedup tracking
-        self.recent_alerts.insert(type_key, timestamp);
-
-        // Add to history
-        self.alert_history.push_back(alert);
-
-        // Trim history if needed
-        while self.alert_history.len() > self.max_history {
-            self.alert_history.pop_front();
+        // A retry for a failed handler is not a new alert: the history keeps
+        // only the first occurrence inside the window.
+        if !seen_before {
+            self.recorded_alerts.insert(type_key, timestamp);
+            self.alert_history.push_back(alert);
+            while self.alert_history.len() > self.max_history {
+                self.alert_history.pop_front();
+            }
         }
+
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Returns recent alerts.
@@ -819,6 +912,7 @@ impl AlertManager {
 
         // Clean up dedup tracking
         self.recent_alerts.retain(|_, &mut ts| ts >= cutoff);
+        self.recorded_alerts.retain(|_, &mut ts| ts >= cutoff);
     }
 
     /// Returns the total number of alerts in history.
@@ -837,6 +931,7 @@ impl AlertManager {
     pub fn clear_history(&mut self) {
         self.alert_history.clear();
         self.recent_alerts.clear();
+        self.recorded_alerts.clear();
     }
 }
 
@@ -1054,16 +1149,16 @@ mod tests {
             1000,
         );
 
-        handler.handle(&alert);
-        handler.handle(&alert);
+        handler.handle(&alert).unwrap();
+        handler.handle(&alert).unwrap();
 
-        assert_eq!(handler.count(), 2);
+        assert_eq!(handler.count().unwrap(), 2);
 
-        let alerts = handler.alerts();
+        let alerts = handler.alerts().unwrap();
         assert_eq!(alerts.len(), 2);
 
-        handler.clear();
-        assert_eq!(handler.count(), 0);
+        handler.clear().unwrap();
+        assert_eq!(handler.count().unwrap(), 0);
     }
 
     // AlertManager tests
@@ -1089,23 +1184,25 @@ mod tests {
         // We need to clone the Arc for the handler
         struct ArcHandler(Arc<CollectingAlertHandler>);
         impl AlertHandler for ArcHandler {
-            fn handle(&self, alert: &Alert) {
-                self.0.handle(alert);
+            fn handle(&self, alert: &Alert) -> MMResult<()> {
+                self.0.handle(alert)
             }
         }
 
         manager.add_handler(Box::new(ArcHandler(Arc::clone(&collector))));
 
-        manager.alert(
-            AlertType::StrategyError {
-                message: "test".to_string(),
-            },
-            AlertSeverity::Error,
-            1000,
-        );
+        manager
+            .alert(
+                AlertType::StrategyError {
+                    message: "test".to_string(),
+                },
+                AlertSeverity::Error,
+                1000,
+            )
+            .unwrap();
 
         assert_eq!(manager.history_count(), 1);
-        assert_eq!(collector.count(), 1);
+        assert_eq!(collector.count().unwrap(), 1);
     }
 
     #[test]
@@ -1113,33 +1210,39 @@ mod tests {
         let mut manager = AlertManager::new(100, 60000);
 
         // First alert
-        manager.alert(
-            AlertType::StrategyError {
-                message: "test".to_string(),
-            },
-            AlertSeverity::Error,
-            1000,
-        );
+        manager
+            .alert(
+                AlertType::StrategyError {
+                    message: "test".to_string(),
+                },
+                AlertSeverity::Error,
+                1000,
+            )
+            .unwrap();
 
         // Duplicate within window (should be skipped)
-        manager.alert(
-            AlertType::StrategyError {
-                message: "test2".to_string(),
-            },
-            AlertSeverity::Error,
-            2000,
-        );
+        manager
+            .alert(
+                AlertType::StrategyError {
+                    message: "test2".to_string(),
+                },
+                AlertSeverity::Error,
+                2000,
+            )
+            .unwrap();
 
         assert_eq!(manager.history_count(), 1);
 
         // After window (should be added)
-        manager.alert(
-            AlertType::StrategyError {
-                message: "test3".to_string(),
-            },
-            AlertSeverity::Error,
-            70000,
-        );
+        manager
+            .alert(
+                AlertType::StrategyError {
+                    message: "test3".to_string(),
+                },
+                AlertSeverity::Error,
+                70000,
+            )
+            .unwrap();
 
         assert_eq!(manager.history_count(), 2);
     }
@@ -1148,21 +1251,25 @@ mod tests {
     fn test_manager_different_types_not_deduplicated() {
         let mut manager = AlertManager::new(100, 60000);
 
-        manager.alert(
-            AlertType::StrategyError {
-                message: "test".to_string(),
-            },
-            AlertSeverity::Error,
-            1000,
-        );
+        manager
+            .alert(
+                AlertType::StrategyError {
+                    message: "test".to_string(),
+                },
+                AlertSeverity::Error,
+                1000,
+            )
+            .unwrap();
 
-        manager.alert(
-            AlertType::CircuitBreakerTriggered {
-                reason: "test".to_string(),
-            },
-            AlertSeverity::Error,
-            1001,
-        );
+        manager
+            .alert(
+                AlertType::CircuitBreakerTriggered {
+                    reason: "test".to_string(),
+                },
+                AlertSeverity::Error,
+                1001,
+            )
+            .unwrap();
 
         assert_eq!(manager.history_count(), 2);
     }
@@ -1172,14 +1279,16 @@ mod tests {
         let mut manager = AlertManager::new(3, 0); // No dedup, max 3 history
 
         for i in 0..5 {
-            manager.alert(
-                AlertType::Custom {
-                    name: format!("test{}", i),
-                    message: "msg".to_string(),
-                },
-                AlertSeverity::Info,
-                i as u64,
-            );
+            manager
+                .alert(
+                    AlertType::Custom {
+                        name: format!("test{}", i),
+                        message: "msg".to_string(),
+                    },
+                    AlertSeverity::Info,
+                    i as u64,
+                )
+                .unwrap();
         }
 
         assert_eq!(manager.history_count(), 3);
@@ -1190,14 +1299,16 @@ mod tests {
         let mut manager = AlertManager::new(100, 0);
 
         for i in 0..5 {
-            manager.alert(
-                AlertType::Custom {
-                    name: format!("test{}", i),
-                    message: "msg".to_string(),
-                },
-                AlertSeverity::Info,
-                i as u64,
-            );
+            manager
+                .alert(
+                    AlertType::Custom {
+                        name: format!("test{}", i),
+                        message: "msg".to_string(),
+                    },
+                    AlertSeverity::Info,
+                    i as u64,
+                )
+                .unwrap();
         }
 
         let recent = manager.get_recent_alerts(2);
@@ -1208,30 +1319,36 @@ mod tests {
     fn test_manager_get_alerts_by_severity() {
         let mut manager = AlertManager::new(100, 0);
 
-        manager.alert(
-            AlertType::Custom {
-                name: "info".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Info,
-            1,
-        );
-        manager.alert(
-            AlertType::Custom {
-                name: "error".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Error,
-            2,
-        );
-        manager.alert(
-            AlertType::Custom {
-                name: "error2".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Error,
-            3,
-        );
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "info".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Info,
+                1,
+            )
+            .unwrap();
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "error".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Error,
+                2,
+            )
+            .unwrap();
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "error2".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Error,
+                3,
+            )
+            .unwrap();
 
         let errors = manager.get_alerts_by_severity(AlertSeverity::Error);
         assert_eq!(errors.len(), 2);
@@ -1241,14 +1358,16 @@ mod tests {
     fn test_manager_acknowledge() {
         let mut manager = AlertManager::new(100, 0);
 
-        manager.alert(
-            AlertType::Custom {
-                name: "test".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Info,
-            1,
-        );
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "test".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Info,
+                1,
+            )
+            .unwrap();
 
         assert_eq!(manager.unacknowledged_count(), 1);
 
@@ -1263,14 +1382,16 @@ mod tests {
         let mut manager = AlertManager::new(100, 0);
 
         for i in 0..3 {
-            manager.alert(
-                AlertType::Custom {
-                    name: format!("test{}", i),
-                    message: "msg".to_string(),
-                },
-                AlertSeverity::Info,
-                i as u64,
-            );
+            manager
+                .alert(
+                    AlertType::Custom {
+                        name: format!("test{}", i),
+                        message: "msg".to_string(),
+                    },
+                    AlertSeverity::Info,
+                    i as u64,
+                )
+                .unwrap();
         }
 
         assert_eq!(manager.unacknowledged_count(), 3);
@@ -1282,22 +1403,26 @@ mod tests {
     fn test_manager_cleanup() {
         let mut manager = AlertManager::new(100, 0);
 
-        manager.alert(
-            AlertType::Custom {
-                name: "old".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Info,
-            1000,
-        );
-        manager.alert(
-            AlertType::Custom {
-                name: "new".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Info,
-            5000,
-        );
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "old".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Info,
+                1000,
+            )
+            .unwrap();
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "new".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Info,
+                5000,
+            )
+            .unwrap();
 
         assert_eq!(manager.history_count(), 2);
 
@@ -1311,14 +1436,16 @@ mod tests {
     fn test_manager_clear_history() {
         let mut manager = AlertManager::new(100, 0);
 
-        manager.alert(
-            AlertType::Custom {
-                name: "test".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Info,
-            1,
-        );
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "test".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Info,
+                1,
+            )
+            .unwrap();
 
         assert_eq!(manager.history_count(), 1);
         manager.clear_history();
@@ -1332,8 +1459,8 @@ mod tests {
 
         struct ArcHandler(Arc<CollectingAlertHandler>);
         impl AlertHandler for ArcHandler {
-            fn handle(&self, alert: &Alert) {
-                self.0.handle(alert);
+            fn handle(&self, alert: &Alert) -> MMResult<()> {
+                self.0.handle(alert)
             }
             fn accepts_severity(&self, severity: AlertSeverity) -> bool {
                 self.0.accepts_severity(severity)
@@ -1343,29 +1470,33 @@ mod tests {
         manager.add_handler(Box::new(ArcHandler(Arc::clone(&collector))));
 
         // Info alert - should not be collected
-        manager.alert(
-            AlertType::Custom {
-                name: "info".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Info,
-            1,
-        );
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "info".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Info,
+                1,
+            )
+            .unwrap();
 
         // Error alert - should be collected
-        manager.alert(
-            AlertType::Custom {
-                name: "error".to_string(),
-                message: "msg".to_string(),
-            },
-            AlertSeverity::Error,
-            2,
-        );
+        manager
+            .alert(
+                AlertType::Custom {
+                    name: "error".to_string(),
+                    message: "msg".to_string(),
+                },
+                AlertSeverity::Error,
+                2,
+            )
+            .unwrap();
 
         // Both in history
         assert_eq!(manager.history_count(), 2);
         // Only error collected by handler
-        assert_eq!(collector.count(), 1);
+        assert_eq!(collector.count().unwrap(), 1);
     }
 
     #[test]
@@ -1389,8 +1520,8 @@ mod tests {
             1000,
         );
 
-        handler.handle(&alert);
-        handler.handle(&alert);
+        handler.handle(&alert).unwrap();
+        handler.handle(&alert).unwrap();
 
         assert_eq!(count.load(Ordering::Relaxed), 2);
     }
@@ -1615,7 +1746,7 @@ mod tests {
                 "Test".to_string(),
                 1000,
             );
-            handler.handle(&alert);
+            handler.handle(&alert).unwrap();
         }
 
         assert_eq!(handler.name(), "LogAlertHandler");
@@ -1662,5 +1793,121 @@ mod tests {
     fn test_manager_acknowledge_nonexistent() {
         let mut manager = AlertManager::new(100, 0);
         assert!(!manager.acknowledge("nonexistent_id"));
+    }
+
+    #[test]
+    fn test_collecting_handler_poisoned_lock_returns_lock_poisoned() {
+        let handler = std::sync::Arc::new(CollectingAlertHandler::new(AlertSeverity::Info));
+        let clone = std::sync::Arc::clone(&handler);
+        let joined = std::thread::spawn(move || {
+            let _guard = clone.alerts.lock();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(matches!(handler.count(), Err(MMError::LockPoisoned(_))));
+        assert!(matches!(handler.alerts(), Err(MMError::LockPoisoned(_))));
+        assert!(matches!(handler.clear(), Err(MMError::LockPoisoned(_))));
+    }
+
+    #[test]
+    fn test_alert_manager_failing_handler_still_delivers_to_others_and_returns_error() {
+        struct Failing;
+        impl AlertHandler for Failing {
+            fn handle(&self, _alert: &Alert) -> MMResult<()> {
+                Err(MMError::ConnectionError("down".to_string()))
+            }
+        }
+        struct Shared(std::sync::Arc<CollectingAlertHandler>);
+        impl AlertHandler for Shared {
+            fn handle(&self, alert: &Alert) -> MMResult<()> {
+                self.0.handle(alert)
+            }
+        }
+        let collector = std::sync::Arc::new(CollectingAlertHandler::new(AlertSeverity::Info));
+        let mut manager = AlertManager::new(10, 0);
+        manager.add_handler(Box::new(Failing));
+        manager.add_handler(Box::new(Shared(std::sync::Arc::clone(&collector))));
+        let result = manager.alert(
+            AlertType::Custom {
+                name: "x".to_string(),
+                message: "m".to_string(),
+            },
+            AlertSeverity::Error,
+            1,
+        );
+        assert!(matches!(result, Err(MMError::ConnectionError(_))));
+        assert_eq!(collector.count().unwrap(), 1);
+        assert_eq!(manager.get_recent_alerts(10).len(), 1);
+    }
+
+    #[test]
+    fn test_alert_manager_failed_delivery_is_not_deduplicated() {
+        struct FailOnce(std::sync::atomic::AtomicBool);
+        impl AlertHandler for FailOnce {
+            fn handle(&self, _alert: &Alert) -> MMResult<()> {
+                if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    Err(MMError::ConnectionError("down".to_string()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let alert_type = || AlertType::Custom {
+            name: "x".to_string(),
+            message: "m".to_string(),
+        };
+        let mut manager = AlertManager::new(10, 60_000);
+        manager.add_handler(Box::new(FailOnce(std::sync::atomic::AtomicBool::new(true))));
+
+        assert!(
+            manager
+                .alert(alert_type(), AlertSeverity::Error, 1)
+                .is_err()
+        );
+        // The retry inside the window is delivered, not suppressed, and is
+        // not recorded as a second alert.
+        assert!(manager.alert(alert_type(), AlertSeverity::Error, 2).is_ok());
+        assert_eq!(manager.get_recent_alerts(10).len(), 1);
+        // After a successful delivery, a duplicate is suppressed again.
+        assert!(manager.alert(alert_type(), AlertSeverity::Error, 3).is_ok());
+        assert_eq!(manager.get_recent_alerts(10).len(), 1);
+    }
+
+    #[test]
+    fn test_alert_manager_persistent_failure_does_not_redeliver_to_healthy_handlers() {
+        struct Failing;
+        impl AlertHandler for Failing {
+            fn handle(&self, _alert: &Alert) -> MMResult<()> {
+                Err(MMError::ConnectionError("webhook down".to_string()))
+            }
+        }
+        struct Shared(std::sync::Arc<CollectingAlertHandler>);
+        impl AlertHandler for Shared {
+            fn handle(&self, alert: &Alert) -> MMResult<()> {
+                self.0.handle(alert)
+            }
+        }
+        let alert_type = || AlertType::Custom {
+            name: "x".to_string(),
+            message: "m".to_string(),
+        };
+        let collector = std::sync::Arc::new(CollectingAlertHandler::new(AlertSeverity::Info));
+        let mut manager = AlertManager::new(10, 60_000);
+        manager.add_handler(Box::new(Failing));
+        manager.add_handler(Box::new(Shared(std::sync::Arc::clone(&collector))));
+
+        assert!(
+            manager
+                .alert(alert_type(), AlertSeverity::Error, 1)
+                .is_err()
+        );
+        assert!(
+            manager
+                .alert(alert_type(), AlertSeverity::Error, 2)
+                .is_err()
+        );
+        assert_eq!(collector.count().unwrap(), 1);
+        assert_eq!(manager.get_recent_alerts(10).len(), 1);
     }
 }

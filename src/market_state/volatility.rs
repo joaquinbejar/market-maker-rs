@@ -120,7 +120,7 @@ impl VolatilityEstimator {
     /// # Errors
     ///
     /// Returns error if:
-    /// - Less than 2 prices provided
+    /// - Less than 3 prices provided (the sample variance needs 2 returns)
     /// - Any price is zero or negative
     /// - Numerical calculation fails
     ///
@@ -144,17 +144,7 @@ impl VolatilityEstimator {
         }
 
         // Calculate log returns
-        let mut log_returns = Vec::with_capacity(prices.len() - 1);
-        for i in 1..prices.len() {
-            if prices[i] <= Decimal::ZERO || prices[i - 1] <= Decimal::ZERO {
-                return Err(MMError::InvalidMarketState(
-                    "prices must be positive".to_string(),
-                ));
-            }
-            let ratio = prices[i] / prices[i - 1];
-            let log_return = decimal_ln(ratio)?;
-            log_returns.push(log_return);
-        }
+        let log_returns = log_returns(prices)?;
 
         // Calculate mean of log returns
         let sum: Decimal = log_returns.iter().sum();
@@ -196,7 +186,7 @@ impl VolatilityEstimator {
     /// # Errors
     ///
     /// Returns error if:
-    /// - Less than 2 prices provided
+    /// - Less than 3 prices provided (the sample variance needs 2 returns)
     /// - Lambda not in range (0, 1)
     /// - Any price is invalid
     ///
@@ -227,21 +217,11 @@ impl VolatilityEstimator {
         }
 
         // Calculate log returns
-        let mut log_returns = Vec::with_capacity(prices.len() - 1);
-        for i in 1..prices.len() {
-            if prices[i] <= Decimal::ZERO || prices[i - 1] <= Decimal::ZERO {
-                return Err(MMError::InvalidMarketState(
-                    "prices must be positive".to_string(),
-                ));
-            }
-            let ratio = prices[i] / prices[i - 1];
-            let log_return = decimal_ln(ratio)?;
-            log_returns.push(log_return);
-        }
+        let log_returns = log_returns(prices)?;
 
         // Initialize variance with simple variance of first few returns
         let initial_variance = if log_returns.len() >= 5 {
-            let first_returns = &log_returns[0..5];
+            let first_returns = log_returns.get(..5).unwrap_or_default();
             let mean: Decimal = first_returns.iter().sum::<Decimal>() / Decimal::from(5);
             let squared_devs: Decimal = first_returns
                 .iter()
@@ -332,20 +312,20 @@ impl VolatilityEstimator {
 
         let mut sum_squared_ratios = Decimal::ZERO;
 
-        for i in 0..high_prices.len() {
-            if high_prices[i] <= Decimal::ZERO || low_prices[i] <= Decimal::ZERO {
+        for (&high, &low) in high_prices.iter().zip(low_prices) {
+            if high <= Decimal::ZERO || low <= Decimal::ZERO {
                 return Err(MMError::InvalidMarketState(
                     "prices must be positive".to_string(),
                 ));
             }
 
-            if high_prices[i] < low_prices[i] {
+            if high < low {
                 return Err(MMError::InvalidMarketState(
                     "high price must be >= low price".to_string(),
                 ));
             }
 
-            let ratio = high_prices[i] / low_prices[i];
+            let ratio = high / low;
             let log_ratio = decimal_ln(ratio)?;
             sum_squared_ratios += log_ratio * log_ratio;
         }
@@ -364,9 +344,52 @@ impl VolatilityEstimator {
     }
 }
 
+/// Computes the log returns `ln(p[i] / p[i - 1])` of a price series.
+///
+/// # Errors
+///
+/// Returns `MMError::InvalidMarketState` if any price is not positive or
+/// there are fewer than 2 returns.
+fn log_returns(prices: &[Decimal]) -> MMResult<Vec<Decimal>> {
+    let mut log_returns = Vec::with_capacity(prices.len().saturating_sub(1));
+    for window in prices.windows(2) {
+        let [prev, next] = window else {
+            continue;
+        };
+        if *next <= Decimal::ZERO || *prev <= Decimal::ZERO {
+            return Err(MMError::InvalidMarketState(
+                "prices must be positive".to_string(),
+            ));
+        }
+        log_returns.push(decimal_ln(*next / *prev)?);
+    }
+    // The sample variance divides by `n - 1`.
+    if log_returns.len() < 2 {
+        return Err(MMError::InvalidMarketState(format!(
+            "need at least 2 log returns (3 prices), got {}",
+            log_returns.len()
+        )));
+    }
+    Ok(log_returns)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_calculate_simple_two_prices_returns_err() {
+        let estimator = VolatilityEstimator::new();
+        let result = estimator.calculate_simple(&[dec!(100), dec!(101)]);
+        assert!(matches!(result, Err(MMError::InvalidMarketState(_))));
+    }
+
+    #[test]
+    fn test_calculate_ewma_two_prices_returns_err() {
+        let estimator = VolatilityEstimator::new();
+        let result = estimator.calculate_ewma(&[dec!(100), dec!(101)], dec!(0.94));
+        assert!(matches!(result, Err(MMError::InvalidMarketState(_))));
+    }
     use crate::dec;
 
     #[test]

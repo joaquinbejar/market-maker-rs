@@ -34,6 +34,7 @@ use crate::execution::connector::{
 };
 use crate::types::action::{Action, Dir};
 use crate::types::error::{MMError, MMResult};
+use rust_decimal::prelude::FromPrimitive;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,113 @@ pub struct OrderBookConnectorConfig {
     pub fee_rate: Decimal,
     /// Fee currency.
     pub fee_currency: String,
+}
+
+/// Largest supported price or quantity precision: `10^19` is the largest
+/// power of ten that fits in a `u64`.
+pub const MAX_PRECISION: u32 = 19;
+
+/// Returns `10^exponent` as a `u128`; `None` when it does not fit
+/// (exponent above 38).
+fn pow10(exponent: u32) -> Option<u128> {
+    10u128.checked_pow(exponent)
+}
+
+/// Scales a non negative `value` to integer units at `precision` decimal
+/// places, truncating toward zero, through its mantissa and scale so no
+/// intermediate `Decimal` can overflow.
+///
+/// # Errors
+///
+/// Returns [`MMError::NumericalError`] if `value` is negative or the
+/// result does not fit in a `u128`.
+fn decimal_to_units(value: Decimal, precision: u32) -> MMResult<u128> {
+    let out_of_range =
+        || MMError::NumericalError(format!("{value} is out of range at precision {precision}"));
+    let mantissa = u128::try_from(value.mantissa()).map_err(|_| out_of_range())?;
+    let scale = value.scale();
+    if precision >= scale {
+        let factor = precision
+            .checked_sub(scale)
+            .and_then(pow10)
+            .ok_or_else(out_of_range)?;
+        mantissa.checked_mul(factor).ok_or_else(out_of_range)
+    } else {
+        // `scale - precision` is at most 28, so the power always fits.
+        let divisor = scale
+            .checked_sub(precision)
+            .and_then(pow10)
+            .ok_or_else(out_of_range)?;
+        mantissa.checked_div(divisor).ok_or_else(out_of_range)
+    }
+}
+
+/// Builds the `Decimal` worth `raw` integer units at `precision` decimal
+/// places. Accepts any `u128` whose value is inside the `Decimal` range.
+///
+/// # Errors
+///
+/// Returns [`MMError::InvalidConfiguration`] if `precision` is above
+/// [`MAX_PRECISION`], or [`MMError::NumericalError`] if the value is
+/// outside the `Decimal` range.
+fn units_to_decimal(raw: u128, precision: u32) -> MMResult<Decimal> {
+    if precision > MAX_PRECISION {
+        return Err(MMError::InvalidConfiguration(format!(
+            "precision must be at most {MAX_PRECISION}, got {precision}"
+        )));
+    }
+    let out_of_range = || {
+        MMError::NumericalError(format!(
+            "raw value {raw} at precision {precision} is out of the decimal range"
+        ))
+    };
+    let unit = pow10(precision).ok_or_else(out_of_range)?;
+    let (whole, fraction) = (
+        raw.checked_div(unit).ok_or_else(out_of_range)?,
+        raw.checked_rem(unit).ok_or_else(out_of_range)?,
+    );
+    let whole = Decimal::from_u128(whole).ok_or_else(out_of_range)?;
+    // `fraction < 10^19` always fits the 96 bit mantissa.
+    let fraction = i128::try_from(fraction)
+        .ok()
+        .and_then(|f| Decimal::try_from_i128_with_scale(f, precision).ok())
+        .ok_or_else(out_of_range)?;
+    let value = whole.checked_add(fraction).ok_or_else(out_of_range)?;
+    // The 96 bit mantissa can round a large raw value with a fractional
+    // part; reject anything that does not convert back to the same raw.
+    if decimal_to_units(value, precision).ok() != Some(raw) {
+        return Err(MMError::NumericalError(format!(
+            "raw value {raw} at precision {precision} is not exactly representable"
+        )));
+    }
+    Ok(value)
+}
+
+impl OrderBookConnectorConfig {
+    /// Validates the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] if `price_precision` or
+    /// `quantity_precision` is above [`MAX_PRECISION`].
+    pub fn validate(&self) -> MMResult<()> {
+        for (name, precision) in [
+            ("price_precision", self.price_precision),
+            ("quantity_precision", self.quantity_precision),
+        ] {
+            if precision > MAX_PRECISION {
+                return Err(MMError::InvalidConfiguration(format!(
+                    "{name} must be at most {MAX_PRECISION}, got {precision}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Maps a poisoned lock to [`MMError::LockPoisoned`].
+fn poisoned<T>(_: std::sync::PoisonError<T>) -> MMError {
+    MMError::LockPoisoned("orderbook connector".to_string())
 }
 
 impl Default for OrderBookConnectorConfig {
@@ -108,18 +216,12 @@ impl OrderBookConnector {
     /// * `symbol` - The trading symbol
     /// * `config` - The connector configuration
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// A new `OrderBookConnector` instance.
-    #[must_use]
-    pub fn with_config(symbol: &str, config: OrderBookConnectorConfig) -> Self {
-        Self {
-            order_book: Arc::new(OrderBook::new(symbol)),
-            config,
-            order_id_counter: AtomicU64::new(1),
-            order_mapping: std::sync::RwLock::new(HashMap::new()),
-            balances: std::sync::RwLock::new(HashMap::new()),
-        }
+    /// Returns [`MMError::InvalidConfiguration`] if a precision is above
+    /// [`MAX_PRECISION`].
+    pub fn with_config(symbol: &str, config: OrderBookConnectorConfig) -> MMResult<Self> {
+        Self::from_orderbook(Arc::new(OrderBook::new(symbol)), config)
     }
 
     /// Creates a new OrderBook connector wrapping an existing order book.
@@ -129,21 +231,22 @@ impl OrderBookConnector {
     /// * `order_book` - The existing order book to wrap
     /// * `config` - The connector configuration
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// A new `OrderBookConnector` instance.
-    #[must_use]
+    /// Returns [`MMError::InvalidConfiguration`] if a precision is above
+    /// [`MAX_PRECISION`].
     pub fn from_orderbook(
         order_book: Arc<DefaultOrderBook>,
         config: OrderBookConnectorConfig,
-    ) -> Self {
-        Self {
+    ) -> MMResult<Self> {
+        config.validate()?;
+        Ok(Self {
             order_book,
             config,
             order_id_counter: AtomicU64::new(1),
             order_mapping: std::sync::RwLock::new(HashMap::new()),
             balances: std::sync::RwLock::new(HashMap::new()),
-        }
+        })
     }
 
     /// Returns a reference to the underlying order book.
@@ -164,9 +267,13 @@ impl OrderBookConnector {
     ///
     /// * `asset` - The asset symbol
     /// * `balance` - The balance amount
-    pub fn set_balance(&self, asset: &str, balance: Decimal) {
-        let mut balances = self.balances.write().unwrap();
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn set_balance(&self, asset: &str, balance: Decimal) -> MMResult<()> {
+        let mut balances = self.balances.write().map_err(poisoned)?;
         balances.insert(asset.to_string(), balance);
+        Ok(())
     }
 
     /// Generates a new unique order ID.
@@ -210,37 +317,56 @@ impl OrderBookConnector {
     }
 
     /// Converts a Decimal price to the raw `u128` used by orderbook-rs.
-    fn price_to_u128(&self, price: Decimal) -> u128 {
-        let multiplier = Decimal::from(10u64.pow(self.config.price_precision));
-        let scaled = price * multiplier;
-        scaled
-            .to_string()
-            .parse::<f64>()
-            .map(|f| f as u128)
-            .unwrap_or(0)
+    ///
+    /// Rejects a price that is not positive, that rounds to zero ticks, or
+    /// that does not fit: a zero raw price would make a sell marketable.
+    fn price_to_u128(&self, price: Decimal) -> MMResult<u128> {
+        let precision = self.config.price_precision;
+        let not_positive = || {
+            MMError::NumericalError(format!(
+                "price {price} is not a positive raw price at precision {precision}"
+            ))
+        };
+        if price <= Decimal::ZERO {
+            return Err(not_positive());
+        }
+        match decimal_to_units(price, precision)? {
+            0 => Err(not_positive()),
+            raw => Ok(raw),
+        }
     }
 
     /// Converts a raw `u128` price from orderbook-rs to Decimal.
-    fn u128_to_price(&self, price: u128) -> Decimal {
-        let divisor = Decimal::from(10u64.pow(self.config.price_precision));
-        Decimal::from(price) / divisor
+    fn u128_to_price(&self, price: u128) -> MMResult<Decimal> {
+        units_to_decimal(price, self.config.price_precision)
     }
 
     /// Converts a Decimal quantity to u64 for orderbook-rs.
-    fn quantity_to_u64(&self, quantity: Decimal) -> u64 {
-        let multiplier = Decimal::from(10u64.pow(self.config.quantity_precision));
-        let scaled = quantity * multiplier;
-        scaled
-            .to_string()
-            .parse::<f64>()
-            .map(|f| f as u64)
-            .unwrap_or(0)
+    ///
+    /// Rejects a quantity that is negative (checked before truncation, so
+    /// a tiny negative quantity is rejected too) or does not fit in a `u64`.
+    fn quantity_to_u64(&self, quantity: Decimal) -> MMResult<u64> {
+        if quantity < Decimal::ZERO {
+            return Err(MMError::NumericalError(format!(
+                "quantity {quantity} is negative"
+            )));
+        }
+        let raw = decimal_to_units(quantity, self.config.quantity_precision)?;
+        if raw == 0 {
+            // A zero or sub-lot quantity would cancel a resting order on modify
+            // or submit an empty order, so it is rejected before the book changes.
+            return Err(MMError::NumericalError(format!(
+                "quantity {quantity} rounds to zero lots"
+            )));
+        }
+        u64::try_from(raw).map_err(|_| {
+            MMError::NumericalError(format!("quantity {quantity} does not fit in u64"))
+        })
     }
 
     /// Converts a u64 quantity from orderbook-rs to Decimal.
-    fn u64_to_quantity(&self, quantity: u64) -> Decimal {
-        let divisor = Decimal::from(10u64.pow(self.config.quantity_precision));
-        Decimal::from(quantity) / divisor
+    fn u64_to_quantity(&self, quantity: u64) -> MMResult<Decimal> {
+        units_to_decimal(u128::from(quantity), self.config.quantity_precision)
     }
 
     /// Gets the current timestamp in milliseconds.
@@ -257,7 +383,7 @@ impl ExchangeConnector for OrderBookConnector {
         let (order_id, ob_order_id) = self.next_order_id();
         let ob_side = Self::convert_side(dir);
         let ob_tif = Self::convert_tif(request.time_in_force);
-        let quantity = self.quantity_to_u64(request.quantity);
+        let quantity = self.quantity_to_u64(request.quantity)?;
 
         let result = match request.order_type {
             OrderType::Market => {
@@ -281,17 +407,18 @@ impl ExchangeConnector for OrderBookConnector {
                 let price = request.price.ok_or_else(|| {
                     MMError::InvalidConfiguration("Limit order requires price".to_string())
                 })?;
-                let ob_price = self.price_to_u128(price);
+                let ob_price = self.price_to_u128(price)?;
 
+                // The mapping lock is held across the book update so no
+                // other caller can see the order in the book but not in
+                // the mapping, and a poisoned lock fails before the book
+                // is touched.
+                let mut mapping = self.order_mapping.write().map_err(poisoned)?;
                 self.order_book
                     .add_limit_order(ob_order_id, ob_price, quantity, ob_side, ob_tif, None)
                     .map_err(|e| MMError::InvalidPositionUpdate(e.to_string()))?;
-
-                // Store mapping
-                {
-                    let mut mapping = self.order_mapping.write().unwrap();
-                    mapping.insert(order_id.as_str().to_string(), ob_order_id);
-                }
+                mapping.insert(order_id.as_str().to_string(), ob_order_id);
+                drop(mapping);
 
                 OrderResponse {
                     order_id: order_id.clone(),
@@ -306,17 +433,18 @@ impl ExchangeConnector for OrderBookConnector {
                 let price = request.price.ok_or_else(|| {
                     MMError::InvalidConfiguration("PostOnly order requires price".to_string())
                 })?;
-                let ob_price = self.price_to_u128(price);
+                let ob_price = self.price_to_u128(price)?;
 
+                // The mapping lock is held across the book update so no
+                // other caller can see the order in the book but not in
+                // the mapping, and a poisoned lock fails before the book
+                // is touched.
+                let mut mapping = self.order_mapping.write().map_err(poisoned)?;
                 self.order_book
                     .add_post_only_order(ob_order_id, ob_price, quantity, ob_side, ob_tif, None)
                     .map_err(|e| MMError::InvalidPositionUpdate(e.to_string()))?;
-
-                // Store mapping
-                {
-                    let mut mapping = self.order_mapping.write().unwrap();
-                    mapping.insert(order_id.as_str().to_string(), ob_order_id);
-                }
+                mapping.insert(order_id.as_str().to_string(), ob_order_id);
+                drop(mapping);
 
                 OrderResponse {
                     order_id: order_id.clone(),
@@ -334,7 +462,7 @@ impl ExchangeConnector for OrderBookConnector {
 
     async fn cancel_order(&self, order_id: &OrderId) -> MMResult<OrderResponse> {
         let ob_order_id = {
-            let mapping = self.order_mapping.read().unwrap();
+            let mapping = self.order_mapping.read().map_err(poisoned)?;
             mapping.get(order_id.as_str()).copied().ok_or_else(|| {
                 MMError::InvalidPositionUpdate(format!("Order not found: {}", order_id))
             })?
@@ -346,7 +474,7 @@ impl ExchangeConnector for OrderBookConnector {
 
         // Remove from mapping
         {
-            let mut mapping = self.order_mapping.write().unwrap();
+            let mut mapping = self.order_mapping.write().map_err(poisoned)?;
             mapping.remove(order_id.as_str());
         }
 
@@ -366,12 +494,12 @@ impl ExchangeConnector for OrderBookConnector {
         new_price: Option<Decimal>,
         new_quantity: Option<Decimal>,
     ) -> MMResult<OrderResponse> {
-        let ob_order_id = {
-            let mapping = self.order_mapping.read().unwrap();
-            mapping.get(order_id.as_str()).copied().ok_or_else(|| {
-                MMError::InvalidPositionUpdate(format!("Order not found: {}", order_id))
-            })?
-        };
+        // The mapping write lock is held through the whole cancel/replace
+        // so concurrent callers never see a stale or missing mapping.
+        let mut mapping = self.order_mapping.write().map_err(poisoned)?;
+        let ob_order_id = mapping.get(order_id.as_str()).copied().ok_or_else(|| {
+            MMError::InvalidPositionUpdate(format!("Order not found: {}", order_id))
+        })?;
 
         // For order modification, we cancel and re-add the order
         // This is a common pattern when the underlying system doesn't support atomic modifications
@@ -404,18 +532,21 @@ impl ExchangeConnector for OrderBookConnector {
             }
         };
 
+        // Convert the new values before touching the book, so a bad value
+        // leaves the existing order resting.
+        let final_price = match new_price {
+            Some(p) => self.price_to_u128(p)?,
+            None => current_price,
+        };
+        let final_quantity = match new_quantity {
+            Some(q) => self.quantity_to_u64(q)?,
+            None => current_quantity,
+        };
+
         // Cancel the existing order
         self.order_book
             .cancel_order(ob_order_id)
             .map_err(|e| MMError::InvalidPositionUpdate(e.to_string()))?;
-
-        // Create new order with updated values
-        let final_price = new_price
-            .map(|p| self.price_to_u128(p))
-            .unwrap_or(current_price);
-        let final_quantity = new_quantity
-            .map(|q| self.quantity_to_u64(q))
-            .unwrap_or(current_quantity);
 
         // Generate new order ID for the replacement order
         let new_ob_order_id = self.next_ob_order_id();
@@ -432,10 +563,8 @@ impl ExchangeConnector for OrderBookConnector {
             .map_err(|e| MMError::InvalidPositionUpdate(e.to_string()))?;
 
         // Update mapping with new order ID
-        {
-            let mut mapping = self.order_mapping.write().unwrap();
-            mapping.insert(order_id.as_str().to_string(), new_ob_order_id);
-        }
+        mapping.insert(order_id.as_str().to_string(), new_ob_order_id);
+        drop(mapping);
 
         Ok(OrderResponse {
             order_id: order_id.clone(),
@@ -449,7 +578,7 @@ impl ExchangeConnector for OrderBookConnector {
 
     async fn get_order_status(&self, order_id: &OrderId) -> MMResult<OrderResponse> {
         let ob_order_id = {
-            let mapping = self.order_mapping.read().unwrap();
+            let mapping = self.order_mapping.read().map_err(poisoned)?;
             mapping.get(order_id.as_str()).copied().ok_or_else(|| {
                 MMError::InvalidPositionUpdate(format!("Order not found: {}", order_id))
             })?
@@ -473,7 +602,7 @@ impl ExchangeConnector for OrderBookConnector {
     }
 
     async fn get_open_orders(&self, _symbol: &str) -> MMResult<Vec<OrderResponse>> {
-        let mapping = self.order_mapping.read().unwrap();
+        let mapping = self.order_mapping.read().map_err(poisoned)?;
         let mut orders = Vec::new();
 
         for id_str in mapping.keys() {
@@ -493,7 +622,7 @@ impl ExchangeConnector for OrderBookConnector {
 
     async fn cancel_all_orders(&self, _symbol: &str) -> MMResult<Vec<OrderResponse>> {
         let order_ids: Vec<(String, OBOrderId)> = {
-            let mapping = self.order_mapping.read().unwrap();
+            let mapping = self.order_mapping.read().map_err(poisoned)?;
             mapping
                 .iter()
                 .map(|(k, v): (&String, &OBOrderId)| (k.clone(), *v))
@@ -517,7 +646,7 @@ impl ExchangeConnector for OrderBookConnector {
 
         // Clear mapping
         {
-            let mut mapping = self.order_mapping.write().unwrap();
+            let mut mapping = self.order_mapping.write().map_err(poisoned)?;
             mapping.clear();
         }
 
@@ -530,27 +659,26 @@ impl ExchangeConnector for OrderBookConnector {
             .create_snapshot(depth)
             .map_err(|e| MMError::InvalidMarketState(e.to_string()))?;
 
-        let bids: Vec<BookLevel> = snapshot
+        let bids = snapshot
             .bids
             .iter()
             .map(|level| {
-                BookLevel::new(
-                    self.u128_to_price(level.price().as_u128()),
-                    self.u64_to_quantity(level.visible_quantity().as_u64()),
-                )
+                Ok(BookLevel::new(
+                    self.u128_to_price(level.price().as_u128())?,
+                    self.u64_to_quantity(level.visible_quantity().as_u64())?,
+                ))
             })
-            .collect();
-
-        let asks: Vec<BookLevel> = snapshot
+            .collect::<MMResult<Vec<BookLevel>>>()?;
+        let asks = snapshot
             .asks
             .iter()
             .map(|level| {
-                BookLevel::new(
-                    self.u128_to_price(level.price().as_u128()),
-                    self.u64_to_quantity(level.visible_quantity().as_u64()),
-                )
+                Ok(BookLevel::new(
+                    self.u128_to_price(level.price().as_u128())?,
+                    self.u64_to_quantity(level.visible_quantity().as_u64())?,
+                ))
             })
-            .collect();
+            .collect::<MMResult<Vec<BookLevel>>>()?;
 
         Ok(OrderBookSnapshot {
             symbol: self.order_book.symbol().to_string(),
@@ -561,7 +689,7 @@ impl ExchangeConnector for OrderBookConnector {
     }
 
     async fn get_balance(&self, asset: &str) -> MMResult<Decimal> {
-        let balances = self.balances.read().unwrap();
+        let balances = self.balances.read().map_err(poisoned)?;
         Ok(balances.get(asset).copied().unwrap_or(Decimal::ZERO))
     }
 }
@@ -575,6 +703,174 @@ mod tests {
     async fn test_connector_creation() {
         let connector = OrderBookConnector::new("BTC-USD");
         assert_eq!(connector.symbol(), "BTC-USD");
+    }
+
+    fn config(price_precision: u32, quantity_precision: u32) -> OrderBookConnectorConfig {
+        OrderBookConnectorConfig {
+            price_precision,
+            quantity_precision,
+            ..OrderBookConnectorConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_with_config_precision_above_max_returns_err() {
+        for cfg in [config(20, 8), config(2, 20)] {
+            assert!(matches!(
+                OrderBookConnector::with_config("BTC-USD", cfg),
+                Err(MMError::InvalidConfiguration(_))
+            ));
+        }
+        assert!(OrderBookConnector::with_config("BTC-USD", config(19, 19)).is_ok());
+    }
+
+    #[test]
+    fn test_from_orderbook_precision_above_max_returns_err() {
+        let book = Arc::new(OrderBook::new("BTC-USD"));
+        assert!(matches!(
+            OrderBookConnector::from_orderbook(book, config(u32::MAX, 8)),
+            Err(MMError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn test_raw_to_decimal_beyond_range_returns_err() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        assert!(matches!(
+            connector.u128_to_price(u128::MAX),
+            Err(MMError::NumericalError(_))
+        ));
+        assert_eq!(connector.u128_to_price(12345).unwrap(), dec!(123.45));
+        assert_eq!(connector.u64_to_quantity(150_000_000).unwrap(), dec!(1.5));
+    }
+
+    #[test]
+    fn test_price_to_u128_non_positive_or_huge_returns_err() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        for price in [dec!(0), dec!(-1), dec!(0.001)] {
+            assert!(matches!(
+                connector.price_to_u128(price),
+                Err(MMError::NumericalError(_))
+            ));
+        }
+        assert_eq!(connector.price_to_u128(dec!(1.23)).unwrap(), 123);
+        // Decimal::MAX * 10^19 does not fit in a u128.
+        let fine = OrderBookConnector::with_config("BTC-USD", config(19, 8)).unwrap();
+        assert!(matches!(
+            fine.price_to_u128(Decimal::MAX),
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[test]
+    fn test_units_to_decimal_inexact_raw_returns_err_exact_large_raw_converts() {
+        assert!(matches!(
+            units_to_decimal(u128::MAX, 19),
+            Err(MMError::NumericalError(_))
+        ));
+        let raw = 10u128.pow(29);
+        let value = units_to_decimal(raw, 19).unwrap();
+        assert_eq!(value, dec!(10000000000));
+        assert_eq!(decimal_to_units(value, 19).unwrap(), raw);
+    }
+
+    #[test]
+    fn test_price_to_u128_beyond_decimal_mantissa_round_trips() {
+        // Decimal::MAX * 100 is above 2^96 but a valid u128 raw price.
+        let connector = OrderBookConnector::new("BTC-USD");
+        let raw = connector.price_to_u128(Decimal::MAX).unwrap();
+        assert_eq!(raw, 7_922_816_251_426_433_759_354_395_033_500);
+        assert_eq!(connector.u128_to_price(raw).unwrap(), Decimal::MAX);
+        // A raw value above 2^96 whose price is inside the Decimal range.
+        let big = 10u128.pow(30);
+        assert_eq!(
+            connector.u128_to_price(big).unwrap(),
+            Decimal::from_u128(10u128.pow(28)).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_quantity_to_u64_tiny_negative_returns_err() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        assert!(matches!(
+            connector.quantity_to_u64(dec!(-0.000000001)),
+            Err(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            connector.quantity_to_u64(dec!(0.000000001)),
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_poisoned_mapping_leaves_book_untouched() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = connector.order_mapping.write().unwrap();
+                    panic!("poison the mapping");
+                })
+                .join();
+        });
+        let request = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(1.0));
+        assert!(matches!(
+            connector.submit_order(request).await,
+            Err(MMError::LockPoisoned(_))
+        ));
+        assert!(connector.order_book().best_bid().is_none());
+    }
+
+    #[test]
+    fn test_quantity_to_u64_negative_or_huge_returns_err() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        for quantity in [dec!(-1), dec!(1_000_000_000_000)] {
+            assert!(matches!(
+                connector.quantity_to_u64(quantity),
+                Err(MMError::NumericalError(_))
+            ));
+        }
+        assert!(matches!(
+            connector.quantity_to_u64(dec!(0)),
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_sell_at_zero_price_returns_err() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let request = OrderRequest::limit_sell("BTC-USD", dec!(0), dec!(1.0));
+        assert!(matches!(
+            connector.submit_order(request).await,
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_invalid_price_keeps_order() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let request = OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(1.0));
+        let response = connector.submit_order(request).await.unwrap();
+        let result = connector
+            .modify_order(&response.order_id, Some(dec!(-5)), None)
+            .await;
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
+        let book = connector.get_orderbook("BTC-USD", 10).await.unwrap();
+        assert_eq!(book.bids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_sublot_quantity_keeps_order() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let request = OrderRequest::limit_buy("BTC-USD", dec!(100), dec!(1));
+        let response = connector.submit_order(request).await.unwrap();
+        let result = connector
+            .modify_order(&response.order_id, None, Some(dec!(0.000000001)))
+            .await;
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
+        let book = connector.get_orderbook("BTC-USD", 10).await.unwrap();
+        assert_eq!(book.bids.len(), 1);
+        assert!(connector.get_order_status(&response.order_id).await.is_ok());
     }
 
     #[tokio::test]
@@ -626,7 +922,7 @@ mod tests {
         assert_eq!(balance, Decimal::ZERO);
 
         // Set balance
-        connector.set_balance("BTC", dec!(10.0));
+        connector.set_balance("BTC", dec!(10.0)).unwrap();
         let balance = connector.get_balance("BTC").await.unwrap();
         assert_eq!(balance, dec!(10.0));
     }

@@ -122,26 +122,48 @@ impl MarginAccount {
         self.lock().errors.clone()
     }
 
-    /// The fault latched by a fill with an unsupported side, if any. While
-    /// it is set, the policy rejects every order; reset clears it.
+    /// The fault latched by a fill with an unsupported side, if any, or
+    /// [`MMError::LockPoisoned`] when a thread panicked while holding the
+    /// account. While either is set, the policy rejects every order; reset
+    /// clears both.
     #[must_use]
     pub fn fault(&self) -> Option<MMError> {
-        self.lock().fault.clone()
+        match self.shared.lock() {
+            Ok(shared) => shared.fault.clone(),
+            Err(_) => Some(Self::poisoned()),
+        }
     }
 
-    /// Locks the shared account; a poisoned lock is recovered, since every
-    /// gate operation leaves the gate consistent on error.
+    fn poisoned() -> MMError {
+        MMError::LockPoisoned("margin account".to_string())
+    }
+
+    /// Locks the shared account for a decision or a booking: a poisoned
+    /// lock fails closed with [`MMError::LockPoisoned`], since a panic may
+    /// have interrupted an update.
+    fn lock_checked(&self) -> MMResult<MutexGuard<'_, Shared>> {
+        self.shared.lock().map_err(|_| Self::poisoned())
+    }
+
+    /// Locks the shared account for a read only view (debug output,
+    /// descriptions, snapshots); a poisoned lock is recovered there, and
+    /// decisions still fail closed through [`MarginAccount::lock_checked`].
     fn lock(&self) -> MutexGuard<'_, Shared> {
         self.shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Restores the initial gate and clears errors, the fault and a
+    /// poisoned lock.
     fn reset(&self) {
         let mut shared = self.lock();
         shared.gate = shared.initial.clone();
         shared.errors.clear();
         shared.fault = None;
+        // Cleared while the guard is held, so no other thread can observe
+        // the restored state as poisoned or a poisoned state as clean.
+        self.shared.clear_poison();
     }
 }
 
@@ -183,7 +205,14 @@ impl PretradePolicy for MarginRiskPolicy {
                 };
             }
         };
-        let mut shared = self.account.lock();
+        let mut shared = match self.account.lock_checked() {
+            Ok(shared) => shared,
+            Err(error) => {
+                return PretradeDecision::Rejected {
+                    reason: format!("policy fault: {error}"),
+                };
+            }
+        };
         if let Some(fault) = &shared.fault {
             return PretradeDecision::Rejected {
                 reason: format!("policy fault: {fault}"),
@@ -247,14 +276,18 @@ impl PretradePolicy for MarginRiskPolicy {
     }
 
     fn on_market_data(&mut self, mark: Decimal, timestamp: u64) {
-        let mut shared = self.account.lock();
+        // A poisoned account stays poisoned (orders are rejected) until
+        // reset; the mark is not forwarded to a possibly torn gate.
+        let Ok(mut shared) = self.account.lock_checked() else {
+            return;
+        };
         let instrument = shared.instrument.clone();
         let result = shared.gate.on_market_data(&instrument, mark, timestamp);
         Self::record(&mut shared, "market data", result);
     }
 
     fn on_order_event(&mut self, event: &OrderEvent) -> MMResult<()> {
-        let mut shared = self.account.lock();
+        let mut shared = self.account.lock_checked()?;
         // A fill with an unsupported side is unknown exposure, whether or
         // not the gate saw the order: latch the fault and fail, booking
         // nothing.
@@ -385,7 +418,7 @@ pub struct MarginGateAccountant {
 
 impl FillAccountant for MarginGateAccountant {
     fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
-        let shared = self.account.lock();
+        let shared = self.account.lock_checked()?;
         let id = ExecutionId::new(format!("sim-{}", fill.execution_id))
             .map_err(|e| MMError::InvalidPositionUpdate(format!("execution id: {e}")))?;
         if shared.gate.ledger().execution_cashflow(&id).is_none() {
@@ -410,24 +443,26 @@ impl FillAccountant for MarginGateAccountant {
         let total = ledger
             .balance(&shared.quote)
             .map_or(Decimal::ZERO, |b| b.total);
-        let deposits: Decimal = ledger
-            .transfers()
-            .filter(|t| t.asset == shared.quote)
-            .map(|t| match t.kind {
-                TransferKind::Deposit => t.amount,
-                TransferKind::Withdrawal => -t.amount,
-            })
-            .sum();
+        // A snapshot cannot fail, so the sums saturate at the `Decimal`
+        // bounds instead of panicking.
+        let deposits =
+            ledger
+                .transfers()
+                .filter(|t| t.asset == shared.quote)
+                .fold(Decimal::ZERO, |acc, t| match t.kind {
+                    TransferKind::Deposit => acc.saturating_add(t.amount),
+                    TransferKind::Withdrawal => acc.saturating_sub(t.amount),
+                });
         AccountingSnapshot {
             position: position
                 .as_ref()
                 .map_or(Decimal::ZERO, |p| p.quantity)
                 .saturating_sub(base_fees),
             average_entry_price: position.as_ref().and_then(|p| p.average_price()),
-            cash_flow: total - deposits + quote_fees,
+            cash_flow: total.saturating_sub(deposits).saturating_add(quote_fees),
             fees: quote_fees,
             base_fees,
-            fills_posted: ledger.journal().len() as u64,
+            fills_posted: crate::types::decimal::saturating_u64(ledger.journal().len()),
         }
     }
 

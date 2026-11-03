@@ -80,6 +80,7 @@ use crate::risk::pretrade::{
 use crate::strategy::quote::Quote;
 use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
+use rust_decimal_macros::dec;
 
 use super::accounting::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
 use super::data::{HistoricalDataSource, MarketTick};
@@ -185,10 +186,11 @@ impl SimulatedFill {
         self
     }
 
-    /// Returns the notional value (price * quantity).
+    /// Returns the notional value (price * quantity), saturating at the
+    /// `Decimal` bounds instead of panicking.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.quantity
+        self.price.saturating_mul(self.quantity)
     }
 }
 
@@ -228,13 +230,17 @@ impl SlippageModel {
     ///
     /// * `price` - The base price
     /// * `volatility` - Current volatility (used for volatility-based model)
+    ///
+    /// The products saturate at the `Decimal` bounds instead of panicking.
     #[must_use]
     pub fn calculate_slippage(&self, price: Decimal, volatility: Decimal) -> Decimal {
         match self {
             SlippageModel::None => Decimal::ZERO,
             SlippageModel::Fixed(amount) => *amount,
-            SlippageModel::Percentage(pct) => price * pct,
-            SlippageModel::VolatilityBased { multiplier } => price * volatility * multiplier,
+            SlippageModel::Percentage(pct) => price.saturating_mul(*pct),
+            SlippageModel::VolatilityBased { multiplier } => {
+                price.saturating_mul(volatility).saturating_mul(*multiplier)
+            }
         }
     }
 }
@@ -428,8 +434,8 @@ impl Default for BacktestConfig {
             initial_capital: Decimal::from(100_000),
             fee_rate: Decimal::ZERO,
             fee_currency: FeeCurrency::Quote,
-            tick_size: Decimal::from_str_exact("0.01").unwrap(),
-            lot_size: Decimal::from_str_exact("0.001").unwrap(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.001),
             slippage: SlippageModel::None,
             default_order_size: Decimal::ONE,
             record_equity_curve: true,
@@ -626,7 +632,10 @@ impl BacktestResult {
         if self.num_trades == 0 {
             Decimal::ZERO
         } else {
-            self.net_pnl / Decimal::from(self.num_trades)
+            // Dividing by a count of at least one cannot overflow.
+            self.net_pnl
+                .checked_div(Decimal::from(self.num_trades))
+                .unwrap_or(Decimal::ZERO)
         }
     }
 
@@ -637,10 +646,19 @@ impl BacktestResult {
     }
 
     /// Returns the return on capital.
+    ///
+    /// A quotient beyond the `Decimal` range saturates to `Decimal::MAX` or
+    /// `Decimal::MIN` with the sign of the PnL.
     #[must_use]
     pub fn return_on_capital(&self, initial_capital: Decimal) -> Decimal {
         if initial_capital > Decimal::ZERO {
-            self.net_pnl / initial_capital
+            self.net_pnl.checked_div(initial_capital).unwrap_or(
+                if self.net_pnl.is_sign_negative() {
+                    Decimal::MIN
+                } else {
+                    Decimal::MAX
+                },
+            )
         } else {
             Decimal::ZERO
         }
@@ -956,7 +974,13 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             self.mark_to(mid_price);
 
             // Track equity
-            let equity = self.config.initial_capital + self.pnl.total - self.total_fees;
+            // The run cannot fail, so money sums saturate at the `Decimal`
+            // bounds instead of panicking.
+            let equity = self
+                .config
+                .initial_capital
+                .saturating_add(self.pnl.total)
+                .saturating_sub(self.total_fees);
             if self.config.record_equity_curve {
                 self.equity_curve.push((tick.timestamp, equity));
             }
@@ -965,13 +989,16 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             if equity > self.peak_equity {
                 self.peak_equity = equity;
             }
-            let drawdown = self.peak_equity - equity;
+            let drawdown = self.peak_equity.saturating_sub(equity);
             if drawdown > self.max_drawdown {
                 self.max_drawdown = drawdown;
             }
 
-            num_ticks += 1;
-            callback(num_ticks as usize, total_ticks);
+            num_ticks = num_ticks.saturating_add(1);
+            callback(
+                usize::try_from(num_ticks).unwrap_or(usize::MAX),
+                total_ticks,
+            );
         }
 
         // Reports still in flight reach the strategy after the data ends.
@@ -980,8 +1007,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         BacktestResult {
             total_pnl: self.pnl.total,
             total_fees: self.total_fees,
-            net_pnl: self.pnl.total - self.total_fees,
-            num_trades: self.trades.len() as u64,
+            net_pnl: self.pnl.total.saturating_sub(self.total_fees),
+            num_trades: crate::types::decimal::saturating_u64(self.trades.len()),
             num_ticks,
             start_time,
             end_time,
@@ -1067,7 +1094,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     fn match_active_orders(&mut self, tick: &MarketTick, now: u64) {
         self.fill_model.on_tick(tick);
         for index in 0..self.orders.len() {
-            let order = &self.orders[index];
+            let Some(order) = self.orders.get(index) else {
+                continue;
+            };
             // Eligibility uses the tick's exchange time, not the clamped
             // clock, so an out of order tick older than the activation
             // can never fill the order.
@@ -1100,7 +1129,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                     filled_quantity,
                     fill_price,
                 } => (
-                    filled_quantity.min(order.quantity) - order.filled,
+                    filled_quantity
+                        .min(order.quantity)
+                        .saturating_sub(order.filled),
                     fill_price,
                 ),
             };
@@ -1125,19 +1156,22 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                         continue;
                     }
                 };
-            if self.orders[index].apply_fill(quantity).is_err() {
+            let Some(order) = self.orders.get_mut(index) else {
+                continue;
+            };
+            if order.apply_fill(quantity).is_err() {
                 continue;
             }
             // Reports and result metrics carry the fee valued in quote.
             let fee = charge.quote_value;
             let stamp = self.clock.stamp();
-            let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
+            let report = ExecutionReport::fill(stamp, order, price, quantity, fee);
             let mut fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
                 .with_execution_id(self.next_execution_id);
             if charge.asset == FeeAsset::Base {
                 fill.base_fee = charge.amount;
             }
-            let (order_id, cumulative) = (self.orders[index].id, self.orders[index].filled);
+            let (order_id, cumulative) = (order.id, order.filled);
             // The policy books the fill first so a ledger it owns is up to
             // date when the accountant reads it.
             self.notify_policy(OrderEvent::Fill {
@@ -1212,7 +1246,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             // A size that rounds to zero is rejected by the venue checks.
             let mut size = round_to_step(requested, self.config.lot_size, false);
             let id = self.next_order_id;
-            self.next_order_id += 1;
+            self.next_order_id = self.next_order_id.saturating_add(1);
             let stamp = self.clock.stamp();
             // After a fault the policy or the fill model could not account
             // for something: no new order is admitted.
@@ -1276,7 +1310,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
     fn schedule(&mut self, effective: u64, action: PendingAction) {
         let key = (effective, self.next_message);
-        self.next_message += 1;
+        self.next_message = self.next_message.saturating_add(1);
         if let PendingAction::Activate(order) = &action {
             self.pending_activations.insert(order.id, key);
         }
@@ -1320,10 +1354,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     fn apply_cancel(&mut self, id: SimOrderId) {
         let stamp = self.clock.stamp();
         if let Some(index) = self.orders.iter().position(|o| o.id == id)
-            && self.orders[index].cancel().is_ok()
+            && let Some(order) = self.orders.get_mut(index)
+            && order.cancel().is_ok()
         {
-            let report =
-                ExecutionReport::status(stamp, &self.orders[index], ExecutionKind::Canceled);
+            let report = ExecutionReport::status(stamp, order, ExecutionKind::Canceled);
             self.orders.remove(index);
             self.emit(report);
             return;
@@ -1416,8 +1450,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             .slippage
             .calculate_slippage(price, Decimal::ZERO);
         match dir {
-            Dir::Buy => price + slippage,
-            Dir::Sell => price - slippage,
+            Dir::Buy => price.saturating_add(slippage),
+            Dir::Sell => price.saturating_sub(slippage),
         }
     }
 
@@ -1431,7 +1465,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         charge: FeeCharge,
     ) {
         let execution_id = self.next_execution_id;
-        self.next_execution_id += 1;
+        self.next_execution_id = self.next_execution_id.saturating_add(1);
         if let Some(accountant) = self.accountant.as_mut() {
             let posted = AccountingFill {
                 execution_id,
@@ -1500,52 +1534,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
     /// Calculates an approximate Sharpe ratio from the equity curve.
     fn calculate_sharpe_ratio(&self) -> Option<Decimal> {
-        if self.equity_curve.len() < 2 {
-            return None;
-        }
-
-        // Calculate returns
-        let returns: Vec<Decimal> = self
-            .equity_curve
-            .windows(2)
-            .filter_map(|w| {
-                if w[0].1 > Decimal::ZERO {
-                    Some((w[1].1 - w[0].1) / w[0].1)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if returns.is_empty() {
-            return None;
-        }
-
-        let n = Decimal::from(returns.len() as u64);
-        let mean: Decimal = returns.iter().sum::<Decimal>() / n;
-
-        // Calculate standard deviation
-        let variance: Decimal = returns
-            .iter()
-            .map(|r| {
-                let diff = *r - mean;
-                diff * diff
-            })
-            .sum::<Decimal>()
-            / n;
-
-        if variance <= Decimal::ZERO {
-            return None;
-        }
-
-        // Approximate sqrt using Newton's method
-        let std_dev = decimal_sqrt(variance)?;
-
-        if std_dev > Decimal::ZERO {
-            Some(mean / std_dev)
-        } else {
-            None
-        }
+        sharpe_ratio(&self.equity_curve)
     }
 
     /// Returns the current state (position and PnL).
@@ -1781,7 +1770,9 @@ fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
         return value;
     }
     // Truncation toward zero; adjust to floor for negative values.
-    let toward_zero = value - remainder;
+    let Some(toward_zero) = value.checked_sub(remainder) else {
+        return value;
+    };
     let down = if remainder < Decimal::ZERO {
         toward_zero.checked_sub(step)
     } else {
@@ -1793,6 +1784,57 @@ fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
         down
     };
     rounded.unwrap_or(value)
+}
+
+/// Approximate Sharpe ratio of an equity curve (mean over standard
+/// deviation of per step returns), or `None` when it is undefined or a
+/// step overflows.
+fn sharpe_ratio(equity_curve: &[(u64, Decimal)]) -> Option<Decimal> {
+    // A window whose previous equity is not positive has no return and is
+    // skipped; a return that overflows makes the whole ratio `None`.
+    let returns: Vec<Decimal> = equity_curve
+        .windows(2)
+        .filter_map(|w| match w {
+            [prev, next] if prev.1 > Decimal::ZERO => Some(
+                next.1
+                    .checked_sub(prev.1)
+                    .and_then(|d| d.checked_div(prev.1)),
+            ),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+
+    if returns.is_empty() {
+        return None;
+    }
+
+    let n = Decimal::from(returns.len());
+    let mean = returns
+        .iter()
+        .try_fold(Decimal::ZERO, |acc, r| acc.checked_add(*r))?
+        .checked_div(n)?;
+
+    // Calculate standard deviation
+    let variance = returns
+        .iter()
+        .try_fold(Decimal::ZERO, |acc, r| {
+            let diff = r.checked_sub(mean)?;
+            acc.checked_add(diff.checked_mul(diff)?)
+        })?
+        .checked_div(n)?;
+
+    if variance <= Decimal::ZERO {
+        return None;
+    }
+
+    // Approximate sqrt using Newton's method
+    let std_dev = decimal_sqrt(variance)?;
+
+    if std_dev > Decimal::ZERO {
+        mean.checked_div(std_dev)
+    } else {
+        None
+    }
 }
 
 /// Approximate square root using Newton's method.
@@ -1808,8 +1850,8 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
     let two = Decimal::TWO;
 
     for _ in 0..20 {
-        let next = (x + n / x) / two;
-        if (next - x).abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+        let next = x.checked_add(n.checked_div(x)?)?.checked_div(two)?;
+        if next.checked_sub(x)?.abs() < dec!(0.0000001) {
             return Some(next);
         }
         x = next;
@@ -1821,6 +1863,25 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sharpe_ratio_overflowing_return_is_none() {
+        let tiny = dec!(0.0000000000000000000000000001);
+        let curve = [(0, dec!(100)), (1, dec!(110)), (2, tiny), (3, Decimal::MAX)];
+        assert_eq!(sharpe_ratio(&curve), None);
+    }
+
+    #[test]
+    fn test_sharpe_ratio_non_positive_previous_equity_is_skipped() {
+        let curve = [
+            (0, dec!(100)),
+            (1, dec!(-5)),
+            (2, dec!(110)),
+            (3, dec!(121)),
+            (4, dec!(120)),
+        ];
+        assert!(sharpe_ratio(&curve).is_some());
+    }
     use crate::backtest::VecDataSource;
     use crate::backtest::{
         MarketImpactFillModel, ProbabilisticFillModel, QueuePositionFillModel, SimLatencyConfig,
@@ -3913,6 +3974,54 @@ mod tests {
             )
             .unwrap();
             MarginAccount::new(gate, pair).unwrap()
+        }
+
+        #[test]
+        fn test_margin_policy_poisoned_account_fails_closed_until_reset() {
+            let account = account(None);
+            let mut policy = account.policy();
+            let mut accountant = account.accountant();
+            let request = PretradeRequest::new(
+                "o-1",
+                Action::Buy,
+                Some(dec!(100)),
+                dec!(1),
+                OrderPurpose::Quote,
+                0,
+            );
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                account.with_gate(|_| panic!("poison the account"))
+            }));
+            assert!(poisoned.is_err());
+
+            assert!(matches!(account.fault(), Some(MMError::LockPoisoned(_))));
+            assert!(policy.check(&request).is_rejected());
+            let event = OrderEvent::Accepted {
+                order_id: "o-1".to_string(),
+            };
+            assert!(matches!(
+                policy.on_order_event(&event),
+                Err(MMError::LockPoisoned(_))
+            ));
+            let fill = AccountingFill {
+                execution_id: 1,
+                order_id: 1,
+                side: Action::Buy,
+                price: dec!(100),
+                quantity: dec!(1),
+                cumulative_quantity: dec!(1),
+                fee: Decimal::ZERO,
+                fee_asset: crate::types::fee::FeeAsset::Quote,
+                timestamp: 0,
+            };
+            assert!(matches!(
+                accountant.post_fill(&fill),
+                Err(MMError::LockPoisoned(_))
+            ));
+
+            policy.reset();
+            assert!(account.fault().is_none());
+            assert!(!policy.check(&request).is_rejected());
         }
 
         #[test]

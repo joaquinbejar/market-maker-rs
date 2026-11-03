@@ -23,7 +23,8 @@ async fn main() {
         fee_currency: "USD".to_string(),
     };
 
-    let connector = OrderBookConnector::with_config("BTC-USD", config);
+    let connector =
+        OrderBookConnector::with_config("BTC-USD", config).expect("valid connector precision");
 
     println!("Connector Configuration:");
     println!("  Symbol: BTC-USD");
@@ -33,8 +34,12 @@ async fn main() {
     println!();
 
     // Set initial balance
-    connector.set_balance("USD", dec!(100000.0));
-    connector.set_balance("BTC", dec!(10.0));
+    connector
+        .set_balance("USD", dec!(100000.0))
+        .expect("fresh connector lock");
+    connector
+        .set_balance("BTC", dec!(10.0))
+        .expect("fresh connector lock");
 
     println!("Initial Balances:");
     let usd_balance = connector

@@ -26,6 +26,7 @@
 //! ```
 
 use async_trait::async_trait;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,6 +76,11 @@ pub struct MockConfig {
     pub spread: Decimal,
 }
 
+/// Maps a poisoned lock to [`MMError::LockPoisoned`].
+fn poisoned<T>(_: std::sync::PoisonError<T>) -> MMError {
+    MMError::LockPoisoned("mock connector".to_string())
+}
+
 impl Default for MockConfig {
     fn default() -> Self {
         let mut balances = HashMap::new();
@@ -87,7 +93,7 @@ impl Default for MockConfig {
             initial_balances: balances,
             default_depth: 10,
             base_price: Decimal::from(50_000),
-            spread: Decimal::from_str_exact("0.001").unwrap(),
+            spread: dec!(0.001),
         }
     }
 }
@@ -226,9 +232,13 @@ impl MockExchangeConnector {
     }
 
     /// Sets the balance for an asset.
-    pub fn set_balance(&self, asset: &str, balance: Decimal) {
-        let mut balances = self.balances.write().unwrap();
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn set_balance(&self, asset: &str, balance: Decimal) -> MMResult<()> {
+        let mut balances = self.balances.write().map_err(poisoned)?;
         balances.insert(asset.to_string(), balance);
+        Ok(())
     }
 
     /// Generates a new unique order ID.
@@ -251,8 +261,10 @@ impl MockExchangeConnector {
         if self.config.failure_rate > 0.0 {
             // Simple deterministic "random" based on order counter
             let counter = self.order_counter.load(Ordering::SeqCst);
-            let threshold = (self.config.failure_rate * 100.0) as u64;
-            counter % 100 < threshold
+            // `bucket < trunc(rate * 100)` is `bucket + 1 <= rate * 100`
+            // for an integer bucket, without a float to int cast.
+            let bucket = u8::try_from(counter % 100).unwrap_or(u8::MAX);
+            f64::from(bucket) + 1.0 <= self.config.failure_rate * 100.0
         } else {
             false
         }
@@ -266,21 +278,19 @@ impl MockExchangeConnector {
         let mut bids = Vec::with_capacity(depth);
         let mut asks = Vec::with_capacity(depth);
 
-        let tick_size = base_price * Decimal::from_str_exact("0.0001").unwrap();
+        let tick_size = base_price * dec!(0.0001);
 
         for i in 0..depth {
             let offset = tick_size * Decimal::from(i);
 
             // Bid prices descending from mid - half_spread
             let bid_price = base_price - half_spread - offset;
-            let bid_qty =
-                Decimal::from(1) + Decimal::from(i) * Decimal::from_str_exact("0.5").unwrap();
+            let bid_qty = Decimal::from(1) + Decimal::from(i) * dec!(0.5);
             bids.push(BookLevel::new(bid_price, bid_qty));
 
             // Ask prices ascending from mid + half_spread
             let ask_price = base_price + half_spread + offset;
-            let ask_qty =
-                Decimal::from(1) + Decimal::from(i) * Decimal::from_str_exact("0.5").unwrap();
+            let ask_qty = Decimal::from(1) + Decimal::from(i) * dec!(0.5);
             asks.push(BookLevel::new(ask_price, ask_qty));
         }
 
@@ -310,17 +320,21 @@ impl MockExchangeConnector {
     }
 
     /// Gets the number of open orders.
-    #[must_use]
-    pub fn open_order_count(&self) -> usize {
-        let orders = self.orders.read().unwrap();
-        orders.values().filter(|o| o.status.is_open()).count()
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn open_order_count(&self) -> MMResult<usize> {
+        let orders = self.orders.read().map_err(poisoned)?;
+        Ok(orders.values().filter(|o| o.status.is_open()).count())
     }
 
     /// Gets all order IDs.
-    #[must_use]
-    pub fn all_order_ids(&self) -> Vec<OrderId> {
-        let orders = self.orders.read().unwrap();
-        orders.values().map(|o| o.order_id.clone()).collect()
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn all_order_ids(&self) -> MMResult<Vec<OrderId>> {
+        let orders = self.orders.read().map_err(poisoned)?;
+        Ok(orders.values().map(|o| o.order_id.clone()).collect())
     }
 }
 
@@ -357,7 +371,7 @@ impl ExchangeConnector for MockExchangeConnector {
         };
 
         {
-            let mut orders = self.orders.write().unwrap();
+            let mut orders = self.orders.write().map_err(poisoned)?;
             orders.insert(order_id.as_str().to_string(), state);
         }
 
@@ -378,7 +392,7 @@ impl ExchangeConnector for MockExchangeConnector {
             ));
         }
 
-        let mut orders = self.orders.write().unwrap();
+        let mut orders = self.orders.write().map_err(poisoned)?;
         let state = orders
             .get_mut(order_id.as_str())
             .ok_or_else(|| MMError::InvalidMarketState(format!("order not found: {}", order_id)))?;
@@ -414,7 +428,7 @@ impl ExchangeConnector for MockExchangeConnector {
 
         // Get the original request
         let original_request = {
-            let orders = self.orders.read().unwrap();
+            let orders = self.orders.read().map_err(poisoned)?;
             let state = orders.get(order_id.as_str()).ok_or_else(|| {
                 MMError::InvalidMarketState(format!("order not found: {}", order_id))
             })?;
@@ -440,7 +454,7 @@ impl ExchangeConnector for MockExchangeConnector {
     async fn get_order_status(&self, order_id: &OrderId) -> MMResult<OrderResponse> {
         self.simulate_latency().await;
 
-        let orders = self.orders.read().unwrap();
+        let orders = self.orders.read().map_err(poisoned)?;
         let state = orders
             .get(order_id.as_str())
             .ok_or_else(|| MMError::InvalidMarketState(format!("order not found: {}", order_id)))?;
@@ -456,7 +470,7 @@ impl ExchangeConnector for MockExchangeConnector {
     async fn get_open_orders(&self, symbol: &str) -> MMResult<Vec<OrderResponse>> {
         self.simulate_latency().await;
 
-        let orders = self.orders.read().unwrap();
+        let orders = self.orders.read().map_err(poisoned)?;
         let open_orders: Vec<OrderResponse> = orders
             .values()
             .filter(|state| state.request.symbol == symbol && state.status.is_open())
@@ -475,7 +489,7 @@ impl ExchangeConnector for MockExchangeConnector {
         self.simulate_latency().await;
 
         let order_ids: Vec<OrderId> = {
-            let orders = self.orders.read().unwrap();
+            let orders = self.orders.read().map_err(poisoned)?;
             orders
                 .values()
                 .filter(|state| state.request.symbol == symbol && state.status.is_open())
@@ -508,7 +522,7 @@ impl ExchangeConnector for MockExchangeConnector {
     async fn get_balance(&self, asset: &str) -> MMResult<Decimal> {
         self.simulate_latency().await;
 
-        let balances = self.balances.read().unwrap();
+        let balances = self.balances.read().map_err(poisoned)?;
         Ok(*balances.get(asset).unwrap_or(&Decimal::ZERO))
     }
 }
@@ -536,10 +550,10 @@ impl MarketDataStream for MockExchangeConnector {
             order_id: OrderId::new("mock-trade"),
             trade_id: format!("trade-{}", self.current_time()),
             price: self.config.base_price,
-            quantity: Decimal::from_str_exact("0.1").unwrap(),
+            quantity: dec!(0.1),
             side: Action::Buy,
             timestamp: self.current_time(),
-            fee: Decimal::from_str_exact("0.001").unwrap(),
+            fee: dec!(0.001),
             fee_currency: "USD".to_string(),
         })
     }
@@ -718,7 +732,7 @@ mod tests {
     async fn test_set_balance() {
         let connector = MockExchangeConnector::with_defaults();
 
-        connector.set_balance("ETH", dec!(100.0));
+        connector.set_balance("ETH", dec!(100.0)).unwrap();
         let balance = connector.get_balance("ETH").await.unwrap();
         assert_eq!(balance, dec!(100.0));
     }
@@ -782,14 +796,14 @@ mod tests {
     async fn test_open_order_count() {
         let connector = MockExchangeConnector::with_defaults();
 
-        assert_eq!(connector.open_order_count(), 0);
+        assert_eq!(connector.open_order_count().unwrap(), 0);
 
         connector
             .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1)))
             .await
             .unwrap();
 
-        assert_eq!(connector.open_order_count(), 1);
+        assert_eq!(connector.open_order_count().unwrap(), 1);
 
         connector
             .submit_order(OrderRequest::market_buy("BTC-USD", dec!(0.1)))
@@ -797,7 +811,7 @@ mod tests {
             .unwrap();
 
         // Market order is filled immediately, so still 1 open
-        assert_eq!(connector.open_order_count(), 1);
+        assert_eq!(connector.open_order_count().unwrap(), 1);
     }
 
     #[tokio::test]

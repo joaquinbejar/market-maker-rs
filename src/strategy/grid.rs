@@ -114,6 +114,13 @@ impl GridConfig {
             ));
         }
 
+        if i32::try_from(levels_per_side).is_err() {
+            return Err(MMError::InvalidConfiguration(format!(
+                "levels_per_side must be at most {}, got {levels_per_side}",
+                i32::MAX
+            )));
+        }
+
         if grid_spacing <= Decimal::ZERO {
             return Err(MMError::InvalidConfiguration(
                 "grid_spacing must be positive".to_string(),
@@ -321,22 +328,27 @@ impl GridStrategy {
     /// ```
     #[must_use]
     pub fn generate_grid(&self, reference_price: Decimal) -> Vec<GridOrder> {
-        let mut orders = Vec::with_capacity((self.config.levels_per_side * 2) as usize);
+        let max_level = self.max_level();
+        let mut orders = Vec::with_capacity(
+            usize::try_from(max_level)
+                .unwrap_or_default()
+                .saturating_mul(2),
+        );
 
         // Generate buy orders (below reference)
-        for level in 1..=self.config.levels_per_side {
-            let price = self.calculate_price(reference_price, -(level as i32));
-            let size = self.calculate_level_size(level as i32);
+        for level in 1..=max_level {
+            let price = self.calculate_price(reference_price, -level);
+            let size = self.calculate_level_size(level);
 
-            orders.push(GridOrder::new(price, size, OrderSide::Buy, -(level as i32)));
+            orders.push(GridOrder::new(price, size, OrderSide::Buy, -level));
         }
 
         // Generate sell orders (above reference)
-        for level in 1..=self.config.levels_per_side {
-            let price = self.calculate_price(reference_price, level as i32);
-            let size = self.calculate_level_size(level as i32);
+        for level in 1..=max_level {
+            let price = self.calculate_price(reference_price, level);
+            let size = self.calculate_level_size(level);
 
-            orders.push(GridOrder::new(price, size, OrderSide::Sell, level as i32));
+            orders.push(GridOrder::new(price, size, OrderSide::Sell, level));
         }
 
         // Sort by price (lowest to highest)
@@ -488,9 +500,17 @@ impl GridStrategy {
     /// Tuple of (lowest_price, highest_price).
     #[must_use]
     pub fn price_range(&self, reference_price: Decimal) -> (Decimal, Decimal) {
-        let lowest = self.calculate_price(reference_price, -(self.config.levels_per_side as i32));
-        let highest = self.calculate_price(reference_price, self.config.levels_per_side as i32);
+        let max_level = self.max_level();
+        let lowest = self.calculate_price(reference_price, -max_level);
+        let highest = self.calculate_price(reference_price, max_level);
         (lowest, highest)
+    }
+
+    /// Returns `levels_per_side` as a signed level index, clamped to
+    /// `i32::MAX` (the public config field can bypass `GridConfig::new`).
+    #[inline]
+    fn max_level(&self) -> i32 {
+        i32::try_from(self.config.levels_per_side).unwrap_or(i32::MAX)
     }
 
     /// Calculates the maximum notional exposure if all orders fill.
@@ -508,6 +528,12 @@ impl GridStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_grid_config_new_levels_above_i32_max_returns_err() {
+        let result = GridConfig::new(u32::MAX, dec!(0.01), dec!(1.0), dec!(100.0));
+        assert!(matches!(result, Err(MMError::InvalidConfiguration(_))));
+    }
     use crate::dec;
 
     #[test]

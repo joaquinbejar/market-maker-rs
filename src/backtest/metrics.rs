@@ -46,7 +46,10 @@
 
 use crate::Decimal;
 use crate::execution::Action;
+use crate::types::decimal::saturating_u64;
 use crate::types::error::{MMError, MMResult};
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal_macros::dec;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -438,10 +441,9 @@ impl MetricsCalculator {
         };
 
         // Calculate time span for annualization
-        let time_span_ms = if equity_curve.len() >= 2 {
-            equity_curve.last().unwrap().timestamp - equity_curve.first().unwrap().timestamp
-        } else {
-            0
+        let time_span_ms = match (equity_curve.first(), equity_curve.last()) {
+            (Some(first), Some(last)) => last.timestamp.saturating_sub(first.timestamp),
+            _ => 0,
         };
         let years = self.ms_to_years(time_span_ms);
 
@@ -452,8 +454,8 @@ impl MetricsCalculator {
         // Calculate risk metrics
         let volatility = self.calculate_volatility(&returns);
         let downside_volatility = self.calculate_downside_volatility(&returns);
-        let var_95 = self.var(&returns, Decimal::from_str_exact("0.95").unwrap());
-        let var_99 = self.var(&returns, Decimal::from_str_exact("0.99").unwrap());
+        let var_95 = self.var(&returns, dec!(0.95));
+        let var_99 = self.var(&returns, dec!(0.99));
 
         // Calculate risk-adjusted metrics
         let sharpe = self.sharpe_ratio(&returns);
@@ -500,12 +502,11 @@ impl MetricsCalculator {
 
         equity_curve
             .windows(2)
-            .filter_map(|w| {
-                if w[0].equity != Decimal::ZERO {
-                    Some((w[1].equity - w[0].equity) / w[0].equity)
-                } else {
-                    None
+            .filter_map(|w| match w {
+                [prev, next] if prev.equity != Decimal::ZERO => {
+                    Some((next.equity - prev.equity) / prev.equity)
                 }
+                _ => None,
             })
             .collect()
     }
@@ -563,20 +564,18 @@ impl MetricsCalculator {
     /// Returns (max_drawdown, duration_ms).
     #[must_use]
     pub fn max_drawdown(&self, equity_curve: &[EquityPoint]) -> (Decimal, u64) {
-        if equity_curve.is_empty() {
+        let Some(first) = equity_curve.first() else {
             return (Decimal::ZERO, 0);
-        }
+        };
 
-        let mut peak = equity_curve[0].equity;
-        let _peak_time = equity_curve[0].timestamp;
+        let mut peak = first.equity;
         let mut max_dd = Decimal::ZERO;
         let mut max_dd_duration: u64 = 0;
-        let mut current_dd_start = equity_curve[0].timestamp;
+        let mut current_dd_start = first.timestamp;
 
         for point in equity_curve {
             if point.equity > peak {
                 peak = point.equity;
-                // peak_time = point.timestamp;
                 current_dd_start = point.timestamp;
             }
 
@@ -584,7 +583,7 @@ impl MetricsCalculator {
                 let dd = (peak - point.equity) / peak;
                 if dd > max_dd {
                     max_dd = dd;
-                    max_dd_duration = point.timestamp - current_dd_start;
+                    max_dd_duration = point.timestamp.saturating_sub(current_dd_start);
                 }
             }
         }
@@ -609,14 +608,15 @@ impl MetricsCalculator {
 
         // VaR is the loss at the (1 - confidence) percentile
         let percentile = Decimal::ONE - confidence;
-        let index = (percentile * Decimal::from(sorted.len() - 1))
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(0.0) as usize;
-        let index = index.min(sorted.len() - 1);
+        let last = sorted.len().saturating_sub(1);
+        // Truncates toward zero and clamps to the series, like a
+        // saturating float cast would.
+        let raw = (percentile * Decimal::from(last)).trunc();
+        let fallback = if raw.is_sign_negative() { 0 } else { last };
+        let index = raw.to_usize().unwrap_or(fallback).min(last);
 
         // Return as positive number (loss)
-        -sorted[index]
+        sorted.get(index).map_or(Decimal::ZERO, |worst| -*worst)
     }
 
     /// Calculates profit factor.
@@ -718,7 +718,7 @@ impl MetricsCalculator {
     }
 
     fn calculate_trading_metrics(&self, trades: &[TradeRecord]) -> PerformanceMetrics {
-        let total_trades = trades.len() as u64;
+        let total_trades = saturating_u64(trades.len());
 
         if total_trades == 0 {
             return PerformanceMetrics::default();
@@ -727,8 +727,8 @@ impl MetricsCalculator {
         let winners: Vec<&TradeRecord> = trades.iter().filter(|t| t.is_winner()).collect();
         let losers: Vec<&TradeRecord> = trades.iter().filter(|t| t.is_loser()).collect();
 
-        let winning_trades = winners.len() as u64;
-        let losing_trades = losers.len() as u64;
+        let winning_trades = saturating_u64(winners.len());
+        let losing_trades = saturating_u64(losers.len());
 
         let win_rate = Decimal::from(winning_trades) / Decimal::from(total_trades);
 
@@ -848,7 +848,7 @@ fn decimal_sqrt(n: Decimal) -> Decimal {
 
     for _ in 0..20 {
         let next = (x + n / x) / two;
-        if (next - x).abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+        if (next - x).abs() < dec!(0.0000001) {
             return next;
         }
         x = next;
@@ -888,7 +888,7 @@ fn decimal_exp(x: Decimal) -> Decimal {
     for n in 1..30 {
         term *= x / Decimal::from(n);
         result += term;
-        if term.abs() < Decimal::from_str_exact("0.0000001").unwrap() {
+        if term.abs() < dec!(0.0000001) {
             break;
         }
     }
@@ -1115,6 +1115,17 @@ mod tests {
         let var_95 = calculator.var(&returns, dec!(0.95));
         // VaR should be positive (representing loss)
         assert!(var_95 > Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_var_out_of_range_confidence_clamps_to_series() {
+        let calculator = MetricsCalculator::with_defaults();
+        let returns = vec![dec!(-0.05), dec!(0.01), dec!(0.05)];
+
+        // Confidence above 1: negative percentile clamps to the worst return.
+        assert_eq!(calculator.var(&returns, dec!(1.5)), dec!(0.05));
+        // Negative confidence: percentile above 1 clamps to the best return.
+        assert_eq!(calculator.var(&returns, dec!(-5)), dec!(-0.05));
     }
 
     #[test]

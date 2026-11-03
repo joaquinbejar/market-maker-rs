@@ -80,8 +80,12 @@ impl InventoryPosition {
     /// assert_eq!(position.quantity, dec!(15.0));
     /// // Weighted average: (10*100 + 5*102) / 15 = 100.666...
     /// ```
+    ///
+    /// This method cannot return an error, so its arithmetic saturates at
+    /// the `Decimal` bounds instead of panicking; values that large are far
+    /// outside any real position.
     pub fn update_fill(&mut self, fill_quantity: Decimal, fill_price: Decimal, timestamp: u64) {
-        let new_quantity = self.quantity + fill_quantity;
+        let new_quantity = self.quantity.saturating_add(fill_quantity);
 
         // If crossing from long to short or vice versa, reset avg price
         if (self.quantity > Decimal::ZERO && new_quantity < Decimal::ZERO)
@@ -91,8 +95,23 @@ impl InventoryPosition {
         }
         // If increasing position, calculate weighted average
         else if new_quantity.abs() > self.quantity.abs() {
-            let total_cost = self.quantity * self.avg_entry_price + fill_quantity * fill_price;
-            self.avg_entry_price = total_cost / new_quantity;
+            // avg + (price - avg) * fill / new: no intermediate grows past
+            // the inputs, unlike the total cost. `new_quantity` is non zero
+            // here (its magnitude grew), so only an overflow can fail.
+            let old_avg = self.avg_entry_price;
+            let weighted = fill_price.checked_sub(old_avg).and_then(|diff| {
+                diff.checked_mul(fill_quantity)
+                    .and_then(|v| v.checked_div(new_quantity))
+                    // `fill / new` is in (0, 1] here, so this form cannot
+                    // overflow where the product above did.
+                    .or_else(|| diff.checked_mul(fill_quantity.checked_div(new_quantity)?))
+            });
+            self.avg_entry_price = match weighted.and_then(|w| old_avg.checked_add(w)) {
+                Some(avg) => avg,
+                // Last resort: the price difference itself overflows, so the
+                // average saturates toward the fill price.
+                None => old_avg.saturating_add(fill_price.saturating_sub(old_avg)),
+            };
         }
         // If reducing position, keep same avg price
         // (realized PnL is calculated separately)
@@ -131,12 +150,15 @@ impl InventoryPosition {
     /// // If price falls to 95, unrealized PnL = 10 * (95 - 100) = -50
     /// assert_eq!(position.unrealized_pnl(dec!(95.0)), dec!(-50.0));
     /// ```
+    ///
+    /// The arithmetic saturates at the `Decimal` bounds instead of panicking.
     #[must_use]
     pub fn unrealized_pnl(&self, current_price: Decimal) -> Decimal {
         if self.is_flat() {
             return Decimal::ZERO;
         }
-        self.quantity * (current_price - self.avg_entry_price)
+        self.quantity
+            .saturating_mul(current_price.saturating_sub(self.avg_entry_price))
     }
 }
 
@@ -149,6 +171,17 @@ impl Default for InventoryPosition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_fill_huge_values_average_without_overflow() {
+        // quantity * price overflows the total cost form, but the average
+        // of two fills at the same huge price is that price.
+        let mut position = InventoryPosition::new();
+        position.update_fill(dec!(1_000_000_000_000), Decimal::MAX / dec!(2), 1);
+        position.update_fill(dec!(1_000_000_000_000), Decimal::MAX / dec!(2), 2);
+        assert_eq!(position.avg_entry_price, Decimal::MAX / dec!(2));
+        assert_eq!(position.quantity, dec!(2_000_000_000_000));
+    }
     use crate::dec;
 
     #[test]

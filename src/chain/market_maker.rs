@@ -349,11 +349,9 @@ impl ChainMarketMaker {
         };
 
         // Calculate half spread
-        let half_spread = (Decimal::from(theo_price) * clamped_spread_bps / dec!(20000.0))
-            .to_string()
-            .parse::<f64>()
-            .map(|f| f as u64)
-            .unwrap_or(1);
+        let half_spread = crate::types::decimal::decimal_to_u64_saturating(
+            Decimal::from(theo_price) * clamped_spread_bps / dec!(20000.0),
+        );
 
         let bid_price = theo_price.saturating_sub(half_spread);
         let ask_price = theo_price.saturating_add(half_spread);

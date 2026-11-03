@@ -14,6 +14,42 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- No panics in library code (#135). New `MMError::LockPoisoned`; these now
+  return `MMResult` instead of panicking on a poisoned lock:
+  `ThreadSafeOrderManager::{read, write, get_stats, open_order_count,
+  check_timeouts, cleanup}`, `CollectingAlertHandler::{alerts, count, clear}`,
+  `MockExchangeConnector::{set_balance, open_order_count, all_order_ids}` and
+  `OrderBookConnector::set_balance`. `AlertHandler::handle` returns
+  `MMResult<()>`; `AlertManager::{alert, alert_with_message}` deliver to every
+  handler and return the first handler error. `GridConfig::new` rejects
+  `levels_per_side > i32::MAX`; `AccountingFill::cash_flow` and
+  `LimitsPolicy::live_quantity` return `NumericalError` on overflow; position,
+  PnL, notional and slippage values saturate at the `Decimal` bounds.
+  `OrderBookConnector::{with_config, from_orderbook}` return `MMResult<Self>`
+  and reject a price or quantity precision above the new `MAX_PRECISION`
+  (19), also checked by the new `OrderBookConnectorConfig::validate`; orders
+  with a non positive price, a negative quantity or an out of range value
+  return `NumericalError` instead of being saturated. `LiveMetrics::{
+  update_position, update_pnl, update_realized_pnl, update_unrealized_pnl,
+  add_realized_pnl, reset}` return `MMResult<()>`, `LiveMetrics::{
+  get_position, get_realized_pnl, get_unrealized_pnl}` return
+  `MMResult<Decimal>`, `LiveMetrics::snapshot` returns
+  `MMResult<MetricsSnapshot>` and `MetricsBridge::sync` returns
+  `MMResult<()>`: a poisoned lock is `LockPoisoned` and a PnL overflow is
+  `NumericalError`. A poisoned `MarginAccount` rejects orders and returns
+  `LockPoisoned` from event and fill booking until reset, and `fault()`
+  reports it. `VolatilityEstimator::{calculate_simple, calculate_ewma}`
+  need at least 3 prices; `RiskAversionCalibrator::calibrate_from_history`
+  rejects an empty history. `RiskLimits::check_order` and
+  `ManagedOrder::record_fill` return `NumericalError` on overflow;
+  `MarketImpactFillModel` fills return `NumericalError` when the impact
+  overflows. With `max_position` not positive, `RiskLimits::scale_order_size`
+  returns zero and `position_utilization` returns `Decimal::MAX`.
+  `AlertManager` deduplicates per handler: a handler that delivered an
+  alert type inside the window is skipped and one that failed is retried.
+  `OrderBookConnector` accepts every raw price that converts exactly to a
+  `Decimal` and rejects one that would be rounded, and holds the order mapping lock across book updates.
+
 - Backtest fees can be charged in the base asset or a third asset:
   `BacktestConfig::fee_currency` (`FeeCurrency::{Quote, Base, Other}`,
   default `Quote`, unchanged behaviour). `FeeAsset` moved to

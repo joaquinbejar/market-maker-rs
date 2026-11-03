@@ -161,22 +161,26 @@ impl ManagedOrder {
     #[must_use]
     pub fn fill_ratio(&self) -> Decimal {
         if self.original_quantity > Decimal::ZERO {
-            self.filled_quantity / self.original_quantity
+            self.filled_quantity
+                .checked_div(self.original_quantity)
+                .unwrap_or(Decimal::ZERO)
         } else {
             Decimal::ZERO
         }
     }
 
-    /// Returns the notional value of the original order.
+    /// Returns the notional value of the original order, saturating at the
+    /// `Decimal` bounds.
     #[must_use]
     pub fn original_notional(&self) -> Decimal {
-        self.original_price * self.original_quantity
+        self.original_price.saturating_mul(self.original_quantity)
     }
 
-    /// Returns the notional value of filled quantity.
+    /// Returns the notional value of filled quantity, saturating at the
+    /// `Decimal` bounds.
     #[must_use]
     pub fn filled_notional(&self) -> Decimal {
-        self.average_fill_price * self.filled_quantity
+        self.average_fill_price.saturating_mul(self.filled_quantity)
     }
 
     /// Returns the age of the order in milliseconds.
@@ -190,21 +194,41 @@ impl ManagedOrder {
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`] if the fill's side or the
-    /// order's side is neither buy nor sell; the order is unchanged.
+    /// order's side is neither buy nor sell, or [`MMError::NumericalError`]
+    /// if the filled quantity, remaining quantity or average price
+    /// overflows; the order is unchanged in both cases.
     pub fn record_fill(&mut self, fill: &Fill, timestamp: u64) -> MMResult<()> {
         Dir::try_from(self.side)?;
         Dir::try_from(fill.side)?;
-        let new_filled = self.filled_quantity + fill.quantity;
+        let overflow = |what: &str| {
+            MMError::NumericalError(format!(
+                "fill of {} at {} overflows the {what}",
+                fill.quantity, fill.price
+            ))
+        };
+        let new_filled = self
+            .filled_quantity
+            .checked_add(fill.quantity)
+            .ok_or_else(|| overflow("filled quantity"))?;
 
         // Calculate new VWAP
-        if new_filled > Decimal::ZERO {
-            let old_value = self.average_fill_price * self.filled_quantity;
-            let new_value = fill.price * fill.quantity;
-            self.average_fill_price = (old_value + new_value) / new_filled;
-        }
+        let average_fill_price = if new_filled > Decimal::ZERO {
+            self.average_fill_price
+                .checked_mul(self.filled_quantity)
+                .and_then(|old| old.checked_add(fill.price.checked_mul(fill.quantity)?))
+                .and_then(|total| total.checked_div(new_filled))
+                .ok_or_else(|| overflow("average price"))?
+        } else {
+            self.average_fill_price
+        };
+        let remaining_quantity = self
+            .original_quantity
+            .checked_sub(new_filled)
+            .ok_or_else(|| overflow("remaining quantity"))?;
 
+        self.average_fill_price = average_fill_price;
         self.filled_quantity = new_filled;
-        self.remaining_quantity = self.original_quantity - new_filled;
+        self.remaining_quantity = remaining_quantity;
         self.updated_at = timestamp;
         self.fills.push(fill.clone());
 
@@ -713,17 +737,25 @@ impl OrderManager {
         let mut stats = OrderManagerStats::default();
 
         for order in self.orders.values() {
-            stats.total_orders += 1;
-            stats.total_fills += order.fills.len();
+            stats.total_orders = stats.total_orders.saturating_add(1);
+            stats.total_fills = stats.total_fills.saturating_add(order.fills.len());
 
             match &order.status {
-                OrderStatus::Pending => stats.pending_orders += 1,
-                OrderStatus::Open { .. } | OrderStatus::PartiallyFilled { .. } => {
-                    stats.open_orders += 1
+                OrderStatus::Pending => {
+                    stats.pending_orders = stats.pending_orders.saturating_add(1)
                 }
-                OrderStatus::Filled { .. } => stats.filled_orders += 1,
-                OrderStatus::Cancelled { .. } => stats.cancelled_orders += 1,
-                OrderStatus::Rejected { .. } => stats.rejected_orders += 1,
+                OrderStatus::Open { .. } | OrderStatus::PartiallyFilled { .. } => {
+                    stats.open_orders = stats.open_orders.saturating_add(1)
+                }
+                OrderStatus::Filled { .. } => {
+                    stats.filled_orders = stats.filled_orders.saturating_add(1)
+                }
+                OrderStatus::Cancelled { .. } => {
+                    stats.cancelled_orders = stats.cancelled_orders.saturating_add(1)
+                }
+                OrderStatus::Rejected { .. } => {
+                    stats.rejected_orders = stats.rejected_orders.saturating_add(1)
+                }
             }
         }
 
@@ -799,28 +831,34 @@ impl ThreadSafeOrderManager {
 
     /// Executes a read operation on the order manager.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the lock is poisoned.
-    pub fn read<F, R>(&self, f: F) -> R
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn read<F, R>(&self, f: F) -> MMResult<R>
     where
         F: FnOnce(&OrderManager) -> R,
     {
-        let guard = self.inner.read().unwrap();
-        f(&guard)
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| MMError::LockPoisoned("order manager".to_string()))?;
+        Ok(f(&guard))
     }
 
     /// Executes a write operation on the order manager.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the lock is poisoned.
-    pub fn write<F, R>(&self, f: F) -> R
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn write<F, R>(&self, f: F) -> MMResult<R>
     where
         F: FnOnce(&mut OrderManager) -> R,
     {
-        let mut guard = self.inner.write().unwrap();
-        f(&mut guard)
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| MMError::LockPoisoned("order manager".to_string()))?;
+        Ok(f(&mut guard))
     }
 
     /// Registers a new order.
@@ -830,7 +868,7 @@ impl ThreadSafeOrderManager {
         client_order_id: String,
         timestamp: u64,
     ) -> MMResult<()> {
-        self.write(|m| m.register_order(request, client_order_id, timestamp))
+        self.write(|m| m.register_order(request, client_order_id, timestamp))?
     }
 
     /// Updates an order with exchange response.
@@ -840,7 +878,7 @@ impl ThreadSafeOrderManager {
         response: &OrderResponse,
         timestamp: u64,
     ) -> MMResult<()> {
-        self.write(|m| m.update_order(client_order_id, response, timestamp))
+        self.write(|m| m.update_order(client_order_id, response, timestamp))?
     }
 
     /// Records a fill.
@@ -849,18 +887,22 @@ impl ThreadSafeOrderManager {
     ///
     /// Returns the [`OrderManager::record_fill`] errors.
     pub fn record_fill(&self, fill: &Fill, timestamp: u64) -> MMResult<()> {
-        self.write(|m| m.record_fill(fill, timestamp))
+        self.write(|m| m.record_fill(fill, timestamp))?
     }
 
     /// Gets order statistics.
-    #[must_use]
-    pub fn get_stats(&self) -> OrderManagerStats {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn get_stats(&self) -> MMResult<OrderManagerStats> {
         self.read(|m| m.get_stats())
     }
 
     /// Gets the number of open orders.
-    #[must_use]
-    pub fn open_order_count(&self) -> usize {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn open_order_count(&self) -> MMResult<usize> {
         self.read(|m| m.open_order_count())
     }
 
@@ -871,23 +913,28 @@ impl ThreadSafeOrderManager {
     /// Returns [`MMError::UnsupportedAction`] if `side` is neither buy nor
     /// sell.
     pub fn get_open_quantity(&self, symbol: &str, side: Action) -> MMResult<Decimal> {
-        self.read(|m| m.get_open_quantity(symbol, side))
+        self.read(|m| m.get_open_quantity(symbol, side))?
     }
 
     /// Checks for timed out orders.
-    #[must_use]
-    pub fn check_timeouts(&self, current_time: u64) -> Vec<String> {
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn check_timeouts(&self, current_time: u64) -> MMResult<Vec<String>> {
         self.read(|m| m.check_timeouts(current_time))
     }
 
     /// Marks an order as cancelled.
     pub fn mark_cancelled(&self, client_order_id: &str, timestamp: u64) -> MMResult<()> {
-        self.write(|m| m.mark_cancelled(client_order_id, timestamp))
+        self.write(|m| m.mark_cancelled(client_order_id, timestamp))?
     }
 
     /// Cleans up old orders.
-    pub fn cleanup(&self, retention_ms: u64, current_time: u64) {
-        self.write(|m| m.cleanup(retention_ms, current_time));
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn cleanup(&self, retention_ms: u64, current_time: u64) -> MMResult<()> {
+        self.write(|m| m.cleanup(retention_ms, current_time))
     }
 }
 
@@ -932,6 +979,26 @@ mod tests {
         assert_eq!(order.filled_quantity, Decimal::ZERO);
         assert_eq!(order.remaining_quantity, dec!(0.1));
         assert_eq!(order.fill_ratio(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_managed_order_record_fill_overflow_returns_err_unchanged() {
+        let mut order = ManagedOrder::new(
+            OrderId::new("12345"),
+            "client-1".to_string(),
+            "BTC-USD".to_string(),
+            Action::Buy,
+            OrderType::Limit,
+            dec!(50000.0),
+            dec!(10.0),
+            1000,
+        );
+        let fill = create_test_fill(&order.order_id, Decimal::MAX, dec!(2));
+        let result = order.record_fill(&fill, 1001);
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
+        assert_eq!(order.filled_quantity, Decimal::ZERO);
+        assert_eq!(order.remaining_quantity, dec!(10.0));
+        assert!(order.fills.is_empty());
     }
 
     #[test]
@@ -1229,9 +1296,9 @@ mod tests {
             .register_order(&request, "client-1".to_string(), 1000)
             .unwrap();
 
-        assert_eq!(manager.open_order_count(), 1);
+        assert_eq!(manager.open_order_count().unwrap(), 1);
 
-        let stats = manager.get_stats();
+        let stats = manager.get_stats().unwrap();
         assert_eq!(stats.total_orders, 1);
         assert_eq!(stats.pending_orders, 1);
     }
@@ -1411,5 +1478,21 @@ mod tests {
             assert_eq!(unchanged.updated_at, 1000);
             assert!(unchanged.fills.is_empty());
         }
+    }
+
+    #[test]
+    fn test_thread_safe_order_manager_poisoned_lock_returns_lock_poisoned() {
+        let manager = ThreadSafeOrderManager::new(OrderManagerConfig::default());
+        let clone = manager.clone();
+        let joined = std::thread::spawn(move || {
+            let _ = clone.write(|_| panic!("poison the lock"));
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(matches!(
+            manager.open_order_count(),
+            Err(MMError::LockPoisoned(_))
+        ));
+        assert!(matches!(manager.get_stats(), Err(MMError::LockPoisoned(_))));
     }
 }

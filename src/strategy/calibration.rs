@@ -49,13 +49,14 @@
 use crate::Decimal;
 use crate::types::decimal::{decimal_ln, decimal_sqrt};
 use crate::types::error::{MMError, MMResult};
+use rust_decimal_macros::dec;
 use std::fmt;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// Natural logarithm of 2, used in half-life calculations.
-const LN_2: &str = "0.6931471805599453";
+const LN_2: Decimal = dec!(0.6931471805599453);
 
 /// Configuration for the calibration process.
 ///
@@ -91,7 +92,7 @@ impl Default for CalibrationConfig {
     fn default() -> Self {
         Self {
             min_samples: 30,
-            confidence_level: Decimal::from_str_exact("0.95").unwrap(),
+            confidence_level: dec!(0.95),
             robust_estimation: true,
         }
     }
@@ -119,7 +120,7 @@ impl CalibrationConfig {
     pub fn quick() -> Self {
         Self {
             min_samples: 10,
-            confidence_level: Decimal::from_str_exact("0.90").unwrap(),
+            confidence_level: dec!(0.90),
             robust_estimation: false,
         }
     }
@@ -129,7 +130,7 @@ impl CalibrationConfig {
     pub fn precise() -> Self {
         Self {
             min_samples: 100,
-            confidence_level: Decimal::from_str_exact("0.99").unwrap(),
+            confidence_level: dec!(0.99),
             robust_estimation: true,
         }
     }
@@ -209,19 +210,19 @@ impl<T: Clone> CalibrationResult<T> {
     /// Returns true if the calibration quality is acceptable (>= 0.5).
     #[must_use]
     pub fn is_acceptable(&self) -> bool {
-        self.quality >= Decimal::from_str_exact("0.5").unwrap()
+        self.quality >= dec!(0.5)
     }
 
     /// Returns true if the calibration quality is good (>= 0.7).
     #[must_use]
     pub fn is_good(&self) -> bool {
-        self.quality >= Decimal::from_str_exact("0.7").unwrap()
+        self.quality >= dec!(0.7)
     }
 
     /// Returns true if the calibration quality is excellent (>= 0.9).
     #[must_use]
     pub fn is_excellent(&self) -> bool {
-        self.quality >= Decimal::from_str_exact("0.9").unwrap()
+        self.quality >= dec!(0.9)
     }
 }
 
@@ -289,11 +290,10 @@ impl RiskAversionCalibrator {
         desired_halflife_ms: u64,
         volatility: Decimal,
     ) -> CalibrationResult<Decimal> {
-        let ln2 = Decimal::from_str_exact(LN_2).unwrap_or(Decimal::ONE);
+        let ln2 = LN_2;
 
         // Convert ms to seconds
-        let halflife_seconds =
-            Decimal::from(desired_halflife_ms) / Decimal::from_str_exact("1000").unwrap();
+        let halflife_seconds = Decimal::from(desired_halflife_ms) / dec!(1000);
 
         // γ = ln(2) / (half_life × σ²)
         let sigma_squared = volatility * volatility;
@@ -305,7 +305,7 @@ impl RiskAversionCalibrator {
         };
 
         // Confidence interval based on volatility uncertainty (±20%)
-        let margin = gamma * Decimal::from_str_exact("0.2").unwrap();
+        let margin = gamma * dec!(0.2);
         let low = gamma - margin;
         let high = gamma + margin;
 
@@ -317,7 +317,7 @@ impl RiskAversionCalibrator {
         if gamma > Decimal::from(100) {
             result.add_note("Very high γ - consider longer half-life");
         }
-        if gamma < Decimal::from_str_exact("0.01").unwrap() {
+        if gamma < dec!(0.01) {
             result.add_note("Very low γ - consider shorter half-life");
         }
 
@@ -344,7 +344,9 @@ impl RiskAversionCalibrator {
         pnl_history: &[(u64, Decimal)],
         volatility: Decimal,
     ) -> MMResult<CalibrationResult<Decimal>> {
-        if inventory_history.len() < self.config.min_samples {
+        // Also guards `min_samples == 0`: the confidence interval divides
+        // by the sample count.
+        if inventory_history.len() < self.config.min_samples.max(1) {
             return Err(MMError::InvalidConfiguration(format!(
                 "Insufficient inventory samples: {} < {}",
                 inventory_history.len(),
@@ -369,9 +371,8 @@ impl RiskAversionCalibrator {
         let observed_halflife_ms = self.estimate_halflife(inventory_history);
 
         // Calculate γ from observed half-life
-        let ln2 = Decimal::from_str_exact(LN_2).unwrap_or(Decimal::ONE);
-        let halflife_seconds =
-            Decimal::from(observed_halflife_ms) / Decimal::from_str_exact("1000").unwrap();
+        let ln2 = LN_2;
+        let halflife_seconds = Decimal::from(observed_halflife_ms) / dec!(1000);
         let sigma_squared = volatility * volatility;
 
         let gamma = if sigma_squared.is_zero() || halflife_seconds.is_zero() {
@@ -386,10 +387,10 @@ impl RiskAversionCalibrator {
         // Confidence interval based on sample size
         let std_error = decimal_sqrt(inv_variance).unwrap_or(Decimal::ONE)
             / decimal_sqrt(Decimal::from(inventories.len())).unwrap_or(Decimal::ONE);
-        let z_score = Decimal::from_str_exact("1.96").unwrap(); // 95% CI
+        let z_score = dec!(1.96); // 95% CI
         let margin = gamma * std_error * z_score;
 
-        let low = (gamma - margin).max(Decimal::from_str_exact("0.001").unwrap());
+        let low = (gamma - margin).max(dec!(0.001));
         let high = gamma + margin;
 
         let mut result =
@@ -405,15 +406,15 @@ impl RiskAversionCalibrator {
     /// Assesses the quality of a γ value.
     fn assess_gamma_quality(&self, gamma: Decimal) -> Decimal {
         // Optimal γ range is typically 0.1 to 10
-        let optimal_low = Decimal::from_str_exact("0.1").unwrap();
+        let optimal_low = dec!(0.1);
         let optimal_high = Decimal::from(10);
 
         if gamma >= optimal_low && gamma <= optimal_high {
-            Decimal::from_str_exact("0.9").unwrap()
-        } else if gamma >= Decimal::from_str_exact("0.01").unwrap() && gamma <= Decimal::from(100) {
-            Decimal::from_str_exact("0.7").unwrap()
+            dec!(0.9)
+        } else if gamma >= dec!(0.01) && gamma <= Decimal::from(100) {
+            dec!(0.7)
         } else {
-            Decimal::from_str_exact("0.4").unwrap()
+            dec!(0.4)
         }
     }
 
@@ -427,21 +428,21 @@ impl RiskAversionCalibrator {
         let pnl_mean = self.mean(&pnls);
 
         // Quality based on profitability and inventory control
-        let mut quality = Decimal::from_str_exact("0.5").unwrap();
+        let mut quality = dec!(0.5);
 
         // Bonus for positive PnL
         if pnl_mean > Decimal::ZERO {
-            quality += Decimal::from_str_exact("0.2").unwrap();
+            quality += dec!(0.2);
         }
 
         // Bonus for low inventory variance
         if inv_variance < Decimal::from(10) {
-            quality += Decimal::from_str_exact("0.2").unwrap();
+            quality += dec!(0.2);
         }
 
         // Bonus for sufficient samples
         if pnl_history.len() >= 100 {
-            quality += Decimal::from_str_exact("0.1").unwrap();
+            quality += dec!(0.1);
         }
 
         quality.min(Decimal::ONE)
@@ -449,15 +450,18 @@ impl RiskAversionCalibrator {
 
     /// Estimates half-life from inventory time series.
     fn estimate_halflife(&self, inventory_history: &[(u64, Decimal)]) -> u64 {
-        if inventory_history.len() < 2 {
+        let Some((first, rest)) = inventory_history.split_first() else {
+            return 300_000; // Default 5 minutes
+        };
+        if rest.is_empty() {
             return 300_000; // Default 5 minutes
         }
 
         // Simple estimation: time for inventory to cross zero
         let mut crossings = Vec::new();
-        let mut last_sign = inventory_history[0].1.is_sign_positive();
+        let mut last_sign = first.1.is_sign_positive();
 
-        for (ts, inv) in inventory_history.iter().skip(1) {
+        for (ts, inv) in rest {
             let current_sign = inv.is_sign_positive();
             if current_sign != last_sign {
                 crossings.push(*ts);
@@ -470,8 +474,12 @@ impl RiskAversionCalibrator {
         }
 
         // Average time between crossings approximates half-life
-        let total_time = crossings.last().unwrap() - crossings.first().unwrap();
-        let avg_crossing_time = total_time / (crossings.len() as u64 - 1);
+        let (Some(first), Some(last)) = (crossings.first(), crossings.last()) else {
+            return 300_000; // Default
+        };
+        let total_time = last.saturating_sub(*first);
+        let intervals = u64::try_from(crossings.len().saturating_sub(1)).unwrap_or(u64::MAX);
+        let avg_crossing_time = total_time.checked_div(intervals).unwrap_or(0);
 
         avg_crossing_time.max(1000) // At least 1 second
     }
@@ -632,14 +640,14 @@ impl OrderIntensityCalibrator {
         let k = -slope;
 
         // Ensure k is positive
-        let k = k.max(Decimal::from_str_exact("0.001").unwrap());
+        let k = k.max(dec!(0.001));
 
         // Confidence interval based on R² and sample size
         let std_error = self.estimate_std_error(&x_values, &y_values, slope, _intercept);
-        let z_score = Decimal::from_str_exact("1.96").unwrap();
+        let z_score = dec!(1.96);
         let margin = std_error * z_score;
 
-        let low = (k - margin).max(Decimal::from_str_exact("0.001").unwrap());
+        let low = (k - margin).max(dec!(0.001));
         let high = k + margin;
 
         // Quality based on R² and sample size
@@ -647,7 +655,7 @@ impl OrderIntensityCalibrator {
 
         let mut result = CalibrationResult::new(k, (low, high), total_count, quality);
 
-        if r_squared < Decimal::from_str_exact("0.5").unwrap() {
+        if r_squared < dec!(0.5) {
             result.add_note("Low R² - relationship may not be log-linear");
         }
 
@@ -694,12 +702,12 @@ impl OrderIntensityCalibrator {
         let mut var_x = Decimal::ZERO;
         let mut var_y = Decimal::ZERO;
 
-        for i in 0..n {
-            let dx = x[i] - x_mean;
-            let dy = y[i] - y_mean;
-            cov_xy += weights[i] * dx * dy;
-            var_x += weights[i] * dx * dx;
-            var_y += weights[i] * dy * dy;
+        for ((&xi, &yi), &wi) in x.iter().zip(y).zip(weights) {
+            let dx = xi - x_mean;
+            let dy = yi - y_mean;
+            cov_xy += wi * dx * dy;
+            var_x += wi * dx * dx;
+            var_y += wi * dy * dy;
         }
 
         if var_x.is_zero() {
@@ -729,14 +737,14 @@ impl OrderIntensityCalibrator {
     ) -> Decimal {
         let n = x.len();
         if n < 3 {
-            return Decimal::from_str_exact("0.1").unwrap();
+            return dec!(0.1);
         }
 
         // Calculate residual sum of squares
         let mut rss = Decimal::ZERO;
-        for i in 0..n {
-            let predicted = intercept + slope * x[i];
-            let residual = y[i] - predicted;
+        for (&xi, &yi) in x.iter().zip(y) {
+            let predicted = intercept + slope * xi;
+            let residual = yi - predicted;
             rss += residual * residual;
         }
 
@@ -745,25 +753,25 @@ impl OrderIntensityCalibrator {
         let x_var: Decimal = x.iter().map(|xi| (*xi - x_mean) * (*xi - x_mean)).sum();
 
         if x_var.is_zero() {
-            return Decimal::from_str_exact("0.1").unwrap();
+            return dec!(0.1);
         }
 
         // Standard error of slope
         let mse = rss / Decimal::from(n - 2);
-        decimal_sqrt(mse / x_var).unwrap_or(Decimal::from_str_exact("0.1").unwrap())
+        decimal_sqrt(mse / x_var).unwrap_or(dec!(0.1))
     }
 
     /// Calculates quality score.
     fn calculate_quality(&self, r_squared: Decimal, sample_size: usize) -> Decimal {
-        let mut quality = r_squared * Decimal::from_str_exact("0.6").unwrap();
+        let mut quality = r_squared * dec!(0.6);
 
         // Bonus for sample size
         if sample_size >= 100 {
-            quality += Decimal::from_str_exact("0.3").unwrap();
+            quality += dec!(0.3);
         } else if sample_size >= 50 {
-            quality += Decimal::from_str_exact("0.2").unwrap();
+            quality += dec!(0.2);
         } else if sample_size >= 30 {
-            quality += Decimal::from_str_exact("0.1").unwrap();
+            quality += dec!(0.1);
         }
 
         quality.min(Decimal::ONE)
@@ -969,20 +977,20 @@ impl VolatilityRegimeDetector {
     pub fn regime_adjustments(&self, regime: VolatilityRegime) -> RegimeAdjustments {
         match regime {
             VolatilityRegime::Low => RegimeAdjustments::new(
-                Decimal::from_str_exact("0.7").unwrap(), // Less aggressive
-                Decimal::from_str_exact("0.8").unwrap(), // Tighter spreads
-                Decimal::from_str_exact("1.2").unwrap(), // Larger positions OK
+                dec!(0.7), // Less aggressive
+                dec!(0.8), // Tighter spreads
+                dec!(1.2), // Larger positions OK
             ),
             VolatilityRegime::Normal => RegimeAdjustments::neutral(),
             VolatilityRegime::High => RegimeAdjustments::new(
-                Decimal::from_str_exact("1.5").unwrap(), // More aggressive inventory control
-                Decimal::from_str_exact("1.5").unwrap(), // Wider spreads
-                Decimal::from_str_exact("0.7").unwrap(), // Smaller positions
+                dec!(1.5), // More aggressive inventory control
+                dec!(1.5), // Wider spreads
+                dec!(0.7), // Smaller positions
             ),
             VolatilityRegime::Extreme => RegimeAdjustments::new(
-                Decimal::from_str_exact("2.0").unwrap(), // Very aggressive
-                Decimal::from_str_exact("2.5").unwrap(), // Much wider spreads
-                Decimal::from_str_exact("0.3").unwrap(), // Minimal positions
+                dec!(2.0), // Very aggressive
+                dec!(2.5), // Much wider spreads
+                dec!(0.3), // Minimal positions
             ),
         }
     }
@@ -1002,7 +1010,7 @@ impl VolatilityRegimeDetector {
 
 impl Default for VolatilityRegimeDetector {
     fn default() -> Self {
-        Self::new(Decimal::from_str_exact("1.5").unwrap(), 3_600_000)
+        Self::new(dec!(1.5), 3_600_000)
     }
 }
 
@@ -1209,6 +1217,13 @@ impl Default for ParameterOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_calibrate_from_history_empty_with_zero_min_samples_returns_err() {
+        let calibrator = RiskAversionCalibrator::new(CalibrationConfig::new(0, dec!(0.95), false));
+        let result = calibrator.calibrate_from_history(&[], &[], dec!(0.2));
+        assert!(matches!(result, Err(MMError::InvalidConfiguration(_))));
+    }
     use crate::dec;
 
     // CalibrationConfig tests

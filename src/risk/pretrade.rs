@@ -330,17 +330,20 @@ impl LimitsPolicy {
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`]
-    /// if `side` is neither buy nor sell.
+    /// if `side` is neither buy nor sell, or [`MMError::NumericalError`]
+    /// if the live quantity overflows.
     pub fn live_quantity(&self, side: Action) -> MMResult<Decimal> {
-        Ok(self.live_quantity_dir(Dir::try_from(side)?))
+        let dir = Dir::try_from(side)?;
+        self.live_quantity_dir(dir)
+            .ok_or_else(|| MMError::NumericalError(format!("live {side:?} quantity overflows")))
     }
 
-    fn live_quantity_dir(&self, dir: Dir) -> Decimal {
+    /// Sum of the live quantities on `dir`; `None` on overflow.
+    fn live_quantity_dir(&self, dir: Dir) -> Option<Decimal> {
         self.live
             .values()
             .filter(|(d, _)| *d == dir)
-            .map(|(_, q)| *q)
-            .sum()
+            .try_fold(Decimal::ZERO, |acc, (_, q)| acc.checked_add(*q))
     }
 
     fn signed(dir: Dir, quantity: Decimal) -> Decimal {
@@ -403,21 +406,29 @@ impl PretradePolicy for LimitsPolicy {
             };
         }
 
-        // Worst case exposure on the order's side before this order.
-        let worst = self.position + Self::signed(dir, self.live_quantity_dir(dir));
-        let mut capacity = request.quantity;
-        let by_position = match dir {
-            Dir::Buy => self.limits.max_position - worst,
-            Dir::Sell => self.limits.max_position + worst,
+        // Worst case exposure on the order's side before this order. An
+        // exposure that cannot be represented is rejected, never approved.
+        let Some(worst) = self
+            .live_quantity_dir(dir)
+            .and_then(|live| self.position.checked_add(Self::signed(dir, live)))
+        else {
+            return PretradeDecision::Rejected {
+                reason: "exposure overflows decimal range".to_string(),
+            };
         };
-        capacity = capacity.min(by_position);
+        let mut capacity = request.quantity;
+        // Room left before a limit on the order's side. Overflow only
+        // happens when the limit is so far away that it cannot bind.
+        let room = |limit: Decimal| match dir {
+            Dir::Buy => limit.checked_sub(worst),
+            Dir::Sell => limit.checked_add(worst),
+        };
+        if let Some(by_position) = room(self.limits.max_position) {
+            capacity = capacity.min(by_position);
+        }
         // An unrepresentable quotient (tiny price) means the notional limit
         // does not bind.
-        if let Some(units) = self.limits.max_notional.checked_div(price) {
-            let by_notional = match dir {
-                Dir::Buy => units - worst,
-                Dir::Sell => units + worst,
-            };
+        if let Some(by_notional) = self.limits.max_notional.checked_div(price).and_then(room) {
             capacity = capacity.min(by_notional);
         }
 
@@ -488,7 +499,7 @@ impl PretradePolicy for LimitsPolicy {
                     .position
                     .saturating_add(Self::signed(dir, *quantity).saturating_sub(base_fee));
                 if let Some((_, remaining)) = self.live.get_mut(order_id) {
-                    *remaining -= *quantity;
+                    *remaining = remaining.saturating_sub(*quantity);
                     if *remaining <= Decimal::ZERO {
                         self.live.remove(order_id);
                     }
@@ -540,6 +551,63 @@ mod tests {
             OrderPurpose::Quote,
             0,
         )
+    }
+
+    fn unbounded_short_policy() -> LimitsPolicy {
+        let limits = RiskLimits::new(Decimal::MAX, Decimal::MAX, dec!(0)).unwrap();
+        let mut policy = LimitsPolicy::new(limits);
+        policy
+            .on_order_event(&OrderEvent::Fill {
+                order_id: "short".to_string(),
+                execution_id: "e0".to_string(),
+                side: Action::Sell,
+                price: dec!(1),
+                quantity: Decimal::MAX,
+                cumulative_quantity: Decimal::MAX,
+                fee: Decimal::ZERO,
+                fee_asset: crate::types::fee::FeeAsset::Quote,
+                timestamp: 0,
+            })
+            .unwrap();
+        policy
+    }
+
+    fn buy_at_one(id: &str, quantity: Decimal) -> PretradeRequest {
+        PretradeRequest::new(
+            id,
+            Action::Buy,
+            Some(dec!(1)),
+            quantity,
+            OrderPurpose::Quote,
+            0,
+        )
+    }
+
+    #[test]
+    fn test_check_room_beyond_decimal_range_accepted() {
+        let mut policy = unbounded_short_policy();
+        assert_eq!(policy.position(), -Decimal::MAX);
+        let decision = policy.check(&buy_at_one("a", Decimal::MAX));
+        assert_eq!(decision, PretradeDecision::Accepted);
+    }
+
+    #[test]
+    fn test_check_live_exposure_overflow_rejected() {
+        let mut policy = unbounded_short_policy();
+        assert_eq!(
+            policy.check(&buy_at_one("a", Decimal::MAX)),
+            PretradeDecision::Accepted
+        );
+        assert_eq!(
+            policy.check(&buy_at_one("b", Decimal::MAX)),
+            PretradeDecision::Accepted
+        );
+        let decision = policy.check(&buy_at_one("c", dec!(1)));
+        assert!(matches!(decision, PretradeDecision::Rejected { .. }));
+        assert!(matches!(
+            policy.live_quantity(Action::Buy),
+            Err(MMError::NumericalError(_))
+        ));
     }
 
     #[test]

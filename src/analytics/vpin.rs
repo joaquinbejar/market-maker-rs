@@ -58,6 +58,7 @@
 //! "Flow Toxicity and Liquidity in a High-Frequency World."
 //! The Review of Financial Studies, 25(5), 1457-1493.
 
+use rust_decimal_macros::dec;
 use std::collections::VecDeque;
 
 use crate::Decimal;
@@ -158,7 +159,7 @@ impl VPINConfig {
     ///
     /// Returns `MMError::InvalidConfiguration` if bucket_volume is not positive.
     pub fn with_defaults(bucket_volume: Decimal) -> MMResult<Self> {
-        Self::new(bucket_volume, 50, Decimal::from_str_exact("0.7").unwrap())
+        Self::new(bucket_volume, 50, dec!(0.7))
     }
 }
 
@@ -429,9 +430,9 @@ impl VPINCalculator {
     pub fn toxicity_level(&self) -> &'static str {
         match self.get_vpin() {
             None => "unknown",
-            Some(vpin) if vpin < Decimal::from_str_exact("0.3").unwrap() => "low",
-            Some(vpin) if vpin < Decimal::from_str_exact("0.5").unwrap() => "moderate",
-            Some(vpin) if vpin < Decimal::from_str_exact("0.7").unwrap() => "elevated",
+            Some(vpin) if vpin < dec!(0.3) => "low",
+            Some(vpin) if vpin < dec!(0.5) => "moderate",
+            Some(vpin) if vpin < dec!(0.7) => "elevated",
             Some(_) => "high",
         }
     }
@@ -531,7 +532,7 @@ fn decimal_sqrt_approx(x: Decimal) -> Decimal {
     }
 
     let mut guess = x / Decimal::from(2);
-    let epsilon = Decimal::from_str_exact("0.0000001").unwrap();
+    let epsilon = dec!(0.0000001);
 
     for _ in 0..20 {
         let new_guess = (guess + x / guess) / Decimal::from(2);

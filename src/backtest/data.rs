@@ -342,26 +342,18 @@ impl VecDataSource {
     /// Returns the time range of the data.
     #[must_use]
     pub fn time_range(&self) -> Option<(u64, u64)> {
-        if self.ticks.is_empty() {
-            None
-        } else {
-            Some((
-                self.ticks.first().unwrap().timestamp,
-                self.ticks.last().unwrap().timestamp,
-            ))
+        match (self.ticks.first(), self.ticks.last()) {
+            (Some(first), Some(last)) => Some((first.timestamp, last.timestamp)),
+            _ => None,
         }
     }
 }
 
 impl HistoricalDataSource for VecDataSource {
     fn next_tick(&mut self) -> Option<MarketTick> {
-        if self.index < self.ticks.len() {
-            let tick = self.ticks[self.index].clone();
-            self.index += 1;
-            Some(tick)
-        } else {
-            None
-        }
+        let tick = self.ticks.get(self.index)?.clone();
+        self.index = self.index.saturating_add(1);
+        Some(tick)
     }
 
     fn peek_tick(&self) -> Option<&MarketTick> {

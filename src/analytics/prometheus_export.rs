@@ -61,6 +61,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use super::live_metrics::LiveMetrics;
+use crate::types::error::MMResult;
 
 /// Default histogram buckets for latency measurements in milliseconds.
 const LATENCY_BUCKETS: &[f64] = &[
@@ -544,6 +545,23 @@ impl MetricsServer {
     }
 }
 
+/// Builds a response without the fallible `Response::builder`.
+fn text_response(
+    status: StatusCode,
+    content_type: Option<&'static str>,
+    body: String,
+) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = status;
+    if let Some(content_type) = content_type {
+        response.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static(content_type),
+        );
+    }
+    response
+}
+
 /// Handles HTTP requests to the metrics server.
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
@@ -551,46 +569,28 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let response = match req.uri().path() {
         "/metrics" => match metrics.encode() {
-            Ok(body) => Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/plain; charset=utf-8")
-                .body(Full::new(Bytes::from(body)))
-                .unwrap_or_else(|_| {
-                    Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::from("Failed to build response")))
-                        .unwrap()
-                }),
-            Err(e) => Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from(format!(
-                    "Error encoding metrics: {}",
-                    e
-                ))))
-                .unwrap(),
+            Ok(body) => text_response(StatusCode::OK, Some("text/plain; charset=utf-8"), body),
+            Err(e) => text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                format!("Error encoding metrics: {}", e),
+            ),
         },
-        "/health" => Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("OK")))
-            .unwrap(),
-        "/" => Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/html")
-            .body(Full::new(Bytes::from(
-                r#"<html>
+        "/health" => text_response(StatusCode::OK, None, "OK".to_string()),
+        "/" => text_response(
+            StatusCode::OK,
+            Some("text/html"),
+            r#"<html>
 <head><title>Market Maker Metrics</title></head>
 <body>
 <h1>Market Maker Metrics</h1>
 <p><a href="/metrics">Metrics</a></p>
 <p><a href="/health">Health</a></p>
 </body>
-</html>"#,
-            )))
-            .unwrap(),
-        _ => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from("Not Found")))
-            .unwrap(),
+</html>"#
+                .to_string(),
+        ),
+        _ => text_response(StatusCode::NOT_FOUND, None, "Not Found".to_string()),
     };
 
     Ok(response)
@@ -612,7 +612,7 @@ async fn handle_request(
 /// let bridge = MetricsBridge::new(Arc::clone(&live_metrics), Arc::clone(&prom_metrics));
 ///
 /// // Sync metrics periodically
-/// bridge.sync();
+/// bridge.sync().unwrap();
 /// ```
 pub struct MetricsBridge {
     live_metrics: Arc<LiveMetrics>,
@@ -637,17 +637,24 @@ impl MetricsBridge {
     /// Syncs current values from `LiveMetrics` to `PrometheusMetrics`.
     ///
     /// Call this periodically to update Prometheus metrics with the latest values.
-    pub fn sync(&self) {
-        let snapshot = self.live_metrics.snapshot(0);
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of [`LiveMetrics::snapshot`] (a poisoned lock or a
+    /// PnL overflow); Prometheus is left untouched in that case.
+    pub fn sync(&self) -> MMResult<()> {
+        let snapshot = self.live_metrics.snapshot(0)?;
 
         // Sync counters (Prometheus counters can only increase, so we set to current total)
         // Note: This works because we're setting absolute values, not incrementing
+        // Prometheus values are f64; counts are exact below 2^53 (not money).
         let quotes_diff = snapshot.quotes_generated as f64 - self.prom_metrics.get_quotes_total();
         if quotes_diff > 0.0 {
             self.prom_metrics.inc_quotes_by(quotes_diff);
         }
 
         // Sync gauges (these can be set directly)
+        // Prometheus gauges are f64; counts are exact below 2^53 (not money).
         self.prom_metrics
             .set_open_orders(snapshot.open_orders as f64);
         self.prom_metrics
@@ -656,6 +663,7 @@ impl MetricsBridge {
             snapshot.realized_pnl.to_string().parse().unwrap_or(0.0),
             snapshot.unrealized_pnl.to_string().parse().unwrap_or(0.0),
         );
+        Ok(())
     }
 
     /// Returns a reference to the live metrics.
@@ -762,11 +770,13 @@ mod tests {
         // Record some activity
         live_metrics.record_quote(1);
         live_metrics.record_quote(2);
-        live_metrics.update_position(crate::dec!(50.0));
-        live_metrics.update_pnl(crate::dec!(100.0), crate::dec!(25.0));
+        live_metrics.update_position(crate::dec!(50.0)).unwrap();
+        live_metrics
+            .update_pnl(crate::dec!(100.0), crate::dec!(25.0))
+            .unwrap();
 
         // Sync
-        bridge.sync();
+        bridge.sync().unwrap();
 
         // Verify Prometheus metrics updated
         assert_eq!(prom_metrics.get_quotes_total(), 2.0);

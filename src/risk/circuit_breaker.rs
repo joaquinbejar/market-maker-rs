@@ -390,16 +390,17 @@ impl CircuitBreaker {
             return self.state.clone();
         }
 
-        // Update daily loss
+        // Update daily loss. This method cannot fail, so the sums saturate
+        // at the `Decimal` bounds; a saturated loss trips the limits.
         if pnl < Decimal::ZERO {
-            self.daily_loss += pnl.abs();
-            self.consecutive_losses += 1;
+            self.daily_loss = self.daily_loss.saturating_add(pnl.abs());
+            self.consecutive_losses = self.consecutive_losses.saturating_add(1);
         } else {
             self.consecutive_losses = 0;
         }
 
         // Update equity
-        self.current_equity += pnl;
+        self.current_equity = self.current_equity.saturating_add(pnl);
         if self.current_equity > self.peak_equity {
             self.peak_equity = self.current_equity;
         }
@@ -465,7 +466,8 @@ impl CircuitBreaker {
     pub fn start_cooldown(&mut self, timestamp: u64) {
         if self.state.is_triggered() {
             self.state = CircuitBreakerState::Cooldown {
-                resume_at: timestamp + self.config.cooldown_duration_ms,
+                // Saturates: an overflowing cooldown never resumes (fails closed).
+                resume_at: timestamp.saturating_add(self.config.cooldown_duration_ms),
             };
         }
     }
@@ -572,7 +574,18 @@ impl CircuitBreaker {
             return false;
         }
 
-        let drawdown = (window_peak - self.current_equity) / window_peak;
+        // This check cannot fail, so the arithmetic saturates; a drawdown
+        // beyond the `Decimal` range trips the breaker (fail closed).
+        // Computed as `1 - equity / peak` so no intermediate is clamped.
+        let drawdown = self
+            .current_equity
+            .checked_div(window_peak)
+            .and_then(|ratio| Decimal::ONE.checked_sub(ratio))
+            .unwrap_or(if self.current_equity.is_sign_negative() {
+                Decimal::MAX
+            } else {
+                Decimal::MIN
+            });
         drawdown >= self.config.rapid_drawdown_threshold
     }
 
@@ -775,6 +788,20 @@ mod tests {
     }
 
     #[test]
+    fn test_record_trade_extreme_loss_saturates_and_triggers() {
+        let config =
+            CircuitBreakerConfig::new(Decimal::MAX, dec!(1.0), 100, dec!(0.10), 300_000, 60_000)
+                .unwrap();
+        let mut breaker =
+            CircuitBreaker::with_initial_equity(config, dec!(0.0000000000000000000000000001), 0);
+
+        breaker.record_trade(Decimal::MIN, 1000);
+        let state = breaker.record_trade(Decimal::MIN, 2000);
+
+        assert!(state.is_triggered());
+    }
+
+    #[test]
     fn test_manual_trigger() {
         let mut breaker = CircuitBreaker::new(default_config());
 
@@ -806,6 +833,23 @@ mod tests {
         if let CircuitBreakerState::Cooldown { resume_at } = breaker.state() {
             assert_eq!(*resume_at, 2000 + 60_000); // cooldown is 60_000ms
         }
+    }
+
+    #[test]
+    fn test_start_cooldown_max_duration_saturates_and_stays_closed() {
+        let mut config = default_config();
+        config.cooldown_duration_ms = u64::MAX;
+        let mut breaker = CircuitBreaker::new(config);
+        breaker.trigger_manual(1000);
+        breaker.start_cooldown(2000);
+        assert_eq!(
+            breaker.state(),
+            &CircuitBreakerState::Cooldown {
+                resume_at: u64::MAX
+            }
+        );
+        breaker.check_cooldown(u64::MAX - 1);
+        assert!(!breaker.is_trading_allowed());
     }
 
     #[test]

@@ -70,6 +70,7 @@
 use crate::Decimal;
 use crate::types::decimal::decimal_sqrt;
 use crate::types::error::{MMError, MMResult};
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
@@ -187,8 +188,9 @@ impl CorrelationMatrix {
 
         // Set diagonal to 1.0
         for i in 0..n {
-            let idx = Self::index_for(i, i, n);
-            correlations[idx] = Decimal::ONE;
+            if let Some(diagonal) = correlations.get_mut(Self::index_for(i, i, n)) {
+                *diagonal = Decimal::ONE;
+            }
         }
 
         Self {
@@ -241,7 +243,7 @@ impl CorrelationMatrix {
         let i = self.asset_index(asset1)?;
         let j = self.asset_index(asset2)?;
         let idx = Self::index_for(i, j, self.assets.len());
-        Some(self.correlations[idx])
+        self.correlations.get(idx).copied()
     }
 
     /// Sets the correlation between two assets.
@@ -288,7 +290,10 @@ impl CorrelationMatrix {
         }
 
         let idx = Self::index_for(i, j, self.assets.len());
-        self.correlations[idx] = correlation;
+        let slot = self.correlations.get_mut(idx).ok_or_else(|| {
+            MMError::NumericalError(format!("correlation index {idx} out of range"))
+        })?;
+        *slot = correlation;
 
         Ok(())
     }
@@ -337,18 +342,22 @@ impl CorrelationMatrix {
         }
 
         // Calculate correlations for each pair
-        for i in 0..self.assets.len() {
-            for j in i..self.assets.len() {
-                if i == j {
-                    continue; // Diagonal stays 1.0
-                }
-
-                let returns_i = returns.get(&self.assets[i]).unwrap();
-                let returns_j = returns.get(&self.assets[j]).unwrap();
+        let missing = |asset: &AssetId| {
+            MMError::InvalidConfiguration(format!("missing returns for {asset:?}"))
+        };
+        let n = self.assets.len();
+        for (i, asset_i) in self.assets.iter().enumerate() {
+            for (j, asset_j) in self.assets.iter().enumerate().skip(i + 1) {
+                // The diagonal stays 1.0.
+                let returns_i = returns.get(asset_i).ok_or_else(|| missing(asset_i))?;
+                let returns_j = returns.get(asset_j).ok_or_else(|| missing(asset_j))?;
 
                 let correlation = Self::calculate_correlation(returns_i, returns_j)?;
-                let idx = Self::index_for(i, j, self.assets.len());
-                self.correlations[idx] = correlation;
+                let idx = Self::index_for(i, j, n);
+                let slot = self.correlations.get_mut(idx).ok_or_else(|| {
+                    MMError::NumericalError(format!("correlation index {idx} out of range"))
+                })?;
+                *slot = correlation;
             }
         }
 
@@ -374,9 +383,9 @@ impl CorrelationMatrix {
         let mut var_x = Decimal::ZERO;
         let mut var_y = Decimal::ZERO;
 
-        for i in 0..n {
-            let dx = x[i] - mean_x;
-            let dy = y[i] - mean_y;
+        for (&xi, &yi) in x.iter().zip(y) {
+            let dx = xi - mean_x;
+            let dy = yi - mean_y;
             cov += dx * dy;
             var_x += dx * dx;
             var_y += dy * dy;
@@ -409,8 +418,9 @@ impl CorrelationMatrix {
 
         for i in 0..n {
             for j in i..n {
-                let idx = Self::index_for(i, j, n);
-                let corr = self.correlations[idx];
+                let Some(&corr) = self.correlations.get(Self::index_for(i, j, n)) else {
+                    return false;
+                };
 
                 if i == j {
                     // Diagonal must be 1.0
@@ -438,7 +448,7 @@ impl CorrelationMatrix {
         for (i, row) in matrix.iter_mut().enumerate() {
             for (j, cell) in row.iter_mut().enumerate() {
                 let idx = Self::index_for(i, j, n);
-                *cell = self.correlations[idx];
+                *cell = self.correlations.get(idx).copied().unwrap_or(Decimal::ZERO);
             }
         }
 
@@ -672,16 +682,16 @@ impl PortfolioRiskCalculator {
     /// Converts confidence level to z-score.
     fn confidence_to_z_score(&self, confidence: Decimal) -> Decimal {
         // Common z-scores for standard confidence levels
-        let conf_90 = Decimal::from_str_exact("0.90").unwrap();
-        let conf_95 = Decimal::from_str_exact("0.95").unwrap();
-        let conf_99 = Decimal::from_str_exact("0.99").unwrap();
+        let conf_90 = dec!(0.90);
+        let conf_95 = dec!(0.95);
+        let conf_99 = dec!(0.99);
 
         if confidence >= conf_99 {
-            Decimal::from_str_exact("2.326").unwrap() // 99%
+            dec!(2.326) // 99%
         } else if confidence >= conf_95 {
-            Decimal::from_str_exact("1.645").unwrap() // 95%
+            dec!(1.645) // 95%
         } else if confidence >= conf_90 {
-            Decimal::from_str_exact("1.282").unwrap() // 90%
+            dec!(1.282) // 90%
         } else {
             Decimal::ONE // Default
         }

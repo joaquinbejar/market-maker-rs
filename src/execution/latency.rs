@@ -36,6 +36,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
+use crate::types::decimal::saturating_u64;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -76,7 +78,7 @@ impl LatencyMeasurement {
     #[must_use]
     pub fn from_duration(duration: Duration, timestamp: u64) -> Self {
         Self {
-            value_us: duration.as_micros() as u64,
+            value_us: saturating_u64(duration.as_micros()),
             timestamp,
         }
     }
@@ -138,22 +140,27 @@ impl LatencyStats {
         let mut values: Vec<u64> = measurements.iter().map(|m| m.value_us).collect();
         values.sort_unstable();
 
-        let count = values.len() as u64;
-        let min_us = values[0];
-        let max_us = values[values.len() - 1];
-        let sum: u64 = values.iter().sum();
-        let avg_us = sum / count;
+        let (Some(&min_us), Some(&max_us)) = (values.first(), values.last()) else {
+            return Self::default();
+        };
+        let count = saturating_u64(values.len());
+        // Non zero: `values` is not empty.
+        let n = u128::from(count).max(1);
+        // A sum of at most 2^64 values below 2^64 always fits in a u128,
+        // and the mean is at most the largest value, so it narrows back.
+        let sum: u128 = values.iter().map(|&v| u128::from(v)).sum();
+        let avg_us = u64::try_from(sum / n).unwrap_or(u64::MAX);
 
-        // Calculate standard deviation
-        let variance: u64 = values
-            .iter()
-            .map(|&v| {
-                let diff = v.abs_diff(avg_us);
-                diff * diff
-            })
-            .sum::<u64>()
-            / count;
-        let std_dev_us = integer_sqrt(variance);
+        // Population variance, floor(sum(d^2) / n), without overflowing:
+        // each squared deviation fits in a u128, and summing the per term
+        // quotients and remainders separately keeps both sums in range.
+        let (quotients, remainders) = values.iter().fold((0u128, 0u128), |(q, r), &v| {
+            let diff = u128::from(v.abs_diff(avg_us));
+            let square = diff.saturating_mul(diff);
+            (q.saturating_add(square / n), r.saturating_add(square % n))
+        });
+        let variance = quotients.saturating_add(remainders / n);
+        let std_dev_us = u64::try_from(variance.isqrt()).unwrap_or(u64::MAX);
 
         // Calculate percentiles
         let p50_us = percentile(&values, 50.0);
@@ -332,13 +339,15 @@ impl Histogram {
 
     /// Records a value in the histogram.
     pub fn record(&mut self, value_us: u64) {
-        let bucket_idx = (value_us / self.bucket_size_us) as usize;
-        if bucket_idx < self.buckets.len() {
-            self.buckets[bucket_idx] += 1;
-        } else {
-            self.overflow_count += 1;
+        let bucket = value_us
+            .checked_div(self.bucket_size_us)
+            .and_then(|idx| usize::try_from(idx).ok())
+            .and_then(|idx| self.buckets.get_mut(idx));
+        match bucket {
+            Some(count) => *count = count.saturating_add(1),
+            None => self.overflow_count = self.overflow_count.saturating_add(1),
         }
-        self.total_count += 1;
+        self.total_count = self.total_count.saturating_add(1);
     }
 
     /// Calculates the approximate percentile value.
@@ -352,19 +361,24 @@ impl Histogram {
             return 0;
         }
 
+        // Stats boundary, not money: a count above 2^53 loses precision
+        // only in the target rank. The float to int `as` cast saturates
+        // (NaN maps to 0), which is the clamping wanted here.
         let target = ((p / 100.0) * self.total_count as f64).ceil() as u64;
         let mut cumulative = 0u64;
 
         for (i, &count) in self.buckets.iter().enumerate() {
-            cumulative += count;
+            cumulative = cumulative.saturating_add(count);
             if cumulative >= target {
                 // Return the upper bound of this bucket
-                return (i as u64 + 1) * self.bucket_size_us;
+                return saturating_u64(i)
+                    .saturating_add(1)
+                    .saturating_mul(self.bucket_size_us);
             }
         }
 
         // Value is in overflow bucket
-        self.buckets.len() as u64 * self.bucket_size_us
+        self.max_trackable_us()
     }
 
     /// Returns the bucket counts.
@@ -394,7 +408,8 @@ impl Histogram {
     /// Returns the maximum trackable value (before overflow).
     #[must_use]
     pub fn max_trackable_us(&self) -> u64 {
-        self.bucket_size_us * self.buckets.len() as u64
+        self.bucket_size_us
+            .saturating_mul(saturating_u64(self.buckets.len()))
     }
 
     /// Resets the histogram.
@@ -510,7 +525,7 @@ impl LatencyTracker {
     /// * `duration` - Latency as a Duration
     /// * `timestamp` - Timestamp when measurement was taken (milliseconds)
     pub fn record_duration(&mut self, metric: LatencyMetric, duration: Duration, timestamp: u64) {
-        self.record(metric, duration.as_micros() as u64, timestamp);
+        self.record(metric, saturating_u64(duration.as_micros()), timestamp);
     }
 
     /// Gets statistics for a specific metric.
@@ -603,29 +618,11 @@ impl LatencyTracker {
 
 /// Calculates the percentile value from a sorted slice.
 fn percentile(sorted_values: &[u64], p: f64) -> u64 {
-    if sorted_values.is_empty() {
-        return 0;
-    }
-
-    let idx = ((p / 100.0) * (sorted_values.len() - 1) as f64).round() as usize;
-    sorted_values[idx.min(sorted_values.len() - 1)]
-}
-
-/// Integer square root using Newton's method.
-fn integer_sqrt(n: u64) -> u64 {
-    if n == 0 {
-        return 0;
-    }
-
-    let mut x = n;
-    let mut y = x.div_ceil(2);
-
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-
-    x
+    let last = sorted_values.len().saturating_sub(1);
+    // Stats boundary, not money: lossless below 2^53 elements, and the
+    // float to int `as` cast saturates (NaN maps to 0) before clamping.
+    let idx = ((p / 100.0) * last as f64).round() as usize;
+    sorted_values.get(idx.min(last)).copied().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -752,6 +749,47 @@ mod tests {
 
         assert_eq!(hist.total_count(), 2);
         assert_eq!(hist.overflow_count(), 1);
+    }
+
+    #[test]
+    fn test_histogram_record_zero_bucket_size_counts_overflow() {
+        let mut hist = Histogram::new(0, 10);
+        hist.record(500);
+
+        assert_eq!(hist.total_count(), 1);
+        assert_eq!(hist.overflow_count(), 1);
+        assert_eq!(hist.max_trackable_us(), 0);
+    }
+
+    #[test]
+    fn test_measurement_from_duration_huge_saturates() {
+        let m = LatencyMeasurement::from_duration(Duration::MAX, 7);
+        assert_eq!(m.value_us, u64::MAX);
+    }
+
+    #[test]
+    fn test_latency_stats_huge_values_saturate() {
+        let measurements = [
+            LatencyMeasurement::new(u64::MAX, 1),
+            LatencyMeasurement::new(u64::MAX, 2),
+        ];
+        let stats = LatencyStats::from_measurements(&measurements);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.max_us, u64::MAX);
+        assert_eq!(stats.avg_us, u64::MAX);
+        assert_eq!(stats.std_dev_us, 0);
+    }
+
+    #[test]
+    fn test_latency_stats_extreme_spread_mean_and_std_are_exact() {
+        let measurements = [
+            LatencyMeasurement::new(0, 1),
+            LatencyMeasurement::new(u64::MAX, 2),
+        ];
+        let stats = LatencyStats::from_measurements(&measurements);
+        assert_eq!(stats.avg_us, u64::MAX / 2);
+        // Both deviations are about 2^63, so the population std is too.
+        assert_eq!(stats.std_dev_us, u64::MAX / 2);
     }
 
     #[test]
@@ -921,17 +959,6 @@ mod tests {
 
         assert_eq!(tracker.measurement_count(LatencyMetric::OrderToAck), 0);
         assert_eq!(tracker.measurement_count(LatencyMetric::OrderToFill), 1);
-    }
-
-    #[test]
-    fn test_integer_sqrt() {
-        assert_eq!(integer_sqrt(0), 0);
-        assert_eq!(integer_sqrt(1), 1);
-        assert_eq!(integer_sqrt(4), 2);
-        assert_eq!(integer_sqrt(9), 3);
-        assert_eq!(integer_sqrt(10), 3);
-        assert_eq!(integer_sqrt(100), 10);
-        assert_eq!(integer_sqrt(10000), 100);
     }
 
     #[test]
