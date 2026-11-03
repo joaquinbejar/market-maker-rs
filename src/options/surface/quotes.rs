@@ -38,7 +38,7 @@
 use optionstratlib::OptionStyle;
 use rust_decimal::prelude::ToPrimitive;
 
-use super::store::YEAR_MS;
+use super::store::tau_between;
 use crate::Decimal;
 use crate::types::error::{MMError, MMResult};
 
@@ -328,9 +328,8 @@ pub fn clean_quotes(
         if !verdicts.get(index).is_some_and(alive) {
             continue;
         }
-        let ms = q.expiry_at.saturating_sub(cutoff);
-        #[expect(clippy::cast_precision_loss, reason = "ms to years in f64 model time")]
-        let tau = ms as f64 / YEAR_MS;
+        // Alive quotes expire after the cutoff (others are Expired).
+        let tau = tau_between(cutoff, q.expiry_at)?;
         let spot = to_f64("underlying", q.underlying)?;
         let strike = to_f64("strike", q.strike)?;
         let forward = finite("forward", spot * ((r - q_carry) * tau).exp())?;

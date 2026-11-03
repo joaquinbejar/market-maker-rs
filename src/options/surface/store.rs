@@ -233,13 +233,27 @@ impl CalibratedSurface {
     }
 }
 
-/// `(to - from) / YEAR_MS` for `to > from`.
-fn tau_between(from: u64, to: u64) -> MMResult<f64> {
+/// Largest millisecond count an `f64` holds exactly, `2^53`.
+const EXACT_MS: u64 = 1 << 53;
+
+/// `(to - from) / YEAR_MS` for `to > from`; the difference converts to
+/// `f64` exactly, as it is at most `2^53` (about 285 000 years).
+pub(crate) fn tau_between(from: u64, to: u64) -> MMResult<f64> {
     let ms = to
         .checked_sub(from)
         .filter(|ms| *ms > 0)
         .ok_or_else(|| MMError::InvalidConfiguration(format!("expiry {to} is not after {from}")))?;
-    Ok(ms as f64 / YEAR_MS)
+    if ms > EXACT_MS {
+        return Err(MMError::InvalidConfiguration(format!(
+            "{ms} ms between {from} and {to} is not exact in f64"
+        )));
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "at most 2^53, checked above: exact"
+    )]
+    let ms = ms as f64;
+    Ok(ms / YEAR_MS)
 }
 
 /// What may be served.
