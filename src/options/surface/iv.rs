@@ -1,27 +1,36 @@
 //! Implied total variance of cleaned quotes.
 //!
 //! Each price is turned into an undiscounted Black price (`price / DF`) and
-//! inverted for the total variance `w` with a safeguarded Newton on
+//! inverted for the total variance `w` on its out of the money price: the
+//! price itself for an out of the money option, and the price less the
+//! intrinsic value for an in the money one (undiscounted put-call parity,
+//! `C - P = F - K`). The inversion is a safeguarded Newton on
 //! [`black_undiscounted`] and [`black_w`], inside the bracket `[0, w_max]`
 //! (`w_max = max_vol^2 tau`), with bisection whenever the Newton step leaves
-//! the bracket or `black_w` is unavailable (it is singular at `w = 0`).
-//! Every loop is bounded. Where the Black price at a trial `w` is positive
-//! but below the smallest positive `f64` (an error of
-//! [`black_undiscounted`], never a 0), it is below every positive price, the
-//! target included, so the root lies above that `w` and the bracket moves
-//! there.
+//! the bracket or `black_w` is unavailable (it is singular at `w = 0`). It
+//! stops when the price matches to [`IvConfig::price_tolerance`] relative to
+//! the out of the money price, or when the bracket is narrower than
+//! [`IvConfig::w_tolerance`] relative to its upper end. Every loop is
+//! bounded. Where the Black price at a trial `w` is positive but below the
+//! smallest positive `f64` (an error of [`black_undiscounted`], never a 0),
+//! it is below every positive price, the target included, so the root lies
+//! above that `w` and the bracket moves there.
 //!
 //! Undiscounted bounds: `max(F - K, 0) <= C <= F` and
-//! `max(K - F, 0) <= P <= K`. A price at its lower bound, within the
-//! tolerance, has `w = 0`: a valid extreme, which is what a zero bid gives.
-//! A price below the lower bound or at or above the upper bound has no
-//! implied variance and is an [`IvFailure`].
+//! `max(K - F, 0) <= P <= K`. Out of the money, a price of 0 has `w = 0`:
+//! a valid extreme, which is what a zero bid gives; any positive price is
+//! inverted, however small. In the money, a time
+//! value that the intrinsic value's rounding leaves unknown to the price
+//! tolerance ([`IvFailure::BelowResolution`]) is not inverted. That, a price
+//! below the lower bound, and a price at or above the upper bound are each
+//! an [`IvFailure`], never a `w`.
 //!
 //! For a cleaned quote, the mid gives the observed `w`, and the bid and ask
 //! give the band `[w_bid, w_ask]` whose width sets the weight,
-//! `1 / max(w_ask - w_bid, eps)^2`. A quote whose ask is below the lower
-//! bound, or whose mid has no implied variance, is left out of the fit with
-//! its failure.
+//! `1 / max(w_ask - w_bid, eps)^2`. A bid at or below the lower bound, or
+//! within the intrinsic value's rounding, is `w_bid = 0`, flagged
+//! [`IvObservation::bid_at_bound`]. A quote whose ask or mid has no implied
+//! variance is left out of the fit with its failure.
 
 use optionstratlib::OptionStyle;
 use rust_decimal::prelude::ToPrimitive;
@@ -35,7 +44,7 @@ use crate::types::error::{MMError, MMResult};
 pub struct IvConfig {
     /// Largest implied volatility searched; `w_max = max_vol^2 tau`.
     pub max_vol: f64,
-    /// Price tolerance relative to the forward.
+    /// Price tolerance relative to the out of the money price solved for.
     pub price_tolerance: f64,
     /// Relative width of the bracket at which the search stops.
     pub w_tolerance: f64,
@@ -101,6 +110,16 @@ pub enum IvFailure {
         /// The bound.
         bound: f64,
     },
+    /// In the money, the time value, `price - intrinsic`, is not known to
+    /// [`IvConfig::price_tolerance`] relative accuracy: the intrinsic
+    /// value's rounding, about `eps * intrinsic`, is above that share of
+    /// it.
+    BelowResolution {
+        /// `price - intrinsic`.
+        time_value: f64,
+        /// `eps * intrinsic / price_tolerance`.
+        resolution: f64,
+    },
     /// `black(w_max)` is below the price: the volatility is above `max_vol`.
     BracketFailed {
         /// The search's upper end.
@@ -124,6 +143,13 @@ impl std::fmt::Display for IvFailure {
             Self::AtOrAboveUpperBound { price, bound } => {
                 write!(f, "price {price} at or above the upper bound {bound}")
             }
+            Self::BelowResolution {
+                time_value,
+                resolution,
+            } => write!(
+                f,
+                "time value {time_value} below the resolution {resolution} of the intrinsic value"
+            ),
             Self::BracketFailed { w_max } => write!(f, "no root below w_max {w_max}"),
             Self::NoConvergence { iterations } => {
                 write!(f, "no convergence in {iterations} iterations")
@@ -162,8 +188,8 @@ pub fn implied_total_variance(
     } else {
         ((strike - fwd).max(0.0), strike)
     };
-    let tol = config.price_tolerance * fwd;
-    if price < lower - tol {
+    // Below the intrinsic value by more than its rounding.
+    if price < lower - 2.0 * f64::EPSILON * lower {
         return Err(IvFailure::BelowLowerBound {
             price,
             bound: lower,
@@ -175,28 +201,53 @@ pub fn implied_total_variance(
             bound: upper,
         });
     }
-    if price <= lower + tol {
+    if price == 0.0 {
+        // Out of the money at 0 (a zero bid): w = 0, the declared extreme.
+        // In the money, a price at the intrinsic value is below the
+        // resolution below.
         return Ok(0.0);
     }
-    // `None`: positive but below the smallest positive f64.
+    // Solve on the out of the money price: the price itself, or, in the
+    // money, the price less the intrinsic value (undiscounted put-call
+    // parity, C - P = F - K), which is the other style's price.
+    let target = price - lower;
+    // The intrinsic value is rounded to about eps * intrinsic, which the
+    // subtraction carries into the target: the target is known to
+    // price_tolerance relative accuracy only above eps * intrinsic /
+    // price_tolerance. Out of the money the intrinsic value is 0 and every
+    // positive price is known exactly.
+    let resolution = f64::EPSILON * lower / config.price_tolerance;
+    if target <= resolution {
+        return Err(IvFailure::BelowResolution {
+            time_value: target,
+            resolution,
+        });
+    }
+    let otm_style = if strike >= fwd {
+        OptionStyle::Call
+    } else {
+        OptionStyle::Put
+    };
+    let tol = config.price_tolerance * target;
+    // `None`: positive but below the smallest positive f64, so below the
+    // target, which is a positive f64.
     let black = |w: f64| {
-        black_or_underflow(fwd, strike, w, style).map_err(|e| IvFailure::Numerical(e.to_string()))
+        black_or_underflow(fwd, strike, w, otm_style)
+            .map_err(|e| IvFailure::Numerical(e.to_string()))
     };
     let w_max = config.max_vol * config.max_vol * tau;
-    if black(w_max)?.is_none_or(|p| p < price - tol) {
+    if black(w_max)?.is_none_or(|p| p < target - tol) {
         return Err(IvFailure::BracketFailed { w_max });
     }
     let (mut lo, mut hi) = (0.0_f64, w_max);
     // Brenner and Subrahmanyam's at the money guess, w = 2 pi (C / F)^2,
     // kept inside the bracket.
-    let time_value = (price - lower) / fwd;
+    let time_value = target / fwd;
     let mut w = (2.0 * std::f64::consts::PI * time_value * time_value)
         .max(0.25 * hi * f64::EPSILON)
         .min(0.5 * hi);
     for _ in 0..config.max_iterations {
-        // Here `price > lower + tol >= 0`, so an underflowed Black price is
-        // below it.
-        let diff = black(w)?.map(|p| p - price);
+        let diff = black(w)?.map(|p| p - target);
         if diff.is_some_and(|d| d.abs() <= tol) {
             return Ok(w);
         }
@@ -205,7 +256,7 @@ pub fn implied_total_variance(
         } else {
             hi = w;
         }
-        if hi - lo <= config.w_tolerance * hi.max(f64::MIN_POSITIVE) {
+        if hi - lo <= config.w_tolerance * hi {
             return Ok(0.5 * (lo + hi));
         }
         let newton = diff.and_then(|d| {
@@ -337,10 +388,14 @@ pub fn extract(report: &CleaningReport, config: &IvConfig) -> MMResult<Extractio
                 continue;
             }
         };
-        // A bid at or below the lower bound (a zero bid) is w = 0.
+        // A bid at or below the lower bound (a zero bid), or within the
+        // rounding of the intrinsic value, is the band's declared extreme
+        // w = 0, flagged.
         let (w_bid, bid_at_bound) = match solve(c.quote.bid) {
             Ok(w) => (w, w == 0.0),
-            Err(IvFailure::BelowLowerBound { .. }) => (0.0, true),
+            Err(IvFailure::BelowLowerBound { .. } | IvFailure::BelowResolution { .. }) => {
+                (0.0, true)
+            }
             Err(e) => {
                 failures.push((c.index, "bid", e));
                 continue;
@@ -430,6 +485,104 @@ mod tests {
         }
     }
 
+    /// A fixed linear congruential sequence in [0, 1).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    }
+
+    #[test]
+    fn test_implied_total_variance_small_premiums_are_inverted_not_zero() {
+        // Out of the money premiums far below price_tolerance * F, which an
+        // absolute tolerance would read as w = 0 or stop on early.
+        let c = config();
+        let fwd = 100.0;
+        for (z, vol, tau) in [
+            (-7.30, 1.811, 0.6535),
+            (7.55, 0.985, 0.26),
+            (-5.79, 1.847, 1.497),
+        ] {
+            let w: f64 = vol * vol * tau;
+            let strike = fwd * f64::exp(z * w.sqrt());
+            let style = if strike >= fwd {
+                OptionStyle::Call
+            } else {
+                OptionStyle::Put
+            };
+            let price = black_undiscounted(fwd, strike, w, style).unwrap();
+            let got = implied_total_variance(price, fwd, strike, tau, style, &c).unwrap();
+            assert!(
+                (got - w).abs() <= 1e-9 * w,
+                "z {z}: price {price:e}, {got} vs {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_implied_total_variance_round_trips_to_eight_standard_deviations() {
+        // z uniform in [-8, 8] standard deviations, vol in [0.05, 2], tau in
+        // [0.02, 2]; both styles. Out of the money every representable
+        // price is inverted; in the money, a time value lost in the
+        // intrinsic value's rounding is BelowResolution, never a w.
+        let c = config();
+        let fwd = 100.0;
+        let mut rng = Lcg(7);
+        let (mut otm, mut tiny, mut itm, mut unresolved) = (0, 0, 0, 0);
+        let mut worst = 0.0_f64;
+        for _ in 0..20_000 {
+            let z = 16.0 * rng.next() - 8.0;
+            let vol = 0.05 + 1.95 * rng.next();
+            let tau = 0.02 + 1.98 * rng.next();
+            let w: f64 = vol * vol * tau;
+            let strike = fwd * f64::exp(z * w.sqrt());
+            for style in [OptionStyle::Call, OptionStyle::Put] {
+                let Some(price) = black_or_underflow(fwd, strike, w, style).unwrap() else {
+                    continue;
+                };
+                let in_the_money = match style {
+                    OptionStyle::Call => strike < fwd,
+                    OptionStyle::Put => strike > fwd,
+                };
+                match implied_total_variance(price, fwd, strike, tau, style, &c) {
+                    Ok(got) => {
+                        let rel = (got - w).abs() / w;
+                        if in_the_money {
+                            itm += 1;
+                        } else {
+                            otm += 1;
+                            worst = worst.max(rel);
+                            if (1e-15 * fwd..=1e-9 * fwd).contains(&price) {
+                                tiny += 1;
+                            }
+                        }
+                        assert!(
+                            rel <= 1e-9,
+                            "z {z} vol {vol} tau {tau} {style:?}: price {price:e}, {got} vs {w}"
+                        );
+                    }
+                    Err(IvFailure::BelowResolution { .. }) if in_the_money => unresolved += 1,
+                    Err(e) => panic!("z {z} vol {vol} tau {tau} {style:?}: price {price:e}: {e}"),
+                }
+            }
+        }
+        // Observed: every representable out of the money price inverted
+        // (worst relative error 2.7e-12), 4757 of them in [1e-15 F, 1e-9 F];
+        // in the money, 6690 inverted and 13310 below the resolution.
+        assert!(tiny > 1000, "{tiny} premiums in [1e-15 F, 1e-9 F]");
+        assert!(
+            otm > 19_000 && itm > 1000 && unresolved > 0,
+            "{otm} {itm} {unresolved}"
+        );
+        assert!(worst <= 1e-9, "{worst}");
+    }
+
     #[test]
     fn test_black_or_underflow_reads_the_pricing_underflow() {
         // Far out of the money at small w: positive, below every f64.
@@ -470,11 +623,16 @@ mod tests {
     #[test]
     fn test_implied_total_variance_bounds_and_bracket() {
         let c = config();
-        // Intrinsic is w = 0.
-        assert_eq!(
+        // Out of the money, 0 is w = 0; in the money, the intrinsic value
+        // and a time value lost in its rounding are below the resolution.
+        assert!(matches!(
             implied_total_variance(10.0, 100.0, 90.0, 1.0, OptionStyle::Call, &c),
-            Ok(0.0)
-        );
+            Err(IvFailure::BelowResolution { .. })
+        ));
+        assert!(matches!(
+            implied_total_variance(10.0 + 1e-10, 100.0, 90.0, 1.0, OptionStyle::Call, &c),
+            Err(IvFailure::BelowResolution { .. })
+        ));
         assert_eq!(
             implied_total_variance(0.0, 100.0, 110.0, 1.0, OptionStyle::Call, &c),
             Ok(0.0)
