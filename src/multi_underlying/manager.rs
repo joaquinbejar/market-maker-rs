@@ -297,17 +297,13 @@ impl MultiUnderlyingManager {
     #[must_use]
     pub fn get_cross_asset_hedges(&self) -> Vec<CrossAssetHedge> {
         let mut hedges = Vec::new();
-        let symbols: Vec<&String> = self.states.keys().collect();
+        let states: Vec<_> = self.states.iter().collect();
 
-        for i in 0..symbols.len() {
-            for j in (i + 1)..symbols.len() {
-                let symbol_a = symbols[i];
-                let symbol_b = symbols[j];
-
+        let mut rest = states.as_slice();
+        while let Some((&(symbol_a, state_a), tail)) = rest.split_first() {
+            rest = tail;
+            for &(symbol_b, state_b) in tail {
                 if let Some(correlation) = self.get_correlation(symbol_a, symbol_b) {
-                    let state_a = &self.states[symbol_a];
-                    let state_b = &self.states[symbol_b];
-
                     // Only suggest hedges for active underlyings with significant delta
                     if state_a.status != UnderlyingStatus::Active
                         || state_b.status != UnderlyingStatus::Active
@@ -388,7 +384,7 @@ impl MultiUnderlyingManager {
         match self.allocation_strategy {
             CapitalAllocationStrategy::Equal => {
                 let count = self.configs.len() + 1;
-                self.total_capital / Decimal::from(count as u32)
+                self.total_capital / Decimal::from(count)
             }
             CapitalAllocationStrategy::TargetWeight => self.total_capital * config.target_weight,
             _ => self.total_capital * config.target_weight,
@@ -401,7 +397,7 @@ impl MultiUnderlyingManager {
             return;
         }
 
-        let allocation = self.total_capital / Decimal::from(count as u32);
+        let allocation = self.total_capital / Decimal::from(count);
         for state in self.states.values_mut() {
             state.allocated_capital = allocation;
         }
@@ -497,20 +493,17 @@ impl MultiUnderlyingManager {
         }
 
         // Add covariance terms
-        let symbols: Vec<&String> = self.states.keys().collect();
-        for i in 0..symbols.len() {
-            for j in (i + 1)..symbols.len() {
-                if let Some(correlation) = self.get_correlation(symbols[i], symbols[j]) {
-                    let state_a = &self.states[symbols[i]];
-                    let state_b = &self.states[symbols[j]];
-
-                    if state_a.status == UnderlyingStatus::Active
-                        && state_b.status == UnderlyingStatus::Active
-                    {
-                        // 2 * correlation * vega_a * vega_b
-                        total_variance +=
-                            Decimal::from(2) * correlation * state_a.vega * state_b.vega;
-                    }
+        let states: Vec<_> = self.states.iter().collect();
+        let mut rest = states.as_slice();
+        while let Some((&(symbol_a, state_a), tail)) = rest.split_first() {
+            rest = tail;
+            for &(symbol_b, state_b) in tail {
+                if let Some(correlation) = self.get_correlation(symbol_a, symbol_b)
+                    && state_a.status == UnderlyingStatus::Active
+                    && state_b.status == UnderlyingStatus::Active
+                {
+                    // 2 * correlation * vega_a * vega_b
+                    total_variance += Decimal::from(2) * correlation * state_a.vega * state_b.vega;
                 }
             }
         }

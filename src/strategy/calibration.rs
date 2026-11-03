@@ -448,15 +448,18 @@ impl RiskAversionCalibrator {
 
     /// Estimates half-life from inventory time series.
     fn estimate_halflife(&self, inventory_history: &[(u64, Decimal)]) -> u64 {
-        if inventory_history.len() < 2 {
+        let Some((first, rest)) = inventory_history.split_first() else {
+            return 300_000; // Default 5 minutes
+        };
+        if rest.is_empty() {
             return 300_000; // Default 5 minutes
         }
 
         // Simple estimation: time for inventory to cross zero
         let mut crossings = Vec::new();
-        let mut last_sign = inventory_history[0].1.is_sign_positive();
+        let mut last_sign = first.1.is_sign_positive();
 
-        for (ts, inv) in inventory_history.iter().skip(1) {
+        for (ts, inv) in rest {
             let current_sign = inv.is_sign_positive();
             if current_sign != last_sign {
                 crossings.push(*ts);
@@ -697,12 +700,12 @@ impl OrderIntensityCalibrator {
         let mut var_x = Decimal::ZERO;
         let mut var_y = Decimal::ZERO;
 
-        for i in 0..n {
-            let dx = x[i] - x_mean;
-            let dy = y[i] - y_mean;
-            cov_xy += weights[i] * dx * dy;
-            var_x += weights[i] * dx * dx;
-            var_y += weights[i] * dy * dy;
+        for ((&xi, &yi), &wi) in x.iter().zip(y).zip(weights) {
+            let dx = xi - x_mean;
+            let dy = yi - y_mean;
+            cov_xy += wi * dx * dy;
+            var_x += wi * dx * dx;
+            var_y += wi * dy * dy;
         }
 
         if var_x.is_zero() {
@@ -737,9 +740,9 @@ impl OrderIntensityCalibrator {
 
         // Calculate residual sum of squares
         let mut rss = Decimal::ZERO;
-        for i in 0..n {
-            let predicted = intercept + slope * x[i];
-            let residual = y[i] - predicted;
+        for (&xi, &yi) in x.iter().zip(y) {
+            let predicted = intercept + slope * xi;
+            let residual = yi - predicted;
             rss += residual * residual;
         }
 

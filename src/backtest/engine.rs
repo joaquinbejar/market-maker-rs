@@ -1068,7 +1068,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     fn match_active_orders(&mut self, tick: &MarketTick, now: u64) {
         self.fill_model.on_tick(tick);
         for index in 0..self.orders.len() {
-            let order = &self.orders[index];
+            let Some(order) = self.orders.get(index) else {
+                continue;
+            };
             // Eligibility uses the tick's exchange time, not the clamped
             // clock, so an out of order tick older than the activation
             // can never fill the order.
@@ -1126,19 +1128,22 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                         continue;
                     }
                 };
-            if self.orders[index].apply_fill(quantity).is_err() {
+            let Some(order) = self.orders.get_mut(index) else {
+                continue;
+            };
+            if order.apply_fill(quantity).is_err() {
                 continue;
             }
             // Reports and result metrics carry the fee valued in quote.
             let fee = charge.quote_value;
             let stamp = self.clock.stamp();
-            let report = ExecutionReport::fill(stamp, &self.orders[index], price, quantity, fee);
+            let report = ExecutionReport::fill(stamp, order, price, quantity, fee);
             let mut fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
                 .with_execution_id(self.next_execution_id);
             if charge.asset == FeeAsset::Base {
                 fill.base_fee = charge.amount;
             }
-            let (order_id, cumulative) = (self.orders[index].id, self.orders[index].filled);
+            let (order_id, cumulative) = (order.id, order.filled);
             // The policy books the fill first so a ledger it owns is up to
             // date when the accountant reads it.
             self.notify_policy(OrderEvent::Fill {
@@ -1321,10 +1326,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     fn apply_cancel(&mut self, id: SimOrderId) {
         let stamp = self.clock.stamp();
         if let Some(index) = self.orders.iter().position(|o| o.id == id)
-            && self.orders[index].cancel().is_ok()
+            && let Some(order) = self.orders.get_mut(index)
+            && order.cancel().is_ok()
         {
-            let report =
-                ExecutionReport::status(stamp, &self.orders[index], ExecutionKind::Canceled);
+            let report = ExecutionReport::status(stamp, order, ExecutionKind::Canceled);
             self.orders.remove(index);
             self.emit(report);
             return;
@@ -1509,12 +1514,11 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         let returns: Vec<Decimal> = self
             .equity_curve
             .windows(2)
-            .filter_map(|w| {
-                if w[0].1 > Decimal::ZERO {
-                    Some((w[1].1 - w[0].1) / w[0].1)
-                } else {
-                    None
+            .filter_map(|w| match w {
+                [prev, next] if prev.1 > Decimal::ZERO => {
+                    next.1.checked_sub(prev.1)?.checked_div(prev.1)
                 }
+                _ => None,
             })
             .collect();
 

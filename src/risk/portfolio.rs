@@ -188,8 +188,9 @@ impl CorrelationMatrix {
 
         // Set diagonal to 1.0
         for i in 0..n {
-            let idx = Self::index_for(i, i, n);
-            correlations[idx] = Decimal::ONE;
+            if let Some(diagonal) = correlations.get_mut(Self::index_for(i, i, n)) {
+                *diagonal = Decimal::ONE;
+            }
         }
 
         Self {
@@ -242,7 +243,7 @@ impl CorrelationMatrix {
         let i = self.asset_index(asset1)?;
         let j = self.asset_index(asset2)?;
         let idx = Self::index_for(i, j, self.assets.len());
-        Some(self.correlations[idx])
+        self.correlations.get(idx).copied()
     }
 
     /// Sets the correlation between two assets.
@@ -289,7 +290,10 @@ impl CorrelationMatrix {
         }
 
         let idx = Self::index_for(i, j, self.assets.len());
-        self.correlations[idx] = correlation;
+        let slot = self.correlations.get_mut(idx).ok_or_else(|| {
+            MMError::NumericalError(format!("correlation index {idx} out of range"))
+        })?;
+        *slot = correlation;
 
         Ok(())
     }
@@ -379,9 +383,9 @@ impl CorrelationMatrix {
         let mut var_x = Decimal::ZERO;
         let mut var_y = Decimal::ZERO;
 
-        for i in 0..n {
-            let dx = x[i] - mean_x;
-            let dy = y[i] - mean_y;
+        for (&xi, &yi) in x.iter().zip(y) {
+            let dx = xi - mean_x;
+            let dy = yi - mean_y;
             cov += dx * dy;
             var_x += dx * dx;
             var_y += dy * dy;
@@ -414,8 +418,9 @@ impl CorrelationMatrix {
 
         for i in 0..n {
             for j in i..n {
-                let idx = Self::index_for(i, j, n);
-                let corr = self.correlations[idx];
+                let Some(&corr) = self.correlations.get(Self::index_for(i, j, n)) else {
+                    return false;
+                };
 
                 if i == j {
                     // Diagonal must be 1.0
@@ -443,7 +448,7 @@ impl CorrelationMatrix {
         for (i, row) in matrix.iter_mut().enumerate() {
             for (j, cell) in row.iter_mut().enumerate() {
                 let idx = Self::index_for(i, j, n);
-                *cell = self.correlations[idx];
+                *cell = self.correlations.get(idx).copied().unwrap_or(Decimal::ZERO);
             }
         }
 

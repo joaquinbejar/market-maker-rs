@@ -76,7 +76,7 @@ impl LatencyMeasurement {
     #[must_use]
     pub fn from_duration(duration: Duration, timestamp: u64) -> Self {
         Self {
-            value_us: duration.as_micros() as u64,
+            value_us: u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
             timestamp,
         }
     }
@@ -138,10 +138,12 @@ impl LatencyStats {
         let mut values: Vec<u64> = measurements.iter().map(|m| m.value_us).collect();
         values.sort_unstable();
 
-        let count = values.len() as u64;
-        let min_us = values[0];
-        let max_us = values[values.len() - 1];
-        let sum: u64 = values.iter().sum();
+        let (Some(&min_us), Some(&max_us)) = (values.first(), values.last()) else {
+            return Self::default();
+        };
+        // Non zero: `values` is not empty.
+        let count = len_to_u64(values.len()).max(1);
+        let sum: u64 = values.iter().fold(0u64, |acc, &v| acc.saturating_add(v));
         let avg_us = sum / count;
 
         // Calculate standard deviation
@@ -149,9 +151,9 @@ impl LatencyStats {
             .iter()
             .map(|&v| {
                 let diff = v.abs_diff(avg_us);
-                diff * diff
+                diff.saturating_mul(diff)
             })
-            .sum::<u64>()
+            .fold(0u64, u64::saturating_add)
             / count;
         let std_dev_us = integer_sqrt(variance);
 
@@ -332,13 +334,15 @@ impl Histogram {
 
     /// Records a value in the histogram.
     pub fn record(&mut self, value_us: u64) {
-        let bucket_idx = (value_us / self.bucket_size_us) as usize;
-        if bucket_idx < self.buckets.len() {
-            self.buckets[bucket_idx] += 1;
-        } else {
-            self.overflow_count += 1;
+        let bucket = value_us
+            .checked_div(self.bucket_size_us)
+            .and_then(|idx| usize::try_from(idx).ok())
+            .and_then(|idx| self.buckets.get_mut(idx));
+        match bucket {
+            Some(count) => *count = count.saturating_add(1),
+            None => self.overflow_count = self.overflow_count.saturating_add(1),
         }
-        self.total_count += 1;
+        self.total_count = self.total_count.saturating_add(1);
     }
 
     /// Calculates the approximate percentile value.
@@ -352,19 +356,29 @@ impl Histogram {
             return 0;
         }
 
+        // Stats boundary, not money: a count above 2^53 loses precision
+        // only in the target rank. The float to int `as` cast saturates
+        // (NaN maps to 0), which is the clamping wanted here.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
         let target = ((p / 100.0) * self.total_count as f64).ceil() as u64;
         let mut cumulative = 0u64;
 
         for (i, &count) in self.buckets.iter().enumerate() {
-            cumulative += count;
+            cumulative = cumulative.saturating_add(count);
             if cumulative >= target {
                 // Return the upper bound of this bucket
-                return (i as u64 + 1) * self.bucket_size_us;
+                return len_to_u64(i)
+                    .saturating_add(1)
+                    .saturating_mul(self.bucket_size_us);
             }
         }
 
         // Value is in overflow bucket
-        self.buckets.len() as u64 * self.bucket_size_us
+        self.max_trackable_us()
     }
 
     /// Returns the bucket counts.
@@ -394,7 +408,8 @@ impl Histogram {
     /// Returns the maximum trackable value (before overflow).
     #[must_use]
     pub fn max_trackable_us(&self) -> u64 {
-        self.bucket_size_us * self.buckets.len() as u64
+        self.bucket_size_us
+            .saturating_mul(len_to_u64(self.buckets.len()))
     }
 
     /// Resets the histogram.
@@ -510,7 +525,11 @@ impl LatencyTracker {
     /// * `duration` - Latency as a Duration
     /// * `timestamp` - Timestamp when measurement was taken (milliseconds)
     pub fn record_duration(&mut self, metric: LatencyMetric, duration: Duration, timestamp: u64) {
-        self.record(metric, duration.as_micros() as u64, timestamp);
+        self.record(
+            metric,
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            timestamp,
+        );
     }
 
     /// Gets statistics for a specific metric.
@@ -603,12 +622,23 @@ impl LatencyTracker {
 
 /// Calculates the percentile value from a sorted slice.
 fn percentile(sorted_values: &[u64], p: f64) -> u64 {
-    if sorted_values.is_empty() {
-        return 0;
-    }
+    let last = sorted_values.len().saturating_sub(1);
+    // Stats boundary, not money: lossless below 2^53 elements, and the
+    // float to int `as` cast saturates (NaN maps to 0) before clamping.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let idx = ((p / 100.0) * last as f64).round() as usize;
+    sorted_values.get(idx.min(last)).copied().unwrap_or(0)
+}
 
-    let idx = ((p / 100.0) * (sorted_values.len() - 1) as f64).round() as usize;
-    sorted_values[idx.min(sorted_values.len() - 1)]
+/// Converts a length or index to `u64`, saturating on the (theoretical)
+/// platforms where `usize` is wider.
+#[inline]
+fn len_to_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// Integer square root using Newton's method.
@@ -752,6 +782,33 @@ mod tests {
 
         assert_eq!(hist.total_count(), 2);
         assert_eq!(hist.overflow_count(), 1);
+    }
+
+    #[test]
+    fn test_histogram_record_zero_bucket_size_counts_overflow() {
+        let mut hist = Histogram::new(0, 10);
+        hist.record(500);
+
+        assert_eq!(hist.total_count(), 1);
+        assert_eq!(hist.overflow_count(), 1);
+        assert_eq!(hist.max_trackable_us(), 0);
+    }
+
+    #[test]
+    fn test_measurement_from_duration_huge_saturates() {
+        let m = LatencyMeasurement::from_duration(Duration::MAX, 7);
+        assert_eq!(m.value_us, u64::MAX);
+    }
+
+    #[test]
+    fn test_latency_stats_huge_values_saturate() {
+        let measurements = [
+            LatencyMeasurement::new(u64::MAX, 1),
+            LatencyMeasurement::new(u64::MAX, 2),
+        ];
+        let stats = LatencyStats::from_measurements(&measurements);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.max_us, u64::MAX);
     }
 
     #[test]
