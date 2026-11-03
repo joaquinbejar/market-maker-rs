@@ -1686,4 +1686,19 @@ mod tests {
         let mut manager = AlertManager::new(100, 0);
         assert!(!manager.acknowledge("nonexistent_id"));
     }
+
+    #[test]
+    fn test_collecting_handler_poisoned_lock_returns_lock_poisoned() {
+        let handler = std::sync::Arc::new(CollectingAlertHandler::new(AlertSeverity::Info));
+        let clone = std::sync::Arc::clone(&handler);
+        let joined = std::thread::spawn(move || {
+            let _guard = clone.alerts.lock();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(matches!(handler.count(), Err(MMError::LockPoisoned(_))));
+        assert!(matches!(handler.alerts(), Err(MMError::LockPoisoned(_))));
+        assert!(matches!(handler.clear(), Err(MMError::LockPoisoned(_))));
+    }
 }

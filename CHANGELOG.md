@@ -14,6 +14,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- No panics in library code (#135). New `MMError::LockPoisoned`; these now
+  return `MMResult` instead of panicking on a poisoned lock:
+  `ThreadSafeOrderManager::{read, write, get_stats, open_order_count,
+  check_timeouts, cleanup}`, `CollectingAlertHandler::{alerts, count, clear}`,
+  `MockExchangeConnector::{set_balance, open_order_count, all_order_ids}` and
+  `OrderBookConnector::set_balance`. `GridConfig::new` rejects
+  `levels_per_side > i32::MAX`; `AccountingFill::cash_flow` and
+  `LimitsPolicy::live_quantity` return `NumericalError` on overflow; position,
+  PnL, notional and slippage values saturate at the `Decimal` bounds.
+
 - Backtest fees can be charged in the base asset or a third asset:
   `BacktestConfig::fee_currency` (`FeeCurrency::{Quote, Base, Other}`,
   default `Quote`, unchanged behaviour). `FeeAsset` moved to

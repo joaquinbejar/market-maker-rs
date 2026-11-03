@@ -1427,4 +1427,20 @@ mod tests {
             assert!(unchanged.fills.is_empty());
         }
     }
+
+    #[test]
+    fn test_thread_safe_order_manager_poisoned_lock_returns_lock_poisoned() {
+        let manager = ThreadSafeOrderManager::new(OrderManagerConfig::default());
+        let clone = manager.clone();
+        let joined = std::thread::spawn(move || {
+            let _ = clone.write(|_| panic!("poison the lock"));
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(matches!(
+            manager.open_order_count(),
+            Err(MMError::LockPoisoned(_))
+        ));
+        assert!(matches!(manager.get_stats(), Err(MMError::LockPoisoned(_))));
+    }
 }
