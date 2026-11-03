@@ -241,7 +241,9 @@ fn test_kernel_bounds_boundary_factor_two_accepts_largest_b() {
 /// `2S` fills, the bound's worst case, are not reachable: the run stops at
 /// the end of the row in which decision `S` is taken (end of the data or
 /// truncation at `max_steps`), and an order only fills on a later row, so
-/// the last quote never fills.
+/// the last quote never fills. `2S - 2` is the reachable maximum under
+/// the specified truncation semantics, and the `2S` in `B` remains a valid
+/// upper bound.
 fn boundary_run(fee: Decimal, fee_num: u128, fs: u32) {
     let (p, q, steps) = (1_000u64, 1_000u64, 40u64);
     let f = 10u128.pow(fs);
