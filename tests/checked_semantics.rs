@@ -13,6 +13,8 @@ fn midpoint_of_equal_large_prices_stays_at_price() {
     assert_eq!(tick.mid_price(), Decimal::MAX);
     let tick = MarketTick::new(0, Decimal::MIN, dec!(1), Decimal::MIN, dec!(1));
     assert_eq!(tick.mid_price(), Decimal::MIN);
+    let tick = MarketTick::new(0, dec!(5e28), dec!(1), dec!(6e28), dec!(1));
+    assert_eq!(tick.mid_price(), dec!(5.5e28));
 }
 
 #[test]

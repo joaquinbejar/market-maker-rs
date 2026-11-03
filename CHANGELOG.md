@@ -127,6 +127,13 @@ project follows [Semantic Versioning](https://semver.org/).
   `MMError::NumericalError`.
 - `OrderBookSnapshot::mid_price`, `spread` and `spread_bps` (execution)
   return `None` when the arithmetic overflows.
+- `OHLCVBar::typical_price` and `vwap` are an overflow safe mean of high,
+  low and close, so they stay within the bar's range near the bounds.
+- `OrderIntensityEstimator::fill_probability` is 1, not `None`, when the
+  intensity times the horizon overflows.
+- Backtest CAGR computes the exponential of a negative argument as
+  `1 / exp(-x)`, so a short losing run annualizes toward -100% instead of
+  far below it.
 - Mid prices (`MarketTick`, `Quote`, data feed quotes, the VPIN quote
   rule) are exact near the `Decimal` bounds instead of saturating the sum,
   and every book and trade flow imbalance is invariant under a common
@@ -155,6 +162,10 @@ project follows [Semantic Versioning](https://semver.org/).
 These signature changes are breaking and ship in 0.7.0, not in a patch
 release.
 
+- `AccountingStatus` has a new `snapshot_failures` field (`serde(default)`):
+  the execution ids after whose post the accountant's snapshot failed, so
+  the engine kept stale balances. `is_consistent` is false while it is not
+  empty.
 - `QueuePositionFillModel::update_queue` returns `MMResult<()>` and
   rejects a negative bid or ask size with `MMError::InvalidMarketState`,
   leaving its estimates unchanged; `simulate_fill` rejects such a tick the
