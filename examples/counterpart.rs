@@ -5,8 +5,10 @@
 //! ```text
 //! counterpart identity
 //! counterpart calibrate --quotes quotes.csv --config config.json --out surface.json
-//! counterpart price --surface surface.json --dynamics sticky-moneyness|sticky-strike \
-//!     --s-ref S --requests requests.csv --responses responses.csv
+//! counterpart price --surface surface.json --dynamics sticky-moneyness \
+//!     --requests requests.csv --responses responses.csv
+//! counterpart price --surface surface.json --dynamics sticky-strike --s-ref S \
+//!     --requests requests.csv --responses responses.csv
 //! ```
 //!
 //! - `identity` prints, as JSON, the protocol, the crate version and the
@@ -130,12 +132,12 @@ fn run(args: &[String]) -> Protocol<()> {
         .ok_or_else(|| "a command is required: identity, calibrate or price".to_string())?;
     match command.as_str() {
         "identity" | "--identity" => {
-            options(rest, &[])?;
+            options(rest, &[], &[])?;
             println!("{}", identity());
             Ok(())
         }
         "calibrate" => {
-            let o = options(rest, &["quotes", "config", "out"])?;
+            let o = options(rest, &["quotes", "config", "out"], &[])?;
             let quotes = read(&o, "quotes")?;
             let config = read(&o, "config")?;
             let out = calibrate(&config, &quotes)?;
@@ -144,10 +146,11 @@ fn run(args: &[String]) -> Protocol<()> {
         "price" => {
             let o = options(
                 rest,
-                &["surface", "dynamics", "s-ref", "requests", "responses"],
+                &["surface", "dynamics", "requests", "responses"],
+                &["s-ref"],
             )?;
             let surface = surface_from_json(&read(&o, "surface")?)?;
-            let dynamics = dynamics(get(&o, "dynamics")?, get(&o, "s-ref")?)?;
+            let dynamics = dynamics(get(&o, "dynamics")?, o.get("s-ref").map(String::as_str))?;
             let out = price(surface, dynamics, &read(&o, "requests")?)?;
             write(&o, "responses", &out)
         }
@@ -155,21 +158,26 @@ fn run(args: &[String]) -> Protocol<()> {
     }
 }
 
-/// `--key value` pairs; every key is required and no other is accepted.
-fn options(args: &[String], keys: &[&str]) -> Protocol<BTreeMap<String, String>> {
+/// `--key value` pairs: every `required` key, any of the `optional` ones,
+/// and no other.
+fn options(
+    args: &[String],
+    required: &[&str],
+    optional: &[&str],
+) -> Protocol<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let key = flag
             .strip_prefix("--")
-            .filter(|k| keys.contains(k))
+            .filter(|k| required.contains(k) || optional.contains(k))
             .ok_or_else(|| format!("unexpected argument {flag:?}"))?;
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         if out.insert(key.to_string(), value.clone()).is_some() {
             return Err(format!("{flag} given twice"));
         }
     }
-    for key in keys {
+    for key in required {
         if !out.contains_key(*key) {
             return Err(format!("--{key} is required"));
         }
@@ -589,15 +597,21 @@ fn surface_from_json(text: &str) -> Protocol<SviSurface> {
     SviSurface::new(slices, short_expiry).map_err(|e| format!("surface: {e}"))
 }
 
-fn dynamics(name: &str, s_ref: &str) -> Protocol<Dynamics> {
-    let s_ref = decimal("s-ref", s_ref)?;
-    if s_ref <= Decimal::ZERO {
-        return Err(format!("--s-ref must be positive, got {s_ref}"));
-    }
-    match name {
-        "sticky-moneyness" => Ok(Dynamics::StickyMoneyness),
-        "sticky-strike" => Ok(Dynamics::StickyStrike { s_ref }),
-        other => Err(format!(
+/// The dynamics: `--s-ref` is required for sticky strike, where it anchors
+/// the surface, and refused for sticky moneyness, which has no use for it.
+fn dynamics(name: &str, s_ref: Option<&str>) -> Protocol<Dynamics> {
+    match (name, s_ref) {
+        ("sticky-moneyness", None) => Ok(Dynamics::StickyMoneyness),
+        ("sticky-moneyness", Some(_)) => Err("--s-ref applies to sticky-strike only".to_string()),
+        ("sticky-strike", Some(text)) => {
+            let s_ref = decimal("s-ref", text)?;
+            if s_ref <= Decimal::ZERO {
+                return Err(format!("--s-ref must be positive, got {s_ref}"));
+            }
+            Ok(Dynamics::StickyStrike { s_ref })
+        }
+        ("sticky-strike", None) => Err("--s-ref is required for sticky-strike".to_string()),
+        (other, _) => Err(format!(
             "--dynamics {other:?} is not sticky-moneyness or sticky-strike"
         )),
     }
@@ -926,9 +940,22 @@ mod tests {
             .is_err()
         );
         assert!(surface_from_json("{}").is_err());
-        assert!(dynamics("sticky-strike", "0").is_err());
-        assert!(dynamics("sticky-delta", "100").is_err());
-        assert!(options(&["--x".to_string(), "1".to_string()], &["y"]).is_err());
+        assert!(dynamics("sticky-strike", Some("0")).is_err());
+        assert!(dynamics("sticky-strike", None).is_err());
+        assert!(dynamics("sticky-moneyness", Some("100")).is_err());
+        assert!(dynamics("sticky-delta", None).is_err());
+        assert_eq!(
+            dynamics("sticky-moneyness", None).unwrap(),
+            Dynamics::StickyMoneyness
+        );
+        assert_eq!(
+            dynamics("sticky-strike", Some("100")).unwrap(),
+            Dynamics::StickyStrike {
+                s_ref: Decimal::from(100)
+            }
+        );
+        assert!(options(&["--x".to_string(), "1".to_string()], &["y"], &[]).is_err());
+        assert!(options(&[], &[], &["y"]).is_ok());
     }
 
     /// Quotes of a known two-slice SVI surface, bid and ask a relative
