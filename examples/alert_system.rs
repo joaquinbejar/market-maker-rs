@@ -29,8 +29,8 @@ fn main() {
     // Wrapper to use Arc with the manager
     struct ArcHandler(Arc<CollectingAlertHandler>);
     impl AlertHandler for ArcHandler {
-        fn handle(&self, alert: &Alert) {
-            self.0.handle(alert);
+        fn handle(&self, alert: &Alert) -> MMResult<()> {
+            self.0.handle(alert)
         }
         fn accepts_severity(&self, severity: AlertSeverity) -> bool {
             self.0.accepts_severity(severity)
@@ -83,7 +83,9 @@ fn main() {
 
     let mut timestamp = 1000u64;
     for (alert_type, severity) in alerts {
-        manager.alert(alert_type.clone(), severity, timestamp);
+        manager
+            .alert(alert_type.clone(), severity, timestamp)
+            .expect("alert delivery");
         println!("Alert: {:?}", severity);
         println!("  Type: {}", alert_type.type_key());
         println!("  Message: {}", alert_type.default_message());
