@@ -16,15 +16,16 @@ use std::rc::Rc;
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::engine::FeeCurrency;
 use market_maker_rs::backtest::kernel::{
-    ActionStatus, ExecKind, FinancialKernel, GateVerdict, KernelAction, KernelConfig,
-    KernelDataset, KernelEvent, KernelLatency, KernelState, Observation, Phase, ReportRec, Status,
-    TermReason,
+    ActionStatus, EventSink, ExecKind, FinancialKernel, GateVerdict, KernelAction, KernelConfig,
+    KernelDataset, KernelEvent, KernelLatency, KernelState, Observation, Origin, Phase,
+    QueueLengths, ReportRec, Status, TermReason,
 };
 use market_maker_rs::backtest::{
     BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy, ExecutionKind,
     ExecutionReport, MarketTick, SimLatencyConfig, SimulatedFill, SlippageModel, VecDataSource,
 };
 use market_maker_rs::dec;
+use market_maker_rs::execution::Action;
 use market_maker_rs::position::inventory::InventoryPosition;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::risk::pretrade::{LimitsPolicy, PretradeDecision};
@@ -178,9 +179,10 @@ pub fn scenario(seed: u64, index: u64) -> Scenario {
         }
         mid += i64::try_from(rng.below(5)).unwrap() - 2;
         mid = mid.clamp(50, 5_000);
-        let half = 1 + i64::try_from(rng.below(2)).unwrap();
-        let bid = u64::try_from(mid - half).unwrap();
-        let ask = u64::try_from(mid + half).unwrap();
+        // Spreads of 1 to 4 ticks: odd spreads give an odd `bid + ask`.
+        let spread = 1 + i64::try_from(rng.below(4)).unwrap();
+        let bid = u64::try_from(mid - spread / 2).unwrap();
+        let ask = bid + u64::try_from(spread).unwrap();
         let price = |t: u64| Decimal::from(t) * tick;
         let size = |l: u64| Decimal::from(l) * lot;
         ticks.push(MarketTick::new(
@@ -288,6 +290,16 @@ pub struct EngineLog {
     pub decisions: Vec<(u64, Decimal, Decimal)>,
     /// Delivered reports, in delivery order.
     pub delivered: Vec<ExecutionReport>,
+    /// Interleaving of decisions (observed tick time) and deliveries
+    /// (order id, sequence).
+    pub timeline: Vec<Tl>,
+}
+
+/// One entry of the agent timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tl {
+    Decision(u64),
+    Delivery(u64, u64),
 }
 
 /// The engine side of the script.
@@ -308,6 +320,10 @@ impl BacktestStrategy for Scripted {
             position.quantity,
             position.avg_entry_price,
         ));
+        self.log
+            .borrow_mut()
+            .timeline
+            .push(Tl::Decision(tick.timestamp));
         let action = self.scenario.action(self.k, bid, ask);
         self.k += 1;
         match action {
@@ -331,6 +347,10 @@ impl BacktestStrategy for Scripted {
 
     fn on_execution_report(&mut self, report: &ExecutionReport) {
         self.log.borrow_mut().delivered.push(report.clone());
+        self.log
+            .borrow_mut()
+            .timeline
+            .push(Tl::Delivery(report.order_id, report.stamp.sequence));
     }
 
     fn reset(&mut self) {}
@@ -397,6 +417,8 @@ pub struct KernelRun {
     pub events: Vec<KernelEvent>,
     /// Number of events before each decision.
     pub marks: Vec<usize>,
+    /// Queue-bound checks performed.
+    pub probes: u64,
     pub observations: Vec<Observation>,
     pub actions: Vec<KernelAction>,
     pub states: Vec<State>,
@@ -415,12 +437,33 @@ pub fn max_lots(sc: &Scenario) -> u64 {
 
 /// Runs the script on the kernel; `keep_states` keeps the state at every
 /// decision.
+/// Records events and checks the queue bounds after every applied event.
+#[derive(Debug, Default)]
+pub struct Rec {
+    pub events: Vec<KernelEvent>,
+    pub probes: u64,
+}
+
+impl EventSink for Rec {
+    fn event(&mut self, event: KernelEvent) {
+        self.events.push(event);
+    }
+
+    fn queues(&mut self, q: QueueLengths) {
+        assert!(q.orders + q.awaiting <= q.held, "slots {q:?}");
+        assert!(q.msgs <= 2 * q.held, "messages {q:?}");
+        assert!(q.deliveries <= 3 * q.held, "deliveries {q:?}");
+        self.probes += 1;
+    }
+}
+
 pub fn run_kernel(k: &Kernel<'_>, sc: &Scenario, keep_states: bool) -> KernelRun {
-    let mut events = Vec::new();
-    let mut s = k.reset_with(sc.latency_seed, &mut events);
+    let mut rec = Rec::default();
+    let mut s = k.reset_with(sc.latency_seed, &mut rec);
     let mut run = KernelRun {
         events: Vec::new(),
         marks: Vec::new(),
+        probes: 0,
         observations: Vec::new(),
         actions: Vec::new(),
         states: Vec::new(),
@@ -434,14 +477,15 @@ pub fn run_kernel(k: &Kernel<'_>, sc: &Scenario, keep_states: bool) -> KernelRun
         if keep_states {
             run.states.push(s);
         }
-        run.marks.push(events.len());
+        run.marks.push(rec.events.len());
         run.observations.push(obs);
         run.actions.push(action);
-        let out = k.step_with(&mut s, action, &mut events);
+        let out = k.step_with(&mut s, action, &mut rec);
         run.outcomes.push(out.applied);
         decision += 1;
     }
-    run.events = events;
+    run.probes = rec.probes;
+    run.events = rec.events;
     run.last = s;
     run
 }
@@ -490,6 +534,34 @@ pub fn assert_equivalent(k: &Kernel<'_>, sc: &Scenario, kr: &KernelRun, er: &Eng
         Status::Terminal(TermReason::EndOfData),
         "{ctx}: status"
     );
+    compare(k, sc, kr, er, ctx, true);
+}
+
+/// As [`assert_equivalent`] for a run truncated at `max_steps`, against an
+/// engine run on the rows the kernel processed. Everything must match
+/// exactly, except that the engine then flushes the reports still in
+/// flight, which the truncated kernel never delivers: its deliveries and
+/// timeline are a prefix of the engine's.
+pub fn assert_equivalent_truncated(
+    k: &Kernel<'_>,
+    sc: &Scenario,
+    kr: &KernelRun,
+    er: &EngineRun,
+    ctx: &str,
+) {
+    assert_eq!(kr.last.status(), Status::Truncated, "{ctx}: status");
+    compare(k, sc, kr, er, ctx, false);
+}
+
+#[allow(clippy::too_many_lines)]
+fn compare(
+    k: &Kernel<'_>,
+    sc: &Scenario,
+    kr: &KernelRun,
+    er: &EngineRun,
+    ctx: &str,
+    complete: bool,
+) {
     // 1. Execution reports, in creation order.
     let created: Vec<&ReportRec> = kr
         .events
@@ -512,14 +584,37 @@ pub fn assert_equivalent(k: &Kernel<'_>, sc: &Scenario, kr: &KernelRun, er: &Eng
             _ => None,
         })
         .collect();
-    assert_eq!(
-        delivered.len(),
-        er.log.delivered.len(),
-        "{ctx}: delivered count"
-    );
+    if complete {
+        assert_eq!(
+            delivered.len(),
+            er.log.delivered.len(),
+            "{ctx}: delivered count"
+        );
+    } else {
+        assert!(
+            delivered.len() <= er.log.delivered.len(),
+            "{ctx}: delivered count"
+        );
+    }
     for (i, (ours, theirs)) in delivered.iter().zip(&er.log.delivered).enumerate() {
         assert_report(k, ours, theirs, &format!("{ctx}: delivered {i}"));
     }
+    // Interleaving of decisions and deliveries.
+    let timeline: Vec<Tl> = kr
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            KernelEvent::Observed { row, .. } => Some(Tl::Decision(
+                sc.ticks[usize::try_from(*row).unwrap()].timestamp,
+            )),
+            KernelEvent::Delivered(r) => Some(Tl::Delivery(r.order_id, r.seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        timeline, er.log.timeline,
+        "{ctx}: decision and delivery interleaving"
+    );
     // 2. Fills.
     let fills: Vec<_> = kr
         .events
@@ -631,13 +726,14 @@ pub fn assert_equivalent(k: &Kernel<'_>, sc: &Scenario, kr: &KernelRun, er: &Eng
 /// `cancel_pending` agreement: for every delivered kernel report with the
 /// flag set the engine later emits exactly one cancel outcome for the order;
 /// with the flag clear, none. A flagged report with no outcome is only
-/// allowed when the run ended at the end of the data with venue messages
-/// dropped. Returns the number of flagged reports.
+/// allowed when a cancel for that same order was dropped at the end of the
+/// data. Returns the number of flagged reports.
 pub fn assert_cancel_pending_agreement(kr: &KernelRun, er: &EngineRun, ctx: &str) -> (u64, u64) {
-    let dropped = kr
-        .events
-        .iter()
-        .any(|e| matches!(e, KernelEvent::EndOfData { dropped_msgs, .. } if *dropped_msgs > 0));
+    let dropped_cancel = |id: u64| {
+        kr.events.iter().any(
+            |e| matches!(e, KernelEvent::DroppedMsg { order_id, cancel: true } if *order_id == id),
+        )
+    };
     let mut flagged = 0;
     let mut dropped_cases = 0;
     let created: Vec<&ReportRec> = kr
@@ -673,8 +769,8 @@ pub fn assert_cancel_pending_agreement(kr: &KernelRun, er: &EngineRun, ctx: &str
             flagged += 1;
             if later == 0 {
                 assert!(
-                    dropped,
-                    "{ctx}: cancel_pending without outcome and nothing dropped: {r:?}"
+                    dropped_cancel(r.order_id),
+                    "{ctx}: cancel_pending without outcome and no dropped cancel for it: {r:?}"
                 );
                 dropped_cases += 1;
             } else {
@@ -758,11 +854,108 @@ pub fn perturb(
         }
         let tick = sc.cfg.tick_size;
         let mid = (t.bid_price / tick).normalize().mantissa() + i128::from(rng.below(9)) - 4;
-        let half = 1 + i128::from(rng.below(3));
-        let bid = (mid - half).max(1);
+        let spread = 1 + i128::from(rng.below(4));
+        let bid = (mid - spread / 2).max(1);
         t.bid_price = Decimal::from(bid) * tick;
-        t.ask_price = Decimal::from(bid + 2 * half) * tick;
+        t.ask_price = Decimal::from(bid + spread) * tick;
         changed += 1;
     }
     (out, changed)
+}
+
+/// A delivered report as the agent's enriched history: every field except
+/// the venue stamp (`ts_ns`, `seq`).
+pub type Enriched = (
+    u64,
+    Action,
+    ExecKind,
+    Origin,
+    bool,
+    u64,
+    u64,
+    u64,
+    u64,
+    i128,
+);
+
+pub fn enriched(reports: &[ReportRec]) -> Vec<Enriched> {
+    reports
+        .iter()
+        .map(|r| {
+            (
+                r.order_id,
+                r.side,
+                r.kind,
+                r.origin,
+                r.cancel_pending,
+                r.price,
+                r.qty,
+                r.last,
+                r.cum,
+                r.fee_u,
+            )
+        })
+        .collect()
+}
+
+/// Coverage of the seeded run paths.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Coverage {
+    pub odd_mid2_rows: u64,
+    pub fs0_runs_with_fills: u64,
+    pub equal_ts_cancel_wins: u64,
+    pub cancel_before_activation: u64,
+    pub cancel_pending_with_jitter: u64,
+}
+
+/// Counts the paths of one run into `c`.
+pub fn cover(sc: &Scenario, kr: &KernelRun, c: &mut Coverage) {
+    let tick = sc.cfg.tick_size;
+    let ticks = |d: Decimal| (d / tick).normalize().mantissa();
+    c.odd_mid2_rows += sc
+        .ticks
+        .iter()
+        .filter(|t| (ticks(t.bid_price) + ticks(t.ask_price)) % 2 == 1)
+        .count() as u64;
+    if sc.cfg.fee_rate.is_zero() && kr.last.counters().venue_fills > 0 {
+        c.fs0_runs_with_fills += 1;
+    }
+    let reports: Vec<&ReportRec> = kr
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            KernelEvent::Report(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    for (i, r) in reports.iter().enumerate() {
+        if r.kind == ExecKind::Canceled {
+            let accepted = reports[..i]
+                .iter()
+                .any(|p| p.order_id == r.order_id && p.kind == ExecKind::Accepted);
+            if !accepted {
+                c.cancel_before_activation += 1;
+            } else {
+                // The cancel landed at the time of a row that crosses the
+                // order: the cancel won the equal-time race with the fill.
+                let crosses = sc.ticks.iter().any(|t| {
+                    t.timestamp * MS == r.ts_ns && {
+                        let (b, a) = (ticks(t.bid_price), ticks(t.ask_price));
+                        let p = i128::from(r.price);
+                        if r.side == Action::Buy {
+                            a <= p
+                        } else {
+                            b >= p
+                        }
+                    }
+                });
+                if crosses {
+                    c.equal_ts_cancel_wins += 1;
+                }
+            }
+        }
+        if r.cancel_pending && sc.cfg.latency.jitter_q > 0 {
+            c.cancel_pending_with_jitter += 1;
+        }
+    }
 }

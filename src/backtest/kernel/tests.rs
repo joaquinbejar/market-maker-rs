@@ -472,3 +472,250 @@ fn test_kernel_fee_units_match_fee_currency_charge() {
         assert_eq!(notional, price * qty);
     }
 }
+
+/// States of a run with resting orders, pending activations, awaiting
+/// orders and queued deliveries.
+fn busy_states() -> (KernelConfig, KernelDataset) {
+    let latency = KernelLatency::zero(MS).with_delays(1, 5, 8, 3);
+    let cfg = config(latency);
+    let rows = (0..40)
+        .map(|i| tick(1_000 + 3 * i, 96 + i % 4, 100 + i % 3))
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    (cfg, data)
+}
+
+fn collect_states<'d>(k: &FinancialKernel<'d>) -> Vec<KernelState<16, 64, 128, 64>> {
+    let mut s = k.reset(9);
+    let mut out = Vec::new();
+    let mut i = 0u64;
+    while s.phase() == Phase::AwaitDecision {
+        out.push(s);
+        let action = match i % 4 {
+            0 => quote(101, 103),
+            1 => quote(95, 99),
+            2 => KernelAction::Hold,
+            _ => quote(100, 99),
+        };
+        k.step(&mut s, action);
+        i += 1;
+    }
+    out
+}
+
+type Mutation = fn(&mut KernelState<16, 64, 128, 64>, &FinancialKernel<'_>) -> bool;
+
+#[test]
+fn test_kernel_decode_rejects_each_unreachable_state() {
+    let (cfg, data) = busy_states();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    let states = collect_states(&k);
+    for s in &states {
+        assert_eq!(&decode(&encode(s), &k).unwrap(), s);
+    }
+    let mutations: [(&str, Mutation); 12] = [
+        ("resting order price 2^63", |s, _| {
+            s.orders.get_mut(0).map(|o| o.price = 1 << 63).is_some()
+        }),
+        ("activation quantity 0", |s, _| {
+            s.msgs.as_mut_slice().iter_mut().any(|m| match &mut m.kind {
+                book::MsgKind::Activate(o) => {
+                    o.qty = 0;
+                    true
+                }
+                book::MsgKind::Cancel { .. } => false,
+            })
+        }),
+        ("awaiting price above P", |s, k| {
+            let p = k.cfg.p;
+            s.awaiting.get_mut(0).map(|o| o.price = p + 1).is_some()
+        }),
+        ("report price above P", |s, k| {
+            let p = k.cfg.p;
+            s.deliveries
+                .get_mut(0)
+                .map(|d| d.report.price = p + 1)
+                .is_some()
+        }),
+        ("fill quantity above Q", |s, k| {
+            let q = k.cfg.q;
+            s.deliveries
+                .as_mut_slice()
+                .iter_mut()
+                .any(|d| match &mut d.fill {
+                    Some(f) => {
+                        f.qty = q + 1;
+                        true
+                    }
+                    None => false,
+                })
+        }),
+        ("delivered fills", |s, _| {
+            s.agent.delivered_fills += 1;
+            true
+        }),
+        ("delivered local rejects", |s, _| {
+            s.agent.delivered_local_rejects += 1;
+            true
+        }),
+        ("agent position", |s, _| {
+            s.agent.pos.quantity += Decimal::ONE;
+            true
+        }),
+        ("open order without counterpart", |s, _| {
+            let id = (1..s.next_order_id).find(|id| !s.is_open(*id));
+            match id {
+                Some(id) => {
+                    let at = s
+                        .account
+                        .position(|o| o.order_id > id)
+                        .unwrap_or(s.account.len());
+                    s.account
+                        .insert(
+                            at,
+                            account::OpenOrder {
+                                order_id: id,
+                                awaiting_cancel_outcome: false,
+                            },
+                        )
+                        .is_ok()
+                }
+                None => false,
+            }
+        }),
+        ("running at max_steps", |s, k| {
+            s.step = k.cfg.s_max;
+            s.counters.actions = k.cfg.s_max;
+            true
+        }),
+        ("maximum position beyond X_eff", |s, k| {
+            s.venue.max_abs_pos = k.cfg.x_eff + 1;
+            true
+        }),
+        ("time after the current row", |s, k| {
+            match s.cur_row.and_then(|r| k.data.row(r)) {
+                Some(row) => {
+                    s.now_ns = row.ts_ns + 1;
+                    true
+                }
+                None => false,
+            }
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let mut applied = false;
+        for base in &states {
+            let mut s = *base;
+            if mutate(&mut s, &k) {
+                assert!(decode(&encode(&s), &k).is_err(), "{name} decoded");
+                applied = true;
+            }
+        }
+        assert!(applied, "{name} never applicable");
+    }
+}
+
+#[test]
+fn test_kernel_mask_matches_admission_under_capacity_pressure() {
+    // Small capacities, no capacity check: the account fills up and the
+    // mask's refusal branch must agree with admission on 256 quotes.
+    let latency = KernelLatency::zero(MS).with_delays(0, 3, 6, 2);
+    let cfg = config(latency);
+    let rows = (0..30)
+        .map(|i| tick(1_000 + i, 97 + i % 3, 101 + i % 2))
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k: FinancialKernel<'_, 6, 12, 18, 8> =
+        FinancialKernel::new_relaxed(&cfg, &data, false, false, true).unwrap();
+    let grid = ActionGrid::new([0, 1, 3, 2_000], [0, 2, 4, 3_000], [1, 2, 10, 11]).unwrap();
+    let mut s = k.reset(5);
+    let (mut refused, mut admitted, mut decisions) = (0u64, 0u64, 0u64);
+    while s.phase() == Phase::AwaitDecision {
+        let mask = k.mask(&s, &grid);
+        let mut probes = 0;
+        for b in 0..4 {
+            for a in 0..4 {
+                for x in 0..4 {
+                    for y in 0..4 {
+                        let allowed = mask.allows(b, a, x, y);
+                        let applied = match k.grid_action(&s, &grid, (b, a, x, y)) {
+                            Some(action) => {
+                                let mut c = s;
+                                let out = k.step(&mut c, action).applied;
+                                if let (Some(reason), ActionStatus::Rejected(got)) =
+                                    (mask.refusal, out)
+                                    && matches!(
+                                        got,
+                                        RejectReason::CapacityOrders
+                                            | RejectReason::CapacityMsgs
+                                            | RejectReason::CapacityDeliveries
+                                    )
+                                {
+                                    assert_eq!(got, reason);
+                                }
+                                out == ActionStatus::Applied
+                            }
+                            None => false,
+                        };
+                        assert_eq!(applied, allowed, "mask {mask:?} at {:?}", (b, a, x, y));
+                        admitted += u64::from(applied);
+                        probes += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(probes, 256);
+        if mask.refusal.is_some() {
+            assert!(!mask.global_quote_ok);
+            refused += 1;
+        }
+        decisions += 1;
+        k.step(&mut s, quote(90, 110));
+    }
+    assert!(refused > 0, "capacity refusal never reached");
+    assert!(admitted > 0 && decisions > refused);
+}
+
+#[test]
+fn test_kernel_config_rejects_trailing_zero_scales() {
+    let base = config(KernelLatency::zero(MS));
+    let mut tick_zeros = base.clone();
+    tick_zeros.tick_size = dec!(1.000);
+    let mut lot_zeros = base.clone();
+    lot_zeros.lot_size = dec!(0.0010);
+    let mut fee_zeros = base.clone();
+    fee_zeros.fee_rate = dec!(0.00010);
+    let mut capital = base.clone();
+    capital.initial_capital = dec!(1000.000);
+    for c in [tick_zeros, lot_zeros, fee_zeros, capital] {
+        assert!(
+            config::validate(&c, config::Relax::default()).is_err(),
+            "{c:?}"
+        );
+    }
+    // Dataset prices and sizes written beyond the grid scale.
+    let ticks = [crate::backtest::MarketTick::new(
+        1,
+        dec!(98.0),
+        dec!(1),
+        dec!(102),
+        dec!(1),
+    )];
+    assert!(KernelDataset::from_ticks(&ticks, &base).is_err());
+    let ticks = [crate::backtest::MarketTick::new(
+        1,
+        dec!(98),
+        dec!(1.00),
+        dec!(102),
+        dec!(1),
+    )];
+    assert!(KernelDataset::from_ticks(&ticks, &base).is_err());
+    let ticks = [crate::backtest::MarketTick::new(
+        1,
+        dec!(98),
+        dec!(1),
+        dec!(102),
+        dec!(1),
+    )];
+    assert!(KernelDataset::from_ticks(&ticks, &base).is_ok());
+}

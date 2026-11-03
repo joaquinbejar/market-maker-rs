@@ -233,57 +233,88 @@ fn test_kernel_bounds_boundary_factor_two_accepts_largest_b() {
     assert!(build(&at(limit - 42, 2)).is_err(), "S + 1");
 }
 
-#[test]
-fn test_kernel_bounds_fills_at_max_price_and_size_never_halt() {
-    // B at the factor 2 limit through C0; every decision buys Q lots at
-    // P - 1 and the next row fills it.
+/// Runs the most fills the truncation rule allows, `2S - 2` fills of `Q`
+/// lots next to `P` (both sides of every quote but the last), with `B`
+/// exactly at the limit for `fee` (factor 20 when the fee scale is 0, else
+/// 2), and checks every report and ledger value against the engine.
+///
+/// `2S` fills, the bound's worst case, are not reachable: the run stops at
+/// the end of the row in which decision `S` is taken (end of the data or
+/// truncation at `max_steps`), and an order only fills on a later row, so
+/// the last quote never fills.
+fn boundary_run(fee: Decimal, fee_num: u128, fs: u32) {
     let (p, q, steps) = (1_000u64, 1_000u64, 40u64);
-    let f = 1_000u128;
+    let f = 10u128.pow(fs);
     let n = u128::from(p * q) * f;
-    let fee = u128::from(p * q);
+    let fee_u = u128::from(p * q) * fee_num;
     let x = 2 * u128::from(steps * q);
-    let rest = 2 * u128::from(steps) * (n + fee) + x * u128::from(p) * f;
-    let limit = ((1u128 << 96) - 1) / 2;
+    let rest = 2 * u128::from(steps) * (n + fee_u) + x * u128::from(p) * f;
+    let factor = if fs == 0 { 20 } else { 2 };
+    let limit = ((1u128 << 96) - 1) / factor;
     let c0 = i128::try_from(limit - rest).unwrap();
     let config = cfg(
         dec!(1),
         dec!(1),
-        dec!(0.001),
+        fee,
         steps,
         Decimal::from(p),
         Decimal::from(q),
-        Decimal::try_from_i128_with_scale(c0, 3).unwrap(),
-    );
-    let rows = (0..steps)
-        .map(|i| KernelTick {
-            ts_ns: (i + 1) * MS,
-            bid: 1,
-            bid_lots: 1,
-            ask: 2,
-            ask_lots: 1,
+        Decimal::try_from_i128_with_scale(c0, fs).unwrap(),
+    )
+    .with_latency(KernelLatency::zero(MS).with_delays(3, 0, 5, 0));
+    // Rows alternate (1, 2), which fills a buy at P - 2, and (P - 1, P),
+    // which fills a sell at P - 1 (the highest a sell can fill, as every
+    // ask is at most P). The gap before row S - 1 leaves the second to last
+    // quote two rows before the last decision.
+    let rows: Vec<(u64, u64, u64)> = (0..steps + 3)
+        .map(|i| {
+            let ts = 1_000 + i + if i >= steps - 1 { 2 } else { 0 };
+            if i % 2 == 0 {
+                (ts, 1, 2)
+            } else {
+                (ts, p - 1, p)
+            }
         })
         .collect();
-    let data = KernelDataset::from_kernel_ticks(rows, &config).unwrap();
-    let k: Small<'_> = FinancialKernel::new(&config, &data).unwrap();
-    assert_eq!(k.bound(), limit);
-    let mut s = k.reset(0);
-    while s.phase() == Phase::AwaitDecision {
-        k.step(
-            &mut s,
-            KernelAction::Quote {
-                bid: p - 1,
-                ask: p,
-                bid_lots: q,
-                ask_lots: q,
-            },
-        );
-    }
-    assert_eq!(s.status(), Status::Terminal(TermReason::EndOfData));
-    assert_eq!(s.counters().venue_fills, steps - 1);
+    let ticks = rows
+        .iter()
+        .map(|(ts, b, a)| {
+            MarketTick::new(*ts, Decimal::from(*b), dec!(1), Decimal::from(*a), dec!(1))
+        })
+        .collect();
+    let actions = (0..steps)
+        .map(|_| KernelAction::Quote {
+            bid: p - 2,
+            ask: p - 1,
+            bid_lots: q,
+            ask_lots: q,
+        })
+        .collect();
+    let sc = Scenario::fixed(config, ticks, actions);
+    let data = sc.data();
+    let k = kernel(&sc, &data);
+    assert_eq!(k.bound(), limit, "B at the factor {factor} limit");
+    let kr = run_kernel(&k, &sc, false);
+    assert_eq!(kr.last.status(), Status::Terminal(TermReason::EndOfData));
+    assert_eq!(kr.observations.len(), usize::try_from(steps).unwrap());
     assert_eq!(
-        s.venue_position_lots(),
-        i64::try_from((steps - 1) * q).unwrap()
+        kr.last.counters().venue_fills,
+        2 * steps - 2,
+        "2S - 2 fills"
     );
+    assert_eq!(kr.last.counters().halts, 0);
+    let er = run_engine(&sc);
+    assert_equivalent(&k, &sc, &kr, &er, &format!("boundary fs {fs}"));
+}
+
+#[test]
+fn test_kernel_bounds_fills_at_max_price_and_size_never_halt() {
+    boundary_run(dec!(0.001), 1, 3);
+}
+
+#[test]
+fn test_kernel_bounds_factor_twenty_boundary_full_run_never_halts() {
+    boundary_run(dec!(0), 0, 0);
 }
 
 #[test]
@@ -696,15 +727,27 @@ fn grid() -> ActionGrid<3, 2> {
     ActionGrid::new([0, 1, 4], [0, 2, 3], [1, 2]).unwrap()
 }
 
+/// 4 x 4 offsets and 4 sizes: 256 quotes, some out of range.
+fn big_grid() -> ActionGrid<4, 4> {
+    ActionGrid::new([0, 1, 4, 9_000], [0, 2, 3, 12_000], [1, 2, 10, 11]).unwrap()
+}
+
 fn admissions(k: &Kernel<'_>, s: &State) -> Vec<ActionStatus> {
-    let g = grid();
+    admissions_on(k, s, &grid())
+}
+
+fn admissions_on<const K: usize, const M: usize>(
+    k: &Kernel<'_>,
+    s: &State,
+    g: &ActionGrid<K, M>,
+) -> Vec<ActionStatus> {
     let mut out = Vec::new();
-    for b in 0..3 {
-        for a in 0..3 {
-            for x in 0..2 {
-                for y in 0..2 {
+    for b in 0..K {
+        for a in 0..K {
+            for x in 0..M {
+                for y in 0..M {
                     let mut c = *s;
-                    out.push(match k.grid_action(s, &g, (b, a, x, y)) {
+                    out.push(match k.grid_action(s, g, (b, a, x, y)) {
                         Some(action) => k.step(&mut c, action).applied,
                         None => ActionStatus::Rejected(RejectReason::PriceRange),
                     });
@@ -746,8 +789,11 @@ fn test_kernel_hidden_progress_leaves_mask_and_admission_identical() {
                 for j in 0..kr.states.len() {
                     let (a, ha, oa) = run_prefix(&k, base.latency_seed, &kr.actions, j);
                     let (b, hb, ob) = run_prefix(&vk, variant.latency_seed, &kr.actions, j);
-                    if b.phase() != Phase::AwaitDecision || ha != hb || oa != ob {
-                        break;
+                    if b.phase() != Phase::AwaitDecision
+                        || enriched(&ha) != enriched(&hb)
+                        || oa != ob
+                    {
+                        continue;
                     }
                     // Same observed rows: every row up to the observed one.
                     let row = usize::try_from(k.observe(&a).row.unwrap()).unwrap();
@@ -778,25 +824,27 @@ fn test_kernel_hidden_progress_leaves_mask_and_admission_identical() {
 
 #[test]
 fn test_kernel_mask_exactness_full_grid_matches_admission() {
-    for seed in 0..10 {
+    // Every one of the 256 grid quotes at every decision.
+    let mut admitted = [0u64; 2];
+    for seed in 0..5 {
         for index in 0..DATASETS {
             let sc = scenario(seed, index);
             let data = sc.data();
             let k = kernel(&sc, &data);
             let kr = run_kernel(&k, &sc, true);
-            let g = grid();
+            let g = big_grid();
             for s in &kr.states {
                 let mask = k.mask(s, &g);
-                let all = admissions(&k, s);
+                let all = admissions_on(&k, s, &g);
+                assert_eq!(all.len(), 256);
                 let mut i = 0;
-                for b in 0..3 {
-                    for a in 0..3 {
-                        for x in 0..2 {
-                            for y in 0..2 {
-                                assert_eq!(
-                                    all[i] == ActionStatus::Applied,
-                                    mask.allows(b, a, x, y)
-                                );
+                for b in 0..4 {
+                    for a in 0..4 {
+                        for x in 0..4 {
+                            for y in 0..4 {
+                                let applied = all[i] == ActionStatus::Applied;
+                                assert_eq!(applied, mask.allows(b, a, x, y));
+                                admitted[usize::from(applied)] += 1;
                                 i += 1;
                             }
                         }
@@ -805,6 +853,7 @@ fn test_kernel_mask_exactness_full_grid_matches_admission() {
             }
         }
     }
+    assert!(admitted[0] > 0 && admitted[1] > 0, "{admitted:?}");
 }
 
 #[test]

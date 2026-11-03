@@ -29,6 +29,7 @@ const TAIL: usize = 123;
 #[test]
 fn test_kernel_equivalence_seeded_runs_match_engine_exactly() {
     let mut cover = [0u64; 8];
+    let mut paths = Coverage::default();
     for seed in 0..seeds() {
         for index in 0..DATASETS {
             let ctx = format!("seed {seed} dataset {index}");
@@ -39,6 +40,8 @@ fn test_kernel_equivalence_seeded_runs_match_engine_exactly() {
             let er = run_engine(&sc);
             assert_equivalent(&k, &sc, &kr, &er, &ctx);
             let (flagged, dropped) = assert_cancel_pending_agreement(&kr, &er, &ctx);
+            harness::cover(&sc, &kr, &mut paths);
+            assert!(kr.probes > 0, "{ctx}: no queue-bound probe");
             // With the capacities new() requires, no capacity reject.
             let rejected = kr.last.counters().rejected;
             for reason in [
@@ -93,6 +96,18 @@ fn test_kernel_equivalence_seeded_runs_match_engine_exactly() {
     .zip(cover)
     {
         assert!(count > 0, "no {name} in the seeded runs");
+    }
+    // Odd mids and fs = 0 runs compare equity and drawdown in half money
+    // units; the race and jitter paths are exercised against the engine.
+    let p = paths;
+    for (name, count) in [
+        ("odd bid + ask rows", p.odd_mid2_rows),
+        ("fee scale 0 runs with fills", p.fs0_runs_with_fills),
+        ("equal-time cancel beating a fill", p.equal_ts_cancel_wins),
+        ("cancel before activation", p.cancel_before_activation),
+        ("cancel_pending with jitter", p.cancel_pending_with_jitter),
+    ] {
+        assert!(count > 0, "no {name} in the seeded runs: {p:?}");
     }
 }
 
@@ -261,8 +276,9 @@ fn check_lookahead(
         let pdata = psc.data();
         let pk = kernel(&psc, &pdata);
         let (ps, hist, out) = run_prefix(&pk, sc.latency_seed, &kr.actions, j);
-        let same_history =
-            ps.phase() == Phase::AwaitDecision && hist == base_hist && out == base_out;
+        let same_history = ps.phase() == Phase::AwaitDecision
+            && enriched(&hist) == enriched(&base_hist)
+            && out == base_out;
         if *strict {
             assert!(same_history, "{ctx}: {name}: delivered history changed");
         }
