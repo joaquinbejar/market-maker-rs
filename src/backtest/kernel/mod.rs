@@ -492,7 +492,8 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         }
     }
 
-    /// Admission then the transaction; a transaction failure halts.
+    /// Admission then the transaction; a transaction failure rolls back,
+    /// halts and reports `Rejected(Terminal)`.
     fn admit_apply<E: EventSink>(
         &self,
         s: &mut KernelState<ORD, MSG, DLV, OBS>,
@@ -502,12 +503,16 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     ) -> ActionStatus {
         match admitted {
             Err(reason) => ActionStatus::Rejected(reason),
-            Ok(()) => {
-                if let Err(reason) = step::apply_quote(&self.cfg, s, legs, em) {
+            Ok(()) => match step::apply_quote(&self.cfg, s, legs, em) {
+                Ok(()) => ActionStatus::Applied,
+                // The transaction was rolled back and the run halted: the
+                // action never took effect. `StepOutcome::status` carries
+                // the halt reason.
+                Err(reason) => {
                     step::halt(s, reason, em);
+                    ActionStatus::Rejected(RejectReason::Terminal)
                 }
-                ActionStatus::Applied
-            }
+            },
         }
     }
 

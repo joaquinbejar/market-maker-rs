@@ -101,7 +101,9 @@ impl HaltReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RejectReason {
-    /// The run is over (or the state is not at a decision point).
+    /// The run is over (or the state is not at a decision point), or the
+    /// action's transaction failed and halted the run: it never took effect
+    /// and [`StepOutcome::status`] gives the halt reason.
     Terminal = 1,
     /// A price is outside `min..=max_price` ticks.
     PriceRange = 2,

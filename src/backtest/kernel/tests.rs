@@ -1146,3 +1146,52 @@ fn test_kernel_decode_rejects_counters_out_of_range_on_a_reset_state() {
     k.step(&mut next, quote(97, 103));
     assert!(!matches!(next.status(), Status::Halted(_)));
 }
+
+#[test]
+fn test_kernel_transaction_halt_reports_rejected_and_rolls_back() {
+    let latency = KernelLatency::zero(MS).with_delays(0, 3, 4, 2);
+    let cfg = config(latency);
+    let rows = (0..8).map(|i| tick(1_000 + i, 97, 101)).collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k: FinancialKernel<'_> =
+        FinancialKernel::new_relaxed(&cfg, &data, true, false, true).unwrap();
+    let mut s = k.reset(0);
+    k.step(&mut s, quote(95, 105));
+    // The next order id cannot advance: the transaction fails after it
+    // already scheduled the cancels of the resting orders.
+    s.next_order_id = u64::MAX;
+    let before = s;
+    let mut events = Vec::new();
+    let out = k.step_with(&mut s, quote(96, 104), &mut events);
+    assert_eq!(out.applied, ActionStatus::Rejected(RejectReason::Terminal));
+    assert_eq!(out.status, Status::Halted(HaltReason::CounterOverflow));
+    assert_eq!(s.status(), Status::Halted(HaltReason::CounterOverflow));
+    assert_eq!(s.phase(), Phase::Terminal);
+    assert_eq!(s.counters().halts, 1);
+    // Rolled back: no cancel, order, delivery, draw or reservation stays.
+    assert_eq!(s.msgs, before.msgs);
+    assert_eq!(s.orders, before.orders);
+    assert_eq!(s.deliveries, before.deliveries);
+    assert_eq!(s.account, before.account);
+    assert_eq!(s.gate, before.gate);
+    assert_eq!(s.rng_latency, before.rng_latency);
+    assert_eq!(
+        (s.stamp_seq, s.next_msg_seq, s.next_order_id),
+        (before.stamp_seq, before.next_msg_seq, before.next_order_id)
+    );
+    assert_eq!(
+        s.last, before.last,
+        "no outcome recorded for the failed action"
+    );
+    assert_eq!(s.counters().rejected, before.counters().rejected);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, KernelEvent::Report(_) | KernelEvent::Decided(_)))
+    );
+    assert!(events.contains(&KernelEvent::Halted(HaltReason::CounterOverflow)));
+    // The halted state stays halted and unchanged.
+    let halted = s;
+    assert_eq!(k.step(&mut s, KernelAction::Hold).events, 0);
+    assert_eq!(s, halted);
+}

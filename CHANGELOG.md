@@ -78,7 +78,9 @@ project follows [Semantic Versioning](https://semver.org/).
   which accepts only states satisfying every invariant `step` relies on;
   `fingerprint`), validated `KernelDataset`s, event sinks
   and a `QuoteAdapter` for Avellaneda-Stoikov and GLFT quotes (bound to one
-  kernel; GLFT at an inventory bound posts a one-sided action). Inside its
+  kernel; GLFT at an inventory bound posts a one-sided action). An action
+  whose transaction fails is rolled back and reported as
+  `Rejected(Terminal)` with the halt in the step status. Inside its
   subset (immediate fills, quote fees, optional `LimitsPolicy` limits,
   latency with jitter, ordered data) it reproduces engine runs exactly;
   `new` rejects configurations outside the exactness bounds and capacities
