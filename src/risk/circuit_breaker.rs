@@ -575,10 +575,16 @@ impl CircuitBreaker {
 
         // This check cannot fail, so the arithmetic saturates; a drawdown
         // beyond the `Decimal` range trips the breaker (fail closed).
-        let drawdown = window_peak
-            .saturating_sub(self.current_equity)
+        // Computed as `1 - equity / peak` so no intermediate is clamped.
+        let drawdown = self
+            .current_equity
             .checked_div(window_peak)
-            .unwrap_or(Decimal::MAX);
+            .and_then(|ratio| Decimal::ONE.checked_sub(ratio))
+            .unwrap_or(if self.current_equity.is_sign_negative() {
+                Decimal::MAX
+            } else {
+                Decimal::MIN
+            });
         drawdown >= self.config.rapid_drawdown_threshold
     }
 

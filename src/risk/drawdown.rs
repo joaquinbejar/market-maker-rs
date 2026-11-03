@@ -258,7 +258,9 @@ impl DrawdownTracker {
     /// ```
     #[must_use]
     pub fn current_drawdown_pct(&self) -> Decimal {
-        self.current_drawdown() * Decimal::ONE_HUNDRED
+        // Saturates like `current_drawdown`: an unrepresentable drawdown
+        // reads as `Decimal::MAX`.
+        self.current_drawdown().saturating_mul(Decimal::ONE_HUNDRED)
     }
 
     /// Checks if the maximum allowed drawdown has been reached or exceeded.
@@ -422,20 +424,48 @@ impl DrawdownTracker {
     }
 }
 
-/// Relative drawdown `(peak - equity) / peak` for a positive `peak`.
+/// Relative drawdown `(peak - equity) / peak` for a positive `peak`,
+/// computed as `1 - equity / peak` so no intermediate is clamped.
 ///
-/// Callers cannot return errors, so the arithmetic saturates: a drawdown
-/// beyond the `Decimal` range reads as `Decimal::MAX`, which breaches any
-/// limit (fail closed).
+/// Callers cannot return errors, so only a ratio that is itself beyond the
+/// `Decimal` range saturates, with its sign: a huge drawdown reads as
+/// `Decimal::MAX` (which breaches any limit, fail closed) and a huge
+/// negative one as `Decimal::MIN`.
 fn drawdown_from(peak: Decimal, equity: Decimal) -> Decimal {
-    peak.saturating_sub(equity)
+    let ratio_overflow = || {
+        // `equity / peak` overflowed or `1 - ratio` did: the sign of the
+        // true ratio is the opposite of the sign of `equity`.
+        if equity.is_sign_negative() {
+            Decimal::MAX
+        } else {
+            Decimal::MIN
+        }
+    };
+    equity
         .checked_div(peak)
-        .unwrap_or(Decimal::MAX)
+        .and_then(|ratio| Decimal::ONE.checked_sub(ratio))
+        .unwrap_or_else(ratio_overflow)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_drawdown_from_huge_values_keeps_ratio_exact() {
+        // `peak - equity` overflows here, but the ratio is representable.
+        let peak = Decimal::MAX;
+        let equity = -Decimal::MAX;
+        assert_eq!(drawdown_from(peak, equity), dec!(2));
+    }
+
+    #[test]
+    fn test_current_drawdown_pct_extreme_loss_saturates() {
+        let mut tracker =
+            DrawdownTracker::new(dec!(0.0000000000000000000000000001), dec!(0.20)).unwrap();
+        tracker.update(Decimal::MIN, 1000);
+        assert_eq!(tracker.current_drawdown_pct(), Decimal::MAX);
+    }
 
     #[test]
     fn test_update_extreme_loss_saturates_and_breaches() {
