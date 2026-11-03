@@ -144,10 +144,22 @@ project follows [Semantic Versioning](https://semver.org/).
   still rests stays tracked, and the first failure is returned after every
   order was attempted. `MockExchangeConnector::cancel_all_orders` returns
   the first cancel error, `LockPoisoned` included, instead of dropping it.
-  Calling again retries the orders that failed (#146).
+  Calling again retries the orders that failed. An order the book no
+  longer knows (filled or cancelled outside the connector) is unmapped and
+  left out of the cancelled responses instead of failing every later
+  call, and an order re-mapped by a concurrent modify is cancelled through
+  its current book id (#146).
 
 ### Breaking
 
+These signature changes are breaking and ship in 0.7.0, not in a patch
+release.
+
+- `QueuePositionFillModel::update_queue` returns `MMResult<()>` and
+  rejects a negative bid or ask size with `MMError::InvalidMarketState`,
+  leaving its estimates unchanged; `simulate_fill` rejects such a tick the
+  same way. Invalid sizes are never read as an empty queue, which would
+  fill orders at once (#144).
 - Checked arithmetic (#144): these now return `MMResult` and report an
   overflow as `MMError::NumericalError`:
   - `InventoryPosition::update_fill` returns `MMResult<()>` and leaves the
@@ -182,6 +194,11 @@ project follows [Semantic Versioning](https://semver.org/).
   position, cash flow, realized PnL and fee totals before it touches the
   order, the policy or itself; a fill that would overflow any of them is
   recorded as a fault and changes nothing, instead of saturating.
+- Values documented as report only (notionals, totals, utilizations,
+  analytics statistics, backtest metrics) saturate at the `Decimal` bounds;
+  every value that feeds a quote, a mark, a signal or state is computed
+  overflow safe or returns a typed error. A `ProbabilisticFillModel` time
+  component too large to represent saturates to 1, its clamp.
 - `SimulatedFill::base_delta`, `ProbabilisticFillModel` probabilities and
   `MarginLedgerAccountant` base fees report overflow instead of
   saturating.
