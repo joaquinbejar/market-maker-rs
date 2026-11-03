@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `options::surface` (feature `options`): the `VolSurface` trait (total
+  implied variance `w(k, tau)` and its derivatives at a log forward
+  moneyness and a time to expiry), the validated `TotalVariance` value,
+  `check_point` and a `FlatSurface`. Model arithmetic there is `f64`, an
+  explicit exception documented in the module (#95, #96).
+
 ### Changed
 
 - `BacktestEngine::faults` keeps only the first `MAX_RECORDED_FAULTS` (16)
