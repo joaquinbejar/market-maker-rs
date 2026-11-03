@@ -99,7 +99,21 @@ pub enum MMError {
         /// Why the contract is not supported.
         reason: String,
     } = 9,
+
+    /// A price whose true value is positive is below the smallest positive
+    /// `f64` (about 4.9e-324), so it cannot be represented.
+    ///
+    /// Returned by `options::pricing::black_undiscounted` (feature `options`)
+    /// for `w > 0`, where the Black price is strictly positive. It is never
+    /// replaced by 0; an implied volatility solver can treat it as "below
+    /// the representable range" and must propagate every other error. It is
+    /// a numerical limit: [`MMError::is_numerical_error`] is true for it.
+    #[error("numerical error: {}", PRICE_UNDERFLOW_MESSAGE)]
+    PriceUnderflow = 10,
 }
+
+/// The message of [`MMError::PriceUnderflow`].
+const PRICE_UNDERFLOW_MESSAGE: &str = "Black price is positive but below the smallest positive f64";
 
 impl MMError {
     /// Returns true if this error is related to configuration issues.
@@ -114,10 +128,11 @@ impl MMError {
         matches!(self, Self::InvalidMarketState(_))
     }
 
-    /// Returns true if this error is related to numerical issues.
+    /// Returns true if this error is related to numerical issues:
+    /// [`MMError::NumericalError`] and [`MMError::PriceUnderflow`].
     #[must_use]
     pub fn is_numerical_error(&self) -> bool {
-        matches!(self, Self::NumericalError(_))
+        matches!(self, Self::NumericalError(_) | Self::PriceUnderflow)
     }
 
     /// Returns true if this error is related to connection issues.
@@ -140,6 +155,7 @@ impl MMError {
             | Self::LockPoisoned(msg) => msg,
             Self::UnsupportedContract { reason } => reason,
             Self::UnsupportedAction { .. } => "only buy and sell are supported",
+            Self::PriceUnderflow => PRICE_UNDERFLOW_MESSAGE,
         }
     }
 }
@@ -270,6 +286,33 @@ mod tests {
         assert!(!err.is_market_state_error());
         assert!(!err.is_numerical_error());
         assert!(!err.is_connection_error());
+    }
+
+    #[test]
+    fn test_price_underflow_display_message_and_class() {
+        let err = MMError::PriceUnderflow;
+        assert_eq!(
+            err.to_string(),
+            "numerical error: Black price is positive but below the smallest positive f64"
+        );
+        assert_eq!(
+            err.message(),
+            "Black price is positive but below the smallest positive f64"
+        );
+        assert!(err.is_numerical_error());
+        assert!(!err.is_configuration_error());
+        assert!(!err.is_market_state_error());
+        assert!(!err.is_connection_error());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_price_underflow_serialization() {
+        let err = MMError::PriceUnderflow;
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(json, r#"{"type":"PriceUnderflow"}"#);
+        let deserialized: MMError = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, err);
     }
 
     #[cfg(feature = "serde")]

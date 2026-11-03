@@ -562,15 +562,16 @@ impl Model {
 ///
 /// The domain is every finite positive `F` and `K` and finite `w >= 0`. For
 /// `w > 0` the true price is strictly positive; a price below the smallest
-/// positive `f64` (about 4.9e-324) is an error, never a 0. Prices in the
-/// subnormal range keep only the precision that range has.
+/// positive `f64` (about 4.9e-324) is [`MMError::PriceUnderflow`], never a 0.
+/// Prices in the subnormal range keep only the precision that range has.
 ///
 /// # Errors
 ///
-/// [`MMError::InvalidMarketState`] when `F` or `K` is not finite and
-/// positive, or `w` is negative or not finite; [`MMError::NumericalError`]
-/// for a non-finite result or a positive price below the smallest positive
-/// `f64`.
+/// - [`MMError::InvalidMarketState`] when `F` or `K` is not finite and
+///   positive, or `w` is negative or not finite.
+/// - [`MMError::PriceUnderflow`] when `w > 0` and the price, positive in
+///   exact arithmetic, is below the smallest positive `f64`.
+/// - [`MMError::NumericalError`] for a non-finite intermediate or result.
 pub fn black_undiscounted(fwd: f64, strike: f64, w: f64, style: OptionStyle) -> MMResult<f64> {
     check_black(fwd, strike, w)?;
     let call = matches!(style, OptionStyle::Call);
@@ -583,9 +584,7 @@ pub fn black_undiscounted(fwd: f64, strike: f64, w: f64, style: OptionStyle) -> 
     let price = black_price(fwd, strike, k, vol, call)?;
     if price == 0.0 {
         // The true price is positive for w > 0: never report it as 0.
-        return Err(numerical(
-            "Black price is positive but below the smallest positive f64".to_string(),
-        ));
+        return Err(MMError::PriceUnderflow);
     }
     Ok(price)
 }

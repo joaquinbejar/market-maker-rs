@@ -551,7 +551,7 @@ fn test_black_is_increasing_in_w_from_the_intrinsic_value() {
                 // the smallest f64: an error, never 0, and never again once
                 // the price is representable.
                 let p = match black_undiscounted(fwd, strike, w, style) {
-                    Err(MMError::NumericalError(_)) if intrinsic == 0.0 && !representable => {
+                    Err(MMError::PriceUnderflow) if intrinsic == 0.0 && !representable => {
                         continue;
                     }
                     other => other.unwrap(),
@@ -964,13 +964,23 @@ fn test_black_at_the_edges_of_the_f64_range_has_no_overflow() {
 fn test_black_price_below_the_smallest_f64_is_an_error_not_zero() {
     // h = ln(1e-300) / 0.01 = -69078: the true price is positive and far below
     // the smallest subnormal.
-    assert!(matches!(
+    assert_eq!(
         black_undiscounted(1.0, 1e300, 1e-4, OptionStyle::Call),
-        Err(MMError::NumericalError(_))
-    ));
-    assert!(matches!(
+        Err(MMError::PriceUnderflow)
+    );
+    assert_eq!(
         black_undiscounted(1e300, 1.0, 1e-4, OptionStyle::Put),
-        Err(MMError::NumericalError(_))
+        Err(MMError::PriceUnderflow)
+    );
+    // w = 0 out of the money is its intrinsic value, exactly 0, not an error.
+    assert_eq!(
+        black_undiscounted(1.0, 1e300, 0.0, OptionStyle::Call),
+        Ok(0.0)
+    );
+    // Invalid inputs keep their class.
+    assert!(matches!(
+        black_undiscounted(f64::NAN, 1.0, 1e-4, OptionStyle::Call),
+        Err(MMError::InvalidMarketState(_))
     ));
     // The in-the-money side of the same pair is its intrinsic value.
     assert_eq!(
