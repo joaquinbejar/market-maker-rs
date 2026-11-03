@@ -60,6 +60,7 @@ jobs:
           - options
           - chain
           - data-feeds
+          - l3
           - api
           - persistence
           - multi-underlying
