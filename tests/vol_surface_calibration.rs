@@ -197,6 +197,16 @@ fn test_holdout_compares_svi_with_the_baseline_by_bucket() {
     .unwrap();
     assert_eq!(report.not_applicable, vec![(CUTOFF + 365 * DAY, 6)]);
     assert!(report.fit_failures.is_empty(), "{:?}", report.fit_failures);
+    assert!(report.baseline_failures.is_empty());
+    assert_eq!(report.wings_unassigned, 0);
+    assert_eq!(report.shortest_expiry, Some(CUTOFF + 7 * DAY));
+    assert_eq!(report.expiries.len(), 4);
+    assert!(
+        report
+            .expiries
+            .iter()
+            .all(|e| e.quotes == 15 && e.held == 7)
+    );
     // 7 of 15 held out on each of the 4 dense expiries.
     assert_eq!(report.all.svi.points, 28);
     assert_eq!(report.all.svi.missing, 0);
@@ -263,4 +273,81 @@ fn test_replay_scores_the_frozen_model_and_is_causal() {
         report.steps[0].as_ref().unwrap(),
     );
     assert_eq!(a, b);
+}
+
+#[test]
+fn test_replay_refuses_to_score_labels_observed_before_the_freeze() {
+    // Daily cutoffs, each calibration available a day and a half later:
+    // the model frozen at t_i exists only after the next snapshot's data.
+    let days = [30, 90, 180];
+    let snaps: Vec<Snapshot> = (0..3_u64)
+        .map(|i| {
+            let cutoff = CUTOFF + i * DAY;
+            let left: Vec<u64> = days.iter().map(|d| d - i).collect();
+            Snapshot {
+                cutoff,
+                available_at: cutoff + DAY + DAY / 2,
+                quotes: snapshot_quotes(cutoff, &left, &days, &STRIKES),
+            }
+        })
+        .collect();
+    let policy = UsePolicy {
+        allow_degraded: false,
+        max_age_ms: 5 * DAY,
+        k_grid: config().k_grid,
+        diagnostics: DiagnosticsConfig::default(),
+    };
+    let report = replay(&snaps, rates(), &config(), &policy, &IvConfig::default()).unwrap();
+    assert_eq!(report.steps.len(), 2);
+    for step in &report.steps {
+        let error = step.as_ref().unwrap_err();
+        assert!(error.contains("not after the freeze"), "{error}");
+    }
+}
+
+#[test]
+fn test_holdout_keeps_the_targets_of_a_failed_fit() {
+    // Three expiries of 15 out of the money quotes: 21 held out. The
+    // shortest expiry's SVI fit is forced to fail; its 7 targets stay in
+    // every denominator, missing for SVI and scored by the baseline.
+    let quotes = snapshot_quotes(CUTOFF, &[30, 90, 180], &[30, 90, 180], &STRIKES);
+    let cleaning = clean_quotes(&quotes, CUTOFF, rates(), &config().cleaning).unwrap();
+    let mut observed = extract(&cleaning, &IvConfig::default()).unwrap();
+    let first = CUTOFF + 30 * DAY;
+    for (i, o) in observed
+        .observations
+        .iter_mut()
+        .filter(|o| o.quote.quote.expiry_at == first)
+        .enumerate()
+    {
+        // A zigzag no SVI slice follows within max_rmse_vol.
+        o.w_mid *= if i % 4 < 2 { 2.5 } else { 0.4 };
+    }
+    let report = validate_holdout(
+        &observed.observations,
+        &FitConfig::default(),
+        HoldoutRule::default(),
+        WingRule::default(),
+    )
+    .unwrap();
+    assert_eq!(report.fit_failures.len(), 1, "{:?}", report.fit_failures);
+    assert_eq!(report.fit_failures[0].0, first);
+    assert!(report.baseline_failures.is_empty());
+    assert_eq!(report.all.svi.points, 21);
+    assert_eq!(report.all.svi.missing, 7);
+    assert_eq!(report.all.baseline.points, 21);
+    assert_eq!(report.all.baseline.missing, 0);
+    // The shortest expiry is the one that failed, not the next one.
+    assert_eq!(report.shortest_expiry, Some(first));
+    assert_eq!(report.shortest.svi.points, 7);
+    assert_eq!(report.shortest.svi.missing, 7);
+    assert_eq!(report.shortest.baseline.missing, 0);
+    // No trained w_atm there: its wing membership is undecided.
+    assert_eq!(report.wings_unassigned, 7);
+    let failed = report
+        .expiries
+        .iter()
+        .find(|e| e.expiry_at == first)
+        .unwrap();
+    assert_eq!((failed.held, failed.comparison.svi.missing), (7, 7));
 }

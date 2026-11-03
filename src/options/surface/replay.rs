@@ -15,6 +15,11 @@
 //!    model scored on them. `surface_at` is never asked again at the label
 //!    time, which could already hold a calibration of the labels.
 //!
+//! A step whose labels' cutoff is not after `t_i` (a calibration that
+//! finishes after the next snapshot's data) is an error with the reason,
+//! never a score: those labels were observed by the time the model existed,
+//! so scoring them would not be a forecast.
+//!
 //! The replay is evidence about the surface and its causality; it makes no
 //! claim about option PnL or execution.
 
@@ -134,6 +139,15 @@ pub fn replay(
             continue;
         };
         let t = model_snap.available_at;
+        // A forecast scores data after its freeze: labels observed by `t`
+        // are not a forecast of the frozen model, however it is aged.
+        if label_snap.cutoff <= t {
+            steps.push(Err(format!(
+                "at {t}: the labels' cutoff {} is not after the freeze",
+                label_snap.cutoff
+            )));
+            continue;
+        }
         let served = match store.surface_at(t, policy) {
             Ok(served) => served,
             Err(error) => {

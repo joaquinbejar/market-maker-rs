@@ -228,11 +228,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bucket(&mut report, "wings_abs_k_0.2", &validation.wings_abs)?;
     report.push(',');
     bucket(&mut report, "shortest_expiry", &validation.shortest)?;
+    report.push_str(",\"expiries\":[");
+    for (i, e) in validation.expiries.iter().enumerate() {
+        if i > 0 {
+            report.push(',');
+        }
+        write!(
+            report,
+            "{{\"expiry_at\":{},\"quotes\":{},",
+            e.expiry_at, e.quotes
+        )?;
+        bucket(&mut report, "held", &e.comparison)?;
+        report.push('}');
+    }
     write!(
         report,
-        ",\"not_applicable\":{:?},\"fit_failures\":{}}},",
+        "],\"shortest_expiry_at\":{},\"wings_unassigned\":{},\"not_applicable\":{:?},\"fit_failures\":{},\"baseline_failures\":{}}},",
+        validation
+            .shortest_expiry
+            .map_or_else(|| "null".to_string(), |e| e.to_string()),
+        validation.wings_unassigned,
         validation.not_applicable,
-        validation.fit_failures.len()
+        validation.fit_failures.len(),
+        validation.baseline_failures.len()
     )?;
     report.push_str("\"replay\":[");
     for (i, step) in replayed.steps.iter().enumerate() {

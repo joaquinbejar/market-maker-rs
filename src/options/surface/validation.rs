@@ -1,23 +1,28 @@
 //! Out of sample validation of the SVI fit against a simple baseline.
 //!
-//! The split is fixed before any fit, by a declared rule: per expiry, the
-//! out of the money quotes are sorted by `k` and every other one (odd
-//! positions) is held out, but only for an expiry with at least
-//! [`HoldoutRule::min_quotes`] quotes, so that at least half are left to
-//! train on; any other expiry is reported as not applicable with its size,
-//! and all its quotes train. SVI and the baseline train on exactly the same
-//! quotes, and nothing (grid, weights, tolerances) is chosen with the
-//! held out ones.
+//! Everything about the targets is fixed before any fit, by a declared
+//! rule: per expiry, the out of the money quotes are sorted by `k` and
+//! every other one (odd positions) is held out, but only for an expiry with
+//! at least [`HoldoutRule::min_quotes`] quotes, so that at least half are
+//! left to train on; any other expiry is reported as not applicable with
+//! its size, and is not fitted. The shortest expiry with a holdout is fixed
+//! with the split. Nothing (grid, weights, tolerances) is chosen with the
+//! held out quotes.
 //!
-//! The baseline ([`BaselineSurface`]) is linear in `w` between the quoted
-//! `k` of each expiry, flat beyond them, and linear in `w` across expiries.
+//! Per expiry, SVI ([`fit_slice`]) and the baseline ([`BaselineSlice`],
+//! linear in `w` between the quoted `k`, flat beyond) are each trained on
+//! exactly the same quotes, independently: a failure of one leaves the
+//! other scored. Each held out quote is scored on its own expiry's model.
 //!
 //! Residuals are observed minus model implied volatility. They are reported
-//! by bucket, each with its size and the points the model could not
-//! evaluate (never dropped to improve a metric):
+//! by bucket and by expiry, each with its size and the points a model could
+//! not evaluate, its fit having failed included (never dropped to improve a
+//! metric):
 //!
 //! - **wings**: `|k| / sqrt(w_atm) > z_wing`, the preregistered threshold,
 //!   with `w_atm` the trained SVI slice's `w(0)` (never the held out data);
+//!   where the SVI fit failed there is no `w_atm`, and those points are
+//!   counted as unassigned rather than guessed into or out of the bucket;
 //! - **auxiliary wings**: `|k| > abs_k`, a separate fixed cut;
 //! - **shortest expiry**;
 //! - **all**.
@@ -26,117 +31,70 @@ use std::collections::BTreeMap;
 
 use super::calibrate::{FitConfig, SliceObservation, fit_slice};
 use super::iv::IvObservation;
-use super::svi::{ShortExpiryPolicy, SviSurface};
-use super::{TotalVariance, VolSurface};
+use super::svi::SviSlice;
 use crate::types::error::{MMError, MMResult};
 
-/// One expiry of the baseline: `(k, w)` points by increasing `k`.
+/// One expiry of the baseline: linear in `w` between the quoted `k`, flat
+/// beyond them.
 #[derive(Debug, Clone, PartialEq)]
-struct BaselineSlice {
-    tau: f64,
+pub struct BaselineSlice {
     points: Vec<(f64, f64)>,
 }
 
 impl BaselineSlice {
-    fn eval(&self, k: f64) -> MMResult<(f64, f64)> {
+    /// From `(k, w)` points.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] without points, or for a value
+    /// that is not finite, a `w` that is not positive, or a repeated `k`.
+    pub fn new(mut points: Vec<(f64, f64)>) -> MMResult<Self> {
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let ok = !points.is_empty()
+            && points
+                .iter()
+                .all(|(k, w)| k.is_finite() && w.is_finite() && *w > 0.0)
+            && points.windows(2).all(|p| matches!(p, [a, b] if b.0 > a.0));
+        if !ok {
+            return Err(MMError::InvalidConfiguration(
+                "baseline: points must be finite, w positive and k strictly increasing".to_string(),
+            ));
+        }
+        Ok(Self { points })
+    }
+
+    /// The total variance at `k`.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] for a `k` that is not finite.
+    pub fn w(&self, k: f64) -> MMResult<f64> {
         let (Some(&(k0, w0)), Some(&(kn, wn))) = (self.points.first(), self.points.last()) else {
             return Err(MMError::InvalidConfiguration(
                 "empty baseline slice".to_string(),
             ));
         };
+        if !k.is_finite() {
+            return Err(MMError::InvalidConfiguration(format!(
+                "baseline: k must be finite, got {k}"
+            )));
+        }
         if k <= k0 {
-            return Ok((w0, 0.0));
+            return Ok(w0);
         }
         if k >= kn {
-            return Ok((wn, 0.0));
+            return Ok(wn);
         }
         for pair in self.points.windows(2) {
             if let [(ka, wa), (kb, wb)] = pair
                 && k <= *kb
             {
-                let slope = (wb - wa) / (kb - ka);
-                return Ok((wa + slope * (k - ka), slope));
+                return Ok(wa + (wb - wa) * (k - ka) / (kb - ka));
             }
         }
         Err(MMError::InvalidConfiguration(
             "baseline bracket not found".to_string(),
         ))
-    }
-}
-
-/// Linear in `w` between quoted `k`, flat beyond, linear across expiries.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BaselineSurface {
-    slices: Vec<BaselineSlice>,
-}
-
-impl BaselineSurface {
-    /// From `(tau, [(k, w)])` per expiry.
-    ///
-    /// # Errors
-    ///
-    /// [`MMError::InvalidConfiguration`] for fewer than two expiries, an
-    /// expiry without points, non-increasing `tau` or `k`, or a value that
-    /// is not finite.
-    pub fn new(mut slices: Vec<(f64, Vec<(f64, f64)>)>) -> MMResult<Self> {
-        slices.sort_by(|a, b| a.0.total_cmp(&b.0));
-        if slices.len() < 2 || slices.windows(2).any(|p| matches!(p, [a, b] if b.0 <= a.0)) {
-            return Err(MMError::InvalidConfiguration(
-                "a baseline needs at least two increasing expiries".to_string(),
-            ));
-        }
-        let mut out = Vec::with_capacity(slices.len());
-        for (tau, mut points) in slices {
-            points.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let ok = tau.is_finite()
-                && tau > 0.0
-                && !points.is_empty()
-                && points
-                    .iter()
-                    .all(|(k, w)| k.is_finite() && w.is_finite() && *w > 0.0)
-                && points.windows(2).all(|p| matches!(p, [a, b] if b.0 > a.0));
-            if !ok {
-                return Err(MMError::InvalidConfiguration(format!(
-                    "baseline expiry {tau}: points must be finite, positive and strictly increasing in k"
-                )));
-            }
-            out.push(BaselineSlice { tau, points });
-        }
-        Ok(Self { slices: out })
-    }
-}
-
-impl VolSurface for BaselineSurface {
-    fn total_variance_at(&self, k: f64, tau: f64) -> MMResult<TotalVariance> {
-        let (Some(first), Some(last)) = (self.slices.first(), self.slices.last()) else {
-            return Err(MMError::InvalidConfiguration("empty baseline".to_string()));
-        };
-        if tau < first.tau || tau > last.tau {
-            return Err(MMError::InvalidMarketState(format!(
-                "tau {tau} outside the baseline [{}, {}]",
-                first.tau, last.tau
-            )));
-        }
-        let j = self
-            .slices
-            .iter()
-            .position(|s| s.tau >= tau)
-            .unwrap_or(self.slices.len().saturating_sub(1))
-            .max(1);
-        let (Some(lo), Some(hi)) = (self.slices.get(j - 1), self.slices.get(j)) else {
-            return Err(MMError::InvalidConfiguration(
-                "baseline bracket".to_string(),
-            ));
-        };
-        let x = (tau - lo.tau) / (hi.tau - lo.tau);
-        let (wl, kl) = lo.eval(k)?;
-        let (wh, kh) = hi.eval(k)?;
-        TotalVariance::new(
-            (1.0 - x) * wl + x * wh,
-            (1.0 - x) * kl + x * kh,
-            0.0,
-            (wh - wl) / (hi.tau - lo.tau),
-        )
     }
 }
 
@@ -193,13 +151,37 @@ pub struct BucketComparison {
     pub baseline: BucketStats,
 }
 
+/// One expiry with a holdout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExpiryHoldout {
+    /// Expiry, ms.
+    pub expiry_at: u64,
+    /// Out of the money quotes of the expiry.
+    pub quotes: usize,
+    /// Of which held out.
+    pub held: usize,
+    /// SVI and baseline on the held out quotes.
+    pub comparison: BucketComparison,
+}
+
 /// The holdout validation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HoldoutReport {
     /// Expiries (ms) without a holdout, with their size.
     pub not_applicable: Vec<(u64, usize)>,
-    /// Expiries whose SVI slice failed to fit, with the reason.
+    /// Expiries whose SVI slice failed to fit, with the reason; their held
+    /// out quotes count as missing for SVI.
     pub fit_failures: Vec<(u64, String)>,
+    /// Expiries whose baseline could not be built, with the reason; their
+    /// held out quotes count as missing for the baseline.
+    pub baseline_failures: Vec<(u64, String)>,
+    /// Each expiry with a holdout, by increasing expiry.
+    pub expiries: Vec<ExpiryHoldout>,
+    /// The shortest expiry with a holdout, fixed with the split.
+    pub shortest_expiry: Option<u64>,
+    /// Held out quotes whose wing membership is undecided: no trained SVI
+    /// `w_atm` for their expiry. Left out of the `wings` bucket only.
+    pub wings_unassigned: usize,
     /// Every held out point.
     pub all: BucketComparison,
     /// `|k| / sqrt(w_atm) > z_wing`.
@@ -246,19 +228,49 @@ impl Acc {
     }
 }
 
-fn residual(model: &impl VolSurface, o: &IvObservation) -> Option<f64> {
+#[derive(Default)]
+struct Pair([Acc; 2]);
+
+impl Pair {
+    fn add(&mut self, svi: Option<f64>, baseline: Option<f64>) {
+        let [s, b] = &mut self.0;
+        s.add(svi);
+        b.add(baseline);
+    }
+
+    fn comparison(&self) -> BucketComparison {
+        let [s, b] = &self.0;
+        BucketComparison {
+            svi: s.stats(),
+            baseline: b.stats(),
+        }
+    }
+}
+
+/// Observed minus model implied volatility, for a model `w` that is finite
+/// and positive.
+fn vol_residual(o: &IvObservation, w: Option<f64>) -> Option<f64> {
     let tau = o.quote.tau;
-    let w = model.total_variance(o.quote.k, tau).ok()?.w();
-    Some((o.w_mid / tau).sqrt() - (w / tau).sqrt())
+    let w = w.filter(|w| w.is_finite() && *w > 0.0)?;
+    let r = (o.w_mid / tau).sqrt() - (w / tau).sqrt();
+    r.is_finite().then_some(r)
+}
+
+/// One expiry's split, fixed before any fit.
+struct Split<'a> {
+    expiry: u64,
+    quotes: usize,
+    train: Vec<&'a IvObservation>,
+    test: Vec<&'a IvObservation>,
 }
 
 /// Splits `observations` by the rule, trains SVI and the baseline on the
-/// same training quotes, and scores both on the held out ones.
+/// same training quotes of each expiry, independently, and scores both on
+/// the held out ones.
 ///
 /// # Errors
 ///
-/// [`MMError::InvalidConfiguration`] for an invalid fit configuration, or
-/// when fewer than two expiries can be trained.
+/// [`MMError::InvalidConfiguration`] for an invalid fit configuration.
 pub fn validate_holdout(
     observations: &[IvObservation],
     fit: &FitConfig,
@@ -273,81 +285,120 @@ pub fn validate_holdout(
             .or_default()
             .push(o);
     }
+    // 1. The split and the shortest expiry, before any fit.
     let mut not_applicable = Vec::new();
-    let mut fit_failures = Vec::new();
-    let mut svi_slices = Vec::new();
-    let mut baseline_slices = Vec::new();
-    let mut held: Vec<&IvObservation> = Vec::new();
-    let mut atm: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut splits = Vec::new();
     for (expiry, mut group) in by_expiry {
-        group.sort_by(|a, b| a.quote.k.total_cmp(&b.quote.k));
-        let (train, test): (Vec<_>, Vec<_>) = if group.len() >= rule.min_quotes {
-            let (t, h): (Vec<_>, Vec<_>) = group.iter().enumerate().partition(|(i, _)| i % 2 == 0);
-            (
-                t.into_iter().map(|(_, o)| *o).collect(),
-                h.into_iter().map(|(_, o)| *o).collect(),
-            )
-        } else {
+        if group.len() < rule.min_quotes {
             not_applicable.push((expiry, group.len()));
-            (group.clone(), Vec::new())
-        };
-        let tau = train.first().map_or(0.0, |o| o.quote.tau);
-        let points: MMResult<Vec<SliceObservation>> = train
+            continue;
+        }
+        group.sort_by(|a, b| a.quote.k.total_cmp(&b.quote.k));
+        let quotes = group.len();
+        let (train, test): (Vec<_>, Vec<_>) =
+            group.into_iter().enumerate().partition(|(i, _)| i % 2 == 0);
+        splits.push(Split {
+            expiry,
+            quotes,
+            train: train.into_iter().map(|(_, o)| o).collect(),
+            test: test.into_iter().map(|(_, o)| o).collect(),
+        });
+    }
+    let shortest_expiry = splits.first().map(|s| s.expiry);
+    // 2. Fits on the training quotes, each model on its own; 3. scores.
+    let mut fit_failures = Vec::new();
+    let mut baseline_failures = Vec::new();
+    let mut expiries = Vec::with_capacity(splits.len());
+    let mut wings_unassigned = 0_usize;
+    let (mut all, mut wing, mut wing_abs, mut shortest) = Default::default();
+    for split in &splits {
+        let tau = split.train.first().map_or(0.0, |o| o.quote.tau);
+        let points: MMResult<Vec<SliceObservation>> = split
+            .train
             .iter()
             .map(|o| SliceObservation::new(o.quote.k, o.w_mid, o.weight))
             .collect();
-        match fit_slice(tau, &points?, fit) {
-            Ok(f) => {
-                if let Ok((w0, _, _)) = f.slice.eval(0.0) {
-                    atm.insert(expiry, w0);
+        let svi: Option<SviSlice> = match points
+            .map_err(|e| e.to_string())
+            .and_then(|p| fit_slice(tau, &p, fit).map_err(|e| e.to_string()))
+        {
+            Ok(f) => Some(f.slice),
+            Err(why) => {
+                fit_failures.push((split.expiry, why));
+                None
+            }
+        };
+        let baseline =
+            match BaselineSlice::new(split.train.iter().map(|o| (o.quote.k, o.w_mid)).collect()) {
+                Ok(b) => Some(b),
+                Err(error) => {
+                    baseline_failures.push((split.expiry, error.to_string()));
+                    None
                 }
-                svi_slices.push(f.slice);
-                let base: Vec<(f64, f64)> = train
-                    .iter()
-                    .filter(|o| o.w_mid > 0.0)
-                    .map(|o| (o.quote.k, o.w_mid))
-                    .collect();
-                baseline_slices.push((tau, base));
-                held.extend(test);
+            };
+        let w_atm = svi
+            .as_ref()
+            .and_then(|s| s.eval(0.0).ok())
+            .map(|(w, _, _)| w)
+            .filter(|w| w.is_finite() && *w > 0.0);
+        let mut per_expiry = Pair::default();
+        for o in &split.test {
+            let k = o.quote.k;
+            let rs = vol_residual(o, svi.as_ref().and_then(|s| s.eval(k).ok()).map(|v| v.0));
+            let rb = vol_residual(o, baseline.as_ref().and_then(|b| b.w(k).ok()));
+            per_expiry.add(rs, rb);
+            Pair::add(&mut all, rs, rb);
+            match w_atm {
+                Some(w) if k.abs() / w.sqrt() > wings.z_wing => Pair::add(&mut wing, rs, rb),
+                Some(_) => {}
+                None => wings_unassigned = wings_unassigned.saturating_add(1),
             }
-            Err(failure) => fit_failures.push((expiry, failure.to_string())),
-        }
-    }
-    let svi = SviSurface::new(svi_slices, ShortExpiryPolicy::Reject)?;
-    let baseline = BaselineSurface::new(baseline_slices)?;
-    let shortest_expiry = atm.keys().next().copied();
-    let mut acc: [[Acc; 2]; 4] = Default::default();
-    for o in held {
-        let expiry = o.quote.quote.expiry_at;
-        let k = o.quote.k;
-        let z = atm
-            .get(&expiry)
-            .map_or(f64::INFINITY, |w| k.abs() / w.sqrt());
-        let buckets = [
-            true,
-            z > wings.z_wing,
-            k.abs() > wings.abs_k,
-            Some(expiry) == shortest_expiry,
-        ];
-        let (rs, rb) = (residual(&svi, o), residual(&baseline, o));
-        for (bucket, member) in acc.iter_mut().zip(buckets) {
-            if member {
-                let [s, b] = bucket;
-                s.add(rs);
-                b.add(rb);
+            if k.abs() > wings.abs_k {
+                Pair::add(&mut wing_abs, rs, rb);
+            }
+            if Some(split.expiry) == shortest_expiry {
+                Pair::add(&mut shortest, rs, rb);
             }
         }
+        expiries.push(ExpiryHoldout {
+            expiry_at: split.expiry,
+            quotes: split.quotes,
+            held: split.test.len(),
+            comparison: per_expiry.comparison(),
+        });
     }
-    let cmp = |a: &[Acc; 2]| BucketComparison {
-        svi: a[0].stats(),
-        baseline: a[1].stats(),
-    };
     Ok(HoldoutReport {
         not_applicable,
         fit_failures,
-        all: cmp(&acc[0]),
-        wings: cmp(&acc[1]),
-        wings_abs: cmp(&acc[2]),
-        shortest: cmp(&acc[3]),
+        baseline_failures,
+        expiries,
+        shortest_expiry,
+        wings_unassigned,
+        all: Pair::comparison(&all),
+        wings: Pair::comparison(&wing),
+        wings_abs: Pair::comparison(&wing_abs),
+        shortest: Pair::comparison(&shortest),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_baseline_slice_interpolates_in_w_and_is_flat_beyond() {
+        let b = BaselineSlice::new(vec![(0.1, 0.05), (-0.1, 0.03)]).unwrap();
+        assert_eq!(b.w(-0.5).unwrap(), 0.03);
+        assert_eq!(b.w(0.5).unwrap(), 0.05);
+        assert!((b.w(0.0).unwrap() - 0.04).abs() < 1e-15);
+        assert!(b.w(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn test_baseline_slice_invalid_points_return_err() {
+        assert!(BaselineSlice::new(Vec::new()).is_err());
+        assert!(BaselineSlice::new(vec![(0.0, 0.0)]).is_err());
+        assert!(BaselineSlice::new(vec![(0.0, 0.01), (0.0, 0.02)]).is_err());
+        assert!(BaselineSlice::new(vec![(f64::NAN, 0.01)]).is_err());
+    }
 }

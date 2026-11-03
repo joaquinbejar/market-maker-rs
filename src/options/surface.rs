@@ -87,8 +87,8 @@ pub use store::{
 };
 pub use svi::{KRange, Region, ShortExpiryPolicy, SviSlice, SviSurface};
 pub use validation::{
-    BaselineSurface, BucketComparison, BucketStats, HoldoutReport, HoldoutRule, WingRule,
-    validate_holdout,
+    BaselineSlice, BucketComparison, BucketStats, ExpiryHoldout, HoldoutReport, HoldoutRule,
+    WingRule, validate_holdout,
 };
 
 /// A volatility surface: total implied variance and its derivatives.
