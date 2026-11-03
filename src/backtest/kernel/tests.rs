@@ -12,6 +12,7 @@
 use super::*;
 use crate::backtest::engine::FeeCurrency;
 use crate::dec;
+use crate::execution::Action;
 use crate::risk::RiskLimits;
 use crate::risk::pretrade::{
     LimitsPolicy, OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
@@ -513,7 +514,21 @@ fn test_kernel_decode_rejects_each_unreachable_state() {
     for s in &states {
         assert_eq!(&decode(&encode(s), &k).unwrap(), s);
     }
-    let mutations: [(&str, Mutation); 12] = [
+    let mutations: [(&str, Mutation); 14] = [
+        ("venue average entry zero on a position", |s, _| {
+            if s.venue.pos.quantity.is_zero() {
+                return false;
+            }
+            s.venue.pos.avg_entry = Decimal::ZERO;
+            true
+        }),
+        ("agent average entry above the price range", |s, k| {
+            if s.agent.pos.quantity.is_zero() {
+                return false;
+            }
+            s.agent.pos.avg_entry = k.price(k.cfg.p).unwrap() + Decimal::ONE;
+            true
+        }),
         ("resting order price 2^63", |s, _| {
             s.orders.get_mut(0).map(|o| o.price = 1 << 63).is_some()
         }),
@@ -718,4 +733,322 @@ fn test_kernel_config_rejects_trailing_zero_scales() {
         dec!(1),
     )];
     assert!(KernelDataset::from_ticks(&ticks, &base).is_ok());
+}
+
+#[test]
+fn test_kernel_dataset_digest_is_unchanged() {
+    // Pinned before the digest stopped allocating a writer per row.
+    let cfg = KernelConfig::new(dec!(0.25), dec!(0.1), dec!(1000), dec!(10), 10);
+    let rows = (0..5u64)
+        .map(|i| KernelTick {
+            ts_ns: 1_000 + 7 * i,
+            bid: 100 + i,
+            bid_lots: 3,
+            ask: 102 + i,
+            ask_lots: 1 + i,
+        })
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    assert_eq!(data.id().digest, 0x3dc3_a1ba_9ab0_1876_c94e_012d_ffc5_52e6);
+}
+
+#[test]
+fn test_kernel_one_sided_cancels_and_submits_one_order() {
+    let latency = KernelLatency::zero(MS).with_delays(0, 2, 3, 1);
+    let cfg = config(latency);
+    let rows = (0..12).map(|i| tick(1_000 + 2 * i, 97, 101)).collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    let mut events = Vec::new();
+    let mut s = k.reset_with(0, &mut events);
+    k.step_with(&mut s, quote(95, 105), &mut events);
+    let before = s;
+    let out = k.step_with(
+        &mut s,
+        KernelAction::OneSided {
+            side: QuoteSide::Ask,
+            price: 104,
+            lots: 2,
+        },
+        &mut events,
+    );
+    assert_eq!(out.applied, ActionStatus::Applied);
+    // One order id, two cancels for the two-sided quote's orders.
+    assert_eq!(s.next_order_id(), before.next_order_id() + 1);
+    assert!(s.is_open(3) && !s.is_open(4));
+    while s.phase() == Phase::AwaitDecision {
+        k.step_with(&mut s, KernelAction::Hold, &mut events);
+    }
+    let three: Vec<_> = reports(&events, true)
+        .into_iter()
+        .filter(|r| r.order_id == 3)
+        .map(|r| (r.kind, r.side, r.price, r.qty))
+        .collect();
+    assert_eq!(three, vec![(ExecKind::Accepted, Action::Sell, 104, 2)]);
+    for id in [1, 2] {
+        assert!(
+            reports(&events, true)
+                .iter()
+                .any(|r| r.order_id == id && r.kind == ExecKind::Canceled)
+        );
+    }
+    // Admission applies the same ranges; out of range is rejected.
+    let mut t = before;
+    let out = k.step(
+        &mut t,
+        KernelAction::OneSided {
+            side: QuoteSide::Bid,
+            price: 0,
+            lots: 1,
+        },
+    );
+    assert_eq!(
+        out.applied,
+        ActionStatus::Rejected(RejectReason::PriceRange)
+    );
+    assert_eq!(decode(&encode(&s), &k).unwrap(), s);
+}
+
+#[test]
+fn test_kernel_quote_error_code_kept_in_outcome_event_and_state() {
+    let cfg = config(KernelLatency::zero(MS));
+    let data =
+        KernelDataset::from_kernel_ticks((0..4).map(|i| tick(1 + i, 98, 102)).collect(), &cfg)
+            .unwrap();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    let base = k.reset(0);
+    let mut a = base;
+    let mut b = base;
+    let mut events = Vec::new();
+    let out = k.step_with(&mut a, KernelAction::QuoteError(ErrCode(6)), &mut events);
+    assert_eq!(out.applied, ActionStatus::QuoteError(ErrCode(6)));
+    assert!(events.contains(&KernelEvent::Decided(ActionStatus::QuoteError(ErrCode(6)))));
+    assert_eq!(a.last(), Some(ActionStatus::QuoteError(ErrCode(6))));
+    k.step(&mut b, KernelAction::QuoteError(ErrCode(7)));
+    assert_ne!(encode(&a), encode(&b), "the code is in the encoding");
+    assert_eq!(decode(&encode(&a), &k).unwrap(), a);
+    assert_eq!(a.counters().rejected[RejectReason::QuoteError.index()], 1);
+    assert_eq!(a.counters().quote_errors, 1);
+}
+
+#[test]
+fn test_kernel_foreign_state_is_refused_by_every_interpreting_accessor() {
+    let cfg = config(KernelLatency::zero(MS));
+    let other = KernelConfig::new(dec!(0.5), dec!(0.1), dec!(1000), dec!(10), 100);
+    let a = KernelDataset::from_kernel_ticks((0..3).map(|i| tick(1 + i, 98, 102)).collect(), &cfg)
+        .unwrap();
+    let b =
+        KernelDataset::from_kernel_ticks((0..3).map(|i| tick(1 + i, 98, 102)).collect(), &other)
+            .unwrap();
+    let ka: FinancialKernel<'_> = FinancialKernel::new(&cfg, &a).unwrap();
+    let kb: FinancialKernel<'_> = FinancialKernel::new(&other, &b).unwrap();
+    let s = ka.reset(0);
+    assert!(ka.owns(&s) && !kb.owns(&s));
+    let obs = kb.observe(&s);
+    assert_eq!(obs.status, Status::Halted(HaltReason::StateMismatch));
+    assert_eq!(obs.row, None);
+    assert!(kb.venue_summary(&s).is_err());
+    let grid = ActionGrid::new([0], [0], [1]).unwrap();
+    let mask = kb.mask(&s, &grid);
+    assert!(!mask.global_quote_ok && mask.bid == 0 && mask.ask == 0 && mask.size == 0);
+    assert_eq!(kb.grid_action(&s, &grid, (0, 0, 0, 0)), None);
+    assert!(ka.venue_summary(&s).is_ok());
+}
+
+#[test]
+fn test_kernel_transaction_undo_restores_the_state_exactly() {
+    let (cfg, data) = busy_states();
+    let limited = cfg
+        .clone()
+        .with_limits(RiskLimits::new(dec!(2), Decimal::MAX, dec!(0)).unwrap());
+    for c in [cfg, limited] {
+        let k: FinancialKernel<'_> = FinancialKernel::new(&c, &data).unwrap();
+        let mut changed = 0;
+        for s0 in collect_states(&k) {
+            let all_legs = [
+                step::Legs {
+                    legs: [Some((Dir::Buy, 99, 2)), Some((Dir::Sell, 101, 3))],
+                    crossed: false,
+                },
+                step::Legs {
+                    legs: [Some((Dir::Buy, 101, 1)), Some((Dir::Sell, 99, 1))],
+                    crossed: true,
+                },
+                step::Legs {
+                    legs: [Some((Dir::Sell, 102, 4)), None],
+                    crossed: false,
+                },
+            ];
+            for legs in all_legs {
+                let mut s = s0;
+                let undo = step::Undo::save(&s);
+                let mut sink = Vec::new();
+                step::quote_transaction(&k.cfg, &mut s, legs, &mut sink).unwrap();
+                if s != s0 {
+                    changed += 1;
+                }
+                undo.restore(&mut s);
+                assert_eq!(s, s0, "rollback must be exact");
+                assert_eq!(encode(&s), encode(&s0));
+            }
+        }
+        assert!(changed > 0);
+    }
+}
+
+fn adapter_kernel_data() -> (KernelConfig, KernelDataset) {
+    let cfg = KernelConfig::new(dec!(1), dec!(1), dec!(5000), dec!(5), 100)
+        .with_initial_capital(dec!(100000))
+        .with_limits(RiskLimits::new(dec!(30), Decimal::MAX, dec!(0)).unwrap());
+    let rows = (0..5).map(|i| tick(10 + i, 999, 1_001)).collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    (cfg, data)
+}
+
+fn glft(size: Decimal, lot: Decimal, start: u64) -> GlftQuoter {
+    GlftQuoter {
+        config: crate::strategy::glft::GLFTConfig::new(
+            dec!(0.01),
+            dec!(0.3),
+            dec!(0.9),
+            30,
+            lot,
+            600_000,
+            dec!(0),
+        )
+        .unwrap(),
+        volatility: dec!(1684.7),
+        size,
+        session_start_ms: start,
+    }
+}
+
+fn observation_at(ms: u64, position: Decimal) -> Observation {
+    Observation {
+        row: Some(0),
+        ts_ns: ms * MS,
+        bid: 999,
+        bid_lots: 1,
+        ask: 1_001,
+        ask_lots: 1,
+        position,
+        avg_entry: dec!(1000),
+        delivered_fills: 0,
+        delivered_local_rejects: 0,
+        open_orders: 0,
+        awaiting_cancel_outcome: 0,
+        step: 0,
+        status: Status::Running,
+        rejected: [0; 8],
+    }
+}
+
+#[test]
+fn test_kernel_adapter_glft_at_inventory_bound_posts_one_side() {
+    let (cfg, data) = adapter_kernel_data();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    let mut adapter = QuoteAdapter::new(glft(dec!(1), dec!(1), 0), &k, dec!(1)).unwrap();
+    // At +Q only an ask is posted, at -Q only a bid; inside, both.
+    let long = adapter.act(&k, &observation_at(10, dec!(30)));
+    assert!(
+        matches!(
+            long,
+            KernelAction::OneSided {
+                side: QuoteSide::Ask,
+                lots: 1,
+                ..
+            }
+        ),
+        "{long:?}"
+    );
+    let short = adapter.act(&k, &observation_at(10, dec!(-30)));
+    assert!(
+        matches!(
+            short,
+            KernelAction::OneSided {
+                side: QuoteSide::Bid,
+                lots: 1,
+                ..
+            }
+        ),
+        "{short:?}"
+    );
+    assert!(matches!(
+        adapter.act(&k, &observation_at(10, dec!(0))),
+        KernelAction::Quote { .. }
+    ));
+}
+
+#[test]
+fn test_kernel_adapter_session_start_converts_time_and_rejects_earlier() {
+    let (cfg, data) = adapter_kernel_data();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    // The model time is the elapsed time since the session start.
+    let mut late = QuoteAdapter::new(glft(dec!(1), dec!(1), 0), &k, dec!(1)).unwrap();
+    let mut started = QuoteAdapter::new(glft(dec!(1), dec!(1), 590_000), &k, dec!(1)).unwrap();
+    let at_start = late.act(&k, &observation_at(0, dec!(5)));
+    let same = started.act(&k, &observation_at(590_000, dec!(5)));
+    assert_eq!(at_start, same, "same elapsed time, same quote");
+    assert_ne!(late.act(&k, &observation_at(590_000, dec!(5))), same);
+    // Before the session start: an error, never a silent zero.
+    assert_eq!(
+        started.act(&k, &observation_at(10, dec!(5))),
+        KernelAction::QuoteError(quote_error_code(&MMError::InvalidTimestamp(String::new())))
+    );
+    let mut avs = QuoteAdapter::new(
+        AvellanedaQuoter {
+            risk_aversion: dec!(0.1),
+            volatility: dec!(0.2),
+            order_intensity: dec!(1.5),
+            session_start_ms: 100,
+            horizon_ms: 1_000,
+            size: dec!(1),
+        },
+        &k,
+        dec!(1),
+    )
+    .unwrap();
+    let invalid =
+        KernelAction::QuoteError(quote_error_code(&MMError::InvalidTimestamp(String::new())));
+    assert_eq!(
+        avs.act(&k, &observation_at(50, dec!(0))),
+        invalid,
+        "before the start"
+    );
+    assert_eq!(
+        avs.act(&k, &observation_at(1_101, dec!(0))),
+        invalid,
+        "past the horizon"
+    );
+    assert!(matches!(
+        avs.act(&k, &observation_at(600, dec!(0))),
+        KernelAction::Quote { .. }
+    ));
+}
+
+#[test]
+fn test_kernel_adapter_rejects_lot_and_size_mismatch_and_foreign_kernel() {
+    let (cfg, data) = adapter_kernel_data();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    assert!(
+        QuoteAdapter::new(glft(dec!(2), dec!(2), 0), &k, dec!(1)).is_err(),
+        "model lot 2, kernel lot 1"
+    );
+    assert!(
+        QuoteAdapter::new(glft(dec!(2), dec!(1), 0), &k, dec!(1)).is_err(),
+        "size is two model lots"
+    );
+    let mut adapter = QuoteAdapter::new(glft(dec!(1), dec!(1), 0), &k, dec!(1)).unwrap();
+    // Bound to its kernel: another grid gives the mismatch code.
+    let other_cfg = KernelConfig::new(dec!(0.5), dec!(1), dec!(5000), dec!(5), 100);
+    let other_data = KernelDataset::from_kernel_ticks(
+        (0..3).map(|i| tick(10 + i, 1_998, 2_002)).collect(),
+        &other_cfg,
+    )
+    .unwrap();
+    let other: FinancialKernel<'_> = FinancialKernel::new(&other_cfg, &other_data).unwrap();
+    assert_eq!(
+        adapter.act(&other, &observation_at(10, dec!(0))),
+        KernelAction::QuoteError(ERR_KERNEL_MISMATCH)
+    );
 }

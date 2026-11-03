@@ -836,8 +836,84 @@ pub(super) fn capacity_ok<const ORD: usize, const MSG: usize, const DLV: usize>(
     Ok(())
 }
 
-/// Applies an admitted quote as `replace_quotes`, on a copy that is
-/// committed only if every step succeeds.
+/// The orders of an admitted action: one or two legs `(side, price,
+/// lots)`, and whether the quote is crossed (both legs rejected locally).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Legs {
+    pub(super) legs: [Option<(Dir, u64, u64)>; 2],
+    pub(super) crossed: bool,
+}
+
+/// What the transaction may change, saved before it runs. Every change is
+/// an append (deliveries, account), an insert of a message with a fresh
+/// sequence number, a cancel flag set on the targets of those messages, or
+/// a scalar, so restoring these values rolls the state back exactly.
+pub(super) struct Undo {
+    rng_latency: super::rng::KernelRng,
+    stamp_seq: u64,
+    next_msg_seq: u64,
+    next_order_id: u64,
+    last_delivery_ns: u64,
+    local_rejects: u64,
+    gate: super::gate::GateState,
+    deliveries: usize,
+    account: usize,
+}
+
+impl Undo {
+    pub(super) fn save<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+        s: &St<ORD, MSG, DLV, OBS>,
+    ) -> Self {
+        Self {
+            rng_latency: s.rng_latency,
+            stamp_seq: s.stamp_seq,
+            next_msg_seq: s.next_msg_seq,
+            next_order_id: s.next_order_id,
+            last_delivery_ns: s.last_delivery_ns,
+            local_rejects: s.counters.local_rejects,
+            gate: s.gate,
+            deliveries: s.deliveries.len(),
+            account: s.account.len(),
+        }
+    }
+
+    pub(super) fn restore<
+        const ORD: usize,
+        const MSG: usize,
+        const DLV: usize,
+        const OBS: usize,
+    >(
+        self,
+        s: &mut St<ORD, MSG, DLV, OBS>,
+    ) {
+        // New messages carry sequence numbers from the saved one on; the
+        // cancels among them name the orders whose flag the transaction set.
+        let mut i = 0;
+        while let Some(msg) = s.msgs.get(i).copied() {
+            if msg.seq < self.next_msg_seq {
+                i = i.saturating_add(1);
+                continue;
+            }
+            if let MsgKind::Cancel { id } = msg.kind {
+                set_cancel(s, id, false);
+            }
+            let _ = s.msgs.remove(i);
+        }
+        s.deliveries.truncate(self.deliveries);
+        s.account.truncate(self.account);
+        s.rng_latency = self.rng_latency;
+        s.stamp_seq = self.stamp_seq;
+        s.next_msg_seq = self.next_msg_seq;
+        s.next_order_id = self.next_order_id;
+        s.last_delivery_ns = self.last_delivery_ns;
+        s.counters.local_rejects = self.local_rejects;
+        s.gate = self.gate;
+    }
+}
+
+/// Applies an admitted action as `replace_quotes`, in place; on failure
+/// the undo record restores the pre-action state exactly, without copying
+/// the whole state.
 pub(super) fn apply_quote<
     const ORD: usize,
     const MSG: usize,
@@ -847,16 +923,19 @@ pub(super) fn apply_quote<
 >(
     cfg: &ValidatedConfig,
     s: &mut St<ORD, MSG, DLV, OBS>,
-    quote: (u64, u64, u64, u64),
+    legs: Legs,
     em: &mut E,
 ) -> Result<(), Halt> {
-    let mut t = *s;
+    let undo = Undo::save(s);
     let mut buf = Buf::new();
-    quote_transaction(cfg, &mut t, quote, &mut buf)?;
-    if buf.full {
-        return Err(Halt::CounterOverflow);
+    let mut result = quote_transaction(cfg, s, legs, &mut buf);
+    if result.is_ok() && buf.full {
+        result = Err(Halt::CounterOverflow);
     }
-    *s = t;
+    if let Err(reason) = result {
+        undo.restore(s);
+        return Err(reason);
+    }
     for event in buf.items.iter().take(buf.len).flatten() {
         em.event(*event);
     }
@@ -884,25 +963,26 @@ fn next_target<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: 
     resting.chain(pending).filter(|id| above(*id)).min()
 }
 
-fn mark_cancel<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+fn set_cancel<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
     s: &mut St<ORD, MSG, DLV, OBS>,
     id: u64,
+    inflight: bool,
 ) {
     for order in s.orders.as_mut_slice() {
         if order.id == id {
-            order.cancel_inflight = true;
+            order.cancel_inflight = inflight;
         }
     }
     for msg in s.msgs.as_mut_slice() {
         if let MsgKind::Activate(order) = &mut msg.kind
             && order.id == id
         {
-            order.cancel_inflight = true;
+            order.cancel_inflight = inflight;
         }
     }
 }
 
-fn quote_transaction<
+pub(super) fn quote_transaction<
     const ORD: usize,
     const MSG: usize,
     const DLV: usize,
@@ -911,19 +991,21 @@ fn quote_transaction<
 >(
     cfg: &ValidatedConfig,
     t: &mut St<ORD, MSG, DLV, OBS>,
-    (bid, ask, bid_lots, ask_lots): (u64, u64, u64, u64),
+    legs: Legs,
     em: &mut E,
 ) -> Result<(), Halt> {
     let now = t.now_ns;
     let mut after = None;
     while let Some(id) = next_target(t, after) {
         let eff = delayed(cfg, t, now, cfg.latency.cancel_q)?;
-        mark_cancel(t, id);
+        // The message first: the undo record finds every flag it sets
+        // through the cancel messages it inserted.
         schedule(t, eff, MsgKind::Cancel { id })?;
+        set_cancel(t, id, true);
         after = Some(id);
     }
-    let crossed = bid >= ask;
-    for (dir, price, lots) in [(Dir::Buy, bid, bid_lots), (Dir::Sell, ask, ask_lots)] {
+    let crossed = legs.crossed;
+    for (dir, price, lots) in legs.legs.into_iter().flatten() {
         let id = t.next_order_id;
         bump(&mut t.next_order_id)?;
         let _submitted = stamp(t)?;
@@ -981,16 +1063,18 @@ pub(super) fn record<const ORD: usize, const MSG: usize, const DLV: usize, const
     s: &mut St<ORD, MSG, DLV, OBS>,
     applied: ActionStatus,
 ) -> Result<(), Halt> {
-    match applied {
-        ActionStatus::Applied => {}
-        ActionStatus::Rejected(reason) => {
-            let slot = s
-                .counters
-                .rejected
-                .get_mut(reason.index())
-                .ok_or(Halt::CounterOverflow)?;
-            bump(slot)?;
-        }
+    let counted = match applied {
+        ActionStatus::Applied => None,
+        ActionStatus::Rejected(reason) => Some(reason),
+        ActionStatus::QuoteError(_) => Some(RejectReason::QuoteError),
+    };
+    if let Some(reason) = counted {
+        let slot = s
+            .counters
+            .rejected
+            .get_mut(reason.index())
+            .ok_or(Halt::CounterOverflow)?;
+        bump(slot)?;
     }
     s.last = Some(applied);
     Ok(())

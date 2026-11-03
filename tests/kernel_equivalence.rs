@@ -173,7 +173,15 @@ fn test_kernel_properties_replay_decode_and_reject_equals_hold() {
                 ActionStatus::Rejected(RejectReason::PriceRange)
             );
             k.step_with(&mut b, KernelAction::Hold, &mut eb);
-            assert_eq!(ea, eb, "{ctx}: rejected events");
+            // The streams differ only in the step's own outcome record.
+            let venue = |events: &[KernelEvent]| -> Vec<KernelEvent> {
+                events
+                    .iter()
+                    .filter(|e| !matches!(e, KernelEvent::Decided(_)))
+                    .copied()
+                    .collect()
+            };
+            assert_eq!(venue(&ea), venue(&eb), "{ctx}: rejected events");
             let (xa, xb) = (encode(&a), encode(&b));
             assert_eq!(xa.len(), xb.len());
             let n = xa.len();

@@ -46,10 +46,11 @@ fn main() -> MMResult<()> {
         risk_aversion: dec!(0.1),
         volatility: dec!(0.2),
         order_intensity: dec!(50),
-        terminal_ms: 1_000 + 100 * 2_000,
+        session_start_ms: 1_000,
+        horizon_ms: 100 * 2_000,
         size: dec!(0.5),
     };
-    let mut adapter = QuoteAdapter::new(quoter, &cfg, dec!(0.1))?;
+    let mut adapter = QuoteAdapter::new(quoter, &kernel, dec!(0.1))?;
 
     let mut s = kernel.reset(7);
     let mut decisions = 0u64;

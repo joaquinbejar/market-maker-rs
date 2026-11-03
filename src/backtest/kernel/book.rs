@@ -97,6 +97,16 @@ impl<T: Blank, const N: usize> Arr<T, N> {
         self.as_slice().iter().position(pred)
     }
 
+    /// Removes every item from `len` on.
+    pub(super) fn truncate(&mut self, len: usize) {
+        while self.len > len {
+            let Some(last) = self.len.checked_sub(1) else {
+                return;
+            };
+            let _ = self.remove(last);
+        }
+    }
+
     pub(super) fn clear(&mut self) {
         *self = Self::EMPTY;
     }

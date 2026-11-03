@@ -24,7 +24,9 @@
 //!   (`quantum_ns = 1_000_000` matches the engine's milliseconds);
 //! - datasets with non-decreasing timestamps (the kernel rejects others at
 //!   load; the engine clamps them);
-//! - actions `Hold`, `Quote` and `QuoteError` (an engine `None`).
+//! - actions `Hold`, `Quote` and `QuoteError` (an engine `None`); the
+//!   one-sided `OneSided` action has no engine counterpart and is outside
+//!   the subset.
 //!
 //! # Ordering
 //!
@@ -107,8 +109,8 @@ mod step;
 mod tests;
 
 pub use adapter::{
-    AvellanedaQuoter, ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, GlftQuoter, QuoteAdapter,
-    QuoteSource, quote_error_code,
+    AvellanedaQuoter, ERR_KERNEL_MISMATCH, ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE,
+    GlftQuoter, QuoteAdapter, QuoteSource, SourceQuote, quote_error_code,
 };
 pub use book::{ExecKind, FillRec, Origin, ReportRec};
 pub use config::{
@@ -123,10 +125,12 @@ pub use observe::{ActionGrid, ActionMask, Observation};
 pub use rng::{KernelRng, RNG_ALGO_XORSHIFT64STAR};
 pub use state::{
     ActionStatus, Counters, ErrCode, EventSink, GateRecord, HaltReason, KernelAction, KernelEvent,
-    KernelState, NoSink, Phase, QueueLengths, RejectReason, Status, StepOutcome, TermReason,
+    KernelState, NoSink, Phase, QueueLengths, QuoteSide, RejectReason, Status, StepOutcome,
+    TermReason,
 };
 
 use crate::Decimal;
+use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
 
 use account::held;
@@ -383,7 +387,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     ) -> StepOutcome {
         let mut em = Em::new(sink);
         let terminal = ActionStatus::Rejected(RejectReason::Terminal);
-        if s.data_id != self.data.id || s.cfg_fp != self.cfg.fingerprint {
+        if !self.owns(s) {
             if s.status.is_running() {
                 step::halt(s, HaltReason::StateMismatch, &mut em);
             }
@@ -416,7 +420,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         s.counters.actions = actions;
         let applied = match action {
             KernelAction::Hold => ActionStatus::Applied,
-            KernelAction::QuoteError(_) => {
+            KernelAction::QuoteError(code) => {
                 // At most one per step, and steps are at most S <= 2^60.
                 let Some(errors) = s.counters.quote_errors.checked_add(1) else {
                     step::halt(s, HaltReason::CounterOverflow, &mut em);
@@ -427,30 +431,49 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                     };
                 };
                 s.counters.quote_errors = errors;
-                ActionStatus::Rejected(RejectReason::QuoteError)
+                ActionStatus::QuoteError(code)
             }
             KernelAction::Quote {
                 bid,
                 ask,
                 bid_lots,
                 ask_lots,
-            } => match step::admit(&self.cfg, s, bid, ask, bid_lots, ask_lots) {
-                Ok(()) => {
-                    match step::apply_quote(&self.cfg, s, (bid, ask, bid_lots, ask_lots), &mut em) {
-                        Ok(()) => ActionStatus::Applied,
-                        Err(reason) => {
-                            step::halt(s, reason, &mut em);
-                            return StepOutcome {
-                                applied: ActionStatus::Applied,
-                                status: s.status,
-                                events: em.count,
-                            };
-                        }
-                    }
-                }
-                Err(reason) => ActionStatus::Rejected(reason),
-            },
+            } => self.admit_apply(
+                s,
+                step::admit(&self.cfg, s, bid, ask, bid_lots, ask_lots),
+                step::Legs {
+                    legs: [
+                        Some((Dir::Buy, bid, bid_lots)),
+                        Some((Dir::Sell, ask, ask_lots)),
+                    ],
+                    crossed: bid >= ask,
+                },
+                &mut em,
+            ),
+            KernelAction::OneSided { side, price, lots } => {
+                let dir = match side {
+                    QuoteSide::Bid => Dir::Buy,
+                    QuoteSide::Ask => Dir::Sell,
+                };
+                self.admit_apply(
+                    s,
+                    step::admit(&self.cfg, s, price, price, lots, lots),
+                    step::Legs {
+                        legs: [Some((dir, price, lots)), None],
+                        crossed: false,
+                    },
+                    &mut em,
+                )
+            }
         };
+        if !s.status.is_running() {
+            return StepOutcome {
+                applied,
+                status: s.status,
+                events: em.count,
+            };
+        }
+        em.event(KernelEvent::Decided(applied));
         if let Err(reason) = step::record(s, applied) {
             step::halt(s, reason, &mut em);
         } else {
@@ -467,9 +490,57 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         }
     }
 
+    /// Admission then the transaction; a transaction failure halts.
+    fn admit_apply<E: EventSink>(
+        &self,
+        s: &mut KernelState<ORD, MSG, DLV, OBS>,
+        admitted: Result<(), RejectReason>,
+        legs: step::Legs,
+        em: &mut Em<'_, E>,
+    ) -> ActionStatus {
+        match admitted {
+            Err(reason) => ActionStatus::Rejected(reason),
+            Ok(()) => {
+                if let Err(reason) = step::apply_quote(&self.cfg, s, legs, em) {
+                    step::halt(s, reason, em);
+                }
+                ActionStatus::Applied
+            }
+        }
+    }
+
+    /// Returns true if `s` belongs to this kernel's dataset and
+    /// configuration.
+    #[must_use]
+    pub fn owns(&self, s: &KernelState<ORD, MSG, DLV, OBS>) -> bool {
+        s.data_id == self.data.id && s.cfg_fp == self.cfg.fingerprint
+    }
+
     /// The agent's observation.
+    ///
+    /// A state from another kernel gives an empty observation with status
+    /// `Halted(StateMismatch)`: its rows and ledger use another grid.
     #[must_use]
     pub fn observe(&self, s: &KernelState<ORD, MSG, DLV, OBS>) -> Observation {
+        if !self.owns(s) {
+            return Observation {
+                row: None,
+                ts_ns: 0,
+                bid: 0,
+                bid_lots: 0,
+                ask: 0,
+                ask_lots: 0,
+                position: Decimal::ZERO,
+                avg_entry: Decimal::ZERO,
+                delivered_fills: 0,
+                delivered_local_rejects: 0,
+                open_orders: 0,
+                awaiting_cancel_outcome: 0,
+                step: 0,
+                status: Status::Halted(HaltReason::StateMismatch),
+                rejected: [0; 8],
+            };
+        }
         let row = s
             .agent
             .last_obs_row
@@ -507,8 +578,17 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         s: &KernelState<ORD, MSG, DLV, OBS>,
         grid: &ActionGrid<K, M>,
     ) -> ActionMask {
-        let identity = s.data_id == self.data.id && s.cfg_fp == self.cfg.fingerprint;
-        let deciding = identity && s.status.is_running() && s.phase == Phase::AwaitDecision;
+        let identity = self.owns(s);
+        if !identity {
+            return ActionMask {
+                global_quote_ok: false,
+                bid: 0,
+                ask: 0,
+                size: 0,
+                refusal: Some(RejectReason::Terminal),
+            };
+        }
+        let deciding = s.status.is_running() && s.phase == Phase::AwaitDecision;
         let capacity = step::capacity_ok::<ORD, MSG, DLV>(held(&s.account));
         let refusal = if deciding {
             capacity.err()
@@ -556,7 +636,8 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     }
 
     /// The quote at grid indices `(bid, ask, bid size, ask size)` around the
-    /// observed mid, if the prices are representable.
+    /// observed mid, if the prices are representable (`None` for a state
+    /// from another kernel).
     #[must_use]
     pub fn grid_action<const K: usize, const M: usize>(
         &self,
@@ -564,6 +645,9 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         grid: &ActionGrid<K, M>,
         index: (usize, usize, usize, usize),
     ) -> Option<KernelAction> {
+        if !self.owns(s) {
+            return None;
+        }
         let mid2 = s
             .agent
             .last_obs_row
@@ -581,9 +665,16 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::NumericalError`] if a value does not convert
-    /// (unreachable inside the bounds).
+    /// Returns [`MMError::InvalidMarketState`] for a state from another
+    /// kernel (its ledger uses another money scale), and
+    /// [`MMError::NumericalError`] if a value does not convert (unreachable
+    /// inside the bounds).
     pub fn venue_summary(&self, s: &KernelState<ORD, MSG, DLV, OBS>) -> MMResult<VenueSummary> {
+        if !self.owns(s) {
+            return Err(MMError::InvalidMarketState(
+                "venue summary of a state from another dataset or configuration".to_string(),
+            ));
+        }
         let fail = || MMError::NumericalError("venue summary does not convert".to_string());
         let v = &s.venue;
         let unrealized_h = match v.last_mark2 {

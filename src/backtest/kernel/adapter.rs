@@ -5,13 +5,19 @@
 //! on the unrounded quote, then bids round down, asks up and sizes down to
 //! the grid (a size that is not positive uses the default order size). A
 //! strategy error is a [`KernelAction::QuoteError`], the engine's `None`.
+//! The adapter is bound to one kernel: it takes the grid from it and
+//! refuses to act for another.
 //!
-//! Two cases fall outside the equivalence subset: a rounded price outside
-//! `1..=max_price` ticks or a rounded size outside `1..=max_order_size` lots
-//! becomes a `QuoteError` (the engine would submit it and reject it), and a
-//! quote that is crossed before rounding but not after has its sides
-//! swapped so it stays crossed (both sides are rejected locally, as in the
-//! engine, with the swapped prices in the reports).
+//! Outside the equivalence subset:
+//!
+//! - a rounded price outside `1..=max_price` ticks or a rounded size outside
+//!   `1..=max_order_size` lots becomes a `QuoteError` (the engine would
+//!   submit it and reject it);
+//! - a quote that is crossed before rounding but not after has its sides
+//!   swapped so it stays crossed (both sides are rejected locally, as in the
+//!   engine, with the swapped prices in the reports);
+//! - a one-sided quote (GLFT at an inventory bound) becomes a
+//!   [`KernelAction::OneSided`]: the engine's quote is always two-sided.
 
 use crate::Decimal;
 use crate::backtest::engine::round_to_step;
@@ -21,16 +27,17 @@ use crate::strategy::quote::Quote;
 use crate::types::error::{MMError, MMResult};
 
 use super::FinancialKernel;
-use super::config::KernelConfig;
 use super::grid::Unit;
 use super::observe::Observation;
-use super::state::{ErrCode, KernelAction};
+use super::state::{ErrCode, KernelAction, QuoteSide};
 
 /// Code of a quote whose rounded price is not a positive tick count within
 /// `max_price`.
 pub const ERR_PRICE_OUT_OF_RANGE: ErrCode = ErrCode(100);
 /// Code of a quote whose rounded size is zero or above `max_order_size`.
 pub const ERR_SIZE_OUT_OF_RANGE: ErrCode = ErrCode(101);
+/// Code of an adapter asked to act for a kernel it was not built for.
+pub const ERR_KERNEL_MISMATCH: ErrCode = ErrCode(102);
 
 /// [`ErrCode`] of a strategy error: the `MMError` discriminant plus one.
 #[must_use]
@@ -50,6 +57,17 @@ pub fn quote_error_code(error: &MMError) -> ErrCode {
     })
 }
 
+/// A strategy quote: both sides, or one side only.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceQuote {
+    /// A two-sided quote, as the engine's `BacktestStrategy` returns.
+    Both(Quote),
+    /// Only a bid: `(price, size)`.
+    Bid(Decimal, Decimal),
+    /// Only an ask: `(price, size)`.
+    Ask(Decimal, Decimal),
+}
+
 /// A strategy that quotes from an [`Observation`].
 pub trait QuoteSource {
     /// Quote at the observed `mid` with the known `inventory`.
@@ -57,11 +75,37 @@ pub trait QuoteSource {
     /// # Errors
     ///
     /// Any strategy error; it becomes a [`KernelAction::QuoteError`].
-    fn quote(&mut self, obs: &Observation, mid: Decimal, inventory: Decimal) -> MMResult<Quote>;
+    fn quote(
+        &mut self,
+        obs: &Observation,
+        mid: Decimal,
+        inventory: Decimal,
+    ) -> MMResult<SourceQuote>;
+
+    /// Checks the strategy against the kernel grid (`tick`, `lot`) when the
+    /// adapter is built.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] on a mismatch.
+    fn validate(&self, _tick: Decimal, _lot: Decimal) -> MMResult<()> {
+        Ok(())
+    }
+}
+
+/// Milliseconds since `session_start_ms` at the observation.
+fn elapsed_ms(obs: &Observation, session_start_ms: u64) -> MMResult<u64> {
+    let now_ms = obs.ts_ns / 1_000_000;
+    now_ms.checked_sub(session_start_ms).ok_or_else(|| {
+        MMError::InvalidTimestamp(format!(
+            "observation at {now_ms} ms precedes the session start {session_start_ms} ms"
+        ))
+    })
 }
 
 /// Avellaneda-Stoikov quotes (Avellaneda and Stoikov, 2008, eqs. 29 and
-/// 30) through [`calculate_optimal_quotes`].
+/// 30) through [`calculate_optimal_quotes`], over a horizon measured from
+/// the session start.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AvellanedaQuoter {
     /// Risk aversion `γ`.
@@ -70,16 +114,28 @@ pub struct AvellanedaQuoter {
     pub volatility: Decimal,
     /// Order intensity `k`.
     pub order_intensity: Decimal,
-    /// Terminal time, in milliseconds of the observed rows' clock.
-    pub terminal_ms: u64,
+    /// Session start, in milliseconds of the rows' clock.
+    pub session_start_ms: u64,
+    /// Horizon `T` from the session start, in milliseconds.
+    pub horizon_ms: u64,
     /// Size of both sides.
     pub size: Decimal,
 }
 
 impl QuoteSource for AvellanedaQuoter {
-    fn quote(&mut self, obs: &Observation, mid: Decimal, inventory: Decimal) -> MMResult<Quote> {
-        let now_ms = obs.ts_ns / 1_000_000;
-        let remaining = self.terminal_ms.saturating_sub(now_ms);
+    fn quote(
+        &mut self,
+        obs: &Observation,
+        mid: Decimal,
+        inventory: Decimal,
+    ) -> MMResult<SourceQuote> {
+        let elapsed = elapsed_ms(obs, self.session_start_ms)?;
+        let remaining = self.horizon_ms.checked_sub(elapsed).ok_or_else(|| {
+            MMError::InvalidTimestamp(format!(
+                "{elapsed} ms since the session start is past the horizon {} ms",
+                self.horizon_ms
+            ))
+        })?;
         let (bid, ask) = calculate_optimal_quotes(
             mid,
             inventory,
@@ -88,55 +144,81 @@ impl QuoteSource for AvellanedaQuoter {
             remaining,
             self.order_intensity,
         )?;
-        Ok(Quote {
+        Ok(SourceQuote::Both(Quote {
             bid_price: bid,
             bid_size: self.size,
             ask_price: ask,
             ask_size: self.size,
-            timestamp: now_ms,
-        })
+            timestamp: obs.ts_ns / 1_000_000,
+        }))
     }
 }
 
 /// GLFT quotes (Guéant, Lehalle and Fernandez-Tapia, arXiv:1105.3115,
-/// Theorem 1) through [`GLFTStrategy::calculate_optimal_quotes`]. A side
-/// missing at the inventory bound is an error.
+/// Theorem 1) through [`GLFTStrategy::calculate_optimal_quotes`], with the
+/// model time measured from the session start. At an inventory bound the
+/// model posts one side only, which becomes a one-sided action.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlftQuoter {
-    /// Model configuration.
+    /// Model configuration; its `lot_size` must equal the kernel lot.
     pub config: GLFTConfig,
     /// Volatility `σ`.
     pub volatility: Decimal,
-    /// Size of both sides.
+    /// Order size; one model lot.
     pub size: Decimal,
+    /// Session start (model time 0), in milliseconds of the rows' clock.
+    pub session_start_ms: u64,
 }
 
 impl QuoteSource for GlftQuoter {
-    fn quote(&mut self, obs: &Observation, mid: Decimal, inventory: Decimal) -> MMResult<Quote> {
-        let now_ms = obs.ts_ns / 1_000_000;
+    fn quote(
+        &mut self,
+        obs: &Observation,
+        mid: Decimal,
+        inventory: Decimal,
+    ) -> MMResult<SourceQuote> {
+        let elapsed = elapsed_ms(obs, self.session_start_ms)?;
         let quotes = GLFTStrategy::calculate_optimal_quotes(
             mid,
             inventory,
             &self.config,
             self.volatility,
-            now_ms,
+            elapsed,
         )?;
         match (quotes.bid, quotes.ask) {
-            (Some(bid), Some(ask)) => Ok(Quote {
+            (Some(bid), Some(ask)) => Ok(SourceQuote::Both(Quote {
                 bid_price: bid,
                 bid_size: self.size,
                 ask_price: ask,
                 ask_size: self.size,
-                timestamp: now_ms,
-            }),
-            (None, _) | (_, None) => Err(MMError::InvalidQuoteGeneration(format!(
-                "one-sided glft quote at inventory {inventory}"
+                timestamp: obs.ts_ns / 1_000_000,
+            })),
+            (Some(bid), None) => Ok(SourceQuote::Bid(bid, self.size)),
+            (None, Some(ask)) => Ok(SourceQuote::Ask(ask, self.size)),
+            (None, None) => Err(MMError::InvalidQuoteGeneration(format!(
+                "glft quote with no side at inventory {inventory}"
             ))),
         }
     }
+
+    fn validate(&self, _tick: Decimal, lot: Decimal) -> MMResult<()> {
+        if self.config.lot_size != lot {
+            return Err(MMError::InvalidConfiguration(format!(
+                "glft lot_size {} differs from the kernel lot {lot}",
+                self.config.lot_size
+            )));
+        }
+        if self.size != self.config.lot_size {
+            return Err(MMError::InvalidConfiguration(format!(
+                "glft order size {} must be one model lot ({})",
+                self.size, self.config.lot_size
+            )));
+        }
+        Ok(())
+    }
 }
 
-/// Drives a [`QuoteSource`] from kernel observations.
+/// Drives a [`QuoteSource`] from the observations of one kernel.
 #[derive(Debug, Clone)]
 pub struct QuoteAdapter<S> {
     source: S,
@@ -145,37 +227,33 @@ pub struct QuoteAdapter<S> {
     max_price: u64,
     max_lots: u64,
     default_order_size: Decimal,
+    kernel_fp: u128,
 }
 
 impl<S: QuoteSource> QuoteAdapter<S> {
-    /// An adapter on the grid of `cfg`; `default_order_size` replaces a
-    /// size that is not positive, as the engine's
-    /// `BacktestConfig::default_order_size`.
+    /// An adapter bound to `kernel`: the tick, lot and bounds come from it.
+    /// `default_order_size` replaces a size that is not positive, as the
+    /// engine's `BacktestConfig::default_order_size`.
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::InvalidConfiguration`] if the grid of `cfg` is
-    /// invalid.
-    pub fn new(source: S, cfg: &KernelConfig, default_order_size: Decimal) -> MMResult<Self> {
-        let invalid =
-            |what: &str| MMError::InvalidConfiguration(format!("adapter: invalid {what}"));
-        let tick = Unit::new(cfg.tick_size).ok_or_else(|| invalid("tick_size"))?;
-        let lot = Unit::new(cfg.lot_size).ok_or_else(|| invalid("lot_size"))?;
-        let max_price = tick
-            .count(cfg.max_price)
-            .and_then(|v| u64::try_from(v).ok())
-            .ok_or_else(|| invalid("max_price"))?;
-        let max_lots = lot
-            .count(cfg.max_order_size)
-            .and_then(|v| u64::try_from(v).ok())
-            .ok_or_else(|| invalid("max_order_size"))?;
+    /// Returns [`MMError::InvalidConfiguration`] if the strategy does not
+    /// match the kernel grid ([`QuoteSource::validate`]).
+    pub fn new<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+        source: S,
+        kernel: &FinancialKernel<'_, ORD, MSG, DLV, OBS>,
+        default_order_size: Decimal,
+    ) -> MMResult<Self> {
+        let cfg = &kernel.cfg;
+        source.validate(cfg.tick.value, cfg.lot.value)?;
         Ok(Self {
             source,
-            tick,
-            lot,
-            max_price,
-            max_lots,
+            tick: cfg.tick,
+            lot: cfg.lot,
+            max_price: cfg.p,
+            max_lots: cfg.q,
             default_order_size,
+            kernel_fp: cfg.fingerprint,
         })
     }
 
@@ -185,15 +263,20 @@ impl<S: QuoteSource> QuoteAdapter<S> {
         &self.source
     }
 
-    /// The action for the observation of `kernel`.
+    /// The action for the observation of `kernel`; a kernel other than the
+    /// one the adapter was built for gives `QuoteError(ERR_KERNEL_MISMATCH)`.
     pub fn act<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
         &mut self,
         kernel: &FinancialKernel<'_, ORD, MSG, DLV, OBS>,
         obs: &Observation,
     ) -> KernelAction {
-        let mid = kernel
-            .price(obs.bid)
-            .zip(kernel.price(obs.ask))
+        if kernel.config_fingerprint() != self.kernel_fp {
+            return KernelAction::QuoteError(ERR_KERNEL_MISMATCH);
+        }
+        let mid = self
+            .tick
+            .to_decimal(i128::from(obs.bid))
+            .zip(self.tick.to_decimal(i128::from(obs.ask)))
             .and_then(|(b, a)| b.checked_add(a))
             .and_then(|sum| sum.checked_div(Decimal::TWO));
         let Some(mid) = mid else {
@@ -205,9 +288,17 @@ impl<S: QuoteSource> QuoteAdapter<S> {
         }
     }
 
-    /// Converts a quote as the engine's `replace_quotes` does.
+    /// Converts a strategy quote as the engine's `replace_quotes` does.
     #[must_use]
-    pub fn to_action(&self, quote: &Quote) -> KernelAction {
+    pub fn to_action(&self, quote: &SourceQuote) -> KernelAction {
+        match quote {
+            SourceQuote::Both(quote) => self.two_sided(quote),
+            SourceQuote::Bid(price, size) => self.one_sided(QuoteSide::Bid, *price, *size),
+            SourceQuote::Ask(price, size) => self.one_sided(QuoteSide::Ask, *price, *size),
+        }
+    }
+
+    fn two_sided(&self, quote: &Quote) -> KernelAction {
         let crossed = quote.bid_price >= quote.ask_price;
         let bid = self.ticks(round_to_step(quote.bid_price, self.tick.value, false));
         let ask = self.ticks(round_to_step(quote.ask_price, self.tick.value, true));
@@ -232,6 +323,20 @@ impl<S: QuoteSource> QuoteAdapter<S> {
             bid_lots,
             ask_lots,
         }
+    }
+
+    fn one_sided(&self, side: QuoteSide, price: Decimal, size: Decimal) -> KernelAction {
+        let up = match side {
+            QuoteSide::Bid => false,
+            QuoteSide::Ask => true,
+        };
+        let Some(price) = self.ticks(round_to_step(price, self.tick.value, up)) else {
+            return KernelAction::QuoteError(ERR_PRICE_OUT_OF_RANGE);
+        };
+        let Some(lots) = self.lots(size) else {
+            return KernelAction::QuoteError(ERR_SIZE_OUT_OF_RANGE);
+        };
+        KernelAction::OneSided { side, price, lots }
     }
 
     fn ticks(&self, price: Decimal) -> Option<u64> {

@@ -59,8 +59,9 @@ fn main() -> MMResult<()> {
         config: glft,
         volatility: sigma,
         size: dec!(1),
+        session_start_ms: 0,
     };
-    let mut adapter = QuoteAdapter::new(quoter, &cfg, dec!(1))?;
+    let mut adapter = QuoteAdapter::new(quoter, &kernel, dec!(1))?;
 
     let mut s = kernel.reset(1);
     let (mut quotes, mut errors) = (0u64, 0u64);
@@ -68,7 +69,7 @@ fn main() -> MMResult<()> {
         let obs = kernel.observe(&s);
         let action = adapter.act(&kernel, &obs);
         match action {
-            KernelAction::Quote { .. } => quotes += 1,
+            KernelAction::Quote { .. } | KernelAction::OneSided { .. } => quotes += 1,
             KernelAction::QuoteError(_) => errors += 1,
             KernelAction::Hold => {}
         }

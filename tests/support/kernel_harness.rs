@@ -328,6 +328,8 @@ impl BacktestStrategy for Scripted {
         self.k += 1;
         match action {
             KernelAction::Hold | KernelAction::QuoteError(_) => None,
+            // Outside the subset: the scripts never produce it.
+            KernelAction::OneSided { .. } => panic!("one-sided action in an engine script"),
             KernelAction::Quote {
                 bid,
                 ask,

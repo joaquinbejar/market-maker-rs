@@ -5,7 +5,7 @@ use crate::backtest::data::MarketTick;
 use crate::types::error::{MMError, MMResult};
 
 use super::config::KernelConfig;
-use super::encode::{Fnv128, Writer};
+use super::encode::Fnv128;
 use super::grid::Unit;
 
 /// Digest scheme 1: FNV-1a-128 over the canonical ticks.
@@ -196,21 +196,19 @@ impl KernelDataset {
         };
         let len = u64::try_from(ticks.len())
             .map_err(|_| MMError::InvalidMarketState("dataset length overflows u64".to_string()))?;
+        // Every integer goes straight into the hasher, little endian, in
+        // the canonical order: grid, length, then each row.
         let mut hash = Fnv128::new();
-        let mut w = Writer::new();
-        w.u64(grid.tick_m);
-        w.u32(grid.tick_s);
-        w.u64(grid.lot_m);
-        w.u32(grid.lot_s);
-        w.u64(grid.max_price);
-        w.u64(len);
-        hash.update(&w.finish());
+        hash.update(&grid.tick_m.to_le_bytes());
+        hash.update(&grid.tick_s.to_le_bytes());
+        hash.update(&grid.lot_m.to_le_bytes());
+        hash.update(&grid.lot_s.to_le_bytes());
+        hash.update(&grid.max_price.to_le_bytes());
+        hash.update(&len.to_le_bytes());
         for t in &ticks {
-            let mut w = Writer::new();
             for v in [t.ts_ns, t.bid, t.bid_lots, t.ask, t.ask_lots] {
-                w.u64(v);
+                hash.update(&v.to_le_bytes());
             }
-            hash.update(&w.finish());
         }
         let id = DatasetId {
             scheme: DIGEST_FNV1A128,

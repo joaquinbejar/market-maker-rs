@@ -76,7 +76,8 @@ project follows [Semantic Versioning](https://semver.org/).
   over a fixed width, `Copy` `KernelState`, with `reset`, `step`,
   `observe` and `mask`, a canonical state encoding (`encode`, `decode` with
   full validation, `fingerprint`), validated `KernelDataset`s, event sinks
-  and a `QuoteAdapter` for Avellaneda-Stoikov and GLFT quotes. Inside its
+  and a `QuoteAdapter` for Avellaneda-Stoikov and GLFT quotes (bound to one
+  kernel; GLFT at an inventory bound posts a one-sided action). Inside its
   subset (immediate fills, quote fees, optional `LimitsPolicy` limits,
   latency with jitter, ordered data) it reproduces engine runs exactly;
   `new` rejects configurations outside the exactness bounds and capacities

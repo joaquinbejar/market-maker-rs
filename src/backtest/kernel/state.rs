@@ -187,6 +187,7 @@ impl KernelEvent {
             | Self::RowEnd { .. }
             | Self::EndOfData { .. }
             | Self::Halted(_)
+            | Self::Decided(_)
             | Self::DroppedMsg { .. } => false,
         }
     }
@@ -203,6 +204,15 @@ impl Status {
 /// An error code carried by [`KernelAction::QuoteError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ErrCode(pub u16);
+
+/// Side of a one-sided quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteSide {
+    /// A buy order (bid).
+    Bid,
+    /// A sell order (ask).
+    Ask,
+}
 
 /// One decision of the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,8 +232,21 @@ pub enum KernelAction {
         /// Ask size, in lots.
         ask_lots: u64,
     },
-    /// The strategy failed; recorded as a hold.
+    /// The strategy failed; recorded as a hold, with its code kept in the
+    /// outcome, the events and the state.
     QuoteError(ErrCode),
+    /// Cancel every resting or pending order and submit one order on
+    /// `side`, for a strategy that may only trade one way (an inventory
+    /// bound). Outside the engine-equivalence subset: the engine's quote is
+    /// always two-sided. Admission is the same as for a `Quote`.
+    OneSided {
+        /// Side of the order.
+        side: QuoteSide,
+        /// Price, in ticks.
+        price: u64,
+        /// Size, in lots.
+        lots: u64,
+    },
 }
 
 /// What happened to the action.
@@ -233,6 +256,9 @@ pub enum ActionStatus {
     Applied,
     /// Not admitted; nothing but the counters changed.
     Rejected(RejectReason),
+    /// A [`KernelAction::QuoteError`]: recorded as a hold, counted in
+    /// [`RejectReason::QuoteError`], with the strategy's code.
+    QuoteError(ErrCode),
 }
 
 /// Result of one [`super::FinancialKernel::step`].
@@ -336,6 +362,8 @@ pub enum KernelEvent {
     },
     /// The run halted.
     Halted(HaltReason),
+    /// The outcome of a step's action (the agent's own, synchronous).
+    Decided(ActionStatus),
     /// A venue message dropped at the end of the data.
     DroppedMsg {
         /// Order the message is for.

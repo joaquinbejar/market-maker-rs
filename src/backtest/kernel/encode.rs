@@ -523,6 +523,10 @@ pub fn encode<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: u
             w.u8(2);
             w.u16(reason.code());
         }
+        Some(ActionStatus::QuoteError(code)) => {
+            w.u8(3);
+            w.u16(code.0);
+        }
     }
     let c = &s.counters;
     w.u64(c.actions);
@@ -664,6 +668,7 @@ pub fn decode<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: u
             RejectReason::from_code(code)
                 .ok_or_else(|| err(format!("invalid reject reason {code}")))?,
         )),
+        (3, code) => Some(ActionStatus::QuoteError(super::state::ErrCode(code))),
         (tag, code) => return Err(err(format!("invalid last outcome ({tag}, {code})"))),
     };
     let actions = r.u64()?;
@@ -1191,6 +1196,17 @@ fn validate_reachability<const ORD: usize, const MSG: usize, const DLV: usize, c
             !pos.quantity.is_zero() || pos.avg_entry.is_zero(),
             "flat position with an entry price",
         )?;
+    }
+    // A position's average entry is a weighted mean of fill prices, so it
+    // lies in the price range.
+    let lowest = cfg.tick.to_decimal(i128::from(cfg.min_price.max(1)));
+    let highest = cfg.tick.to_decimal(i128::from(cfg.p));
+    for pos in [&s.agent.pos, &s.venue.pos] {
+        if !pos.quantity.is_zero() {
+            let inside = lowest.is_some_and(|l| pos.avg_entry >= l)
+                && highest.is_some_and(|h| pos.avg_entry <= h);
+            check(inside, "average entry outside the price range")?;
+        }
     }
     // Every open order has a counterpart at the venue or in the deliveries
     // (at the end of the data dropped activations leave none).
