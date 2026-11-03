@@ -55,6 +55,9 @@ pub mod market_maker;
 /// Greeks-based risk management.
 pub mod risk_manager;
 
+/// Volatility surfaces as total implied variance.
+pub mod surface;
+
 pub use adapter::OptionsAdapter;
 pub use greeks::{PortfolioGreeks, PositionGreeks};
 pub use market_maker::{
@@ -66,3 +69,4 @@ pub use risk_manager::{
     GreeksCircuitBreakerState, GreeksCircuitBreakerStatus, GreeksRiskManager, HedgeUrgency,
     LimitUtilization, OrderDecision,
 };
+pub use surface::{FlatSurface, TotalVariance, VolSurface};
