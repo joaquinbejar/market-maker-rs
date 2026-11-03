@@ -410,21 +410,23 @@ impl FillAccountant for MarginGateAccountant {
         let total = ledger
             .balance(&shared.quote)
             .map_or(Decimal::ZERO, |b| b.total);
-        let deposits: Decimal = ledger
-            .transfers()
-            .filter(|t| t.asset == shared.quote)
-            .map(|t| match t.kind {
-                TransferKind::Deposit => t.amount,
-                TransferKind::Withdrawal => -t.amount,
-            })
-            .sum();
+        // A snapshot cannot fail, so the sums saturate at the `Decimal`
+        // bounds instead of panicking.
+        let deposits =
+            ledger
+                .transfers()
+                .filter(|t| t.asset == shared.quote)
+                .fold(Decimal::ZERO, |acc, t| match t.kind {
+                    TransferKind::Deposit => acc.saturating_add(t.amount),
+                    TransferKind::Withdrawal => acc.saturating_sub(t.amount),
+                });
         AccountingSnapshot {
             position: position
                 .as_ref()
                 .map_or(Decimal::ZERO, |p| p.quantity)
                 .saturating_sub(base_fees),
             average_entry_price: position.as_ref().and_then(|p| p.average_price()),
-            cash_flow: total - deposits + quote_fees,
+            cash_flow: total.saturating_sub(deposits).saturating_add(quote_fees),
             fees: quote_fees,
             base_fees,
             fills_posted: crate::types::decimal::saturating_u64(ledger.journal().len()),

@@ -186,10 +186,11 @@ impl SimulatedFill {
         self
     }
 
-    /// Returns the notional value (price * quantity).
+    /// Returns the notional value (price * quantity), saturating at the
+    /// `Decimal` bounds instead of panicking.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.quantity
+        self.price.saturating_mul(self.quantity)
     }
 }
 
@@ -229,13 +230,17 @@ impl SlippageModel {
     ///
     /// * `price` - The base price
     /// * `volatility` - Current volatility (used for volatility-based model)
+    ///
+    /// The products saturate at the `Decimal` bounds instead of panicking.
     #[must_use]
     pub fn calculate_slippage(&self, price: Decimal, volatility: Decimal) -> Decimal {
         match self {
             SlippageModel::None => Decimal::ZERO,
             SlippageModel::Fixed(amount) => *amount,
-            SlippageModel::Percentage(pct) => price * pct,
-            SlippageModel::VolatilityBased { multiplier } => price * volatility * multiplier,
+            SlippageModel::Percentage(pct) => price.saturating_mul(*pct),
+            SlippageModel::VolatilityBased { multiplier } => {
+                price.saturating_mul(volatility).saturating_mul(*multiplier)
+            }
         }
     }
 }
@@ -627,7 +632,10 @@ impl BacktestResult {
         if self.num_trades == 0 {
             Decimal::ZERO
         } else {
-            self.net_pnl / Decimal::from(self.num_trades)
+            // Dividing by a count of at least one cannot overflow.
+            self.net_pnl
+                .checked_div(Decimal::from(self.num_trades))
+                .unwrap_or(Decimal::ZERO)
         }
     }
 
@@ -638,10 +646,19 @@ impl BacktestResult {
     }
 
     /// Returns the return on capital.
+    ///
+    /// A quotient beyond the `Decimal` range saturates to `Decimal::MAX` or
+    /// `Decimal::MIN` with the sign of the PnL.
     #[must_use]
     pub fn return_on_capital(&self, initial_capital: Decimal) -> Decimal {
         if initial_capital > Decimal::ZERO {
-            self.net_pnl / initial_capital
+            self.net_pnl.checked_div(initial_capital).unwrap_or(
+                if self.net_pnl.is_sign_negative() {
+                    Decimal::MIN
+                } else {
+                    Decimal::MAX
+                },
+            )
         } else {
             Decimal::ZERO
         }
@@ -957,7 +974,13 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             self.mark_to(mid_price);
 
             // Track equity
-            let equity = self.config.initial_capital + self.pnl.total - self.total_fees;
+            // The run cannot fail, so money sums saturate at the `Decimal`
+            // bounds instead of panicking.
+            let equity = self
+                .config
+                .initial_capital
+                .saturating_add(self.pnl.total)
+                .saturating_sub(self.total_fees);
             if self.config.record_equity_curve {
                 self.equity_curve.push((tick.timestamp, equity));
             }
@@ -966,12 +989,12 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             if equity > self.peak_equity {
                 self.peak_equity = equity;
             }
-            let drawdown = self.peak_equity - equity;
+            let drawdown = self.peak_equity.saturating_sub(equity);
             if drawdown > self.max_drawdown {
                 self.max_drawdown = drawdown;
             }
 
-            num_ticks += 1;
+            num_ticks = num_ticks.saturating_add(1);
             callback(
                 usize::try_from(num_ticks).unwrap_or(usize::MAX),
                 total_ticks,
@@ -984,7 +1007,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         BacktestResult {
             total_pnl: self.pnl.total,
             total_fees: self.total_fees,
-            net_pnl: self.pnl.total - self.total_fees,
+            net_pnl: self.pnl.total.saturating_sub(self.total_fees),
             num_trades: crate::types::decimal::saturating_u64(self.trades.len()),
             num_ticks,
             start_time,
@@ -1106,7 +1129,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                     filled_quantity,
                     fill_price,
                 } => (
-                    filled_quantity.min(order.quantity) - order.filled,
+                    filled_quantity
+                        .min(order.quantity)
+                        .saturating_sub(order.filled),
                     fill_price,
                 ),
             };
@@ -1221,7 +1246,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             // A size that rounds to zero is rejected by the venue checks.
             let mut size = round_to_step(requested, self.config.lot_size, false);
             let id = self.next_order_id;
-            self.next_order_id += 1;
+            self.next_order_id = self.next_order_id.saturating_add(1);
             let stamp = self.clock.stamp();
             // After a fault the policy or the fill model could not account
             // for something: no new order is admitted.
@@ -1285,7 +1310,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 
     fn schedule(&mut self, effective: u64, action: PendingAction) {
         let key = (effective, self.next_message);
-        self.next_message += 1;
+        self.next_message = self.next_message.saturating_add(1);
         if let PendingAction::Activate(order) = &action {
             self.pending_activations.insert(order.id, key);
         }
@@ -1425,8 +1450,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             .slippage
             .calculate_slippage(price, Decimal::ZERO);
         match dir {
-            Dir::Buy => price + slippage,
-            Dir::Sell => price - slippage,
+            Dir::Buy => price.saturating_add(slippage),
+            Dir::Sell => price.saturating_sub(slippage),
         }
     }
 
@@ -1440,7 +1465,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         charge: FeeCharge,
     ) {
         let execution_id = self.next_execution_id;
-        self.next_execution_id += 1;
+        self.next_execution_id = self.next_execution_id.saturating_add(1);
         if let Some(accountant) = self.accountant.as_mut() {
             let posted = AccountingFill {
                 execution_id,
@@ -1530,17 +1555,19 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         }
 
         let n = Decimal::from(returns.len());
-        let mean: Decimal = returns.iter().sum::<Decimal>() / n;
+        let mean = returns
+            .iter()
+            .try_fold(Decimal::ZERO, |acc, r| acc.checked_add(*r))?
+            .checked_div(n)?;
 
         // Calculate standard deviation
-        let variance: Decimal = returns
+        let variance = returns
             .iter()
-            .map(|r| {
-                let diff = *r - mean;
-                diff * diff
-            })
-            .sum::<Decimal>()
-            / n;
+            .try_fold(Decimal::ZERO, |acc, r| {
+                let diff = r.checked_sub(mean)?;
+                acc.checked_add(diff.checked_mul(diff)?)
+            })?
+            .checked_div(n)?;
 
         if variance <= Decimal::ZERO {
             return None;
@@ -1550,7 +1577,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         let std_dev = decimal_sqrt(variance)?;
 
         if std_dev > Decimal::ZERO {
-            Some(mean / std_dev)
+            mean.checked_div(std_dev)
         } else {
             None
         }
@@ -1789,7 +1816,9 @@ fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal {
         return value;
     }
     // Truncation toward zero; adjust to floor for negative values.
-    let toward_zero = value - remainder;
+    let Some(toward_zero) = value.checked_sub(remainder) else {
+        return value;
+    };
     let down = if remainder < Decimal::ZERO {
         toward_zero.checked_sub(step)
     } else {
@@ -1816,8 +1845,8 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
     let two = Decimal::TWO;
 
     for _ in 0..20 {
-        let next = (x + n / x) / two;
-        if (next - x).abs() < dec!(0.0000001) {
+        let next = x.checked_add(n.checked_div(x)?)?.checked_div(two)?;
+        if next.checked_sub(x)?.abs() < dec!(0.0000001) {
             return Some(next);
         }
         x = next;

@@ -80,8 +80,12 @@ impl InventoryPosition {
     /// assert_eq!(position.quantity, dec!(15.0));
     /// // Weighted average: (10*100 + 5*102) / 15 = 100.666...
     /// ```
+    ///
+    /// This method cannot return an error, so its arithmetic saturates at
+    /// the `Decimal` bounds instead of panicking; values that large are far
+    /// outside any real position.
     pub fn update_fill(&mut self, fill_quantity: Decimal, fill_price: Decimal, timestamp: u64) {
-        let new_quantity = self.quantity + fill_quantity;
+        let new_quantity = self.quantity.saturating_add(fill_quantity);
 
         // If crossing from long to short or vice versa, reset avg price
         if (self.quantity > Decimal::ZERO && new_quantity < Decimal::ZERO)
@@ -91,8 +95,15 @@ impl InventoryPosition {
         }
         // If increasing position, calculate weighted average
         else if new_quantity.abs() > self.quantity.abs() {
-            let total_cost = self.quantity * self.avg_entry_price + fill_quantity * fill_price;
-            self.avg_entry_price = total_cost / new_quantity;
+            let total_cost = self
+                .quantity
+                .saturating_mul(self.avg_entry_price)
+                .saturating_add(fill_quantity.saturating_mul(fill_price));
+            // `new_quantity` is non zero here (its magnitude grew), so only
+            // an overflow can fail; keep the previous average in that case.
+            if let Some(avg) = total_cost.checked_div(new_quantity) {
+                self.avg_entry_price = avg;
+            }
         }
         // If reducing position, keep same avg price
         // (realized PnL is calculated separately)
@@ -131,12 +142,15 @@ impl InventoryPosition {
     /// // If price falls to 95, unrealized PnL = 10 * (95 - 100) = -50
     /// assert_eq!(position.unrealized_pnl(dec!(95.0)), dec!(-50.0));
     /// ```
+    ///
+    /// The arithmetic saturates at the `Decimal` bounds instead of panicking.
     #[must_use]
     pub fn unrealized_pnl(&self, current_price: Decimal) -> Decimal {
         if self.is_flat() {
             return Decimal::ZERO;
         }
-        self.quantity * (current_price - self.avg_entry_price)
+        self.quantity
+            .saturating_mul(current_price.saturating_sub(self.avg_entry_price))
     }
 }
 

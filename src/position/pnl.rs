@@ -6,6 +6,9 @@ use crate::Decimal;
 use pretty_simple_display::{DebugPretty, DisplaySimple};
 
 /// Represents profit and loss information.
+///
+/// Updates cannot return errors, so sums saturate at the `Decimal` bounds
+/// instead of panicking.
 #[derive(Clone, PartialEq)]
 #[cfg_attr(not(feature = "serde"), derive(Debug))]
 #[cfg_attr(
@@ -57,7 +60,7 @@ impl PnL {
     pub fn update(&mut self, realized: Decimal, unrealized: Decimal) {
         self.realized = realized;
         self.unrealized = unrealized;
-        self.total = realized + unrealized;
+        self.total = realized.saturating_add(unrealized);
     }
 
     /// Adds realized PnL (e.g., from a closed trade).
@@ -82,8 +85,8 @@ impl PnL {
     /// assert_eq!(pnl.total, dec!(75.0));
     /// ```
     pub fn add_realized(&mut self, amount: Decimal) {
-        self.realized += amount;
-        self.total = self.realized + self.unrealized;
+        self.realized = self.realized.saturating_add(amount);
+        self.total = self.realized.saturating_add(self.unrealized);
     }
 
     /// Updates the unrealized PnL component.
@@ -107,7 +110,7 @@ impl PnL {
     /// ```
     pub fn set_unrealized(&mut self, amount: Decimal) {
         self.unrealized = amount;
-        self.total = self.realized + self.unrealized;
+        self.total = self.realized.saturating_add(self.unrealized);
     }
 }
 

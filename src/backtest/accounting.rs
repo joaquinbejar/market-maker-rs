@@ -44,7 +44,7 @@ use std::fmt;
 use crate::Decimal;
 use crate::execution::Action;
 use crate::types::action::Dir;
-use crate::types::error::MMResult;
+use crate::types::error::{MMError, MMResult};
 
 use super::lifecycle::SimOrderId;
 
@@ -93,9 +93,21 @@ impl AccountingFill {
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction)
-    /// if the side is neither buy nor sell.
+    /// if the side is neither buy nor sell, or
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// if the notional overflows.
     pub fn cash_flow(&self) -> MMResult<Decimal> {
-        Ok(-self.signed_quantity()? * self.price)
+        let dir = Dir::try_from(self.side)?;
+        let notional = self.quantity.checked_mul(self.price).ok_or_else(|| {
+            MMError::NumericalError(format!(
+                "cash flow overflow: {} * {}",
+                self.quantity, self.price
+            ))
+        })?;
+        Ok(match dir {
+            Dir::Buy => -notional,
+            Dir::Sell => notional,
+        })
     }
 }
 
@@ -325,14 +337,16 @@ mod margin_ledger {
                 .iter()
                 .filter(|e| e.instrument == self.instrument)
             {
-                snapshot.cash_flow += match entry.side {
-                    LedgerSide::Buy => -entry.notional,
-                    LedgerSide::Sell => entry.notional,
+                // A snapshot cannot fail, so the sums saturate at the
+                // `Decimal` bounds instead of panicking.
+                snapshot.cash_flow = match entry.side {
+                    LedgerSide::Buy => snapshot.cash_flow.saturating_sub(entry.notional),
+                    LedgerSide::Sell => snapshot.cash_flow.saturating_add(entry.notional),
                 };
                 if let Some(fee) = entry.fee.as_ref().filter(|f| f.asset == self.quote) {
-                    snapshot.fees += fee.amount;
+                    snapshot.fees = snapshot.fees.saturating_add(fee.amount);
                 }
-                snapshot.fills_posted += 1;
+                snapshot.fills_posted = snapshot.fills_posted.saturating_add(1);
             }
             snapshot
         }
@@ -376,6 +390,15 @@ mod tests {
         let sell = fill(Action::Sell, dec!(100), dec!(2));
         assert_eq!(sell.signed_quantity().unwrap(), dec!(-2));
         assert_eq!(sell.cash_flow().unwrap(), dec!(200));
+    }
+
+    #[test]
+    fn test_cash_flow_notional_overflow_returns_err() {
+        let huge = fill(Action::Buy, Decimal::MAX, dec!(2));
+        assert!(matches!(
+            huge.cash_flow(),
+            Err(crate::types::error::MMError::NumericalError(_))
+        ));
     }
 
     #[test]
