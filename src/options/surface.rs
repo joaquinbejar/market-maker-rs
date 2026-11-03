@@ -47,14 +47,19 @@ use rust_decimal::prelude::ToPrimitive;
 /// A volatility surface: total implied variance and its derivatives.
 ///
 /// Implementations provide [`VolSurface::total_variance_at`]; callers use
-/// [`VolSurface::total_variance`], which checks the point first, so an
-/// implementation never sees a non-finite `k` or a `tau <= 0`.
+/// [`VolSurface::total_variance`], which runs [`check_point`] before calling
+/// it. That is a convention, not a guarantee Rust enforces: an
+/// implementation could override the provided method (it should not), and
+/// `total_variance_at` is public like every trait method, so code that calls
+/// it directly must check the point itself. Consumers such as the option
+/// pricer also validate their inputs at their own boundary.
 /// Implementations must be thread safe (`Send + Sync`), so one surface can
 /// be shared by the pricers of a whole chain.
 pub trait VolSurface: Send + Sync {
-    /// The surface's own evaluation, called by
-    /// [`VolSurface::total_variance`] with a point that passed
-    /// [`check_point`] (finite `k`, finite `tau > 0`).
+    /// The surface's own evaluation. It assumes `(k, tau)` passed
+    /// [`check_point`] (finite `k`, finite `tau > 0`):
+    /// [`VolSurface::total_variance`] checks it before the call, and a direct
+    /// caller must check it first.
     ///
     /// # Errors
     ///
@@ -65,8 +70,9 @@ pub trait VolSurface: Send + Sync {
     fn total_variance_at(&self, k: f64, tau: f64) -> MMResult<TotalVariance>;
 
     /// The total implied variance at log forward moneyness `k` and time to
-    /// expiry `tau` (years), with its derivatives. Implementations should
-    /// not override it: it is where the point is checked.
+    /// expiry `tau` (years), with its derivatives, after checking the point.
+    /// Implementations should not override it: it is where the point is
+    /// checked.
     ///
     /// # Errors
     ///
@@ -153,7 +159,8 @@ impl TotalVariance {
 
 /// Checks a surface query point: `k` finite, `tau` finite and strictly
 /// positive. [`VolSurface::total_variance`] calls it before the surface's
-/// own evaluation.
+/// own evaluation; a direct caller of [`VolSurface::total_variance_at`]
+/// must call it first.
 ///
 /// # Errors
 ///
@@ -341,7 +348,7 @@ mod tests {
     #[test]
     fn test_vol_surface_point_is_checked_before_the_implementation() {
         // An implementation that would accept anything: the provided method
-        // still refuses an invalid point before calling it.
+        // (when not overridden) refuses an invalid point before calling it.
         struct Permissive;
         impl VolSurface for Permissive {
             fn total_variance_at(&self, _k: f64, _tau: f64) -> MMResult<TotalVariance> {
