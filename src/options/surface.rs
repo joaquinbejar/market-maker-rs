@@ -50,6 +50,8 @@ pub mod calibrate;
 pub mod diagnostics;
 /// Implied total variance of cleaned quotes.
 pub mod iv;
+/// From a quote set to a calibrated surface and its quality report.
+pub mod pipeline;
 /// Cleaning of option quotes before calibration.
 pub mod quotes;
 /// Shock scenarios on a surface, each with its own diagnostics.
@@ -66,6 +68,10 @@ pub use diagnostics::{
     Check, DiagnosticGrid, DiagnosticPoint, DiagnosticsConfig, SurfaceDiagnostics, diagnose,
 };
 pub use iv::{Extraction, IvConfig, IvFailure, IvObservation, extract, implied_total_variance};
+pub use pipeline::{
+    QualityReport, QuoteResidual, SliceReport, StabilityConfig, StabilityPoint,
+    SurfaceCalibrationConfig, calibrate_surface,
+};
 pub use quotes::{
     CleanQuote, CleaningConfig, CleaningReport, OptionQuote, QuoteFlag, QuoteVerdict, Rates,
     Rejection, clean_quotes,
