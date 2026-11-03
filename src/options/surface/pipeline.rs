@@ -484,6 +484,8 @@ mod tests {
                 .is_some_and(SurfaceDiagnostics::is_clean)
         );
         let surface = entry.surface().unwrap();
+        // Healthy was decided on a grid holding every node of the surface.
+        assert!(surface.covers_nodes(&report.diagnostics.as_ref().unwrap().grid));
         for d in [30, 90, 180] {
             let truth = truth_slice(d);
             for k in [-0.3, -0.1, 0.0, 0.1, 0.3] {

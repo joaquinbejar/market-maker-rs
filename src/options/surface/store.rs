@@ -623,6 +623,36 @@ mod tests {
     }
 
     #[test]
+    fn test_served_diagnosis_covers_the_aged_and_shocked_nodes() {
+        let mut store = SurfaceStore::new();
+        let entry = calibrated(DAY, DAY, 0.04, SurfaceStatus::Healthy);
+        let calibrated_grid = entry
+            .surface()
+            .unwrap()
+            .node_grid(policy(false).k_grid, &[])
+            .unwrap();
+        store.insert(entry).unwrap();
+        let served = store.surface_at(6 * DAY, &policy(false)).unwrap();
+        assert_eq!(served.served_status, SurfaceStatus::Healthy);
+        // The served status was decided on the aged surface's own nodes, not
+        // on the calibration's.
+        assert!(served.surface.covers_nodes(&served.diagnostics.grid));
+        assert!(!served.surface.covers_nodes(&calibrated_grid));
+        // Shocks move no node: each shocked surface is diagnosed on the same
+        // grid, which holds its nodes.
+        let scenarios = crate::options::surface::run_scenarios(
+            &served.surface,
+            &crate::options::surface::standard_scenarios().unwrap(),
+            &served.diagnostics.grid,
+            policy(false).diagnostics,
+        )
+        .unwrap();
+        for scenario in &scenarios {
+            assert!(served.surface.covers_nodes(&scenario.diagnostics.grid));
+        }
+    }
+
+    #[test]
     fn test_ageing_preserves_calendar_order() {
         // tau_i(t) / tau_i(cutoff) grows with the expiry, so w_2 >= w_1 at
         // the cutoff stays true after ageing.
