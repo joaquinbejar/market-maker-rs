@@ -458,6 +458,8 @@ impl SviSurface {
     }
 
     fn bracket(&self, k: f64, tau: f64) -> MMResult<Bracket<'_>> {
+        // total_variance checks the point before total_variance_at; region()
+        // reaches here directly, so the check stays.
         check_point(k, tau)?;
         let (Some(first), Some(last)) = (self.slices.first(), self.slices.last()) else {
             return Err(MMError::InvalidConfiguration(
@@ -518,7 +520,7 @@ impl SviSurface {
 }
 
 impl VolSurface for SviSurface {
-    fn total_variance(&self, k: f64, tau: f64) -> MMResult<TotalVariance> {
+    fn total_variance_at(&self, k: f64, tau: f64) -> MMResult<TotalVariance> {
         match self.bracket(k, tau)? {
             Bracket::Short(first) => {
                 let (w1, w1_k, w1_kk) = first.eval(k)?;

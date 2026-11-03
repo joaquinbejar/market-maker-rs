@@ -133,7 +133,7 @@ impl<S: VolSurface> ShockedSurface<S> {
 }
 
 impl<S: VolSurface> VolSurface for ShockedSurface<S> {
-    fn total_variance(&self, k: f64, tau: f64) -> MMResult<TotalVariance> {
+    fn total_variance_at(&self, k: f64, tau: f64) -> MMResult<TotalVariance> {
         let base = self.base.total_variance(k, tau)?;
         let (w, w_k, w_kk, w_tau) = (base.w(), base.w_k(), base.w_kk(), base.w_tau());
         // sigma = sqrt(w / tau) and its derivatives at fixed tau or k.
