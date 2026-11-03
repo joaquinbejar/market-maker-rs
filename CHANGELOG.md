@@ -70,6 +70,17 @@ project follows [Semantic Versioning](https://semver.org/).
   `details`.
 - `options::adapter::ADAPTER_MS_PER_YEAR`: the 365.25-day year of the
   adapter's ms helpers, now named; their results are unchanged (#95).
+- `backtest::kernel` (feature `kernel`, no dependencies): `FinancialKernel`,
+  a deterministic, resumable re-implementation of the backtest engine loop
+  over a fixed width, `Copy` `KernelState`, with `reset`, `step`,
+  `observe` and `mask`, a canonical state encoding (`encode`, `decode` with
+  full validation, `fingerprint`), validated `KernelDataset`s, event sinks
+  and a `QuoteAdapter` for Avellaneda-Stoikov and GLFT quotes. Inside its
+  subset (immediate fills, quote fees, optional `LimitsPolicy` limits,
+  latency with jitter, ordered data) it reproduces engine runs exactly;
+  `new` rejects configurations outside the exactness bounds and capacities
+  below the dataset's needs. Examples `kernel_avellaneda` and `kernel_glft`
+  (#83).
 - `options::surface` (feature `options`): the `VolSurface` trait (total
   implied variance `w(k, tau)` and its derivatives at a log forward
   moneyness and a time to expiry), the validated `TotalVariance` value,

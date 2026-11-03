@@ -115,6 +115,14 @@ required-features = ["multi-underlying"]
 name = "event_system"
 required-features = ["events"]
 
+[[example]]
+name = "kernel_avellaneda"
+required-features = ["kernel"]
+
+[[example]]
+name = "kernel_glft"
+required-features = ["kernel"]
+
 [[bench]]
 name = "quote_generation"
 harness = false
