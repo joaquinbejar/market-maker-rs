@@ -1036,3 +1036,56 @@ fn test_black_scaling_never_underflows_an_intermediate() {
     let want = 8.360_537_541_944_882e-31;
     assert!(close(got, want, 1e-11, 0.0), "{got:e} vs {want:e}");
 }
+
+#[test]
+fn test_surface_point_is_where_value_reads_the_surface() {
+    use market_maker_rs::options::pricing::surface_point;
+    use std::sync::Mutex;
+    // A surface that records every point it is asked for.
+    struct Recording(Mutex<Vec<(f64, f64)>>);
+    impl VolSurface for Recording {
+        fn total_variance_at(
+            &self,
+            k: f64,
+            tau: f64,
+        ) -> market_maker_rs::types::error::MMResult<TotalVariance> {
+            self.0.lock().unwrap().push((k, tau));
+            TotalVariance::new(0.04 * tau + 0.01 * k * k, 0.02 * k, 0.02, 0.04)
+        }
+    }
+    for dynamics in [
+        Dynamics::StickyMoneyness,
+        Dynamics::StickyStrike { s_ref: dec!(99.5) },
+    ] {
+        for strike in [dec!(100.0000000000000001), dec!(80), dec!(125)] {
+            let surface = Recording(Mutex::new(Vec::new()));
+            let i = OptionInputs::european(
+                dec!(100),
+                strike,
+                dec!(0.25),
+                dec!(0.03),
+                dec!(0.01),
+                OptionStyle::Call,
+            );
+            value(&i, &surface, dynamics).unwrap();
+            let read = surface.0.lock().unwrap().clone();
+            assert_eq!(
+                read,
+                vec![surface_point(&i, dynamics).unwrap()],
+                "{dynamics:?} K {strike}"
+            );
+        }
+    }
+    let at_expiry = OptionInputs::european(
+        dec!(100),
+        dec!(100),
+        dec!(0),
+        dec!(0),
+        dec!(0),
+        OptionStyle::Call,
+    );
+    assert!(matches!(
+        surface_point(&at_expiry, Dynamics::StickyMoneyness),
+        Err(MMError::InvalidMarketState(_))
+    ));
+}

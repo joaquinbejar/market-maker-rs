@@ -176,6 +176,21 @@ cargo run --example display_example --features serde
 
 ---
 
+### 10. `counterpart.rs` - Batch Counterpart (requires `options` feature)
+**What it demonstrates:**
+- `calibrate`: a surface from a quotes CSV with `calibrate_surface`, written as JSON (status, slices, report)
+- `price`: European values and total Greeks on that surface for a requests CSV, one response row per request
+- `identity`: the protocol, crate version and build commit as JSON
+
+**Key concepts:**
+- Decimal in and out of the CSV files, never through `f64`
+- An error is a row with a class (`InvalidInput`, `Unsupported`, `Numerical`), never a number
+- Exit code 2 only on a protocol failure
+
+**Run:** `cargo run --example counterpart --features options -- identity`
+
+---
+
 ## Learning Path
 
 ### For Beginners:

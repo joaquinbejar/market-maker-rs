@@ -83,6 +83,11 @@ name = "vol_surface_validation"
 required-features = ["options"]
 
 [[example]]
+name = "counterpart"
+required-features = ["options"]
+test = true
+
+[[example]]
 name = "options_market_making"
 required-features = ["options"]
 
