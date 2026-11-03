@@ -157,18 +157,6 @@ pub(crate) fn decimal_to_u64_saturating(value: Decimal) -> u64 {
     truncated.to_u64().unwrap_or(u64::MAX)
 }
 
-/// Converts a `Decimal` to `u128`, truncating toward zero and saturating
-/// like [`decimal_to_u64_saturating`].
-#[must_use]
-#[inline]
-pub(crate) fn decimal_to_u128_saturating(value: Decimal) -> u128 {
-    let truncated = value.trunc();
-    if truncated.is_sign_negative() {
-        return 0;
-    }
-    truncated.to_u128().unwrap_or(u128::MAX)
-}
-
 /// Converts a count, length or duration in integer units to `u64`,
 /// saturating at `u64::MAX` when the value does not fit.
 #[must_use]
@@ -187,16 +175,6 @@ mod tests {
         assert_eq!(decimal_to_u64_saturating(dec!(-3.5)), 0);
         assert_eq!(decimal_to_u64_saturating(dec!(-0.5)), 0);
         assert_eq!(decimal_to_u64_saturating(Decimal::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn test_decimal_to_u128_saturating_bounds_clamp() {
-        assert_eq!(decimal_to_u128_saturating(dec!(7.99)), 7);
-        assert_eq!(decimal_to_u128_saturating(dec!(-1)), 0);
-        assert_eq!(
-            decimal_to_u128_saturating(Decimal::MAX),
-            Decimal::MAX.to_u128().unwrap()
-        );
     }
 
     #[test]
