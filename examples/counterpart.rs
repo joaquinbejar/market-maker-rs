@@ -22,8 +22,15 @@
 //! - `price` values every request row on the surface and writes one
 //!   response row per request: `ok` with the price, the total Greeks, the
 //!   total variance read and the dynamics, or `error` with a class and a
-//!   reason and no number. The classes are `InvalidInput`, `Unsupported` and
-//!   `Numerical`.
+//!   reason and no number. The classes are:
+//!   - `InvalidInput`: the row itself (a field that is not a number, an
+//!     unknown kind or style, a non-positive spot or strike, `as_of_days`
+//!     after `expiry_days`);
+//!   - `OutOfDomain`: a valid row the surface does not answer, for example a
+//!     time to expiry outside its slices;
+//!   - `Unsupported`: a contract the pricer does not value (American);
+//!   - `Numerical`: a numerical limit (a factor that under- or overflows, a
+//!     non-finite intermediate).
 //!
 //! Numbers in the CSV files are read from their text as `Decimal`, never
 //! through `f64`, and written as `Decimal` without exponent notation.
@@ -51,7 +58,7 @@ use market_maker_rs::options::surface::{
 };
 use market_maker_rs::types::error::MMError;
 use optionstratlib::{OptionStyle, OptionType};
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Value, json};
 
 /// The protocol of the files and of `identity`.
@@ -567,7 +574,9 @@ fn dynamics_name(d: Dynamics) -> &'static str {
     }
 }
 
-/// The class of a row error, for the harness to map onto its own.
+/// The class of an error of the shared checks or of the valuation, for the
+/// harness to map onto its own; surface errors are classed before
+/// ([`value_row`] reads the surface first, as `OutOfDomain`).
 fn class(e: &MMError) -> &'static str {
     match e {
         MMError::UnsupportedContract { .. } => "Unsupported",
@@ -627,31 +636,53 @@ fn value_row(
         .checked_sub(as_of)
         .ok_or_else(|| invalid("expiry_days - as_of_days overflows".to_string()))?;
     let model = |e: MMError| (class(&e), e.to_string());
-    let tau = tau_from_days(days).map_err(model)?;
+    let tau = tau_from_days(days).map_err(|e| invalid(e.to_string()))?;
+    if strike <= Decimal::ZERO {
+        return Err(invalid(format!("strike must be positive, got {strike}")));
+    }
+    // The row's own inputs first (spot, time to expiry, rates and the
+    // factors derived from them), then the surface's domain, then the value.
+    pricer.check_market(spot, tau, rate, carry).map_err(model)?;
     let mut inputs = OptionInputs::european(spot, strike, tau, rate, carry, style);
     inputs.exercise = exercise;
+    let w = total_variance(surface, dynamics, &inputs).map_err(|e| match e {
+        Read::Surface(e) => ("OutOfDomain", e.to_string()),
+        Read::Inputs(e) => model(e),
+    })?;
     let v = pricer.value(&inputs).map_err(model)?;
-    let w = total_variance(surface, dynamics, &inputs).map_err(model)?;
     Ok(format!(
         "{},{},{},{},{},{w}",
         v.price, v.delta, v.gamma, v.vega, v.theta
     ))
 }
 
-/// The total variance the valuation read, at the `k` of the dynamics; 0 at
-/// expiry, where no surface is read.
+/// Why the total variance could not be read.
+enum Read {
+    /// The inputs have no `f64` value.
+    Inputs(MMError),
+    /// The surface does not answer at the point.
+    Surface(MMError),
+}
+
+/// The total variance at the `k` of the dynamics, written as `f64` text
+/// (shortest round trip, no exponent); `0` at expiry, where no surface is
+/// read. `k = ln(K / anchor) - (r - q) tau` is recomputed here in `f64`; the
+/// pricer takes the log ratio near the money as a `log1p` of the exact
+/// `Decimal` ratio, so the two `k` can differ in their last bits.
 fn total_variance(
     surface: &SviSurface,
     dynamics: Dynamics,
     i: &OptionInputs,
-) -> Result<Decimal, MMError> {
+) -> Result<String, Read> {
     if i.tau_years <= Decimal::ZERO {
-        return Ok(Decimal::ZERO);
+        return Ok("0".to_string());
     }
     let f = |name: &str, d: Decimal| {
-        d.to_f64()
-            .filter(|x| x.is_finite())
-            .ok_or_else(|| MMError::NumericalError(format!("{name} {d} has no f64 value")))
+        d.to_f64().filter(|x| x.is_finite()).ok_or_else(|| {
+            Read::Inputs(MMError::NumericalError(format!(
+                "{name} {d} has no f64 value"
+            )))
+        })
     };
     let tau = f("time to expiry", i.tau_years)?;
     let anchor = match dynamics {
@@ -660,15 +691,15 @@ fn total_variance(
     };
     let k = (f("strike", i.strike)? / f("anchor spot", anchor)?).ln()
         - (f("rate", i.rate)? - f("carry", i.carry)?) * tau;
-    let w = surface.total_variance(k, tau)?.w();
-    Decimal::from_f64(w)
-        .ok_or_else(|| MMError::NumericalError(format!("total variance {w} has no Decimal value")))
+    let w = surface.total_variance(k, tau).map_err(Read::Surface)?.w();
+    Ok(format!("{w}"))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use rust_decimal::prelude::FromPrimitive;
 
     /// A skewed two-slice surface (30 and 60 days).
     fn surface_json() -> String {
@@ -734,6 +765,8 @@ mod tests {
                 "underflow,100,45,call,european,100,0,10000,0",
                 "text,100,45,call,european,1e2x,0,0,0",
                 "tau,100,90,call,european,100,0,0,0",
+                "strike,0,45,call,european,100,0,0,0",
+                "late,100,45,call,european,100,46,0,0",
             ],
         );
         let classes: Vec<&str> = r
@@ -750,6 +783,8 @@ mod tests {
                 "InvalidInput",
                 "Unsupported",
                 "Numerical",
+                "InvalidInput",
+                "OutOfDomain",
                 "InvalidInput",
                 "InvalidInput"
             ]
