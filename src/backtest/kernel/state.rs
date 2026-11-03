@@ -1,0 +1,545 @@
+//! Kernel state, phases, outcomes, reasons and events.
+
+use crate::Decimal;
+
+use super::account::AgentAccount;
+use super::book::{Arr, Delivery, FillRec, ObsEntry, ReportRec, VenueMsg, VenueOrder};
+use super::data::DatasetId;
+use super::gate::{GateState, GateVerdict};
+use super::ledger::{AgentView, VenueLedger};
+use super::rng::KernelRng;
+use crate::execution::Action;
+
+/// Where the common advance stands.
+///
+/// Code 2 is reserved and never used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The current row's first event pass, before matching.
+    BeforeMatch = 1,
+    /// The current row's second event pass, after its observation was
+    /// queued.
+    ObsQueued = 3,
+    /// Paused at a decision point.
+    AwaitDecision = 4,
+    /// The run is over.
+    Terminal = 5,
+}
+
+impl Phase {
+    pub(super) fn code(self) -> u8 {
+        match self {
+            Self::BeforeMatch => 1,
+            Self::ObsQueued => 3,
+            Self::AwaitDecision => 4,
+            Self::Terminal => 5,
+        }
+    }
+
+    pub(super) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::BeforeMatch),
+            3 => Some(Self::ObsQueued),
+            4 => Some(Self::AwaitDecision),
+            5 => Some(Self::Terminal),
+            _ => None,
+        }
+    }
+}
+
+/// Why a run ended normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TermReason {
+    /// Every row was processed.
+    EndOfData = 1,
+}
+
+/// Why a run halted. Codes 1 to 4 and 9 are retired and never reused.
+///
+/// No halt is reachable through [`super::FinancialKernel::new`] except
+/// `StateMismatch` (a state from another kernel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HaltReason {
+    /// A ledger value left its exact range.
+    LedgerOverflow = 5,
+    /// A time computation overflowed.
+    TimeOverflow = 6,
+    /// A sequence, counter or container overflowed.
+    CounterOverflow = 7,
+    /// The state belongs to another dataset or configuration.
+    StateMismatch = 8,
+    /// The pretrade exposure was not representable.
+    GateNumeric = 10,
+}
+
+impl HaltReason {
+    pub(super) fn code(self) -> u16 {
+        match self {
+            Self::LedgerOverflow => 5,
+            Self::TimeOverflow => 6,
+            Self::CounterOverflow => 7,
+            Self::StateMismatch => 8,
+            Self::GateNumeric => 10,
+        }
+    }
+
+    pub(super) fn from_code(code: u16) -> Option<Self> {
+        match code {
+            5 => Some(Self::LedgerOverflow),
+            6 => Some(Self::TimeOverflow),
+            7 => Some(Self::CounterOverflow),
+            8 => Some(Self::StateMismatch),
+            10 => Some(Self::GateNumeric),
+            _ => None,
+        }
+    }
+}
+
+/// Why an action was not admitted. Code 7 is retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RejectReason {
+    /// The run is over (or the state is not at a decision point).
+    Terminal = 1,
+    /// A price is outside `min..=max_price` ticks.
+    PriceRange = 2,
+    /// A size is outside `1..=max_order_size` lots.
+    SizeRange = 3,
+    /// Not enough order slots for two more open orders.
+    CapacityOrders = 4,
+    /// Not enough venue message capacity for two more open orders.
+    CapacityMsgs = 5,
+    /// Not enough delivery capacity for two more open orders.
+    CapacityDeliveries = 6,
+    /// The strategy failed to produce a quote (recorded as a hold).
+    QuoteError = 8,
+}
+
+impl RejectReason {
+    /// Numeric code (1 to 8).
+    #[must_use]
+    pub fn code(self) -> u16 {
+        match self {
+            Self::Terminal => 1,
+            Self::PriceRange => 2,
+            Self::SizeRange => 3,
+            Self::CapacityOrders => 4,
+            Self::CapacityMsgs => 5,
+            Self::CapacityDeliveries => 6,
+            Self::QuoteError => 8,
+        }
+    }
+
+    pub(super) fn from_code(code: u16) -> Option<Self> {
+        match code {
+            1 => Some(Self::Terminal),
+            2 => Some(Self::PriceRange),
+            3 => Some(Self::SizeRange),
+            4 => Some(Self::CapacityOrders),
+            5 => Some(Self::CapacityMsgs),
+            6 => Some(Self::CapacityDeliveries),
+            8 => Some(Self::QuoteError),
+            _ => None,
+        }
+    }
+
+    /// Index in [`Counters::rejected`].
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Terminal => 0,
+            Self::PriceRange => 1,
+            Self::SizeRange => 2,
+            Self::CapacityOrders => 3,
+            Self::CapacityMsgs => 4,
+            Self::CapacityDeliveries => 5,
+            Self::QuoteError => 7,
+        }
+    }
+}
+
+/// Run status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// The run continues.
+    Running,
+    /// The run ended normally.
+    Terminal(TermReason),
+    /// `max_steps` decisions were taken.
+    Truncated,
+    /// The run halted.
+    Halted(HaltReason),
+}
+
+impl Status {
+    /// Returns true while the run continues.
+    #[must_use]
+    pub fn is_running(self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
+/// An error code carried by [`KernelAction::QuoteError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ErrCode(pub u16);
+
+/// One decision of the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelAction {
+    /// Leave the resting orders in place.
+    Hold,
+    /// Cancel every resting or pending order and submit a bid and an ask.
+    /// A crossed quote (`bid >= ask`) is admitted and rejected locally on
+    /// both sides, as the engine does.
+    Quote {
+        /// Bid, in ticks.
+        bid: u64,
+        /// Ask, in ticks.
+        ask: u64,
+        /// Bid size, in lots.
+        bid_lots: u64,
+        /// Ask size, in lots.
+        ask_lots: u64,
+    },
+    /// The strategy failed; recorded as a hold.
+    QuoteError(ErrCode),
+}
+
+/// What happened to the action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionStatus {
+    /// Admitted (a quote may still be rejected locally, through a report).
+    Applied,
+    /// Not admitted; nothing but the counters changed.
+    Rejected(RejectReason),
+}
+
+/// Result of one [`super::FinancialKernel::step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepOutcome {
+    /// What happened to the action.
+    pub applied: ActionStatus,
+    /// Status after the step.
+    pub status: Status,
+    /// Events emitted by the step.
+    pub events: u32,
+}
+
+/// Run counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counters {
+    /// Step calls that took a decision (every call while running).
+    pub actions: u64,
+    /// Not admitted actions, by [`RejectReason::index`].
+    pub rejected: [u64; 8],
+    /// Halts (at most one).
+    pub halts: u64,
+    /// Venue messages dropped at the end of the data.
+    pub eof_dropped_msgs: u64,
+    /// Observations dropped at the end of the data.
+    pub eof_dropped_obs: u64,
+    /// `QuoteError` actions.
+    pub quote_errors: u64,
+    /// Venue fills (venue time; never observed directly).
+    pub venue_fills: u64,
+    /// Local rejects (venue time; never observed directly).
+    pub local_rejects: u64,
+}
+
+impl Counters {
+    pub(super) const ZERO: Self = Self {
+        actions: 0,
+        rejected: [0; 8],
+        halts: 0,
+        eof_dropped_msgs: 0,
+        eof_dropped_obs: 0,
+        quote_errors: 0,
+        venue_fills: 0,
+        local_rejects: 0,
+    };
+}
+
+/// A pretrade decision of the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GateRecord {
+    /// Order id.
+    pub order_id: u64,
+    /// Side.
+    pub side: Action,
+    /// Requested lots.
+    pub requested: u64,
+    /// Verdict.
+    pub verdict: GateVerdict,
+    /// Submitted lots (0 when refused).
+    pub submitted: u64,
+}
+
+/// An event of the run, in event order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum KernelEvent {
+    /// A report was produced (venue time); the engine records it here.
+    Report(ReportRec),
+    /// A fill was booked in the venue ledger.
+    Fill(FillRec),
+    /// The gate decided on an order.
+    Gate(GateRecord),
+    /// A report reached the agent.
+    Delivered(ReportRec),
+    /// An observation reached the agent: a decision point.
+    Observed {
+        /// Row observed.
+        row: u64,
+        /// Time of the decision, in nanoseconds.
+        at_ns: u64,
+    },
+    /// A row was fully processed and the ledger marked at its mid.
+    RowEnd {
+        /// Row index.
+        row: u64,
+        /// Row time, in nanoseconds.
+        ts_ns: u64,
+        /// Equity at the row's mid, in half money units.
+        equity_half_u: i128,
+    },
+    /// The data ended; pending messages and observations were dropped.
+    EndOfData {
+        /// Venue messages dropped.
+        dropped_msgs: u64,
+        /// Observations dropped.
+        dropped_obs: u64,
+    },
+    /// The run halted.
+    Halted(HaltReason),
+}
+
+/// Receiver of [`KernelEvent`]s. Implementations should not allocate per
+/// event on hot paths; the kernel itself never allocates for events.
+pub trait EventSink {
+    /// Receives one event.
+    fn event(&mut self, event: KernelEvent);
+}
+
+/// A sink that ignores every event.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoSink;
+
+impl EventSink for NoSink {
+    fn event(&mut self, _event: KernelEvent) {}
+}
+
+impl EventSink for Vec<KernelEvent> {
+    fn event(&mut self, event: KernelEvent) {
+        self.push(event);
+    }
+}
+
+/// Lengths of the internal queues, for bound checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueLengths {
+    /// Resting orders.
+    pub orders: u64,
+    /// Terminal orders awaiting a cancel outcome.
+    pub awaiting: u64,
+    /// Venue messages.
+    pub msgs: u64,
+    /// Undelivered reports.
+    pub deliveries: u64,
+    /// Observations in flight.
+    pub observed: u64,
+    /// Open orders in the agent account.
+    pub held: u64,
+}
+
+/// The complete simulation state: a `Copy` value, so a copy is a snapshot.
+///
+/// The fields are private; [`super::FinancialKernel::reset`],
+/// [`super::FinancialKernel::step`] and [`super::decode`] are the only ways
+/// to build one. The in-memory layout is unstable; the canonical encoding
+/// ([`super::encode`]) is the stable form.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KernelState<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize> {
+    pub(super) data_id: DatasetId,
+    pub(super) cfg_fp: u128,
+    pub(super) format_version: u16,
+    pub(super) phase: Phase,
+    /// Pass to resume after a decision (`BeforeMatch` or `ObsQueued`).
+    pub(super) resume: Phase,
+    /// Next row to read.
+    pub(super) cursor: u64,
+    /// Row being processed.
+    pub(super) cur_row: Option<u64>,
+    pub(super) now_ns: u64,
+    pub(super) step: u64,
+    pub(super) status: Status,
+    pub(super) rng_latency: KernelRng,
+    pub(super) rng_fill: KernelRng,
+    pub(super) stamp_seq: u64,
+    pub(super) next_msg_seq: u64,
+    pub(super) next_order_id: u64,
+    pub(super) next_exec_id: u64,
+    pub(super) last_delivery_ns: u64,
+    pub(super) last_observed_ns: u64,
+    pub(super) orders: Arr<VenueOrder, ORD>,
+    pub(super) msgs: Arr<VenueMsg, MSG>,
+    pub(super) awaiting: Arr<VenueOrder, ORD>,
+    pub(super) venue: VenueLedger,
+    pub(super) gate: GateState,
+    pub(super) deliveries: Arr<Delivery, DLV>,
+    pub(super) observed: Arr<ObsEntry, OBS>,
+    pub(super) agent: AgentView,
+    pub(super) account: AgentAccount<ORD>,
+    pub(super) last: Option<ActionStatus>,
+    pub(super) counters: Counters,
+}
+
+impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
+    KernelState<ORD, MSG, DLV, OBS>
+{
+    /// Identity of the dataset the state belongs to.
+    #[must_use]
+    pub fn data_id(&self) -> DatasetId {
+        self.data_id
+    }
+
+    /// Fingerprint of the configuration the state belongs to.
+    #[must_use]
+    pub fn cfg_fingerprint(&self) -> u128 {
+        self.cfg_fp
+    }
+
+    /// Phase of the advance.
+    #[must_use]
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Run status.
+    #[must_use]
+    pub fn status(&self) -> Status {
+        self.status
+    }
+
+    /// Rows read so far.
+    #[must_use]
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Simulated time, in nanoseconds.
+    #[must_use]
+    pub fn now_ns(&self) -> u64 {
+        self.now_ns
+    }
+
+    /// Decisions taken.
+    #[must_use]
+    pub fn step_count(&self) -> u64 {
+        self.step
+    }
+
+    /// Counters.
+    #[must_use]
+    pub fn counters(&self) -> Counters {
+        self.counters
+    }
+
+    /// Outcome of the last action.
+    #[must_use]
+    pub fn last(&self) -> Option<ActionStatus> {
+        self.last
+    }
+
+    /// Next event stamp sequence number.
+    #[must_use]
+    pub fn stamp_seq(&self) -> u64 {
+        self.stamp_seq
+    }
+
+    /// Next venue message sequence number.
+    #[must_use]
+    pub fn next_msg_seq(&self) -> u64 {
+        self.next_msg_seq
+    }
+
+    /// Next order id.
+    #[must_use]
+    pub fn next_order_id(&self) -> u64 {
+        self.next_order_id
+    }
+
+    /// Next execution id.
+    #[must_use]
+    pub fn next_exec_id(&self) -> u64 {
+        self.next_exec_id
+    }
+
+    /// Position the agent knows of (delivered fills).
+    #[must_use]
+    pub fn agent_position(&self) -> Decimal {
+        self.agent.pos.quantity
+    }
+
+    /// Average entry the agent knows of.
+    #[must_use]
+    pub fn agent_avg_entry(&self) -> Decimal {
+        self.agent.pos.avg_entry
+    }
+
+    /// Venue position (every fill), as the engine's `get_state`.
+    #[must_use]
+    pub fn venue_position(&self) -> Decimal {
+        self.venue.pos.quantity
+    }
+
+    /// Venue average entry.
+    #[must_use]
+    pub fn venue_avg_entry(&self) -> Decimal {
+        self.venue.pos.avg_entry
+    }
+
+    /// Venue realized cash flow, as the engine's `pnl.realized`.
+    #[must_use]
+    pub fn venue_realized(&self) -> Decimal {
+        self.venue.realized
+    }
+
+    /// Venue position, in lots.
+    #[must_use]
+    pub fn venue_position_lots(&self) -> i64 {
+        self.gate.venue_pos_lots
+    }
+
+    /// Live reserved lots per side `(buy, sell)`.
+    #[must_use]
+    pub fn live_lots(&self) -> (u64, u64) {
+        (self.gate.live_buy_lots, self.gate.live_sell_lots)
+    }
+
+    /// Returns true while `order_id` is open in the agent account (submitted
+    /// and its closing report not yet delivered).
+    #[must_use]
+    pub fn is_open(&self, order_id: u64) -> bool {
+        self.account
+            .as_slice()
+            .iter()
+            .any(|o| o.order_id == order_id)
+    }
+
+    /// Queue lengths.
+    #[must_use]
+    pub fn queue_lengths(&self) -> QueueLengths {
+        let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+        QueueLengths {
+            orders: n(self.orders.len()),
+            awaiting: n(self.awaiting.len()),
+            msgs: n(self.msgs.len()),
+            deliveries: n(self.deliveries.len()),
+            observed: n(self.observed.len()),
+            held: n(self.account.len()),
+        }
+    }
+}

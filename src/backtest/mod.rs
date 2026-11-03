@@ -15,6 +15,8 @@
 //! - **Accounting port**: `FillAccountant` to select the accounting authority for fills
 //! - **Fill models**: Realistic fill simulation with queue position and market impact
 //! - **Performance metrics**: Comprehensive metrics calculation (Sharpe, Sortino, etc.)
+//! - **Financial kernel** (feature `kernel`): the engine loop as a resumable,
+//!   `Copy` state machine for external RL trainers
 //!
 //! # Example
 //!
@@ -52,6 +54,9 @@ pub mod engine;
 
 /// Realistic fill models for backtesting.
 pub mod fill_models;
+
+#[cfg(feature = "kernel")]
+pub mod kernel;
 
 pub mod latency;
 
