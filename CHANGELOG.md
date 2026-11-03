@@ -8,12 +8,23 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- With the `margin` feature, a fill whose base fee breaks the fee
+  declaration of the gate's limits is recorded in `MarginAccount::errors`
+  as a fee breach (the gate then rejects new orders on the instrument),
+  and the message for a fill that is not clean includes its shortfalls.
+  The `backtest::margin` docs give the declaration that matches
+  `FeeCurrency::Base`.
 - `BacktestEngine::faults` keeps only the first `MAX_RECORDED_FAULTS` (16)
   errors; `BacktestEngine::fault_count` reports the total. Admission still
   stops at the first fault (#133).
 
 ### Breaking
 
+- The `margin` feature depends on margin-rs 0.1 from crates.io instead of
+  a git revision. Callers that build the `RiskGate` or `Ledger` passed to
+  `MarginAccount` or `MarginLedgerAccountant` use margin-rs 0.1, whose
+  order and execution direction is `financial_types::Action`, the type
+  market-maker-rs already uses.
 - No panics in library code (#135). New `MMError::LockPoisoned`; these now
   return `MMResult` instead of panicking on a poisoned lock:
   `ThreadSafeOrderManager::{read, write, get_stats, open_order_count,

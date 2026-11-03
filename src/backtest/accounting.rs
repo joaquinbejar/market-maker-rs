@@ -178,7 +178,8 @@ mod margin_ledger {
     use crate::Decimal;
     use crate::types::action::Dir;
     use crate::types::error::{MMError, MMResult};
-    use margin_rs::ledger::{Execution, Ledger, Side as LedgerSide};
+    use margin_rs::Action;
+    use margin_rs::ledger::{Execution, Ledger};
     use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId};
 
     /// [`FillAccountant`] backed by the exact single account ledger of
@@ -294,10 +295,7 @@ mod margin_ledger {
             let id = ExecutionId::new(format!("sim-{}", fill.execution_id))
                 .map_err(|e| margin_error("execution id", e))?;
             // Before booking: a rejected post leaves the ledger unchanged.
-            let side = match Dir::try_from(fill.side)? {
-                Dir::Buy => LedgerSide::Buy,
-                Dir::Sell => LedgerSide::Sell,
-            };
+            let side = Action::from(Dir::try_from(fill.side)?);
             let mut execution =
                 Execution::new(id, self.instrument.clone(), side, fill.price, fill.quantity);
             // Negative fees are rebates and are booked as such.
@@ -339,9 +337,13 @@ mod margin_ledger {
             {
                 // A snapshot cannot fail, so the sums saturate at the
                 // `Decimal` bounds instead of panicking.
-                snapshot.cash_flow = match entry.side {
-                    LedgerSide::Buy => snapshot.cash_flow.saturating_sub(entry.notional),
-                    LedgerSide::Sell => snapshot.cash_flow.saturating_add(entry.notional),
+                snapshot.cash_flow = match Dir::try_from(entry.side) {
+                    Ok(Dir::Buy) => snapshot.cash_flow.saturating_sub(entry.notional),
+                    Ok(Dir::Sell) => snapshot.cash_flow.saturating_add(entry.notional),
+                    // margin-rs books only buys and sells and rejects any
+                    // other action before booking, so no journal entry has
+                    // another side.
+                    Err(_) => snapshot.cash_flow,
                 };
                 if let Some(fee) = entry.fee.as_ref().filter(|f| f.asset == self.quote) {
                     snapshot.fees = snapshot.fees.saturating_add(fee.amount);
