@@ -100,7 +100,7 @@ impl From<&str> for OrderId {
 /// Order direction: the shared [`financial_types::Action`].
 ///
 /// Only [`Action::Buy`] and [`Action::Sell`] are supported; any other action
-/// is rejected with [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction).
+/// is rejected with [`MMError::UnsupportedAction`].
 ///
 /// # Example
 ///
@@ -548,8 +548,8 @@ impl Fill {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction) if the fill's side is neither
-    /// buy nor sell, and [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// Returns [`MMError::UnsupportedAction`] if the fill's side is neither
+    /// buy nor sell, and [`MMError::NumericalError`]
     /// if the notional or the net value overflows.
     pub fn net_value(&self) -> MMResult<Decimal> {
         let overflow = || MMError::NumericalError("fill net value overflows".to_string());
@@ -738,7 +738,7 @@ pub trait ExchangeConnector: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Implementations return [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction) when
+    /// Implementations return [`MMError::UnsupportedAction`] when
     /// `request.side` is neither buy nor sell, before any other effect, and
     /// their own errors otherwise.
     async fn submit_order(&self, request: OrderRequest) -> MMResult<OrderResponse>;

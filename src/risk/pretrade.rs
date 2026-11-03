@@ -1,6 +1,6 @@
 //! Pretrade risk port.
 //!
-//! Every order passes a [`PretradePolicy`] before it is submitted. The
+//! Every order passes a [`PretradePolicy`](crate::risk::pretrade::PretradePolicy) before it is submitted. The
 //! policy accepts it, reduces its quantity or rejects it, and is told about
 //! the order's lifecycle afterwards (accepts, fills, cancels) so it can track
 //! live exposure and reservations. The same seam serves the quote path of
@@ -9,7 +9,7 @@
 //! and the live hedge or quote path of
 //! [`OrderManager::register_order_checked`](crate::execution::OrderManager::register_order_checked).
 //!
-//! [`LimitsPolicy`] is a local policy built on [`RiskLimits`] and
+//! [`LimitsPolicy`](crate::risk::pretrade::LimitsPolicy) is a local policy built on [`RiskLimits`] and
 //! [`CircuitBreaker`]. With the `margin` feature, the backtest module offers
 //! an adapter over the `margin-rs` risk gate.
 //!

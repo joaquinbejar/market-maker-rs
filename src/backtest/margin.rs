@@ -1,7 +1,7 @@
 //! `margin-rs` risk gate behind the pretrade and accounting ports.
 //!
 //! [`MarginAccount`] shares one `margin_rs::risk::RiskGate` (which owns the
-//! account's ledger) between a [`PretradePolicy`] and a [`FillAccountant`]:
+//! account's ledger) between a [`PretradePolicy`](crate::risk::pretrade::PretradePolicy) and a [`FillAccountant`]:
 //!
 //! - [`MarginAccount::policy`] submits every order to the gate (reservation
 //!   and hard limits), forwards venue accepts, rejects, cancel requests and
