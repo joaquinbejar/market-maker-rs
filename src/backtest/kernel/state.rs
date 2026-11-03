@@ -173,6 +173,25 @@ pub enum Status {
     Halted(HaltReason),
 }
 
+impl KernelEvent {
+    /// Returns true for the events the agent receives (deliveries and
+    /// observations). Every other event is a venue-time diagnostic that an
+    /// agent must not observe.
+    #[must_use]
+    pub fn is_agent_facing(&self) -> bool {
+        match self {
+            Self::Delivered(_) | Self::Observed { .. } => true,
+            Self::Report(_)
+            | Self::Fill(_)
+            | Self::Gate(_)
+            | Self::RowEnd { .. }
+            | Self::EndOfData { .. }
+            | Self::Halted(_)
+            | Self::DroppedMsg { .. } => false,
+        }
+    }
+}
+
 impl Status {
     /// Returns true while the run continues.
     #[must_use]
@@ -223,8 +242,11 @@ pub struct StepOutcome {
     pub applied: ActionStatus,
     /// Status after the step.
     pub status: Status,
-    /// Events emitted by the step.
-    pub events: u32,
+    /// Agent-facing events of the step: deliveries and observations. Venue
+    /// events (reports at venue time, fills, gate records, row ends) are
+    /// diagnostics and are not counted, so this never reveals undelivered
+    /// venue progress.
+    pub events: u64,
 }
 
 /// Run counters.
@@ -314,13 +336,28 @@ pub enum KernelEvent {
     },
     /// The run halted.
     Halted(HaltReason),
+    /// A venue message dropped at the end of the data.
+    DroppedMsg {
+        /// Order the message is for.
+        order_id: u64,
+        /// True for a cancel, false for an activation.
+        cancel: bool,
+    },
 }
 
 /// Receiver of [`KernelEvent`]s. Implementations should not allocate per
 /// event on hot paths; the kernel itself never allocates for events.
+///
+/// Only [`KernelEvent::is_agent_facing`] events may reach an agent; the
+/// rest, and [`EventSink::queues`], are diagnostics.
 pub trait EventSink {
     /// Receives one event.
     fn event(&mut self, event: KernelEvent);
+
+    /// Queue lengths after every applied event (venue message, delivery,
+    /// fill, observation push, action, end of data). A diagnostic for
+    /// checking the queue bounds; ignored by default.
+    fn queues(&mut self, _lengths: QueueLengths) {}
 }
 
 /// A sink that ignores every event.
@@ -424,12 +461,16 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     }
 
     /// Rows read so far.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn cursor(&self) -> u64 {
         self.cursor
     }
 
     /// Simulated time, in nanoseconds.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn now_ns(&self) -> u64 {
         self.now_ns
@@ -442,6 +483,8 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     }
 
     /// Counters.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn counters(&self) -> Counters {
         self.counters
@@ -454,12 +497,16 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     }
 
     /// Next event stamp sequence number.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn stamp_seq(&self) -> u64 {
         self.stamp_seq
     }
 
     /// Next venue message sequence number.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn next_msg_seq(&self) -> u64 {
         self.next_msg_seq
@@ -472,6 +519,8 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     }
 
     /// Next execution id.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn next_exec_id(&self) -> u64 {
         self.next_exec_id
@@ -490,30 +539,40 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     }
 
     /// Venue position (every fill), as the engine's `get_state`.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn venue_position(&self) -> Decimal {
         self.venue.pos.quantity
     }
 
     /// Venue average entry.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn venue_avg_entry(&self) -> Decimal {
         self.venue.pos.avg_entry
     }
 
     /// Venue realized cash flow, as the engine's `pnl.realized`.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn venue_realized(&self) -> Decimal {
         self.venue.realized
     }
 
     /// Venue position, in lots.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn venue_position_lots(&self) -> i64 {
         self.gate.venue_pos_lots
     }
 
     /// Live reserved lots per side `(buy, sell)`.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn live_lots(&self) -> (u64, u64) {
         (self.gate.live_buy_lots, self.gate.live_sell_lots)
@@ -530,6 +589,8 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     }
 
     /// Queue lengths.
+    ///
+    /// Diagnostic: reveals venue progress; an agent must not observe it.
     #[must_use]
     pub fn queue_lengths(&self) -> QueueLengths {
         let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);

@@ -190,7 +190,10 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] if the configuration is
-    /// invalid or breaks a bound (module docs), if `data` was built on
+    /// invalid or breaks a bound (module docs), if `tick_size`, `lot_size`
+    /// or `fee_rate` carry trailing zeros or `initial_capital` a scale above
+    /// the money scale (the engine computes with raw scales, so these are
+    /// rejected rather than normalised), if `data` was built on
     /// another grid, if a capacity or the length does not fit `u32`, or if
     /// a capacity is below [`capacity_need`].
     pub fn new(cfg: &KernelConfig, data: &'d KernelDataset) -> MMResult<Self> {
@@ -414,7 +417,16 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         let applied = match action {
             KernelAction::Hold => ActionStatus::Applied,
             KernelAction::QuoteError(_) => {
-                s.counters.quote_errors = s.counters.quote_errors.saturating_add(1);
+                // At most one per step, and steps are at most S <= 2^60.
+                let Some(errors) = s.counters.quote_errors.checked_add(1) else {
+                    step::halt(s, HaltReason::CounterOverflow, &mut em);
+                    return StepOutcome {
+                        applied: terminal,
+                        status: s.status,
+                        events: em.count,
+                    };
+                };
+                s.counters.quote_errors = errors;
                 ActionStatus::Rejected(RejectReason::QuoteError)
             }
             KernelAction::Quote {
@@ -444,6 +456,9 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         } else {
             s.phase = s.resume;
             step::advance(&self.cfg, self.data, s, &mut em);
+        }
+        if em.overflow && s.status.is_running() {
+            step::halt(s, HaltReason::CounterOverflow, &mut em);
         }
         StepOutcome {
             applied,

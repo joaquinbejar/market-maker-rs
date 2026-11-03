@@ -20,54 +20,86 @@ use super::encode::insert_by_id;
 use super::gate::{self, GateVerdict};
 use super::grid::{half_units_decimal, scaled_decimal};
 use super::state::{
-    ActionStatus, EventSink, GateRecord, HaltReason, KernelEvent, KernelState, Phase, RejectReason,
-    Status, TermReason,
+    ActionStatus, EventSink, GateRecord, HaltReason, KernelEvent, KernelState, Phase, QueueLengths,
+    RejectReason, Status, TermReason,
 };
 
 type Halt = HaltReason;
 
-/// Counts the events forwarded to the caller's sink.
+/// Counts the agent-facing events forwarded to the caller's sink.
+///
+/// A step delivers at most `3 * 2S` reports and `len` observations in the
+/// whole run, below `2^63` for `S <= 2^60` and `len <= u32::MAX`, so the
+/// count cannot overflow; if it did, `overflow` halts the step.
 pub(super) struct Em<'a, E: EventSink> {
     sink: &'a mut E,
-    pub(super) count: u32,
+    pub(super) count: u64,
+    pub(super) overflow: bool,
 }
 
 impl<'a, E: EventSink> Em<'a, E> {
     pub(super) fn new(sink: &'a mut E) -> Self {
-        Self { sink, count: 0 }
+        Self {
+            sink,
+            count: 0,
+            overflow: false,
+        }
     }
 }
 
 impl<E: EventSink> EventSink for Em<'_, E> {
     fn event(&mut self, event: KernelEvent) {
-        self.count = self.count.saturating_add(1);
+        if event.is_agent_facing() {
+            match self.count.checked_add(1) {
+                Some(count) => self.count = count,
+                None => self.overflow = true,
+            }
+        }
         self.sink.event(event);
+    }
+
+    fn queues(&mut self, lengths: QueueLengths) {
+        self.sink.queues(lengths);
     }
 }
 
-/// Events of one action transaction, forwarded only if it commits.
+/// Events of one action transaction, forwarded only if it commits. Two
+/// orders produce at most a gate record and a report each, so four slots
+/// suffice; a fifth event fails the transaction.
 struct Buf {
-    items: [Option<KernelEvent>; 8],
+    items: [Option<KernelEvent>; 4],
     len: usize,
+    full: bool,
 }
 
 impl Buf {
     fn new() -> Self {
         Self {
-            items: [None; 8],
+            items: [None; 4],
             len: 0,
+            full: false,
         }
     }
 }
 
 impl EventSink for Buf {
     fn event(&mut self, event: KernelEvent) {
-        // Two orders, each with at most a gate record and a report.
-        if let Some(slot) = self.items.get_mut(self.len) {
-            *slot = Some(event);
-            self.len = self.len.saturating_add(1);
+        match (self.items.get_mut(self.len), self.len.checked_add(1)) {
+            (Some(slot), Some(next)) => {
+                *slot = Some(event);
+                self.len = next;
+            }
+            (None, _) | (_, None) => self.full = true,
         }
     }
+}
+
+/// Reports the queue lengths to the sink.
+fn probe<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize, E: EventSink>(
+    s: &St<ORD, MSG, DLV, OBS>,
+    em: &mut E,
+) {
+    em.queues(s.queue_lengths());
 }
 
 type St<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize> =
@@ -407,11 +439,15 @@ fn run_events<
             Class::Venue => apply_next_msg(cfg, s, em)?,
             Class::Delivery => deliver_next(cfg, s, em)?,
             Class::Observation => {
-                if pop_observation(cfg, s, em) {
+                let paused = pop_observation(cfg, s, em);
+                probe(s, em);
+                if paused {
                     return Ok(true);
                 }
+                continue;
             }
         }
+        probe(s, em);
     }
 }
 
@@ -485,6 +521,7 @@ fn match_row<
             *slot = order;
         }
         queue_delivery(cfg, s, report, Some(fill), em)?;
+        probe(s, em);
     }
     let mut index = 0;
     while let Some(order) = s.orders.get(index).copied() {
@@ -636,6 +673,13 @@ fn end_of_data<
     }
     let dropped_msgs = u64::try_from(s.msgs.len()).map_err(|_| Halt::CounterOverflow)?;
     let dropped_obs = u64::try_from(s.observed.len()).map_err(|_| Halt::CounterOverflow)?;
+    for msg in s.msgs.as_slice() {
+        let (order_id, cancel) = match msg.kind {
+            MsgKind::Activate(order) => (order.id, false),
+            MsgKind::Cancel { id } => (id, true),
+        };
+        em.event(KernelEvent::DroppedMsg { order_id, cancel });
+    }
     s.msgs.clear();
     s.observed.clear();
     s.counters.eof_dropped_msgs = s
@@ -650,6 +694,7 @@ fn end_of_data<
         .ok_or(Halt::CounterOverflow)?;
     s.status = Status::Terminal(TermReason::EndOfData);
     s.phase = Phase::Terminal;
+    probe(s, em);
     em.event(KernelEvent::EndOfData {
         dropped_msgs,
         dropped_obs,
@@ -725,6 +770,7 @@ fn advance_inner<
                         row: index,
                     })
                     .map_err(|_| Halt::CounterOverflow)?;
+                probe(s, em);
                 s.phase = Phase::ObsQueued;
             }
             Phase::ObsQueued => {
@@ -807,10 +853,14 @@ pub(super) fn apply_quote<
     let mut t = *s;
     let mut buf = Buf::new();
     quote_transaction(cfg, &mut t, quote, &mut buf)?;
+    if buf.full {
+        return Err(Halt::CounterOverflow);
+    }
     *s = t;
     for event in buf.items.iter().take(buf.len).flatten() {
         em.event(*event);
     }
+    probe(s, em);
     Ok(())
 }
 
