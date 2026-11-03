@@ -38,7 +38,6 @@
 //! // let result = engine.run();
 //! ```
 
-/// Accounting port at the fill boundary.
 pub mod accounting;
 
 /// `margin-rs` risk gate behind the pretrade and accounting ports.

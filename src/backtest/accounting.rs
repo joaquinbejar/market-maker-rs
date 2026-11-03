@@ -1,14 +1,14 @@
 //! Accounting port at the backtest fill boundary.
 //!
-//! By default [`BacktestEngine`](super::BacktestEngine) keeps its own
+//! By default [`BacktestEngine`](crate::backtest::BacktestEngine) keeps its own
 //! position, cash flow and fee totals. A [`FillAccountant`] replaces that
 //! built in bookkeeping: once selected with
-//! [`BacktestEngine::with_accountant`](super::BacktestEngine::with_accountant),
+//! [`BacktestEngine::with_accountant`](crate::backtest::BacktestEngine::with_accountant),
 //! every fill is posted to it exactly once and the result metrics (position,
 //! PnL, fees, equity) are read back from its [`AccountingSnapshot`]. Only one
 //! accountant is ever active, so the engine never books a fill twice.
 //!
-//! With the `margin` feature, [`MarginLedgerAccountant`] posts fills to the
+//! With the `margin` feature, `MarginLedgerAccountant` posts fills to the
 //! exact ledger of the `margin-rs` crate.
 //!
 //! # Example
@@ -79,7 +79,7 @@ impl AccountingFill {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction)
+    /// Returns [`MMError::UnsupportedAction`]
     /// if the side is neither buy nor sell.
     pub fn signed_quantity(&self) -> MMResult<Decimal> {
         Ok(match Dir::try_from(self.side)? {
@@ -92,9 +92,9 @@ impl AccountingFill {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction)
+    /// Returns [`MMError::UnsupportedAction`]
     /// if the side is neither buy nor sell, or
-    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// [`MMError::NumericalError`]
     /// if the notional overflows.
     pub fn cash_flow(&self) -> MMResult<Decimal> {
         let dir = Dir::try_from(self.side)?;
@@ -142,7 +142,7 @@ pub struct AccountingSnapshot {
 ///   it for position, PnL, fees and equity.
 /// - A post that returns an error leaves the accountant unchanged; the
 ///   engine records the error (see
-///   [`BacktestEngine::accounting_errors`](super::BacktestEngine::accounting_errors))
+///   [`BacktestEngine::accounting_errors`](crate::backtest::BacktestEngine::accounting_errors))
 ///   and keeps running, so the run shows where the accountant disagreed.
 /// - [`FillAccountant::reset`] returns the accountant to its initial state
 ///   and is called by the engine's reset.
