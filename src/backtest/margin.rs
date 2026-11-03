@@ -427,7 +427,7 @@ impl FillAccountant for MarginGateAccountant {
             cash_flow: total - deposits + quote_fees,
             fees: quote_fees,
             base_fees,
-            fills_posted: ledger.journal().len() as u64,
+            fills_posted: crate::types::decimal::saturating_u64(ledger.journal().len()),
         }
     }
 

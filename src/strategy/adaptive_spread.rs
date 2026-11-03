@@ -444,7 +444,7 @@ impl AdaptiveSpreadCalculator {
         let levels_usize = if levels == 0 {
             usize::MAX
         } else {
-            levels as usize
+            usize::try_from(levels).unwrap_or(usize::MAX)
         };
 
         let bid_depth: Decimal = bid_depths
@@ -459,7 +459,8 @@ impl AdaptiveSpreadCalculator {
             .map(|(_, size)| *size)
             .sum();
 
-        let actual_levels = bid_depths.len().min(ask_depths.len()).min(levels_usize) as u32;
+        let actual_levels = u32::try_from(bid_depths.len().min(ask_depths.len()).min(levels_usize))
+            .unwrap_or(u32::MAX);
 
         OrderBookImbalance::new(bid_depth, ask_depth, actual_levels)
     }
@@ -485,7 +486,7 @@ impl AdaptiveSpreadCalculator {
         let levels_usize = if levels == 0 {
             usize::MAX
         } else {
-            levels as usize
+            usize::try_from(levels).unwrap_or(usize::MAX)
         };
 
         // Weight by inverse distance from mid
@@ -509,7 +510,8 @@ impl AdaptiveSpreadCalculator {
             })
             .sum();
 
-        let actual_levels = bid_depths.len().min(ask_depths.len()).min(levels_usize) as u32;
+        let actual_levels = u32::try_from(bid_depths.len().min(ask_depths.len()).min(levels_usize))
+            .unwrap_or(u32::MAX);
 
         OrderBookImbalance::new(bid_depth, ask_depth, actual_levels)
     }

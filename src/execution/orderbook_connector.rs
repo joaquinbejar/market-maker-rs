@@ -33,6 +33,7 @@ use crate::execution::connector::{
     OrderStatus, OrderType, TimeInForce,
 };
 use crate::types::action::{Action, Dir};
+use crate::types::decimal::{decimal_to_u64_saturating, decimal_to_u128_saturating};
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -222,11 +223,7 @@ impl OrderBookConnector {
     fn price_to_u128(&self, price: Decimal) -> u128 {
         let multiplier = Decimal::from(10u64.pow(self.config.price_precision));
         let scaled = price * multiplier;
-        scaled
-            .to_string()
-            .parse::<f64>()
-            .map(|f| f as u128)
-            .unwrap_or(0)
+        decimal_to_u128_saturating(scaled)
     }
 
     /// Converts a raw `u128` price from orderbook-rs to Decimal.
@@ -239,11 +236,7 @@ impl OrderBookConnector {
     fn quantity_to_u64(&self, quantity: Decimal) -> u64 {
         let multiplier = Decimal::from(10u64.pow(self.config.quantity_precision));
         let scaled = quantity * multiplier;
-        scaled
-            .to_string()
-            .parse::<f64>()
-            .map(|f| f as u64)
-            .unwrap_or(0)
+        decimal_to_u64_saturating(scaled)
     }
 
     /// Converts a u64 quantity from orderbook-rs to Decimal.

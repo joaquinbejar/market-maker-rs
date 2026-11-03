@@ -56,7 +56,10 @@ impl ReconnectConfig {
     /// Calculates the delay for a given attempt number.
     #[must_use]
     pub fn delay_for_attempt(&self, attempt: u32) -> u64 {
-        let delay = self.initial_delay_ms as f64 * self.backoff_multiplier.powi(attempt as i32);
+        let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+        // Stats boundary, not money: a delay in ms is exact below 2^53, and
+        // the float to int `as` cast saturates (NaN maps to 0) before the cap.
+        let delay = self.initial_delay_ms as f64 * self.backoff_multiplier.powi(exponent);
         (delay as u64).min(self.max_delay_ms)
     }
 

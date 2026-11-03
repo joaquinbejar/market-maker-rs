@@ -46,6 +46,7 @@
 
 use crate::Decimal;
 use crate::execution::Action;
+use crate::types::decimal::saturating_u64;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
@@ -717,7 +718,7 @@ impl MetricsCalculator {
     }
 
     fn calculate_trading_metrics(&self, trades: &[TradeRecord]) -> PerformanceMetrics {
-        let total_trades = trades.len() as u64;
+        let total_trades = saturating_u64(trades.len());
 
         if total_trades == 0 {
             return PerformanceMetrics::default();
@@ -726,8 +727,8 @@ impl MetricsCalculator {
         let winners: Vec<&TradeRecord> = trades.iter().filter(|t| t.is_winner()).collect();
         let losers: Vec<&TradeRecord> = trades.iter().filter(|t| t.is_loser()).collect();
 
-        let winning_trades = winners.len() as u64;
-        let losing_trades = losers.len() as u64;
+        let winning_trades = saturating_u64(winners.len());
+        let losing_trades = saturating_u64(losers.len());
 
         let win_rate = Decimal::from(winning_trades) / Decimal::from(total_trades);
 

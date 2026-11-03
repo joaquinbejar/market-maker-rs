@@ -98,10 +98,12 @@ impl MockDataFeed {
 
     /// Simulates a price update.
     pub async fn simulate_price_update(&self, symbol: &str, price: Decimal) {
-        let timestamp = std::time::SystemTime::now()
+        let timestamp: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
 
         let update = PriceUpdate::new(symbol, price, timestamp, DataSource::Simulated);
         self.set_price(symbol, price).await;
@@ -127,10 +129,12 @@ impl MockDataFeed {
 
     /// Simulates an IV surface update.
     pub async fn simulate_iv_update(&self, symbol: &str, updated_points: Vec<IVPoint>) {
-        let timestamp = std::time::SystemTime::now()
+        let timestamp: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
 
         let update = IVSurfaceUpdate::new(symbol, timestamp, updated_points.clone());
 

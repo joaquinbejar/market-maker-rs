@@ -641,12 +641,14 @@ impl MetricsBridge {
 
         // Sync counters (Prometheus counters can only increase, so we set to current total)
         // Note: This works because we're setting absolute values, not incrementing
+        // Prometheus values are f64; counts are exact below 2^53 (not money).
         let quotes_diff = snapshot.quotes_generated as f64 - self.prom_metrics.get_quotes_total();
         if quotes_diff > 0.0 {
             self.prom_metrics.inc_quotes_by(quotes_diff);
         }
 
         // Sync gauges (these can be set directly)
+        // Prometheus gauges are f64; counts are exact below 2^53 (not money).
         self.prom_metrics
             .set_open_orders(snapshot.open_orders as f64);
         self.prom_metrics

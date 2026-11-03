@@ -261,8 +261,10 @@ impl MockExchangeConnector {
         if self.config.failure_rate > 0.0 {
             // Simple deterministic "random" based on order counter
             let counter = self.order_counter.load(Ordering::SeqCst);
-            let threshold = (self.config.failure_rate * 100.0) as u64;
-            counter % 100 < threshold
+            // `bucket < trunc(rate * 100)` is `bucket + 1 <= rate * 100`
+            // for an integer bucket, without a float to int cast.
+            let bucket = u8::try_from(counter % 100).unwrap_or(u8::MAX);
+            f64::from(bucket) + 1.0 <= self.config.failure_rate * 100.0
         } else {
             false
         }

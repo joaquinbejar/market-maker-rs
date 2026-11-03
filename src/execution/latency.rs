@@ -36,6 +36,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
+use crate::types::decimal::saturating_u64;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -76,7 +78,7 @@ impl LatencyMeasurement {
     #[must_use]
     pub fn from_duration(duration: Duration, timestamp: u64) -> Self {
         Self {
-            value_us: u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            value_us: saturating_u64(duration.as_micros()),
             timestamp,
         }
     }
@@ -142,7 +144,7 @@ impl LatencyStats {
             return Self::default();
         };
         // Non zero: `values` is not empty.
-        let count = len_to_u64(values.len()).max(1);
+        let count = saturating_u64(values.len()).max(1);
         let sum: u64 = values.iter().fold(0u64, |acc, &v| acc.saturating_add(v));
         let avg_us = sum / count;
 
@@ -359,11 +361,6 @@ impl Histogram {
         // Stats boundary, not money: a count above 2^53 loses precision
         // only in the target rank. The float to int `as` cast saturates
         // (NaN maps to 0), which is the clamping wanted here.
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
         let target = ((p / 100.0) * self.total_count as f64).ceil() as u64;
         let mut cumulative = 0u64;
 
@@ -371,7 +368,7 @@ impl Histogram {
             cumulative = cumulative.saturating_add(count);
             if cumulative >= target {
                 // Return the upper bound of this bucket
-                return len_to_u64(i)
+                return saturating_u64(i)
                     .saturating_add(1)
                     .saturating_mul(self.bucket_size_us);
             }
@@ -409,7 +406,7 @@ impl Histogram {
     #[must_use]
     pub fn max_trackable_us(&self) -> u64 {
         self.bucket_size_us
-            .saturating_mul(len_to_u64(self.buckets.len()))
+            .saturating_mul(saturating_u64(self.buckets.len()))
     }
 
     /// Resets the histogram.
@@ -525,11 +522,7 @@ impl LatencyTracker {
     /// * `duration` - Latency as a Duration
     /// * `timestamp` - Timestamp when measurement was taken (milliseconds)
     pub fn record_duration(&mut self, metric: LatencyMetric, duration: Duration, timestamp: u64) {
-        self.record(
-            metric,
-            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
-            timestamp,
-        );
+        self.record(metric, saturating_u64(duration.as_micros()), timestamp);
     }
 
     /// Gets statistics for a specific metric.
@@ -625,20 +618,8 @@ fn percentile(sorted_values: &[u64], p: f64) -> u64 {
     let last = sorted_values.len().saturating_sub(1);
     // Stats boundary, not money: lossless below 2^53 elements, and the
     // float to int `as` cast saturates (NaN maps to 0) before clamping.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
     let idx = ((p / 100.0) * last as f64).round() as usize;
     sorted_values.get(idx.min(last)).copied().unwrap_or(0)
-}
-
-/// Converts a length or index to `u64`, saturating on the (theoretical)
-/// platforms where `usize` is wider.
-#[inline]
-fn len_to_u64(n: usize) -> u64 {
-    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// Integer square root using Newton's method.

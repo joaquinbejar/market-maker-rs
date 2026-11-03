@@ -258,7 +258,7 @@ impl ApiState {
     /// Updates the quotes.
     pub async fn update_quotes(&self, quotes: Vec<QuoteResponse>) {
         let mut status = self.status.write().await;
-        status.active_quotes = quotes.len() as u32;
+        status.active_quotes = u32::try_from(quotes.len()).unwrap_or(u32::MAX);
         status.last_quote_update = current_timestamp();
         drop(status);
 
@@ -363,7 +363,9 @@ fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

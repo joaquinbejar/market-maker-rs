@@ -108,7 +108,7 @@ impl OptionsAdapter {
         let ms = years * ms_per_year;
 
         // Convert to u64, handling potential overflow
-        ms.to_string().parse::<f64>().map(|f| f as u64).unwrap_or(0)
+        crate::types::decimal::decimal_to_u64_saturating(ms)
     }
 
     /// Converts milliseconds to years for use with OptionStratLib.

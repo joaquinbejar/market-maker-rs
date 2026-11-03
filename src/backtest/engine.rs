@@ -972,7 +972,10 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             }
 
             num_ticks += 1;
-            callback(num_ticks as usize, total_ticks);
+            callback(
+                usize::try_from(num_ticks).unwrap_or(usize::MAX),
+                total_ticks,
+            );
         }
 
         // Reports still in flight reach the strategy after the data ends.
@@ -982,7 +985,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             total_pnl: self.pnl.total,
             total_fees: self.total_fees,
             net_pnl: self.pnl.total - self.total_fees,
-            num_trades: self.trades.len() as u64,
+            num_trades: crate::types::decimal::saturating_u64(self.trades.len()),
             num_ticks,
             start_time,
             end_time,
@@ -1526,7 +1529,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             return None;
         }
 
-        let n = Decimal::from(returns.len() as u64);
+        let n = Decimal::from(returns.len());
         let mean: Decimal = returns.iter().sum::<Decimal>() / n;
 
         // Calculate standard deviation

@@ -57,6 +57,7 @@ use rust_decimal_macros::dec;
 use std::collections::VecDeque;
 
 use crate::Decimal;
+use crate::types::decimal::{decimal_to_u64_saturating, saturating_u64};
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -576,7 +577,7 @@ impl OrderIntensityEstimator {
             // E[T] = 1/λ in seconds, convert to ms
             let time_seconds = Decimal::ONE / lambda;
             let time_ms = time_seconds * Decimal::from(1000);
-            Some(time_ms.to_string().parse::<f64>().unwrap_or(0.0) as u64)
+            Some(decimal_to_u64_saturating(time_ms))
         } else {
             None
         }
@@ -621,7 +622,11 @@ impl OrderIntensityEstimator {
             .collect();
 
         let mean_spread = spreads.iter().copied().sum::<Decimal>() / Decimal::from(spreads.len());
-        let mean_time = times.iter().sum::<u64>() / times.len() as u64;
+        let mean_time = times
+            .iter()
+            .fold(0u64, |acc, &t| acc.saturating_add(t))
+            .checked_div(saturating_u64(times.len()))
+            .unwrap_or(0);
 
         let min_spread = spreads.iter().copied().min().unwrap_or(Decimal::ZERO);
         let max_spread = spreads.iter().copied().max().unwrap_or(Decimal::ZERO);

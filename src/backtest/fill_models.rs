@@ -701,7 +701,8 @@ impl ProbabilisticFillModel {
         let current = self.state.load(Ordering::Relaxed);
         let next = current.wrapping_mul(6364136223846793005).wrapping_add(1);
         self.state.store(next, Ordering::Relaxed);
-        let value = (next >> 33) as u32;
+        // `next >> 33` keeps 31 bits, so it always fits in a `u32`.
+        let value = u32::try_from(next >> 33).unwrap_or(u32::MAX);
         Decimal::from(value) / Decimal::from(u32::MAX)
     }
 }
