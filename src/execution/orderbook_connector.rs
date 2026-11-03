@@ -52,6 +52,11 @@ pub struct OrderBookConnectorConfig {
     pub fee_currency: String,
 }
 
+/// Maps a poisoned lock to [`MMError::LockPoisoned`].
+fn poisoned<T>(_: std::sync::PoisonError<T>) -> MMError {
+    MMError::LockPoisoned("orderbook connector".to_string())
+}
+
 impl Default for OrderBookConnectorConfig {
     fn default() -> Self {
         Self {
@@ -164,9 +169,13 @@ impl OrderBookConnector {
     ///
     /// * `asset` - The asset symbol
     /// * `balance` - The balance amount
-    pub fn set_balance(&self, asset: &str, balance: Decimal) {
-        let mut balances = self.balances.write().unwrap();
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the lock is poisoned.
+    pub fn set_balance(&self, asset: &str, balance: Decimal) -> MMResult<()> {
+        let mut balances = self.balances.write().map_err(poisoned)?;
         balances.insert(asset.to_string(), balance);
+        Ok(())
     }
 
     /// Generates a new unique order ID.
@@ -289,7 +298,7 @@ impl ExchangeConnector for OrderBookConnector {
 
                 // Store mapping
                 {
-                    let mut mapping = self.order_mapping.write().unwrap();
+                    let mut mapping = self.order_mapping.write().map_err(poisoned)?;
                     mapping.insert(order_id.as_str().to_string(), ob_order_id);
                 }
 
@@ -314,7 +323,7 @@ impl ExchangeConnector for OrderBookConnector {
 
                 // Store mapping
                 {
-                    let mut mapping = self.order_mapping.write().unwrap();
+                    let mut mapping = self.order_mapping.write().map_err(poisoned)?;
                     mapping.insert(order_id.as_str().to_string(), ob_order_id);
                 }
 
@@ -334,7 +343,7 @@ impl ExchangeConnector for OrderBookConnector {
 
     async fn cancel_order(&self, order_id: &OrderId) -> MMResult<OrderResponse> {
         let ob_order_id = {
-            let mapping = self.order_mapping.read().unwrap();
+            let mapping = self.order_mapping.read().map_err(poisoned)?;
             mapping.get(order_id.as_str()).copied().ok_or_else(|| {
                 MMError::InvalidPositionUpdate(format!("Order not found: {}", order_id))
             })?
@@ -346,7 +355,7 @@ impl ExchangeConnector for OrderBookConnector {
 
         // Remove from mapping
         {
-            let mut mapping = self.order_mapping.write().unwrap();
+            let mut mapping = self.order_mapping.write().map_err(poisoned)?;
             mapping.remove(order_id.as_str());
         }
 
@@ -367,7 +376,7 @@ impl ExchangeConnector for OrderBookConnector {
         new_quantity: Option<Decimal>,
     ) -> MMResult<OrderResponse> {
         let ob_order_id = {
-            let mapping = self.order_mapping.read().unwrap();
+            let mapping = self.order_mapping.read().map_err(poisoned)?;
             mapping.get(order_id.as_str()).copied().ok_or_else(|| {
                 MMError::InvalidPositionUpdate(format!("Order not found: {}", order_id))
             })?
@@ -433,7 +442,7 @@ impl ExchangeConnector for OrderBookConnector {
 
         // Update mapping with new order ID
         {
-            let mut mapping = self.order_mapping.write().unwrap();
+            let mut mapping = self.order_mapping.write().map_err(poisoned)?;
             mapping.insert(order_id.as_str().to_string(), new_ob_order_id);
         }
 
@@ -449,7 +458,7 @@ impl ExchangeConnector for OrderBookConnector {
 
     async fn get_order_status(&self, order_id: &OrderId) -> MMResult<OrderResponse> {
         let ob_order_id = {
-            let mapping = self.order_mapping.read().unwrap();
+            let mapping = self.order_mapping.read().map_err(poisoned)?;
             mapping.get(order_id.as_str()).copied().ok_or_else(|| {
                 MMError::InvalidPositionUpdate(format!("Order not found: {}", order_id))
             })?
@@ -473,7 +482,7 @@ impl ExchangeConnector for OrderBookConnector {
     }
 
     async fn get_open_orders(&self, _symbol: &str) -> MMResult<Vec<OrderResponse>> {
-        let mapping = self.order_mapping.read().unwrap();
+        let mapping = self.order_mapping.read().map_err(poisoned)?;
         let mut orders = Vec::new();
 
         for id_str in mapping.keys() {
@@ -493,7 +502,7 @@ impl ExchangeConnector for OrderBookConnector {
 
     async fn cancel_all_orders(&self, _symbol: &str) -> MMResult<Vec<OrderResponse>> {
         let order_ids: Vec<(String, OBOrderId)> = {
-            let mapping = self.order_mapping.read().unwrap();
+            let mapping = self.order_mapping.read().map_err(poisoned)?;
             mapping
                 .iter()
                 .map(|(k, v): (&String, &OBOrderId)| (k.clone(), *v))
@@ -517,7 +526,7 @@ impl ExchangeConnector for OrderBookConnector {
 
         // Clear mapping
         {
-            let mut mapping = self.order_mapping.write().unwrap();
+            let mut mapping = self.order_mapping.write().map_err(poisoned)?;
             mapping.clear();
         }
 
@@ -561,7 +570,7 @@ impl ExchangeConnector for OrderBookConnector {
     }
 
     async fn get_balance(&self, asset: &str) -> MMResult<Decimal> {
-        let balances = self.balances.read().unwrap();
+        let balances = self.balances.read().map_err(poisoned)?;
         Ok(balances.get(asset).copied().unwrap_or(Decimal::ZERO))
     }
 }
@@ -626,7 +635,7 @@ mod tests {
         assert_eq!(balance, Decimal::ZERO);
 
         // Set balance
-        connector.set_balance("BTC", dec!(10.0));
+        connector.set_balance("BTC", dec!(10.0)).unwrap();
         let balance = connector.get_balance("BTC").await.unwrap();
         assert_eq!(balance, dec!(10.0));
     }

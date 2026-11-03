@@ -33,8 +33,12 @@ async fn main() {
     println!();
 
     // Set initial balance
-    connector.set_balance("USD", dec!(100000.0));
-    connector.set_balance("BTC", dec!(10.0));
+    connector
+        .set_balance("USD", dec!(100000.0))
+        .expect("fresh connector lock");
+    connector
+        .set_balance("BTC", dec!(10.0))
+        .expect("fresh connector lock");
 
     println!("Initial Balances:");
     let usd_balance = connector
