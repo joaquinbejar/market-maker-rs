@@ -933,3 +933,107 @@ fn test_kernel_step_after_termination_is_idempotent_and_uncounted() {
         (steps, actions, rejected)
     );
 }
+
+/// Byte offsets of the sequence fields in a state encoding (see the field
+/// order table of `encode`): after the header, capacities, dataset id,
+/// fingerprint, phases, cursor, current row, now, step, status and the two
+/// random streams.
+fn sequence_offset(bytes: &[u8]) -> usize {
+    let cur_row_tag = 4 + 2 + 1 + 1 + 16 + 74 + 16 + 1 + 1 + 8;
+    let cur_row = if bytes[cur_row_tag] == 1 { 9 } else { 1 };
+    cur_row_tag + cur_row + 8 + 8 + 3 + 32
+}
+
+fn patch(bytes: &[u8], at: usize, value: u64) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    out
+}
+
+#[test]
+fn test_kernel_decode_public_counter_tamper_rejected() {
+    for (seed, index) in [(0, 0), (3, 4), (7, 11)] {
+        let sc = scenario(seed, index);
+        let data = sc.data();
+        let k = kernel(&sc, &data);
+        let kr = run_kernel(&k, &sc, true);
+        // The reset state (first decision) and a mid-run state.
+        for s in [kr.states[0], kr.states[kr.states.len() / 2]] {
+            let bytes = encode(&s);
+            assert_eq!(decode(&bytes, &k).unwrap(), s);
+            let seq = sequence_offset(&bytes);
+            let n = bytes.len();
+            // stamp_seq, next_msg_seq, next_order_id, next_exec_id,
+            // last_delivery_ns, last_observed_ns.
+            let mut cases: Vec<(String, Vec<u8>)> = (0..6)
+                .map(|i| {
+                    (
+                        format!("sequence field {i}"),
+                        patch(&bytes, seq + 8 * i, u64::MAX),
+                    )
+                })
+                .collect();
+            cases.push((
+                "stamp_seq + 1e6".into(),
+                patch(&bytes, seq, s.stamp_seq() + 1_000_000),
+            ));
+            cases.push((
+                "next_exec_id + 1".into(),
+                patch(&bytes, seq + 24, s.next_exec_id() + 1),
+            ));
+            // Counters: actions, then after the rejects halts, the two
+            // drop counters, quote errors, venue fills and local rejects.
+            cases.push(("actions".into(), patch(&bytes, n - 120, u64::MAX)));
+            for (i, name) in [
+                "halts",
+                "eof msgs",
+                "eof obs",
+                "quote errors",
+                "venue fills",
+                "local rejects",
+            ]
+            .iter()
+            .enumerate()
+            {
+                cases.push(((*name).into(), patch(&bytes, n - 48 + 8 * i, u64::MAX)));
+            }
+            cases.push((
+                "rejected[PriceRange]".into(),
+                patch(&bytes, n - 112 + 8, u64::MAX),
+            ));
+            for (name, tampered) in cases {
+                assert!(
+                    decode(&tampered, &k).is_err(),
+                    "seed {seed} dataset {index}: {name} decoded"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_kernel_decode_reset_state_with_max_stamp_seq_rejected() {
+    // The reported repro: only stamp_seq set to u64::MAX on a reset state.
+    let config = KernelConfig::new(dec!(1), dec!(1), dec!(1000), dec!(10), 100);
+    let rows = (0..4)
+        .map(|i| KernelTick {
+            ts_ns: (1 + i) * MS,
+            bid: 98,
+            bid_lots: 1,
+            ask: 102,
+            ask_lots: 1,
+        })
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &config).unwrap();
+    let k: Small<'_> = FinancialKernel::new(&config, &data).unwrap();
+    let s = k.reset(0);
+    let bytes = encode(&s);
+    assert_eq!(
+        &bytes[sequence_offset(&bytes)..sequence_offset(&bytes) + 8],
+        &s.stamp_seq().to_le_bytes()
+    );
+    assert!(decode(&patch(&bytes, sequence_offset(&bytes), u64::MAX), &k).is_err());
+    let mut next = decode(&bytes, &k).unwrap();
+    k.step(&mut next, quote(97, 103));
+    assert!(!matches!(next.status(), Status::Halted(_)));
+}
