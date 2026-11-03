@@ -44,18 +44,52 @@ use crate::Decimal;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal::prelude::ToPrimitive;
 
+/// Calibration of raw SVI slices to observed total variances.
+pub mod calibrate;
 /// Static diagnostics of a surface on a declared grid.
 pub mod diagnostics;
+/// Implied total variance of cleaned quotes.
+pub mod iv;
+/// From a quote set to a calibrated surface and its quality report.
+pub mod pipeline;
+/// Cleaning of option quotes before calibration.
+pub mod quotes;
+/// Causal replay of quote snapshots.
+pub mod replay;
 /// Shock scenarios on a surface, each with its own diagnostics.
 pub mod shocks;
+/// Causal availability of calibrated surfaces.
+pub mod store;
 /// Raw SVI slices and surfaces of slices.
 pub mod svi;
+/// Out of sample validation of the SVI fit against a baseline.
+pub mod validation;
 
+pub use calibrate::{
+    ActiveConstraint, FitConfig, FitFailure, Residual, SliceFit, SliceObservation, fit_slice,
+};
 pub use diagnostics::{
     Check, DiagnosticGrid, DiagnosticPoint, DiagnosticsConfig, SurfaceDiagnostics, diagnose,
 };
+pub use iv::{Extraction, IvConfig, IvFailure, IvObservation, extract, implied_total_variance};
+pub use pipeline::{
+    QualityReport, QuoteResidual, SliceReport, StabilityConfig, StabilityPoint,
+    SurfaceCalibrationConfig, calibrate_surface,
+};
+pub use quotes::{
+    CleanQuote, CleaningConfig, CleaningReport, OptionQuote, QuoteFlag, QuoteVerdict, Rates,
+    Rejection, clean_quotes,
+};
+pub use replay::{ReplayReport, ReplayResidual, ReplayStep, Snapshot, replay};
 pub use shocks::{ScenarioReport, ShockedSurface, SurfaceShock, run_scenarios, standard_scenarios};
+pub use store::{
+    CalibratedSurface, ServedSurface, SurfaceStatus, SurfaceStore, UsePolicy, YEAR_MS,
+};
 pub use svi::{KRange, Region, ShortExpiryPolicy, SviSlice, SviSurface};
+pub use validation::{
+    BaselineSlice, BucketComparison, BucketStats, ExpiryHoldout, HoldoutReport, HoldoutRule,
+    WingRule, validate_holdout,
+};
 
 /// A volatility surface: total implied variance and its derivatives.
 ///

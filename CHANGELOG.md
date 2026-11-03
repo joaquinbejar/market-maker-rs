@@ -8,6 +8,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Surface calibration under `options::surface` (feature `options`, #96):
+  quote cleaning with a reason for every rejected quote and a global error
+  for future data (`clean_quotes`); implied total variance by safeguarded
+  Newton on the undiscounted Black price (`implied_total_variance`,
+  `extract`); the quasi-explicit SVI slice fit with typed failures and
+  reported active constraints (`fit_slice`); `calibrate_surface` with a
+  `QualityReport` (residuals by strike and expiry, diagnosis on every node,
+  stability against the previous surface aged to the same instant) and a
+  Healthy, Degraded or Failed status; a causal, append only `SurfaceStore`
+  that ages surfaces at constant volatility per `k` and serves them under a
+  `UsePolicy`; holdout validation against a baseline linear in `w`
+  (`validate_holdout`) and a causal `replay`; and the
+  `vol_surface_validation` example. Wiring the surface into the backtest
+  engine waits for option instruments (#97).
 - `options::pricing` (feature `options`): European option valuation on a
   `VolSurface`, `value(&OptionInputs, &dyn VolSurface, Dynamics)` with
   `Dynamics::{StickyMoneyness, StickyStrike { s_ref }}`, returning an
