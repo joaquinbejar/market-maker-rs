@@ -53,6 +53,14 @@ pub struct OrderBookConnectorConfig {
     pub fee_currency: String,
 }
 
+/// Returns `10^precision`, saturating at `Decimal::MAX` when the power
+/// overflows `u64` (precision above 19).
+fn scale_factor(precision: u32) -> Decimal {
+    10u64
+        .checked_pow(precision)
+        .map_or(Decimal::MAX, Decimal::from)
+}
+
 /// Maps a poisoned lock to [`MMError::LockPoisoned`].
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> MMError {
     MMError::LockPoisoned("orderbook connector".to_string())
@@ -221,28 +229,32 @@ impl OrderBookConnector {
 
     /// Converts a Decimal price to the raw `u128` used by orderbook-rs.
     fn price_to_u128(&self, price: Decimal) -> u128 {
-        let multiplier = Decimal::from(10u64.pow(self.config.price_precision));
-        let scaled = price * multiplier;
+        let multiplier = scale_factor(self.config.price_precision);
+        let scaled = price.saturating_mul(multiplier);
         decimal_to_u128_saturating(scaled)
     }
 
     /// Converts a raw `u128` price from orderbook-rs to Decimal.
     fn u128_to_price(&self, price: u128) -> Decimal {
-        let divisor = Decimal::from(10u64.pow(self.config.price_precision));
-        Decimal::from(price) / divisor
+        let divisor = scale_factor(self.config.price_precision);
+        Decimal::from(price)
+            .checked_div(divisor)
+            .unwrap_or(Decimal::ZERO)
     }
 
     /// Converts a Decimal quantity to u64 for orderbook-rs.
     fn quantity_to_u64(&self, quantity: Decimal) -> u64 {
-        let multiplier = Decimal::from(10u64.pow(self.config.quantity_precision));
-        let scaled = quantity * multiplier;
+        let multiplier = scale_factor(self.config.quantity_precision);
+        let scaled = quantity.saturating_mul(multiplier);
         decimal_to_u64_saturating(scaled)
     }
 
     /// Converts a u64 quantity from orderbook-rs to Decimal.
     fn u64_to_quantity(&self, quantity: u64) -> Decimal {
-        let divisor = Decimal::from(10u64.pow(self.config.quantity_precision));
-        Decimal::from(quantity) / divisor
+        let divisor = scale_factor(self.config.quantity_precision);
+        Decimal::from(quantity)
+            .checked_div(divisor)
+            .unwrap_or(Decimal::ZERO)
     }
 
     /// Gets the current timestamp in milliseconds.
