@@ -28,15 +28,16 @@
 //! metrics.record_order_filled(1002);
 //!
 //! // Update position and PnL
-//! metrics.update_position(dec!(10.0));
-//! metrics.update_pnl(dec!(100.0), dec!(50.0));
+//! metrics.update_position(dec!(10.0)).unwrap();
+//! metrics.update_pnl(dec!(100.0), dec!(50.0)).unwrap();
 //!
 //! // Get snapshot
-//! let snapshot = metrics.snapshot(1100);
+//! let snapshot = metrics.snapshot(1100).unwrap();
 //! println!("Quotes: {}, Fills: {}", snapshot.quotes_generated, snapshot.orders_filled);
 //! ```
 
 use crate::Decimal;
+use crate::types::error::{MMError, MMResult};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -301,7 +302,7 @@ impl MetricsSnapshot {
 /// metrics.decrement_open_orders();
 ///
 /// // Get snapshot
-/// let snapshot = metrics.snapshot(1100);
+/// let snapshot = metrics.snapshot(1100).unwrap();
 /// assert_eq!(snapshot.quotes_generated, 1);
 /// assert_eq!(snapshot.orders_filled, 1);
 /// ```
@@ -445,10 +446,13 @@ impl LiveMetrics {
     /// # Arguments
     ///
     /// * `position` - New position value
-    pub fn update_position(&self, position: Decimal) {
-        if let Ok(mut pos) = self.position.write() {
-            *pos = position;
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the position lock is poisoned.
+    pub fn update_position(&self, position: Decimal) -> MMResult<()> {
+        *write(&self.position, "position")? = position;
+        Ok(())
     }
 
     /// Updates the PnL values.
@@ -457,58 +461,81 @@ impl LiveMetrics {
     ///
     /// * `realized` - Realized PnL
     /// * `unrealized` - Unrealized PnL
-    pub fn update_pnl(&self, realized: Decimal, unrealized: Decimal) {
-        if let Ok(mut rpnl) = self.realized_pnl.write() {
-            *rpnl = realized;
-        }
-        if let Ok(mut upnl) = self.unrealized_pnl.write() {
-            *upnl = unrealized;
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if a PnL lock is poisoned; neither
+    /// value is written in that case.
+    pub fn update_pnl(&self, realized: Decimal, unrealized: Decimal) -> MMResult<()> {
+        let mut rpnl = write(&self.realized_pnl, "realized pnl")?;
+        let mut upnl = write(&self.unrealized_pnl, "unrealized pnl")?;
+        *rpnl = realized;
+        *upnl = unrealized;
+        Ok(())
     }
 
     /// Updates only the realized PnL.
-    pub fn update_realized_pnl(&self, realized: Decimal) {
-        if let Ok(mut rpnl) = self.realized_pnl.write() {
-            *rpnl = realized;
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the realized PnL lock is poisoned.
+    pub fn update_realized_pnl(&self, realized: Decimal) -> MMResult<()> {
+        *write(&self.realized_pnl, "realized pnl")? = realized;
+        Ok(())
     }
 
     /// Updates only the unrealized PnL.
-    pub fn update_unrealized_pnl(&self, unrealized: Decimal) {
-        if let Ok(mut upnl) = self.unrealized_pnl.write() {
-            *upnl = unrealized;
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the unrealized PnL lock is
+    /// poisoned.
+    pub fn update_unrealized_pnl(&self, unrealized: Decimal) -> MMResult<()> {
+        *write(&self.unrealized_pnl, "unrealized pnl")? = unrealized;
+        Ok(())
     }
 
     /// Adds to the realized PnL.
-    pub fn add_realized_pnl(&self, amount: Decimal) {
-        if let Ok(mut rpnl) = self.realized_pnl.write() {
-            *rpnl += amount;
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the realized PnL lock is
+    /// poisoned, or [`MMError::NumericalError`] if the sum overflows; the
+    /// value is unchanged in both cases.
+    pub fn add_realized_pnl(&self, amount: Decimal) -> MMResult<()> {
+        let mut rpnl = write(&self.realized_pnl, "realized pnl")?;
+        *rpnl = rpnl.checked_add(amount).ok_or_else(|| {
+            MMError::NumericalError(format!("realized pnl overflow: {} + {amount}", *rpnl))
+        })?;
+        Ok(())
     }
 
     /// Returns the current position.
-    #[must_use]
-    pub fn get_position(&self) -> Decimal {
-        self.position.read().map(|p| *p).unwrap_or(Decimal::ZERO)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the position lock is poisoned.
+    pub fn get_position(&self) -> MMResult<Decimal> {
+        read(&self.position, "position")
     }
 
     /// Returns the current realized PnL.
-    #[must_use]
-    pub fn get_realized_pnl(&self) -> Decimal {
-        self.realized_pnl
-            .read()
-            .map(|p| *p)
-            .unwrap_or(Decimal::ZERO)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the realized PnL lock is poisoned.
+    pub fn get_realized_pnl(&self) -> MMResult<Decimal> {
+        read(&self.realized_pnl, "realized pnl")
     }
 
     /// Returns the current unrealized PnL.
-    #[must_use]
-    pub fn get_unrealized_pnl(&self) -> Decimal {
-        self.unrealized_pnl
-            .read()
-            .map(|p| *p)
-            .unwrap_or(Decimal::ZERO)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if the unrealized PnL lock is
+    /// poisoned.
+    pub fn get_unrealized_pnl(&self) -> MMResult<Decimal> {
+        read(&self.unrealized_pnl, "unrealized pnl")
     }
 
     /// Creates a snapshot of current metrics.
@@ -516,8 +543,12 @@ impl LiveMetrics {
     /// # Arguments
     ///
     /// * `current_time` - Current timestamp in milliseconds
-    #[must_use]
-    pub fn snapshot(&self, current_time: u64) -> MetricsSnapshot {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if a position or PnL lock is
+    /// poisoned, or [`MMError::NumericalError`] if the total PnL overflows.
+    pub fn snapshot(&self, current_time: u64) -> MMResult<MetricsSnapshot> {
         let start = self.start_time.load(Ordering::Relaxed);
         let uptime_ms = current_time.saturating_sub(start);
 
@@ -551,11 +582,14 @@ impl LiveMetrics {
         };
 
         // Read Decimal values
-        let position = self.get_position();
-        let realized = self.get_realized_pnl();
-        let unrealized = self.get_unrealized_pnl();
+        let position = self.get_position()?;
+        let realized = self.get_realized_pnl()?;
+        let unrealized = self.get_unrealized_pnl()?;
+        let current_pnl = realized.checked_add(unrealized).ok_or_else(|| {
+            MMError::NumericalError(format!("total pnl overflow: {realized} + {unrealized}"))
+        })?;
 
-        MetricsSnapshot {
+        Ok(MetricsSnapshot {
             timestamp: current_time,
             quotes_generated,
             orders_submitted,
@@ -565,7 +599,7 @@ impl LiveMetrics {
             partial_fills: self.partial_fills.get(),
             open_orders: self.open_orders.get(),
             current_position: position,
-            current_pnl: realized + unrealized,
+            current_pnl,
             unrealized_pnl: unrealized,
             realized_pnl: realized,
             fill_rate,
@@ -575,7 +609,7 @@ impl LiveMetrics {
             uptime_ms,
             last_quote_time: self.last_quote_time.load(Ordering::Relaxed),
             last_fill_time: self.last_fill_time.load(Ordering::Relaxed),
-        }
+        })
     }
 
     /// Resets all metrics for a new trading session.
@@ -583,7 +617,12 @@ impl LiveMetrics {
     /// # Arguments
     ///
     /// * `new_start_time` - New start timestamp in milliseconds
-    pub fn reset(&self, new_start_time: u64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::LockPoisoned`] if a position or PnL lock is
+    /// poisoned; counters, gauges and timestamps are reset regardless.
+    pub fn reset(&self, new_start_time: u64) -> MMResult<()> {
         self.start_time.store(new_start_time, Ordering::Relaxed);
 
         // Reset counters
@@ -597,20 +636,13 @@ impl LiveMetrics {
         // Reset gauges
         self.open_orders.set(0);
 
-        // Reset Decimal values
-        if let Ok(mut pos) = self.position.write() {
-            *pos = Decimal::ZERO;
-        }
-        if let Ok(mut rpnl) = self.realized_pnl.write() {
-            *rpnl = Decimal::ZERO;
-        }
-        if let Ok(mut upnl) = self.unrealized_pnl.write() {
-            *upnl = Decimal::ZERO;
-        }
-
         // Reset timestamps
         self.last_quote_time.store(0, Ordering::Relaxed);
         self.last_fill_time.store(0, Ordering::Relaxed);
+
+        // Reset Decimal values
+        self.update_position(Decimal::ZERO)?;
+        self.update_pnl(Decimal::ZERO, Decimal::ZERO)
     }
 
     // Direct counter access for advanced use cases
@@ -658,6 +690,22 @@ impl Default for LiveMetrics {
     }
 }
 
+/// Reads a value behind a lock, mapping poison to [`MMError::LockPoisoned`].
+fn read(lock: &RwLock<Decimal>, name: &str) -> MMResult<Decimal> {
+    lock.read()
+        .map(|value| *value)
+        .map_err(|_| MMError::LockPoisoned(format!("live metrics {name}")))
+}
+
+/// Write guard over a value, mapping poison to [`MMError::LockPoisoned`].
+fn write<'a>(
+    lock: &'a RwLock<Decimal>,
+    name: &str,
+) -> MMResult<std::sync::RwLockWriteGuard<'a, Decimal>> {
+    lock.write()
+        .map_err(|_| MMError::LockPoisoned(format!("live metrics {name}")))
+}
+
 /// Thread-safe shared live metrics.
 ///
 /// Use this type alias when sharing metrics across threads.
@@ -666,6 +714,72 @@ pub type SharedLiveMetrics = Arc<LiveMetrics>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn poison(lock: &Arc<RwLock<Decimal>>) {
+        let lock = Arc::clone(lock);
+        let _ = std::thread::spawn(move || {
+            let _guard = lock.write().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+    }
+
+    #[test]
+    fn test_live_metrics_poisoned_position_returns_lock_poisoned() {
+        let metrics = LiveMetrics::new(0);
+        poison(&metrics.position);
+        assert!(matches!(
+            metrics.get_position(),
+            Err(MMError::LockPoisoned(_))
+        ));
+        assert!(matches!(
+            metrics.update_position(dec!(1)),
+            Err(MMError::LockPoisoned(_))
+        ));
+        assert!(matches!(metrics.snapshot(0), Err(MMError::LockPoisoned(_))));
+        assert!(matches!(metrics.reset(0), Err(MMError::LockPoisoned(_))));
+    }
+
+    #[test]
+    fn test_live_metrics_poisoned_pnl_returns_lock_poisoned() {
+        let metrics = LiveMetrics::new(0);
+        poison(&metrics.unrealized_pnl);
+        assert!(matches!(
+            metrics.update_pnl(dec!(1), dec!(2)),
+            Err(MMError::LockPoisoned(_))
+        ));
+        // Neither value is written when one lock is poisoned.
+        assert_eq!(metrics.get_realized_pnl().unwrap(), Decimal::ZERO);
+        assert!(matches!(
+            metrics.get_unrealized_pnl(),
+            Err(MMError::LockPoisoned(_))
+        ));
+        assert!(matches!(
+            metrics.update_unrealized_pnl(dec!(1)),
+            Err(MMError::LockPoisoned(_))
+        ));
+    }
+
+    #[test]
+    fn test_add_realized_pnl_overflow_returns_err_unchanged() {
+        let metrics = LiveMetrics::new(0);
+        metrics.update_realized_pnl(Decimal::MAX).unwrap();
+        assert!(matches!(
+            metrics.add_realized_pnl(dec!(1)),
+            Err(MMError::NumericalError(_))
+        ));
+        assert_eq!(metrics.get_realized_pnl().unwrap(), Decimal::MAX);
+    }
+
+    #[test]
+    fn test_snapshot_total_pnl_overflow_returns_err() {
+        let metrics = LiveMetrics::new(0);
+        metrics.update_pnl(Decimal::MAX, Decimal::MAX).unwrap();
+        assert!(matches!(
+            metrics.snapshot(0),
+            Err(MMError::NumericalError(_))
+        ));
+    }
     use crate::dec;
     use std::thread;
 
@@ -840,25 +954,25 @@ mod tests {
     #[test]
     fn test_live_metrics_position() {
         let metrics = LiveMetrics::new(1000);
-        metrics.update_position(dec!(100.5));
-        assert_eq!(metrics.get_position(), dec!(100.5));
+        metrics.update_position(dec!(100.5)).unwrap();
+        assert_eq!(metrics.get_position().unwrap(), dec!(100.5));
     }
 
     #[test]
     fn test_live_metrics_pnl() {
         let metrics = LiveMetrics::new(1000);
-        metrics.update_pnl(dec!(100.0), dec!(50.0));
+        metrics.update_pnl(dec!(100.0), dec!(50.0)).unwrap();
 
-        assert_eq!(metrics.get_realized_pnl(), dec!(100.0));
-        assert_eq!(metrics.get_unrealized_pnl(), dec!(50.0));
+        assert_eq!(metrics.get_realized_pnl().unwrap(), dec!(100.0));
+        assert_eq!(metrics.get_unrealized_pnl().unwrap(), dec!(50.0));
     }
 
     #[test]
     fn test_live_metrics_add_realized_pnl() {
         let metrics = LiveMetrics::new(1000);
-        metrics.add_realized_pnl(dec!(50.0));
-        metrics.add_realized_pnl(dec!(30.0));
-        assert_eq!(metrics.get_realized_pnl(), dec!(80.0));
+        metrics.add_realized_pnl(dec!(50.0)).unwrap();
+        metrics.add_realized_pnl(dec!(30.0)).unwrap();
+        assert_eq!(metrics.get_realized_pnl().unwrap(), dec!(80.0));
     }
 
     #[test]
@@ -869,10 +983,10 @@ mod tests {
         metrics.record_quote(1002);
         metrics.record_order_submitted();
         metrics.record_order_filled(1003);
-        metrics.update_position(dec!(10.0));
-        metrics.update_pnl(dec!(100.0), dec!(50.0));
+        metrics.update_position(dec!(10.0)).unwrap();
+        metrics.update_pnl(dec!(100.0), dec!(50.0)).unwrap();
 
-        let snapshot = metrics.snapshot(2000);
+        let snapshot = metrics.snapshot(2000).unwrap();
 
         assert_eq!(snapshot.timestamp, 2000);
         assert_eq!(snapshot.quotes_generated, 2);
@@ -897,7 +1011,7 @@ mod tests {
             metrics.record_order_filled(10000);
         }
 
-        let snapshot = metrics.snapshot(10000);
+        let snapshot = metrics.snapshot(10000).unwrap();
 
         // Fill rate = 5/10 = 0.5
         assert_eq!(snapshot.fill_rate, dec!(0.5));
@@ -915,14 +1029,14 @@ mod tests {
 
         metrics.record_quote(1001);
         metrics.record_order_submitted();
-        metrics.update_position(dec!(100.0));
+        metrics.update_position(dec!(100.0)).unwrap();
 
-        metrics.reset(2000);
+        metrics.reset(2000).unwrap();
 
         assert_eq!(metrics.start_time(), 2000);
         assert_eq!(metrics.total_quotes(), 0);
         assert_eq!(metrics.total_orders_submitted(), 0);
-        assert_eq!(metrics.get_position(), Decimal::ZERO);
+        assert_eq!(metrics.get_position().unwrap(), Decimal::ZERO);
     }
 
     #[test]
@@ -959,7 +1073,7 @@ mod tests {
         for i in 0..10 {
             let m = Arc::clone(&metrics);
             handles.push(thread::spawn(move || {
-                m.add_realized_pnl(Decimal::from(i + 1));
+                m.add_realized_pnl(Decimal::from(i + 1)).unwrap();
             }));
         }
 
@@ -968,7 +1082,7 @@ mod tests {
         }
 
         // Sum of 1..=10 = 55
-        assert_eq!(metrics.get_realized_pnl(), dec!(55));
+        assert_eq!(metrics.get_realized_pnl().unwrap(), dec!(55));
     }
 
     #[test]

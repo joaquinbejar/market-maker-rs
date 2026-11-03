@@ -61,6 +61,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use super::live_metrics::LiveMetrics;
+use crate::types::error::MMResult;
 
 /// Default histogram buckets for latency measurements in milliseconds.
 const LATENCY_BUCKETS: &[f64] = &[
@@ -611,7 +612,7 @@ async fn handle_request(
 /// let bridge = MetricsBridge::new(Arc::clone(&live_metrics), Arc::clone(&prom_metrics));
 ///
 /// // Sync metrics periodically
-/// bridge.sync();
+/// bridge.sync().unwrap();
 /// ```
 pub struct MetricsBridge {
     live_metrics: Arc<LiveMetrics>,
@@ -636,8 +637,13 @@ impl MetricsBridge {
     /// Syncs current values from `LiveMetrics` to `PrometheusMetrics`.
     ///
     /// Call this periodically to update Prometheus metrics with the latest values.
-    pub fn sync(&self) {
-        let snapshot = self.live_metrics.snapshot(0);
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of [`LiveMetrics::snapshot`] (a poisoned lock or a
+    /// PnL overflow); Prometheus is left untouched in that case.
+    pub fn sync(&self) -> MMResult<()> {
+        let snapshot = self.live_metrics.snapshot(0)?;
 
         // Sync counters (Prometheus counters can only increase, so we set to current total)
         // Note: This works because we're setting absolute values, not incrementing
@@ -657,6 +663,7 @@ impl MetricsBridge {
             snapshot.realized_pnl.to_string().parse().unwrap_or(0.0),
             snapshot.unrealized_pnl.to_string().parse().unwrap_or(0.0),
         );
+        Ok(())
     }
 
     /// Returns a reference to the live metrics.
@@ -763,11 +770,13 @@ mod tests {
         // Record some activity
         live_metrics.record_quote(1);
         live_metrics.record_quote(2);
-        live_metrics.update_position(crate::dec!(50.0));
-        live_metrics.update_pnl(crate::dec!(100.0), crate::dec!(25.0));
+        live_metrics.update_position(crate::dec!(50.0)).unwrap();
+        live_metrics
+            .update_pnl(crate::dec!(100.0), crate::dec!(25.0))
+            .unwrap();
 
         // Sync
-        bridge.sync();
+        bridge.sync().unwrap();
 
         // Verify Prometheus metrics updated
         assert_eq!(prom_metrics.get_quotes_total(), 2.0);
