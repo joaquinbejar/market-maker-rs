@@ -28,6 +28,17 @@
 //! on the first node, where it returns the slope of the only segment there
 //! is. A surface that is smooth in `tau` (such as [`FlatSurface`]) returns
 //! its derivative.
+//!
+//! # No arbitrage checks here
+//!
+//! A [`TotalVariance`] is only required to be a valid number: `w > 0` and
+//! finite derivatives. Static arbitrage is a property of the whole surface,
+//! not of one point, and is diagnosed where surfaces are built (calibration
+//! and its diagnostics): a negative `w_tau` (calendar arbitrage) or a smile
+//! that fails the butterfly condition is accepted here. A consumer must not
+//! assume `w_tau >= 0`, for example to read a forward variance; the option
+//! pricer uses `w_tau` only in theta, where a negative value is still
+//! well defined.
 
 use crate::Decimal;
 use crate::types::error::{MMError, MMResult};
@@ -35,20 +46,37 @@ use rust_decimal::prelude::ToPrimitive;
 
 /// A volatility surface: total implied variance and its derivatives.
 ///
+/// Implementations provide [`VolSurface::total_variance_at`]; callers use
+/// [`VolSurface::total_variance`], which checks the point first, so an
+/// implementation never sees a non-finite `k` or a `tau <= 0`.
 /// Implementations must be thread safe (`Send + Sync`), so one surface can
 /// be shared by the pricers of a whole chain.
 pub trait VolSurface: Send + Sync {
+    /// The surface's own evaluation, called by
+    /// [`VolSurface::total_variance`] with a point that passed
+    /// [`check_point`] (finite `k`, finite `tau > 0`).
+    ///
+    /// # Errors
+    ///
+    /// - [`MMError::InvalidMarketState`] when `(k, tau)` is outside the domain
+    ///   the surface declares.
+    /// - [`MMError::NumericalError`] when the result is not a valid
+    ///   [`TotalVariance`].
+    fn total_variance_at(&self, k: f64, tau: f64) -> MMResult<TotalVariance>;
+
     /// The total implied variance at log forward moneyness `k` and time to
-    /// expiry `tau` (years), with its derivatives.
+    /// expiry `tau` (years), with its derivatives. Implementations should
+    /// not override it: it is where the point is checked.
     ///
     /// # Errors
     ///
     /// - [`MMError::InvalidMarketState`] when `k` is not finite or `tau` is not
-    ///   finite and strictly positive ([`check_point`]), or when `(k, tau)` is
-    ///   outside the domain the surface declares.
-    /// - [`MMError::NumericalError`] when the result is not a valid
-    ///   [`TotalVariance`].
-    fn total_variance(&self, k: f64, tau: f64) -> MMResult<TotalVariance>;
+    ///   finite and strictly positive ([`check_point`]).
+    /// - The errors of [`VolSurface::total_variance_at`].
+    fn total_variance(&self, k: f64, tau: f64) -> MMResult<TotalVariance> {
+        check_point(k, tau)?;
+        self.total_variance_at(k, tau)
+    }
 }
 
 /// Total implied variance `w` at one point, with `w_k = dw/dk`,
@@ -124,7 +152,8 @@ impl TotalVariance {
 }
 
 /// Checks a surface query point: `k` finite, `tau` finite and strictly
-/// positive. Every [`VolSurface`] implementation calls it first.
+/// positive. [`VolSurface::total_variance`] calls it before the surface's
+/// own evaluation.
 ///
 /// # Errors
 ///
@@ -185,11 +214,9 @@ impl VolSurface for FlatSurface {
     ///
     /// # Errors
     ///
-    /// [`MMError::InvalidMarketState`] for an invalid point;
     /// [`MMError::NumericalError`] when `sigma^2 tau` overflows or underflows
     /// to zero.
-    fn total_variance(&self, k: f64, tau: f64) -> MMResult<TotalVariance> {
-        check_point(k, tau)?;
+    fn total_variance_at(&self, _k: f64, tau: f64) -> MMResult<TotalVariance> {
         let var = self.sigma_f64 * self.sigma_f64;
         TotalVariance::new(var * tau, 0.0, 0.0, var)
     }
@@ -309,6 +336,36 @@ mod tests {
             s.total_variance(0.0, 1e-306),
             Err(MMError::NumericalError(_))
         ));
+    }
+
+    #[test]
+    fn test_vol_surface_point_is_checked_before_the_implementation() {
+        // An implementation that would accept anything: the provided method
+        // still refuses an invalid point before calling it.
+        struct Permissive;
+        impl VolSurface for Permissive {
+            fn total_variance_at(&self, _k: f64, _tau: f64) -> MMResult<TotalVariance> {
+                TotalVariance::new(1.0, 0.0, 0.0, 0.0)
+            }
+        }
+        assert!(Permissive.total_variance(0.0, 1.0).is_ok());
+        for (k, tau) in [
+            (f64::NAN, 1.0),
+            (0.0, 0.0),
+            (0.0, -1.0),
+            (0.0, f64::INFINITY),
+        ] {
+            assert!(matches!(
+                Permissive.total_variance(k, tau),
+                Err(MMError::InvalidMarketState(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_total_variance_accepts_a_negative_w_tau() {
+        // Calendar arbitrage is a surface diagnostic, not an invalid point.
+        assert!(TotalVariance::new(0.04, 0.0, 0.0, -0.01).is_ok());
     }
 
     #[test]
