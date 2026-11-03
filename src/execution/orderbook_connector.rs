@@ -344,6 +344,13 @@ impl OrderBookConnector {
             )));
         }
         let raw = decimal_to_units(quantity, self.config.quantity_precision)?;
+        if raw == 0 {
+            // A zero or sub-lot quantity would cancel a resting order on modify
+            // or submit an empty order, so it is rejected before the book changes.
+            return Err(MMError::NumericalError(format!(
+                "quantity {quantity} rounds to zero lots"
+            )));
+        }
         u64::try_from(raw).map_err(|_| {
             MMError::NumericalError(format!("quantity {quantity} does not fit in u64"))
         })
@@ -769,7 +776,10 @@ mod tests {
             connector.quantity_to_u64(dec!(-0.000000001)),
             Err(MMError::NumericalError(_))
         ));
-        assert_eq!(connector.quantity_to_u64(dec!(0.000000001)).unwrap(), 0);
+        assert!(matches!(
+            connector.quantity_to_u64(dec!(0.000000001)),
+            Err(MMError::NumericalError(_))
+        ));
     }
 
     #[tokio::test]
@@ -800,7 +810,10 @@ mod tests {
                 Err(MMError::NumericalError(_))
             ));
         }
-        assert_eq!(connector.quantity_to_u64(dec!(0)).unwrap(), 0);
+        assert!(matches!(
+            connector.quantity_to_u64(dec!(0)),
+            Err(MMError::NumericalError(_))
+        ));
     }
 
     #[tokio::test]
@@ -824,6 +837,20 @@ mod tests {
         assert!(matches!(result, Err(MMError::NumericalError(_))));
         let book = connector.get_orderbook("BTC-USD", 10).await.unwrap();
         assert_eq!(book.bids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_modify_order_sublot_quantity_keeps_order() {
+        let connector = OrderBookConnector::new("BTC-USD");
+        let request = OrderRequest::limit_buy("BTC-USD", dec!(100), dec!(1));
+        let response = connector.submit_order(request).await.unwrap();
+        let result = connector
+            .modify_order(&response.order_id, None, Some(dec!(0.000000001)))
+            .await;
+        assert!(matches!(result, Err(MMError::NumericalError(_))));
+        let book = connector.get_orderbook("BTC-USD", 10).await.unwrap();
+        assert_eq!(book.bids.len(), 1);
+        assert!(connector.get_order_status(&response.order_id).await.is_ok());
     }
 
     #[tokio::test]
