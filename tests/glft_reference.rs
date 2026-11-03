@@ -1,5 +1,7 @@
 //! Validation of `GLFTStrategy` against a reference solution of the
-//! Gueant, Lehalle and Fernandez-Tapia model (#86).
+//! Gueant, Lehalle and Fernandez-Tapia model. The reference was written for
+//! #86 to document the gap; since #134 `GLFTStrategy` implements the model
+//! and these tests assert that it matches.
 //!
 //! # Declared before comparing
 //!
@@ -27,22 +29,23 @@
 //!   `delta_b ~ (1/gamma) ln(1 + gamma/k) + (1 + 2q)/2 * gamma sigma^2 (T - t)`
 //!   are the first order expansion of Theorem 1 for `t` close to `T`.
 //!
-//! **What `GLFTStrategy` computes** (`src/strategy/glft.rs`): the A-S
-//! reservation price minus an extra term `q * phi * f(tau)`, and the A-S
-//! spread `gamma sigma^2 tau + (2/gamma) ln(1 + gamma/k)`. It has no fill
-//! intensity `A` and no inventory bound `Q`. With `phi = 0` and dynamic gamma
-//! off it is exactly the A-S baseline of #85, and its quotes are the
-//! footnote 8 expansion above at every horizon.
+//! **What `GLFTStrategy` computes** (`src/strategy/glft.rs`, #134): the
+//! quotes of Theorem 1, with `exp(-(M - c I) tau) * 1` applied to the vector
+//! by Taylor steps, and the closed form after Proposition 3. These tests
+//! check it against this reference, which it does not import.
 //!
 //! **Parameters**: the paper's example (Figure 1): `sigma = 0.3 tick/sqrt(s)`,
 //! `A = 0.9 /s`, `k = 0.3 /tick`, `gamma = 0.01 /tick`, `T = 600 s`.
 //!
 //! **Units**: the reference works in ticks and seconds. `GLFTStrategy`
 //! takes an absolute volatility per sqrt(year) and times in milliseconds,
-//! with a 365 day year (31 536 000 s), so it is called with
-//! `sigma_year = 0.3 * sqrt(31 536 000)` ticks per sqrt(year), so that
-//! `sigma_year^2 * tau_years = sigma^2 * tau_seconds`, prices in ticks
-//! around a mid of 1000 ticks, `phi = 0`, `min_spread = 0`.
+//! with a 365 day year (31 536 000 s), and `A` per second, so it is called
+//! with `sigma_year = 0.3 * sqrt(31 536 000)` ticks per sqrt(year), so that
+//! its `alpha = k gamma sigma_year^2 / (2 * 31 536 000)` per second equals the
+//! paper's `k gamma sigma^2 / 2` per second, `A = 0.9` per second (so
+//! `eta tau` is dimensionless with `tau` in seconds), `gamma` and `k` per
+//! tick, `lot_size = 1`, prices in ticks around a mid of 1000 ticks and
+//! `min_spread = 0`.
 //!
 //! **Numerics** (f64, test code only, not a public type):
 //! - `exp(-M tau)` is evaluated by two independent methods: symmetric
@@ -60,9 +63,8 @@
 
 use market_maker_rs::Decimal;
 use market_maker_rs::dec;
-use market_maker_rs::strategy::glft::{GLFTConfig, GLFTStrategy};
+use market_maker_rs::strategy::glft::{GLFTConfig, GLFTStrategy, GlftQuotes};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use std::str::FromStr;
 
 /// Agreement of the two matrix exponentials on the normalized `v`
 /// (relative, per component).
@@ -385,32 +387,57 @@ mod reference {
 
 use reference::{Method, Params};
 
-/// Quote distances `(mid - bid, ask - mid)` of `GLFTStrategy` with the paper
-/// parameters converted to its units, `phi = 0`, at `tau` seconds to `T`.
-fn current_type(p: &Params, tau_s: f64, q: i64) -> (f64, f64) {
-    let horizon_ms: u64 = 3_600_000;
-    let tau_ms = (tau_s * 1000.0).round() as u64;
-    let sigma_year = Decimal::from_f64(p.sigma * SECONDS_PER_YEAR.sqrt()).expect("finite");
-    let config = GLFTConfig::new(
-        Decimal::from_f64(p.gamma).expect("finite"),
+fn config(p: &Params, q_max: i64, lot_size: Decimal, horizon_ms: u64) -> GLFTConfig {
+    GLFTConfig::new(
+        Decimal::from_f64(p.gamma).expect("finite") / lot_size,
         Decimal::from_f64(p.k).expect("finite"),
-        Decimal::ZERO,
+        Decimal::from_f64(p.a).expect("finite"),
+        u32::try_from(q_max).expect("small bound"),
+        lot_size,
         horizon_ms,
         Decimal::ZERO,
     )
-    .expect("valid config");
-    let (bid, ask) = GLFTStrategy::calculate_optimal_quotes(
+    .expect("valid config")
+}
+
+fn sigma_year(p: &Params) -> Decimal {
+    Decimal::from_f64(p.sigma * SECONDS_PER_YEAR.sqrt()).expect("finite")
+}
+
+fn distances(quotes: GlftQuotes) -> (Option<f64>, Option<f64>) {
+    (
+        quotes
+            .bid
+            .map(|b| (MID_TICKS - b).to_f64().expect("finite")),
+        quotes
+            .ask
+            .map(|a| (a - MID_TICKS).to_f64().expect("finite")),
+    )
+}
+
+/// Quote distances `(mid - bid, ask - mid)` of `GLFTStrategy` with the paper
+/// parameters converted to its units, at `tau` seconds to `T`, inventory
+/// bound `q_max` and `q` lots of size 1. `None` where it posts no quote.
+fn current_type(p: &Params, q_max: i64, tau_s: f64, q: i64) -> (Option<f64>, Option<f64>) {
+    let horizon_ms: u64 = 36_000_000;
+    let tau_ms = (tau_s * 1000.0).round() as u64;
+    let quotes = GLFTStrategy::calculate_optimal_quotes(
         MID_TICKS,
         Decimal::from(q),
-        &config,
-        sigma_year,
+        &config(p, q_max, Decimal::ONE, horizon_ms),
+        sigma_year(p),
         horizon_ms - tau_ms,
     )
     .expect("quotes inside the domain");
-    (
-        (MID_TICKS - bid).to_f64().expect("finite"),
-        (ask - MID_TICKS).to_f64().expect("finite"),
-    )
+    distances(quotes)
+}
+
+fn assert_close(label: &str, x: Option<f64>, y: Option<f64>, tol: f64) {
+    match (x, y) {
+        (Some(x), Some(y)) => assert!((x - y).abs() <= tol, "{label}: {x} vs {y}"),
+        (None, None) => {}
+        _ => panic!("{label}: quote presence differs: {x:?} vs {y:?}"),
+    }
 }
 
 /// The footnote 8 expansion in f64, independent of `GLFTStrategy`.
@@ -549,16 +576,16 @@ fn test_glft_expm_long_horizon_normalized_without_overflow() {
 #[test]
 fn test_glft_quotes_at_terminal_time_match_current_type() {
     // At t = T, v = 1 and both quotes are (1/gamma) ln(1 + gamma/k) at every
-    // inventory; with phi = 0 the current type gives the same distances.
+    // inventory; the current type gives the same distances.
     let p = PAPER;
     let q_max = 16;
     for q in [-5, -1, 0, 1, 5] {
         let (b, a) = reference::quotes(Method::Taylor, &p, q_max, 0.0, q);
-        let (cb, ca) = current_type(&p, 0.0, q);
+        let (cb, ca) = current_type(&p, q_max, 0.0, q);
         assert!((b.expect("bid") - p.base()).abs() < 1e-15);
         assert!((a.expect("ask") - p.base()).abs() < 1e-15);
-        assert!((cb - p.base()).abs() < DECIMAL_TOL, "q={q}: {cb}");
-        assert!((ca - p.base()).abs() < DECIMAL_TOL, "q={q}: {ca}");
+        assert_close(&format!("bid q={q}"), cb, Some(p.base()), DECIMAL_TOL);
+        assert_close(&format!("ask q={q}"), ca, Some(p.base()), DECIMAL_TOL);
     }
 }
 
@@ -583,11 +610,12 @@ fn test_glft_quotes_near_terminal_reduce_to_avellaneda_stoikov() {
             e1 / e01 > 50.0 && e01 / e001 > 50.0,
             "q={q}: {e1} {e01} {e001}"
         );
-        // The current type with phi = 0 is that expansion.
+        // The current type follows the reference, not the expansion.
         for tau in [0.01, 1.0, 600.0] {
-            let (cb, ca) = current_type(&p, tau, q);
-            let (eb, ea) = as_expansion(&p, tau, q);
-            assert!((cb - eb).abs() < DECIMAL_TOL && (ca - ea).abs() < DECIMAL_TOL);
+            let (cb, ca) = current_type(&p, q_max, tau, q);
+            let (rb, ra) = reference::quotes(Method::Jacobi, &p, q_max, tau, q);
+            assert_close(&format!("bid q={q} tau={tau}"), cb, rb, DECIMAL_TOL);
+            assert_close(&format!("ask q={q} tau={tau}"), ca, ra, DECIMAL_TOL);
         }
     }
 }
@@ -604,6 +632,23 @@ fn test_glft_quotes_long_horizon_converge_to_spectral_limit() {
         let (b, a, lb, la) = (b.unwrap(), a.unwrap(), lb.unwrap(), la.unwrap());
         assert!((b - lb).abs() < SPECTRAL_LIMIT_TOL, "q={q}: {b} vs {lb}");
         assert!((a - la).abs() < SPECTRAL_LIMIT_TOL, "q={q}: {a} vs {la}");
+        let (cb, ca) = current_type(&p, q_max, PAPER_T, q);
+        assert_close(&format!("bid q={q}"), cb, Some(lb), SPECTRAL_LIMIT_TOL);
+        assert_close(&format!("ask q={q}"), ca, Some(la), SPECTRAL_LIMIT_TOL);
+        // Ten times longer, the current type is still finite and at the limit.
+        let (cb, ca) = current_type(&p, q_max, 10.0 * PAPER_T, q);
+        assert_close(
+            &format!("bid q={q} 6000 s"),
+            cb,
+            Some(lb),
+            SPECTRAL_LIMIT_TOL,
+        );
+        assert_close(
+            &format!("ask q={q} 6000 s"),
+            ca,
+            Some(la),
+            SPECTRAL_LIMIT_TOL,
+        );
     }
 }
 
@@ -633,6 +678,14 @@ fn test_glft_quotes_larger_inventory_bound_converge() {
     let (g8, g16, g32) = (gap(0, 3), gap(1, 3), gap(2, 3));
     assert!(g8 > g16 && g16 > g32, "{g8} {g16} {g32}");
     assert!(g32 < TRUNCATION_TOL, "Q=32 vs Q=64 at |q|<=3: {g32}");
+    // The current type converges the same way, and matches each truncation.
+    for (&q_max, row) in qs.iter().zip(&quotes) {
+        for (q, (rb, ra)) in (-3..=3).zip(row) {
+            let (cb, ca) = current_type(&p, q_max, PAPER_T, q);
+            assert_close(&format!("Q={q_max} bid q={q}"), cb, Some(*rb), DECIMAL_TOL);
+            assert_close(&format!("Q={q_max} ask q={q}"), ca, Some(*ra), DECIMAL_TOL);
+        }
+    }
 }
 
 #[test]
@@ -644,112 +697,83 @@ fn test_glft_quotes_at_inventory_bound_omit_one_side() {
         reference::quotes(Method::Taylor, &p, q_max, PAPER_T, -q_max);
     assert!(bid_at_top.is_none() && ask_at_top.is_some());
     assert!(ask_at_bottom.is_none() && bid_at_bottom.is_some());
-    // The current type has no bound: it quotes both sides at any inventory.
-    let (cb, ca) = current_type(&p, PAPER_T, q_max);
-    assert!(cb.is_finite() && ca.is_finite());
+    // The current type omits the same sides and matches the posted ones.
+    for (q, rb, ra) in [
+        (q_max, bid_at_top, ask_at_top),
+        (-q_max, bid_at_bottom, ask_at_bottom),
+    ] {
+        let (cb, ca) = current_type(&p, q_max, PAPER_T, q);
+        assert_close(&format!("bid q={q}"), cb, rb, DECIMAL_TOL);
+        assert_close(&format!("ask q={q}"), ca, ra, DECIMAL_TOL);
+    }
 }
 
 #[test]
-fn test_glft_current_type_paper_horizon_deviates_from_reference() {
-    // Evidence, not a target: with the paper parameters at T - t = 600 s the
-    // A-S skew per unit of inventory is gamma sigma^2 tau = 0.54 ticks, while
-    // the reference skews by about 0.068 ticks. Update this test if the type
-    // is ever changed to follow the paper.
+fn test_glft_current_type_matches_reference_both_methods() {
+    let p = PAPER;
+    for q_max in [8, 16, 32] {
+        for tau in [0.0, 1.0, 10.0, 60.0, 600.0, 3600.0] {
+            let vj = reference::v(Method::Jacobi, &p, q_max, tau);
+            let vt = reference::v(Method::Taylor, &p, q_max, tau);
+            for q in -q_max..=q_max {
+                let (cb, ca) = current_type(&p, q_max, tau, q);
+                for (name, v) in [("Jacobi", &vj), ("Taylor", &vt)] {
+                    let (rb, ra) = reference::quotes_from(&p, v, q_max, q);
+                    let label = format!("{name} Q={q_max} tau={tau} q={q}");
+                    assert_close(&format!("{label} bid"), cb, rb, DECIMAL_TOL);
+                    assert_close(&format!("{label} ask"), ca, ra, DECIMAL_TOL);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_glft_current_type_closed_form_matches_reference() {
+    // Proposition 3: the closed form, and the exact skew per unit of
+    // inventory at the paper horizon is close to its slope C.
     let p = PAPER;
     let q_max = 32;
-    let v = reference::v(Method::Taylor, &p, q_max, PAPER_T);
-    let skew = |q: i64| {
-        let (b, _) = reference::quotes_from(&p, &v, q_max, q);
-        b.unwrap()
-    };
-    let reference_slope = skew(1) - skew(0);
-    let (c0, _) = current_type(&p, PAPER_T, 0);
-    let (c1, _) = current_type(&p, PAPER_T, 1);
-    let current_slope = c1 - c0;
-    assert!(
-        (current_slope - 0.54).abs() < DECIMAL_TOL,
-        "{current_slope}"
-    );
-    assert!(
-        (reference_slope - p.closed_form_slope()).abs() < 0.01,
-        "{reference_slope}"
-    );
-    assert!(current_slope > 5.0 * reference_slope);
+    let horizon_ms = 600_000;
+    let config = config(&p, q_max, Decimal::ONE, horizon_ms);
+    for q in [-5, -1, 0, 1, 5] {
+        let closed =
+            GLFTStrategy::closed_form_quotes(MID_TICKS, Decimal::from(q), &config, sigma_year(&p))
+                .expect("closed form");
+        let (cb, ca) = distances(closed);
+        let (rb, ra) = reference::closed_form(&p, q);
+        assert_close(&format!("bid q={q}"), cb, Some(rb), DECIMAL_TOL);
+        assert_close(&format!("ask q={q}"), ca, Some(ra), DECIMAL_TOL);
+    }
+    let (c0, _) = current_type(&p, q_max, PAPER_T, 0);
+    let (c1, _) = current_type(&p, q_max, PAPER_T, 1);
+    let slope = c1.expect("bid") - c0.expect("bid");
+    assert!((slope - p.closed_form_slope()).abs() < 0.01, "{slope}");
 }
 
-/// (s, q, gamma, sigma, tau_ms, k, bid, ask): the A-S reference fixtures of
-/// #85 (`tests/avellaneda_stoikov_fixtures.rs`, computed with Python
-/// `decimal` at 50 digits), reused as the control.
-type ControlRow = (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    u64,
-    &'static str,
-    &'static str,
-    &'static str,
-);
-const AS_CONTROL: &[ControlRow] = &[
-    (
-        "100",
-        "5",
-        "0.1",
-        "2",
-        3_600_000,
-        "1.5",
-        "99.35436364707177686775",
-        "100.64517973192365692221",
-    ),
-    (
-        "60000",
-        "0.5",
-        "0.01",
-        "12000",
-        86_400_000,
-        "0.05",
-        "56036.56236486854974285828",
-        "60018.23215567939546262117",
-    ),
-    (
-        "60000",
-        "-2",
-        "0.01",
-        "12000",
-        600_000,
-        "0.05",
-        "60022.86373473156344148842",
-        "60086.72530636432696947049",
-    ),
-    (
-        "50",
-        "3",
-        "0.5",
-        "10",
-        0,
-        "2",
-        "49.55371289737158048847",
-        "50.44628710262841951153",
-    ),
-];
-
 #[test]
-fn test_glft_current_type_zero_penalty_reproduces_as_control() {
-    let d = |s: &str| Decimal::from_str(s).expect("fixture literal");
-    let tol = dec!(0.000000000001);
-    for (s, q, g, sig, tau, k, bid, ask) in AS_CONTROL {
-        let terminal = 100_000_000_u64;
-        let config = GLFTConfig::new(d(g), d(k), Decimal::ZERO, terminal, Decimal::ZERO).unwrap();
-        let (got_bid, got_ask) =
-            GLFTStrategy::calculate_optimal_quotes(d(s), d(q), &config, d(sig), terminal - tau)
-                .unwrap();
-        for (expected, actual) in [(d(bid), got_bid), (d(ask), got_ask)] {
-            let scale = expected.abs().max(Decimal::ONE);
-            assert!(
-                (expected - actual).abs() <= tol * scale,
-                "s={s} q={q}: expected {expected}, actual {actual}"
-            );
-        }
+fn test_glft_current_type_lot_size_matches_rescaled_reference() {
+    // With lots of 0.5, gamma per unit of price is 2 gamma_L, and inventory
+    // 1.5 is 3 lots: the quotes are those of the reference with gamma_L.
+    let p = PAPER;
+    let q_max = 16;
+    let horizon_ms = 600_000;
+    let lot = dec!(0.5);
+    let config = config(&p, q_max, lot, horizon_ms);
+    for q in [-3_i64, 0, 3] {
+        let inventory = Decimal::from(q) * lot;
+        let quotes = GLFTStrategy::calculate_optimal_quotes(
+            MID_TICKS,
+            inventory,
+            &config,
+            sigma_year(&p),
+            0,
+        )
+        .expect("quotes");
+        let (cb, ca) = distances(quotes);
+        let (rb, ra) = reference::quotes(Method::Jacobi, &p, q_max, PAPER_T, q);
+        assert_close(&format!("bid q={q}"), cb, rb, DECIMAL_TOL);
+        assert_close(&format!("ask q={q}"), ca, ra, DECIMAL_TOL);
     }
 }
 
@@ -786,13 +810,15 @@ fn test_glft_reference_paper_parameters_print_evidence_table() {
         let v = reference::v(Method::Taylor, &p, q_max, tau);
         for q in [-5, -2, -1, 0, 1, 2, 5] {
             let (rb, ra) = reference::quotes_from(&p, &v, q_max, q);
-            let (cb, ca) = current_type(&p, tau, q);
+            let (cb, ca) = current_type(&p, q_max, tau, q);
             let (ab, aa) = reference::closed_form(&p, q);
             let (lb, la) = reference::quotes_from(&p, &f0, q_max, q);
             println!(
-                "| {tau} | {q} | {} | {} | {cb:.6} | {ca:.6} | {ab:.6} | {aa:.6} | {} | {} |",
+                "| {tau} | {q} | {} | {} | {} | {} | {ab:.6} | {aa:.6} | {} | {} |",
                 fmt_opt(rb),
                 fmt_opt(ra),
+                fmt_opt(cb),
+                fmt_opt(ca),
                 fmt_opt(lb),
                 fmt_opt(la)
             );
@@ -805,11 +831,13 @@ fn test_glft_reference_paper_parameters_print_evidence_table() {
     let v8 = reference::v(Method::Taylor, &p, 8, PAPER_T);
     for q in [-8, -7, 7, 8] {
         let (rb, ra) = reference::quotes_from(&p, &v8, 8, q);
-        let (cb, ca) = current_type(&p, PAPER_T, q);
+        let (cb, ca) = current_type(&p, 8, PAPER_T, q);
         println!(
-            "| {q} | {} | {} | {cb:.6} | {ca:.6} |",
+            "| {q} | {} | {} | {} | {} |",
             fmt_opt(rb),
-            fmt_opt(ra)
+            fmt_opt(ra),
+            fmt_opt(cb),
+            fmt_opt(ca)
         );
     }
     println!();

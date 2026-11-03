@@ -29,7 +29,7 @@ pub use crate::strategy::calibration::{
     RiskAversionCalibrator, VolatilityRegime, VolatilityRegimeDetector,
 };
 pub use crate::strategy::config::StrategyConfig;
-pub use crate::strategy::glft::{GLFTConfig, GLFTStrategy, PenaltyFunction};
+pub use crate::strategy::glft::{GLFTConfig, GLFTStrategy, GlftQuotes};
 pub use crate::strategy::grid::{GridConfig, GridOrder, GridStrategy, OrderSide};
 pub use crate::strategy::quote::Quote;
 
