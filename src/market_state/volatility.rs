@@ -120,7 +120,7 @@ impl VolatilityEstimator {
     /// # Errors
     ///
     /// Returns error if:
-    /// - Less than 2 prices provided
+    /// - Less than 3 prices provided (the sample variance needs 2 returns)
     /// - Any price is zero or negative
     /// - Numerical calculation fails
     ///
@@ -186,7 +186,7 @@ impl VolatilityEstimator {
     /// # Errors
     ///
     /// Returns error if:
-    /// - Less than 2 prices provided
+    /// - Less than 3 prices provided (the sample variance needs 2 returns)
     /// - Lambda not in range (0, 1)
     /// - Any price is invalid
     ///
@@ -348,7 +348,8 @@ impl VolatilityEstimator {
 ///
 /// # Errors
 ///
-/// Returns `MMError::InvalidMarketState` if any price is not positive.
+/// Returns `MMError::InvalidMarketState` if any price is not positive or
+/// there are fewer than 2 returns.
 fn log_returns(prices: &[Decimal]) -> MMResult<Vec<Decimal>> {
     let mut log_returns = Vec::with_capacity(prices.len().saturating_sub(1));
     for window in prices.windows(2) {
@@ -362,12 +363,33 @@ fn log_returns(prices: &[Decimal]) -> MMResult<Vec<Decimal>> {
         }
         log_returns.push(decimal_ln(*next / *prev)?);
     }
+    // The sample variance divides by `n - 1`.
+    if log_returns.len() < 2 {
+        return Err(MMError::InvalidMarketState(format!(
+            "need at least 2 log returns (3 prices), got {}",
+            log_returns.len()
+        )));
+    }
     Ok(log_returns)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_calculate_simple_two_prices_returns_err() {
+        let estimator = VolatilityEstimator::new();
+        let result = estimator.calculate_simple(&[dec!(100), dec!(101)]);
+        assert!(matches!(result, Err(MMError::InvalidMarketState(_))));
+    }
+
+    #[test]
+    fn test_calculate_ewma_two_prices_returns_err() {
+        let estimator = VolatilityEstimator::new();
+        let result = estimator.calculate_ewma(&[dec!(100), dec!(101)], dec!(0.94));
+        assert!(matches!(result, Err(MMError::InvalidMarketState(_))));
+    }
     use crate::dec;
 
     #[test]
