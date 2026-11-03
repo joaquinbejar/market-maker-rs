@@ -161,7 +161,9 @@ impl ManagedOrder {
     #[must_use]
     pub fn fill_ratio(&self) -> Decimal {
         if self.original_quantity > Decimal::ZERO {
-            self.filled_quantity / self.original_quantity
+            self.filled_quantity
+                .checked_div(self.original_quantity)
+                .unwrap_or(Decimal::ZERO)
         } else {
             Decimal::ZERO
         }
@@ -735,17 +737,25 @@ impl OrderManager {
         let mut stats = OrderManagerStats::default();
 
         for order in self.orders.values() {
-            stats.total_orders += 1;
-            stats.total_fills += order.fills.len();
+            stats.total_orders = stats.total_orders.saturating_add(1);
+            stats.total_fills = stats.total_fills.saturating_add(order.fills.len());
 
             match &order.status {
-                OrderStatus::Pending => stats.pending_orders += 1,
-                OrderStatus::Open { .. } | OrderStatus::PartiallyFilled { .. } => {
-                    stats.open_orders += 1
+                OrderStatus::Pending => {
+                    stats.pending_orders = stats.pending_orders.saturating_add(1)
                 }
-                OrderStatus::Filled { .. } => stats.filled_orders += 1,
-                OrderStatus::Cancelled { .. } => stats.cancelled_orders += 1,
-                OrderStatus::Rejected { .. } => stats.rejected_orders += 1,
+                OrderStatus::Open { .. } | OrderStatus::PartiallyFilled { .. } => {
+                    stats.open_orders = stats.open_orders.saturating_add(1)
+                }
+                OrderStatus::Filled { .. } => {
+                    stats.filled_orders = stats.filled_orders.saturating_add(1)
+                }
+                OrderStatus::Cancelled { .. } => {
+                    stats.cancelled_orders = stats.cancelled_orders.saturating_add(1)
+                }
+                OrderStatus::Rejected { .. } => {
+                    stats.rejected_orders = stats.rejected_orders.saturating_add(1)
+                }
             }
         }
 

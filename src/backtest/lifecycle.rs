@@ -109,7 +109,7 @@ impl SimClock {
             timestamp: self.now,
             sequence: self.next_sequence,
         };
-        self.next_sequence += 1;
+        self.next_sequence = self.next_sequence.saturating_add(1);
         stamp
     }
 
@@ -298,6 +298,7 @@ impl SimOrder {
                 self.id, quantity, remaining
             )));
         }
+        // Cannot overflow: 0 < quantity <= remaining was checked above.
         self.filled += quantity;
         self.state = if self.remaining() == Decimal::ZERO {
             SimOrderState::Filled

@@ -175,13 +175,27 @@ impl JitterRng {
         x ^= x << 25;
         x ^= x >> 27;
         self.state = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D) % (max + 1)
+        let value = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        // `max + 1` overflows only for `u64::MAX`, where every value is in range.
+        match max.checked_add(1) {
+            Some(bound) => value % bound,
+            None => value,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_jitter_rng_draw_max_bound_does_not_overflow() {
+        let mut rng = JitterRng::new(7);
+        for _ in 0..16 {
+            let _ = rng.draw(u64::MAX);
+        }
+        assert!(rng.draw(3) <= 3);
+    }
 
     #[test]
     fn test_default_is_zero() {

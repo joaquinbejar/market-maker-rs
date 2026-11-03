@@ -91,10 +91,11 @@ impl SimulatedOrder {
         }
     }
 
-    /// Returns the notional value of the order.
+    /// Returns the notional value of the order, saturating at the
+    /// `Decimal` bounds.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.quantity
+        self.price.saturating_mul(self.quantity)
     }
 
     /// Returns true if this is a buy order.
@@ -447,7 +448,8 @@ impl QueuePositionFillModel {
 
     /// Calculates volume cleared based on time in queue.
     fn volume_cleared(&self, time_in_queue_ms: u64) -> Decimal {
-        self.fill_rate * Decimal::from(time_in_queue_ms)
+        self.fill_rate
+            .saturating_mul(Decimal::from(time_in_queue_ms))
     }
 }
 
@@ -491,14 +493,15 @@ impl QueuePositionFillModel {
         // Calculate how much volume has cleared
         let cleared = self.volume_cleared(time_in_queue_ms);
 
-        if cleared >= queue_ahead + order.quantity {
+        if cleared >= queue_ahead.saturating_add(order.quantity) {
             // Full fill - we've cleared the queue plus our order
             FillResult::FullFill {
                 fill_price: order.price,
             }
         } else if cleared > queue_ahead {
             // Partial fill - some of our order filled
-            let filled = cleared - queue_ahead;
+            // Cannot overflow: cleared > queue_ahead >= 0 here.
+            let filled = cleared.saturating_sub(queue_ahead);
             if filled > Decimal::ZERO {
                 FillResult::PartialFill {
                     filled_quantity: filled.min(order.quantity),

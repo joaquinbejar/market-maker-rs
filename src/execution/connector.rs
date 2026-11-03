@@ -38,7 +38,7 @@ use std::fmt;
 
 use crate::Decimal;
 use crate::types::action::Dir;
-use crate::types::error::MMResult;
+use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -436,7 +436,7 @@ impl OrderRequest {
     /// Returns None for market orders without a price.
     #[must_use]
     pub fn notional(&self) -> Option<Decimal> {
-        self.price.map(|p| p * self.quantity)
+        self.price.map(|p| p.saturating_mul(self.quantity))
     }
 }
 
@@ -535,10 +535,11 @@ pub struct Fill {
 }
 
 impl Fill {
-    /// Returns the notional value of the fill (price * quantity).
+    /// Returns the notional value of the fill (price * quantity),
+    /// saturating at the `Decimal` bounds.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.quantity
+        self.price.saturating_mul(self.quantity)
     }
 
     /// Returns the net value after fees.
@@ -548,12 +549,16 @@ impl Fill {
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`](crate::types::error::MMError::UnsupportedAction) if the fill's side is neither
-    /// buy nor sell.
+    /// buy nor sell, and [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// if the notional or the net value overflows.
     pub fn net_value(&self) -> MMResult<Decimal> {
-        Ok(match Dir::try_from(self.side)? {
-            Dir::Buy => self.notional() + self.fee,
-            Dir::Sell => self.notional() - self.fee,
-        })
+        let overflow = || MMError::NumericalError("fill net value overflows".to_string());
+        let notional = self.price.checked_mul(self.quantity).ok_or_else(overflow)?;
+        match Dir::try_from(self.side)? {
+            Dir::Buy => notional.checked_add(self.fee),
+            Dir::Sell => notional.checked_sub(self.fee),
+        }
+        .ok_or_else(overflow)
     }
 }
 
@@ -584,10 +589,11 @@ impl BookLevel {
         Self { price, quantity }
     }
 
-    /// Returns the notional value at this level (price * quantity).
+    /// Returns the notional value at this level (price * quantity),
+    /// saturating at the `Decimal` bounds.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.quantity
+        self.price.saturating_mul(self.quantity)
     }
 }
 
@@ -995,6 +1001,32 @@ mod tests {
                 action: Action::Other
             })
         );
+    }
+
+    #[test]
+    fn test_fill_net_value_overflow_returns_numerical_error() {
+        let fill = Fill {
+            order_id: OrderId::new("1"),
+            trade_id: "t".to_string(),
+            price: Decimal::MAX,
+            quantity: dec!(2),
+            side: Action::Buy,
+            timestamp: 1,
+            fee: Decimal::ZERO,
+            fee_currency: "USD".to_string(),
+        };
+        assert_eq!(fill.notional(), Decimal::MAX);
+        assert!(matches!(fill.net_value(), Err(MMError::NumericalError(_))));
+        let fee_overflow = Fill {
+            price: Decimal::MAX,
+            quantity: Decimal::ONE,
+            fee: Decimal::ONE,
+            ..fill
+        };
+        assert!(matches!(
+            fee_overflow.net_value(),
+            Err(MMError::NumericalError(_))
+        ));
     }
 
     #[test]
