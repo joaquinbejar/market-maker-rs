@@ -239,6 +239,21 @@ impl MarginShadow {
             self.fault = None;
             return Ok(());
         }
+        // The order and the cumulative quantity name a fill. A repeat changes
+        // nothing, even after later fills or once the order has closed.
+        let id = ExecutionId::new(format!("fill-{}-{}", r.order_id, r.cum)).unwrap();
+        if let Some(booked) = self
+            .ledger
+            .journal()
+            .iter()
+            .find(|entry| entry.execution_id == id)
+        {
+            return if booked.side == r.side && booked.quantity == self.lots(r.last) {
+                Ok(())
+            } else {
+                Err(format!("fill {id:?} repeated with other terms"))
+            };
+        }
         let Some(order) = self.open.get(&r.order_id).copied() else {
             return Err(format!(
                 "fill of order {} without a reservation",
@@ -250,8 +265,6 @@ impl MarginShadow {
             ..order
         };
         let (_, reserved) = self.reserved(&next);
-        // The order and the cumulative quantity name a fill.
-        let id = ExecutionId::new(format!("fill-{}-{}", r.order_id, r.cum)).unwrap();
         let mut execution = Execution::new(
             id,
             self.instrument.clone(),
@@ -717,23 +730,45 @@ fn test_margin_reservation_shrinks_with_each_partial_and_cancel_releases_the_res
 #[test]
 fn test_margin_duplicate_fill_changes_nothing() {
     on_large_stack(|| {
-        let sc = fixed(KernelLatency::zero(MS), None, vec![bid(15, 5)], 4);
+        let sc = fixed(KernelLatency::zero(MS), None, vec![bid(15, 5)], 8);
         let data = sc.data();
         let k = kernel(&sc, &data);
         let kr = run_kernel(&k, &sc, true);
-        let mut shadow = MarginShadow::new(&sc.cfg);
-        shadow.submit(&kr.actions[0], 1, 2, &[]).unwrap();
-        let partial = kr
+        let fills: Vec<KernelEvent> = kr
             .events
             .iter()
-            .find(|e| matches!(e, KernelEvent::Delivered(r) if r.kind == ExecKind::PartialFill))
+            .filter(|e| {
+                matches!(e, KernelEvent::Delivered(r)
+                    if matches!(r.kind, ExecKind::PartialFill | ExecKind::Fill))
+            })
             .copied()
-            .unwrap();
-        shadow.apply(&k, &[partial]).unwrap();
-        let once = shadow.image();
-        shadow.apply(&k, &[partial]).unwrap();
-        assert_eq!(shadow.image(), once);
-        shadow.check().unwrap();
+            .collect();
+        assert_eq!(fills.len(), 5, "four partials and the fill");
+        let mut shadow = MarginShadow::new(&sc.cfg);
+        shadow.submit(&kr.actions[0], 1, 2, &[]).unwrap();
+        let assert_repeats_change_nothing = |shadow: &mut MarginShadow, repeats: &[KernelEvent]| {
+            let (image, open) = (shadow.image(), shadow.open.clone());
+            shadow.apply(&k, repeats).unwrap();
+            assert_eq!(shadow.image(), image);
+            assert_eq!(shadow.open, open);
+            shadow.check().unwrap();
+        };
+        shadow.apply(&k, &fills[..2]).unwrap();
+        // The latest partial, then an older one.
+        assert_repeats_change_nothing(&mut shadow, &fills[1..2]);
+        assert_repeats_change_nothing(&mut shadow, &fills[..1]);
+        shadow.apply(&k, &fills[2..]).unwrap();
+        assert!(shadow.open.is_empty());
+        // The terminal fill and a partial, once the order has closed.
+        assert_repeats_change_nothing(&mut shadow, &fills[4..]);
+        assert_repeats_change_nothing(&mut shadow, &fills[..1]);
+
+        // The same fill with other terms is an error, not a repeat.
+        let KernelEvent::Delivered(mut other) = fills[0] else {
+            panic!("not a delivered fill");
+        };
+        other.last += 1;
+        assert!(shadow.apply(&k, &[KernelEvent::Delivered(other)]).is_err());
     });
 }
 
