@@ -20,10 +20,18 @@
 //!
 //! Each observed pair of quotes also counts as its mirror image, with buckets
 //! `i` and `n + 1 - i` swapped and the mid move negated, so `B* G¹ = 0` as in
-//! the paper's theorem 3.1. The bucket of imbalance `I` is `j` with
-//! `(j - 1) / n < I <= j / n`; the paper leaves `I = 0` without a bucket, and
-//! here it is bucket 1. Unlike the paper's matrix `R` with four columns, any
-//! mid move on the half tick grid is accepted.
+//! the paper's theorem 3.1. The paper's mirror `I -> 1 - I` only maps buckets
+//! onto buckets if the discretization is itself symmetric, and its rule
+//! `(j - 1) / n < I <= j / n` is not, which biases the adjustments in one
+//! direction. So here `n` is odd, the middle bucket holds `I = 1/2`, a book
+//! with `I < 1/2` follows the paper's rule (`I = 0` is in bucket 1, which the
+//! paper leaves out), and a book with `I > 1/2` takes the mirror of its swapped
+//! book. The rule compares integer multiples of sizes, without rounding a
+//! division, and `G*` is antisymmetric exactly.
+//!
+//! The paper's moves are four values of up to one tick. Here a pair moving the
+//! mid by more than `max_mid_move_ticks` is left out and counted, so that one
+//! bad print cannot move the fit.
 //!
 //! # Fallbacks
 //!
@@ -34,15 +42,25 @@
 //!
 //! - A state below `min_state_observations`, or one from which the data never
 //!   leads to a mid move, keeps adjustment 0 and absorbs the chains that reach it.
+//!   A state that reaches an observed move is calibrated even if some of its
+//!   paths end in such a state, which then pulls its adjustment toward 0.
 //! - The paper warns the limit may lie outside the quotes. A state where it
 //!   does is [`StateStatus::OutsideQuotes`].
-//! - A pair with a spread above `spread_states`, or further apart than
-//!   `max_quote_gap_ms`, is not counted. Such a spread also has no adjustment.
+//! - That switch makes the signal non-monotonic in the imbalance: a strong
+//!   imbalance can give the mid while a weaker one gives a large adjustment.
+//! - A pair with a spread above `spread_states`, further apart than
+//!   `max_quote_gap_ms` or with too large a move is not counted, and a spread
+//!   above `spread_states` has no adjustment. Leaving pairs out cuts the
+//!   chains and changes the adjustments, by an amount that grows with the share
+//!   left out and that can be large: check `skipped_pairs` against `pairs`, and
+//!   choose `spread_states` to cover the data.
+//! - [`StateEstimate::fallback_within_moves`] reports how much a state's
+//!   adjustment depends on absorption by fallback states.
 //!
 //! # Invalid quotes
 //!
 //! [`calibrate_micro_price`] and [`compare_estimators`] leave out a crossed,
-//! empty or off grid quote and count it, so one bad quote does not lose a
+//! empty, off grid or unrepresentable quote and count it, so one bad quote does not lose a
 //! month's report. [`MicroPriceCalibrator::observe`] and
 //! [`MicroPriceModel::signal`] refuse it. The quotes on either side of it form
 //! a pair if they pass the gap rule.
@@ -83,6 +101,8 @@ use serde::{Deserialize, Serialize};
 
 /// Most states `imbalance_buckets * spread_states` accepted.
 const MAX_STATES: usize = 256;
+/// Mid moves over which [`StateEstimate::fallback_within_moves`] is measured.
+const FALLBACK_HORIZON_MOVES: usize = 10;
 /// Most terms of the series for `G*`.
 const MAX_SERIES_TERMS: usize = 10_000;
 /// Size of a series term, in half ticks, below which the series has converged.
@@ -172,12 +192,12 @@ impl TopOfBook {
 /// Discretization and data rules of the estimator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawConfig"))]
 #[non_exhaustive]
 pub struct MicroPriceConfig {
     /// Price grid. Positive; quotes off this grid are refused.
     pub tick_size: Decimal,
-    /// Imbalance buckets `n`. At least 2.
+    /// Imbalance buckets `n`. Odd and at least 3.
     pub imbalance_buckets: u32,
     /// Spreads `m`, of 1 to `m` ticks. Positive.
     pub spread_states: u32,
@@ -185,11 +205,13 @@ pub struct MicroPriceConfig {
     pub min_state_observations: u64,
     /// Longest time between two quotes of a pair, in milliseconds. Positive.
     pub max_quote_gap_ms: u64,
+    /// Largest mid move of a pair, in ticks. Positive.
+    pub max_mid_move_ticks: u32,
 }
 
 impl MicroPriceConfig {
-    /// Creates a configuration with a minimum of 100 observations per state and
-    /// a longest gap of one minute.
+    /// Creates a configuration with a minimum of 100 observations per state, a
+    /// longest gap of one minute and a largest mid move of 10 ticks.
     #[must_use]
     pub fn new(tick_size: Decimal, imbalance_buckets: u32, spread_states: u32) -> Self {
         Self {
@@ -198,6 +220,7 @@ impl MicroPriceConfig {
             spread_states,
             min_state_observations: 100,
             max_quote_gap_ms: 60_000,
+            max_mid_move_ticks: 10,
         }
     }
 
@@ -215,17 +238,26 @@ impl MicroPriceConfig {
         self
     }
 
+    /// Sets the largest mid move of a pair, in ticks.
+    #[must_use]
+    pub fn with_max_mid_move_ticks(mut self, ticks: u32) -> Self {
+        self.max_mid_move_ticks = ticks;
+        self
+    }
+
     /// Checks the configuration.
     ///
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a value out of its range
-    /// or more than 256 states.
+    /// an even number of buckets or more than 256 states.
     pub fn validate(&self) -> MMResult<()> {
         let states =
             u64::from(self.imbalance_buckets).saturating_mul(u64::from(self.spread_states));
         if self.tick_size <= Decimal::ZERO
-            || self.imbalance_buckets < 2
+            || self.imbalance_buckets < 3
+            || self.imbalance_buckets.is_multiple_of(2)
+            || self.max_mid_move_ticks == 0
             || self.spread_states == 0
             || self.min_state_observations == 0
             || self.max_quote_gap_ms == 0
@@ -260,37 +292,72 @@ impl MicroPriceConfig {
         ticks.to_i64().or_overflow(what)
     }
 
-    /// Returns the bucket index from 0, and the state index if the spread has one.
-    fn state_of(&self, quote: &TopOfBook) -> MMResult<(usize, Option<usize>)> {
-        let buckets = Decimal::from(self.imbalance_buckets);
-        let scaled = quote
-            .imbalance()?
-            .checked_mul(buckets)
+    /// The bucket from 0 of a book with `lighter <= heavier` on the side `I`
+    /// measures: the smallest `j` with `n · lighter <= j · total`.
+    fn lower_bucket(&self, lighter: Decimal, heavier: Decimal) -> MMResult<u32> {
+        let total = lighter.checked_add(heavier).or_overflow("total size")?;
+        let scaled = lighter
+            .checked_mul(Decimal::from(self.imbalance_buckets))
             .or_overflow("imbalance bucket")?;
-        let bucket = scaled
-            .ceil()
-            .max(Decimal::ONE)
-            .to_u32()
-            .and_then(|b| b.checked_sub(1))
-            .and_then(|b| usize::try_from(b).ok())
+        for j in 1..self.imbalance_buckets {
+            let bound = total
+                .checked_mul(Decimal::from(j))
+                .or_overflow("imbalance bucket")?;
+            if scaled <= bound {
+                return j.checked_sub(1).or_overflow("imbalance bucket");
+            }
+        }
+        self.imbalance_buckets
+            .checked_sub(1)
+            .or_overflow("imbalance bucket")
+    }
+
+    /// Returns the state index, if the spread has one.
+    fn state_of(&self, quote: &TopOfBook) -> MMResult<Option<usize>> {
+        quote.validate()?;
+        let last = self
+            .imbalance_buckets
+            .checked_sub(1)
             .or_overflow("imbalance bucket")?;
+        let bucket = if quote.bid_size <= quote.ask_size {
+            self.lower_bucket(quote.bid_size, quote.ask_size)?
+        } else {
+            last.checked_sub(self.lower_bucket(quote.ask_size, quote.bid_size)?)
+                .or_overflow("imbalance bucket")?
+        };
         let spread = self
             .in_ticks(quote.ask, "ask")?
             .checked_sub(self.in_ticks(quote.bid, "bid")?)
             .or_overflow("spread")?;
         if spread > i64::from(self.spread_states) {
-            return Ok((bucket, None));
+            return Ok(None);
         }
-        let spread_index = usize::try_from(spread)
+        let spread_index = u32::try_from(spread)
             .ok()
             .and_then(|s| s.checked_sub(1))
             .or_overflow("spread")?;
-        let state = usize::try_from(self.imbalance_buckets)
-            .ok()
-            .and_then(|n| spread_index.checked_mul(n))
+        let state = spread_index
+            .checked_mul(self.imbalance_buckets)
             .and_then(|v| v.checked_add(bucket))
+            .and_then(|v| usize::try_from(v).ok())
             .or_overflow("state index")?;
-        Ok((bucket, Some(state)))
+        Ok(Some(state))
+    }
+
+    /// Refuses a quote the estimator cannot use, whatever the reason, as
+    /// [`MMError::InvalidMarketState`].
+    fn usable_state(&self, quote: &TopOfBook) -> MMResult<Option<usize>> {
+        let state = self.state_of(quote).and_then(|state| {
+            quote.mid()?;
+            quote.weighted_mid()?;
+            Ok(state)
+        });
+        state.map_err(|error| {
+            MMError::InvalidMarketState(format!(
+                "unusable quote at {}: {error}",
+                quote.timestamp_ms
+            ))
+        })
     }
 
     /// The state with the imbalance bucket mirrored.
@@ -314,6 +381,7 @@ impl MicroPriceConfig {
 /// gives the same fit as an uninterrupted run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawCalibrator"))]
 pub struct MicroPriceCalibrator {
     config: MicroPriceConfig,
     states: usize,
@@ -359,8 +427,13 @@ impl MicroPriceCalibrator {
     /// quote, or a timestamp that goes back, leaving the calibrator unchanged;
     /// and [`MMError::NumericalError`] on overflow.
     pub fn observe(&mut self, quote: &TopOfBook) -> MMResult<()> {
-        let (_, to) = self.config.state_of(quote)?;
-        let next_half_ticks = self.half_ticks(quote)?;
+        let to = self.config.usable_state(quote)?;
+        let next_half_ticks = self.half_ticks(quote).map_err(|error| {
+            MMError::InvalidMarketState(format!(
+                "unusable quote at {}: {error}",
+                quote.timestamp_ms
+            ))
+        })?;
         if let Some(previous) = self.previous {
             if quote.timestamp_ms < previous.timestamp_ms {
                 return Err(MMError::InvalidMarketState(format!(
@@ -368,13 +441,18 @@ impl MicroPriceCalibrator {
                     quote.timestamp_ms, previous.timestamp_ms
                 )));
             }
-            let (_, from) = self.config.state_of(&previous)?;
+            let from = self.config.state_of(&previous)?;
             let gap = quote.timestamp_ms.saturating_sub(previous.timestamp_ms);
-            let transition = from.zip(to).filter(|_| gap <= self.config.max_quote_gap_ms);
+            let change = next_half_ticks
+                .checked_sub(self.half_ticks(&previous)?)
+                .or_overflow("mid move")?;
+            let largest = i64::from(self.config.max_mid_move_ticks)
+                .checked_mul(2)
+                .or_overflow("largest mid move")?;
+            let transition = from
+                .zip(to)
+                .filter(|_| gap <= self.config.max_quote_gap_ms && change.abs() <= largest);
             if let Some((from, to)) = transition {
-                let change = next_half_ticks
-                    .checked_sub(self.half_ticks(&previous)?)
-                    .or_overflow("mid move")?;
                 self.count(from, to, change)?;
                 let negated = change.checked_neg().or_overflow("mid move")?;
                 self.count(self.config.mirror(from)?, self.config.mirror(to)?, negated)?;
@@ -404,7 +482,8 @@ impl MicroPriceCalibrator {
         self.pairs
     }
 
-    /// Returns the pairs left out for a spread out of range or a gap.
+    /// Returns the pairs left out for a spread out of range, a gap or too
+    /// large a mid move.
     #[must_use]
     pub fn skipped_pairs(&self) -> u64 {
         self.skipped_pairs
@@ -476,6 +555,11 @@ pub struct StateEstimate {
     /// [`StateStatus::NoPriceMove`]; for [`StateStatus::OutsideQuotes`], the
     /// value that was refused.
     pub adjustment: Decimal,
+    /// Probability that the chain from this state reaches a fallback state
+    /// within 10 mid moves. Fallback states absorb the chain with adjustment 0,
+    /// so the higher this is, the more the adjustment is shrunk by them and not
+    /// by evidence. 1 for a fallback state.
+    pub fallback_within_moves: Decimal,
     /// Whether the signal uses the adjustment.
     pub status: StateStatus,
 }
@@ -483,6 +567,7 @@ pub struct StateEstimate {
 /// Fitted adjustments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "RawModel"))]
 pub struct MicroPriceModel {
     config: MicroPriceConfig,
     states: Vec<StateEstimate>,
@@ -533,7 +618,7 @@ impl MicroPriceModel {
     /// quote and [`MMError::NumericalError`] on overflow.
     pub fn signal(&self, quote: &TopOfBook) -> MMResult<MicroPriceSignal> {
         let mid = quote.mid()?;
-        let (_, state) = self.config.state_of(quote)?;
+        let state = self.config.usable_state(quote)?;
         let (adjustment, source) = match state.and_then(|s| self.states.get(s)) {
             None => (Decimal::ZERO, SignalSource::SpreadOutOfRange),
             Some(estimate) => match estimate.status {
@@ -593,7 +678,7 @@ pub struct MicroPriceRecord {
     pub dataset_hash: u128,
     /// Pairs counted, mirrors not included.
     pub pairs: u64,
-    /// Pairs left out for a spread out of range or a gap.
+    /// Pairs left out for a spread out of range, a gap or too large a mid move.
     pub skipped_pairs: u64,
     /// Quotes left out as invalid or off the grid. They are not in the hash.
     pub invalid_quotes: u64,
@@ -756,7 +841,7 @@ pub fn compare_estimators(
     let mut valid = Vec::with_capacity(inside.len());
     let mut invalid_quotes = 0u64;
     for quote in inside {
-        match model.config.state_of(quote) {
+        match model.config.usable_state(quote) {
             Ok(_) => valid.push(*quote),
             Err(MMError::InvalidMarketState(_)) => {
                 invalid_quotes = invalid_quotes.saturating_add(1);
@@ -780,14 +865,21 @@ struct ErrorSums {
 }
 
 impl ErrorSums {
-    fn add(&mut self, future: f64, estimate: f64, side: f64) {
-        let error = future - estimate;
+    /// Adds `future - estimate`, subtracted in `Decimal` so that a high price
+    /// level does not round the error away in `f64`.
+    fn add(&mut self, future: Decimal, estimate: Decimal, side: f64) -> MMResult<()> {
+        let error = to_f64(
+            future
+                .checked_sub(estimate)
+                .or_overflow("estimator error")?,
+        )?;
         self.squared += error * error;
         self.absolute += error.abs();
         if side != 0.0 {
             self.directional += side * error;
             self.directional_samples = self.directional_samples.saturating_add(1);
         }
+        Ok(())
     }
 
     fn finish(&self, samples: u64) -> MMResult<EstimatorError> {
@@ -817,11 +909,18 @@ struct SetSums {
 }
 
 impl SetSums {
-    fn add(&mut self, future: f64, mid: f64, weighted: f64, micro: f64, side: f64) {
+    fn add(
+        &mut self,
+        future: Decimal,
+        mid: Decimal,
+        weighted: Decimal,
+        micro: Decimal,
+        side: f64,
+    ) -> MMResult<()> {
         self.samples = self.samples.saturating_add(1);
-        self.mid.add(future, mid, side);
-        self.weighted.add(future, weighted, side);
-        self.micro.add(future, micro, side);
+        self.mid.add(future, mid, side)?;
+        self.weighted.add(future, weighted, side)?;
+        self.micro.add(future, micro, side)
     }
 
     fn finish(&self) -> MMResult<Option<EstimatorSet>> {
@@ -866,25 +965,22 @@ fn compare_at(
             continue;
         };
         let signal = model.signal(quote)?;
-        let future_mid = to_f64(future.mid()?)?;
-        let mid = to_f64(signal.mid)?;
-        let weighted = to_f64(quote.weighted_mid()?)?;
-        let micro = to_f64(signal.price)?;
-        let half = Decimal::ONE
-            .checked_div(Decimal::TWO)
-            .or_overflow("one half")?;
-        let side = match quote.imbalance()?.cmp(&half) {
+        let future_mid = future.mid()?;
+        let mid = signal.mid;
+        let weighted = quote.weighted_mid()?;
+        let micro = signal.price;
+        let side = match quote.bid_size.cmp(&quote.ask_size) {
             std::cmp::Ordering::Greater => 1.0,
             std::cmp::Ordering::Less => -1.0,
             std::cmp::Ordering::Equal => 0.0,
         };
-        overall.add(future_mid, mid, weighted, micro, side);
+        overall.add(future_mid, mid, weighted, micro, side)?;
         if !matches!(signal.source, SignalSource::MicroPrice) {
             fallback_samples = fallback_samples.saturating_add(1);
         }
-        let (_, state) = model.config.state_of(quote)?;
+        let state = model.config.state_of(quote)?;
         if let Some(cell) = state.and_then(|s| cells.get_mut(s)) {
-            cell.add(future_mid, mid, weighted, micro, side);
+            cell.add(future_mid, mid, weighted, micro, side)?;
         }
     }
     let mut by_state = Vec::new();
@@ -952,7 +1048,8 @@ fn fit_counts(counts: &MicroPriceCalibrator) -> MMResult<MicroPriceFit> {
         ));
     }
 
-    // Solve (1 - Q) [G¹ | B] = [R K | T].
+    // Solve (1 - Q) [G¹ | F | B] = [R K | fallback indicator | T], where F is the
+    // probability of reaching a fallback state before the next mid move.
     let mut system = Vec::with_capacity(states);
     for (x, (q_row, t_row)) in q.iter().zip(&t).enumerate() {
         let mut row: Vec<f64> = q_row
@@ -961,6 +1058,8 @@ fn fit_counts(counts: &MicroPriceCalibrator) -> MMResult<MicroPriceFit> {
             .map(|(y, v)| if x == y { 1.0 - v } else { -v })
             .collect();
         row.push(*expected_move.get(x).or_overflow("state")?);
+        let fallback = *status.get(x).or_overflow("state")? != StateStatus::Calibrated;
+        row.push(if fallback { 1.0 } else { 0.0 });
         row.extend_from_slice(t_row);
         system.push(row);
     }
@@ -970,10 +1069,15 @@ fn fit_counts(counts: &MicroPriceCalibrator) -> MMResult<MicroPriceFit> {
         ));
     }
     let first_column = states;
-    let matrix_start = states.checked_add(1).or_overflow("system width")?;
+    let fallback_column = states.checked_add(1).or_overflow("system width")?;
+    let matrix_start = states.checked_add(2).or_overflow("system width")?;
     let g1: Vec<f64> = system
         .iter()
         .map(|row| row.get(first_column).copied().or_overflow("solution"))
+        .collect::<MMResult<_>>()?;
+    let before_move: Vec<f64> = system
+        .iter()
+        .map(|row| row.get(fallback_column).copied().or_overflow("solution"))
         .collect::<MMResult<_>>()?;
     let b: Vec<&[f64]> = system
         .iter()
@@ -984,22 +1088,24 @@ fn fit_counts(counts: &MicroPriceCalibrator) -> MMResult<MicroPriceFit> {
         return Ok(MicroPriceFit::Insufficient(MicroPriceFailure::NotConverged));
     };
 
+    let fallback_within = fallback_within_moves(&before_move, &b);
     let n = counts.config.imbalance_buckets;
     let half_tick = tick / 2.0;
     let mut estimates = Vec::with_capacity(states);
-    for (x, (((first, star), observed), state_status)) in g1
-        .iter()
-        .zip(&g_star)
-        .zip(&observations)
-        .zip(&status)
-        .enumerate()
-    {
+    for x in 0..states {
         let index = u32::try_from(x).map_err(|_| overflow("state index"))?;
         let bucket = index.checked_rem(n).or_overflow("state bucket")?;
         let spread = index.checked_div(n).or_overflow("state spread")?;
         let spread_ticks = spread.checked_add(1).or_overflow("state spread")?;
-        let first = first * half_tick;
-        let star = star * half_tick;
+        // Rounding must not break the antisymmetry the mirrored data has.
+        let other = counts.config.mirror(x)?;
+        let antisymmetric = |values: &[f64]| -> MMResult<f64> {
+            let own = values.get(x).copied().or_overflow("state")?;
+            let mirrored = values.get(other).copied().or_overflow("state")?;
+            Ok((own - mirrored) / 2.0 * half_tick)
+        };
+        let first = antisymmetric(&g1)?;
+        let star = antisymmetric(&g_star)?;
         let (Some(first_adjustment), Some(adjustment)) =
             (decimal_or_none(first), decimal_or_none(star))
         else {
@@ -1007,24 +1113,27 @@ fn fit_counts(counts: &MicroPriceCalibrator) -> MMResult<MicroPriceFit> {
                 MicroPriceFailure::Unrepresentable,
             ));
         };
+        let share = fallback_within.get(x).copied().or_overflow("state")?;
+        let Some(fallback_within_moves) = decimal_or_none(share.clamp(0.0, 1.0)) else {
+            return Ok(MicroPriceFit::Insufficient(
+                MicroPriceFailure::Unrepresentable,
+            ));
+        };
         // In `Decimal`, the type of the price, so that the signal stays inside
         // the quotes exactly.
-        let half_spread = counts
-            .config
-            .tick_size
-            .checked_mul(Decimal::from(spread_ticks))
-            .and_then(|spread| spread.checked_div(Decimal::TWO))
-            .or_overflow("half spread")?;
+        let half_spread = half_spread_of(&counts.config, spread_ticks)?;
+        let state_status = *status.get(x).or_overflow("state")?;
         let status = match state_status {
             StateStatus::Calibrated if adjustment.abs() > half_spread => StateStatus::OutsideQuotes,
-            other => *other,
+            other => other,
         };
         estimates.push(StateEstimate {
             imbalance_bucket: bucket.checked_add(1).or_overflow("state bucket")?,
             spread_ticks,
-            observations: *observed,
+            observations: *observations.get(x).or_overflow("state")?,
             first_adjustment,
             adjustment,
+            fallback_within_moves,
             status,
         });
     }
@@ -1042,19 +1151,38 @@ fn fit_counts(counts: &MicroPriceCalibrator) -> MMResult<MicroPriceFit> {
     }))
 }
 
-/// Marks and empties the states with no path to a mid move or an absorbing
-/// state, which would make `1 - Q` singular.
+/// Half the spread of a state, in price units.
+fn half_spread_of(config: &MicroPriceConfig, spread_ticks: u32) -> MMResult<Decimal> {
+    config
+        .tick_size
+        .checked_mul(Decimal::from(spread_ticks))
+        .and_then(|spread| spread.checked_div(Decimal::TWO))
+        .or_overflow("half spread")
+}
+
+/// `F + B F + ... ` over 10 mid moves, which stays at 1 on fallback states.
+fn fallback_within_moves(before_move: &[f64], b: &[&[f64]]) -> Vec<f64> {
+    let mut within = before_move.to_vec();
+    for _ in 0..FALLBACK_HORIZON_MOVES {
+        within = b
+            .iter()
+            .zip(before_move)
+            .map(|(row, first)| first + row.iter().zip(&within).map(|(p, v)| p * v).sum::<f64>())
+            .collect();
+    }
+    within
+}
+
+/// Marks and empties the calibrated states with no path to an observed mid
+/// move. Reaching a rare state does not count: it would keep `1 - Q` invertible
+/// with an adjustment of 0 that no observed move supports.
 fn mark_no_price_move(
     q: &mut [Vec<f64>],
     t: &mut [Vec<f64>],
     expected_move: &mut [f64],
     status: &mut [StateStatus],
 ) -> MMResult<()> {
-    let mut exits: Vec<bool> = t
-        .iter()
-        .zip(status.iter())
-        .map(|(row, s)| *s != StateStatus::Calibrated || row.iter().any(|v| *v > 0.0))
-        .collect();
+    let mut exits: Vec<bool> = t.iter().map(|row| row.iter().any(|v| *v > 0.0)).collect();
     loop {
         let mut changed = false;
         for x in 0..exits.len() {
@@ -1077,8 +1205,9 @@ fn mark_no_price_move(
         }
     }
     for (x, exit) in exits.iter().enumerate() {
-        if !exit {
-            *status.get_mut(x).or_overflow("state")? = StateStatus::NoPriceMove;
+        let state = status.get_mut(x).or_overflow("state")?;
+        if !exit && *state == StateStatus::Calibrated {
+            *state = StateStatus::NoPriceMove;
             q.get_mut(x).or_overflow("state")?.fill(0.0);
             t.get_mut(x).or_overflow("state")?.fill(0.0);
             *expected_move.get_mut(x).or_overflow("state")? = 0.0;
@@ -1188,4 +1317,126 @@ fn decimal_or_none(value: f64) -> Option<Decimal> {
     Some(value)
         .filter(|v| v.is_finite())
         .and_then(Decimal::from_f64)
+}
+
+/// Decoded form of [`MicroPriceConfig`], validated before use.
+#[cfg(feature = "serde")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    tick_size: Decimal,
+    imbalance_buckets: u32,
+    spread_states: u32,
+    min_state_observations: u64,
+    max_quote_gap_ms: u64,
+    max_mid_move_ticks: u32,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawConfig> for MicroPriceConfig {
+    type Error = MMError;
+
+    fn try_from(raw: RawConfig) -> MMResult<Self> {
+        let config = Self {
+            tick_size: raw.tick_size,
+            imbalance_buckets: raw.imbalance_buckets,
+            spread_states: raw.spread_states,
+            min_state_observations: raw.min_state_observations,
+            max_quote_gap_ms: raw.max_quote_gap_ms,
+            max_mid_move_ticks: raw.max_mid_move_ticks,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+/// Decoded form of [`MicroPriceCalibrator`], validated before use.
+#[cfg(feature = "serde")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCalibrator {
+    config: MicroPriceConfig,
+    states: usize,
+    stay: Vec<u64>,
+    moved: Vec<u64>,
+    move_half_ticks: Vec<i64>,
+    previous: Option<TopOfBook>,
+    pairs: u64,
+    skipped_pairs: u64,
+    hash: u128,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawCalibrator> for MicroPriceCalibrator {
+    type Error = MMError;
+
+    fn try_from(raw: RawCalibrator) -> MMResult<Self> {
+        let states = raw.config.state_count()?;
+        let cells = states.checked_mul(states).or_overflow("transition cells")?;
+        if raw.states != states
+            || raw.stay.len() != cells
+            || raw.moved.len() != cells
+            || raw.move_half_ticks.len() != states
+        {
+            return Err(MMError::InvalidConfiguration(format!(
+                "calibrator state does not match {states} states"
+            )));
+        }
+        if let Some(previous) = &raw.previous {
+            raw.config.usable_state(previous)?;
+        }
+        Ok(Self {
+            config: raw.config,
+            states,
+            stay: raw.stay,
+            moved: raw.moved,
+            move_half_ticks: raw.move_half_ticks,
+            previous: raw.previous,
+            pairs: raw.pairs,
+            skipped_pairs: raw.skipped_pairs,
+            hash: raw.hash,
+        })
+    }
+}
+
+/// Decoded form of [`MicroPriceModel`], validated before use.
+#[cfg(feature = "serde")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModel {
+    config: MicroPriceConfig,
+    states: Vec<StateEstimate>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawModel> for MicroPriceModel {
+    type Error = MMError;
+
+    fn try_from(raw: RawModel) -> MMResult<Self> {
+        if raw.states.len() != raw.config.state_count()? {
+            return Err(MMError::InvalidConfiguration(format!(
+                "{} states do not match the configuration",
+                raw.states.len()
+            )));
+        }
+        let n = raw.config.imbalance_buckets;
+        for (x, state) in raw.states.iter().enumerate() {
+            let index = u32::try_from(x).map_err(|_| overflow("state index"))?;
+            let bucket = index.checked_rem(n).and_then(|b| b.checked_add(1));
+            let spread = index.checked_div(n).and_then(|s| s.checked_add(1));
+            let half_spread = half_spread_of(&raw.config, state.spread_ticks)?;
+            if bucket != Some(state.imbalance_bucket)
+                || spread != Some(state.spread_ticks)
+                || (state.status == StateStatus::Calibrated && state.adjustment.abs() > half_spread)
+            {
+                return Err(MMError::InvalidConfiguration(format!(
+                    "invalid state {x}: {state:?}"
+                )));
+            }
+        }
+        Ok(Self {
+            config: raw.config,
+            states: raw.states,
+        })
+    }
 }

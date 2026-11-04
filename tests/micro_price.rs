@@ -29,7 +29,7 @@ impl Rng {
 }
 
 fn config() -> MicroPriceConfig {
-    MicroPriceConfig::new(TICK, 2, 1)
+    MicroPriceConfig::new(TICK, 3, 1)
         .with_min_state_observations(1)
         .with_max_quote_gap_ms(GAP_MS)
 }
@@ -93,8 +93,8 @@ fn test_fit_hand_computed_chain_gives_the_closed_form() {
     // T a = (0.1 - 0.3) a, so B a = -0.2 / 0.6 a = -1/3 a, and
     // G* = (1/3) / (1 + 1/3) = 1/4 tick.
     let model = model_of(&hand_fixture(), &config());
-    let (low, high) = (model.states()[0], model.states()[1]);
-    assert_eq!((high.imbalance_bucket, high.spread_ticks), (2, 1));
+    let (low, high) = (model.states()[0], model.states()[2]);
+    assert_eq!((high.imbalance_bucket, high.spread_ticks), (3, 1));
     assert_eq!(high.observations, 10);
     let in_ticks = |v: Decimal| (v / TICK).to_f64().unwrap();
     assert!((in_ticks(high.first_adjustment) - 1.0 / 3.0).abs() < 1e-9);
@@ -166,12 +166,12 @@ fn test_fit_rare_state_is_a_mid_fallback() {
         timestamp_ms: time + 1,
         ..wide
     });
-    let cfg = MicroPriceConfig::new(TICK, 2, 2)
+    let cfg = MicroPriceConfig::new(TICK, 3, 2)
         .with_min_state_observations(3)
         .with_max_quote_gap_ms(GAP_MS);
     let model = model_of(&quotes, &cfg);
-    let rare = model.states()[3];
-    assert_eq!((rare.imbalance_bucket, rare.spread_ticks), (2, 2));
+    let rare = model.states()[5];
+    assert_eq!((rare.imbalance_bucket, rare.spread_ticks), (3, 2));
     assert_eq!(rare.status, StateStatus::Rare);
     assert_eq!(rare.adjustment, dec!(0));
     let signal = model.signal(&wide).unwrap();
@@ -192,13 +192,37 @@ fn test_fit_state_without_moves_is_a_mid_fallback_not_singular() {
         timestamp_ms: time + 1,
         ..wide
     });
-    let cfg = MicroPriceConfig::new(TICK, 2, 2)
+    let cfg = MicroPriceConfig::new(TICK, 3, 2)
         .with_min_state_observations(1)
         .with_max_quote_gap_ms(GAP_MS);
     let model = model_of(&quotes, &cfg);
+    assert_eq!(model.states()[5].status, StateStatus::NoPriceMove);
     assert_eq!(model.states()[3].status, StateStatus::NoPriceMove);
-    assert_eq!(model.states()[2].status, StateStatus::NoPriceMove);
-    assert_eq!(model.states()[1].status, StateStatus::Calibrated);
+    assert_eq!(model.states()[2].status, StateStatus::Calibrated);
+}
+
+#[test]
+fn test_fit_reaching_only_a_rare_state_is_not_calibrated() {
+    // Ten isolated pairs from a one tick to a three tick quote, with the same
+    // mid: no mid move anywhere in the data.
+    let mut quotes = Vec::new();
+    for i in 0..10 {
+        let narrow = quote(i * 3_000, 1000, true);
+        quotes.push(narrow);
+        quotes.push(TopOfBook {
+            timestamp_ms: i * 3_000 + 1,
+            bid: dec!(9.99),
+            ask: dec!(10.02),
+            ..narrow
+        });
+    }
+    let cfg = MicroPriceConfig::new(TICK, 3, 3)
+        .with_min_state_observations(3)
+        .with_max_quote_gap_ms(GAP_MS);
+    assert_eq!(
+        record_of(&quotes, &cfg).fit,
+        MicroPriceFit::Insufficient(MicroPriceFailure::NoCalibratedState)
+    );
 }
 
 #[test]
@@ -251,11 +275,11 @@ fn test_fit_limit_outside_the_quotes_is_a_mid_fallback() {
             time += 2 * GAP_MS;
         }
     }
-    let cfg = MicroPriceConfig::new(TICK, 2, 2)
+    let cfg = MicroPriceConfig::new(TICK, 3, 2)
         .with_min_state_observations(1)
         .with_max_quote_gap_ms(GAP_MS);
     let model = model_of(&quotes, &cfg);
-    let (narrow, broad) = (model.states()[1], model.states()[3]);
+    let (narrow, broad) = (model.states()[2], model.states()[5]);
     assert_eq!(narrow.status, StateStatus::OutsideQuotes, "{narrow:?}");
     assert!(narrow.adjustment.abs() > TICK / dec!(2));
     assert_eq!(broad.status, StateStatus::Calibrated, "{broad:?}");
@@ -318,6 +342,8 @@ fn test_config_invalid_values_are_refused() {
     for bad in [
         MicroPriceConfig::new(dec!(0), 5, 2),
         MicroPriceConfig::new(TICK, 1, 2),
+        MicroPriceConfig::new(TICK, 4, 2),
+        good.with_max_mid_move_ticks(0),
         MicroPriceConfig::new(TICK, 5, 0),
         MicroPriceConfig::new(TICK, 17, 16),
         good.with_min_state_observations(0),
@@ -329,7 +355,7 @@ fn test_config_invalid_values_are_refused() {
 
 #[test]
 fn test_imbalance_extremes_have_buckets() {
-    let cfg = MicroPriceConfig::new(TICK, 4, 1).with_min_state_observations(1);
+    let cfg = MicroPriceConfig::new(TICK, 5, 1).with_min_state_observations(1);
     let model = model_of(&simulated(3, 20_000), &cfg);
     let at = |bid_size, ask_size| TopOfBook {
         bid_size,
@@ -440,8 +466,8 @@ fn test_compare_hand_computed_errors_for_all_estimators() {
         sized(quote(t, 1000, true), dec!(9), dec!(1)),
         // Mid 10.015, weighted and micro 10.0125; low bucket.
         quote(t + 100, 1001, false),
-        // I = 1/2 is in the low bucket and has no side. Mid and weighted
-        // 10.015, micro 10.0125.
+        // I = 1/2 is in the middle bucket, with no data and no side. Mid, weighted
+        // and micro 10.015.
         sized(quote(t + 200, 1001, true), dec!(1), dec!(1)),
         // Two ticks is out of range. Mid and micro 10.03, weighted 10.025.
         TopOfBook {
@@ -455,7 +481,7 @@ fn test_compare_hand_computed_errors_for_all_estimators() {
     let report = compare_estimators(&record, &quotes, &window, &[100]).unwrap();
     let horizon = &report[0];
     assert_eq!((horizon.samples, horizon.unscored_samples), (4, 1));
-    assert_eq!((horizon.fallback_samples, horizon.invalid_quotes), (1, 0));
+    assert_eq!((horizon.fallback_samples, horizon.invalid_quotes), (2, 0));
 
     // future mid - estimator, for samples 0 to 3; sides are +, -, none, -.
     let check = |got: EstimatorError, errors: [f64; 4]| {
@@ -478,7 +504,7 @@ fn test_compare_hand_computed_errors_for_all_estimators() {
     let set = horizon.overall.unwrap();
     check(set.mid, [0.01, 0.0, 0.015, -0.005]);
     check(set.weighted_mid, [0.006, 0.0025, 0.015, 0.0]);
-    check(set.micro_price, [0.0075, 0.0025, 0.0175, -0.005]);
+    check(set.micro_price, [0.0075, 0.0025, 0.015, -0.005]);
 
     // The out of range quote counts only overall.
     let cells: Vec<_> = horizon
@@ -486,7 +512,274 @@ fn test_compare_hand_computed_errors_for_all_estimators() {
         .iter()
         .map(|s| (s.imbalance_bucket, s.spread_ticks, s.samples))
         .collect();
-    assert_eq!(cells, [(1, 1, 2), (2, 1, 1)]);
+    assert_eq!(cells, [(1, 1, 1), (2, 1, 1), (3, 1, 1)]);
+}
+
+#[test]
+fn test_compare_high_price_level_keeps_the_errors() {
+    let record = record_of(&hand_fixture(), &config());
+    let t = TRAIN_END;
+    // At 2e16 an f64 cannot tell these mids apart.
+    let high = |q: TopOfBook| TopOfBook {
+        bid: q.bid + dec!(20000000000000000),
+        ask: q.ask + dec!(20000000000000000),
+        ..q
+    };
+    let quotes = [high(quote(t, 1000, true)), high(quote(t + 100, 1001, true))];
+    let window = TimeWindow::new(t, t + 101).unwrap();
+    let report = compare_estimators(&record, &quotes, &window, &[100]).unwrap();
+    let rmse = report[0].overall.unwrap().mid.rmse.to_f64().unwrap();
+    assert!((rmse - 0.01).abs() < 1e-12, "{rmse}");
+}
+
+#[test]
+fn test_signal_is_antisymmetric_for_all_small_size_pairs() {
+    for buckets in [3, 5, 7, 11] {
+        let cfg = MicroPriceConfig::new(TICK, buckets, 1).with_min_state_observations(1);
+        let model = model_of(&simulated(3, 40_000), &cfg);
+        for bid_size in 0..12u32 {
+            for ask_size in 0..12u32 {
+                if bid_size + ask_size == 0 {
+                    continue;
+                }
+                let at = |bid: u32, ask: u32| TopOfBook {
+                    bid_size: Decimal::from(bid),
+                    ask_size: Decimal::from(ask),
+                    ..quote(1, 1000, true)
+                };
+                let one = model.signal(&at(bid_size, ask_size)).unwrap();
+                let two = model.signal(&at(ask_size, bid_size)).unwrap();
+                assert_eq!(one.adjustment, -two.adjustment, "{bid_size}:{ask_size}");
+                if bid_size == ask_size {
+                    assert_eq!(one.adjustment, dec!(0));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_bucket_boundaries_follow_the_exact_rule() {
+    // n = 3: I <= 1/3 is bucket 1, without rounding 1/3 in a Decimal, and its
+    // mirror I >= 2/3 is bucket 3; anything between is bucket 2.
+    let cfg = MicroPriceConfig::new(TICK, 3, 1).with_min_state_observations(1);
+    let mut quotes = Vec::new();
+    for (i, (bid, ask)) in [(1, 2), (2, 1), (2, 3), (3, 2), (1, 1)].iter().enumerate() {
+        let t = i as u64 * 200_000;
+        for offset in [0, 1] {
+            quotes.push(TopOfBook {
+                bid_size: Decimal::from(*bid),
+                ask_size: Decimal::from(*ask),
+                ..quote(t + offset, 1000, true)
+            });
+        }
+    }
+    let record = record_of(&quotes, &cfg);
+    let MicroPriceFit::Insufficient(failure) = record.fit else {
+        panic!("no mid moves in this data");
+    };
+    assert_eq!(failure, MicroPriceFailure::NoCalibratedState);
+    let mut calibrator = MicroPriceCalibrator::new(cfg).unwrap();
+    for q in &quotes {
+        calibrator.observe(q).unwrap();
+    }
+    // Add one move out of each bucket, so that the table is reported.
+    let mut moving = quotes.clone();
+    for (i, (bid, ask)) in [(1, 2), (2, 3), (2, 1)].iter().enumerate() {
+        let t = 2_000_000 + i as u64 * 200_000;
+        moving.push(TopOfBook {
+            bid_size: Decimal::from(*bid),
+            ask_size: Decimal::from(*ask),
+            ..quote(t, 1000, true)
+        });
+        moving.push(quote(t + 1, 1001, false));
+    }
+    let model = model_of(&moving, &cfg);
+    let observed: Vec<u64> = model.states().iter().map(|s| s.observations).collect();
+    // Unmoved pairs from 1:2 and 2:1, mirrored, give 2 each in buckets 1 and 3;
+    // from 2:3, 3:2 and 1:1, mirrored, 6 in bucket 2. The moves add 2, 2 and 2.
+    assert_eq!(observed, [4, 8, 4]);
+}
+
+#[test]
+fn test_fit_large_move_pair_is_left_out_and_counted() {
+    let clean = simulated(6, 20_000);
+    let mut printed = clean.clone();
+    printed[10_000].bid += dec!(1000);
+    printed[10_000].ask += dec!(1000);
+    let cfg = MicroPriceConfig::new(TICK, 5, 2);
+    let (a, b) = (record_of(&clean, &cfg), record_of(&printed, &cfg));
+    assert_eq!(b.skipped_pairs, a.skipped_pairs + 2);
+    let diff =
+        a.model().unwrap().states()[0].adjustment - b.model().unwrap().states()[0].adjustment;
+    assert!(diff.abs() < dec!(0.001), "{diff}");
+    assert_ne!(a.dataset_hash, b.dataset_hash);
+}
+
+#[test]
+fn test_calibrate_unrepresentable_quotes_are_counted_not_fatal() {
+    let good = quote(1, 1000, true);
+    let bad = [
+        TopOfBook {
+            ask: Decimal::MAX,
+            ..good
+        },
+        TopOfBook {
+            bid: dec!(1E28),
+            ask: dec!(1.1E28),
+            ..good
+        },
+        TopOfBook {
+            bid: dec!(1E17),
+            ask: dec!(1E17) + TICK,
+            ..good
+        },
+        TopOfBook {
+            bid_size: Decimal::MAX,
+            ask_size: Decimal::MAX,
+            ..good
+        },
+    ];
+    let mut quotes = bad.to_vec();
+    quotes.extend(hand_fixture().iter().map(|q| TopOfBook {
+        timestamp_ms: q.timestamp_ms + 2,
+        ..*q
+    }));
+    let record = record_of(&quotes, &config());
+    assert_eq!(record.invalid_quotes, 4);
+    assert!(record.model().is_some());
+
+    let t = TRAIN_END;
+    let mut test: Vec<_> = bad
+        .iter()
+        .map(|q| TopOfBook {
+            timestamp_ms: t,
+            ..*q
+        })
+        .collect();
+    test.push(quote(t, 1000, true));
+    test.push(quote(t + 100, 1000, true));
+    let window = TimeWindow::new(t, t + 1_000).unwrap();
+    let report = compare_estimators(&record, &test, &window, &[50]).unwrap();
+    assert_eq!((report[0].invalid_quotes, report[0].samples), (4, 2));
+}
+
+#[test]
+fn test_fallback_within_moves_reports_absorption() {
+    let model = model_of(&hand_fixture(), &config());
+    assert_eq!(model.states()[2].fallback_within_moves, dec!(0));
+    // The middle bucket has no data, so it is a fallback.
+    assert_eq!(model.states()[1].fallback_within_moves, dec!(1));
+
+    // The high state also goes to a rare middle state, one pair in eleven.
+    let mut quotes = hand_fixture();
+    let time = quotes.last().unwrap().timestamp_ms + 2 * GAP_MS;
+    quotes.push(quote(time, 1000, true));
+    quotes.push(TopOfBook {
+        bid_size: dec!(1),
+        ask_size: dec!(1),
+        ..quote(time + 1, 1000, true)
+    });
+    let model = model_of(&quotes, &config().with_min_state_observations(3));
+    let high = model.states()[2];
+    assert_eq!(high.status, StateStatus::Calibrated);
+    assert_eq!(model.states()[1].status, StateStatus::Rare);
+    assert!(high.fallback_within_moves > dec!(0.1), "{high:?}");
+    assert!(high.fallback_within_moves < dec!(1), "{high:?}");
+}
+
+#[test]
+fn test_half_spread_boundary_stays_calibrated() {
+    // In eighths, so that f64 is exact: stay 5, to L unmoved 1, up a tick to L 1
+    // and to H 1. T cancels on the antisymmetric vector, so G* = G¹ =
+    // (1/4) / (1 - (5/8 - 1/8)) = half a tick, still inside the quote.
+    let model = model_of(
+        &pairs_from_high(&[(5, 0, true), (1, 0, false), (1, 1, false), (1, 1, true)]),
+        &config(),
+    );
+    let high = model.states()[2];
+    assert_eq!(high.adjustment, TICK / dec!(2));
+    assert_eq!(high.status, StateStatus::Calibrated);
+}
+
+#[test]
+fn test_dataset_hash_covers_every_field_of_a_quote() {
+    let quotes = hand_fixture();
+    let base = record_of(&quotes, &config()).dataset_hash;
+    let edits: [fn(&mut TopOfBook); 5] = [
+        |q| q.timestamp_ms += 1,
+        |q| q.bid -= TICK,
+        |q| q.ask += TICK,
+        |q| q.bid_size += dec!(1),
+        |q| q.ask_size += dec!(1),
+    ];
+    for (i, edit) in edits.iter().enumerate() {
+        let mut changed = quotes.clone();
+        edit(&mut changed[0]);
+        assert_ne!(
+            record_of(&changed, &config()).dataset_hash,
+            base,
+            "field {i}"
+        );
+    }
+}
+
+#[test]
+fn test_skipped_pairs_counts_gap_and_spread() {
+    let wide = TopOfBook {
+        ask: dec!(10.05),
+        ..quote(10, 1000, true)
+    };
+    let quotes = [
+        quote(0, 1000, true),
+        wide,
+        quote(20, 1000, true),
+        quote(20 + GAP_MS + 1, 1000, true),
+        quote(20 + GAP_MS + 2, 1000, true),
+    ];
+    let record = record_of(&quotes, &config());
+    assert_eq!((record.pairs, record.skipped_pairs), (1, 3));
+}
+
+#[test]
+fn test_compare_horizon_at_the_window_end_is_unscored() {
+    let record = record_of(&hand_fixture(), &config());
+    let t = TRAIN_END;
+    let window = TimeWindow::new(t, t + 100).unwrap();
+    let report = compare_estimators(&record, &[quote(t, 1000, true)], &window, &[100]).unwrap();
+    assert_eq!((report[0].samples, report[0].unscored_samples), (0, 1));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_decode_invalid_state_is_refused() {
+    let calibrator = MicroPriceCalibrator::new(config()).unwrap();
+    let json = serde_json::to_string(&calibrator).unwrap();
+    assert!(serde_json::from_str::<MicroPriceCalibrator>(&json).is_ok());
+    for (from, to) in [
+        ("\"states\":3", "\"states\":4000000000000000000"),
+        ("\"states\":3", "\"states\":2"),
+        ("\"tick_size\":\"0.01\"", "\"tick_size\":\"0\""),
+        ("\"tick_size\":\"0.01\"", "\"tick_size\":\"-0.01\""),
+        ("\"move_half_ticks\":[0,", "\"move_half_ticks\":["),
+    ] {
+        assert!(json.contains(from), "{from}");
+        let bad = json.replace(from, to);
+        assert!(
+            serde_json::from_str::<MicroPriceCalibrator>(&bad).is_err(),
+            "{to}"
+        );
+    }
+
+    let model = model_of(&hand_fixture(), &config());
+    let json = serde_json::to_string(&model).unwrap();
+    assert_eq!(
+        serde_json::from_str::<MicroPriceModel>(&json).unwrap(),
+        model
+    );
+    let adjustment = model.states()[2].adjustment.to_string();
+    let bad = json.replace(&adjustment, "1000");
+    assert!(serde_json::from_str::<MicroPriceModel>(&bad).is_err());
 }
 
 #[test]
