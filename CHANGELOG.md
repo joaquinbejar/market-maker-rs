@@ -205,6 +205,13 @@ project follows [Semantic Versioning](https://semver.org/).
 These signature changes are breaking and ship in 0.7.0, not in a patch
 release.
 
+- `ChainMarketMaker::generate_quote` and `refresh_all_quotes` enforce the chain
+  risk status: while `RiskStatus::can_quote` is false they refuse with the new
+  `MMError::QuotingHalted`, before anything is valued, and when the status
+  cannot be computed they return its error. This is a behaviour change, with
+  the signatures unchanged: a breached limit or a failed booking stops quotes
+  until it clears, and a delta above `delta_hedge_threshold` stops them until
+  the caller hedges (#182).
 - `OptionsAdapter::time_to_terminal_ms` returns `MMResult<u64>`: a failed
   conversion to years is an error, not 0, which reads as already expired.
 - Checked arithmetic in the legacy options and chain files (#166). These now
@@ -253,8 +260,7 @@ release.
     `update_greeks` does not clear it;
   - `ChainMarketMaker::check_chain_risk` returns `MMResult<RiskStatus>`, which
     is `Breached` while a fill is missing, so `can_quote` is false, and
-    `calculate_hedge` `MMResult<Vec<HedgeOrder>>`. The quoting methods do not
-    call it, so stopping is up to the caller;
+    `calculate_hedge` `MMResult<Vec<HedgeOrder>>`;
   - both managers gain `has_unbooked_fill`, and `GreeksRiskManager` gains
     `reconcile` as well, which installs recomputed Greeks and reruns the
     breaker. A later fill that books, or a successful retry, does not clear

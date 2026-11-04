@@ -57,6 +57,7 @@ pub fn quote_error_code(error: &MMError) -> ErrCode {
         MMError::FillNotBooked(_) => 12,
         MMError::FillBookedCheckFailed(_) => 13,
         MMError::GreeksMissFill => 14,
+        MMError::QuotingHalted(_) => 15,
     })
 }
 
