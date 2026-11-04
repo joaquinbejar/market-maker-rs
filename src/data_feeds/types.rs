@@ -361,9 +361,16 @@ impl MarketSnapshot {
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();
         if mid > Decimal::ZERO {
-            self.spread()
+            let spread = self.spread();
+            // An overflow is an extreme spread, never a zero one.
+            let bound = if spread < Decimal::ZERO {
+                Decimal::MIN
+            } else {
+                Decimal::MAX
+            };
+            spread
                 .checked_div(mid)
-                .unwrap_or(Decimal::ZERO)
+                .unwrap_or(bound)
                 .saturating_mul(Decimal::from(10000))
         } else {
             Decimal::ZERO

@@ -628,7 +628,7 @@ impl OrderIntensityCalibrator {
 
         for obs in &valid_obs {
             x_values.push(obs.spread_bps);
-            y_values.push(decimal_ln(obs.fill_rate).unwrap_or(Decimal::ZERO));
+            y_values.push(decimal_ln(obs.fill_rate)?);
             weights.push(Decimal::from(obs.count));
         }
 
