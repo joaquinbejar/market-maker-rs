@@ -46,11 +46,7 @@ impl UnifiedGreeks {
     /// Returns the absolute dollar delta.
     #[must_use]
     pub fn abs_dollar_delta(&self) -> Decimal {
-        if self.total_dollar_delta < Decimal::ZERO {
-            -self.total_dollar_delta
-        } else {
-            self.total_dollar_delta
-        }
+        self.total_dollar_delta.abs()
     }
 }
 
@@ -105,16 +101,24 @@ impl UnifiedRisk {
     }
 
     /// Returns the total P&L.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn total_pnl(&self) -> Decimal {
-        self.total_unrealized_pnl + self.total_realized_pnl
+        self.total_unrealized_pnl
+            .saturating_add(self.total_realized_pnl)
     }
 
     /// Returns the capital utilization percentage.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn capital_utilization(&self) -> Decimal {
         if self.total_capital > Decimal::ZERO {
-            self.total_position_value / self.total_capital * Decimal::from(100)
+            self.total_position_value
+                .checked_div(self.total_capital)
+                .unwrap_or(Decimal::MAX)
+                .saturating_mul(Decimal::ONE_HUNDRED)
         } else {
             Decimal::ZERO
         }

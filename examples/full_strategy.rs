@@ -66,7 +66,7 @@ fn main() {
 
     // Step 5: Simulate market activity - Buy at ask
     println!("=== Trade 1: Buy 10 units at ${:.2} ===", ask);
-    inventory.update_fill(dec!(10.0), ask, 1000);
+    inventory.update_fill(dec!(10.0), ask, 1000).unwrap();
     pnl.set_unrealized(inventory.unrealized_pnl(market_state.mid_price));
 
     println!("Position after trade:");
@@ -129,7 +129,7 @@ fn main() {
 
     // Calculate realized PnL for this trade
     let realized_pnl_trade = dec!(-5.0) * (bid_new - inventory.avg_entry_price);
-    inventory.update_fill(dec!(-5.0), bid_new, 2000);
+    inventory.update_fill(dec!(-5.0), bid_new, 2000).unwrap();
     pnl.add_realized(realized_pnl_trade);
     pnl.set_unrealized(inventory.unrealized_pnl(market_state.mid_price));
 
@@ -157,7 +157,9 @@ fn main() {
     );
 
     let final_realized = inventory.quantity * (bid_final - inventory.avg_entry_price);
-    inventory.update_fill(-inventory.quantity, bid_final, 3000);
+    inventory
+        .update_fill(-inventory.quantity, bid_final, 3000)
+        .unwrap();
     pnl.add_realized(final_realized);
     pnl.set_unrealized(Decimal::ZERO);
 

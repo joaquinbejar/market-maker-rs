@@ -1289,7 +1289,11 @@ fn validate_invariants<const ORD: usize, const MSG: usize, const DLV: usize, con
 ///   the end and bounded by the messages and rows;
 /// - at a decision every venue message and delivery due by `now_ns` was
 ///   applied, and every scheduled time is within the largest delay of it.
-#[allow(clippy::too_many_lines)] // One linear list of relations.
+#[allow(clippy::too_many_lines)]
+// One linear list of relations.
+// Every operand is a `u64` widened to `u128`; at most three are summed or
+// one is multiplied by 4, which stays far below `u128::MAX`.
+#[allow(clippy::arithmetic_side_effects)]
 fn validate_counters<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
     s: &KernelState<ORD, MSG, DLV, OBS>,
     k: &FinancialKernel<'_, ORD, MSG, DLV, OBS>,
@@ -1431,20 +1435,30 @@ fn validate_ledger<const ORD: usize, const MSG: usize, const DLV: usize, const O
         .fee_scale()
         .and_then(|f| u128::try_from(f).ok())
         .ok_or_else(|| err("fee scale"))?;
-    let unit = u128::from(cfg.tick.mantissa) * u128::from(cfg.lot.mantissa);
-    let per_fill = u128::from(cfg.p) * u128::from(cfg.q) * unit;
+    // An upper bound that saturates at `u128::MAX` is still an upper bound;
+    // a lower bound that overflows exceeds every value, so it rejects.
+    let bound = |factors: &[u128]| factors.iter().fold(1u128, |acc, &x| acc.saturating_mul(x));
+    let floor = |factors: &[u128], what: &str| {
+        factors
+            .iter()
+            .try_fold(1u128, |acc, &x| acc.checked_mul(x))
+            .ok_or_else(|| err(what))
+    };
+    let unit = [u128::from(cfg.tick.mantissa), u128::from(cfg.lot.mantissa)];
+    let per_fill = bound(&[u128::from(cfg.p), u128::from(cfg.q), bound(&unit)]);
     let r = cfg.rate_num.unsigned_abs();
     check(
-        v.cash_u.unsigned_abs() <= fills * per_fill * f,
+        v.cash_u.unsigned_abs() <= bound(&[fills, per_fill, f]),
         "cash beyond the fills' notional",
     )?;
     let fees = v.fixed_fees_u;
     check(
-        fees.unsigned_abs() <= fills * per_fill * r,
+        fees.unsigned_abs() <= bound(&[fills, per_fill, r]),
         "fees beyond the fills' largest fees",
     )?;
+    let [tick, lot] = unit;
     check(
-        fees.unsigned_abs() >= fills * unit * r,
+        fees.unsigned_abs() >= floor(&[fills, tick, lot, r], "fee floor overflows")?,
         "fees below the fills' smallest fees",
     )?;
     let sign_ok = match cfg.rate_num.signum() {
@@ -1453,7 +1467,7 @@ fn validate_ledger<const ORD: usize, const MSG: usize, const DLV: usize, const O
         _ => fees <= 0,
     };
     check(sign_ok, "fees with the wrong sign for the fee rate")?;
-    let lots = u128::from(cfg.q) * fills;
+    let lots = bound(&[u128::from(cfg.q), fills]);
     check(
         u128::from(s.gate.venue_pos_lots.unsigned_abs()) <= lots
             && u128::from(v.max_abs_pos) <= lots,

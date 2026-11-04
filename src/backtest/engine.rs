@@ -79,6 +79,7 @@ use crate::risk::pretrade::{
 };
 use crate::strategy::quote::Quote;
 use crate::types::action::Dir;
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal_macros::dec;
 
@@ -166,17 +167,20 @@ impl SimulatedFill {
 
     /// Change of the base asset held: the signed quantity minus the base
     /// fee (a buy receives `quantity - base_fee`, a sell delivers
-    /// `quantity + base_fee`). Saturates instead of overflowing.
+    /// `quantity + base_fee`).
     ///
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`] if the side is neither buy
-    /// nor sell.
+    /// nor sell, or [`MMError::NumericalError`] if the delta overflows.
     pub fn base_delta(&self) -> MMResult<Decimal> {
-        Ok(match Dir::try_from(self.side)? {
-            Dir::Buy => self.quantity.saturating_sub(self.base_fee),
-            Dir::Sell => -self.quantity.saturating_add(self.base_fee),
-        })
+        let delta = match Dir::try_from(self.side)? {
+            Dir::Buy => self.quantity.checked_sub(self.base_fee),
+            Dir::Sell => Decimal::ZERO
+                .checked_sub(self.quantity)
+                .and_then(|q| q.checked_sub(self.base_fee)),
+        };
+        delta.or_overflow("fill base delta")
     }
 
     /// Sets the engine execution id.
@@ -192,6 +196,15 @@ impl SimulatedFill {
     pub fn notional(&self) -> Decimal {
         self.price.saturating_mul(self.quantity)
     }
+}
+
+/// A fill's built in bookkeeping, validated before the engine applies it.
+#[derive(Debug, Clone)]
+struct Booking {
+    position: InventoryPosition,
+    cash_flow: Decimal,
+    base_fee_quantity: Decimal,
+    fixed_fees: Decimal,
 }
 
 /// Slippage model for simulating execution costs.
@@ -588,13 +601,20 @@ pub struct AccountingStatus {
     /// [`SimulatedFill::execution_id`] (see
     /// [`BacktestResult::refused_trades`]).
     pub refused_executions: Vec<u64>,
+    /// Execution ids after whose post the accountant's snapshot failed, in
+    /// venue order (`0` for the snapshot taken when the accountant was
+    /// selected or reset). The engine then kept its previous balances, so
+    /// they may be stale.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub snapshot_failures: Vec<u64>,
 }
 
 impl AccountingStatus {
-    /// Returns `true` if the accountant booked every venue fill.
+    /// Returns `true` if the accountant booked every venue fill and every
+    /// snapshot of it succeeded.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
-        self.refused_executions.is_empty()
+        self.refused_executions.is_empty() && self.snapshot_failures.is_empty()
     }
 }
 
@@ -792,6 +812,8 @@ pub struct BacktestEngine<
     /// Selected accountant; `None` keeps the built in bookkeeping.
     accountant: Option<Box<dyn FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe>>,
     accounting_errors: Vec<(u64, MMError)>,
+    /// Execution ids after which the accountant's snapshot failed.
+    snapshot_failures: Vec<u64>,
     next_execution_id: u64,
     /// Pretrade policy every new order passes before submission.
     policy: Option<Box<dyn PretradePolicy + Send + Sync + UnwindSafe + RefUnwindSafe>>,
@@ -914,6 +936,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             last_observed_at: 0,
             accountant: None,
             accounting_errors: Vec::new(),
+            snapshot_failures: Vec::new(),
             next_execution_id: 1,
             policy: None,
             pretrade_log: Vec::new(),
@@ -1029,6 +1052,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             accounting: AccountingStatus {
                 accountant: self.accountant_description(),
                 refused_executions: self.accounting_errors.iter().map(|(id, _)| *id).collect(),
+                snapshot_failures: self.snapshot_failures.clone(),
             },
         }
     }
@@ -1156,21 +1180,35 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                         continue;
                     }
                 };
+            // Reports and result metrics carry the fee valued in quote.
+            let fee = charge.quote_value;
+            let mut fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
+                .with_execution_id(self.next_execution_id);
+            if charge.asset == FeeAsset::Base {
+                fill.base_fee = charge.amount;
+            }
+            // The built in bookkeeping is validated before anything is
+            // mutated: a booking that overflows is a fault that leaves the
+            // order, the policy and the engine unchanged.
+            let booking = if self.accountant.is_some() {
+                None
+            } else {
+                match self.plan_booking(&fill, dir, &charge) {
+                    Ok(booking) => Some(booking),
+                    Err(error) => {
+                        self.record_fault(error);
+                        continue;
+                    }
+                }
+            };
             let Some(order) = self.orders.get_mut(index) else {
                 continue;
             };
             if order.apply_fill(quantity).is_err() {
                 continue;
             }
-            // Reports and result metrics carry the fee valued in quote.
-            let fee = charge.quote_value;
             let stamp = self.clock.stamp();
             let report = ExecutionReport::fill(stamp, order, price, quantity, fee);
-            let mut fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
-                .with_execution_id(self.next_execution_id);
-            if charge.asset == FeeAsset::Base {
-                fill.base_fee = charge.amount;
-            }
             let (order_id, cumulative) = (order.id, order.filled);
             // The policy books the fill first so a ledger it owns is up to
             // date when the accountant reads it.
@@ -1185,7 +1223,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 fee_asset: charge.asset.clone(),
                 timestamp: now,
             });
-            self.process_fill(fill.clone(), dir, order_id, cumulative, charge);
+            self.process_fill(fill.clone(), booking, order_id, cumulative, charge);
             self.queue_delivery(report, Some((dir, fill)));
         }
         let targets = &self.cancel_targets;
@@ -1388,10 +1426,15 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.strategy.on_execution_report(&delivery.report);
         if let Some((_, fill)) = delivery.fill {
             // The fill was produced by the engine, so its side is buy or
-            // sell; an error leaves the known position unchanged.
-            if let Ok(base_delta) = fill.base_delta() {
-                self.agent_position
-                    .update_fill(base_delta, fill.price, fill.timestamp);
+            // sell, and a base delta error was already recorded when the
+            // venue applied it. A position overflow leaves the known
+            // position unchanged and is recorded as a fault.
+            if let Ok(base_delta) = fill.base_delta()
+                && let Err(error) =
+                    self.agent_position
+                        .update_fill(base_delta, fill.price, fill.timestamp)
+            {
+                self.record_fault(error);
             }
             self.strategy.on_fill(&fill);
         }
@@ -1459,7 +1502,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     fn process_fill(
         &mut self,
         fill: SimulatedFill,
-        dir: Dir,
+        booking: Option<Booking>,
         order_id: SimOrderId,
         cumulative: Decimal,
         charge: FeeCharge,
@@ -1481,41 +1524,80 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             if let Err(error) = accountant.post_fill(&posted) {
                 self.accounting_errors.push((execution_id, error));
             }
-            self.sync_accounting(fill.timestamp);
+            self.sync_accounting(fill.timestamp, execution_id);
             self.track_fill(fill);
             return;
         }
 
-        // Update position: the net base held (base fees deducted).
-        let base_delta = match fill.base_delta() {
-            Ok(delta) => delta,
-            Err(error) => {
-                self.record_fault(error);
-                return;
-            }
+        // Validated by `plan_booking` before the order was filled.
+        let Some(booking) = booking else {
+            self.record_fault(MMError::InvalidMarketState(format!(
+                "fill {execution_id} reached the built in bookkeeping without a booking"
+            )));
+            return;
         };
-        self.position
-            .update_fill(base_delta, fill.price, fill.timestamp);
-
-        // Update realized PnL for closing trades
-        // Simplified: just track the cash flow
-        let cash_flow = match dir {
-            Dir::Buy => -fill.notional(),
-            Dir::Sell => fill.notional(),
-        };
-        self.pnl.add_realized(cash_flow);
-
-        // Track fees: base fees are kept in base units and marked.
-        match charge.asset {
-            FeeAsset::Base => {
-                self.base_fee_quantity = self.base_fee_quantity.saturating_add(charge.amount);
-            }
-            FeeAsset::Quote | FeeAsset::Other(_) => {
-                self.fixed_fees = self.fixed_fees.saturating_add(charge.quote_value);
-            }
-        }
+        self.position = booking.position;
+        self.pnl.add_realized(booking.cash_flow);
+        self.base_fee_quantity = booking.base_fee_quantity;
+        self.fixed_fees = booking.fixed_fees;
         self.mark_to(fill.price);
         self.track_fill(fill);
+    }
+
+    /// The built in bookkeeping of one fill, computed without mutating the
+    /// engine: the position after it (base fees deducted), the cash flow
+    /// (negative for a buy) and the fee totals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the position, the notional,
+    /// the realized PnL or a fee total overflows.
+    fn plan_booking(
+        &self,
+        fill: &SimulatedFill,
+        dir: Dir,
+        charge: &FeeCharge,
+    ) -> MMResult<Booking> {
+        let base_delta = fill.base_delta()?;
+        let mut position = self.position.clone();
+        position.update_fill(base_delta, fill.price, fill.timestamp)?;
+
+        // Simplified realized PnL: the cash flow of the fill.
+        let notional = fill
+            .price
+            .checked_mul(fill.quantity)
+            .or_overflow("fill notional")?;
+        let cash_flow = match dir {
+            Dir::Buy => Decimal::ZERO.checked_sub(notional),
+            Dir::Sell => Some(notional),
+        }
+        .or_overflow("fill cash flow")?;
+        self.pnl
+            .realized
+            .checked_add(cash_flow)
+            .or_overflow("realized pnl")?;
+
+        // Base fees are kept in base units and marked.
+        let (base_fee_quantity, fixed_fees) = match charge.asset {
+            FeeAsset::Base => (
+                self.base_fee_quantity
+                    .checked_add(charge.amount)
+                    .or_overflow("base fee total")?,
+                self.fixed_fees,
+            ),
+            FeeAsset::Quote | FeeAsset::Other(_) => (
+                self.base_fee_quantity,
+                self.fixed_fees
+                    .checked_add(charge.quote_value)
+                    .or_overflow("fee total")?,
+            ),
+        };
+        Ok(Booking {
+            position,
+            cash_flow,
+            base_fee_quantity,
+            fixed_fees,
+        })
     }
 
     /// Updates the position high water mark and records the trade.
@@ -1600,13 +1682,16 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         accountant: impl FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
     ) -> Self {
         self.accountant = Some(Box::new(accountant));
-        self.sync_accounting(0);
+        self.sync_accounting(0, 0);
         self
     }
 
     /// Snapshot of the selected accountant, if one was selected.
+    ///
+    /// The inner result is the accountant's: an error if a sum over its
+    /// bookings overflows.
     #[must_use]
-    pub fn accounting_snapshot(&self) -> Option<AccountingSnapshot> {
+    pub fn accounting_snapshot(&self) -> Option<MMResult<AccountingSnapshot>> {
         self.accountant.as_ref().map(|a| a.snapshot())
     }
 
@@ -1705,6 +1790,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             accountant.reset();
         }
         self.accounting_errors.clear();
+        self.snapshot_failures.clear();
         self.next_execution_id = 1;
         if let Some(policy) = self.policy.as_mut() {
             policy.reset();
@@ -1713,17 +1799,25 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.faults.clear();
         self.fault_count = 0;
         self.reports.clear();
-        self.sync_accounting(0);
+        self.sync_accounting(0, 0);
     }
 
     /// Copies the selected accountant's state into the engine's position,
     /// PnL and fee fields, so runs start from the accountant's initial
-    /// state (also with no fills at all).
-    fn sync_accounting(&mut self, timestamp: u64) {
+    /// state (also with no fills at all). A snapshot that fails is
+    /// recorded as a fault and leaves those fields unchanged.
+    fn sync_accounting(&mut self, timestamp: u64, execution_id: u64) {
         let Some(accountant) = self.accountant.as_ref() else {
             return;
         };
-        let snapshot = accountant.snapshot();
+        let snapshot = match accountant.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.snapshot_failures.push(execution_id);
+                self.record_fault(error);
+                return;
+            }
+        };
         self.position.quantity = snapshot.position;
         self.position.avg_entry_price = snapshot.average_entry_price.unwrap_or(Decimal::ZERO);
         self.position.last_update = timestamp;
@@ -1864,6 +1958,20 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_base_delta_overflow_returns_numerical_error() {
+        let mut fill = SimulatedFill::new(Action::Sell, dec!(1), Decimal::MAX, 0);
+        fill.base_fee = dec!(1);
+        let result = fill.base_delta();
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        let mut fill = SimulatedFill::new(Action::Buy, dec!(1), Decimal::MIN, 0);
+        fill.base_fee = dec!(1);
+        assert!(matches!(fill.base_delta(), Err(MMError::NumericalError(_))));
+    }
 
     #[test]
     fn test_sharpe_ratio_overflowing_return_is_none() {
@@ -3113,8 +3221,8 @@ mod tests {
             self.snapshot.fills_posted += 1;
             Ok(())
         }
-        fn snapshot(&self) -> AccountingSnapshot {
-            self.snapshot.clone()
+        fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+            Ok(self.snapshot.clone())
         }
         fn reset(&mut self) {
             self.log.lock().unwrap().clear();
@@ -3185,7 +3293,7 @@ mod tests {
         assert_eq!(selected.total_pnl, builtin.total_pnl);
         assert_eq!(selected.net_pnl, builtin.net_pnl);
         assert_eq!(selected.max_position, builtin.max_position);
-        let snapshot = engine.accounting_snapshot().unwrap();
+        let snapshot = engine.accounting_snapshot().unwrap().unwrap();
         assert_eq!(snapshot.fills_posted, 3);
         assert_eq!(snapshot.cash_flow, dec!(-200));
         assert_eq!(snapshot.fees, dec!(0.2));
@@ -3247,7 +3355,7 @@ mod tests {
                 }
                 self.0.post_fill(fill)
             }
-            fn snapshot(&self) -> AccountingSnapshot {
+            fn snapshot(&self) -> MMResult<AccountingSnapshot> {
                 self.0.snapshot()
             }
             fn reset(&mut self) {
@@ -3264,6 +3372,65 @@ mod tests {
         let second = engine.run();
         assert_eq!(second.accounting, first.accounting);
         assert_eq!(second.refused_trades().count(), 1);
+    }
+
+    #[test]
+    fn test_failed_accounting_snapshot_is_recorded_as_fault() {
+        #[derive(Debug, Default)]
+        struct FailingSnapshot;
+        impl FillAccountant for FailingSnapshot {
+            fn post_fill(&mut self, _fill: &AccountingFill) -> MMResult<()> {
+                Ok(())
+            }
+            fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+                Err(MMError::NumericalError(
+                    "ledger cash flow overflows".to_string(),
+                ))
+            }
+            fn reset(&mut self) {}
+        }
+        let mut engine = queued_engine_with_fees().with_accountant(FailingSnapshot);
+        assert_eq!(engine.fault_count(), 1);
+        assert!(matches!(
+            engine.faults().first(),
+            Some(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            engine.accounting_snapshot(),
+            Some(Err(MMError::NumericalError(_)))
+        ));
+        let result = engine.run();
+        assert_eq!(result.accounting.snapshot_failures.first(), Some(&0));
+        assert!(!result.accounting.is_consistent());
+    }
+
+    #[test]
+    fn test_snapshot_failure_after_a_booked_fill_is_inconsistent() {
+        // Books every fill, but its snapshot fails once anything is booked.
+        #[derive(Debug, Default)]
+        struct FailAfterFirst(RecordingAccountant);
+        impl FillAccountant for FailAfterFirst {
+            fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
+                self.0.post_fill(fill)
+            }
+            fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+                let snapshot = self.0.snapshot()?;
+                if snapshot.fills_posted > 0 {
+                    return Err(MMError::NumericalError(
+                        "ledger cash flow overflows".to_string(),
+                    ));
+                }
+                Ok(snapshot)
+            }
+            fn reset(&mut self) {
+                self.0.reset();
+            }
+        }
+        let mut engine = queued_engine_with_fees().with_accountant(FailAfterFirst::default());
+        let result = engine.run();
+        assert!(result.accounting.refused_executions.is_empty());
+        assert_eq!(result.accounting.snapshot_failures.first(), Some(&1));
+        assert!(!result.accounting.is_consistent());
     }
 
     #[test]
@@ -3307,7 +3474,7 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
         assert_eq!(
             engine.accounting_snapshot(),
-            Some(AccountingSnapshot::default())
+            Some(Ok(AccountingSnapshot::default()))
         );
         let second = engine.run();
         assert_eq!(*log.lock().unwrap(), first_log);
@@ -3348,7 +3515,7 @@ mod tests {
             assert_eq!(result.final_position, builtin.final_position);
             assert_eq!(result.total_fees, dec!(0.2));
             assert_eq!(result.net_pnl, builtin.net_pnl);
-            let snapshot = engine.accounting_snapshot().unwrap();
+            let snapshot = engine.accounting_snapshot().unwrap().unwrap();
             assert_eq!(snapshot.cash_flow, dec!(-200));
             assert_eq!(snapshot.average_entry_price, Some(dec!(100)));
             assert_eq!(snapshot.fills_posted, 3);
@@ -3377,7 +3544,7 @@ mod tests {
                 })
             );
             assert!(acc.ledger().journal().is_empty());
-            assert_eq!(acc.snapshot().fills_posted, 0);
+            assert_eq!(acc.snapshot().unwrap().fills_posted, 0);
         }
 
         #[test]
@@ -3385,12 +3552,12 @@ mod tests {
             let mut acc = accountant(dec!(1000));
             acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(0.1)))
                 .unwrap();
-            let before = acc.snapshot();
+            let before = acc.snapshot().unwrap();
             let mut fill = ask_fill(2, dec!(100), dec!(1), dec!(0.1));
             fill.side = Action::Other;
             assert!(acc.post_fill(&fill).is_err());
             assert_eq!(acc.ledger().journal().len(), 1);
-            assert_eq!(acc.snapshot(), before);
+            assert_eq!(acc.snapshot().unwrap(), before);
         }
 
         fn ask_fill(id: u64, price: Decimal, quantity: Decimal, fee: Decimal) -> AccountingFill {
@@ -3412,7 +3579,7 @@ mod tests {
             let mut acc = accountant(dec!(1000));
             acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(0.1)))
                 .unwrap();
-            let snapshot = acc.snapshot();
+            let snapshot = acc.snapshot().unwrap();
             assert_eq!(snapshot.position, dec!(-1));
             assert_eq!(snapshot.cash_flow, dec!(100));
             assert_eq!(snapshot.fees, dec!(0.1));
@@ -3427,7 +3594,7 @@ mod tests {
             let mut acc = accountant(dec!(1000));
             acc.post_fill(&ask_fill(1, dec!(100), dec!(1), dec!(-0.05)))
                 .unwrap();
-            assert_eq!(acc.snapshot().fees, dec!(-0.05));
+            assert_eq!(acc.snapshot().unwrap().fees, dec!(-0.05));
         }
 
         #[test]
@@ -3444,13 +3611,13 @@ mod tests {
             assert_eq!(acc.overdrafts().get(&btc), Some(&dec!(1.001)));
             // The account delivered 1.001 BTC; the fee is reported in base
             // for the engine to mark.
-            let snapshot = acc.snapshot();
+            let snapshot = acc.snapshot().unwrap();
             assert_eq!(snapshot.position, dec!(-1.001));
             assert_eq!(snapshot.cash_flow, dec!(100));
             assert_eq!(snapshot.fees, Decimal::ZERO);
             assert_eq!(snapshot.base_fees, dec!(0.001));
             acc.reset();
-            assert_eq!(acc.snapshot().base_fees, Decimal::ZERO);
+            assert_eq!(acc.snapshot().unwrap().base_fees, Decimal::ZERO);
         }
 
         #[test]
@@ -3459,7 +3626,7 @@ mod tests {
             let mut fill = ask_fill(1, dec!(100), dec!(1), dec!(0.5));
             fill.fee_asset = FeeAsset::Other("BNB".to_string());
             assert!(acc.post_fill(&fill).is_err());
-            assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+            assert_eq!(acc.snapshot().unwrap(), AccountingSnapshot::default());
         }
 
         #[test]
@@ -3521,7 +3688,7 @@ mod tests {
             ledger.book_execution(&eth_buy).unwrap();
             let acc = MarginLedgerAccountant::new(ledger, InstrumentId::new("BTC-USDC").unwrap())
                 .unwrap();
-            assert_eq!(acc.snapshot(), AccountingSnapshot::default());
+            assert_eq!(acc.snapshot().unwrap(), AccountingSnapshot::default());
         }
 
         #[test]
@@ -3595,6 +3762,68 @@ mod tests {
         fn reset(&mut self) {
             self.seen.lock().unwrap().clear();
         }
+    }
+
+    /// Fills every sell in full at a fixed price, so two fills of size 2
+    /// at a third of `Decimal::MAX` overflow the realized cash.
+    #[derive(Debug)]
+    struct HugeSellModel;
+
+    impl FillModel for HugeSellModel {
+        fn simulate_fill(
+            &self,
+            order: &SimulatedOrder,
+            _tick: &MarketTick,
+            _time_in_queue_ms: u64,
+        ) -> MMResult<FillResult> {
+            Ok(if order.side == Action::Sell {
+                FillResult::FullFill {
+                    fill_price: Decimal::MAX / dec!(3),
+                }
+            } else {
+                FillResult::NoFill
+            })
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &'static str {
+            "HugeSell"
+        }
+    }
+
+    #[test]
+    fn test_overflowing_booking_faults_before_any_state_changes() {
+        let quotes = vec![Some((dec!(100), dec!(200))); 5];
+        let mut engine = BacktestEngine::with_fill_model(
+            BacktestConfig::default()
+                .with_default_order_size(dec!(2))
+                .with_fee_rate(Decimal::ZERO),
+            ScriptedStrategy::new(quotes),
+            VecDataSource::new(queue_ticks()),
+            HugeSellModel,
+        )
+        .unwrap();
+        let result = engine.run();
+
+        // The first sell books; the second would overflow the realized cash.
+        assert!(
+            engine
+                .faults()
+                .iter()
+                .any(|f| *f == MMError::NumericalError("realized pnl overflows".to_string())),
+            "{:?}",
+            engine.faults()
+        );
+        let first = (Decimal::MAX / dec!(3)) * dec!(2);
+        assert_eq!(result.num_trades, 1);
+        assert_eq!(result.final_position, dec!(-2));
+        assert_eq!(engine.pnl.realized, first);
+        // The refused fill left its order unfilled and reported nothing.
+        let fills = engine
+            .execution_reports()
+            .iter()
+            .filter(|r| r.kind == ExecutionKind::Fill || r.kind == ExecutionKind::PartialFill)
+            .count();
+        assert_eq!(fills, 1);
     }
 
     /// Fill model that fails on every order.

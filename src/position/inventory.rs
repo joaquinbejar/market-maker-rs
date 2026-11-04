@@ -1,6 +1,7 @@
 //! Inventory position tracking.
 
 use crate::Decimal;
+use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
 use pretty_simple_display::{DebugPretty, DisplaySimple};
@@ -72,20 +73,35 @@ impl InventoryPosition {
     /// use market_maker_rs::dec;
     ///
     /// let mut position = InventoryPosition::new();
-    /// position.update_fill(dec!(10.0), dec!(100.0), 1000);
+    /// position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
     /// assert_eq!(position.quantity, dec!(10.0));
     /// assert_eq!(position.avg_entry_price, dec!(100.0));
     ///
-    /// position.update_fill(dec!(5.0), dec!(102.0), 2000);
+    /// position.update_fill(dec!(5.0), dec!(102.0), 2000).unwrap();
     /// assert_eq!(position.quantity, dec!(15.0));
     /// // Weighted average: (10*100 + 5*102) / 15 = 100.666...
     /// ```
     ///
-    /// This method cannot return an error, so its arithmetic saturates at
-    /// the `Decimal` bounds instead of panicking; values that large are far
-    /// outside any real position.
-    pub fn update_fill(&mut self, fill_quantity: Decimal, fill_price: Decimal, timestamp: u64) {
-        let new_quantity = self.quantity.saturating_add(fill_quantity);
+    /// Any price is accepted, negative ones included (some instruments
+    /// trade below zero). The average entry price is the exact weighted
+    /// mean, computed in an overflow safe form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the position quantity or the
+    /// average entry price overflows; the position is then left unchanged.
+    pub fn update_fill(
+        &mut self,
+        fill_quantity: Decimal,
+        fill_price: Decimal,
+        timestamp: u64,
+    ) -> MMResult<()> {
+        let new_quantity = self.quantity.checked_add(fill_quantity).ok_or_else(|| {
+            MMError::NumericalError(format!(
+                "position quantity overflows: {} + {}",
+                self.quantity, fill_quantity
+            ))
+        })?;
 
         // If crossing from long to short or vice versa, reset avg price
         if (self.quantity > Decimal::ZERO && new_quantity < Decimal::ZERO)
@@ -99,19 +115,26 @@ impl InventoryPosition {
             // the inputs, unlike the total cost. `new_quantity` is non zero
             // here (its magnitude grew), so only an overflow can fail.
             let old_avg = self.avg_entry_price;
-            let weighted = fill_price.checked_sub(old_avg).and_then(|diff| {
-                diff.checked_mul(fill_quantity)
-                    .and_then(|v| v.checked_div(new_quantity))
-                    // `fill / new` is in (0, 1] here, so this form cannot
-                    // overflow where the product above did.
-                    .or_else(|| diff.checked_mul(fill_quantity.checked_div(new_quantity)?))
-            });
-            self.avg_entry_price = match weighted.and_then(|w| old_avg.checked_add(w)) {
-                Some(avg) => avg,
-                // Last resort: the price difference itself overflows, so the
-                // average saturates toward the fill price.
-                None => old_avg.saturating_add(fill_price.saturating_sub(old_avg)),
-            };
+            let weighted = fill_price
+                .checked_sub(old_avg)
+                .and_then(|diff| {
+                    diff.checked_mul(fill_quantity)
+                        .and_then(|v| v.checked_div(new_quantity))
+                        // `fill / new` is in (0, 1] here, so this form cannot
+                        // overflow where the product above did.
+                        .or_else(|| diff.checked_mul(fill_quantity.checked_div(new_quantity)?))
+                })
+                .and_then(|w| old_avg.checked_add(w));
+            // Only prices of opposite sign near the bounds reach here (their
+            // difference overflows); no form without that difference keeps
+            // the rounding of the exact mean, so this is an error rather
+            // than an approximate average.
+            self.avg_entry_price = weighted.ok_or_else(|| {
+                MMError::NumericalError(format!(
+                    "average entry price overflows: {} at {} plus {} at {}",
+                    self.quantity, old_avg, fill_quantity, fill_price
+                ))
+            })?;
         }
         // If reducing position, keep same avg price
         // (realized PnL is calculated separately)
@@ -123,6 +146,7 @@ impl InventoryPosition {
         if self.quantity == Decimal::ZERO {
             self.avg_entry_price = Decimal::ZERO;
         }
+        Ok(())
     }
 
     /// Calculates the unrealized PnL at a given market price.
@@ -142,7 +166,7 @@ impl InventoryPosition {
     /// use market_maker_rs::dec;
     ///
     /// let mut position = InventoryPosition::new();
-    /// position.update_fill(dec!(10.0), dec!(100.0), 1000);
+    /// position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
     ///
     /// // If price rises to 105, unrealized PnL = 10 * (105 - 100) = 50
     /// assert_eq!(position.unrealized_pnl(dec!(105.0)), dec!(50.0));
@@ -173,12 +197,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_update_fill_unrepresentable_average_returns_error_and_keeps_position() {
+        let mut position = InventoryPosition {
+            quantity: dec!(1),
+            avg_entry_price: Decimal::MIN,
+            last_update: 0,
+        };
+        let before = position.clone();
+        let result = position.update_fill(dec!(3), Decimal::MAX, 1);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        assert_eq!(position, before);
+    }
+
+    #[test]
+    fn test_update_fill_quantity_overflow_returns_error_and_keeps_position() {
+        let mut position = InventoryPosition::new();
+        position.update_fill(Decimal::MAX, dec!(1), 1).unwrap();
+        let before = position.clone();
+        let result = position.update_fill(dec!(1), dec!(2), 2);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        assert_eq!(position, before);
+    }
+
+    #[test]
     fn test_update_fill_huge_values_average_without_overflow() {
         // quantity * price overflows the total cost form, but the average
         // of two fills at the same huge price is that price.
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(1_000_000_000_000), Decimal::MAX / dec!(2), 1);
-        position.update_fill(dec!(1_000_000_000_000), Decimal::MAX / dec!(2), 2);
+        position
+            .update_fill(dec!(1_000_000_000_000), Decimal::MAX / dec!(2), 1)
+            .unwrap();
+        position
+            .update_fill(dec!(1_000_000_000_000), Decimal::MAX / dec!(2), 2)
+            .unwrap();
         assert_eq!(position.avg_entry_price, Decimal::MAX / dec!(2));
         assert_eq!(position.quantity, dec!(2_000_000_000_000));
     }
@@ -249,7 +306,7 @@ mod tests {
     #[test]
     fn test_update_fill_buy() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(10.0), dec!(100.0), 1000);
+        position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
         assert_eq!(position.quantity, dec!(10.0));
         assert_eq!(position.avg_entry_price, dec!(100.0));
         assert_eq!(position.last_update, 1000);
@@ -258,7 +315,9 @@ mod tests {
     #[test]
     fn test_update_fill_sell() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(-10.0), dec!(100.0), 1000);
+        position
+            .update_fill(dec!(-10.0), dec!(100.0), 1000)
+            .unwrap();
         assert_eq!(position.quantity, dec!(-10.0));
         assert_eq!(position.avg_entry_price, dec!(100.0));
     }
@@ -266,8 +325,8 @@ mod tests {
     #[test]
     fn test_update_fill_weighted_average() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(10.0), dec!(100.0), 1000);
-        position.update_fill(dec!(5.0), dec!(102.0), 2000);
+        position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
+        position.update_fill(dec!(5.0), dec!(102.0), 2000).unwrap();
 
         assert_eq!(position.quantity, dec!(15.0));
         // (10*100 + 5*102) / 15 = 100.666666...
@@ -278,8 +337,8 @@ mod tests {
     #[test]
     fn test_update_fill_reduce_position() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(10.0), dec!(100.0), 1000);
-        position.update_fill(dec!(-5.0), dec!(105.0), 2000);
+        position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
+        position.update_fill(dec!(-5.0), dec!(105.0), 2000).unwrap();
 
         assert_eq!(position.quantity, dec!(5.0));
         // Avg price should remain at original entry
@@ -289,8 +348,10 @@ mod tests {
     #[test]
     fn test_update_fill_flatten_position() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(10.0), dec!(100.0), 1000);
-        position.update_fill(dec!(-10.0), dec!(105.0), 2000);
+        position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
+        position
+            .update_fill(dec!(-10.0), dec!(105.0), 2000)
+            .unwrap();
 
         assert_eq!(position.quantity, Decimal::ZERO);
         assert_eq!(position.avg_entry_price, Decimal::ZERO);
@@ -300,8 +361,10 @@ mod tests {
     #[test]
     fn test_update_fill_flip_position() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(10.0), dec!(100.0), 1000);
-        position.update_fill(dec!(-15.0), dec!(105.0), 2000);
+        position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
+        position
+            .update_fill(dec!(-15.0), dec!(105.0), 2000)
+            .unwrap();
 
         assert_eq!(position.quantity, dec!(-5.0));
         // When flipping, new avg price is the flip fill price
@@ -311,7 +374,7 @@ mod tests {
     #[test]
     fn test_unrealized_pnl_long_profit() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(10.0), dec!(100.0), 1000);
+        position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
 
         let pnl = position.unrealized_pnl(dec!(105.0));
         assert_eq!(pnl, dec!(50.0)); // 10 * (105 - 100)
@@ -320,7 +383,7 @@ mod tests {
     #[test]
     fn test_unrealized_pnl_long_loss() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(10.0), dec!(100.0), 1000);
+        position.update_fill(dec!(10.0), dec!(100.0), 1000).unwrap();
 
         let pnl = position.unrealized_pnl(dec!(95.0));
         assert_eq!(pnl, dec!(-50.0)); // 10 * (95 - 100)
@@ -329,7 +392,9 @@ mod tests {
     #[test]
     fn test_unrealized_pnl_short_profit() {
         let mut position = InventoryPosition::new();
-        position.update_fill(dec!(-10.0), dec!(100.0), 1000);
+        position
+            .update_fill(dec!(-10.0), dec!(100.0), 1000)
+            .unwrap();
 
         let pnl = position.unrealized_pnl(dec!(95.0));
         assert_eq!(pnl, dec!(50.0)); // -10 * (95 - 100)

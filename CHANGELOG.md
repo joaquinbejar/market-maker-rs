@@ -102,6 +102,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `OrderFlowStats::imbalance`, `VolumeBucket` imbalances and VPIN keep their
+  proportions when a side's volume is beyond the `Decimal` bounds, and
+  `net_flow` keeps its sign. `buy_vwap` and `sell_vwap` are `None` when their
+  inputs overflow, and `volume_ratio` is `None` when a volume sits at the
+  bound.
 - `tests/contract_fixtures.rs`: the inverse future fixture uses the Deribit
   contract value, 10 USD (was 100), on 100 contracts, and the linear one the
   Binance terms (multiplier 1, lot step 0.001); both are cross-checked
@@ -115,8 +120,116 @@ project follows [Semantic Versioning](https://semver.org/).
 - `BacktestEngine::faults` keeps only the first `MAX_RECORDED_FAULTS` (16)
   errors; `BacktestEngine::fault_count` reports the total. Admission still
   stops at the first fault (#133).
+- CI installs Rust with `dtolnay/rust-toolchain`, pinned by commit, in
+  place of the archived `actions-rs/toolchain`; toolchains, components and
+  matrices are unchanged. `make lint` also runs clippy with
+  `--no-default-features` (#155).
+- The crate denies `clippy::unwrap_used`, `expect_used`,
+  `indexing_slicing`, `panic` and `arithmetic_side_effects` outside tests
+  (#145). Five legacy option files (`options::greeks`, `risk_manager`,
+  `market_maker`, `adapter` and `chain::market_maker`) are exempt from the
+  arithmetic lint until #166 converts them.
+- Arithmetic outside those legacy option files is checked (#135, #144): a function
+  that returns `MMResult` reports an overflow or a zero divisor as
+  `MMError::NumericalError`; derived display and report values (mid
+  prices, spreads, notionals, imbalances, analytics statistics, backtest
+  metrics, persisted record totals, multi underlying aggregates) saturate
+  at the `Decimal` bounds and say so in their docs; an overflowing ratio
+  that returns `Option` is `None`. Several former panics on overflow or a
+  zero divisor (grid inventory scaling with a zero `max_position`, the
+  weighted book imbalance at a zero mid, every Decimal `sum`, which
+  panics on overflow, and the order intensity square root of the smallest
+  positive Decimal) are now errors or saturating values.
+  `OrderManager::get_open_quantity` reports an overflowing total as
+  `MMError::NumericalError`.
+- `OrderBookSnapshot::mid_price`, `spread` and `spread_bps` (execution)
+  return `None` when the arithmetic overflows.
+- `OHLCVBar::typical_price` and `vwap` are an overflow safe mean of high,
+  low and close, so they stay within the bar's range near the bounds.
+- `OrderIntensityEstimator::fill_probability` is 1, not `None`, when the
+  intensity times the horizon overflows.
+- Backtest CAGR computes the exponential of a negative argument as
+  `1 / exp(-x)`, so a short losing run annualizes toward -100% instead of
+  far below it.
+- Mid prices (`MarketTick`, `Quote`, data feed quotes, the VPIN quote
+  rule) are exact near the `Decimal` bounds instead of saturating the sum,
+  and every book and trade flow imbalance is invariant under a common
+  scale of its sides, even when their sum is not representable.
+
+### Fixed
+
+- `ProbabilisticFillModel` draws its uniform number from the top 32 bits
+  of the generator state scaled by 2^32, so it covers [0, 1). The draw used
+  to stay below 0.5, so a fill with probability p happened with
+  probability min(1, 2p). Backtests that use this model now fill less
+  often, and their output for a given seed changes (#143).
+- `OrderBookConnector::cancel_all_orders` no longer clears the whole order
+  mapping when some cancels fail: an order whose cancel failed while it
+  still rests stays tracked, and the first failure is returned after every
+  order was attempted. `MockExchangeConnector::cancel_all_orders` returns
+  the first cancel error, `LockPoisoned` included, instead of dropping it.
+  Calling again retries the orders that failed. An order the book no
+  longer knows (filled or cancelled outside the connector) is unmapped and
+  left out of the cancelled responses instead of failing every later
+  call, and an order re-mapped by a concurrent modify is cancelled through
+  its current book id (#146).
 
 ### Breaking
+
+These signature changes are breaking and ship in 0.7.0, not in a patch
+release.
+
+- `AccountingStatus` has a new `snapshot_failures` field (`serde(default)`):
+  the execution ids after whose post the accountant's snapshot failed, so
+  the engine kept stale balances. `is_consistent` is false while it is not
+  empty.
+- `QueuePositionFillModel::update_queue` returns `MMResult<()>` and
+  rejects a negative bid or ask size with `MMError::InvalidMarketState`,
+  leaving its estimates unchanged; `simulate_fill` rejects such a tick the
+  same way. Invalid sizes are never read as an empty queue, which would
+  fill orders at once (#144).
+- Checked arithmetic (#144): these now return `MMResult` and report an
+  overflow as `MMError::NumericalError`:
+  - `InventoryPosition::update_fill` returns `MMResult<()>` and leaves the
+    position unchanged when the quantity or the exact average entry price
+    is not representable (it no longer saturates the average);
+  - `FillAccountant::snapshot` returns `MMResult<AccountingSnapshot>`
+    (implementors change their signature), and
+    `BacktestEngine::accounting_snapshot` returns
+    `Option<MMResult<AccountingSnapshot>>`; a failed snapshot is recorded
+    as an engine fault;
+  - `DepthBasedOffering::calculate_ask_size` and `calculate_bid_size`;
+  - `GridStrategy::generate_grid`, `generate_grid_with_inventory`,
+    `calculate_price`, `calculate_level_size`, `price_range` and
+    `max_notional_exposure`;
+  - `AdaptiveSpread::bid_price` and `ask_price`, and
+    `AdaptiveSpreadCalculator::calculate_spread`,
+    `calculate_spread_with_volatility`,
+    `calculate_weighted_orderbook_imbalance`,
+    `calculate_orderbook_imbalance` and `calculate_tradeflow_imbalance`
+    (a saturated depth or volume would distort the signal);
+  - `RiskAversionCalibrator::calibrate_from_halflife`,
+    `ParameterOptimizer::optimize_quick` and
+    `OptimizedParameters::adjusted_gamma`;
+  - `MultiUnderlyingManager::reallocate_capital` returns `MMResult<()>`
+    and computes every allocation before applying any.
+  - `PortfolioPosition::total_absolute_position` and `net_position`
+    return `MMResult<Decimal>`; their Decimal sums used to panic on
+    overflow.
+- `LimitsPolicy` latches a fault and rejects every later check when a fill
+  would overflow its position, instead of saturating it.
+- The backtest engine's built in bookkeeping validates each fill's
+  position, cash flow, realized PnL and fee totals before it touches the
+  order, the policy or itself; a fill that would overflow any of them is
+  recorded as a fault and changes nothing, instead of saturating.
+- Values documented as report only (notionals, totals, utilizations,
+  analytics statistics, backtest metrics) saturate at the `Decimal` bounds;
+  every value that feeds a quote, a mark, a signal or state is computed
+  overflow safe or returns a typed error. A `ProbabilisticFillModel` time
+  component too large to represent saturates to 1, its clamp.
+- `SimulatedFill::base_delta`, `ProbabilisticFillModel` probabilities and
+  `MarginLedgerAccountant` base fees report overflow instead of
+  saturating.
 
 - The `margin` feature depends on margin-rs 0.1 from crates.io instead of
   a git revision. Callers that build the `RiskGate` or `Ledger` passed to

@@ -46,7 +46,7 @@
 
 use crate::Decimal;
 use crate::execution::Action;
-use crate::types::decimal::saturating_u64;
+use crate::types::decimal::{saturating_div, saturating_u64};
 use crate::types::error::{MMError, MMResult};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
@@ -154,9 +154,11 @@ impl TradeRecord {
     }
 
     /// Returns the net PnL after fees.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn net_pnl(&self) -> Decimal {
-        self.pnl - self.fees
+        self.pnl.saturating_sub(self.fees)
     }
 
     /// Returns true if this trade was profitable.
@@ -178,16 +180,18 @@ impl TradeRecord {
     }
 
     /// Returns the return percentage for this trade.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn return_pct(&self) -> Decimal {
         if self.entry_price == Decimal::ZERO {
             return Decimal::ZERO;
         }
-        let notional = self.entry_price * self.quantity;
+        let notional = self.entry_price.saturating_mul(self.quantity);
         if notional == Decimal::ZERO {
             return Decimal::ZERO;
         }
-        (self.net_pnl() / notional) * Decimal::ONE_HUNDRED
+        saturating_div(self.net_pnl(), notional).saturating_mul(Decimal::ONE_HUNDRED)
     }
 }
 
@@ -339,21 +343,27 @@ impl PerformanceMetrics {
     }
 
     /// Returns the risk-reward ratio (average winner / average loser).
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn risk_reward_ratio(&self) -> Decimal {
         if self.average_loser == Decimal::ZERO {
             return Decimal::ZERO;
         }
-        self.average_winner / self.average_loser.abs()
+        saturating_div(self.average_winner, self.average_loser.abs())
     }
 
     /// Returns the expectancy per trade.
     /// Formula: (win_rate * avg_winner) - ((1 - win_rate) * abs(avg_loser))
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn expectancy(&self) -> Decimal {
-        let win_component = self.win_rate * self.average_winner;
-        let loss_component = (Decimal::ONE - self.win_rate) * self.average_loser.abs();
-        win_component - loss_component
+        let win_component = self.win_rate.saturating_mul(self.average_winner);
+        let loss_component = Decimal::ONE
+            .saturating_sub(self.win_rate)
+            .saturating_mul(self.average_loser.abs());
+        win_component.saturating_sub(loss_component)
     }
 }
 
@@ -410,6 +420,9 @@ impl MetricsCalculator {
     /// * `trades` - List of completed trades
     /// * `initial_capital` - Starting capital
     ///
+    /// Every metric is report only: a sum, product or ratio
+    /// beyond the `Decimal` bounds saturates instead of failing.
+    ///
     /// # Errors
     ///
     /// Returns an error if the equity curve is empty.
@@ -433,9 +446,9 @@ impl MetricsCalculator {
             .last()
             .map(|p| p.equity)
             .unwrap_or(initial_capital);
-        let total_return = final_equity - initial_capital;
+        let total_return = final_equity.saturating_sub(initial_capital);
         let total_return_pct = if initial_capital != Decimal::ZERO {
-            (total_return / initial_capital) * Decimal::ONE_HUNDRED
+            saturating_div(total_return, initial_capital).saturating_mul(Decimal::ONE_HUNDRED)
         } else {
             Decimal::ZERO
         };
@@ -447,8 +460,10 @@ impl MetricsCalculator {
         };
         let years = self.ms_to_years(time_span_ms);
 
-        let annualized_return =
-            self.annualize_return(total_return_pct / Decimal::ONE_HUNDRED, years);
+        let annualized_return = self.annualize_return(
+            saturating_div(total_return_pct, Decimal::ONE_HUNDRED),
+            years,
+        );
         let cagr = self.calculate_cagr(initial_capital, final_equity, years);
 
         // Calculate risk metrics
@@ -461,7 +476,7 @@ impl MetricsCalculator {
         let sharpe = self.sharpe_ratio(&returns);
         let sortino = self.sortino_ratio(&returns);
         let calmar = if max_dd != Decimal::ZERO {
-            annualized_return / max_dd
+            saturating_div(annualized_return, max_dd)
         } else {
             Decimal::ZERO
         };
@@ -493,7 +508,8 @@ impl MetricsCalculator {
 
     /// Calculates period returns from equity curve.
     ///
-    /// Returns are calculated as: (equity\[i\] - equity\[i-1\]) / equity\[i-1\]
+    /// Returns are calculated as: (equity\[i\] - equity\[i-1\]) / equity\[i-1\],
+    /// saturating at the `Decimal` bounds.
     #[must_use]
     pub fn calculate_returns(&self, equity_curve: &[EquityPoint]) -> Vec<Decimal> {
         if equity_curve.len() < 2 {
@@ -503,9 +519,10 @@ impl MetricsCalculator {
         equity_curve
             .windows(2)
             .filter_map(|w| match w {
-                [prev, next] if prev.equity != Decimal::ZERO => {
-                    Some((next.equity - prev.equity) / prev.equity)
-                }
+                [prev, next] if prev.equity != Decimal::ZERO => Some(saturating_div(
+                    next.equity.saturating_sub(prev.equity),
+                    prev.equity,
+                )),
                 _ => None,
             })
             .collect()
@@ -527,12 +544,10 @@ impl MetricsCalculator {
             return Decimal::ZERO;
         }
 
-        let daily_rf =
-            self.config.risk_free_rate / Decimal::from(self.config.trading_days_per_year);
-        let excess_return = mean - daily_rf;
+        let excess_return = mean.saturating_sub(self.daily_risk_free_rate());
         let annualization_factor = decimal_sqrt(Decimal::from(self.config.trading_days_per_year));
 
-        (excess_return / std_dev) * annualization_factor
+        saturating_div(excess_return, std_dev).saturating_mul(annualization_factor)
     }
 
     /// Calculates the Sortino ratio.
@@ -551,12 +566,10 @@ impl MetricsCalculator {
             return Decimal::ZERO;
         }
 
-        let daily_rf =
-            self.config.risk_free_rate / Decimal::from(self.config.trading_days_per_year);
-        let excess_return = mean - daily_rf;
+        let excess_return = mean.saturating_sub(self.daily_risk_free_rate());
         let annualization_factor = decimal_sqrt(Decimal::from(self.config.trading_days_per_year));
 
-        (excess_return / downside_dev) * annualization_factor
+        saturating_div(excess_return, downside_dev).saturating_mul(annualization_factor)
     }
 
     /// Calculates maximum drawdown and its duration.
@@ -580,7 +593,7 @@ impl MetricsCalculator {
             }
 
             if peak > Decimal::ZERO {
-                let dd = (peak - point.equity) / peak;
+                let dd = saturating_div(peak.saturating_sub(point.equity), peak);
                 if dd > max_dd {
                     max_dd = dd;
                     max_dd_duration = point.timestamp.saturating_sub(current_dd_start);
@@ -607,16 +620,19 @@ impl MetricsCalculator {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // VaR is the loss at the (1 - confidence) percentile
-        let percentile = Decimal::ONE - confidence;
+        let percentile = Decimal::ONE.saturating_sub(confidence);
         let last = sorted.len().saturating_sub(1);
         // Truncates toward zero and clamps to the series, like a
         // saturating float cast would.
-        let raw = (percentile * Decimal::from(last)).trunc();
+        let raw = percentile.saturating_mul(Decimal::from(last)).trunc();
         let fallback = if raw.is_sign_negative() { 0 } else { last };
         let index = raw.to_usize().unwrap_or(fallback).min(last);
 
         // Return as positive number (loss)
-        sorted.get(index).map_or(Decimal::ZERO, |worst| -*worst)
+        // Negating a Decimal flips its sign bit: it cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
+        let loss = sorted.get(index).map_or(Decimal::ZERO, |worst| -*worst);
+        loss
     }
 
     /// Calculates profit factor.
@@ -624,17 +640,19 @@ impl MetricsCalculator {
     /// Formula: sum(winning_trades) / abs(sum(losing_trades))
     #[must_use]
     pub fn profit_factor(&self, trades: &[TradeRecord]) -> Decimal {
-        let gross_profit: Decimal = trades
-            .iter()
-            .filter(|t| t.net_pnl() > Decimal::ZERO)
-            .map(|t| t.net_pnl())
-            .sum();
+        let gross_profit = saturating_sum(
+            trades
+                .iter()
+                .filter(|t| t.net_pnl() > Decimal::ZERO)
+                .map(|t| t.net_pnl()),
+        );
 
-        let gross_loss: Decimal = trades
-            .iter()
-            .filter(|t| t.net_pnl() < Decimal::ZERO)
-            .map(|t| t.net_pnl().abs())
-            .sum();
+        let gross_loss = saturating_sum(
+            trades
+                .iter()
+                .filter(|t| t.net_pnl() < Decimal::ZERO)
+                .map(|t| t.net_pnl().abs()),
+        );
 
         if gross_loss == Decimal::ZERO {
             if gross_profit > Decimal::ZERO {
@@ -643,21 +661,29 @@ impl MetricsCalculator {
             return Decimal::ZERO;
         }
 
-        gross_profit / gross_loss
+        saturating_div(gross_profit, gross_loss)
     }
 
     // Helper methods
 
+    /// The risk free rate per trading day.
+    fn daily_risk_free_rate(&self) -> Decimal {
+        saturating_div(
+            self.config.risk_free_rate,
+            Decimal::from(self.config.trading_days_per_year),
+        )
+    }
+
     fn calculate_volatility(&self, returns: &[Decimal]) -> Decimal {
         let std_dev = self.std_dev(returns);
         let annualization = decimal_sqrt(Decimal::from(self.config.trading_days_per_year));
-        std_dev * annualization
+        std_dev.saturating_mul(annualization)
     }
 
     fn calculate_downside_volatility(&self, returns: &[Decimal]) -> Decimal {
         let downside_dev = self.downside_deviation(returns);
         let annualization = decimal_sqrt(Decimal::from(self.config.trading_days_per_year));
-        downside_dev * annualization
+        downside_dev.saturating_mul(annualization)
     }
 
     fn calculate_cagr(&self, initial: Decimal, final_val: Decimal, years: Decimal) -> Decimal {
@@ -665,7 +691,7 @@ impl MetricsCalculator {
             return Decimal::ZERO;
         }
 
-        let ratio = final_val / initial;
+        let ratio = saturating_div(final_val, initial);
         if ratio <= Decimal::ZERO {
             return Decimal::ZERO;
         }
@@ -673,8 +699,8 @@ impl MetricsCalculator {
         // CAGR = (final/initial)^(1/years) - 1
         // Approximation using ln: exp(ln(ratio) / years) - 1
         let ln_ratio = decimal_ln(ratio);
-        let exponent = ln_ratio / years;
-        decimal_exp(exponent) - Decimal::ONE
+        let exponent = saturating_div(ln_ratio, years);
+        decimal_exp(exponent).saturating_sub(Decimal::ONE)
     }
 
     fn annualize_return(&self, total_return: Decimal, years: Decimal) -> Decimal {
@@ -683,13 +709,13 @@ impl MetricsCalculator {
         }
         // Simple annualization: total_return / years
         // For compound: (1 + total_return)^(1/years) - 1
-        total_return / years
+        saturating_div(total_return, years)
     }
 
     fn ms_to_years(&self, ms: u64) -> Decimal {
         let ms_per_day = Decimal::from(86_400_000u64);
-        let days = Decimal::from(ms) / ms_per_day;
-        days / Decimal::from(self.config.trading_days_per_year)
+        let days = saturating_div(Decimal::from(ms), ms_per_day);
+        saturating_div(days, Decimal::from(self.config.trading_days_per_year))
     }
 
     fn calculate_information_ratio(&self, returns: &[Decimal]) -> Option<Decimal> {
@@ -703,7 +729,7 @@ impl MetricsCalculator {
         let excess: Vec<Decimal> = returns
             .iter()
             .zip(benchmark.iter())
-            .map(|(r, b)| *r - *b)
+            .map(|(r, b)| r.saturating_sub(*b))
             .collect();
 
         let mean_excess = self.mean(&excess);
@@ -714,7 +740,7 @@ impl MetricsCalculator {
         }
 
         let annualization = decimal_sqrt(Decimal::from(self.config.trading_days_per_year));
-        Some((mean_excess / tracking_error) * annualization)
+        Some(saturating_div(mean_excess, tracking_error).saturating_mul(annualization))
     }
 
     fn calculate_trading_metrics(&self, trades: &[TradeRecord]) -> PerformanceMetrics {
@@ -730,22 +756,20 @@ impl MetricsCalculator {
         let winning_trades = saturating_u64(winners.len());
         let losing_trades = saturating_u64(losers.len());
 
-        let win_rate = Decimal::from(winning_trades) / Decimal::from(total_trades);
+        let win_rate = saturating_div(Decimal::from(winning_trades), Decimal::from(total_trades));
 
-        let total_pnl: Decimal = trades.iter().map(|t| t.net_pnl()).sum();
-        let average_trade_pnl = total_pnl / Decimal::from(total_trades);
+        let total_pnl = saturating_sum(trades.iter().map(TradeRecord::net_pnl));
+        let average_trade_pnl = saturating_div(total_pnl, Decimal::from(total_trades));
 
-        let average_winner = if !winners.is_empty() {
-            winners.iter().map(|t| t.net_pnl()).sum::<Decimal>() / Decimal::from(winners.len())
-        } else {
-            Decimal::ZERO
+        // `saturating_div` is zero for an empty side.
+        let average_of = |side: &[&TradeRecord]| {
+            saturating_div(
+                saturating_sum(side.iter().map(|t| t.net_pnl())),
+                Decimal::from(side.len()),
+            )
         };
-
-        let average_loser = if !losers.is_empty() {
-            losers.iter().map(|t| t.net_pnl()).sum::<Decimal>() / Decimal::from(losers.len())
-        } else {
-            Decimal::ZERO
-        };
+        let average_winner = average_of(&winners);
+        let average_loser = average_of(&losers);
 
         let largest_winner = winners
             .iter()
@@ -759,8 +783,11 @@ impl MetricsCalculator {
             .min()
             .unwrap_or(Decimal::ZERO);
 
-        let total_duration: u64 = trades.iter().map(|t| t.duration_ms()).sum();
-        let avg_trade_duration_ms = total_duration / total_trades;
+        let total_duration = trades
+            .iter()
+            .fold(0u64, |acc, t| acc.saturating_add(t.duration_ms()));
+        // `total_trades` is nonzero here.
+        let avg_trade_duration_ms = total_duration.checked_div(total_trades).unwrap_or(0);
 
         let profit_factor = self.profit_factor(trades);
 
@@ -781,29 +808,31 @@ impl MetricsCalculator {
     }
 
     fn mean(&self, values: &[Decimal]) -> Decimal {
-        if values.is_empty() {
-            return Decimal::ZERO;
-        }
-        let sum: Decimal = values.iter().sum();
-        sum / Decimal::from(values.len())
+        // Zero for an empty slice.
+        saturating_div(
+            saturating_sum(values.iter().copied()),
+            Decimal::from(values.len()),
+        )
     }
 
-    fn std_dev(&self, values: &[Decimal]) -> Decimal {
+    /// The sample standard deviation, zero for fewer than 2 values.
+    fn sample_std_dev(&self, values: &[Decimal]) -> Decimal {
         if values.len() < 2 {
             return Decimal::ZERO;
         }
 
         let mean = self.mean(values);
-        let variance: Decimal = values
-            .iter()
-            .map(|v| {
-                let diff = *v - mean;
-                diff * diff
-            })
-            .sum::<Decimal>()
-            / Decimal::from(values.len() - 1);
+        let squares = saturating_sum(values.iter().map(|v| {
+            let diff = v.saturating_sub(mean);
+            diff.saturating_mul(diff)
+        }));
+        let variance = saturating_div(squares, Decimal::from(values.len().saturating_sub(1)));
 
         decimal_sqrt(variance)
+    }
+
+    fn std_dev(&self, values: &[Decimal]) -> Decimal {
+        self.sample_std_dev(values)
     }
 
     fn downside_deviation(&self, returns: &[Decimal]) -> Decimal {
@@ -813,21 +842,7 @@ impl MetricsCalculator {
             .copied()
             .collect();
 
-        if negative_returns.len() < 2 {
-            return Decimal::ZERO;
-        }
-
-        let mean = self.mean(&negative_returns);
-        let variance: Decimal = negative_returns
-            .iter()
-            .map(|v| {
-                let diff = *v - mean;
-                diff * diff
-            })
-            .sum::<Decimal>()
-            / Decimal::from(negative_returns.len() - 1);
-
-        decimal_sqrt(variance)
+        self.sample_std_dev(&negative_returns)
     }
 }
 
@@ -837,7 +852,13 @@ impl Default for MetricsCalculator {
     }
 }
 
-/// Approximate square root using Newton's method.
+/// A sum of report values, saturating at the `Decimal` bounds.
+fn saturating_sum(values: impl Iterator<Item = Decimal>) -> Decimal {
+    values.fold(Decimal::ZERO, Decimal::saturating_add)
+}
+
+/// Approximate square root using Newton's method, saturating at the
+/// `Decimal` bounds (report only).
 fn decimal_sqrt(n: Decimal) -> Decimal {
     if n <= Decimal::ZERO {
         return Decimal::ZERO;
@@ -847,8 +868,8 @@ fn decimal_sqrt(n: Decimal) -> Decimal {
     let two = Decimal::TWO;
 
     for _ in 0..20 {
-        let next = (x + n / x) / two;
-        if (next - x).abs() < dec!(0.0000001) {
+        let next = saturating_div(x.saturating_add(saturating_div(n, x)), two);
+        if next.saturating_sub(x).abs() < dec!(0.0000001) {
             return next;
         }
         x = next;
@@ -858,13 +879,17 @@ fn decimal_sqrt(n: Decimal) -> Decimal {
 }
 
 /// Approximate natural logarithm.
+// For `n > 0`, `x = (n - 1) / (n + 1)` is in (-1, 1) (the sum saturates
+// only at `n = Decimal::MAX`, where x is 1 to 28 digits), so every term and
+// the partial sums stay below 40 in magnitude.
+#[allow(clippy::arithmetic_side_effects)]
 fn decimal_ln(n: Decimal) -> Decimal {
     if n <= Decimal::ZERO {
         return Decimal::ZERO;
     }
 
     // Use the identity: ln(x) ≈ 2 * sum((x-1)/(x+1))^(2k+1) / (2k+1)
-    let x = (n - Decimal::ONE) / (n + Decimal::ONE);
+    let x = n.saturating_sub(Decimal::ONE) / n.saturating_add(Decimal::ONE);
     let x2 = x * x;
 
     let mut result = Decimal::ZERO;
@@ -879,15 +904,24 @@ fn decimal_ln(n: Decimal) -> Decimal {
     result * Decimal::TWO
 }
 
-/// Approximate exponential function.
+/// Approximate exponential function, saturating at the `Decimal` bounds
+/// for a large argument (report only).
+///
+/// A negative argument is computed as `1 / exp(-x)`, so the result stays in
+/// (0, 1] and underflows toward zero instead of following an alternating
+/// series between the bounds.
 fn decimal_exp(x: Decimal) -> Decimal {
+    if x.is_sign_negative() {
+        // `exp(-x) >= 1`, so the quotient is in (0, 1].
+        return saturating_div(Decimal::ONE, decimal_exp(x.abs()));
+    }
     // Taylor series: e^x = sum(x^n / n!)
     let mut result = Decimal::ONE;
     let mut term = Decimal::ONE;
 
     for n in 1..30 {
-        term *= x / Decimal::from(n);
-        result += term;
+        term = term.saturating_mul(saturating_div(x, Decimal::from(n)));
+        result = result.saturating_add(term);
         if term.abs() < dec!(0.0000001) {
             break;
         }
@@ -909,6 +943,42 @@ mod tests {
     }
 
     // EquityPoint tests
+    #[test]
+    fn test_calculate_extreme_values_saturate_instead_of_panicking() {
+        let tiny = dec!(0.0000000000000000000000000001);
+        let curve =
+            create_equity_curve(&[(0, tiny), (1, Decimal::MAX), (2, tiny), (3, Decimal::MAX)]);
+        let trade = TradeRecord::new(
+            0,
+            1,
+            Action::Buy,
+            tiny,
+            Decimal::MAX,
+            Decimal::MAX,
+            Decimal::MAX,
+            Decimal::MIN,
+        );
+        let metrics = MetricsCalculator::with_defaults()
+            .calculate(&curve, &[trade.clone(), trade], tiny)
+            .unwrap();
+        assert_eq!(metrics.total_return, Decimal::MAX);
+        assert_eq!(metrics.total_return_pct, Decimal::MAX);
+    }
+
+    #[test]
+    fn test_short_losing_backtest_cagr_stays_above_minus_one() {
+        // A 50% loss over one hour annualizes toward -100%, never below.
+        let curve = create_equity_curve(&[(0, dec!(100)), (3_600_000, dec!(50))]);
+        let metrics = MetricsCalculator::with_defaults()
+            .calculate(&curve, &[], dec!(100))
+            .unwrap();
+        assert!(metrics.cagr >= Decimal::NEGATIVE_ONE, "{}", metrics.cagr);
+        assert!(metrics.cagr < Decimal::ZERO, "{}", metrics.cagr);
+        let small = decimal_exp(dec!(-1));
+        assert!((small - dec!(0.3678794)).abs() < dec!(0.000001), "{small}");
+        assert!(decimal_exp(dec!(-1000)) >= Decimal::ZERO);
+    }
+
     #[test]
     fn test_equity_point_new() {
         let point = EquityPoint::new(1000, dec!(10000.0));

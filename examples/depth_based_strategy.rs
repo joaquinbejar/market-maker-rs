@@ -41,8 +41,8 @@ fn main() {
     println!("Current Position: {} units", inventory);
     println!();
 
-    let ask_size = strategy.calculate_ask_size(inventory);
-    let bid_size = strategy.calculate_bid_size(inventory);
+    let ask_size = strategy.calculate_ask_size(inventory).unwrap();
+    let bid_size = strategy.calculate_bid_size(inventory).unwrap();
 
     println!("Order Sizes:");
     println!("  Ask (Sell) Size: {} units", ask_size);
@@ -62,8 +62,8 @@ fn main() {
     println!("Current Position: +{} units (LONG)", inventory_long);
     println!();
 
-    let ask_size_long = strategy.calculate_ask_size(inventory_long);
-    let bid_size_long = strategy.calculate_bid_size(inventory_long);
+    let ask_size_long = strategy.calculate_ask_size(inventory_long).unwrap();
+    let bid_size_long = strategy.calculate_bid_size(inventory_long).unwrap();
 
     println!("Order Sizes:");
     println!("  Ask (Sell) Size: {} units", ask_size_long);
@@ -91,8 +91,8 @@ fn main() {
     println!("Current Position: {} units (SHORT)", inventory_short);
     println!();
 
-    let ask_size_short = strategy.calculate_ask_size(inventory_short);
-    let bid_size_short = strategy.calculate_bid_size(inventory_short);
+    let ask_size_short = strategy.calculate_ask_size(inventory_short).unwrap();
+    let bid_size_short = strategy.calculate_bid_size(inventory_short).unwrap();
 
     println!("Order Sizes:");
     println!("  Ask (Sell) Size: {} units", ask_size_short);
@@ -123,8 +123,8 @@ fn main() {
     );
     println!();
 
-    let ask_size_extreme = strategy.calculate_ask_size(inventory_extreme);
-    let bid_size_extreme = strategy.calculate_bid_size(inventory_extreme);
+    let ask_size_extreme = strategy.calculate_ask_size(inventory_extreme).unwrap();
+    let bid_size_extreme = strategy.calculate_bid_size(inventory_extreme).unwrap();
 
     println!("Order Sizes:");
     println!("  Ask (Sell) Size: {} units", ask_size_extreme);
@@ -228,8 +228,8 @@ fn main() {
     );
     println!();
 
-    let ask_size_ob = strategy.calculate_ask_size(inventory_for_ob);
-    let bid_size_ob = strategy.calculate_bid_size(inventory_for_ob);
+    let ask_size_ob = strategy.calculate_ask_size(inventory_for_ob).unwrap();
+    let bid_size_ob = strategy.calculate_bid_size(inventory_for_ob).unwrap();
 
     println!("Calculated Order Sizes:");
     println!("  Ask Size: {} units", ask_size_ob);
@@ -287,8 +287,8 @@ fn main() {
     println!("{}", "-".repeat(60));
 
     for (label, position) in scenarios {
-        let ask = strategy.calculate_ask_size(position);
-        let bid = strategy.calculate_bid_size(position);
+        let ask = strategy.calculate_ask_size(position).unwrap();
+        let bid = strategy.calculate_bid_size(position).unwrap();
         println!("{:<20} {:>12} {:>12} {:>12}", label, position, ask, bid);
     }
     println!();
@@ -306,8 +306,8 @@ fn main() {
     let test_positions = vec![dec!(0.0), dec!(20.0), dec!(-30.0), dec!(50.0)];
     println!("   Ask Size + Bid Size = 2 × Max Exposure (always):");
     for pos in test_positions {
-        let ask = strategy.calculate_ask_size(pos);
-        let bid = strategy.calculate_bid_size(pos);
+        let ask = strategy.calculate_ask_size(pos).unwrap();
+        let bid = strategy.calculate_bid_size(pos).unwrap();
         println!(
             "     Position {:>6}: {} + {} = {}",
             pos,

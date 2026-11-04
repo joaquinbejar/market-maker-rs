@@ -57,7 +57,7 @@ use rust_decimal_macros::dec;
 use std::collections::VecDeque;
 
 use crate::Decimal;
-use crate::types::decimal::{decimal_to_u64_saturating, saturating_u64};
+use crate::types::decimal::{OrOverflow, decimal_to_u64_saturating, saturating_u64};
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -250,7 +250,10 @@ impl FillObservation {
     #[must_use]
     pub fn implied_rate(&self) -> Decimal {
         if self.time_to_fill_ms > 0 {
-            Decimal::from(1000) / Decimal::from(self.time_to_fill_ms)
+            // 1000 over a nonzero `u64` count is at most 1000.
+            #[allow(clippy::arithmetic_side_effects)]
+            let rate = Decimal::from(1000) / Decimal::from(self.time_to_fill_ms);
+            rate
         } else {
             Decimal::from(1000) // Default to 1000/s for instant fills
         }
@@ -387,7 +390,8 @@ impl OrderIntensityEstimator {
     /// * `observation` - The fill observation to record
     pub fn record_fill(&mut self, observation: FillObservation) {
         self.observations.push_back(observation);
-        self.total_fills += 1;
+        // A count of fills: it saturates at `u64::MAX`.
+        self.total_fills = self.total_fills.saturating_add(1);
     }
 
     /// Records a fill from components.
@@ -449,7 +453,7 @@ impl OrderIntensityEstimator {
         }
 
         // Check for spread variance (can't estimate k if all same spread)
-        let spread_variance = calculate_variance(&spreads);
+        let spread_variance = calculate_variance(&spreads)?;
         if spread_variance < dec!(0.0000001) {
             return Err(MMError::InvalidMarketState(
                 "insufficient spread variance for estimation".to_string(),
@@ -457,9 +461,11 @@ impl OrderIntensityEstimator {
         }
 
         // Perform linear regression: ln(rate) = ln(A) - k * spread
-        let (intercept, slope, r_squared) = linear_regression(&spreads, &log_rates);
+        let (intercept, slope, r_squared) = linear_regression(&spreads, &log_rates)?;
 
         // k = -slope (since ln(rate) = ln(A) - k * spread)
+        // Negating a Decimal flips its sign bit: it cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
         let mut k = -slope;
 
         // Clamp k to valid range
@@ -469,18 +475,30 @@ impl OrderIntensityEstimator {
         let baseline_rate = exp_approx(intercept);
 
         // Calculate standard error of k
-        let k_std_error = calculate_slope_std_error(&spreads, &log_rates, slope, intercept);
+        let k_std_error = calculate_slope_std_error(&spreads, &log_rates, slope, intercept)?;
 
-        // Calculate confidence based on sample size and R²
-        let sample_factor = Decimal::from(self.observations.len().min(100)) / Decimal::from(100);
-        let r2_factor = r_squared.max(Decimal::ZERO);
-        let confidence = (sample_factor * dec!(0.5) + r2_factor * dec!(0.5)).min(Decimal::ONE);
+        // Calculate confidence based on sample size and R². Both factors
+        // are in [0, 1] (R² is clamped by the regression), so this cannot
+        // overflow.
+        #[allow(clippy::arithmetic_side_effects)]
+        let confidence = {
+            let sample_factor =
+                Decimal::from(self.observations.len().min(100)) / Decimal::from(100);
+            let r2_factor = r_squared.max(Decimal::ZERO);
+            (sample_factor * dec!(0.5) + r2_factor * dec!(0.5)).min(Decimal::ONE)
+        };
 
         // Apply EWMA smoothing
         let smoothed_k = match self.ewma_k {
             Some(prev_k) => {
                 let alpha = self.config.smoothing_factor;
-                alpha * k + (Decimal::ONE - alpha) * prev_k
+                alpha
+                    .checked_mul(k)
+                    .and_then(|a| {
+                        let b = Decimal::ONE.checked_sub(alpha)?.checked_mul(prev_k)?;
+                        a.checked_add(b)
+                    })
+                    .or_overflow("smoothed k")?
             }
             None => k,
         };
@@ -538,19 +556,24 @@ impl OrderIntensityEstimator {
     ///
     /// # Returns
     ///
-    /// Fill probability in [0, 1], or None if no estimate available.
+    /// Fill probability in [0, 1], or None if no estimate available or the
+    /// intensity overflows.
     #[must_use]
     pub fn fill_probability(&self, spread: Decimal, time_horizon_ms: u64) -> Option<Decimal> {
         let estimate = self.current_estimate.as_ref()?;
 
         // λ(δ) = A * exp(-k * δ)
-        let lambda = estimate.baseline_rate * exp_approx(-estimate.k * spread);
+        let lambda = arrival_rate(estimate, spread)?;
 
         // Convert time to seconds
-        let time_seconds = Decimal::from(time_horizon_ms) / Decimal::from(1000);
+        let time_seconds = Decimal::from(time_horizon_ms).checked_div(Decimal::ONE_THOUSAND)?;
 
         // P(fill) = 1 - exp(-λ * t)
-        let prob = Decimal::ONE - exp_approx(-lambda * time_seconds);
+        // An intensity times time too large to represent is a near certain
+        // fill: `exp_approx` clamps the exponent, so the probability is 1.
+        let rate_time = lambda.checked_mul(time_seconds).unwrap_or(Decimal::MAX);
+        let exponent = Decimal::ZERO.checked_sub(rate_time)?;
+        let prob = Decimal::ONE.checked_sub(exp_approx(exponent))?;
 
         Some(prob.max(Decimal::ZERO).min(Decimal::ONE))
     }
@@ -565,18 +588,22 @@ impl OrderIntensityEstimator {
     ///
     /// # Returns
     ///
-    /// Expected time to fill in milliseconds, or None if no estimate.
+    /// Expected time to fill in milliseconds, or None if no estimate or the
+    /// intensity overflows.
     #[must_use]
     pub fn expected_time_to_fill_ms(&self, spread: Decimal) -> Option<u64> {
         let estimate = self.current_estimate.as_ref()?;
 
         // λ(δ) = A * exp(-k * δ)
-        let lambda = estimate.baseline_rate * exp_approx(-estimate.k * spread);
+        let lambda = arrival_rate(estimate, spread)?;
 
         if lambda > Decimal::ZERO {
-            // E[T] = 1/λ in seconds, convert to ms
-            let time_seconds = Decimal::ONE / lambda;
-            let time_ms = time_seconds * Decimal::from(1000);
+            // E[T] = 1/λ in seconds, convert to ms; a time too long to
+            // represent saturates.
+            let time_ms = Decimal::ONE
+                .checked_div(lambda)
+                .and_then(|t| t.checked_mul(Decimal::ONE_THOUSAND))
+                .unwrap_or(Decimal::MAX);
             Some(decimal_to_u64_saturating(time_ms))
         } else {
             None
@@ -621,7 +648,12 @@ impl OrderIntensityEstimator {
             .map(|o| o.time_to_fill_ms)
             .collect();
 
-        let mean_spread = spreads.iter().copied().sum::<Decimal>() / Decimal::from(spreads.len());
+        // Report only: the sum saturates at the `Decimal` bounds.
+        let mean_spread = spreads
+            .iter()
+            .fold(Decimal::ZERO, |acc, &x| acc.saturating_add(x))
+            .checked_div(Decimal::from(spreads.len()))
+            .unwrap_or(Decimal::ZERO);
         // Summed in u128 (cannot overflow for fewer than 2^64 values); the
         // mean is at most the largest time, so it narrows back to u64.
         let mean_time = times
@@ -676,6 +708,10 @@ pub struct ObservationStats {
 }
 
 /// Approximates natural logarithm using Taylor series.
+// `x > 0` is normalized into [1, 10) by dividing or multiplying by 10, which
+// cannot overflow; `exponent` stays within the 28 decimal digits of a
+// Decimal; and the series runs on `y` in [0, 9/11).
+#[allow(clippy::arithmetic_side_effects)]
 fn ln_approx(x: Decimal) -> Decimal {
     if x <= Decimal::ZERO {
         return Decimal::from(-1000); // Large negative for log(0)
@@ -713,6 +749,9 @@ fn ln_approx(x: Decimal) -> Decimal {
 }
 
 /// Approximates exponential function using Taylor series.
+// `x` is clamped to [-20, 20], so every term is at most 20^19 / 19! and the
+// sum stays far below `Decimal::MAX`; the divisor `i` is at least 1.
+#[allow(clippy::arithmetic_side_effects)]
 fn exp_approx(x: Decimal) -> Decimal {
     // Clamp to prevent overflow
     let x_clamped = x.max(Decimal::from(-20)).min(Decimal::from(20));
@@ -732,113 +771,182 @@ fn exp_approx(x: Decimal) -> Decimal {
     result.max(Decimal::ZERO)
 }
 
+/// Checked sum of `f` over `values`.
+fn checked_sum<T>(values: &[T], f: impl Fn(&T) -> Option<Decimal>) -> Option<Decimal> {
+    values
+        .iter()
+        .try_fold(Decimal::ZERO, |acc, v| acc.checked_add(f(v)?))
+}
+
 /// Performs simple linear regression.
 /// Returns (intercept, slope, r_squared).
-fn linear_regression(x: &[Decimal], y: &[Decimal]) -> (Decimal, Decimal, Decimal) {
+///
+/// # Errors
+///
+/// Returns [`MMError::NumericalError`] if a sum or ratio overflows.
+fn linear_regression(x: &[Decimal], y: &[Decimal]) -> MMResult<(Decimal, Decimal, Decimal)> {
     let n = Decimal::from(x.len());
     if x.len() < 2 {
-        return (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+        return Ok((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
     }
 
-    let sum_x: Decimal = x.iter().copied().sum();
-    let sum_y: Decimal = y.iter().copied().sum();
-    let sum_xy: Decimal = x.iter().zip(y.iter()).map(|(xi, yi)| *xi * *yi).sum();
-    let sum_x2: Decimal = x.iter().map(|xi| *xi * *xi).sum();
-    let sum_y2: Decimal = y.iter().map(|yi| *yi * *yi).sum();
+    let pairs: Vec<(Decimal, Decimal)> = x.iter().copied().zip(y.iter().copied()).collect();
+    let sum_x = checked_sum(x, |v| Some(*v)).or_overflow("regression sum")?;
+    let sum_y = checked_sum(y, |v| Some(*v)).or_overflow("regression sum")?;
+    let sum_xy = checked_sum(&pairs, |(a, b)| a.checked_mul(*b)).or_overflow("regression sum")?;
+    let sum_x2 = checked_sum(x, |v| v.checked_mul(*v)).or_overflow("regression sum")?;
+    let sum_y2 = checked_sum(y, |v| v.checked_mul(*v)).or_overflow("regression sum")?;
 
-    let mean_x = sum_x / n;
-    let mean_y = sum_y / n;
+    let mean_x = sum_x.checked_div(n).or_overflow("regression mean")?;
+    let mean_y = sum_y.checked_div(n).or_overflow("regression mean")?;
 
-    let ss_xy = sum_xy - n * mean_x * mean_y;
-    let ss_xx = sum_x2 - n * mean_x * mean_x;
-    let ss_yy = sum_y2 - n * mean_y * mean_y;
+    // `sum - n * mean_a * mean_b`
+    let centered = |sum: Decimal, a: Decimal, b: Decimal| {
+        n.checked_mul(a)
+            .and_then(|v| v.checked_mul(b))
+            .and_then(|v| sum.checked_sub(v))
+            .or_overflow("regression sum of squares")
+    };
+    let ss_xy = centered(sum_xy, mean_x, mean_y)?;
+    let ss_xx = centered(sum_x2, mean_x, mean_x)?;
+    let ss_yy = centered(sum_y2, mean_y, mean_y)?;
 
     if ss_xx.abs() < dec!(0.0000001) {
-        return (mean_y, Decimal::ZERO, Decimal::ZERO);
+        return Ok((mean_y, Decimal::ZERO, Decimal::ZERO));
     }
 
-    let slope = ss_xy / ss_xx;
-    let intercept = mean_y - slope * mean_x;
+    let slope = ss_xy.checked_div(ss_xx).or_overflow("regression slope")?;
+    let intercept = slope
+        .checked_mul(mean_x)
+        .and_then(|v| mean_y.checked_sub(v))
+        .or_overflow("regression intercept")?;
 
     // R² = (SS_xy)² / (SS_xx * SS_yy)
     let r_squared = if ss_yy.abs() > dec!(0.0000001) {
-        (ss_xy * ss_xy) / (ss_xx * ss_yy)
+        ss_xy
+            .checked_mul(ss_xy)
+            .and_then(|num| num.checked_div(ss_xx.checked_mul(ss_yy)?))
+            .or_overflow("regression r squared")?
     } else {
         Decimal::ONE
     };
 
-    (
+    Ok((
         intercept,
         slope,
         r_squared.max(Decimal::ZERO).min(Decimal::ONE),
-    )
+    ))
 }
 
 /// Calculates variance of a slice.
-fn calculate_variance(values: &[Decimal]) -> Decimal {
+///
+/// # Errors
+///
+/// Returns [`MMError::NumericalError`] if a sum overflows.
+fn calculate_variance(values: &[Decimal]) -> MMResult<Decimal> {
     if values.len() < 2 {
-        return Decimal::ZERO;
+        return Ok(Decimal::ZERO);
     }
 
     let n = Decimal::from(values.len());
-    let mean = values.iter().copied().sum::<Decimal>() / n;
-    let sum_sq_diff: Decimal = values.iter().map(|v| (*v - mean) * (*v - mean)).sum();
+    let mean = checked_sum(values, |v| Some(*v))
+        .and_then(|sum| sum.checked_div(n))
+        .or_overflow("variance mean")?;
+    let sum_sq_diff = checked_sum(values, |v| {
+        let d = v.checked_sub(mean)?;
+        d.checked_mul(d)
+    })
+    .or_overflow("variance sum")?;
 
-    sum_sq_diff / (n - Decimal::ONE)
+    sum_sq_diff
+        .checked_div(n.checked_sub(Decimal::ONE).or_overflow("variance")?)
+        .or_overflow("variance")
 }
 
 /// Calculates standard error of the slope estimate.
+///
+/// # Errors
+///
+/// Returns [`MMError::NumericalError`] if a sum overflows.
 fn calculate_slope_std_error(
     x: &[Decimal],
     y: &[Decimal],
     slope: Decimal,
     intercept: Decimal,
-) -> Decimal {
+) -> MMResult<Decimal> {
     if x.len() < 3 {
-        return Decimal::ZERO;
+        return Ok(Decimal::ZERO);
     }
 
     let n = Decimal::from(x.len());
 
     // Calculate residual sum of squares
-    let rss: Decimal = x
-        .iter()
-        .zip(y.iter())
-        .map(|(xi, yi)| {
-            let predicted = intercept + slope * *xi;
-            let residual = *yi - predicted;
-            residual * residual
-        })
-        .sum();
+    let pairs: Vec<(Decimal, Decimal)> = x.iter().copied().zip(y.iter().copied()).collect();
+    let rss = checked_sum(&pairs, |(xi, yi)| {
+        let predicted = intercept.checked_add(slope.checked_mul(*xi)?)?;
+        let residual = yi.checked_sub(predicted)?;
+        residual.checked_mul(residual)
+    })
+    .or_overflow("residual sum of squares")?;
 
     // Calculate SS_xx
-    let mean_x = x.iter().copied().sum::<Decimal>() / n;
-    let ss_xx: Decimal = x.iter().map(|xi| (*xi - mean_x) * (*xi - mean_x)).sum();
+    let mean_x = checked_sum(x, |v| Some(*v))
+        .and_then(|sum| sum.checked_div(n))
+        .or_overflow("slope error mean")?;
+    let ss_xx = checked_sum(x, |xi| {
+        let d = xi.checked_sub(mean_x)?;
+        d.checked_mul(d)
+    })
+    .or_overflow("slope error sum of squares")?;
 
     if ss_xx.abs() < dec!(0.0000001) {
-        return Decimal::ZERO;
+        return Ok(Decimal::ZERO);
     }
 
     // Standard error = sqrt(RSS / (n-2)) / sqrt(SS_xx)
-    let mse = rss / (n - Decimal::from(2));
-    let se_squared = mse / ss_xx;
+    let se_squared = n
+        .checked_sub(Decimal::TWO)
+        .and_then(|dof| rss.checked_div(dof))
+        .and_then(|mse| mse.checked_div(ss_xx))
+        .or_overflow("slope standard error")?;
 
     // Approximate sqrt
-    decimal_sqrt_approx(se_squared)
+    Ok(decimal_sqrt_approx(se_squared))
+}
+
+/// `λ(δ) = A * exp(-k * δ)`, or `None` on overflow.
+fn arrival_rate(estimate: &IntensityEstimate, spread: Decimal) -> Option<Decimal> {
+    let exponent = Decimal::ZERO.checked_sub(estimate.k.checked_mul(spread)?)?;
+    estimate.baseline_rate.checked_mul(exp_approx(exponent))
 }
 
 /// Approximate square root using Newton's method.
+///
+/// Every step is checked: a guess that rounds to zero (`x / 2` for the
+/// smallest positive Decimal) or a step that overflows ends the iteration
+/// with the best guess so far, never a division by zero.
 fn decimal_sqrt_approx(x: Decimal) -> Decimal {
     if x <= Decimal::ZERO {
         return Decimal::ZERO;
     }
 
-    let mut guess = x / Decimal::from(2);
+    // Start from x / 2, or from x itself when halving rounds to zero.
+    let mut guess = x
+        .checked_div(Decimal::TWO)
+        .filter(|g| !g.is_zero())
+        .unwrap_or(x);
     let epsilon = dec!(0.0000001);
 
     for _ in 0..20 {
-        let new_guess = (guess + x / guess) / Decimal::from(2);
-        if (new_guess - guess).abs() < epsilon {
+        let Some(new_guess) = x
+            .checked_div(guess)
+            .and_then(|q| guess.checked_add(q))
+            .and_then(|sum| sum.checked_div(Decimal::TWO))
+            .filter(|g| !g.is_zero())
+        else {
+            return guess;
+        };
+        if new_guess.saturating_sub(guess).abs() < epsilon {
             return new_guess;
         }
         guess = new_guess;
@@ -851,6 +959,69 @@ fn decimal_sqrt_approx(x: Decimal) -> Decimal {
 mod tests {
     use super::*;
     use crate::dec;
+
+    #[test]
+    fn test_regression_helpers_overflow_returns_numerical_error() {
+        let x = [Decimal::MAX, Decimal::MAX];
+        let y = [dec!(1), dec!(2)];
+        assert!(matches!(
+            linear_regression(&x, &y),
+            Err(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            calculate_variance(&x),
+            Err(MMError::NumericalError(_))
+        ));
+        let x3 = [dec!(1), dec!(2), dec!(3)];
+        let y3 = [dec!(1), dec!(2), dec!(3)];
+        assert!(matches!(
+            calculate_slope_std_error(&x3, &y3, Decimal::MAX, Decimal::MAX),
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[test]
+    fn test_sqrt_approx_smallest_positive_does_not_panic() {
+        let tiny = dec!(0.0000000000000000000000000001);
+        let root = decimal_sqrt_approx(tiny);
+        assert!(root > Decimal::ZERO);
+        assert!(decimal_sqrt_approx(Decimal::MAX) > Decimal::ZERO);
+        let four = decimal_sqrt_approx(dec!(16));
+        assert!((four - dec!(4)).abs() < dec!(0.0001), "{four}");
+    }
+
+    #[test]
+    fn test_fill_probability_with_overflowing_rate_times_time_is_one() {
+        let mut estimator =
+            OrderIntensityEstimator::new(OrderIntensityConfig::new(60_000, 10, dec!(0.1)).unwrap());
+        estimator.current_estimate = Some(IntensityEstimate {
+            k: Decimal::ZERO,
+            baseline_rate: Decimal::MAX / dec!(2),
+            confidence: dec!(1),
+            sample_size: 10,
+            r_squared: dec!(1),
+            k_std_error: Decimal::ZERO,
+            timestamp: 0,
+        });
+        assert_eq!(
+            estimator.fill_probability(dec!(1), 10_000),
+            Some(Decimal::ONE)
+        );
+    }
+
+    #[test]
+    fn test_arrival_rate_overflow_is_none() {
+        let estimate = IntensityEstimate {
+            k: Decimal::MAX,
+            baseline_rate: dec!(1),
+            confidence: dec!(1),
+            sample_size: 10,
+            r_squared: dec!(1),
+            k_std_error: Decimal::ZERO,
+            timestamp: 0,
+        };
+        assert_eq!(arrival_rate(&estimate, dec!(2)), None);
+    }
 
     #[test]
     fn test_config_valid() {
@@ -1084,7 +1255,7 @@ mod tests {
         let x = vec![dec!(1), dec!(2), dec!(3), dec!(4), dec!(5)];
         let y = vec![dec!(5), dec!(8), dec!(11), dec!(14), dec!(17)];
 
-        let (intercept, slope, r_squared) = linear_regression(&x, &y);
+        let (intercept, slope, r_squared) = linear_regression(&x, &y).unwrap();
 
         assert!((intercept - dec!(2)).abs() < dec!(0.001));
         assert!((slope - dec!(3)).abs() < dec!(0.001));

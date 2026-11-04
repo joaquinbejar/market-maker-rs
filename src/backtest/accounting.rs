@@ -30,8 +30,8 @@
 //!         self.snapshot.fills_posted += 1;
 //!         Ok(())
 //!     }
-//!     fn snapshot(&self) -> AccountingSnapshot {
-//!         self.snapshot.clone()
+//!     fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+//!         Ok(self.snapshot.clone())
 //!     }
 //!     fn reset(&mut self) {
 //!         self.snapshot = AccountingSnapshot::default();
@@ -84,6 +84,8 @@ impl AccountingFill {
     pub fn signed_quantity(&self) -> MMResult<Decimal> {
         Ok(match Dir::try_from(self.side)? {
             Dir::Buy => self.quantity,
+            // Negating a Decimal flips its sign bit: it cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
             Dir::Sell => -self.quantity,
         })
     }
@@ -105,6 +107,8 @@ impl AccountingFill {
             ))
         })?;
         Ok(match dir {
+            // Negating a Decimal flips its sign bit: it cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
             Dir::Buy => -notional,
             Dir::Sell => notional,
         })
@@ -156,7 +160,13 @@ pub trait FillAccountant: fmt::Debug {
     fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()>;
 
     /// Returns the current accounting state.
-    fn snapshot(&self) -> AccountingSnapshot;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if a sum over the booked
+    /// executions overflows. The snapshot is a running balance, so it never
+    /// saturates silently.
+    fn snapshot(&self) -> MMResult<AccountingSnapshot>;
 
     /// Returns to the initial state.
     fn reset(&mut self);
@@ -177,6 +187,7 @@ mod margin_ledger {
     use super::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
     use crate::Decimal;
     use crate::types::action::Dir;
+    use crate::types::decimal::OrOverflow;
     use crate::types::error::{MMError, MMResult};
     use margin_rs::Action;
     use margin_rs::ledger::{Execution, Ledger};
@@ -224,7 +235,8 @@ mod margin_ledger {
         /// # Errors
         ///
         /// Returns [`MMError::InvalidConfiguration`] if the instrument is not
-        /// a registered spot instrument.
+        /// a registered spot instrument, or [`MMError::NumericalError`] if
+        /// the base fees already in the ledger overflow.
         pub fn new(ledger: Ledger, instrument: InstrumentId) -> MMResult<Self> {
             let (base, quote) = match ledger.instrument(&instrument) {
                 Some(Instrument::Spot(spot)) => (spot.base().clone(), spot.quote().clone()),
@@ -246,7 +258,8 @@ mod margin_ledger {
                 .iter()
                 .filter(|e| e.instrument == instrument)
                 .filter_map(|e| e.fee.as_ref().filter(|f| f.asset == base))
-                .fold(Decimal::ZERO, |sum, f| sum.saturating_add(f.amount));
+                .try_fold(Decimal::ZERO, |sum, f| sum.checked_add(f.amount))
+                .or_overflow("ledger base fees")?;
             Ok(Self {
                 initial: ledger.clone(),
                 ledger,
@@ -296,6 +309,13 @@ mod margin_ledger {
                 .map_err(|e| margin_error("execution id", e))?;
             // Before booking: a rejected post leaves the ledger unchanged.
             let side = Action::from(Dir::try_from(fill.side)?);
+            let base_fees = match fill.fee_asset {
+                FeeAsset::Base => self
+                    .base_fees
+                    .checked_add(fill.fee)
+                    .or_overflow("ledger base fees")?,
+                FeeAsset::Quote | FeeAsset::Other(_) => self.base_fees,
+            };
             let mut execution =
                 Execution::new(id, self.instrument.clone(), side, fill.price, fill.quantity);
             // Negative fees are rebates and are booked as such.
@@ -306,9 +326,7 @@ mod margin_ledger {
                 .ledger
                 .book_execution_allowing_overdraft(&execution, None)
                 .map_err(|e| margin_error("booking", e))?;
-            if fill.fee_asset == FeeAsset::Base {
-                self.base_fees = self.base_fees.saturating_add(fill.fee);
-            }
+            self.base_fees = base_fees;
             for (asset, shortfall) in booked.shortfalls {
                 let worst = self.overdrafts.entry(asset).or_insert(Decimal::ZERO);
                 *worst = (*worst).max(shortfall);
@@ -316,7 +334,7 @@ mod margin_ledger {
             Ok(())
         }
 
-        fn snapshot(&self) -> AccountingSnapshot {
+        fn snapshot(&self) -> MMResult<AccountingSnapshot> {
             let position = self.ledger.position(&self.instrument);
             let mut snapshot = AccountingSnapshot {
                 // The account holds the traded quantity minus the base it
@@ -324,7 +342,8 @@ mod margin_ledger {
                 position: position
                     .as_ref()
                     .map_or(Decimal::ZERO, |p| p.quantity)
-                    .saturating_sub(self.base_fees),
+                    .checked_sub(self.base_fees)
+                    .or_overflow("ledger position")?,
                 average_entry_price: position.as_ref().and_then(|p| p.average_price()),
                 base_fees: self.base_fees,
                 ..AccountingSnapshot::default()
@@ -335,22 +354,25 @@ mod margin_ledger {
                 .iter()
                 .filter(|e| e.instrument == self.instrument)
             {
-                // A snapshot cannot fail, so the sums saturate at the
-                // `Decimal` bounds instead of panicking.
                 snapshot.cash_flow = match Dir::try_from(entry.side) {
-                    Ok(Dir::Buy) => snapshot.cash_flow.saturating_sub(entry.notional),
-                    Ok(Dir::Sell) => snapshot.cash_flow.saturating_add(entry.notional),
+                    Ok(Dir::Buy) => snapshot.cash_flow.checked_sub(entry.notional),
+                    Ok(Dir::Sell) => snapshot.cash_flow.checked_add(entry.notional),
                     // margin-rs books only buys and sells and rejects any
                     // other action before booking, so no journal entry has
                     // another side.
-                    Err(_) => snapshot.cash_flow,
-                };
-                if let Some(fee) = entry.fee.as_ref().filter(|f| f.asset == self.quote) {
-                    snapshot.fees = snapshot.fees.saturating_add(fee.amount);
+                    Err(_) => Some(snapshot.cash_flow),
                 }
+                .or_overflow("ledger cash flow")?;
+                if let Some(fee) = entry.fee.as_ref().filter(|f| f.asset == self.quote) {
+                    snapshot.fees = snapshot
+                        .fees
+                        .checked_add(fee.amount)
+                        .or_overflow("ledger fees")?;
+                }
+                // A count of journal entries: it saturates at `u64::MAX`.
                 snapshot.fills_posted = snapshot.fills_posted.saturating_add(1);
             }
-            snapshot
+            Ok(snapshot)
         }
 
         fn reset(&mut self) {

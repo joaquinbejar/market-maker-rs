@@ -103,7 +103,9 @@ impl HaltReason {
 pub enum RejectReason {
     /// The run is over (or the state is not at a decision point), or the
     /// action's transaction failed and halted the run: it never took effect
-    /// and [`StepOutcome::status`] gives the halt reason.
+    /// and [`StepOutcome::status`] gives the halt reason. When an admitted
+    /// transaction halts, the action is still counted as an action, with no
+    /// outcome recorded: `step` and `counters.actions` advance.
     Terminal = 1,
     /// A price is outside `min..=max_price` ticks.
     PriceRange = 2,

@@ -187,6 +187,8 @@ impl JitterRng {
         self.state = state;
         // `max + 1` overflows only for `u64::MAX`, where every value is in range.
         match max.checked_add(1) {
+            // `bound >= 1`, so the remainder cannot fail.
+            #[allow(clippy::arithmetic_side_effects)]
             Some(bound) => value % bound,
             None => value,
         }

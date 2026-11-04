@@ -39,6 +39,7 @@ fmt-check:
 .PHONY: lint
 lint:
 	cargo clippy --all-targets --all-features --workspace -- -D warnings
+	cargo clippy --all-targets --no-default-features --workspace -- -D warnings
 
 .PHONY: lint-fix
 lint-fix: 

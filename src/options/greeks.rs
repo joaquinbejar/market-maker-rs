@@ -3,6 +3,9 @@
 //! This module provides types for tracking and aggregating Greeks across
 //! multiple options positions in a portfolio.
 
+// TODO(#166): legacy pricing arithmetic, converted in #166
+#![allow(clippy::arithmetic_side_effects)]
+
 use crate::Decimal;
 use rust_decimal_macros::dec;
 

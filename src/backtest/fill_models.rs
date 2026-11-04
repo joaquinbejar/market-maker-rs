@@ -40,6 +40,7 @@
 use crate::Decimal;
 use crate::execution::Action;
 use crate::types::action::Dir;
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -380,7 +381,7 @@ impl FillModel for ImmediateFillModel {
 /// let tick = MarketTick::new(1001, dec!(99.9), dec!(10.0), dec!(100.1), dec!(10.0));
 ///
 /// // Update queue from market data
-/// model.update_queue(&tick);
+/// model.update_queue(&tick).unwrap();
 ///
 /// // Simulate fill after some time in queue
 /// let result = model.simulate_fill(&order, &tick, 100);
@@ -428,13 +429,21 @@ impl QueuePositionFillModel {
     /// Updates queue depth estimates from market data.
     ///
     /// Uses the bid/ask sizes as estimates of queue depth at those levels.
-    pub fn update_queue(&mut self, tick: &MarketTick) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidMarketState`] if a size is negative; the
+    /// estimates are then unchanged. Invalid data is never read as an empty
+    /// queue, which would fill orders at once.
+    pub fn update_queue(&mut self, tick: &MarketTick) -> MMResult<()> {
+        check_queue_sizes(tick)?;
         // Normalized string keys: 100, 100.0 and 100.00 are the same level.
         let bid_key = tick.bid_price.normalize().to_string();
         let ask_key = tick.ask_price.normalize().to_string();
 
         self.queue_depth.insert(bid_key, tick.bid_size);
         self.queue_depth.insert(ask_key, tick.ask_size);
+        Ok(())
     }
 
     /// Returns the estimated queue depth at a price level.
@@ -526,6 +535,8 @@ impl FillModel for QueuePositionFillModel {
         time_in_queue_ms: u64,
     ) -> MMResult<FillResult> {
         let dir = order.dir()?;
+        // A tick with a negative size has no valid queue estimate.
+        check_queue_sizes(tick)?;
         Ok(self.fill_for(dir, order, tick, time_in_queue_ms))
     }
 
@@ -539,9 +550,14 @@ impl FillModel for QueuePositionFillModel {
 
     /// Keeps only the current top of book levels, so memory stays bounded
     /// on long streams and no stale depth survives a price move.
+    ///
+    /// A tick with a negative size leaves no estimate; `simulate_fill`
+    /// rejects that tick, so it never fills against an empty queue.
     fn on_tick(&mut self, tick: &MarketTick) {
         self.queue_depth.clear();
-        self.update_queue(tick);
+        if self.update_queue(tick).is_err() {
+            self.queue_depth.clear();
+        }
     }
 
     fn validate(&self) -> MMResult<()> {
@@ -656,14 +672,15 @@ impl ProbabilisticFillModel {
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`] if the order's side is neither
-    /// buy nor sell.
+    /// buy nor sell, or [`MMError::NumericalError`] if the probability
+    /// overflows.
     pub fn calculate_probability(
         &self,
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
     ) -> MMResult<Decimal> {
-        Ok(self.probability_for(order.dir()?, order, tick, time_in_queue_ms))
+        self.probability_for(order.dir()?, order, tick, time_in_queue_ms)
     }
 
     /// The fill probability of a supported order.
@@ -673,7 +690,7 @@ impl ProbabilisticFillModel {
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
-    ) -> Decimal {
+    ) -> MMResult<Decimal> {
         // Get available liquidity at our side
         let available_liquidity = match dir {
             Dir::Buy => tick.ask_size,
@@ -682,32 +699,57 @@ impl ProbabilisticFillModel {
 
         // Calculate relative depth (order size / available liquidity)
         let relative_depth = if available_liquidity > Decimal::ZERO {
-            order.quantity / available_liquidity
+            order
+                .quantity
+                .checked_div(available_liquidity)
+                .or_overflow("relative depth")?
         } else {
             Decimal::ONE // Max depth if no liquidity
         };
 
         // Depth component: exp(-depth_factor * relative_depth)
         // Approximated as 1 / (1 + depth_factor * relative_depth) for simplicity
-        let depth_component = Decimal::ONE / (Decimal::ONE + self.depth_factor * relative_depth);
+        let depth_component = self
+            .depth_factor
+            .checked_mul(relative_depth)
+            .and_then(|x| Decimal::ONE.checked_add(x))
+            .and_then(|x| Decimal::ONE.checked_div(x))
+            .or_overflow("depth component")?;
 
         // Time component: 1 - exp(-time_factor * time_ms)
         // Approximated as min(1, time_factor * time_ms) for simplicity
-        let time_component = (self.time_factor * Decimal::from(time_in_queue_ms)).min(Decimal::ONE);
+        // Clamped to 1 anyway, so a product too large to represent is 1;
+        // a negative factor (rejected by `validate`) stays below zero.
+        let time_component = self
+            .time_factor
+            .checked_mul(Decimal::from(time_in_queue_ms))
+            .unwrap_or(if self.time_factor.is_sign_negative() {
+                Decimal::MIN
+            } else {
+                Decimal::ONE
+            })
+            .min(Decimal::ONE);
 
         // Final probability
-        self.base_probability * depth_component * time_component
+        self.base_probability
+            .checked_mul(depth_component)
+            .and_then(|x| x.checked_mul(time_component))
+            .or_overflow("fill probability")
     }
 
-    /// Generates a deterministic pseudo-random number between 0 and 1.
+    /// Generates a deterministic pseudo-random number, uniform in [0, 1).
     fn next_random(&self) -> Decimal {
         // Simple LCG for deterministic randomness
         let current = self.state.load(Ordering::Relaxed);
         let next = current.wrapping_mul(6364136223846793005).wrapping_add(1);
         self.state.store(next, Ordering::Relaxed);
-        // `next >> 33` keeps 31 bits, so it always fits in a `u32`.
-        let value = u32::try_from(next >> 33).unwrap_or(u32::MAX);
-        Decimal::from(value) / Decimal::from(u32::MAX)
+        // The top 32 bits of the state, scaled by 2^32, give a uniform draw
+        // in [0, 1). The high bits of an LCG are its best distributed ones.
+        let value = next >> 32;
+        let scale = Decimal::from(1u64 << 32);
+        Decimal::from(value)
+            .checked_div(scale)
+            .unwrap_or(Decimal::ZERO)
     }
 }
 
@@ -719,7 +761,7 @@ impl ProbabilisticFillModel {
         order: &SimulatedOrder,
         tick: &MarketTick,
         time_in_queue_ms: u64,
-    ) -> FillResult {
+    ) -> MMResult<FillResult> {
         // First check if market has crossed our price
         let market_crossed = match dir {
             Dir::Buy => tick.ask_price <= order.price,
@@ -727,22 +769,22 @@ impl ProbabilisticFillModel {
         };
 
         if !market_crossed {
-            return FillResult::NoFill;
+            return Ok(FillResult::NoFill);
         }
 
         // Calculate fill probability
-        let prob = self.probability_for(dir, order, tick, time_in_queue_ms);
+        let prob = self.probability_for(dir, order, tick, time_in_queue_ms)?;
 
         // Generate random number and compare
         let random = self.next_random();
 
-        if random < prob {
+        Ok(if random < prob {
             FillResult::FullFill {
                 fill_price: order.price,
             }
         } else {
             FillResult::NoFill
-        }
+        })
     }
 }
 
@@ -755,7 +797,7 @@ impl FillModel for ProbabilisticFillModel {
     ) -> MMResult<FillResult> {
         // Before the random draw, so the generator state is untouched.
         let dir = order.dir()?;
-        Ok(self.fill_for(dir, order, tick, time_in_queue_ms))
+        self.fill_for(dir, order, tick, time_in_queue_ms)
     }
 
     fn reset(&mut self) {
@@ -1023,6 +1065,17 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
     Some(x)
 }
 
+/// Rejects a tick whose bid or ask size is negative.
+fn check_queue_sizes(tick: &MarketTick) -> MMResult<()> {
+    if tick.bid_size.is_sign_negative() || tick.ask_size.is_sign_negative() {
+        return Err(MMError::InvalidMarketState(format!(
+            "negative queue size at {}: bid {} ask {}",
+            tick.timestamp, tick.bid_size, tick.ask_size
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,10 +1221,35 @@ mod tests {
         let mut model = QueuePositionFillModel::new(dec!(0.1));
         let tick = MarketTick::new(1000, dec!(100.0), dec!(50.0), dec!(100.1), dec!(30.0));
 
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
 
         assert_eq!(model.get_queue_depth(dec!(100.0)), dec!(50.0));
         assert_eq!(model.get_queue_depth(dec!(100.1)), dec!(30.0));
+    }
+
+    #[test]
+    fn test_queue_position_negative_size_is_rejected() {
+        let mut model = QueuePositionFillModel::new(dec!(0.1));
+        let valid = MarketTick::new(1000, dec!(100.0), dec!(50.0), dec!(100.1), dec!(30.0));
+        model.update_queue(&valid).unwrap();
+        let invalid = MarketTick::new(1001, dec!(100.0), dec!(-50.0), dec!(100.1), dec!(30.0));
+        let result = model.update_queue(&invalid);
+        assert!(
+            matches!(result, Err(MMError::InvalidMarketState(_))),
+            "{result:?}"
+        );
+        // The estimates are unchanged.
+        assert_eq!(model.get_queue_depth(dec!(100.0)), dec!(50.0));
+
+        // Through the engine hook the invalid tick never fills: it is
+        // rejected, not read as an empty queue.
+        model.on_tick(&invalid);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.1), dec!(1.0), 1000);
+        let result = model.simulate_fill(&order, &invalid, 1_000_000);
+        assert!(
+            matches!(result, Err(MMError::InvalidMarketState(_))),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1190,7 +1268,7 @@ mod tests {
     fn test_queue_position_max_queue_and_max_cleared_returns_no_fill() {
         let mut model = QueuePositionFillModel::new(Decimal::MAX);
         let tick = MarketTick::new(1000, dec!(1), dec!(1), dec!(2), Decimal::MAX);
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
         let order = SimulatedOrder::new(Action::Buy, dec!(2), dec!(1), 1000);
         // cleared == queue_ahead == MAX: only the queue ahead cleared.
         let result = model.simulate_fill(&order, &tick, 1).unwrap();
@@ -1201,7 +1279,7 @@ mod tests {
     fn test_queue_position_overflowing_cleared_volume_returns_no_fill() {
         let mut model = QueuePositionFillModel::new(Decimal::MAX);
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10), dec!(100), dec!(5));
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
         let order = SimulatedOrder::new(Action::Buy, dec!(100), dec!(1), 1000);
         let result = model.simulate_fill(&order, &tick, 2).unwrap();
         assert!(!result.is_filled());
@@ -1214,7 +1292,7 @@ mod tests {
 
         // Set up queue with 5 units ahead
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(5.0));
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
 
         // After 60ms: cleared 6 units, queue was 5, order is 1 -> full fill
         let result = model.simulate_fill(&order, &tick, 60).unwrap();
@@ -1228,7 +1306,7 @@ mod tests {
 
         // Set up queue with 5 units ahead
         let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(5.0));
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
 
         // After 60ms: cleared 6 units, queue was 5, partial fill of 1 unit
         let result = model.simulate_fill(&order, &tick, 60).unwrap();
@@ -1255,7 +1333,7 @@ mod tests {
     fn test_queue_position_reset() {
         let mut model = QueuePositionFillModel::new(dec!(0.1));
         let tick = create_test_tick(dec!(100.0), dec!(100.1));
-        model.update_queue(&tick);
+        model.update_queue(&tick).unwrap();
 
         assert!(model.get_queue_depth(dec!(100.0)) > Decimal::ZERO);
 
@@ -1265,6 +1343,33 @@ mod tests {
     }
 
     // ProbabilisticFillModel tests
+    #[test]
+    fn test_probabilistic_huge_time_factor_saturates_the_time_component() {
+        let model = ProbabilisticFillModel::new(dec!(0.5), Decimal::ZERO, Decimal::MAX, 42);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
+        let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(10.0));
+        let prob = model.calculate_probability(&order, &tick, 1_000).unwrap();
+        assert_eq!(prob, dec!(0.5));
+    }
+
+    #[test]
+    fn test_probabilistic_overflowing_probability_returns_numerical_error() {
+        let model = ProbabilisticFillModel::new(dec!(0.5), Decimal::MAX, dec!(0.01), 42);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(10.0), 1000);
+        let tick = MarketTick::new(1000, dec!(99.9), dec!(10.0), dec!(100.0), dec!(1.0));
+        let result = model.calculate_probability(&order, &tick, 100);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        let crossed = create_test_tick(dec!(99.9), dec!(99.9));
+        let result = model.simulate_fill(&order, &crossed, 100);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
     #[test]
     fn test_probabilistic_new() {
         let model = ProbabilisticFillModel::new(dec!(0.5), dec!(1.0), dec!(0.001), 42);
@@ -1326,6 +1431,49 @@ mod tests {
 
         // After reset, should get same result
         assert_eq!(result1, result2);
+    }
+
+    /// Fills `n` crossed orders whose fill probability is exactly `p` and
+    /// returns the empirical fill rate.
+    fn empirical_fill_rate(p: Decimal, seed: u64, n: u32) -> Decimal {
+        // depth_factor 0 makes the depth component 1; time_factor 1 with a
+        // queue time of 1000 ms saturates the time component at 1.
+        let model = ProbabilisticFillModel::new(p, Decimal::ZERO, Decimal::ONE, seed);
+        let order = SimulatedOrder::new(Action::Buy, dec!(100.0), dec!(1.0), 1000);
+        let tick = create_test_tick(dec!(99.9), dec!(99.9));
+        assert_eq!(model.calculate_probability(&order, &tick, 1000).unwrap(), p);
+        let fills = (0..n)
+            .filter(|_| {
+                model
+                    .simulate_fill(&order, &tick, 1000)
+                    .unwrap()
+                    .is_filled()
+            })
+            .count();
+        Decimal::from(fills) / Decimal::from(n)
+    }
+
+    #[test]
+    fn test_probabilistic_fill_rate_matches_probability() {
+        // 20_000 draws: the binomial standard deviation is at most 0.0036, so
+        // a tolerance of 0.02 is more than five standard deviations.
+        let tolerance = dec!(0.02);
+        for p in [dec!(0.1), dec!(0.3), dec!(0.5), dec!(0.7), dec!(0.9)] {
+            for seed in [1u64, 42, 12_345] {
+                let rate = empirical_fill_rate(p, seed, 20_000);
+                assert!(
+                    (rate - p).abs() <= tolerance,
+                    "p {p}, seed {seed}: empirical fill rate {rate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_probabilistic_draw_reaches_upper_half() {
+        // The draw used to stay below 0.5, so p = 0.5 always filled.
+        let rate = empirical_fill_rate(dec!(0.5), 7, 2_000);
+        assert!(rate < dec!(0.6), "empirical fill rate {rate}");
     }
 
     // MarketImpactFillModel tests

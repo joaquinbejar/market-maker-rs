@@ -266,7 +266,7 @@ fn demonstrate_reallocation(manager: &mut MultiUnderlyingManager) {
     // Switch to Equal allocation
     println!("\nSwitching to Equal allocation strategy...");
     manager.set_allocation_strategy(CapitalAllocationStrategy::Equal);
-    manager.reallocate_capital();
+    manager.reallocate_capital().unwrap();
 
     println!("New allocations (Equal strategy):");
     for symbol in manager.symbols() {
@@ -278,7 +278,7 @@ fn demonstrate_reallocation(manager: &mut MultiUnderlyingManager) {
     // Switch to RiskParity allocation
     println!("\nSwitching to RiskParity allocation strategy...");
     manager.set_allocation_strategy(CapitalAllocationStrategy::RiskParity);
-    manager.reallocate_capital();
+    manager.reallocate_capital().unwrap();
 
     println!("New allocations (RiskParity strategy):");
     for symbol in manager.symbols() {

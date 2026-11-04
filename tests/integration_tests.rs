@@ -123,11 +123,13 @@ fn partial_fill_then_cancel_reconciles_exactly() {
         1_010,
     );
     manager.record_fill(&partial, 1_010).expect("record fill");
-    position.update_fill(
-        signed(partial.side, partial.quantity),
-        partial.price,
-        partial.timestamp,
-    );
+    position
+        .update_fill(
+            signed(partial.side, partial.quantity),
+            partial.price,
+            partial.timestamp,
+        )
+        .unwrap();
     ledger.apply(&partial);
 
     let order = manager.get_order_by_client_id("c-1").expect("order exists");
@@ -201,7 +203,9 @@ fn round_trip_with_two_fills_reconciles_exactly() {
         manager
             .record_fill(f, f.timestamp)
             .expect("record buy fill");
-        position.update_fill(signed(f.side, f.quantity), f.price, f.timestamp);
+        position
+            .update_fill(signed(f.side, f.quantity), f.price, f.timestamp)
+            .unwrap();
         ledger.apply(f);
     }
     let bid = manager.get_order_by_client_id("b-1").expect("bid exists");
@@ -227,7 +231,9 @@ fn round_trip_with_two_fills_reconciles_exactly() {
     manager
         .record_fill(&sell, sell.timestamp)
         .expect("record sell fill");
-    position.update_fill(signed(sell.side, sell.quantity), sell.price, sell.timestamp);
+    position
+        .update_fill(signed(sell.side, sell.quantity), sell.price, sell.timestamp)
+        .unwrap();
     ledger.apply(&sell);
 
     assert!(position.is_flat());

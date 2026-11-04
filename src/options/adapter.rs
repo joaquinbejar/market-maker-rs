@@ -4,6 +4,9 @@
 //! types and `optionstratlib` types, as well as utility functions for
 //! calculating Greeks and theoretical values.
 
+// TODO(#166): legacy pricing arithmetic, converted in #166
+#![allow(clippy::arithmetic_side_effects)]
+
 use crate::Decimal;
 use crate::options::greeks::PositionGreeks;
 use crate::types::error::{MMError, MMResult};

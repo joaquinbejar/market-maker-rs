@@ -33,10 +33,12 @@
 //! let config = CalibrationConfig::default();
 //! let calibrator = RiskAversionCalibrator::new(config);
 //!
-//! let result = calibrator.calibrate_from_halflife(
-//!     300_000,      // 5 minute half-life
-//!     dec!(0.02),   // 2% volatility
-//! );
+//! let result = calibrator
+//!     .calibrate_from_halflife(
+//!         300_000,      // 5 minute half-life
+//!         dec!(0.02),   // 2% volatility
+//!     )
+//!     .unwrap();
 //!
 //! println!("Recommended γ: {} (quality: {})", result.value, result.quality);
 //!
@@ -47,7 +49,7 @@
 //! ```
 
 use crate::Decimal;
-use crate::types::decimal::{decimal_ln, decimal_sqrt};
+use crate::types::decimal::{OrOverflow, decimal_ln, decimal_sqrt};
 use crate::types::error::{MMError, MMResult};
 use rust_decimal_macros::dec;
 use std::fmt;
@@ -251,7 +253,7 @@ impl<T: Clone> CalibrationResult<T> {
 /// let calibrator = RiskAversionCalibrator::new(CalibrationConfig::default());
 ///
 /// // 5-minute half-life with 2% volatility
-/// let result = calibrator.calibrate_from_halflife(300_000, dec!(0.02));
+/// let result = calibrator.calibrate_from_halflife(300_000, dec!(0.02)).unwrap();
 /// println!("Recommended γ: {}", result.value);
 /// ```
 #[derive(Debug, Clone)]
@@ -284,30 +286,21 @@ impl RiskAversionCalibrator {
     /// # Returns
     ///
     /// Calibration result with recommended γ value.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if γ or its interval overflows.
     pub fn calibrate_from_halflife(
         &self,
         desired_halflife_ms: u64,
         volatility: Decimal,
-    ) -> CalibrationResult<Decimal> {
-        let ln2 = LN_2;
-
-        // Convert ms to seconds
-        let halflife_seconds = Decimal::from(desired_halflife_ms) / dec!(1000);
-
-        // γ = ln(2) / (half_life × σ²)
-        let sigma_squared = volatility * volatility;
-
-        let gamma = if sigma_squared.is_zero() || halflife_seconds.is_zero() {
-            Decimal::ONE
-        } else {
-            ln2 / (halflife_seconds * sigma_squared)
-        };
+    ) -> MMResult<CalibrationResult<Decimal>> {
+        let gamma = gamma_from_halflife(desired_halflife_ms, volatility)?;
 
         // Confidence interval based on volatility uncertainty (±20%)
-        let margin = gamma * dec!(0.2);
-        let low = gamma - margin;
-        let high = gamma + margin;
+        let margin = gamma.checked_mul(dec!(0.2)).or_overflow("gamma margin")?;
+        let low = gamma.checked_sub(margin).or_overflow("gamma interval")?;
+        let high = gamma.checked_add(margin).or_overflow("gamma interval")?;
 
         // Quality based on reasonable parameter ranges
         let quality = self.assess_gamma_quality(gamma);
@@ -321,7 +314,7 @@ impl RiskAversionCalibrator {
             result.add_note("Very low γ - consider shorter half-life");
         }
 
-        result
+        Ok(result)
     }
 
     /// Calibrates γ from historical inventory and PnL data.
@@ -364,34 +357,32 @@ impl RiskAversionCalibrator {
 
         // Calculate inventory statistics
         let inventories: Vec<Decimal> = inventory_history.iter().map(|(_, inv)| *inv).collect();
-        let inv_mean = self.mean(&inventories);
-        let inv_variance = self.variance(&inventories, inv_mean);
+        let inv_mean = self.mean(&inventories)?;
+        let inv_variance = self.variance(&inventories, inv_mean)?;
 
         // Calculate observed half-life from autocorrelation
         let observed_halflife_ms = self.estimate_halflife(inventory_history);
 
         // Calculate γ from observed half-life
-        let ln2 = LN_2;
-        let halflife_seconds = Decimal::from(observed_halflife_ms) / dec!(1000);
-        let sigma_squared = volatility * volatility;
-
-        let gamma = if sigma_squared.is_zero() || halflife_seconds.is_zero() {
-            Decimal::ONE
-        } else {
-            ln2 / (halflife_seconds * sigma_squared)
-        };
+        let gamma = gamma_from_halflife(observed_halflife_ms, volatility)?;
 
         // Calculate quality based on data consistency
-        let quality = self.calculate_history_quality(inv_variance, pnl_history);
+        let quality = self.calculate_history_quality(inv_variance, pnl_history)?;
 
         // Confidence interval based on sample size
-        let std_error = decimal_sqrt(inv_variance).unwrap_or(Decimal::ONE)
-            / decimal_sqrt(Decimal::from(inventories.len())).unwrap_or(Decimal::ONE);
         let z_score = dec!(1.96); // 95% CI
-        let margin = gamma * std_error * z_score;
+        let margin = decimal_sqrt(inv_variance)
+            .unwrap_or(Decimal::ONE)
+            .checked_div(decimal_sqrt(Decimal::from(inventories.len())).unwrap_or(Decimal::ONE))
+            .and_then(|std_error| gamma.checked_mul(std_error))
+            .and_then(|x| x.checked_mul(z_score))
+            .or_overflow("gamma margin")?;
 
-        let low = (gamma - margin).max(dec!(0.001));
-        let high = gamma + margin;
+        let low = gamma
+            .checked_sub(margin)
+            .or_overflow("gamma interval")?
+            .max(dec!(0.001));
+        let high = gamma.checked_add(margin).or_overflow("gamma interval")?;
 
         let mut result =
             CalibrationResult::new(gamma, (low, high), inventory_history.len(), quality);
@@ -423,29 +414,30 @@ impl RiskAversionCalibrator {
         &self,
         inv_variance: Decimal,
         pnl_history: &[(u64, Decimal)],
-    ) -> Decimal {
+    ) -> MMResult<Decimal> {
         let pnls: Vec<Decimal> = pnl_history.iter().map(|(_, pnl)| *pnl).collect();
-        let pnl_mean = self.mean(&pnls);
+        let pnl_mean = self.mean(&pnls)?;
 
-        // Quality based on profitability and inventory control
+        // Quality based on profitability and inventory control: a sum of
+        // the constants below, at most 1.0, so it cannot overflow.
         let mut quality = dec!(0.5);
 
         // Bonus for positive PnL
         if pnl_mean > Decimal::ZERO {
-            quality += dec!(0.2);
+            quality = quality.saturating_add(dec!(0.2));
         }
 
         // Bonus for low inventory variance
         if inv_variance < Decimal::from(10) {
-            quality += dec!(0.2);
+            quality = quality.saturating_add(dec!(0.2));
         }
 
         // Bonus for sufficient samples
         if pnl_history.len() >= 100 {
-            quality += dec!(0.1);
+            quality = quality.saturating_add(dec!(0.1));
         }
 
-        quality.min(Decimal::ONE)
+        Ok(quality.min(Decimal::ONE))
     }
 
     /// Estimates half-life from inventory time series.
@@ -485,21 +477,26 @@ impl RiskAversionCalibrator {
     }
 
     /// Calculates mean of values.
-    fn mean(&self, values: &[Decimal]) -> Decimal {
+    fn mean(&self, values: &[Decimal]) -> MMResult<Decimal> {
         if values.is_empty() {
-            return Decimal::ZERO;
+            return Ok(Decimal::ZERO);
         }
-        let sum: Decimal = values.iter().copied().sum();
-        sum / Decimal::from(values.len())
+        checked_sum(values.iter().map(|v| Some(*v)))
+            .and_then(|sum| sum.checked_div(Decimal::from(values.len())))
+            .or_overflow("calibration mean")
     }
 
     /// Calculates variance of values.
-    fn variance(&self, values: &[Decimal], mean: Decimal) -> Decimal {
-        if values.len() < 2 {
-            return Decimal::ZERO;
-        }
-        let sum_sq: Decimal = values.iter().map(|v| (*v - mean) * (*v - mean)).sum();
-        sum_sq / Decimal::from(values.len() - 1)
+    fn variance(&self, values: &[Decimal], mean: Decimal) -> MMResult<Decimal> {
+        let Some(dof) = values.len().checked_sub(1).filter(|d| *d > 0) else {
+            return Ok(Decimal::ZERO);
+        };
+        checked_sum(values.iter().map(|v| {
+            let d = v.checked_sub(mean)?;
+            d.checked_mul(d)
+        }))
+        .and_then(|sum_sq| sum_sq.checked_div(Decimal::from(dof)))
+        .or_overflow("calibration variance")
     }
 }
 
@@ -606,7 +603,10 @@ impl OrderIntensityCalibrator {
             .filter(|o| o.fill_rate > Decimal::ZERO && o.fill_rate <= Decimal::ONE)
             .collect();
 
-        let total_count: usize = valid_obs.iter().map(|o| o.count).sum();
+        // A count of observations: it saturates at `usize::MAX`.
+        let total_count = valid_obs
+            .iter()
+            .fold(0usize, |acc, o| acc.saturating_add(o.count));
 
         if total_count < self.config.min_samples {
             return Err(MMError::InvalidConfiguration(format!(
@@ -634,21 +634,26 @@ impl OrderIntensityCalibrator {
 
         // Weighted linear regression
         let (slope, _intercept, r_squared) =
-            self.weighted_linear_regression(&x_values, &y_values, &weights);
+            self.weighted_linear_regression(&x_values, &y_values, &weights)?;
 
         // k is the negative of the slope
+        // Negating a Decimal flips its sign bit: it cannot overflow.
+        #[allow(clippy::arithmetic_side_effects)]
         let k = -slope;
 
         // Ensure k is positive
         let k = k.max(dec!(0.001));
 
         // Confidence interval based on R² and sample size
-        let std_error = self.estimate_std_error(&x_values, &y_values, slope, _intercept);
+        let std_error = self.estimate_std_error(&x_values, &y_values, slope, _intercept)?;
         let z_score = dec!(1.96);
-        let margin = std_error * z_score;
+        let margin = std_error.checked_mul(z_score).or_overflow("k margin")?;
 
-        let low = (k - margin).max(dec!(0.001));
-        let high = k + margin;
+        let low = k
+            .checked_sub(margin)
+            .or_overflow("k interval")?
+            .max(dec!(0.001));
+        let high = k.checked_add(margin).or_overflow("k interval")?;
 
         // Quality based on R² and sample size
         let quality = self.calculate_quality(r_squared, total_count);
@@ -674,57 +679,65 @@ impl OrderIntensityCalibrator {
         x: &[Decimal],
         y: &[Decimal],
         weights: &[Decimal],
-    ) -> (Decimal, Decimal, Decimal) {
+    ) -> MMResult<(Decimal, Decimal, Decimal)> {
         let n = x.len();
         if n < 2 {
-            return (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+            return Ok((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
         }
 
-        let total_weight: Decimal = weights.iter().copied().sum();
+        let total_weight =
+            checked_sum(weights.iter().map(|w| Some(*w))).or_overflow("total weight")?;
 
         // Weighted means
-        let x_mean: Decimal = x
-            .iter()
-            .zip(weights.iter())
-            .map(|(xi, wi)| *xi * *wi)
-            .sum::<Decimal>()
-            / total_weight;
-
-        let y_mean: Decimal = y
-            .iter()
-            .zip(weights.iter())
-            .map(|(yi, wi)| *yi * *wi)
-            .sum::<Decimal>()
-            / total_weight;
+        let weighted_mean = |values: &[Decimal]| {
+            checked_sum(values.iter().zip(weights).map(|(v, w)| v.checked_mul(*w)))
+                .and_then(|sum| sum.checked_div(total_weight))
+                .or_overflow("weighted mean")
+        };
+        let x_mean = weighted_mean(x)?;
+        let y_mean = weighted_mean(y)?;
 
         // Weighted covariance and variance
         let mut cov_xy = Decimal::ZERO;
         let mut var_x = Decimal::ZERO;
         let mut var_y = Decimal::ZERO;
 
+        // `acc + w * a * b`
+        let fma = |acc: Decimal, w: Decimal, a: Decimal, b: Decimal| {
+            w.checked_mul(a)
+                .and_then(|v| v.checked_mul(b))
+                .and_then(|v| acc.checked_add(v))
+                .or_overflow("weighted covariance")
+        };
         for ((&xi, &yi), &wi) in x.iter().zip(y).zip(weights) {
-            let dx = xi - x_mean;
-            let dy = yi - y_mean;
-            cov_xy += wi * dx * dy;
-            var_x += wi * dx * dx;
-            var_y += wi * dy * dy;
+            let dx = xi.checked_sub(x_mean).or_overflow("weighted deviation")?;
+            let dy = yi.checked_sub(y_mean).or_overflow("weighted deviation")?;
+            cov_xy = fma(cov_xy, wi, dx, dy)?;
+            var_x = fma(var_x, wi, dx, dx)?;
+            var_y = fma(var_y, wi, dy, dy)?;
         }
 
         if var_x.is_zero() {
-            return (Decimal::ZERO, y_mean, Decimal::ZERO);
+            return Ok((Decimal::ZERO, y_mean, Decimal::ZERO));
         }
 
-        let slope = cov_xy / var_x;
-        let intercept = y_mean - slope * x_mean;
+        let slope = cov_xy.checked_div(var_x).or_overflow("regression slope")?;
+        let intercept = slope
+            .checked_mul(x_mean)
+            .and_then(|v| y_mean.checked_sub(v))
+            .or_overflow("regression intercept")?;
 
         // R² calculation
         let r_squared = if var_y.is_zero() {
             Decimal::ONE
         } else {
-            (cov_xy * cov_xy) / (var_x * var_y)
+            cov_xy
+                .checked_mul(cov_xy)
+                .and_then(|num| num.checked_div(var_x.checked_mul(var_y)?))
+                .or_overflow("regression r squared")?
         };
 
-        (slope, intercept, r_squared)
+        Ok((slope, intercept, r_squared))
     }
 
     /// Estimates standard error of the slope.
@@ -734,45 +747,60 @@ impl OrderIntensityCalibrator {
         y: &[Decimal],
         slope: Decimal,
         intercept: Decimal,
-    ) -> Decimal {
+    ) -> MMResult<Decimal> {
         let n = x.len();
-        if n < 3 {
-            return dec!(0.1);
-        }
+        let Some(dof) = n.checked_sub(2).filter(|_| n >= 3) else {
+            return Ok(dec!(0.1));
+        };
 
         // Calculate residual sum of squares
-        let mut rss = Decimal::ZERO;
-        for (&xi, &yi) in x.iter().zip(y) {
-            let predicted = intercept + slope * xi;
-            let residual = yi - predicted;
-            rss += residual * residual;
-        }
+        let rss = checked_sum(x.iter().zip(y).map(|(&xi, &yi)| {
+            let predicted = intercept.checked_add(slope.checked_mul(xi)?)?;
+            let residual = yi.checked_sub(predicted)?;
+            residual.checked_mul(residual)
+        }))
+        .or_overflow("residual sum of squares")?;
 
         // Calculate x variance
-        let x_mean: Decimal = x.iter().copied().sum::<Decimal>() / Decimal::from(n);
-        let x_var: Decimal = x.iter().map(|xi| (*xi - x_mean) * (*xi - x_mean)).sum();
+        let x_mean = checked_sum(x.iter().map(|v| Some(*v)))
+            .and_then(|sum| sum.checked_div(Decimal::from(n)))
+            .or_overflow("slope error mean")?;
+        let x_var = checked_sum(x.iter().map(|xi| {
+            let d = xi.checked_sub(x_mean)?;
+            d.checked_mul(d)
+        }))
+        .or_overflow("slope error sum of squares")?;
 
         if x_var.is_zero() {
-            return dec!(0.1);
+            return Ok(dec!(0.1));
         }
 
         // Standard error of slope
-        let mse = rss / Decimal::from(n - 2);
-        decimal_sqrt(mse / x_var).unwrap_or(dec!(0.1))
+        let ratio = rss
+            .checked_div(Decimal::from(dof))
+            .and_then(|mse| mse.checked_div(x_var))
+            .or_overflow("slope standard error")?;
+        Ok(decimal_sqrt(ratio).unwrap_or(dec!(0.1)))
     }
 
     /// Calculates quality score.
+    ///
+    /// A report only score: it saturates at the `Decimal` bounds before the
+    /// clamp to 1.
     fn calculate_quality(&self, r_squared: Decimal, sample_size: usize) -> Decimal {
-        let mut quality = r_squared * dec!(0.6);
+        let mut quality = r_squared.saturating_mul(dec!(0.6));
 
         // Bonus for sample size
-        if sample_size >= 100 {
-            quality += dec!(0.3);
+        let bonus = if sample_size >= 100 {
+            dec!(0.3)
         } else if sample_size >= 50 {
-            quality += dec!(0.2);
+            dec!(0.2)
         } else if sample_size >= 30 {
-            quality += dec!(0.1);
-        }
+            dec!(0.1)
+        } else {
+            Decimal::ZERO
+        };
+        quality = quality.saturating_add(bonus);
 
         quality.min(Decimal::ONE)
     }
@@ -946,12 +974,20 @@ impl VolatilityRegimeDetector {
             return VolatilityRegime::Normal;
         }
 
-        let ratio = current_volatility / historical_volatility;
+        // A ratio too large to represent is beyond every threshold, and a
+        // zero threshold makes every ratio at or above the low one.
+        let ratio = current_volatility
+            .checked_div(historical_volatility)
+            .unwrap_or(Decimal::MAX);
 
         // Thresholds: 0.5, 1.5, 2.5 (relative to regime_threshold)
-        let low_threshold = Decimal::ONE / self.regime_threshold;
+        let low_threshold = Decimal::ONE
+            .checked_div(self.regime_threshold)
+            .unwrap_or(Decimal::MIN);
         let high_threshold = self.regime_threshold;
-        let extreme_threshold = self.regime_threshold + (self.regime_threshold - Decimal::ONE);
+        let extreme_threshold = self
+            .regime_threshold
+            .saturating_add(self.regime_threshold.saturating_sub(Decimal::ONE));
 
         if ratio < low_threshold {
             VolatilityRegime::Low
@@ -1035,9 +1071,15 @@ pub struct OptimizedParameters {
 
 impl OptimizedParameters {
     /// Returns the adjusted risk aversion value.
-    #[must_use]
-    pub fn adjusted_gamma(&self) -> Decimal {
-        self.risk_aversion.value * self.adjustments.gamma_multiplier
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the product overflows.
+    pub fn adjusted_gamma(&self) -> MMResult<Decimal> {
+        self.risk_aversion
+            .value
+            .checked_mul(self.adjustments.gamma_multiplier)
+            .or_overflow("adjusted gamma")
     }
 
     /// Returns the adjusted order intensity value (if available).
@@ -1071,14 +1113,16 @@ impl OptimizedParameters {
 /// let optimizer = ParameterOptimizer::new(CalibrationConfig::default());
 ///
 /// // Quick optimization from basic inputs
-/// let result = optimizer.optimize_quick(
-///     dec!(0.02),    // current volatility
-///     dec!(0.015),   // historical volatility
-///     300_000,       // desired half-life (5 min)
-/// );
+/// let result = optimizer
+///     .optimize_quick(
+///         dec!(0.02),    // current volatility
+///         dec!(0.015),   // historical volatility
+///         300_000,       // desired half-life (5 min)
+///     )
+///     .unwrap();
 ///
 /// println!("Regime: {}", result.regime);
-/// println!("Adjusted γ: {}", result.adjusted_gamma());
+/// println!("Adjusted γ: {}", result.adjusted_gamma().unwrap());
 /// ```
 #[derive(Debug, Clone)]
 pub struct ParameterOptimizer {
@@ -1122,13 +1166,17 @@ impl ParameterOptimizer {
     /// # Returns
     ///
     /// Optimized parameters.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the risk aversion calibration
+    /// overflows.
     pub fn optimize_quick(
         &self,
         current_volatility: Decimal,
         historical_volatility: Decimal,
         desired_halflife_ms: u64,
-    ) -> OptimizedParameters {
+    ) -> MMResult<OptimizedParameters> {
         // Detect regime
         let (regime, adjustments) = self
             .regime_detector
@@ -1137,14 +1185,14 @@ impl ParameterOptimizer {
         // Calibrate risk aversion
         let risk_aversion = self
             .risk_aversion_calibrator
-            .calibrate_from_halflife(desired_halflife_ms, current_volatility);
+            .calibrate_from_halflife(desired_halflife_ms, current_volatility)?;
 
-        OptimizedParameters {
+        Ok(OptimizedParameters {
             risk_aversion,
             order_intensity: None,
             regime,
             adjustments,
-        }
+        })
     }
 
     /// Performs full optimization with fill data.
@@ -1174,7 +1222,7 @@ impl ParameterOptimizer {
         // Calibrate risk aversion
         let risk_aversion = self
             .risk_aversion_calibrator
-            .calibrate_from_halflife(desired_halflife_ms, current_volatility);
+            .calibrate_from_halflife(desired_halflife_ms, current_volatility)?;
 
         // Calibrate order intensity
         let order_intensity = self
@@ -1214,9 +1262,65 @@ impl Default for ParameterOptimizer {
     }
 }
 
+/// `γ = ln(2) / (half_life_seconds × σ²)`, or 1 for a zero half-life or
+/// volatility.
+///
+/// # Errors
+///
+/// Returns [`MMError::NumericalError`] if γ overflows.
+fn gamma_from_halflife(halflife_ms: u64, volatility: Decimal) -> MMResult<Decimal> {
+    // Convert ms to seconds
+    let halflife_seconds = Decimal::from(halflife_ms)
+        .checked_div(dec!(1000))
+        .or_overflow("half-life")?;
+    let sigma_squared = volatility
+        .checked_mul(volatility)
+        .or_overflow("volatility squared")?;
+
+    if sigma_squared.is_zero() || halflife_seconds.is_zero() {
+        return Ok(Decimal::ONE);
+    }
+    halflife_seconds
+        .checked_mul(sigma_squared)
+        .and_then(|d| LN_2.checked_div(d))
+        .or_overflow("gamma")
+}
+
+/// Checked sum of `values`; `None` if any value is `None` or the sum
+/// overflows.
+fn checked_sum(mut values: impl Iterator<Item = Option<Decimal>>) -> Option<Decimal> {
+    values.try_fold(Decimal::ZERO, |acc, v| acc.checked_add(v?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_calibration_overflow_returns_numerical_error() {
+        let calibrator = RiskAversionCalibrator::new(CalibrationConfig::default());
+        let tiny = dec!(0.0000000000001);
+        let result = calibrator.calibrate_from_halflife(1, tiny);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        let result = calibrator.calibrate_from_halflife(1000, Decimal::MAX);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+
+        let k = OrderIntensityCalibrator::new(CalibrationConfig::default());
+        let x = [Decimal::MAX, Decimal::ONE];
+        let y = [dec!(1), dec!(2)];
+        let w = [dec!(2), dec!(1)];
+        let result = k.weighted_linear_regression(&x, &y, &w);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
 
     #[test]
     fn test_calibrate_from_history_empty_with_zero_min_samples_returns_err() {
@@ -1298,7 +1402,9 @@ mod tests {
         let calibrator = RiskAversionCalibrator::default();
 
         // 5-minute half-life with 2% volatility
-        let result = calibrator.calibrate_from_halflife(300_000, dec!(0.02));
+        let result = calibrator
+            .calibrate_from_halflife(300_000, dec!(0.02))
+            .unwrap();
 
         // γ = ln(2) / (300 * 0.02²) = 0.693 / (300 * 0.0004) = 0.693 / 0.12 ≈ 5.78
         assert!(result.value > dec!(5.0));
@@ -1309,7 +1415,9 @@ mod tests {
     #[test]
     fn test_risk_aversion_zero_volatility() {
         let calibrator = RiskAversionCalibrator::default();
-        let result = calibrator.calibrate_from_halflife(300_000, dec!(0.0));
+        let result = calibrator
+            .calibrate_from_halflife(300_000, dec!(0.0))
+            .unwrap();
 
         // Should return default value
         assert_eq!(result.value, Decimal::ONE);
@@ -1459,7 +1567,9 @@ mod tests {
     fn test_optimizer_quick() {
         let optimizer = ParameterOptimizer::default();
 
-        let result = optimizer.optimize_quick(dec!(0.02), dec!(0.015), 300_000);
+        let result = optimizer
+            .optimize_quick(dec!(0.02), dec!(0.015), 300_000)
+            .unwrap();
 
         assert!(result.risk_aversion.value > Decimal::ZERO);
         assert!(result.order_intensity.is_none());
@@ -1470,7 +1580,9 @@ mod tests {
     fn test_optimizer_quick_high_vol() {
         let optimizer = ParameterOptimizer::default();
 
-        let result = optimizer.optimize_quick(dec!(0.04), dec!(0.02), 300_000);
+        let result = optimizer
+            .optimize_quick(dec!(0.04), dec!(0.02), 300_000)
+            .unwrap();
 
         assert_eq!(result.regime, VolatilityRegime::High);
         assert!(result.adjustments.gamma_multiplier > Decimal::ONE);
@@ -1500,10 +1612,12 @@ mod tests {
         let optimizer = ParameterOptimizer::default();
 
         // High volatility regime
-        let result = optimizer.optimize_quick(dec!(0.04), dec!(0.02), 300_000);
+        let result = optimizer
+            .optimize_quick(dec!(0.04), dec!(0.02), 300_000)
+            .unwrap();
 
         let base_gamma = result.risk_aversion.value;
-        let adjusted_gamma = result.adjusted_gamma();
+        let adjusted_gamma = result.adjusted_gamma().unwrap();
 
         // Adjusted should be higher due to high vol regime
         assert!(adjusted_gamma > base_gamma);
@@ -1512,7 +1626,9 @@ mod tests {
     #[test]
     fn test_optimized_parameters_is_acceptable() {
         let optimizer = ParameterOptimizer::default();
-        let result = optimizer.optimize_quick(dec!(0.02), dec!(0.02), 300_000);
+        let result = optimizer
+            .optimize_quick(dec!(0.02), dec!(0.02), 300_000)
+            .unwrap();
 
         assert!(result.is_acceptable());
     }

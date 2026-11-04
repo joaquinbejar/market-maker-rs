@@ -343,7 +343,10 @@ fn deliver_next<
         let dir = Dir::try_from(fill.side).map_err(|_| Halt::LedgerOverflow)?;
         let (delta, price) =
             fill_decimals(cfg, dir, fill.price, fill.qty).ok_or(Halt::LedgerOverflow)?;
-        s.agent.pos.update_fill(delta, price, fill.ts_ns);
+        s.agent
+            .pos
+            .update_fill(delta, price, fill.ts_ns)
+            .ok_or(Halt::LedgerOverflow)?;
         bump(&mut s.agent.delivered_fills)?;
     }
     match (delivery.report.kind, delivery.report.origin) {
@@ -561,7 +564,9 @@ fn process_fill<const ORD: usize, const MSG: usize, const DLV: usize, const OBS:
             v.realized = v.realized.checked_add(notional).ok_or(overflow)?;
         }
     }
-    v.pos.update_fill(delta, price, fill.ts_ns);
+    v.pos
+        .update_fill(delta, price, fill.ts_ns)
+        .ok_or(overflow)?;
     v.fixed_fees_u = v.fixed_fees_u.checked_add(fill.fee_u).ok_or(overflow)?;
     v.last_mark2 = Some(fill.price.checked_mul(2).ok_or(overflow)?);
     v.max_abs_pos = v.max_abs_pos.max(gate.venue_pos_lots.unsigned_abs());

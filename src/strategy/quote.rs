@@ -33,15 +33,19 @@ pub struct Quote {
 
 impl Quote {
     /// Returns the spread (difference between ask and bid).
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn spread(&self) -> Decimal {
-        self.ask_price - self.bid_price
+        self.ask_price.saturating_sub(self.bid_price)
     }
 
     /// Returns the mid-price (average of bid and ask).
+    ///
+    /// Exact: computed without overflow, never saturated.
     #[must_use]
     pub fn mid_price(&self) -> Decimal {
-        (self.bid_price + self.ask_price) / Decimal::from(2)
+        crate::types::decimal::midpoint(self.bid_price, self.ask_price)
     }
 }
 

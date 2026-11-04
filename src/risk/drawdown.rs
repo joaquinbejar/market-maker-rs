@@ -355,9 +355,13 @@ impl DrawdownTracker {
     /// // 10% remaining before hitting 20% limit
     /// assert_eq!(tracker.distance_to_max_drawdown(), dec!(0.10));
     /// ```
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn distance_to_max_drawdown(&self) -> Decimal {
-        let distance = self.max_allowed_drawdown - self.current_drawdown();
+        let distance = self
+            .max_allowed_drawdown
+            .saturating_sub(self.current_drawdown());
         distance.max(Decimal::ZERO)
     }
 
@@ -375,9 +379,12 @@ impl DrawdownTracker {
     /// // 20% drawdown from 12000 = 9600
     /// assert_eq!(tracker.equity_at_max_drawdown(), dec!(9600.0));
     /// ```
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn equity_at_max_drawdown(&self) -> Decimal {
-        self.peak_equity * (Decimal::ONE - self.max_allowed_drawdown)
+        self.peak_equity
+            .saturating_mul(Decimal::ONE.saturating_sub(self.max_allowed_drawdown))
     }
 
     /// Resets the tracker with new equity.

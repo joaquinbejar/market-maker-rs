@@ -63,6 +63,7 @@ use std::collections::VecDeque;
 
 use crate::Decimal;
 use crate::analytics::order_flow::{Trade, TradeSide};
+use crate::types::decimal::imbalance_of_sides;
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -208,10 +209,22 @@ impl VolumeBucket {
     }
 
     /// Returns the signed imbalance (positive = buy pressure).
+    ///
+    /// A bucket whose total sits at the `Decimal` bound may have saturated,
+    /// so it takes the magnitude computed when the bucket completed.
     #[must_use]
     pub fn signed_imbalance(&self) -> Decimal {
-        if self.total_volume > Decimal::ZERO {
-            (self.buy_volume - self.sell_volume) / self.total_volume
+        if self.total_volume == Decimal::MAX {
+            if self.buy_volume < self.sell_volume {
+                Decimal::ZERO.saturating_sub(self.imbalance)
+            } else {
+                self.imbalance
+            }
+        } else if self.total_volume > Decimal::ZERO {
+            self.buy_volume
+                .saturating_sub(self.sell_volume)
+                .checked_div(self.total_volume)
+                .unwrap_or(Decimal::ZERO)
         } else {
             Decimal::ZERO
         }
@@ -229,11 +242,11 @@ impl VolumeBucket {
         self.trade_count > 0
     }
 
-    /// Returns the buy/sell ratio, or None if no sells.
+    /// Returns the buy/sell ratio, or None if no sells or on overflow.
     #[must_use]
     pub fn buy_sell_ratio(&self) -> Option<Decimal> {
         if self.sell_volume > Decimal::ZERO {
-            Some(self.buy_volume / self.sell_volume)
+            self.buy_volume.checked_div(self.sell_volume)
         } else {
             None
         }
@@ -343,45 +356,56 @@ impl VPINCalculator {
     /// # Returns
     ///
     /// `Some(vpin)` if enough buckets are available, `None` otherwise.
+    ///
+    /// The volume and count accumulators are statistics, not balances:
+    /// they saturate at their bounds, where a bucket is complete anyway. The
+    /// bucket's imbalance is computed from the unsaturated volumes, so a
+    /// saturated total does not distort the VPIN.
     pub fn add_trade(&mut self, trade: &Trade) -> Option<Decimal> {
-        self.total_trades += 1;
-        self.total_volume += trade.size;
+        self.total_trades = self.total_trades.saturating_add(1);
+        self.total_volume = self.total_volume.saturating_add(trade.size);
 
         // Update current bucket timestamps
         if self.current_bucket.trade_count == 0 {
             self.current_bucket.start_time = trade.timestamp;
         }
         self.current_bucket.end_time = trade.timestamp;
-        self.current_bucket.trade_count += 1;
+        self.current_bucket.trade_count = self.current_bucket.trade_count.saturating_add(1);
 
-        // Add volume to appropriate side
+        // The volumes before this trade are exact: a total that saturates
+        // completes the bucket on this very trade.
+        let bucket = &mut self.current_bucket;
+        let (prior_buy, prior_sell) = (bucket.buy_volume, bucket.sell_volume);
         match trade.side {
             TradeSide::Buy => {
-                self.current_bucket.buy_volume += trade.size;
+                bucket.buy_volume = bucket.buy_volume.saturating_add(trade.size);
             }
             TradeSide::Sell => {
-                self.current_bucket.sell_volume += trade.size;
+                bucket.sell_volume = bucket.sell_volume.saturating_add(trade.size);
             }
         }
-        self.current_bucket.total_volume += trade.size;
+        bucket.total_volume = bucket.total_volume.saturating_add(trade.size);
 
         // Check if bucket is complete
         if self.current_bucket.total_volume >= self.config.bucket_volume {
-            self.complete_current_bucket();
+            let imbalance = match trade.side {
+                TradeSide::Buy => imbalance_of_sides(
+                    [prior_buy, trade.size].into_iter(),
+                    [prior_sell].into_iter(),
+                ),
+                TradeSide::Sell => imbalance_of_sides(
+                    [prior_buy].into_iter(),
+                    [prior_sell, trade.size].into_iter(),
+                ),
+            };
+            self.complete_current_bucket(imbalance.abs());
         }
 
         self.get_vpin()
     }
 
     /// Completes the current bucket and starts a new one.
-    fn complete_current_bucket(&mut self) {
-        // Calculate imbalance for the bucket
-        let imbalance = if self.current_bucket.total_volume > Decimal::ZERO {
-            let diff = self.current_bucket.buy_volume - self.current_bucket.sell_volume;
-            diff.abs() / self.current_bucket.total_volume
-        } else {
-            Decimal::ZERO
-        };
+    fn complete_current_bucket(&mut self, imbalance: Decimal) {
         self.current_bucket.imbalance = imbalance;
 
         // Handle overflow: if bucket has more than target volume,
@@ -411,8 +435,13 @@ impl VPINCalculator {
             return None;
         }
 
-        let sum: Decimal = self.completed_buckets.iter().map(|b| b.imbalance).sum();
-        Some(sum / Decimal::from(self.config.num_buckets))
+        // Each imbalance is in [0, 1], so the sum cannot overflow in practice;
+        // an overflow or zero bucket count yields `None`.
+        let sum = self
+            .completed_buckets
+            .iter()
+            .try_fold(Decimal::ZERO, |acc, b| acc.checked_add(b.imbalance))?;
+        sum.checked_div(Decimal::from(self.config.num_buckets))
     }
 
     /// Checks if current VPIN exceeds the toxicity threshold.
@@ -450,10 +479,16 @@ impl VPINCalculator {
     }
 
     /// Gets the fill percentage of the current bucket.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn current_bucket_fill_pct(&self) -> Decimal {
         if self.config.bucket_volume > Decimal::ZERO {
-            (self.current_bucket.total_volume / self.config.bucket_volume) * Decimal::from(100)
+            self.current_bucket
+                .total_volume
+                .checked_div(self.config.bucket_volume)
+                .unwrap_or(Decimal::MAX)
+                .saturating_mul(Decimal::ONE_HUNDRED)
         } else {
             Decimal::ZERO
         }
@@ -477,7 +512,12 @@ impl VPINCalculator {
         let imbalances: Vec<Decimal> = self.completed_buckets.iter().map(|b| b.imbalance).collect();
         let n = Decimal::from(imbalances.len());
 
-        let mean = imbalances.iter().copied().sum::<Decimal>() / n;
+        // Imbalances are in [0, 1]: these sums saturate only in theory.
+        let mean = imbalances
+            .iter()
+            .fold(Decimal::ZERO, |acc, &x| acc.saturating_add(x))
+            .checked_div(n)
+            .unwrap_or(Decimal::ZERO);
 
         let min = imbalances.iter().copied().min().unwrap_or(Decimal::ZERO);
         let max = imbalances.iter().copied().max().unwrap_or(Decimal::ZERO);
@@ -485,12 +525,12 @@ impl VPINCalculator {
         // Calculate standard deviation
         let variance = imbalances
             .iter()
-            .map(|&x| {
-                let diff = x - mean;
-                diff * diff
+            .fold(Decimal::ZERO, |acc, &x| {
+                let diff = x.saturating_sub(mean);
+                acc.saturating_add(diff.saturating_mul(diff))
             })
-            .sum::<Decimal>()
-            / n;
+            .checked_div(n)
+            .unwrap_or(Decimal::ZERO);
 
         // Approximate sqrt using Newton's method
         let std_dev = decimal_sqrt_approx(variance);
@@ -531,12 +571,21 @@ fn decimal_sqrt_approx(x: Decimal) -> Decimal {
         return Decimal::ZERO;
     }
 
-    let mut guess = x / Decimal::from(2);
+    let half = |v: Decimal| v.checked_div(Decimal::TWO).unwrap_or(v);
+    let mut guess = half(x);
     let epsilon = dec!(0.0000001);
 
     for _ in 0..20 {
-        let new_guess = (guess + x / guess) / Decimal::from(2);
-        if (new_guess - guess).abs() < epsilon {
+        // Checked: a guess that rounds to zero ends the iteration instead
+        // of dividing by zero.
+        let Some(new_guess) = x
+            .checked_div(guess)
+            .and_then(|q| guess.checked_add(q))
+            .map(half)
+        else {
+            return guess;
+        };
+        if new_guess.saturating_sub(guess).abs() < epsilon {
             return new_guess;
         }
         guess = new_guess;
@@ -600,7 +649,7 @@ impl TradeClassifier {
     ///
     /// The classified trade side.
     pub fn classify_quote_rule(&mut self, price: Decimal, bid: Decimal, ask: Decimal) -> TradeSide {
-        let mid = (bid + ask) / Decimal::from(2);
+        let mid = crate::types::decimal::midpoint(bid, ask);
 
         let side = if price > mid {
             TradeSide::Buy

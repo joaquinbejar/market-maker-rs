@@ -604,7 +604,10 @@ pub(super) fn capacity_need(timestamps: &[u64], latency: &KernelLatency) -> MMRe
     for (j, ts) in timestamps.iter().enumerate() {
         // Rows still in flight when row `j` is pushed: `ts_i + W > ts_j`.
         while let Some(first) = timestamps.get(lo) {
-            if u128::from(*first) + u128::from(obs_window) > u128::from(*ts) {
+            // Two `u64` values summed in a `u128` cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
+            let ends = u128::from(*first) + u128::from(obs_window);
+            if ends > u128::from(*ts) {
                 break;
             }
             lo = lo.saturating_add(1);
@@ -617,7 +620,10 @@ pub(super) fn capacity_need(timestamps: &[u64], latency: &KernelLatency) -> MMRe
             hi = j;
         }
         while let Some(next) = timestamps.get(hi) {
-            if u128::from(*next) > u128::from(*ts) + u128::from(window) {
+            // Two `u64` values summed in a `u128` cannot overflow.
+            #[allow(clippy::arithmetic_side_effects)]
+            let horizon = u128::from(*ts) + u128::from(window);
+            if u128::from(*next) > horizon {
                 break;
             }
             hi = hi.saturating_add(1);

@@ -666,15 +666,18 @@ impl OrderManager {
     /// # Errors
     ///
     /// Returns [`MMError::UnsupportedAction`] if `side` is neither buy nor
-    /// sell.
+    /// sell, or [`MMError::NumericalError`] if the total overflows.
     pub fn get_open_quantity(&self, symbol: &str, side: Action) -> MMResult<Decimal> {
         let side = Action::from(Dir::try_from(side)?);
-        Ok(self
-            .get_open_orders_for_symbol(symbol)
+        self.get_open_orders_for_symbol(symbol)
             .iter()
             .filter(|o| o.side == side)
-            .map(|o| o.remaining_quantity)
-            .sum())
+            .try_fold(Decimal::ZERO, |acc, o| {
+                acc.checked_add(o.remaining_quantity)
+            })
+            .ok_or_else(|| {
+                MMError::NumericalError(format!("open {side} quantity on {symbol} overflows"))
+            })
     }
 
     /// Marks an order as cancelled.
@@ -1170,6 +1173,23 @@ mod tests {
 
         let eth_open = manager.get_open_orders_for_symbol("ETH-USD");
         assert_eq!(eth_open.len(), 1);
+    }
+
+    #[test]
+    fn test_order_manager_open_quantity_overflow_returns_numerical_error() {
+        let mut manager = OrderManager::with_defaults();
+        let request = OrderRequest::limit_buy("BTC-USD", dec!(1), Decimal::MAX);
+        manager
+            .register_order(&request, "a".to_string(), 1000)
+            .unwrap();
+        manager
+            .register_order(&request, "b".to_string(), 1001)
+            .unwrap();
+        let result = manager.get_open_quantity("BTC-USD", Action::Buy);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
     }
 
     #[test]

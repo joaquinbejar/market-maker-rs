@@ -160,12 +160,12 @@ impl ApiState {
         self.quoting_enabled.load(Ordering::SeqCst)
     }
 
-    /// Returns the uptime in seconds.
+    /// Returns the uptime in seconds, zero if the clock went backwards.
     #[must_use]
     pub fn uptime_seconds(&self) -> u64 {
         let start = self.start_time.load(Ordering::SeqCst);
         let now = current_timestamp();
-        (now - start) / 1000
+        now.saturating_sub(start).checked_div(1000).unwrap_or(0)
     }
 
     /// Gets the current status.

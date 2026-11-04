@@ -271,26 +271,36 @@ impl MockExchangeConnector {
     }
 
     /// Generates a simulated order book.
+    ///
+    /// A synthetic book for tests: its prices and sizes saturate at the
+    /// `Decimal` bounds for extreme configurations.
     fn generate_orderbook(&self, symbol: &str, depth: usize) -> OrderBookSnapshot {
         let base_price = self.config.base_price;
-        let half_spread = base_price * self.config.spread / Decimal::from(2);
+        let half_spread = base_price
+            .saturating_mul(self.config.spread)
+            .saturating_mul(dec!(0.5));
 
         let mut bids = Vec::with_capacity(depth);
         let mut asks = Vec::with_capacity(depth);
 
-        let tick_size = base_price * dec!(0.0001);
+        let tick_size = base_price.saturating_mul(dec!(0.0001));
 
         for i in 0..depth {
-            let offset = tick_size * Decimal::from(i);
+            let offset = tick_size.saturating_mul(Decimal::from(i));
+            let qty = Decimal::ONE.saturating_add(Decimal::from(i).saturating_mul(dec!(0.5)));
 
             // Bid prices descending from mid - half_spread
-            let bid_price = base_price - half_spread - offset;
-            let bid_qty = Decimal::from(1) + Decimal::from(i) * dec!(0.5);
+            let bid_price = base_price
+                .saturating_sub(half_spread)
+                .saturating_sub(offset);
+            let bid_qty = qty;
             bids.push(BookLevel::new(bid_price, bid_qty));
 
             // Ask prices ascending from mid + half_spread
-            let ask_price = base_price + half_spread + offset;
-            let ask_qty = Decimal::from(1) + Decimal::from(i) * dec!(0.5);
+            let ask_price = base_price
+                .saturating_add(half_spread)
+                .saturating_add(offset);
+            let ask_qty = qty;
             asks.push(BookLevel::new(ask_price, ask_qty));
         }
 
@@ -498,13 +508,22 @@ impl ExchangeConnector for MockExchangeConnector {
         };
 
         let mut responses = Vec::new();
+        let mut first_error = None;
         for order_id in order_ids {
-            if let Ok(response) = self.cancel_order(&order_id).await {
-                responses.push(response);
+            match self.cancel_order(&order_id).await {
+                Ok(response) => responses.push(response),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
 
-        Ok(responses)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(responses),
+        }
     }
 
     async fn get_orderbook(&self, symbol: &str, depth: usize) -> MMResult<OrderBookSnapshot> {
@@ -682,6 +701,49 @@ mod tests {
 
         let open = connector.get_open_orders("BTC-USD").await.unwrap();
         assert!(open.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_reports_failed_cancels() {
+        let mut connector = MockExchangeConnector::with_defaults();
+        connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1)))
+            .await
+            .unwrap();
+        connector
+            .submit_order(OrderRequest::limit_sell(
+                "BTC-USD",
+                dec!(51000.0),
+                dec!(0.1),
+            ))
+            .await
+            .unwrap();
+        // Every later exchange call fails.
+        connector.config.failure_rate = 1.0;
+
+        let error = connector.cancel_all_orders("BTC-USD").await.unwrap_err();
+        assert!(matches!(error, MMError::InvalidMarketState(_)), "{error}");
+        // Nothing was cancelled, so both orders are still open.
+        assert_eq!(connector.get_open_orders("BTC-USD").await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_orders_poisoned_lock() {
+        let connector = MockExchangeConnector::with_defaults();
+        connector
+            .submit_order(OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1)))
+            .await
+            .unwrap();
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = connector.orders.write().unwrap();
+                panic!("poison the order table");
+            });
+            assert!(poisoner.join().is_err());
+        });
+
+        let error = connector.cancel_all_orders("BTC-USD").await.unwrap_err();
+        assert!(matches!(error, MMError::LockPoisoned(_)), "{error}");
     }
 
     #[tokio::test]

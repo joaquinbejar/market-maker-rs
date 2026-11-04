@@ -19,17 +19,19 @@ impl InvDec {
         last_update: 0,
     };
 
-    /// Applies a fill through the engine's own `update_fill`.
-    pub(super) fn update_fill(&mut self, delta: Decimal, price: Decimal, ts: u64) {
+    /// Applies a fill through the engine's own `update_fill`; `None`, with
+    /// the position unchanged, if the quantity overflows.
+    pub(super) fn update_fill(&mut self, delta: Decimal, price: Decimal, ts: u64) -> Option<()> {
         let mut position = InventoryPosition {
             quantity: self.quantity,
             avg_entry_price: self.avg_entry,
             last_update: self.last_update,
         };
-        position.update_fill(delta, price, ts);
+        position.update_fill(delta, price, ts).ok()?;
         self.quantity = position.quantity;
         self.avg_entry = position.avg_entry_price;
         self.last_update = position.last_update;
+        Some(())
     }
 }
 

@@ -4,6 +4,7 @@
 //! profiting from price oscillations within a range.
 
 use crate::Decimal;
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -195,9 +196,11 @@ impl GridOrder {
     }
 
     /// Returns the notional value of this order.
+    ///
+    /// Report only: it saturates at the `Decimal` bounds, so it must not feed a quote, a mark or state.
     #[must_use]
     pub fn notional(&self) -> Decimal {
-        self.price * self.size
+        self.price.saturating_mul(self.size)
     }
 }
 
@@ -221,7 +224,7 @@ impl GridOrder {
 /// let config = GridConfig::new(3, dec!(0.01), dec!(1.0), dec!(100.0)).unwrap();
 /// let strategy = GridStrategy::new(config).unwrap();
 ///
-/// let orders = strategy.generate_grid(dec!(100.0));
+/// let orders = strategy.generate_grid(dec!(100.0)).unwrap();
 ///
 /// // Should have 3 buy orders below and 3 sell orders above
 /// assert_eq!(orders.len(), 6);
@@ -323,11 +326,15 @@ impl GridStrategy {
     /// let config = GridConfig::new(2, dec!(0.01), dec!(1.0), dec!(100.0)).unwrap();
     /// let strategy = GridStrategy::new(config).unwrap();
     ///
-    /// let orders = strategy.generate_grid(dec!(100.0));
+    /// let orders = strategy.generate_grid(dec!(100.0)).unwrap();
     /// assert_eq!(orders.len(), 4); // 2 buys + 2 sells
     /// ```
-    #[must_use]
-    pub fn generate_grid(&self, reference_price: Decimal) -> Vec<GridOrder> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if a level price or size
+    /// overflows.
+    pub fn generate_grid(&self, reference_price: Decimal) -> MMResult<Vec<GridOrder>> {
         let max_level = self.max_level();
         let mut orders = Vec::with_capacity(
             usize::try_from(max_level)
@@ -337,16 +344,19 @@ impl GridStrategy {
 
         // Generate buy orders (below reference)
         for level in 1..=max_level {
-            let price = self.calculate_price(reference_price, -level);
-            let size = self.calculate_level_size(level);
+            // `level` is in `1..=i32::MAX`, so its negation fits.
+            #[allow(clippy::arithmetic_side_effects)]
+            let below = -level;
+            let price = self.calculate_price(reference_price, below)?;
+            let size = self.calculate_level_size(level)?;
 
-            orders.push(GridOrder::new(price, size, OrderSide::Buy, -level));
+            orders.push(GridOrder::new(price, size, OrderSide::Buy, below));
         }
 
         // Generate sell orders (above reference)
         for level in 1..=max_level {
-            let price = self.calculate_price(reference_price, level);
-            let size = self.calculate_level_size(level);
+            let price = self.calculate_price(reference_price, level)?;
+            let size = self.calculate_level_size(level)?;
 
             orders.push(GridOrder::new(price, size, OrderSide::Sell, level));
         }
@@ -354,7 +364,7 @@ impl GridStrategy {
         // Sort by price (lowest to highest)
         orders.sort_by_key(|a| a.price);
 
-        orders
+        Ok(orders)
     }
 
     /// Generates grid orders adjusted for current inventory.
@@ -382,7 +392,7 @@ impl GridStrategy {
     /// let strategy = GridStrategy::new(config).unwrap();
     ///
     /// // With long inventory, buy sizes should be reduced
-    /// let orders = strategy.generate_grid_with_inventory(dec!(100.0), dec!(5.0));
+    /// let orders = strategy.generate_grid_with_inventory(dec!(100.0), dec!(5.0)).unwrap();
     ///
     /// let buys: Vec<_> = orders.iter().filter(|o| o.side == OrderSide::Buy).collect();
     /// let sells: Vec<_> = orders.iter().filter(|o| o.side == OrderSide::Sell).collect();
@@ -392,17 +402,27 @@ impl GridStrategy {
     /// // Sell sizes unchanged
     /// assert!(sells.iter().all(|o| o.size == dec!(1.0)));
     /// ```
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if a level price or size
+    /// overflows, or if `max_position` is zero.
     pub fn generate_grid_with_inventory(
         &self,
         reference_price: Decimal,
         current_inventory: Decimal,
-    ) -> Vec<GridOrder> {
-        let mut orders = self.generate_grid(reference_price);
+    ) -> MMResult<Vec<GridOrder>> {
+        let mut orders = self.generate_grid(reference_price)?;
 
         // Calculate inventory ratio (how close to max position)
-        let inventory_ratio = current_inventory.abs() / self.config.max_position;
-        let scale_factor = (Decimal::ONE - inventory_ratio).max(Decimal::ZERO);
+        let inventory_ratio = current_inventory
+            .abs()
+            .checked_div(self.config.max_position)
+            .or_overflow("grid inventory ratio")?;
+        // `inventory_ratio >= 0`, so `1 - ratio` cannot overflow.
+        let scale_factor = Decimal::ONE
+            .saturating_sub(inventory_ratio)
+            .max(Decimal::ZERO);
 
         for order in &mut orders {
             // If long, reduce buy sizes; if short, reduce sell sizes
@@ -410,14 +430,17 @@ impl GridStrategy {
                 || (current_inventory < Decimal::ZERO && order.side == OrderSide::Sell);
 
             if should_reduce {
-                order.size *= scale_factor;
+                order.size = order
+                    .size
+                    .checked_mul(scale_factor)
+                    .or_overflow("grid order size")?;
             }
         }
 
         // Filter out orders with zero or near-zero size
         orders.retain(|o| o.size > Decimal::new(1, 8)); // > 0.00000001
 
-        orders
+        Ok(orders)
     }
 
     /// Calculates the price for a specific grid level.
@@ -426,20 +449,29 @@ impl GridStrategy {
     ///
     /// * `reference_price` - Center price
     /// * `level` - Grid level (negative = below, positive = above)
-    #[must_use]
-    pub fn calculate_price(&self, reference_price: Decimal, level: i32) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the price overflows.
+    pub fn calculate_price(&self, reference_price: Decimal, level: i32) -> MMResult<Decimal> {
         let level_decimal = Decimal::from(level);
+        let offset = level_decimal.checked_mul(self.config.grid_spacing);
 
         match self.config.spacing_type {
             GridSpacingType::Geometric => {
                 // price = reference * (1 + level * spacing)
-                reference_price * (Decimal::ONE + level_decimal * self.config.grid_spacing)
+                offset
+                    .and_then(|o| Decimal::ONE.checked_add(o))
+                    .and_then(|f| reference_price.checked_mul(f))
             }
             GridSpacingType::Arithmetic => {
                 // price = reference + level * spacing * reference
-                reference_price + level_decimal * self.config.grid_spacing * reference_price
+                offset
+                    .and_then(|o| o.checked_mul(reference_price))
+                    .and_then(|o| reference_price.checked_add(o))
             }
         }
+        .or_overflow("grid level price")
     }
 
     /// Calculates the order size for a specific level.
@@ -463,30 +495,36 @@ impl GridStrategy {
     /// let strategy = GridStrategy::new(config).unwrap();
     ///
     /// // Level 1: base_size * (1 + 0 * 0.2) = 1.0
-    /// assert_eq!(strategy.calculate_level_size(1), dec!(1.0));
+    /// assert_eq!(strategy.calculate_level_size(1).unwrap(), dec!(1.0));
     ///
     /// // Level 3: base_size * (1 + 2 * 0.2) = 1.4
-    /// assert_eq!(strategy.calculate_level_size(3), dec!(1.4));
+    /// assert_eq!(strategy.calculate_level_size(3).unwrap(), dec!(1.4));
     /// ```
-    #[must_use]
-    pub fn calculate_level_size(&self, level: i32) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the size overflows.
+    pub fn calculate_level_size(&self, level: i32) -> MMResult<Decimal> {
         let abs_level = level.unsigned_abs();
 
         match self.config.size_progression {
             Some(progression) => {
                 // size = base_size * (1 + (level - 1) * progression)
-                let multiplier =
-                    Decimal::ONE + Decimal::from(abs_level.saturating_sub(1)) * progression;
-                self.config.base_size * multiplier
+                Decimal::from(abs_level.saturating_sub(1))
+                    .checked_mul(progression)
+                    .and_then(|x| Decimal::ONE.checked_add(x))
+                    .and_then(|m| self.config.base_size.checked_mul(m))
+                    .or_overflow("grid level size")
             }
-            None => self.config.base_size,
+            None => Ok(self.config.base_size),
         }
     }
 
-    /// Returns the total number of orders in a full grid.
+    /// Returns the total number of orders in a full grid, saturating at
+    /// `u32::MAX`.
     #[must_use]
     pub fn total_orders(&self) -> u32 {
-        self.config.levels_per_side * 2
+        self.config.levels_per_side.saturating_mul(2)
     }
 
     /// Calculates the price range covered by the grid.
@@ -498,12 +536,18 @@ impl GridStrategy {
     /// # Returns
     ///
     /// Tuple of (lowest_price, highest_price).
-    #[must_use]
-    pub fn price_range(&self, reference_price: Decimal) -> (Decimal, Decimal) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if a bound overflows.
+    pub fn price_range(&self, reference_price: Decimal) -> MMResult<(Decimal, Decimal)> {
         let max_level = self.max_level();
-        let lowest = self.calculate_price(reference_price, -max_level);
-        let highest = self.calculate_price(reference_price, max_level);
-        (lowest, highest)
+        // `max_level` is in `0..=i32::MAX`, so its negation fits.
+        #[allow(clippy::arithmetic_side_effects)]
+        let min_level = -max_level;
+        let lowest = self.calculate_price(reference_price, min_level)?;
+        let highest = self.calculate_price(reference_price, max_level)?;
+        Ok((lowest, highest))
     }
 
     /// Returns `levels_per_side` as a signed level index, clamped to
@@ -518,16 +562,73 @@ impl GridStrategy {
     /// # Arguments
     ///
     /// * `reference_price` - Center price for calculation
-    #[must_use]
-    pub fn max_notional_exposure(&self, reference_price: Decimal) -> Decimal {
-        let orders = self.generate_grid(reference_price);
-        orders.iter().map(|o| o.notional()).sum()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if a level or the total
+    /// overflows.
+    pub fn max_notional_exposure(&self, reference_price: Decimal) -> MMResult<Decimal> {
+        self.generate_grid(reference_price)?
+            .iter()
+            .try_fold(Decimal::ZERO, |acc, o| {
+                o.price.checked_mul(o.size).and_then(|n| acc.checked_add(n))
+            })
+            .or_overflow("grid notional exposure")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_grid_overflowing_price_returns_numerical_error() {
+        let config = GridConfig::new(2, dec!(0.5), dec!(1.0), dec!(100.0)).unwrap();
+        let strategy = GridStrategy::new(config).unwrap();
+        let result = strategy.calculate_price(Decimal::MAX, 1);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+        assert!(matches!(
+            strategy.generate_grid(Decimal::MAX),
+            Err(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            strategy.price_range(Decimal::MAX),
+            Err(MMError::NumericalError(_))
+        ));
+        assert!(matches!(
+            strategy.max_notional_exposure(Decimal::MAX),
+            Err(MMError::NumericalError(_))
+        ));
+    }
+
+    #[test]
+    fn test_grid_overflowing_level_size_returns_numerical_error() {
+        let config = GridConfig::new(3, dec!(0.01), Decimal::MAX, Decimal::MAX)
+            .unwrap()
+            .with_size_progression(dec!(1.0));
+        let strategy = GridStrategy::new(config).unwrap();
+        let result = strategy.calculate_level_size(2);
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_grid_with_inventory_zero_max_position_returns_error() {
+        let mut config = GridConfig::new(2, dec!(0.01), dec!(1.0), dec!(10.0)).unwrap();
+        // The public field bypasses the constructor's validation.
+        config.max_position = Decimal::ZERO;
+        let strategy = GridStrategy::new(config).unwrap();
+        let result = strategy.generate_grid_with_inventory(dec!(100.0), dec!(1.0));
+        assert!(
+            matches!(result, Err(MMError::NumericalError(_))),
+            "{result:?}"
+        );
+    }
 
     #[test]
     fn test_grid_config_new_levels_above_i32_max_returns_err() {
@@ -610,7 +711,7 @@ mod tests {
         let config = GridConfig::new(3, dec!(0.01), dec!(1.0), dec!(100.0)).unwrap();
         let strategy = GridStrategy::new(config).unwrap();
 
-        let orders = strategy.generate_grid(dec!(100.0));
+        let orders = strategy.generate_grid(dec!(100.0)).unwrap();
 
         assert_eq!(orders.len(), 6); // 3 buys + 3 sells
 
@@ -634,7 +735,7 @@ mod tests {
         let config = GridConfig::new(2, dec!(0.01), dec!(1.0), dec!(100.0)).unwrap();
         let strategy = GridStrategy::new(config).unwrap();
 
-        let orders = strategy.generate_grid(dec!(100.0));
+        let orders = strategy.generate_grid(dec!(100.0)).unwrap();
 
         // Expected prices with 1% spacing:
         // Buy level -2: 100 * (1 - 0.02) = 98
@@ -652,7 +753,9 @@ mod tests {
         let strategy = GridStrategy::new(config).unwrap();
 
         // 50% of max position long
-        let orders = strategy.generate_grid_with_inventory(dec!(100.0), dec!(5.0));
+        let orders = strategy
+            .generate_grid_with_inventory(dec!(100.0), dec!(5.0))
+            .unwrap();
 
         let buys: Vec<_> = orders.iter().filter(|o| o.side == OrderSide::Buy).collect();
         let sells: Vec<_> = orders
@@ -672,7 +775,9 @@ mod tests {
         let strategy = GridStrategy::new(config).unwrap();
 
         // 50% of max position short
-        let orders = strategy.generate_grid_with_inventory(dec!(100.0), dec!(-5.0));
+        let orders = strategy
+            .generate_grid_with_inventory(dec!(100.0), dec!(-5.0))
+            .unwrap();
 
         let buys: Vec<_> = orders.iter().filter(|o| o.side == OrderSide::Buy).collect();
         let sells: Vec<_> = orders
@@ -692,7 +797,9 @@ mod tests {
         let strategy = GridStrategy::new(config).unwrap();
 
         // At max position, buy orders should be filtered out
-        let orders = strategy.generate_grid_with_inventory(dec!(100.0), dec!(10.0));
+        let orders = strategy
+            .generate_grid_with_inventory(dec!(100.0), dec!(10.0))
+            .unwrap();
 
         let buys: Vec<_> = orders.iter().filter(|o| o.side == OrderSide::Buy).collect();
         assert!(buys.is_empty());
@@ -703,9 +810,9 @@ mod tests {
         let config = GridConfig::new(5, dec!(0.01), dec!(1.0), dec!(100.0)).unwrap();
         let strategy = GridStrategy::new(config).unwrap();
 
-        assert_eq!(strategy.calculate_level_size(1), dec!(1.0));
-        assert_eq!(strategy.calculate_level_size(3), dec!(1.0));
-        assert_eq!(strategy.calculate_level_size(5), dec!(1.0));
+        assert_eq!(strategy.calculate_level_size(1).unwrap(), dec!(1.0));
+        assert_eq!(strategy.calculate_level_size(3).unwrap(), dec!(1.0));
+        assert_eq!(strategy.calculate_level_size(5).unwrap(), dec!(1.0));
     }
 
     #[test]
@@ -716,13 +823,13 @@ mod tests {
         let strategy = GridStrategy::new(config).unwrap();
 
         // Level 1: 1.0 * (1 + 0 * 0.2) = 1.0
-        assert_eq!(strategy.calculate_level_size(1), dec!(1.0));
+        assert_eq!(strategy.calculate_level_size(1).unwrap(), dec!(1.0));
 
         // Level 2: 1.0 * (1 + 1 * 0.2) = 1.2
-        assert_eq!(strategy.calculate_level_size(2), dec!(1.2));
+        assert_eq!(strategy.calculate_level_size(2).unwrap(), dec!(1.2));
 
         // Level 3: 1.0 * (1 + 2 * 0.2) = 1.4
-        assert_eq!(strategy.calculate_level_size(3), dec!(1.4));
+        assert_eq!(strategy.calculate_level_size(3).unwrap(), dec!(1.4));
     }
 
     #[test]
@@ -730,7 +837,7 @@ mod tests {
         let config = GridConfig::new(3, dec!(0.01), dec!(1.0), dec!(100.0)).unwrap();
         let strategy = GridStrategy::new(config).unwrap();
 
-        let (low, high) = strategy.price_range(dec!(100.0));
+        let (low, high) = strategy.price_range(dec!(100.0)).unwrap();
 
         // Low: 100 * (1 - 3 * 0.01) = 97
         assert_eq!(low, dec!(97));
@@ -754,7 +861,7 @@ mod tests {
         let strategy = GridStrategy::new(config).unwrap();
 
         // Arithmetic spacing gives same result as geometric for percentage-based
-        let orders = strategy.generate_grid(dec!(100.0));
+        let orders = strategy.generate_grid(dec!(100.0)).unwrap();
         let prices: Vec<_> = orders.iter().map(|o| o.price).collect();
 
         assert_eq!(prices, vec![dec!(98), dec!(99), dec!(101), dec!(102)]);

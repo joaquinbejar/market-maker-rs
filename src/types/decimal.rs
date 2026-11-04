@@ -165,9 +165,200 @@ pub(crate) fn saturating_u64<T: TryInto<u64>>(value: T) -> u64 {
     value.try_into().unwrap_or(u64::MAX)
 }
 
+/// Maps the `None` of a failed checked operation to
+/// [`MMError::NumericalError`] naming the quantity that overflowed.
+pub(crate) trait OrOverflow<T> {
+    /// Returns the value, or a numerical error saying `what` overflows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] when `self` is `None`.
+    fn or_overflow(self, what: &str) -> MMResult<T>;
+}
+
+impl<T> OrOverflow<T> for Option<T> {
+    #[inline]
+    fn or_overflow(self, what: &str) -> MMResult<T> {
+        self.ok_or_else(|| overflow_error(what))
+    }
+}
+
+/// The error of a checked operation that overflowed or divided by zero.
+#[cold]
+#[inline(never)]
+fn overflow_error(what: &str) -> MMError {
+    MMError::NumericalError(format!("{what} overflows"))
+}
+
+/// `numerator / denominator`, saturating at the `Decimal` bound of the
+/// quotient's sign when it overflows, and zero for a zero denominator.
+///
+/// Used only for report only values.
+#[must_use]
+#[inline]
+pub(crate) fn saturating_div(numerator: Decimal, denominator: Decimal) -> Decimal {
+    numerator.checked_div(denominator).unwrap_or_else(|| {
+        if denominator.is_zero() {
+            Decimal::ZERO
+        } else if numerator.is_sign_negative() == denominator.is_sign_negative() {
+            Decimal::MAX
+        } else {
+            Decimal::MIN
+        }
+    })
+}
+
+/// The midpoint `(a + b) / 2` of two decimals, never saturated.
+///
+/// The mean of two representable values is always representable: when
+/// `a + b` overflows, both share a sign, so `a + (b - a) / 2` is computed
+/// instead. The halving rounds like `Decimal` division in both forms.
+#[must_use]
+#[inline]
+pub(crate) fn midpoint(a: Decimal, b: Decimal) -> Decimal {
+    match a.checked_add(b) {
+        Some(sum) => sum.checked_div(Decimal::TWO),
+        None => b
+            .checked_sub(a)
+            .and_then(|d| d.checked_div(Decimal::TWO))
+            .and_then(|half| a.checked_add(half)),
+    }
+    // Unreachable: both forms above are exact for representable inputs.
+    .unwrap_or(a)
+}
+
+/// The mean `(a + b + c) / 3` of three decimals, never saturated.
+///
+/// When the sum overflows, the mean is computed as the smallest value plus
+/// a third of the (non negative) excesses over it, which keeps it within
+/// the inputs' range; a range too wide for that sums thirds instead.
+#[must_use]
+pub(crate) fn mean3(a: Decimal, b: Decimal, c: Decimal) -> Decimal {
+    let three = Decimal::from(3);
+    let direct = || a.checked_add(b)?.checked_add(c)?.checked_div(three);
+    let from_min = || {
+        let low = a.min(b).min(c);
+        let excess = a
+            .checked_sub(low)?
+            .checked_add(b.checked_sub(low)?)?
+            .checked_add(c.checked_sub(low)?)?;
+        low.checked_add(excess.checked_div(three)?)
+    };
+    let thirds = || {
+        a.checked_div(three)?
+            .checked_add(b.checked_div(three)?)?
+            .checked_add(c.checked_div(three)?)
+    };
+    direct()
+        .or_else(from_min)
+        .or_else(thirds)
+        // Unreachable: thirds of representable values sum within bounds.
+        .unwrap_or(a)
+}
+
+/// The imbalance `(a - b) / (a + b)`, invariant under a common scale of
+/// `a` and `b`, and zero when `a + b` is zero.
+///
+/// When the direct form overflows, both sides are first divided by the
+/// larger magnitude, so a sum beyond the `Decimal` bounds never distorts
+/// the ratio.
+#[must_use]
+pub(crate) fn imbalance_ratio(a: Decimal, b: Decimal) -> Decimal {
+    let ratio = |a: Decimal, b: Decimal| {
+        let total = a.checked_add(b)?;
+        if total.is_zero() {
+            return Some(Decimal::ZERO);
+        }
+        a.checked_sub(b)?.checked_div(total)
+    };
+    ratio(a, b)
+        .or_else(|| {
+            let scale = a.abs().max(b.abs());
+            ratio(a.checked_div(scale)?, b.checked_div(scale)?)
+        })
+        // Unreachable: scaled sides are in [-1, 1].
+        .unwrap_or(Decimal::ZERO)
+}
+
+/// The totals of two sides, and the scale that recovers them.
+///
+/// The scale is one when both sums fit. Otherwise each term is divided by
+/// the number of terms, so the sums always fit and keep their proportions.
+fn scaled_sides<A, B>(a: A, b: B) -> Option<(Decimal, Decimal, Decimal)>
+where
+    A: Iterator<Item = Decimal> + Clone,
+    B: Iterator<Item = Decimal> + Clone,
+{
+    fn sum(mut terms: impl Iterator<Item = Decimal>, scale: Decimal) -> Option<Decimal> {
+        terms.try_fold(Decimal::ZERO, |total, term| {
+            total.checked_add(term.checked_div(scale)?)
+        })
+    }
+    let direct = sum(a.clone(), Decimal::ONE).zip(sum(b.clone(), Decimal::ONE));
+    if let Some((total_a, total_b)) = direct {
+        return Some((total_a, total_b, Decimal::ONE));
+    }
+    let count = a.clone().count().saturating_add(b.clone().count());
+    let scale = Decimal::from(count);
+    Some((sum(a, scale)?, sum(b, scale)?, scale))
+}
+
+/// The imbalance `(sum(a) - sum(b)) / (sum(a) + sum(b))` of two sides given
+/// term by term, exact in proportion even when a sum is beyond the
+/// `Decimal` bounds. Zero when the combined total is not positive.
+#[must_use]
+pub(crate) fn imbalance_of_sides<A, B>(a: A, b: B) -> Decimal
+where
+    A: Iterator<Item = Decimal> + Clone,
+    B: Iterator<Item = Decimal> + Clone,
+{
+    match scaled_sides(a, b) {
+        Some((total_a, total_b, _)) if total_a.saturating_add(total_b) > Decimal::ZERO => {
+            imbalance_ratio(total_a, total_b)
+        }
+        _ => Decimal::ZERO,
+    }
+}
+
+/// The difference `sum(a) - sum(b)` of two sides given term by term.
+///
+/// Report only: the sides are compared before any bound is hit, so the sign
+/// is right, but the result saturates at the `Decimal` bounds.
+#[must_use]
+pub(crate) fn net_of_sides<A, B>(a: A, b: B) -> Decimal
+where
+    A: Iterator<Item = Decimal> + Clone,
+    B: Iterator<Item = Decimal> + Clone,
+{
+    scaled_sides(a, b).map_or(Decimal::ZERO, |(total_a, total_b, scale)| {
+        total_a.saturating_sub(total_b).saturating_mul(scale)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_imbalance_of_sides_beyond_bounds_keeps_proportions() {
+        let max = Decimal::MAX;
+        let imbalance = imbalance_of_sides([max, max].into_iter(), [max].into_iter());
+        assert_eq!(
+            imbalance.round_dp(20),
+            dec!(1).checked_div(dec!(3)).unwrap().round_dp(20)
+        );
+        assert_eq!(net_of_sides([max, max].into_iter(), [max].into_iter()), max);
+    }
+
+    #[test]
+    fn test_imbalance_of_sides_empty_is_zero() {
+        let none = std::iter::empty::<Decimal>();
+        assert_eq!(
+            imbalance_of_sides(none.clone(), none.clone()),
+            Decimal::ZERO
+        );
+        assert_eq!(net_of_sides(none.clone(), none), Decimal::ZERO);
+    }
 
     #[test]
     fn test_decimal_to_u64_saturating_bounds_clamp() {
@@ -175,6 +366,44 @@ mod tests {
         assert_eq!(decimal_to_u64_saturating(dec!(-3.5)), 0);
         assert_eq!(decimal_to_u64_saturating(dec!(-0.5)), 0);
         assert_eq!(decimal_to_u64_saturating(Decimal::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn test_or_overflow_maps_none_to_numerical_error() {
+        let err = Decimal::MAX
+            .checked_add(Decimal::ONE)
+            .or_overflow("sum")
+            .unwrap_err();
+        assert_eq!(err, MMError::NumericalError("sum overflows".to_string()));
+        assert_eq!(Some(Decimal::ONE).or_overflow("sum").unwrap(), Decimal::ONE);
+    }
+
+    #[test]
+    fn test_saturating_div() {
+        assert_eq!(saturating_div(dec!(1), dec!(4)), dec!(0.25));
+        assert_eq!(saturating_div(dec!(1), Decimal::ZERO), Decimal::ZERO);
+        let tiny = dec!(0.0000000000000000000000000001);
+        assert_eq!(saturating_div(Decimal::MAX, tiny), Decimal::MAX);
+        assert_eq!(saturating_div(Decimal::MIN, tiny), Decimal::MIN);
+        assert_eq!(saturating_div(Decimal::MAX, -tiny), Decimal::MIN);
+    }
+
+    #[test]
+    fn test_midpoint_is_exact_near_the_bounds() {
+        assert_eq!(midpoint(dec!(1), dec!(2)), dec!(1.5));
+        assert_eq!(midpoint(Decimal::MAX, Decimal::MAX), Decimal::MAX);
+        assert_eq!(midpoint(Decimal::MIN, Decimal::MIN), Decimal::MIN);
+        assert_eq!(midpoint(Decimal::MIN, Decimal::MAX), Decimal::ZERO);
+        let near = Decimal::MAX - dec!(2);
+        assert_eq!(midpoint(near, Decimal::MAX), Decimal::MAX - dec!(1));
+    }
+
+    #[test]
+    fn test_imbalance_ratio_is_scale_invariant() {
+        assert_eq!(imbalance_ratio(dec!(3), dec!(1)), dec!(0.5));
+        assert_eq!(imbalance_ratio(Decimal::ZERO, Decimal::ZERO), Decimal::ZERO);
+        let huge = imbalance_ratio(Decimal::MAX, Decimal::MAX / dec!(3));
+        assert!((huge - dec!(0.5)).abs() < dec!(0.00000001), "{huge}");
     }
 
     #[test]
