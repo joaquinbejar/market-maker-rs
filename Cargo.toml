@@ -132,6 +132,10 @@ required-features = ["kernel"]
 name = "kernel_glft"
 required-features = ["kernel"]
 
+[[test]]
+name = "kernel_margin"
+required-features = ["kernel", "margin"]
+
 [[bench]]
 name = "quote_generation"
 harness = false

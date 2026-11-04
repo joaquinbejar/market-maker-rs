@@ -1,9 +1,13 @@
 //! The hedged driver and the replay helpers of the kernel's replay, snapshot
 //! and batch gates.
 
+#![allow(dead_code)]
+
 use super::harness::*;
+use market_maker_rs::Decimal;
 use market_maker_rs::backtest::kernel::{
-    ActionStatus, KernelAction, KernelEvent, Observation, Phase, QuoteSide, fnv1a128,
+    ActionStatus, KernelAction, KernelEvent, KernelFillModel, Observation, Phase, QuoteSide,
+    capacity_need, fnv1a128,
 };
 
 /// Absolute position, in lots, at which the driver hedges.
@@ -103,4 +107,37 @@ pub fn replay(
 
 pub fn parent_bid(obs: &Observation) -> u64 {
     obs.bid.saturating_sub(1).max(1)
+}
+
+/// Stack of the threads that hold these states by value: their delivery queue
+/// is several times the size of the other kernel tests'.
+pub const STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Runs `body` on a thread with [`STACK_BYTES`] of stack.
+pub fn on_large_stack(body: impl FnOnce() + Send) {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(STACK_BYTES)
+            .spawn_scoped(scope, body)
+            .unwrap()
+            .join()
+            .unwrap();
+    });
+}
+
+/// The scenario under the queue position model, when the harness capacity
+/// has room for its partial fill reports.
+pub fn partial_scenario(seed: u64, index: u64) -> Option<Scenario> {
+    let mut sc = scenario(seed, index);
+    let mix = seed.wrapping_mul(31).wrapping_add(index);
+    let rate_lots = [1u64, 1, 2, 3][usize::try_from(mix % 4).unwrap()];
+    let rate = (Decimal::from(rate_lots) * sc.cfg.lot_size).normalize();
+    let min_queue_ms = [0u64, 0, 1, 3][usize::try_from((mix / 4) % 4).unwrap()];
+    sc.cfg.fill_model = KernelFillModel::QueuePosition { rate, min_queue_ms };
+    fits(&sc).then_some(sc)
+}
+
+pub fn fits(sc: &Scenario) -> bool {
+    let need = capacity_need(&sc.cfg, &sc.data()).unwrap();
+    (3 + usize::try_from(need.partial_reports_per_order).unwrap()) * ORD <= DLV
 }
