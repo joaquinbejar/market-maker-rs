@@ -785,6 +785,307 @@ fn test_calibrate_window_oversized_config_is_refused() {
     assert!(calibrate_window(&data, &window, &config().with_resolution_ms(1), "d").is_err());
 }
 
+#[test]
+fn test_calibrate_window_volatility_matches_hand_computation() {
+    // Alternating log returns of +r and -r on a 365 day year.
+    let r = 0.001f64;
+    let p: Vec<_> = (0..101u64)
+        .map(|i| PriceSample {
+            timestamp_ms: i * 60_000,
+            price: Decimal::from_f64(if i % 2 == 0 { 100.0 } else { 100.0 * r.exp() }).unwrap(),
+        })
+        .collect();
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let window = TimeWindow::new(0, 101 * 60_000).unwrap();
+    let cfg = config().with_minima(30, 2, 1, 1);
+    let record =
+        calibrate_window(&CalibrationData::new(&p, &e).unwrap(), &window, &cfg, "d").unwrap();
+    let fit = record.parameters().unwrap();
+    assert_eq!(fit.reference_price, dec!(100));
+    // 100 returns with mean 0: the sample variance is 100 r² / 99.
+    let per_step = (100.0 * r * r / 99.0f64).sqrt();
+    let expected = 100.0 * per_step * (31_536_000_000.0f64 / 60_000.0).sqrt();
+    let got = fit.volatility.to_f64().unwrap();
+    assert!((got / expected - 1.0).abs() < 1e-6, "{got} {expected}");
+}
+
+#[test]
+fn test_calibrate_window_every_hashed_field_changes_the_hash() {
+    let p = prices(7, 0, DAY_MS, 60_000, 0.5);
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let hash = |p: &[PriceSample], e: &[QuoteExposure]| {
+        calibrate_window(
+            &CalibrationData::new(p, e).unwrap(),
+            &window,
+            &config(),
+            "d",
+        )
+        .unwrap()
+        .dataset_hash
+    };
+    let base = hash(&p, &e);
+    let mut q = p.clone();
+    q[5].price += dec!(0.01);
+    assert_ne!(hash(&q, &e), base, "price");
+    let mut q = p.clone();
+    q[5].timestamp_ms += 1;
+    assert_ne!(hash(&q, &e), base, "price time");
+    let edits: [fn(&mut QuoteExposure); 4] = [
+        |x| x.timestamp_ms += 1,
+        |x| x.distance += dec!(0.01),
+        |x| x.exposure_ms += 1,
+        |x| x.fills += 1,
+    ];
+    for (i, edit) in edits.iter().enumerate() {
+        let mut f = e.clone();
+        edit(&mut f[12]);
+        f.sort_by_key(|x| x.timestamp_ms);
+        assert_ne!(hash(&p, &f), base, "exposure field {i}");
+    }
+    // The same numbers at another decimal scale are the same data.
+    let mut q = p.clone();
+    let scale = q[5].price.scale().min(27) + 1;
+    q[5].price.rescale(scale);
+    assert_eq!(hash(&q, &e), base);
+}
+
+#[test]
+fn test_calibrate_window_silent_prices_are_a_gap() {
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let run = |p: &[PriceSample], cfg: &WalkForwardConfig| {
+        calibrate_window(&CalibrationData::new(p, &e).unwrap(), &window, cfg, "d")
+            .unwrap()
+            .outcome
+    };
+    // Two samples in a day: the grid is full, but only two buckets were seen.
+    let two = prices(7, 0, 120_000, 60_000, 0.5);
+    assert_eq!(
+        run(&two, &config()),
+        CalibrationOutcome::Insufficient(CalibrationFailure::TooFewPrices { have: 2, need: 30 })
+    );
+    // One hour of data, then silence: enough buckets, a trailing gap.
+    let hour = prices(7, 0, 3_600_000, 60_000, 0.5);
+    assert_eq!(
+        run(&hour, &config()),
+        CalibrationOutcome::Insufficient(CalibrationFailure::PriceGap {
+            gap_ms: DAY_MS - 3_540_000,
+            limit_ms: 300_000
+        })
+    );
+    // A gap in the middle, and one exactly at the limit, which passes.
+    let mut middle = prices(7, 0, DAY_MS, 60_000, 0.5);
+    middle.retain(|s| !(600_000..840_000).contains(&s.timestamp_ms));
+    assert!(matches!(
+        run(&middle, &config()),
+        CalibrationOutcome::Calibrated(_)
+    ));
+    middle.retain(|s| s.timestamp_ms != 840_000);
+    assert!(matches!(
+        run(&middle, &config()),
+        CalibrationOutcome::Insufficient(CalibrationFailure::PriceGap {
+            gap_ms: 360_000,
+            ..
+        })
+    ));
+    assert!(matches!(
+        run(&middle, &config().with_max_gap_buckets(6)),
+        CalibrationOutcome::Calibrated(_)
+    ));
+}
+
+#[test]
+fn test_walk_forward_score_ranks_the_true_model_on_continuous_distances() {
+    // True A = 1 and k = 1, 1 s exposures, most without fills.
+    let mut rng = Rng(31);
+    let mut e = Vec::new();
+    for i in 1..(2 * DAY_MS / 10_000) {
+        let d = 3.0 * rng.unit();
+        e.push(QuoteExposure {
+            timestamp_ms: i * 10_000,
+            distance: Decimal::from_f64(d).unwrap(),
+            exposure_ms: 1_000,
+            fills: rng.poisson((-d).exp()),
+        });
+    }
+    let p = prices(7, 0, 2 * DAY_MS, 60_000, 0.5);
+    let split = ChronologicalSplit {
+        train: TimeWindow {
+            start_ms: 0,
+            end_ms: DAY_MS,
+        },
+        test: TimeWindow {
+            start_ms: DAY_MS,
+            end_ms: 2 * DAY_MS,
+        },
+    };
+    let near_zero = ConstantParameters {
+        volatility: dec!(1),
+        intensity_scale_a: dec!(0.000000001),
+        order_intensity_k: dec!(1),
+    };
+    let report = walk_forward(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &[split],
+        &config(),
+        "d",
+        &near_zero,
+    )
+    .unwrap();
+    let fold = &report.folds[0];
+    assert!(fold.calibrated.unwrap().intensity < fold.constant.intensity);
+}
+
+#[test]
+fn test_walk_forward_score_sees_the_seasonality() {
+    let season = |t: u64| if t % DAY_MS < DAY_MS / 2 { 0.2 } else { 1.8 };
+    let p = prices(7, 0, 4 * DAY_MS, 60_000, 0.5);
+    let e = exposures(11, 0, 4 * DAY_MS, 2.0, 3.0, season);
+    let data = CalibrationData::new(&p, &e).unwrap();
+    let split = ChronologicalSplit {
+        train: TimeWindow {
+            start_ms: 0,
+            end_ms: 2 * DAY_MS,
+        },
+        test: TimeWindow {
+            start_ms: 2 * DAY_MS,
+            end_ms: 4 * DAY_MS,
+        },
+    };
+    let error = |cfg: WalkForwardConfig| {
+        walk_forward(&data, &[split], &cfg, "d", &constant())
+            .unwrap()
+            .folds[0]
+            .calibrated
+            .unwrap()
+            .intensity
+            .unwrap()
+    };
+    assert!(error(config().with_seasonality(2, 30)) < error(config()));
+}
+
+#[test]
+fn test_walk_forward_k_change_compares_across_an_insufficient_fold() {
+    let p = prices(7, 0, 4 * DAY_MS, 60_000, 0.5);
+    let mut e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    e.extend(exposures(11, 2 * DAY_MS, 3 * DAY_MS, 2.0, 5.0, |_| 1.0));
+    let data = CalibrationData::new(&p, &e).unwrap();
+    let spec = WindowSpec {
+        train_ms: DAY_MS,
+        test_ms: DAY_MS,
+        step_ms: DAY_MS,
+    };
+    let splits = chronological_splits(0, 4 * DAY_MS, &spec).unwrap();
+    let report = walk_forward(&data, &splits, &config(), "gap", &constant()).unwrap();
+    assert!(report.folds[1].record.parameters().is_none());
+    assert!(report.folds[1].k_change.is_none());
+    let change = report.folds[2].k_change.expect("against the first fold");
+    assert!((change.to_f64().unwrap() - 2.0).abs() < 0.3, "{change}");
+}
+
+/// Two levels of 60 s, one bucket, as `(distance, fills)`.
+fn two_levels(cells: [(Decimal, u64); 2]) -> Vec<QuoteExposure> {
+    cells
+        .iter()
+        .map(|(distance, fills)| QuoteExposure {
+            timestamp_ms: 100_000,
+            distance: *distance,
+            exposure_ms: 60_000,
+            fills: *fills,
+        })
+        .collect()
+}
+
+#[test]
+fn test_walk_forward_unrepresentable_fold_does_not_lose_the_report() {
+    let p = prices(7, 0, 3 * DAY_MS, 60_000, 0.5);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let cfg = config().with_minima(30, 2, 1, 1);
+    for cells in [
+        [(dec!(10), 30), (dec!(10.01), 20)],
+        [(dec!(33), 1000), (dec!(34), 135)],
+        [(dec!(1.0), 20), (dec!(1.0000001), 10)],
+    ] {
+        let e = two_levels(cells);
+        let record =
+            calibrate_window(&CalibrationData::new(&p, &e).unwrap(), &window, &cfg, "d").unwrap();
+        assert_eq!(
+            record.outcome,
+            CalibrationOutcome::Insufficient(CalibrationFailure::UnrepresentableIntensity),
+            "{cells:?}"
+        );
+    }
+
+    let mut e = two_levels([(dec!(10), 30), (dec!(10.01), 20)]);
+    e.extend(exposures(11, DAY_MS, 3 * DAY_MS, 2.0, 3.0, |_| 1.0));
+    let spec = WindowSpec {
+        train_ms: DAY_MS,
+        test_ms: DAY_MS,
+        step_ms: DAY_MS,
+    };
+    let splits = chronological_splits(0, 3 * DAY_MS, &spec).unwrap();
+    let report = walk_forward(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &splits,
+        &cfg,
+        "d",
+        &constant(),
+    )
+    .unwrap();
+    assert_eq!(report.folds.len(), 2);
+    assert!(report.folds[0].calibrated.is_none());
+    assert!(report.folds[1].calibrated.is_some());
+}
+
+#[test]
+fn test_calibrate_window_buckets_far_apart_keep_the_bisection_working() {
+    // k = ln 2, at distances where exp(-k · d) underflows only with a large k.
+    let outcome = two_bucket_outcome([
+        [(dec!(1), 100, 200), (dec!(2), 100, 100)],
+        [(dec!(700), 100, 200), (dec!(701), 100, 100)],
+    ]);
+    assert_eq!(
+        outcome,
+        CalibrationOutcome::Insufficient(CalibrationFailure::UnrepresentableIntensity)
+    );
+}
+
+#[test]
+fn test_calibrate_window_equal_rates_are_not_decaying() {
+    let p = prices(7, 0, DAY_MS, 60_000, 0.5);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let cfg = config().with_minima(30, 2, 1, 1);
+    for cells in [
+        [(dec!(0.003), 100), (dec!(0.006), 100)],
+        [(dec!(0.1), 70), (dec!(0.3), 70)],
+        [(dec!(7E28), 1000), (dec!(7.9E28), 900)],
+    ] {
+        let e = two_levels(cells);
+        let record =
+            calibrate_window(&CalibrationData::new(&p, &e).unwrap(), &window, &cfg, "d").unwrap();
+        assert_eq!(
+            record.outcome,
+            CalibrationOutcome::Insufficient(CalibrationFailure::NonDecayingIntensity),
+            "{cells:?}"
+        );
+    }
+}
+
+#[test]
+fn test_chronological_splits_too_many_are_refused() {
+    let spec = WindowSpec {
+        train_ms: 1,
+        test_ms: 1,
+        step_ms: 1,
+    };
+    assert!(chronological_splits(0, u64::MAX, &spec).is_err());
+    assert_eq!(
+        chronological_splits(0, 1_000_001, &spec).unwrap().len(),
+        1_000_000
+    );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn test_calibration_record_serde_round_trip_is_identical() {

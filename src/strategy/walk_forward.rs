@@ -33,10 +33,21 @@
 //!
 //! `A`, `k` and `s(t)` are the joint Poisson maximum likelihood estimates, so
 //! exposures without fills count as evidence of a low rate, distances may be
-//! continuous, and `k` is not confused with a bucket that quotes further away. The existing log-linear [`OrderIntensityCalibrator`] cannot
-//! take a level without fills, and does not return `A`.
+//! continuous, and `k` is not confused with a bucket that quotes further away.
+//! An exposure counts entirely in the intraday bucket where it ends, so keep
+//! exposures short against the buckets. [`OrderIntensityCalibrator`] and
+//! [`OrderIntensityEstimator`] are not reused: both regress logarithms of
+//! observed fills, so neither can use an exposure without fills.
 //!
 //! [`OrderIntensityCalibrator`]: crate::strategy::calibration::OrderIntensityCalibrator
+//! [`OrderIntensityEstimator`]: crate::analytics::intensity::OrderIntensityEstimator
+//!
+//! # Price gaps
+//!
+//! A grid bucket without a sample repeats the last price, which reads as a
+//! return of zero. So the grid minimum counts only buckets with a sample, and
+//! a window with a longer silence than `max_gap_buckets` allows, including at
+//! its start or end, is [`CalibrationFailure::PriceGap`].
 //!
 //! # Example
 //!
@@ -77,6 +88,15 @@ const MIN_DISTANCE_LEVELS: usize = 2;
 const MAX_SEASONALITY_BUCKETS: u32 = 1_440;
 /// Bisection steps of the `k` fit; each halves the bracket.
 const K_BISECTION_STEPS: u32 = 200;
+/// Most splits accepted from one call.
+const MAX_SPLITS: usize = 1_000_000;
+/// Relative margin under which the fit cannot tell a difference from rounding.
+const FIT_TOLERANCE: f64 = 1e-12;
+/// Fills per second assumed where the predicted rate is lower, so that a fill
+/// the model calls impossible costs a large but finite score.
+const SCORE_RATE_FLOOR: f64 = 1e-12;
+/// Smallest `exp` result kept; below it the rate is under `Decimal` resolution.
+const EXP_ZERO_BELOW: f64 = 1e-28;
 /// Upper bound of the `k` bracket, in 1 / price units.
 const K_BRACKET_LIMIT: f64 = 1e15;
 
@@ -137,7 +157,8 @@ pub struct WindowSpec {
 /// # Errors
 ///
 /// Returns [`MMError::InvalidConfiguration`] for a zero length, for
-/// `step_ms < test_ms`, or when not even one split fits, and
+/// `step_ms < test_ms`, more than a million splits, or when not even one
+/// split fits, and
 /// [`MMError::NumericalError`] on overflow.
 pub fn chronological_splits(
     start_ms: u64,
@@ -161,6 +182,11 @@ pub fn chronological_splits(
             .or_overflow("test window end")?;
         if test_end > end_ms {
             break;
+        }
+        if splits.len() >= MAX_SPLITS {
+            return Err(MMError::InvalidConfiguration(format!(
+                "more than {MAX_SPLITS} splits in [{start_ms}, {end_ms})"
+            )));
         }
         splits.push(ChronologicalSplit {
             train: TimeWindow::new(train_start, train_end)?,
@@ -300,8 +326,10 @@ pub struct WalkForwardConfig {
     pub volatility_rule: VolatilityRule,
     /// Update rule of [`walk_forward`].
     pub update_rule: UpdateRule,
-    /// Fewest grid prices for a volatility. At least 3.
+    /// Fewest grid buckets with a sample for a volatility. At least 3.
     pub min_grid_prices: usize,
+    /// Longest silence between samples, in grid buckets. Positive.
+    pub max_gap_buckets: u32,
     /// Fewest distance levels with fills for an intensity. At least 2.
     pub min_distance_levels: usize,
     /// Fewest fills for an intensity. Positive.
@@ -319,8 +347,9 @@ pub struct WalkForwardConfig {
 
 impl WalkForwardConfig {
     /// Creates a configuration with a one second grid, the simple estimator,
-    /// rolling updates, one seasonal bucket and minima of 30 grid prices, 2
-    /// levels, 30 fills and one minute of exposure.
+    /// rolling updates, one seasonal bucket, a silence of at most 5 grid
+    /// buckets and minima of 30 grid prices, 2 levels, 30 fills and one minute
+    /// of exposure.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -328,6 +357,7 @@ impl WalkForwardConfig {
             volatility_rule: VolatilityRule::Simple,
             update_rule: UpdateRule::Rolling,
             min_grid_prices: 30,
+            max_gap_buckets: 5,
             min_distance_levels: MIN_DISTANCE_LEVELS,
             min_fills: 30,
             min_exposure_ms: 60_000,
@@ -340,6 +370,13 @@ impl WalkForwardConfig {
     #[must_use]
     pub fn with_resolution_ms(mut self, resolution_ms: u64) -> Self {
         self.resolution_ms = resolution_ms;
+        self
+    }
+
+    /// Sets the longest silence between samples, in grid buckets.
+    #[must_use]
+    pub fn with_max_gap_buckets(mut self, buckets: u32) -> Self {
+        self.max_gap_buckets = buckets;
         self
     }
 
@@ -389,6 +426,7 @@ impl WalkForwardConfig {
         if self.resolution_ms == 0
             || !lambda_ok
             || self.min_grid_prices < MIN_GRID_PRICES
+            || self.max_gap_buckets == 0
             || self.min_distance_levels < MIN_DISTANCE_LEVELS
             || self.min_fills == 0
             || self.min_exposure_ms == 0
@@ -461,6 +499,13 @@ pub enum CalibrationFailure {
         /// Grid prices required.
         need: usize,
     },
+    /// A silence in the prices is longer than allowed.
+    PriceGap {
+        /// Longest silence in the window, in milliseconds.
+        gap_ms: u64,
+        /// Longest silence allowed, in milliseconds.
+        limit_ms: u64,
+    },
     /// The prices did not move, so the volatility is zero.
     FlatPrices,
     /// Too little time at risk.
@@ -490,6 +535,8 @@ pub enum CalibrationFailure {
     /// nearest distance, so no finite `k` exists, or the estimate is above the
     /// search limit of 1e15 per price unit.
     UnboundedIntensity,
+    /// `A` or a multiplier from the fit is not representable as a `Decimal`.
+    UnrepresentableIntensity,
     /// An intraday bucket has no exposure, so nothing is known about its rate.
     UnobservedSeasonalBucket {
         /// Bucket index.
@@ -601,10 +648,15 @@ pub struct ConstantParameters {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
 pub struct OutOfSampleError {
-    /// `|predicted - realized|` volatility; `None` without test prices.
+    /// `|predicted - realized|` volatility; `None` when the test prices would
+    /// not pass the training minimum or gap limit.
     pub volatility: Option<Decimal>,
-    /// Sum over distances of `|fills - expected fills|` per second of
-    /// exposure; `None` without test exposure.
+    /// Poisson negative log likelihood of the test fills per second of
+    /// exposure, `Σ (μ - n · ln μ) / Σ T`, without the `ln(n!)` term that
+    /// depends only on the data. Lower is better, it may be negative, and it
+    /// compares models on one window only. A predicted rate below 1e-12 fills
+    /// per second counts as 1e-12, so a fill at rate zero costs a large finite
+    /// amount. `None` without test exposure.
     pub intensity: Option<Decimal>,
 }
 
@@ -760,16 +812,21 @@ fn estimate(
     window: &TimeWindow,
     config: &WalkForwardConfig,
 ) -> MMResult<Result<CalibratedParameters, CalibrationFailure>> {
-    let grid = grid_prices(prices, window, config.resolution_ms)?;
-    if grid.len() < config.min_grid_prices {
+    let (grid, observed) = grid_prices(prices, window, config.resolution_ms)?;
+    if observed < config.min_grid_prices {
         return Ok(Err(CalibrationFailure::TooFewPrices {
-            have: grid.len(),
+            have: observed,
             need: config.min_grid_prices,
         }));
     }
+    let limit_ms = gap_limit_ms(config)?;
+    let gap_ms = longest_gap_ms(prices, window)?;
+    if gap_ms > limit_ms {
+        return Ok(Err(CalibrationFailure::PriceGap { gap_ms, limit_ms }));
+    }
     let Some(&reference_price) = grid.last() else {
         return Ok(Err(CalibrationFailure::TooFewPrices {
-            have: 0,
+            have: observed,
             need: config.min_grid_prices,
         }));
     };
@@ -806,12 +863,13 @@ fn estimate(
     }))
 }
 
-/// Resamples to the last price at or before each complete grid bucket's end.
+/// Resamples to the last price before each complete grid bucket's end, and
+/// counts the buckets with a sample of their own.
 fn grid_prices(
     prices: &[PriceSample],
     window: &TimeWindow,
     resolution_ms: u64,
-) -> MMResult<Vec<Decimal>> {
+) -> MMResult<(Vec<Decimal>, usize)> {
     let span = window
         .end_ms
         .checked_sub(window.start_ms)
@@ -825,19 +883,49 @@ fn grid_prices(
     let mut grid = Vec::new();
     let mut samples = prices.iter().peekable();
     let mut last = None;
+    let mut observed = 0usize;
     for point in 1..=points {
         let bucket_end = point
             .checked_mul(resolution_ms)
             .and_then(|offset| window.start_ms.checked_add(offset))
             .or_overflow("grid bucket end")?;
+        let mut sampled = false;
         while let Some(sample) = samples.next_if(|s| s.timestamp_ms < bucket_end) {
             last = Some(sample.price);
+            sampled = true;
+        }
+        if sampled {
+            observed = observed.saturating_add(1);
         }
         if let Some(price) = last {
             grid.push(price);
         }
     }
-    Ok(grid)
+    Ok((grid, observed))
+}
+
+/// Longest silence allowed by the configuration.
+fn gap_limit_ms(config: &WalkForwardConfig) -> MMResult<u64> {
+    config
+        .resolution_ms
+        .checked_mul(u64::from(config.max_gap_buckets))
+        .or_overflow("price gap limit")
+}
+
+/// Longest time without a sample, counting from the window's start to its end.
+fn longest_gap_ms(prices: &[PriceSample], window: &TimeWindow) -> MMResult<u64> {
+    let mut longest = 0u64;
+    let mut previous = window.start_ms;
+    let times = prices
+        .iter()
+        .map(|s| s.timestamp_ms)
+        .chain(std::iter::once(window.end_ms));
+    for time in times {
+        let gap = time.checked_sub(previous).or_overflow("price gap")?;
+        longest = longest.max(gap);
+        previous = time;
+    }
+    Ok(longest)
 }
 
 /// Relative volatility per √year of a regular grid.
@@ -857,14 +945,19 @@ fn relative_volatility(
 }
 
 /// Absolute volatility realized on a test window, by the simple estimator
-/// whatever the training rule. `None` when the window has too few grid prices.
+/// whatever the training rule. `None` when the window's prices would not pass
+/// the training minimum or gap limit.
 fn realized_volatility(
     prices: &[PriceSample],
     window: &TimeWindow,
     config: &WalkForwardConfig,
 ) -> MMResult<Option<Decimal>> {
-    let grid = grid_prices(prices, window, config.resolution_ms)?;
-    let Some(&last) = grid.last().filter(|_| grid.len() >= config.min_grid_prices) else {
+    let (grid, observed) = grid_prices(prices, window, config.resolution_ms)?;
+    if observed < config.min_grid_prices || longest_gap_ms(prices, window)? > gap_limit_ms(config)?
+    {
+        return Ok(None);
+    }
+    let Some(&last) = grid.last() else {
         return Ok(None);
     };
     relative_volatility(&grid, config.resolution_ms, VolatilityRule::Simple)?
@@ -893,22 +986,38 @@ struct BucketFit {
 }
 
 impl BucketFit {
-    /// `Σ T · exp(-k · d)`.
+    /// Nearest distance of the bucket; `levels` are in ascending distance.
+    fn nearest(&self) -> f64 {
+        self.levels.first().map_or(0.0, |(d, _)| *d)
+    }
+
+    /// `Σ T · exp(-k · (d - nearest))`, which keeps the nearest level's weight
+    /// from underflowing whatever `k` is.
+    fn relative_mass(&self, k: f64) -> f64 {
+        let nearest = self.nearest();
+        self.levels
+            .iter()
+            .map(|(d, t)| t * (-k * (d - nearest)).exp())
+            .sum()
+    }
+
+    /// `Σ T · exp(-k · d)`, which may underflow to zero.
     fn mass(&self, k: f64) -> f64 {
-        self.levels.iter().map(|(d, t)| t * (-k * d).exp()).sum()
+        self.relative_mass(k) * (-k * self.nearest()).exp()
     }
 
     /// The bucket's expected fills times its mean distance under `k`, once
     /// its own multiplier is profiled out.
     fn fill_moment(&self, k: f64) -> f64 {
-        let mass = self.mass(k);
+        let mass = self.relative_mass(k);
         if self.fills == 0.0 || mass <= 0.0 {
             return 0.0;
         }
+        let nearest = self.nearest();
         let moment: f64 = self
             .levels
             .iter()
-            .map(|(d, t)| t * (-k * d).exp() * d)
+            .map(|(d, t)| t * (-k * (d - nearest)).exp() * d)
             .sum();
         self.fills * moment / mass
     }
@@ -981,16 +1090,13 @@ fn fit_intensity(
     }
 
     let predicted = |k: f64| buckets.iter().map(|b| b.fill_moment(k)).sum::<f64>();
-    if predicted(0.0) <= observed {
+    if predicted(0.0) <= observed * (1.0 + FIT_TOLERANCE) {
         return Ok(Err(CalibrationFailure::NonDecayingIntensity));
     }
     // As `k` grows, each bucket's mean distance falls to its nearest level. At
     // that limit rounding would stop the bisection at an arbitrary finite `k`.
-    let limit: f64 = buckets
-        .iter()
-        .map(|b| b.fills * b.levels.first().map_or(0.0, |(d, _)| *d))
-        .sum();
-    if observed <= limit {
+    let limit: f64 = buckets.iter().map(|b| b.fills * b.nearest()).sum();
+    if observed <= limit * (1.0 + FIT_TOLERANCE) {
         return Ok(Err(CalibrationFailure::UnboundedIntensity));
     }
     let (mut low, mut high) = (0.0f64, 1.0f64);
@@ -1013,13 +1119,30 @@ fn fit_intensity(
     let total_fills: f64 = buckets.iter().map(|b| b.fills).sum();
     let total_mass: f64 = buckets.iter().map(|b| b.mass(k)).sum();
     let a = total_fills / total_mass;
-    let seasonality = buckets
-        .iter()
-        .map(|b| from_f64(b.fills / b.mass(k) / a))
-        .collect::<MMResult<Vec<_>>>()?;
+    let Some(fit_k) = Decimal::from_f64(k) else {
+        return Ok(Err(CalibrationFailure::UnrepresentableIntensity));
+    };
+    if fit_k <= Decimal::ZERO {
+        return Ok(Err(CalibrationFailure::NonDecayingIntensity));
+    }
+    let Some(fit_a) = positive_decimal(a) else {
+        return Ok(Err(CalibrationFailure::UnrepresentableIntensity));
+    };
+    let mut seasonality = Vec::with_capacity(buckets.len());
+    for bucket in &buckets {
+        let multiplier = if bucket.fills == 0.0 {
+            Some(Decimal::ZERO)
+        } else {
+            positive_decimal(bucket.fills / bucket.mass(k) / a)
+        };
+        let Some(multiplier) = multiplier else {
+            return Ok(Err(CalibrationFailure::UnrepresentableIntensity));
+        };
+        seasonality.push(multiplier);
+    }
     Ok(Ok(IntensityFit {
-        a: from_f64(a)?,
-        k: from_f64(k)?,
+        a: fit_a,
+        k: fit_k,
         seasonality,
     }))
 }
@@ -1033,50 +1156,24 @@ fn score(
 ) -> MMResult<OutOfSampleError> {
     let volatility = realized.map(|r| abs_diff(volatility, r)).transpose()?;
 
-    let mut levels: BTreeMap<Decimal, (u64, Decimal)> = BTreeMap::new();
-    let mut total_ms = 0u64;
+    let mut likelihood = 0.0f64;
+    let mut total_seconds = 0.0f64;
     for e in exposures {
-        let expected = expected_fills(rate(e.distance, e.timestamp_ms)?, e.exposure_ms)?;
-        let level = levels.entry(e.distance).or_default();
-        level.0 = level.0.checked_add(e.fills).or_overflow("level fills")?;
-        level.1 = level
-            .1
-            .checked_add(expected)
-            .or_overflow("level expected")?;
-        total_ms = total_ms
-            .checked_add(e.exposure_ms)
-            .or_overflow("test exposure")?;
+        let seconds = to_f64(Decimal::from(e.exposure_ms))? / 1_000.0;
+        let per_second = to_f64(rate(e.distance, e.timestamp_ms)?)?.max(SCORE_RATE_FLOOR);
+        let expected = per_second * seconds;
+        likelihood += expected - to_f64(Decimal::from(e.fills))? * expected.ln();
+        total_seconds += seconds;
     }
-    let intensity = if total_ms == 0 {
-        None
+    let intensity = if total_seconds > 0.0 {
+        Some(from_f64(likelihood / total_seconds)?)
     } else {
-        let mut gap = Decimal::ZERO;
-        for (fills, expected) in levels.values() {
-            gap = gap
-                .checked_add(abs_diff(Decimal::from(*fills), *expected)?)
-                .or_overflow("fill gap")?;
-        }
-        Some(seconds_rate(gap, total_ms)?)
+        None
     };
     Ok(OutOfSampleError {
         volatility,
         intensity,
     })
-}
-
-/// `count` per second of `exposure_ms`.
-fn seconds_rate(count: Decimal, exposure_ms: u64) -> MMResult<Decimal> {
-    count
-        .checked_mul(Decimal::from(MS_PER_SECOND))
-        .and_then(|scaled| scaled.checked_div(Decimal::from(exposure_ms)))
-        .or_overflow("rate per second")
-}
-
-/// Fills a rate per second predicts over `exposure_ms`.
-fn expected_fills(rate: Decimal, exposure_ms: u64) -> MMResult<Decimal> {
-    rate.checked_mul(Decimal::from(exposure_ms))
-        .and_then(|scaled| scaled.checked_div(Decimal::from(MS_PER_SECOND)))
-        .or_overflow("expected fills")
 }
 
 /// `A · exp(-k · δ)`.
@@ -1103,14 +1200,22 @@ fn from_f64(value: f64) -> MMResult<Decimal> {
         .ok_or_else(|| MMError::NumericalError(format!("{value} is not a decimal")))
 }
 
-/// `exp(value)` through `f64`, as the other statistical estimators do.
+/// `exp(value)` through `f64`, as the other statistical estimators do. A
+/// result below the resolution of `Decimal` is zero.
 fn decimal_exp(value: Decimal) -> MMResult<Decimal> {
-    value
-        .to_f64()
-        .map(f64::exp)
+    let result = to_f64(value)?.exp();
+    if result < EXP_ZERO_BELOW {
+        return Ok(Decimal::ZERO);
+    }
+    from_f64(result)
+}
+
+/// A finite, strictly positive `f64` as a `Decimal`, if it stays positive.
+fn positive_decimal(value: f64) -> Option<Decimal> {
+    Some(value)
         .filter(|v| v.is_finite())
         .and_then(Decimal::from_f64)
-        .ok_or_else(|| MMError::NumericalError(format!("exp({value}) is not representable")))
+        .filter(|v| *v > Decimal::ZERO)
 }
 
 /// Index of the intraday bucket of a timestamp. `buckets` is positive.
