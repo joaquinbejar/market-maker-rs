@@ -476,6 +476,16 @@ fn test_consecutive_runs_lose_no_event() {
 }
 
 #[test]
+fn test_second_run_places_its_grid_after_the_first_horizon() {
+    let mut sim = QrSimulator::new(params(), 5, 100).unwrap();
+    let first = sim.run(10.5, 1.0).unwrap();
+    assert_eq!(first.samples.last().unwrap().timestamp_ms, 10_000);
+    let second = sim.run(2.0, 1.0).unwrap();
+    let times: Vec<_> = second.samples.iter().map(|s| s.timestamp_ms).collect();
+    assert_eq!(times, [11_500, 12_500]);
+}
+
+#[test]
 fn test_shift_caps_a_renormalized_queue() {
     // Sizes 1 and 100: a queue of 3 at the second limit is 300 at the first,
     // above the cap of 20.
