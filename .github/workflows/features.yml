@@ -64,6 +64,7 @@ jobs:
           - multi-underlying
           - events
           - margin
+          - instruments
           - kernel
 
     steps:
@@ -80,3 +81,28 @@ jobs:
 
       - name: Check feature ${{ matrix.feature }} alone
         run: cargo check --no-default-features --features ${{ matrix.feature }} --all-targets
+
+      # The library alone, without the dev-dependencies (whose features
+      # unify into every test build).
+      - name: Check the library with feature ${{ matrix.feature }} alone
+        run: cargo check --no-default-features --features ${{ matrix.feature }} --lib
+
+  margin_instruments:
+    name: Test (margin + instruments)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
+
+      # The margin-rs adapter is compiled only with both features.
+      - name: Test the margin-rs instrument adapter
+        run: cargo test --no-default-features --features margin,instruments --lib --test instruments_margin

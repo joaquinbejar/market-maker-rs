@@ -4,8 +4,9 @@
 //! literals computed by hand (shown in the comments), and then checks them
 //! against an independent property rather than re-deriving the same formula:
 //! counterparty conservation, equivalence between instrument forms, sign
-//! symmetry or parity. Nothing here depends on crate types beyond `Decimal`,
-//! so the fixtures stay valid while the contract types are still evolving.
+//! symmetry or parity. The hand fixtures depend on nothing beyond `Decimal`;
+//! separate tests cross-check some of them against the published formulas
+//! of `financial_types`, on its dated venue snapshots.
 //!
 //! Conventions used throughout:
 //! - prices and money are exact `Decimal`;
@@ -15,6 +16,11 @@
 //!   half even, at the settlement asset scale);
 //! - arithmetic that could overflow uses checked operations.
 
+use financial_types::Side;
+use financial_types::instrument::reference::{binance_usdm, deribit};
+use financial_types::instrument::{
+    AssetCode, InstrumentId, Money, MoneyRatio, Ratio, RoundingRule,
+};
 use market_maker_rs::Decimal;
 use market_maker_rs::dec;
 use rust_decimal::RoundingStrategy;
@@ -61,16 +67,17 @@ fn test_spot_trade_counterparties_conserve_value_except_fees() {
 
 // ------------------------------------------------------ linear future
 
-/// Linear (USDT margined) BTC future, multiplier 0.001 BTC per contract,
-/// quote and settlement USDT.
+/// Linear (USDT margined) BTC contract as listed by Binance (`BTCUSDT`):
+/// multiplier 1 BTC per contract, lot step 0.001 BTC, quote and settlement
+/// USDT.
 ///
-/// Long 10 contracts @ 60000, close @ 61000: PnL 10 USDT.
+/// Long 0.01 contracts (10 lot steps) @ 60000, close @ 61000: PnL 10 USDT.
 /// Short the same: -10 USDT.
 #[test]
 fn test_linear_future_close_pnl_matches_spot_exposure() {
     let long_pnl = dec!(10);
     let short_pnl = dec!(-10);
-    // Independent check: 10 contracts x 0.001 BTC is 0.01 BTC of exposure,
+    // Independent check: 0.01 contracts x 1 BTC is 0.01 BTC of exposure,
     // and a 0.01 BTC spot position gains the same over the same move.
     let exposure_btc = dec!(0.01);
     let spot_gain = exposure_btc * dec!(1000);
@@ -78,31 +85,72 @@ fn test_linear_future_close_pnl_matches_spot_exposure() {
     assert_eq!(long_pnl + short_pnl, Decimal::ZERO);
 }
 
+/// Cross-check of the linear literals against the published formula of
+/// `financial_types` on the dated Binance snapshot. Kept apart from the
+/// hand fixture, so a disagreement shows which side moved.
+#[test]
+fn test_linear_future_literals_match_financial_types() {
+    let spec = binance_usdm::btcusdt_perpetual().unwrap();
+    assert_eq!(spec.size().amount(), dec!(1));
+    assert_eq!(spec.lot(), dec!(0.001));
+    let pnl = |side| {
+        spec.realized_pnl(side, dec!(0.01), dec!(60000), dec!(61000))
+            .unwrap()
+    };
+    let usdt = AssetCode::new("USDT").unwrap();
+    let long = pnl(Side::Long);
+    assert!(
+        long.equals(&MoneyRatio::new(
+            Ratio::from_decimal(dec!(10)),
+            usdt.clone()
+        ))
+        .unwrap()
+    );
+    let short = pnl(Side::Short);
+    assert!(
+        short
+            .equals(&MoneyRatio::new(Ratio::from_decimal(dec!(-10)), usdt))
+            .unwrap()
+    );
+}
+
 // ----------------------------------------------------- inverse future
 
-/// Inverse (coin margined) BTC-USD future, contract value 100 USD, settled
-/// in BTC. Specification only: margin-rs 0.1 books inverse contracts, but
-/// market-maker-rs does not use them yet. PnL in BTC is N x CV x
-/// (1/entry - 1/exit).
+/// Inverse (coin margined) BTC-USD future as listed by Deribit: contract
+/// value 10 USD, settled in BTC. Specification only: margin-rs 0.1 books
+/// inverse contracts, but market-maker-rs does not use them yet. PnL in BTC
+/// is N x CV x (1/entry - 1/exit).
 ///
-/// Long 10 @ 60000, exit 61000: 1000 x (1/60000 - 1/61000) = 1/3660 BTC =
+/// Long 100 contracts (1000 USD) @ 60000, exit 61000:
+/// 1000 x (1/60000 - 1/61000) = 1000 x 1000 / 3 660 000 000 = 1/3660 BTC =
 /// 0.000273224043... BTC, settled at satoshi scale (half even) as
 /// 0.00027322 BTC.
-/// Long 10 @ 60000, exit 59000: 1000 x (1/60000 - 1/59000) = -1/3540 BTC =
-/// -0.000282485875... BTC, settled as -0.00028249 BTC.
+/// Long 100 @ 60000, exit 59000: 1000 x (1/60000 - 1/59000) =
+/// -1000 x 1000 / 3 540 000 000 = -1/3540 BTC = -0.000282485875... BTC,
+/// settled as -0.00028249 BTC.
 #[test]
 fn test_inverse_future_close_settles_in_coin_at_satoshi_scale() {
     let up = dec!(0.00027322);
     let down = dec!(-0.00028249);
 
-    // Independent check 1: the unrounded values are exact fractions;
-    // dividing 1 by 3660 and 3540 and rounding once gives the settlements.
+    // Independent check 1: the exact fractions, in integers. N x CV x
+    // (exit - entry) over entry x exit reduces to 1/3660 and -1/3540.
+    let (contracts, cv): (i128, i128) = (100, 10);
+    let up_num = contracts * cv * (61_000 - 60_000);
+    let up_den: i128 = 60_000 * 61_000;
+    assert_eq!(up_num * 3660, up_den);
+    let down_num = contracts * cv * (59_000 - 60_000);
+    let down_den: i128 = 60_000 * 59_000;
+    assert_eq!(down_num * 3540, -down_den);
+
+    // Independent check 2: dividing 1 by 3660 and 3540 and rounding once
+    // gives the settlements.
     let up_exact = Decimal::ONE.checked_div(dec!(3660)).unwrap();
     let down_exact = -Decimal::ONE.checked_div(dec!(3540)).unwrap();
     assert_eq!(round_btc(up_exact), up);
     assert_eq!(round_btc(down_exact), down);
 
-    // Independent check 2: the USD value of the coin PnL at the exit price
+    // Independent check 3: the USD value of the coin PnL at the exit price
     // equals the USD notional times the relative move against entry:
     // up: 1000 x (61000/60000 - 1) = 16.666... USD.
     let usd_at_exit = (up_exact * dec!(61000)).round_dp(6);
@@ -112,6 +160,30 @@ fn test_inverse_future_close_settles_in_coin_at_satoshi_scale() {
 
     // Convexity: an equal move up gains less coin than the move down loses.
     assert!(up.abs() < down.abs());
+}
+
+/// Cross-check of the inverse literals against the published formulas of
+/// `financial_types` (`realized_pnl`, then `settle` at satoshi scale, half
+/// even) on the dated Deribit snapshot. Kept apart from the hand fixture,
+/// so a disagreement shows which side moved.
+#[test]
+fn test_inverse_future_literals_match_financial_types() {
+    let spec =
+        deribit::btc_future(InstrumentId::new("BTC-27NOV26").unwrap(), 1_795_766_400_000).unwrap();
+    assert_eq!(spec.size().amount(), dec!(10));
+    let btc = AssetCode::new("BTC").unwrap();
+    for (exit, (num, den), settled) in [
+        (dec!(61000), (dec!(1), dec!(3660)), dec!(0.00027322)),
+        (dec!(59000), (dec!(-1), dec!(3540)), dec!(-0.00028249)),
+    ] {
+        let pnl = spec
+            .realized_pnl(Side::Long, dec!(100), dec!(60000), exit)
+            .unwrap();
+        let exact = MoneyRatio::new(Ratio::new(num, den).unwrap(), btc.clone());
+        assert!(pnl.equals(&exact).unwrap(), "exact pnl at exit {exit}");
+        let rounded = pnl.settle(BTC_SCALE, RoundingRule::HalfEven).unwrap();
+        assert_eq!(rounded.amount, Money::new(settled, btc.clone()));
+    }
 }
 
 // ---------------------------------------------------------- perpetual

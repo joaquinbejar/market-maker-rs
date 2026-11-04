@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Contract specifications under `instruments` (new feature `instruments`,
+  off by default): `financial_types::instrument` re-exported as
+  `instruments`. With `margin` as well, `instruments::margin::margin_instrument`
+  converts an `InstrumentSpec` into a `margin-rs` `Instrument` with explicit
+  `MarginScales`: exact field mapping, scales at least the digits of the
+  ticks and the lot (`AdapterError::ScaleBelowGrid`), options
+  `AdapterError::Unsupported`, constructor refusals `AdapterError::Margin`.
+  The `financial_types` floor is now 0.3.1 (#93).
 - `examples/counterpart.rs` (feature `options`): a batch counterpart for an
   external harness. `calibrate` builds a surface from a quotes CSV with
   `calibrate_surface` and writes it as JSON (status, reasons, slices in
@@ -99,6 +107,10 @@ project follows [Semantic Versioning](https://semver.org/).
   `net_flow` keeps its sign. `buy_vwap` and `sell_vwap` are `None` when their
   inputs overflow, and `volume_ratio` is `None` when a volume sits at the
   bound.
+- `tests/contract_fixtures.rs`: the inverse future fixture uses the Deribit
+  contract value, 10 USD (was 100), on 100 contracts, and the linear one the
+  Binance terms (multiplier 1, lot step 0.001); both are cross-checked
+  against `financial_types` formulas in separate tests (#128).
 - With the `margin` feature, a fill whose base fee breaks the fee
   declaration of the gate's limits is recorded in `MarginAccount::errors`
   as a fee breach (the gate then rejects new orders on the instrument),

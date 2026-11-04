@@ -35,8 +35,9 @@ rust_decimal = "1.43"
 rust_decimal_macros = "1.40"
 # Shared order direction and option style (`Action`, `OptionStyle`). It
 # derives serde unconditionally, so serde is in the default build through it
-# (owner-approved exception, as in arbitrage-rs).
-financial_types = "0.3"
+# (owner-approved exception, as in arbitrage-rs). The floor is 0.3.1, the
+# first release with the `instruments` module.
+financial_types = "0.3.1"
 margin-rs = { version = "0.1", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
@@ -57,6 +58,8 @@ tower-http = { version = "0.7", features = ["cors"], optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
+# The shared, hand computed instrument fixtures, run by the adapter tests.
+financial_types = { version = "0.3.1", features = ["fixtures"] }
 serde_json = "1.0"
 tokio = { version = "1.53", features = ["macros", "rt", "time", "rt-multi-thread"] }
 
@@ -75,6 +78,9 @@ multi-underlying = ["serde"]
 events = ["dep:tokio", "serde"]
 # Accounting and pretrade risk through margin-rs.
 margin = ["dep:margin-rs"]
+# Contract specifications from financial_types (`instruments` module); with
+# `margin` too, the conversion into margin-rs instruments.
+instruments = ["financial_types/instruments"]
 # Deterministic financial kernel for external RL trainers; no dependencies.
 kernel = []
 
