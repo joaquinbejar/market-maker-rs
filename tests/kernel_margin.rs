@@ -58,6 +58,7 @@ struct OpenOrder {
 enum Fault {
     SkipRelease,
     SkipBooking,
+    ReleaseOnAccepted,
 }
 
 /// A margin-rs ledger and the orders it holds reservations for.
@@ -313,7 +314,13 @@ impl MarginShadow {
     fn apply(&mut self, k: &Kernel<'_>, events: &[KernelEvent]) -> Result<(), String> {
         for event in events {
             match event {
-                KernelEvent::Report(r) if r.kind == ExecKind::Accepted => self.check_accepted(r)?,
+                KernelEvent::Report(r) if r.kind == ExecKind::Accepted => {
+                    self.check_accepted(r)?;
+                    if self.fault == Some(Fault::ReleaseOnAccepted) {
+                        self.fault = None;
+                        self.close(r.order_id)?;
+                    }
+                }
                 KernelEvent::Delivered(r) => match r.kind {
                     ExecKind::Fill | ExecKind::PartialFill => {
                         self.book_fill(r, k.money(r.fee_u).ok_or("fee")?)?;
@@ -400,9 +407,17 @@ impl MarginShadow {
 }
 
 /// A finished run: every report delivered, the queues really empty, the ledger
-/// equal to the kernel's venue totals, and every open reservation an order the
-/// kernel's account still holds open.
-fn check_finished(shadow: &MarginShadow, last: &State, k: &Kernel<'_>) -> Result<(), String> {
+/// equal to the kernel's venue totals, and reservations and open orders agree
+/// both ways. Every open reservation is an order the kernel's account holds
+/// open. An order open there without a reservation was filled in full with its
+/// cancel dropped at the end of the data: it still counts for capacity, but
+/// nothing of it is left to reserve. Returns how many of those there were.
+fn check_finished(
+    shadow: &MarginShadow,
+    last: &State,
+    k: &Kernel<'_>,
+    events: &[KernelEvent],
+) -> Result<u64, String> {
     let q = last.queue_lengths();
     if q.deliveries != 0 || q.msgs != 0 || q.observed != 0 {
         return Err(format!("queues not empty: {q:?}"));
@@ -433,7 +448,27 @@ fn check_finished(shadow: &MarginShadow, last: &State, k: &Kernel<'_>) -> Result
             return Err(format!("reservation of order {id}, closed in the kernel"));
         }
     }
-    Ok(())
+    let mut filled_with_cancel_dropped = 0;
+    for id in (1..last.next_order_id()).filter(|id| last.is_open(*id)) {
+        if shadow.open.contains_key(&id) {
+            continue;
+        }
+        let last_report = events.iter().rev().find_map(|e| match e {
+            KernelEvent::Delivered(r) if r.order_id == id => Some(r),
+            _ => None,
+        });
+        let filled = last_report.is_some_and(|r| r.kind == ExecKind::Fill && r.cum == r.qty);
+        let cancel_dropped = events.iter().any(
+            |e| matches!(e, KernelEvent::DroppedMsg { order_id, cancel: true } if *order_id == id),
+        );
+        if !(filled && cancel_dropped) {
+            return Err(format!(
+                "order {id} open in the kernel without a reservation: {last_report:?}"
+            ));
+        }
+        filled_with_cancel_dropped += 1;
+    }
+    Ok(filled_with_cancel_dropped)
 }
 
 /// A run with the shadow at every decision.
@@ -512,7 +547,7 @@ fn both_models(seed: u64, index: u64) -> Vec<Scenario> {
     scenarios
 }
 
-fn hedged_run(k: &Kernel<'_>, sc: &Scenario, t: &Trajectory) -> ShadowRun {
+fn trajectory_run(k: &Kernel<'_>, sc: &Scenario, t: &Trajectory) -> ShadowRun {
     shadow_run(
         k,
         MarginShadow::new(&sc.cfg),
@@ -576,6 +611,7 @@ fn test_margin_reservations_follow_the_orders_and_end_equal_to_the_kernel() {
     on_large_stack(|| {
         let (mut runs, mut finished, mut with_partials, mut partly, mut still_open) =
             (0, 0, 0, 0, 0);
+        let mut filled_cancel_dropped = 0u64;
         for seed in 0..seeds().min(100) {
             for index in 0..DATASETS {
                 for sc in both_models(seed, index) {
@@ -607,7 +643,7 @@ fn test_margin_reservations_follow_the_orders_and_end_equal_to_the_kernel() {
                         Status::Terminal(TermReason::EndOfData),
                         "{ctx}"
                     );
-                    check_finished(&run.last, &kr.last, &k)
+                    filled_cancel_dropped += check_finished(&run.last, &kr.last, &k, &kr.events)
                         .unwrap_or_else(|e| panic!("{ctx}: {e}"));
                     finished += 1;
                     still_open += run.last.open.len();
@@ -616,12 +652,18 @@ fn test_margin_reservations_follow_the_orders_and_end_equal_to_the_kernel() {
         }
         println!(
             "runs {runs}, finished {finished}, with partial fills {with_partials}, decisions with \
-             a partly consumed reservation {partly}, reservations open at the end {still_open}"
+             a partly consumed reservation {partly}, reservations open at the end {still_open}, \
+             open without a reservation after a fill and a dropped cancel \
+             {filled_cancel_dropped}"
         );
         assert!(finished > 0, "runs to the end of the data");
         assert!(with_partials > 0, "runs with partial fills delivered");
         assert!(partly > 0, "partly consumed reservations");
         assert!(still_open > 0, "reservations open at the end");
+        assert!(
+            filled_cancel_dropped > 0,
+            "orders filled with their cancel dropped"
+        );
     });
 }
 
@@ -723,7 +765,7 @@ fn test_margin_reservation_shrinks_with_each_partial_and_cancel_releases_the_res
             ]
         );
         run.last.check().unwrap();
-        check_finished(&run.last, &kr.last, &k).unwrap();
+        check_finished(&run.last, &kr.last, &k, &kr.events).unwrap();
     });
 }
 
@@ -824,7 +866,7 @@ fn test_margin_dropped_activation_keeps_its_reservation_at_the_end() {
             run.last.ledger.reservation(&reservation_id(1)),
             Some((&run.last.quote, dec!(75)))
         );
-        check_finished(&run.last, &kr.last, &k).unwrap();
+        check_finished(&run.last, &kr.last, &k, &kr.events).unwrap();
     });
 }
 
@@ -851,7 +893,7 @@ fn control_run(start: MarginShadow, sc: &Scenario) -> Result<(), String> {
         &kr.actions,
         &kr.events,
     )?;
-    check_finished(&run.last, &kr.last, &k)
+    check_finished(&run.last, &kr.last, &k, &kr.events).map(|_| ())
 }
 
 #[test]
@@ -860,6 +902,13 @@ fn test_margin_negative_controls_are_caught() {
         let sc = control_scenario();
         let clean = MarginShadow::new(&sc.cfg);
         assert_eq!(control_run(clean.clone(), &sc), Ok(()));
+        // A reservation released while the order rests, with no fill to expose
+        // it: only the check from the kernel's open orders can catch this.
+        let resting = fixed(KernelLatency::zero(MS), None, vec![bid(1, 2)], 4);
+        let early = MarginShadow::new(&resting.cfg).with_fault(Fault::ReleaseOnAccepted);
+        let error = control_run(early, &resting).unwrap_err();
+        assert!(error.contains("without a reservation"), "{error}");
+
         let release = control_run(clean.clone().with_fault(Fault::SkipRelease), &sc);
         assert!(release.is_err(), "a skipped release passed");
         let booking = control_run(clean.clone().with_fault(Fault::SkipBooking), &sc);
@@ -886,7 +935,7 @@ fn test_margin_restore_with_reservations_pending_reproduces_state_and_ledger() {
                     let data = sc.data();
                     let k = kernel(&sc, &data);
                     let t = trajectory(&k, &sc);
-                    let run = hedged_run(&k, &sc, &t);
+                    let run = trajectory_run(&k, &sc, &t);
                     // As a new process would: its own dataset and kernel.
                     let fresh_data = sc.data();
                     let fresh = kernel(&sc, &fresh_data);
@@ -937,7 +986,7 @@ fn test_margin_forks_keep_their_ledgers_apart() {
                     let data = sc.data();
                     let k = kernel(&sc, &data);
                     let t = trajectory(&k, &sc);
-                    let run = hedged_run(&k, &sc, &t);
+                    let run = trajectory_run(&k, &sc, &t);
                     let i = t.states.len() / 2;
                     let parent = t.states[i];
                     let base = &run.at_decision[i];
@@ -987,7 +1036,7 @@ fn run_instances(indices: &[u64]) -> Vec<(u64, u128, u128, LedgerImage)> {
             let data = sc.data();
             let k = kernel(&sc, &data);
             let t = trajectory(&k, &sc);
-            let run = hedged_run(&k, &sc, &t);
+            let run = trajectory_run(&k, &sc, &t);
             Some((
                 *i,
                 fingerprint(&t.last),
