@@ -399,16 +399,32 @@ fn test_simulate_limit_holds_under_latency_and_the_reducing_side_stays() {
     assert_eq!(run.report.final_inventory, dec!(1), "{:?}", run.fills);
     assert_eq!(run.report.max_abs_inventory, dec!(1));
 
-    // Above the notional limit, the side that reduces is still quoted.
+    // A fill is cut to the room left, not refused: 0.5 of the second bid.
+    let mut cfg = sim().with_latency_ms(150);
+    cfg.limits = RiskLimits::new(dec!(1.5), dec!(100000), dec!(0)).unwrap();
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        top(100, dec!(100.00), dec!(1), dec!(1)),
+        trade(200, dec!(1), dec!(1), TradeSide::Sell),
+        top(250, dec!(100.00), dec!(1), dec!(1)),
+        trade(260, dec!(1), dec!(1), TradeSide::Sell),
+    ];
+    let r = simulate(&events, &cfg, &caps(), None).unwrap();
+    assert_eq!(r.final_inventory, dec!(1.5));
+
+    // Above the notional limit even after selling 1, the side that reduces is
+    // still quoted, and the side that adds is not.
     let mut cfg = sim();
-    cfg.limits = RiskLimits::new(dec!(10), dec!(150), dec!(0)).unwrap();
+    cfg.limits = RiskLimits::new(dec!(10), dec!(250), dec!(0)).unwrap();
     let events = [
         top(0, dec!(100.00), dec!(1), dec!(1)),
         trade(1, dec!(1), dec!(1), TradeSide::Sell),
-        top(2, dec!(200.00), dec!(1), dec!(1)),
+        top(2, dec!(100.00), dec!(1), dec!(1)),
+        trade(3, dec!(1), dec!(1), TradeSide::Sell),
+        top(4, dec!(300.00), dec!(1), dec!(1)),
     ];
     let run = simulate_detailed(&events, &cfg, &caps(), None).unwrap();
-    assert_eq!(run.report.final_inventory, dec!(1));
+    assert_eq!(run.report.final_inventory, dec!(2));
     let last = run.decisions.last().unwrap();
     assert!(last.ask.is_some() && last.bid.is_none(), "{last:?}");
 }
