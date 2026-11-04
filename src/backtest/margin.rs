@@ -312,6 +312,20 @@ impl PretradePolicy for MarginRiskPolicy {
             shared.fault = Some(error.clone());
             return Err(error);
         }
+        if let OrderEvent::Fill {
+            fee,
+            fee_asset: FeeAsset::Settlement,
+            ..
+        } = event
+            && !fee.is_zero()
+        {
+            // The account is spot: it has no settlement asset.
+            let error = MMError::InvalidPositionUpdate(
+                "margin account cannot book a settlement asset fee".to_string(),
+            );
+            shared.fault = Some(error.clone());
+            return Err(error);
+        }
         if let OrderEvent::Fill { side, .. } = event
             && let Err(error) = Dir::try_from(*side)
         {
@@ -383,7 +397,7 @@ impl PretradePolicy for MarginRiskPolicy {
                         FeeAsset::Quote => shared.quote.clone(),
                         FeeAsset::Base => shared.base.clone(),
                         // Refused at the top of the method.
-                        FeeAsset::Other(_) => return Ok(()),
+                        FeeAsset::Other(_) | FeeAsset::Settlement => return Ok(()),
                     };
                     execution = execution.with_fee(asset, *fee);
                 }

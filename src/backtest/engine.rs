@@ -272,8 +272,12 @@ impl SlippageModel {
 ///   marked at the current mid like the position, so equity is always cash
 ///   plus net holdings at the mark.
 /// - A third asset fee is converted once at `quote_per_unit`.
+/// - A settlement asset fee needs the contract, so it is only for a run with
+///   `BacktestEngine::with_instrument`; there, every metric is in the settlement
+///   asset.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub enum FeeCurrency {
     /// Quote asset: `price * quantity * rate`, unrounded (the historical
     /// behaviour).
@@ -294,6 +298,13 @@ pub enum FeeCurrency {
         /// Decimal places of the asset.
         scale: u32,
     },
+    /// The settlement asset of a derivative contract: the contract's notional
+    /// times the rate, exact, then rounded half to even to `scale` decimal
+    /// places once. A negative rate is a rebate.
+    Settlement {
+        /// Decimal places of the settlement asset.
+        scale: u32,
+    },
 }
 
 /// A fee computed for one execution.
@@ -303,7 +314,8 @@ pub struct FeeCharge {
     pub amount: Decimal,
     /// Asset the fee is charged in.
     pub asset: FeeAsset,
-    /// Value of the fee in the quote asset, used by the result metrics.
+    /// Value of the fee in the quote asset, or in the settlement asset on a
+    /// derivative contract, used by the result metrics.
     pub quote_value: Decimal,
 }
 
@@ -320,7 +332,7 @@ impl FeeCurrency {
     pub fn validate(&self) -> MMResult<()> {
         match self {
             Self::Quote => Ok(()),
-            Self::Base { scale } => Self::check_scale(*scale),
+            Self::Base { scale } | Self::Settlement { scale } => Self::check_scale(*scale),
             Self::Other {
                 asset,
                 quote_per_unit,
@@ -356,8 +368,9 @@ impl FeeCurrency {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for invalid parameters (see
-    /// [`FeeCurrency::validate`]) and [`MMError::NumericalError`] on
-    /// overflow.
+    /// [`FeeCurrency::validate`]) and for [`FeeCurrency::Settlement`], which
+    /// depends on the contract and not only on price and quantity, and
+    /// [`MMError::NumericalError`] on overflow.
     pub fn charge(&self, price: Decimal, quantity: Decimal, rate: Decimal) -> MMResult<FeeCharge> {
         self.validate()?;
         let overflow = || MMError::NumericalError("fee computation overflowed".to_string());
@@ -367,6 +380,9 @@ impl FeeCurrency {
             value.round_dp_with_strategy(scale, rust_decimal::RoundingStrategy::MidpointNearestEven)
         };
         match self {
+            Self::Settlement { .. } => Err(MMError::InvalidConfiguration(
+                "a settlement asset fee needs the contract: use with_instrument".to_string(),
+            )),
             Self::Quote => Ok(FeeCharge {
                 amount: quote_fee,
                 asset: FeeAsset::Quote,
@@ -551,9 +567,10 @@ pub const MAX_RECORDED_FAULTS: usize = 16;
 pub struct BacktestResult {
     /// Total PnL before fees.
     pub total_pnl: Decimal,
-    /// Total fees paid, in quote. Fees paid in the base asset are valued
-    /// at the final mark, so with base fees this differs from the sum of
-    /// [`SimulatedFill::fee`], which values each fee at its fill price.
+    /// Total fees paid, in quote, or in the settlement asset on a derivative
+    /// contract. Fees paid in the base asset are valued at the final mark, so
+    /// with base fees this differs from the sum of [`SimulatedFill::fee`], which
+    /// values each fee at its fill price.
     pub total_fees: Decimal,
     /// Net PnL after fees.
     pub net_pnl: Decimal,
@@ -607,14 +624,32 @@ pub struct AccountingStatus {
     /// they may be stale.
     #[cfg_attr(feature = "serde", serde(default))]
     pub snapshot_failures: Vec<u64>,
+    /// Marks the accountant could not value. The engine then kept its previous
+    /// unrealized PnL and total, so they may be stale.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub valuation_failures: u64,
+    /// Why the run was refused before it started, with nothing processed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub setup_refused: Option<String>,
+    /// Times a venue fill was dropped because its fee or its booking could not
+    /// be computed. It is then in no metric and not in
+    /// [`BacktestResult::trades`], and its order stays open, so one fill can
+    /// count more than once.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dropped_fills: u64,
 }
 
 impl AccountingStatus {
-    /// Returns `true` if the accountant booked every venue fill and every
-    /// snapshot of it succeeded.
+    /// Returns `true` if the run started, no venue fill was dropped, the
+    /// accountant booked every one, and every snapshot and valuation of it
+    /// succeeded.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
-        self.refused_executions.is_empty() && self.snapshot_failures.is_empty()
+        self.refused_executions.is_empty()
+            && self.snapshot_failures.is_empty()
+            && self.valuation_failures == 0
+            && self.setup_refused.is_none()
+            && self.dropped_fills == 0
     }
 }
 
@@ -814,6 +849,15 @@ pub struct BacktestEngine<
     accounting_errors: Vec<(u64, MMError)>,
     /// Execution ids after which the accountant's snapshot failed.
     snapshot_failures: Vec<u64>,
+    /// Marks the accountant could not value.
+    valuation_failures: u64,
+    /// Why the last run was refused before it started.
+    setup_refused: Option<String>,
+    /// Venue fills dropped because their fee or booking could not be computed.
+    dropped_fills: u64,
+    /// The contract of a derivative run.
+    #[cfg(feature = "instruments")]
+    instrument: Option<financial_types::instrument::InstrumentSpec>,
     next_execution_id: u64,
     /// Pretrade policy every new order passes before submission.
     policy: Option<Box<dyn PretradePolicy + Send + Sync + UnwindSafe + RefUnwindSafe>>,
@@ -937,6 +981,11 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             accountant: None,
             accounting_errors: Vec::new(),
             snapshot_failures: Vec::new(),
+            valuation_failures: 0,
+            setup_refused: None,
+            dropped_fills: 0,
+            #[cfg(feature = "instruments")]
+            instrument: None,
             next_execution_id: 1,
             policy: None,
             pretrade_log: Vec::new(),
@@ -958,6 +1007,14 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         let mut num_ticks = 0u64;
         let mut start_time = 0u64;
         let mut end_time = 0u64;
+
+        // Before any tick is read or any state changes.
+        self.setup_refused = None;
+        if let Err(error) = self.check_setup() {
+            self.setup_refused = Some(error.to_string());
+            self.record_fault(error);
+            return self.result(num_ticks, start_time, end_time);
+        }
 
         while let Some(tick) = self.data_source.next_tick() {
             if num_ticks == 0 {
@@ -1027,6 +1084,11 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         // Reports still in flight reach the strategy after the data ends.
         self.flush_deliveries();
 
+        self.result(num_ticks, start_time, end_time)
+    }
+
+    /// The result of the run so far.
+    fn result(&self, num_ticks: u64, start_time: u64, end_time: u64) -> BacktestResult {
         BacktestResult {
             total_pnl: self.pnl.total,
             total_fees: self.total_fees,
@@ -1053,6 +1115,9 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 accountant: self.accountant_description(),
                 refused_executions: self.accounting_errors.iter().map(|(id, _)| *id).collect(),
                 snapshot_failures: self.snapshot_failures.clone(),
+                valuation_failures: self.valuation_failures,
+                setup_refused: self.setup_refused.clone(),
+                dropped_fills: self.dropped_fills,
             },
         }
     }
@@ -1168,19 +1233,16 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             if price <= Decimal::ZERO {
                 continue;
             }
-            let charge =
-                match self
-                    .config
-                    .fee_currency
-                    .charge(price, quantity, self.config.fee_rate)
-                {
-                    Ok(charge) => charge,
-                    Err(error) => {
-                        self.record_fault(error);
-                        continue;
-                    }
-                };
-            // Reports and result metrics carry the fee valued in quote.
+            let charge = match self.charge_fill(price, quantity) {
+                Ok(charge) => charge,
+                Err(error) => {
+                    self.dropped_fills = self.dropped_fills.saturating_add(1);
+                    self.record_fault(error);
+                    continue;
+                }
+            };
+            // Reports and result metrics carry the fee valued in quote, or in
+            // the settlement asset on a derivative contract.
             let fee = charge.quote_value;
             let mut fill = SimulatedFill::with_fee(side, price, quantity, now, fee)
                 .with_execution_id(self.next_execution_id);
@@ -1196,6 +1258,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                 match self.plan_booking(&fill, dir, &charge) {
                     Ok(booking) => Some(booking),
                     Err(error) => {
+                        self.dropped_fills = self.dropped_fills.saturating_add(1);
                         self.record_fault(error);
                         continue;
                     }
@@ -1585,6 +1648,12 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                     .or_overflow("base fee total")?,
                 self.fixed_fees,
             ),
+            // Refused before the run: the built in bookkeeping is spot style.
+            FeeAsset::Settlement => {
+                return Err(MMError::InvalidConfiguration(
+                    "the built in bookkeeping cannot book a settlement asset fee".to_string(),
+                ));
+            }
             FeeAsset::Quote | FeeAsset::Other(_) => (
                 self.base_fee_quantity,
                 self.fixed_fees
@@ -1675,15 +1744,155 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     ///
     /// Every fill is posted to it exactly once and the position, PnL, fees
     /// and equity of the run are read from its snapshot instead of the built
-    /// in bookkeeping. See [`crate::backtest::accounting`].
+    /// in bookkeeping. The run, and every run after [`BacktestEngine::reset`],
+    /// starts from the accountant's state now
+    /// ([`FillAccountant::begin_from_current_state`]). See
+    /// [`crate::backtest::accounting`].
     #[must_use]
     pub fn with_accountant(
         mut self,
-        accountant: impl FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
+        mut accountant: impl FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
     ) -> Self {
+        accountant.begin_from_current_state();
         self.accountant = Some(Box::new(accountant));
         self.sync_accounting(0, 0);
         self
+    }
+
+    /// Runs a derivative contract: `spec` is the contract and `accountant` the
+    /// accounting authority for its fills, taken together so that neither can be
+    /// set without the other.
+    ///
+    /// The position, the fees and every result metric are then in contracts and
+    /// in the settlement asset of `spec`, which is BTC for an inverse contract,
+    /// so [`BacktestConfig::initial_capital`] must be too. Equity is
+    /// `initial_capital + realized + unrealized - fees`, where realized and
+    /// unrealized come from the accountant and contain no notional.
+    ///
+    /// Limits of such a run:
+    ///
+    /// - [`MarketTick`] sizes and the fill models must be in contracts, or a
+    ///   partial fill is sized wrongly;
+    /// - trade volume is `price * contracts`, which is not a notional;
+    /// - the accountant books with overdraft, with no margin requirement or
+    ///   liquidation, and no funding, expiry or settlement;
+    /// - a fill at or after a future's expiry is refused by the accountant and
+    ///   recorded in [`AccountingStatus::refused_executions`];
+    /// - a mark the accountant cannot value is counted in
+    ///   [`AccountingStatus::valuation_failures`], keeps the previous unrealized
+    ///   PnL and total, and, as a fault, stops new orders.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] for a contract that is not a future or a
+    /// perpetual, a pretrade policy (its limits read `price * quantity`, which is
+    /// not a notional here), a [`BacktestConfig::lot_size`] other than the lot of
+    /// `spec`, a [`BacktestConfig::tick_size`] other than its single price tick,
+    /// or a fee currency other than [`FeeCurrency::Settlement`]; and the error of
+    /// [`FillAccountant::check_instrument`], which refuses an accountant of other
+    /// terms.
+    ///
+    /// The same checks run at the start of every run, so a later
+    /// [`BacktestEngine::with_accountant`] or
+    /// [`BacktestEngine::with_pretrade_policy`] gets the run refused, with
+    /// [`AccountingStatus::setup_refused`] set and nothing processed.
+    #[cfg(feature = "instruments")]
+    pub fn with_instrument(
+        mut self,
+        spec: financial_types::instrument::InstrumentSpec,
+        mut accountant: impl FillAccountant + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
+    ) -> MMResult<Self> {
+        accountant.begin_from_current_state();
+        self.instrument = Some(spec);
+        self.accountant = Some(Box::new(accountant));
+        self.check_setup()?;
+        self.sync_accounting(0, 0);
+        Ok(self)
+    }
+
+    /// Refuses what this configuration cannot book correctly.
+    fn check_setup(&self) -> MMResult<()> {
+        #[cfg(feature = "instruments")]
+        if let Some(spec) = &self.instrument {
+            return self.check_instrument_setup(spec);
+        }
+        if matches!(self.config.fee_currency, FeeCurrency::Settlement { .. }) {
+            return Err(MMError::InvalidConfiguration(
+                "a settlement asset fee needs the contract: use with_instrument".to_string(),
+            ));
+        }
+        if self
+            .accountant
+            .as_ref()
+            .is_some_and(|accountant| accountant.requires_instrument())
+        {
+            return Err(MMError::InvalidConfiguration(
+                "a derivative accountant needs the contract: use with_instrument".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "instruments")]
+    fn check_instrument_setup(
+        &self,
+        spec: &financial_types::instrument::InstrumentSpec,
+    ) -> MMResult<()> {
+        use financial_types::instrument::ContractKind;
+        let refuse = |reason: String| {
+            Err(MMError::InvalidConfiguration(format!(
+                "instrument {}: {reason}",
+                spec.id().as_str()
+            )))
+        };
+        if !matches!(spec.kind(), ContractKind::Future | ContractKind::Perpetual) {
+            return refuse(format!("{:?} is not a future or a perpetual", spec.kind()));
+        }
+        if self.policy.is_some() {
+            return refuse(
+                "a pretrade policy reads price * quantity, which is not a notional here"
+                    .to_string(),
+            );
+        }
+        if self.config.lot_size != spec.lot() {
+            return refuse(format!(
+                "lot size {} differs from the lot {}",
+                self.config.lot_size,
+                spec.lot()
+            ));
+        }
+        let bands = spec.price_ticks().bands();
+        let single_tick = match bands {
+            [only] => only.tick == self.config.tick_size,
+            _ => false,
+        };
+        if !single_tick {
+            return refuse(format!(
+                "tick size {} is not its single price tick",
+                self.config.tick_size
+            ));
+        }
+        let FeeCurrency::Settlement { scale } = self.config.fee_currency else {
+            return refuse("the fee currency must be Settlement".to_string());
+        };
+        self.config.fee_currency.validate()?;
+        let Some(accountant) = self.accountant.as_ref() else {
+            return refuse("it needs an accountant".to_string());
+        };
+        accountant.check_instrument(spec, scale)
+    }
+
+    /// The fee of one execution.
+    fn charge_fill(&self, price: Decimal, quantity: Decimal) -> MMResult<FeeCharge> {
+        #[cfg(feature = "instruments")]
+        if let (Some(spec), FeeCurrency::Settlement { scale }) =
+            (&self.instrument, &self.config.fee_currency)
+        {
+            return settlement_charge(spec, *scale, price, quantity, self.config.fee_rate);
+        }
+        self.config
+            .fee_currency
+            .charge(price, quantity, self.config.fee_rate)
     }
 
     /// Snapshot of the selected accountant, if one was selected.
@@ -1791,6 +2000,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         }
         self.accounting_errors.clear();
         self.snapshot_failures.clear();
+        self.valuation_failures = 0;
+        self.dropped_fills = 0;
         self.next_execution_id = 1;
         if let Some(policy) = self.policy.as_mut() {
             policy.reset();
@@ -1829,6 +2040,18 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.max_position = self.max_position.max(snapshot.position.abs());
     }
 
+    /// Whether this is a run of a derivative contract.
+    fn has_instrument(&self) -> bool {
+        #[cfg(feature = "instruments")]
+        {
+            self.instrument.is_some()
+        }
+        #[cfg(not(feature = "instruments"))]
+        {
+            false
+        }
+    }
+
     /// Marks the position and the base fees paid at `mark`.
     ///
     /// Equity is cash plus the net base held at the mark. Base fees are
@@ -1836,6 +2059,34 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     /// `net = total - fees` stays exact.
     fn mark_to(&mut self, mark: Decimal) {
         self.last_mark = Some(mark);
+        let valued = self
+            .accountant
+            .as_ref()
+            .and_then(|accountant| accountant.unrealized_at(mark));
+        match valued {
+            Some(Ok(unrealized)) => {
+                self.pnl.unrealized = unrealized;
+                self.pnl.total = self.pnl.realized.saturating_add(unrealized);
+                self.total_fees = self.fixed_fees;
+                return;
+            }
+            // Never `position * mark`, which is wrong for this contract: keep
+            // the previous unrealized and total, and say so.
+            Some(Err(error)) => {
+                self.valuation_failures = self.valuation_failures.saturating_add(1);
+                self.record_fault(error);
+                return;
+            }
+            None => {
+                if self.has_instrument() {
+                    self.valuation_failures = self.valuation_failures.saturating_add(1);
+                    self.record_fault(MMError::InvalidConfiguration(
+                        "the accountant of a derivative run must value it".to_string(),
+                    ));
+                    return;
+                }
+            }
+        }
         let base_fee_value = self.base_fee_quantity.saturating_mul(mark);
         self.pnl.unrealized = self
             .position
@@ -1844,6 +2095,63 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
             .saturating_add(base_fee_value);
         self.pnl.total = self.pnl.realized.saturating_add(self.pnl.unrealized);
         self.total_fees = self.fixed_fees.saturating_add(base_fee_value);
+    }
+}
+
+/// The fee of one execution of a derivative contract, in its settlement asset:
+/// the exact notional times `rate`, rounded half to even to `scale` once.
+///
+/// # Errors
+///
+/// [`MMError::NumericalError`] if the notional or the product is not exact.
+#[cfg(feature = "instruments")]
+fn settlement_charge(
+    spec: &financial_types::instrument::InstrumentSpec,
+    scale: u32,
+    price: Decimal,
+    quantity: Decimal,
+    rate: Decimal,
+) -> MMResult<FeeCharge> {
+    use financial_types::instrument::{MoneyRatio, Ratio, RoundingRule};
+    let numerical = |error: financial_types::instrument::InstrumentError| {
+        MMError::NumericalError(format!("settlement fee: {error}"))
+    };
+    let notional = spec.notional(quantity, price).map_err(numerical)?;
+    let numerator = exact_product(notional.ratio.num(), rate).ok_or_else(|| {
+        MMError::NumericalError(format!(
+            "settlement fee: {} times {rate} is not exact in a Decimal",
+            notional.ratio.num()
+        ))
+    })?;
+    let fee = Ratio::new(numerator, notional.ratio.den()).map_err(numerical)?;
+    let settled = MoneyRatio::new(fee, notional.asset)
+        .settle(scale, RoundingRule::HalfEven)
+        .map_err(numerical)?;
+    Ok(FeeCharge {
+        amount: settled.amount.amount,
+        asset: FeeAsset::Settlement,
+        quote_value: settled.amount.amount,
+    })
+}
+
+/// `a * b` if a `Decimal` holds it exactly, or `None`.
+///
+/// `Decimal::checked_mul` rounds a product with more than 28 decimal places,
+/// which would round a fee twice.
+#[cfg(feature = "instruments")]
+fn exact_product(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let (a, b) = (a.normalize(), b.normalize());
+    let mut mantissa = a.mantissa().checked_mul(b.mantissa())?;
+    let mut scale = a.scale().checked_add(b.scale())?;
+    loop {
+        if let Ok(product) = Decimal::try_from_i128_with_scale(mantissa, scale) {
+            return Some(product);
+        }
+        if mantissa % 10 != 0 {
+            return None;
+        }
+        mantissa /= 10;
+        scale = scale.checked_sub(1)?;
     }
 }
 
@@ -1958,6 +2266,75 @@ fn decimal_sqrt(n: Decimal) -> Option<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The notional's numerator times the rate must not round: that would be
+    /// a second rounding, here of 5.5e-29 BTC to 0 instead of 1e-28.
+    #[cfg(feature = "instruments")]
+    #[test]
+    fn test_settlement_fee_is_rounded_once_or_refused() {
+        let spec = crate::instruments::reference::deribit::btc_perpetual().unwrap();
+        let (quantity, price) = (Decimal::new(1, 14), dec!(2));
+        assert!(matches!(
+            settlement_charge(&spec, 28, price, quantity, Decimal::new(11, 16)),
+            Err(MMError::NumericalError(_))
+        ));
+        // 5.5e-28 is a tie, and half to even takes it to 6e-28.
+        let fee = settlement_charge(&spec, 28, price, quantity, Decimal::new(11, 15)).unwrap();
+        assert_eq!(fee.amount, Decimal::new(6, 28));
+        assert_eq!(fee.asset, FeeAsset::Settlement);
+    }
+
+    #[cfg(feature = "instruments")]
+    #[test]
+    fn test_exact_product_refuses_what_checked_mul_rounds() {
+        assert_eq!(exact_product(dec!(1.5), dec!(2)), Some(dec!(3)));
+        // Twenty nine places, but the last digit is a zero.
+        assert_eq!(
+            exact_product(Decimal::new(5, 15), Decimal::new(2, 14)),
+            Some(Decimal::new(1, 28))
+        );
+        assert_eq!(
+            exact_product(Decimal::new(1, 14), Decimal::new(1, 15)),
+            None
+        );
+        assert_eq!(exact_product(Decimal::MAX, dec!(10)), None);
+        assert_eq!(
+            exact_product(Decimal::ZERO, Decimal::new(1, 28)),
+            Some(Decimal::ZERO)
+        );
+    }
+
+    /// With or without the `instruments` feature: a settlement asset fee needs
+    /// the contract, so the run is refused before it starts.
+    #[test]
+    fn test_settlement_fee_without_a_contract_is_refused_before_the_run() {
+        let config = BacktestConfig {
+            fee_rate: dec!(0.001),
+            fee_currency: FeeCurrency::Settlement { scale: 8 },
+            ..BacktestConfig::default()
+        };
+        let ticks = vec![create_test_tick(1000, dec!(100), dec!(101))];
+        let mut engine = BacktestEngine::new(config, PassiveStrategy, VecDataSource::new(ticks));
+        let result = engine.run();
+        assert_eq!(result.num_ticks, 0);
+        assert!(!result.accounting.is_consistent());
+        assert!(
+            result
+                .accounting
+                .setup_refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains("use with_instrument"))
+        );
+        assert_eq!(engine.fault_count(), 1);
+        assert!(matches!(
+            FeeCurrency::Settlement { scale: 8 }.charge(dec!(1), dec!(1), dec!(0.1)),
+            Err(MMError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            FeeCurrency::Settlement { scale: 29 }.validate(),
+            Err(MMError::InvalidConfiguration(_))
+        ));
+    }
 
     #[test]
     fn test_base_delta_overflow_returns_numerical_error() {
@@ -2310,6 +2687,9 @@ mod tests {
             engine.faults().first(),
             Some(MMError::InvalidConfiguration(_))
         ));
+        // A fee that cannot be computed drops the fill, visibly.
+        assert!(result.accounting.dropped_fills > 0);
+        assert!(!result.accounting.is_consistent());
     }
 
     #[test]
@@ -3724,6 +4104,98 @@ mod tests {
         }
 
         #[test]
+        fn test_execution_ids_continue_after_those_the_ledger_started_with() {
+            let pair = InstrumentId::new("BTC-USDC").unwrap();
+            let buy = |execution_id: u64, price: Decimal| AccountingFill {
+                execution_id,
+                ..ask_fill(execution_id, price, dec!(1), dec!(0))
+            };
+            let mut first = accountant(dec!(1000));
+            first.post_fill(&buy(99, dec!(90))).unwrap();
+            let mut second =
+                MarginLedgerAccountant::new(first.ledger().clone(), pair.clone()).unwrap();
+            second.post_fill(&buy(1, dec!(91))).unwrap();
+            // The same fill again is still the same execution.
+            second.post_fill(&buy(1, dec!(91))).unwrap();
+            let ids: Vec<&str> = second
+                .ledger()
+                .journal()
+                .iter()
+                .map(|e| e.execution_id.as_str())
+                .collect();
+            assert_eq!(ids, ["sim-99", "sim-100"]);
+            second.reset();
+            second.post_fill(&buy(1, dec!(92))).unwrap();
+            assert_eq!(
+                second.ledger().journal()[1].execution_id.as_str(),
+                "sim-100"
+            );
+
+            let mut last = accountant(dec!(1000));
+            last.post_fill(&buy(u64::MAX, dec!(90))).unwrap();
+            let mut past = MarginLedgerAccountant::new(last.ledger().clone(), pair).unwrap();
+            assert!(matches!(
+                past.post_fill(&buy(1, dec!(91))),
+                Err(MMError::NumericalError(_))
+            ));
+            assert_eq!(past.ledger().journal().len(), 1);
+        }
+
+        #[test]
+        fn test_an_accountant_starts_from_its_state_at_the_handover() {
+            // Posted to before the engine takes it, with a base fee and an overdraft.
+            let mut acc = accountant(dec!(1000));
+            let sell = ask_fill(1, dec!(100), dec!(1), dec!(0));
+            acc.post_fill(&sell).unwrap();
+            let buy = AccountingFill {
+                side: Action::Buy,
+                fee: dec!(0.5),
+                fee_asset: FeeAsset::Base,
+                ..ask_fill(2, dec!(90), dec!(2), dec!(0))
+            };
+            acc.post_fill(&buy).unwrap();
+            assert!(!acc.overdrafts().is_empty());
+            let handed = acc.snapshot().unwrap();
+            assert_eq!(handed.base_fees, dec!(0.5));
+
+            let mut direct = acc.clone();
+            direct.begin_from_current_state();
+            assert!(direct.overdrafts().is_empty());
+            let next = AccountingFill {
+                side: Action::Buy,
+                ..ask_fill(1, dec!(91), dec!(1), dec!(0))
+            };
+            direct.post_fill(&next).unwrap();
+            assert_eq!(direct.ledger().journal()[2].execution_id.as_str(), "sim-3");
+            assert_ne!(direct.snapshot().unwrap(), handed);
+            direct.reset();
+            assert_eq!(direct.snapshot().unwrap(), handed);
+            assert_eq!(direct.ledger().journal().len(), 2);
+
+            // The engine does this for a spot run too, at its first and later runs.
+            let ticks = vec![
+                create_test_tick(1000, dec!(98.0), dec!(102.0)),
+                create_test_tick(1001, dec!(97.0), dec!(99.0)),
+            ];
+            let mut engine = BacktestEngine::new(
+                BacktestConfig::default().with_default_order_size(dec!(1)),
+                ScriptedStrategy::new(vec![Some((dec!(99), dec!(200))), None]),
+                VecDataSource::new(ticks),
+            )
+            .with_accountant(acc);
+            assert_eq!(engine.accounting_snapshot().unwrap().unwrap(), handed);
+            let first = engine.run();
+            assert!(first.accounting.is_consistent(), "{:?}", first.accounting);
+            assert_eq!(first.num_trades, 1);
+            engine.reset();
+            assert_eq!(engine.accounting_snapshot().unwrap().unwrap(), handed);
+            let second = engine.run();
+            assert_eq!(second.accounting, first.accounting);
+            assert_eq!(second.total_pnl, first.total_pnl);
+            assert_eq!(second.final_position, first.final_position);
+        }
+
+        #[test]
         fn test_unknown_instrument_is_rejected() {
             let ledger = Ledger::default();
             let missing = InstrumentId::new("ETH-USDC").unwrap();
@@ -3815,6 +4287,8 @@ mod tests {
         );
         let first = (Decimal::MAX / dec!(3)) * dec!(2);
         assert_eq!(result.num_trades, 1);
+        assert!(result.accounting.dropped_fills > 0);
+        assert!(!result.accounting.is_consistent());
         assert_eq!(result.final_position, dec!(-2));
         assert_eq!(engine.pnl.realized, first);
         // The refused fill left its order unfilled and reported nothing.
@@ -4358,6 +4832,36 @@ mod tests {
             policy.reset();
             assert!(account.fault().is_none());
             assert!(!policy.check(&request).is_rejected());
+        }
+
+        #[test]
+        fn test_margin_policy_refuses_a_settlement_asset_fee() {
+            let account = account(None);
+            let mut policy = account.policy();
+            let request = PretradeRequest::new(
+                "o-1",
+                Action::Buy,
+                Some(dec!(100)),
+                dec!(1),
+                OrderPurpose::Quote,
+                0,
+            );
+            assert!(!policy.check(&request).is_rejected());
+            let fill = OrderEvent::Fill {
+                order_id: "o-1".to_string(),
+                execution_id: "e-o-1".to_string(),
+                side: Action::Buy,
+                price: dec!(100),
+                quantity: dec!(1),
+                cumulative_quantity: dec!(1),
+                fee: dec!(0.001),
+                fee_asset: crate::types::fee::FeeAsset::Settlement,
+                timestamp: 1,
+            };
+            let error = policy.on_order_event(&fill).unwrap_err();
+            assert!(error.to_string().contains("settlement asset"), "{error}");
+            assert_eq!(account.fault(), Some(error));
+            assert!(account.with_gate(|gate| gate.ledger().journal().is_empty()));
         }
 
         #[test]

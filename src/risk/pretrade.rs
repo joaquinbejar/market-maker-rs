@@ -571,7 +571,7 @@ impl PretradePolicy for LimitsPolicy {
                 // sell delivers `quantity + fee`.
                 let base_fee = match fee_asset {
                     FeeAsset::Base => *fee,
-                    FeeAsset::Quote | FeeAsset::Other(_) => Decimal::ZERO,
+                    FeeAsset::Quote | FeeAsset::Other(_) | FeeAsset::Settlement => Decimal::ZERO,
                 };
                 // The position is a running balance: an overflow is unknown
                 // exposure, so it latches the fault like an unsupported
