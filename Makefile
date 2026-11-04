@@ -20,10 +20,12 @@ build:
 release:
 	cargo build --release
 
-# Run tests
+# Run tests: the default features, then all of them, since the tests of a
+# feature-gated module only compile with its feature.
 .PHONY: test
 test:
 	LOGLEVEL=WARN cargo test
+	LOGLEVEL=WARN cargo test --all-features
 
 # Format the code
 .PHONY: fmt
