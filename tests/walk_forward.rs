@@ -1339,6 +1339,29 @@ fn test_walk_forward_realized_volatility_gap_at_either_end_is_unscored() {
     }
 }
 
+#[test]
+fn test_rate_per_second_small_rate_is_kept() {
+    let p = prices(7, 0, DAY_MS, 60_000, 0.5);
+    let cell = |distance, fills| QuoteExposure {
+        timestamp_ms: 1_000_000,
+        distance,
+        exposure_ms: 1_000,
+        fills,
+    };
+    let e = [cell(dec!(0), 10), cell(dec!(1), 5)];
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let cfg = config().with_seasonality(1, 1).with_minima(30, 2, 1, 1);
+    let record =
+        calibrate_window(&CalibrationData::new(&p, &e).unwrap(), &window, &cfg, "d").unwrap();
+    let rate = record
+        .parameters()
+        .unwrap()
+        .rate_per_second(dec!(20), 1_000_000)
+        .unwrap();
+    let expected = dec!(0.0000095367431640625);
+    assert!((rate - expected).abs() < dec!(0.000000000000001), "{rate}");
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn test_calibration_record_serde_round_trip_is_identical() {
