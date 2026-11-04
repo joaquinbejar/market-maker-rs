@@ -566,6 +566,7 @@ impl MarketDataStream for MockExchangeConnector {
     async fn next_trade(&self) -> MMResult<Fill> {
         // Return a simulated trade
         Ok(Fill {
+            symbol: "BTC-USD".to_string(),
             order_id: OrderId::new("mock-trade"),
             trade_id: format!("trade-{}", self.current_time()),
             price: self.config.base_price,

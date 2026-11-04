@@ -972,6 +972,7 @@ mod tests {
 
     fn create_test_fill(order_id: &OrderId, price: Decimal, quantity: Decimal) -> Fill {
         Fill {
+            symbol: "BTC-USD".to_string(),
             order_id: order_id.clone(),
             trade_id: "trade-1".to_string(),
             price,
