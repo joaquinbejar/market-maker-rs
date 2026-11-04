@@ -112,6 +112,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `make test`, so `make pre-push` and the Run Tests workflow, also runs
+  `cargo test --all-features`: the tests behind a feature such as `chain` or
+  `options` did not run in it before (#183).
 - `instruments::margin::margin_instrument` delegates to
   `margin_rs::Instrument::from_spec`, so the mapping has one implementation
   (#176). Its results and errors are unchanged. `margin` and `instruments`
