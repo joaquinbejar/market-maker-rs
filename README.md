@@ -300,10 +300,10 @@ println!("Delta: {}, Gamma: {}", greeks.delta, greeks.gamma);
 
 // Aggregate portfolio Greeks
 let mut portfolio = PortfolioGreeks::new();
-portfolio.add(&greeks, dec!(10.0)); // 10 contracts
+portfolio.add(&greeks, dec!(10.0)).unwrap(); // 10 contracts
 
 // Check delta neutrality
-let shares_to_hedge = portfolio.shares_to_hedge(dec!(100.0));
+let shares_to_hedge = portfolio.shares_to_hedge(dec!(100.0)).unwrap();
 ```
 
 #### Options Market Making (Feature: `options`)
@@ -346,7 +346,7 @@ let hedger_config = AutoHedgerConfig::default();
 let mut risk_manager = GreeksRiskManager::new("BTC", limits, hedger_config);
 
 // Check if order is allowed
-let decision = risk_manager.check_order(&option_greeks, dec!(10.0));
+let decision = risk_manager.check_order(&option_greeks, dec!(10.0)).unwrap();
 match decision {
     OrderDecision::Allowed => { /* proceed */ },
     OrderDecision::Scaled { new_size, .. } => { /* use scaled size */ },
@@ -354,8 +354,8 @@ match decision {
 }
 
 // Check if hedging is needed
-if risk_manager.needs_hedge() {
-    let hedge = risk_manager.calculate_hedge_order(underlying_price);
+if risk_manager.needs_hedge().unwrap() {
+    let hedge = risk_manager.calculate_hedge_order(underlying_price).unwrap();
 }
 ```
 
@@ -386,7 +386,7 @@ for outcome in mm.refresh_all_quotes(underlying_price, &pricing)? {
 }
 
 // Check chain risk status
-let status = mm.check_chain_risk();
+let status = mm.check_chain_risk().unwrap();
 if !status.can_quote() {
     // Stop quoting or hedge
 }

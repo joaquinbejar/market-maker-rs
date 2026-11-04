@@ -56,8 +56,10 @@ fn main() {
     println!();
 
     // Check moneyness
-    let moneyness = OptionsAdapter::moneyness(dec!(48000.0), dec!(50000.0));
-    let is_atm = OptionsAdapter::is_atm(dec!(48000.0), dec!(50000.0), dec!(0.05));
+    let moneyness = OptionsAdapter::moneyness(dec!(48000.0), dec!(50000.0))
+        .expect("Failed to calculate moneyness");
+    let is_atm = OptionsAdapter::is_atm(dec!(48000.0), dec!(50000.0), dec!(0.05))
+        .expect("Failed to check ATM");
     println!("Moneyness: {:.4} (OTM call)", moneyness);
     println!("Is ATM (5% tolerance): {}", is_atm);
     println!();
@@ -94,7 +96,9 @@ fn main() {
     let mut portfolio = PortfolioGreeks::new();
 
     // Add 10 call contracts
-    portfolio.add(&greeks, dec!(10.0));
+    portfolio
+        .add(&greeks, dec!(10.0))
+        .expect("Failed to add calls");
     println!("After adding 10 calls:");
     println!("  Portfolio Delta: {:.2}", portfolio.delta);
     println!("  Portfolio Gamma: {:.4}", portfolio.gamma);
@@ -103,7 +107,9 @@ fn main() {
     println!();
 
     // Add 5 put contracts (delta hedge)
-    portfolio.add(&put_greeks, dec!(5.0));
+    portfolio
+        .add(&put_greeks, dec!(5.0))
+        .expect("Failed to add puts");
     println!("After adding 5 puts (partial delta hedge):");
     println!("  Portfolio Delta: {:.2}", portfolio.delta);
     println!("  Portfolio Gamma: {:.4}", portfolio.gamma);
@@ -116,16 +122,27 @@ fn main() {
     println!("Dollar Greeks (at ${} underlying):", underlying_price);
     println!(
         "  Dollar Delta: ${:.2}",
-        portfolio.dollar_delta(underlying_price, multiplier)
+        portfolio
+            .dollar_delta(underlying_price, multiplier)
+            .expect("Failed to calculate dollar delta")
     );
     println!(
         "  Dollar Gamma: ${:.2} (per 1% move)",
-        portfolio.dollar_gamma(underlying_price, multiplier)
+        portfolio
+            .dollar_gamma(underlying_price, multiplier)
+            .expect("Failed to calculate dollar gamma")
     );
-    println!("  Dollar Vega: ${:.2}", portfolio.dollar_vega(multiplier));
+    println!(
+        "  Dollar Vega: ${:.2}",
+        portfolio
+            .dollar_vega(multiplier)
+            .expect("Failed to calculate dollar vega")
+    );
     println!(
         "  Dollar Theta: ${:.2}/day",
-        portfolio.dollar_theta(multiplier)
+        portfolio
+            .dollar_theta(multiplier)
+            .expect("Failed to calculate dollar theta")
     );
     println!();
 
@@ -138,6 +155,8 @@ fn main() {
     );
 
     // Calculate shares to hedge
-    let shares_to_hedge = portfolio.shares_to_hedge(multiplier);
+    let shares_to_hedge = portfolio
+        .shares_to_hedge(multiplier)
+        .expect("Failed to calculate shares to hedge");
     println!("Shares needed to delta hedge: {:.4} BTC", shares_to_hedge);
 }

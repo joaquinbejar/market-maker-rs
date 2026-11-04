@@ -286,10 +286,10 @@
 //!
 //! // Aggregate portfolio Greeks
 //! let mut portfolio = PortfolioGreeks::new();
-//! portfolio.add(&greeks, dec!(10.0)); // 10 contracts
+//! portfolio.add(&greeks, dec!(10.0)).unwrap(); // 10 contracts
 //!
 //! // Check delta neutrality
-//! let shares_to_hedge = portfolio.shares_to_hedge(dec!(100.0));
+//! let shares_to_hedge = portfolio.shares_to_hedge(dec!(100.0)).unwrap();
 //! ```
 //!
 //! ### Options Market Making (Feature: `options`)
@@ -332,7 +332,7 @@
 //! let mut risk_manager = GreeksRiskManager::new("BTC", limits, hedger_config);
 //!
 //! // Check if order is allowed
-//! let decision = risk_manager.check_order(&option_greeks, dec!(10.0));
+//! let decision = risk_manager.check_order(&option_greeks, dec!(10.0)).unwrap();
 //! match decision {
 //!     OrderDecision::Allowed => { /* proceed */ },
 //!     OrderDecision::Scaled { new_size, .. } => { /* use scaled size */ },
@@ -340,8 +340,8 @@
 //! }
 //!
 //! // Check if hedging is needed
-//! if risk_manager.needs_hedge() {
-//!     let hedge = risk_manager.calculate_hedge_order(underlying_price);
+//! if risk_manager.needs_hedge().unwrap() {
+//!     let hedge = risk_manager.calculate_hedge_order(underlying_price).unwrap();
 //! }
 //! ```
 //!
@@ -372,7 +372,7 @@
 //! }
 //!
 //! // Check chain risk status
-//! let status = mm.check_chain_risk();
+//! let status = mm.check_chain_risk().unwrap();
 //! if !status.can_quote() {
 //!     // Stop quoting or hedge
 //! }

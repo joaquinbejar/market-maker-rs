@@ -150,7 +150,9 @@ fn main() {
     // Risk status
     println!("=== Chain Risk Status ===\n");
 
-    let risk_status = market_maker.check_chain_risk();
+    let risk_status = market_maker
+        .check_chain_risk()
+        .expect("Failed to check chain risk");
     println!("Risk Status: {:?}", risk_status);
     println!("  Can Quote: {}", risk_status.can_quote());
     println!("  Requires Action: {}", risk_status.requires_action());
@@ -185,17 +187,24 @@ fn main() {
         PositionGreeks::new(dec!(0.5), dec!(0.02), dec!(-0.05), dec!(0.15), dec!(0.08));
 
     // Add 100 contracts across the chain
-    risk_manager.add_position_greeks(&call_greeks, dec!(100.0));
+    risk_manager
+        .add_position_greeks(&call_greeks, dec!(100.0))
+        .expect("Failed to add position");
 
     println!("After adding 100 call contracts:");
     println!("  Chain Delta: {}", risk_manager.current_greeks().delta);
     println!("  Chain Gamma: {}", risk_manager.current_greeks().gamma);
-    println!("  Should Hedge: {}", risk_manager.should_hedge());
+    let should_hedge = risk_manager
+        .should_hedge()
+        .expect("Failed to check the hedge");
+    println!("  Should Hedge: {should_hedge}");
     println!();
 
     // Calculate hedge
-    if risk_manager.should_hedge() {
-        let hedges = risk_manager.calculate_hedge(dec!(50000.0));
+    if should_hedge {
+        let hedges = risk_manager
+            .calculate_hedge(dec!(50000.0))
+            .expect("Failed to calculate hedge");
         if !hedges.is_empty() {
             println!("Hedge Orders:");
             for hedge in &hedges {
@@ -218,12 +227,26 @@ fn main() {
     println!("Dollar Greeks (at ${}):", underlying_price);
     println!(
         "  Dollar Delta: ${:.2}",
-        risk_manager.dollar_delta(dec!(50000.0))
+        risk_manager
+            .dollar_delta(dec!(50000.0))
+            .expect("Failed to calculate dollar delta")
     );
     println!(
         "  Dollar Gamma: ${:.2}",
-        risk_manager.dollar_gamma(dec!(50000.0))
+        risk_manager
+            .dollar_gamma(dec!(50000.0))
+            .expect("Failed to calculate dollar gamma")
     );
-    println!("  Dollar Vega: ${:.2}", risk_manager.dollar_vega());
-    println!("  Dollar Theta: ${:.2}/day", risk_manager.dollar_theta());
+    println!(
+        "  Dollar Vega: ${:.2}",
+        risk_manager
+            .dollar_vega()
+            .expect("Failed to calculate dollar vega")
+    );
+    println!(
+        "  Dollar Theta: ${:.2}/day",
+        risk_manager
+            .dollar_theta()
+            .expect("Failed to calculate dollar theta")
+    );
 }

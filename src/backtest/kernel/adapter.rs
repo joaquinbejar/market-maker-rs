@@ -54,6 +54,9 @@ pub fn quote_error_code(error: &MMError) -> ErrCode {
         MMError::LockPoisoned(_) => 9,
         MMError::UnsupportedContract { .. } => 10,
         MMError::PriceUnderflow => 11,
+        MMError::FillNotBooked(_) => 12,
+        MMError::FillBookedCheckFailed(_) => 13,
+        MMError::GreeksMissFill => 14,
     })
 }
 

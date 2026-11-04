@@ -110,10 +110,38 @@ pub enum MMError {
     /// a numerical limit: [`MMError::is_numerical_error`] is true for it.
     #[error("numerical error: {}", PRICE_UNDERFLOW_MESSAGE)]
     PriceUnderflow = 10,
+
+    /// A fill was not booked: this call left the Greeks unchanged, so they
+    /// miss it.
+    ///
+    /// The risk manager stays fail closed until an explicit reset or
+    /// reconciliation. Booking the fill again cannot count this call twice,
+    /// because it applied nothing. That is all it promises: the next attempt
+    /// may fail too, and one that succeeds does not recover the manager,
+    /// because nothing proves which fill it was. The message carries the cause.
+    #[error("fill not booked, the Greeks miss it: {0}")]
+    FillNotBooked(String) = 11,
+
+    /// A fill was booked, but the risk check after it failed.
+    ///
+    /// The Greeks include the fill: booking it again counts it twice. The
+    /// message carries the cause.
+    #[error("fill booked, but the risk check after it failed: {0}")]
+    FillBookedCheckFailed(String) = 12,
+
+    /// An answer was asked from Greeks known to miss a fill that could not be
+    /// booked ([`MMError::FillNotBooked`]).
+    ///
+    /// It lasts until the risk manager is explicitly reset or reconciled.
+    #[error("{}", GREEKS_MISS_FILL_MESSAGE)]
+    GreeksMissFill = 13,
 }
 
 /// The message of [`MMError::PriceUnderflow`].
 const PRICE_UNDERFLOW_MESSAGE: &str = "Black price is positive but below the smallest positive f64";
+
+/// The message of [`MMError::GreeksMissFill`].
+const GREEKS_MISS_FILL_MESSAGE: &str = "the Greeks miss a fill that could not be booked";
 
 impl MMError {
     /// Returns true if this error is related to configuration issues.
@@ -152,10 +180,13 @@ impl MMError {
             | Self::InvalidQuoteGeneration(msg)
             | Self::InvalidTimestamp(msg)
             | Self::ConnectionError(msg)
-            | Self::LockPoisoned(msg) => msg,
+            | Self::LockPoisoned(msg)
+            | Self::FillNotBooked(msg)
+            | Self::FillBookedCheckFailed(msg) => msg,
             Self::UnsupportedContract { reason } => reason,
             Self::UnsupportedAction { .. } => "only buy and sell are supported",
             Self::PriceUnderflow => PRICE_UNDERFLOW_MESSAGE,
+            Self::GreeksMissFill => GREEKS_MISS_FILL_MESSAGE,
         }
     }
 }
@@ -260,6 +291,9 @@ mod tests {
             MMError::InvalidConfiguration("test".to_string()),
             MMError::InvalidMarketState("test".to_string()),
             MMError::NumericalError("test".to_string()),
+            MMError::FillNotBooked("test".to_string()),
+            MMError::FillBookedCheckFailed("test".to_string()),
+            MMError::GreeksMissFill,
             MMError::InvalidPositionUpdate("test".to_string()),
             MMError::InvalidQuoteGeneration("test".to_string()),
             MMError::InvalidTimestamp("test".to_string()),

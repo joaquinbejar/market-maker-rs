@@ -66,7 +66,9 @@ fn main() {
     // Check order - should be allowed
     println!("=== Order Validation ===\n");
 
-    let decision = risk_manager.check_order(&call_greeks, dec!(10.0));
+    let decision = risk_manager
+        .check_order(&call_greeks, dec!(10.0))
+        .expect("Failed to check order");
     println!("Order: Buy 10 contracts");
     match &decision {
         OrderDecision::Allowed => println!("  Decision: ALLOWED"),
@@ -86,7 +88,9 @@ fn main() {
     println!();
 
     // Execute the order (update Greeks)
-    risk_manager.update_on_fill(&call_greeks, dec!(10.0), 1000);
+    risk_manager
+        .update_on_fill(&call_greeks, dec!(10.0), 1000)
+        .expect("Failed to book fill");
 
     println!("After fill:");
     println!("  Portfolio Delta: {}", risk_manager.current_greeks().delta);
@@ -94,7 +98,9 @@ fn main() {
     println!();
 
     // Check limit utilization
-    let utilization = risk_manager.limit_utilization();
+    let utilization = risk_manager
+        .limit_utilization()
+        .expect("Failed to calculate utilization");
     println!("Limit Utilization:");
     println!("  Delta: {:.1}%", utilization.delta * dec!(100.0));
     println!("  Gamma: {:.1}%", utilization.gamma * dec!(100.0));
@@ -111,12 +117,16 @@ fn main() {
     println!("=== Approaching Limits ===\n");
 
     // Add 150 more contracts (total 160 contracts = 80 delta)
-    risk_manager.update_on_fill(&call_greeks, dec!(150.0), 2000);
+    risk_manager
+        .update_on_fill(&call_greeks, dec!(150.0), 2000)
+        .expect("Failed to book fill");
 
     println!("After adding 150 more contracts:");
     println!("  Portfolio Delta: {}", risk_manager.current_greeks().delta);
 
-    let utilization = risk_manager.limit_utilization();
+    let utilization = risk_manager
+        .limit_utilization()
+        .expect("Failed to calculate utilization");
     println!(
         "  Delta Utilization: {:.1}%",
         utilization.delta * dec!(100.0)
@@ -126,11 +136,19 @@ fn main() {
 
     // Check if hedging is needed
     println!("Hedging Status:");
-    println!("  Needs Hedge: {}", risk_manager.needs_hedge());
-    println!("  Hedge Urgency: {:?}", risk_manager.hedge_urgency());
+    let needs_hedge = risk_manager.needs_hedge().expect("Failed to check hedge");
+    println!("  Needs Hedge: {}", needs_hedge);
+    println!(
+        "  Hedge Urgency: {:?}",
+        risk_manager
+            .hedge_urgency()
+            .expect("Failed to calculate urgency")
+    );
 
-    if risk_manager.needs_hedge()
-        && let Some(hedge) = risk_manager.calculate_hedge_order(dec!(50000.0))
+    if needs_hedge
+        && let Some(hedge) = risk_manager
+            .calculate_hedge_order(dec!(50000.0))
+            .expect("Failed to calculate hedge")
     {
         println!("\nHedge Order:");
         println!("  Symbol: {}", hedge.symbol);
@@ -151,7 +169,9 @@ fn main() {
     // Try to add more - should be scaled or rejected
     println!("=== Order at High Utilization ===\n");
 
-    let decision = risk_manager.check_order(&call_greeks, dec!(50.0));
+    let decision = risk_manager
+        .check_order(&call_greeks, dec!(50.0))
+        .expect("Failed to check order");
     println!("Order: Buy 50 more contracts");
     match &decision {
         OrderDecision::Allowed => println!("  Decision: ALLOWED"),
@@ -179,7 +199,9 @@ fn main() {
     );
 
     // Add more to trip circuit breaker
-    risk_manager.update_on_fill(&call_greeks, dec!(30.0), 3000);
+    risk_manager
+        .update_on_fill(&call_greeks, dec!(30.0), 3000)
+        .expect("Failed to book fill");
 
     println!("After adding 30 more contracts:");
     println!("  Portfolio Delta: {}", risk_manager.current_greeks().delta);
@@ -197,7 +219,9 @@ fn main() {
     }
 
     // Try order with circuit breaker open
-    let decision = risk_manager.check_order(&call_greeks, dec!(1.0));
+    let decision = risk_manager
+        .check_order(&call_greeks, dec!(1.0))
+        .expect("Failed to check order");
     println!("\nOrder attempt with circuit breaker open:");
     match &decision {
         OrderDecision::Rejected { reason } => {
@@ -219,7 +243,9 @@ fn main() {
         risk_manager.circuit_breaker_status().state
     );
 
-    let decision = risk_manager.check_order(&call_greeks, dec!(10.0));
+    let decision = risk_manager
+        .check_order(&call_greeks, dec!(10.0))
+        .expect("Failed to check order");
     println!("\nOrder after reset:");
     match &decision {
         OrderDecision::Allowed => println!("  Decision: ALLOWED ✓"),
