@@ -486,8 +486,9 @@ pub enum CalibrationFailure {
     },
     /// The fitted rate does not fall with distance, so `k` is not positive.
     NonDecayingIntensity,
-    /// Each bucket's fills are all at its nearest distance, so the likelihood
-    /// has no finite `k`.
+    /// The likelihood has no usable `k`: each bucket's fills are all at its
+    /// nearest distance, so no finite `k` exists, or the estimate is above the
+    /// search limit of 1e15 per price unit.
     UnboundedIntensity,
     /// An intraday bucket has no exposure, so nothing is known about its rate.
     UnobservedSeasonalBucket {

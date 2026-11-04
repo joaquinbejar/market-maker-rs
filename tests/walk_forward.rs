@@ -642,14 +642,14 @@ fn test_calibrate_window_thin_or_unobserved_bucket_is_insufficient() {
     assert_eq!(closed.parameters().unwrap().seasonality[1], dec!(0));
 }
 
-/// Two buckets, 12 hours apart, each with `(distance, seconds, fills)` cells.
+/// Two buckets, with exposures inside the window, each with `(distance, seconds, fills)` cells.
 fn two_bucket_outcome(cells: [[(Decimal, u64, u64); 2]; 2]) -> CalibrationOutcome {
     let p = prices(7, 0, DAY_MS, 60_000, 0.5);
     let mut e = Vec::new();
     for (bucket, levels) in cells.iter().enumerate() {
         for (distance, seconds, fills) in levels {
             e.push(QuoteExposure {
-                timestamp_ms: bucket as u64 * DAY_MS / 2 + 1,
+                timestamp_ms: [1_000_000, 50_000_000][bucket],
                 distance: *distance,
                 exposure_ms: seconds * 1_000,
                 fills: *fills,
