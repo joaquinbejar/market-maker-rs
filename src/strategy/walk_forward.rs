@@ -49,6 +49,11 @@
 //! a window with a longer silence than `max_gap_buckets` allows, including at
 //! its start or end, is [`CalibrationFailure::PriceGap`].
 //!
+//! The grid assumes a continuous session. A venue that stops printing
+//! overnight fails a one day window with `PriceGap`, and raising
+//! `max_gap_buckets` to pass it deflates the volatility with those zero
+//! returns. Computing returns across sampled buckets only is a follow-up.
+//!
 //! # Example
 //!
 //! ```
