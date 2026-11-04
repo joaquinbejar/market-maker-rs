@@ -502,6 +502,7 @@ impl OrderResponse {
 /// use market_maker_rs::dec;
 ///
 /// let fill = Fill {
+///     symbol: "BTC-USD".to_string(),
 ///     order_id: OrderId::new("12345"),
 ///     trade_id: "trade-1".to_string(),
 ///     price: dec!(50000.0),
@@ -517,6 +518,11 @@ impl OrderResponse {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Fill {
+    /// Instrument traded: the symbol of the order, the identifier of a contract
+    /// specification (`instruments::orders`). A record written before this
+    /// field reads as empty, which no specification accepts.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub symbol: String,
     /// Order ID that was filled.
     pub order_id: OrderId,
     /// Unique trade/execution ID.
@@ -1009,6 +1015,7 @@ mod tests {
     #[test]
     fn test_fill() {
         let fill = Fill {
+            symbol: "BTC-USD".to_string(),
             order_id: OrderId::new("12345"),
             trade_id: "trade-1".to_string(),
             price: dec!(50000.0),
@@ -1043,6 +1050,7 @@ mod tests {
     #[test]
     fn test_fill_net_value_overflow_returns_numerical_error() {
         let fill = Fill {
+            symbol: "BTC-USD".to_string(),
             order_id: OrderId::new("1"),
             trade_id: "t".to_string(),
             price: Decimal::MAX,

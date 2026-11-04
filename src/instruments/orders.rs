@@ -1,8 +1,8 @@
 //! Orders and fills against a contract specification.
 //!
-//! Orders and fills do not carry a specification: [`OrderRequest`] has a
-//! symbol and [`Fill`] has neither. These functions take the specification
-//! from the caller and refuse what does not fit it, with a typed error;
+//! Orders and fills name their instrument by symbol and do not carry its
+//! specification. These functions take the specification from the caller, check
+//! that it is the one named, and refuse what does not fit it, with a typed error;
 //! nothing is rounded or converted.
 //!
 //! # Units
@@ -22,10 +22,9 @@
 //! passes when it happens to fall on the lot.
 //!
 //! [`fill_notional`] does not apply the grid to a fill: a fill already happened,
-//! and the grid comes from a dated snapshot that may be stale. A [`Fill`] has no
-//! symbol, so nothing here can verify that it belongs to `spec`: a wrong
-//! specification gives a wrong amount, in the wrong asset for an inverse
-//! contract. Carrying the instrument on orders and fills is #191.
+//! and the grid comes from a dated snapshot that may be stale. It does check the
+//! fill is of this instrument, by symbol: that is its identity, not the version
+//! of the terms it traded under.
 
 use financial_types::instrument::{ContractKind, InstrumentError, InstrumentSpec, MoneyRatio};
 
@@ -38,11 +37,11 @@ use financial_types::Action;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum OrderSpecError {
-    /// The order is for another instrument.
-    #[error("order for {order} checked against instrument {instrument}")]
+    /// The order or the fill is of another instrument.
+    #[error("symbol {symbol} checked against instrument {instrument}")]
     SymbolMismatch {
-        /// The order's symbol.
-        order: String,
+        /// The symbol of the order or the fill.
+        symbol: String,
         /// The specification's identifier.
         instrument: String,
     },
@@ -92,7 +91,7 @@ pub enum OrderSpecError {
 pub fn check_order(spec: &InstrumentSpec, order: &OrderRequest) -> Result<(), OrderSpecError> {
     if order.symbol != spec.id().as_str() {
         return Err(OrderSpecError::SymbolMismatch {
-            order: order.symbol.clone(),
+            symbol: order.symbol.clone(),
             instrument: spec.id().as_str().to_string(),
         });
     }
@@ -121,10 +120,17 @@ pub fn check_order(spec: &InstrumentSpec, order: &OrderRequest) -> Result<(), Or
 ///
 /// # Errors
 ///
-/// [`OrderSpecError::OptionNotional`] for an option, and
-/// [`OrderSpecError::Spec`] when `InstrumentSpec::notional` refuses it: a price
+/// [`OrderSpecError::SymbolMismatch`] unless the fill's symbol is the identifier
+/// of `spec`, compared exactly; [`OrderSpecError::OptionNotional`] for an option;
+/// and [`OrderSpecError::Spec`] when `InstrumentSpec::notional` refuses it: a price
 /// or a quantity that is not positive, or a product that is not exact.
 pub fn fill_notional(spec: &InstrumentSpec, fill: &Fill) -> Result<MoneyRatio, OrderSpecError> {
+    if fill.symbol != spec.id().as_str() {
+        return Err(OrderSpecError::SymbolMismatch {
+            symbol: fill.symbol.clone(),
+            instrument: spec.id().as_str().to_string(),
+        });
+    }
     if spec.kind() == ContractKind::Option {
         return Err(OrderSpecError::OptionNotional {
             instrument: spec.id().as_str().to_string(),

@@ -15,8 +15,7 @@ project follows [Semantic Versioning](https://semver.org/).
   asset of the contract, where `Fill::notional` is only right for a linear
   contract of multiplier one. With `margin` too,
   `instruments::margin::fill_execution` converts a fill into a `margin-rs`
-  execution. Orders and fills do not carry a specification, and
-  `MarginLedgerAccountant` stays spot only: both are #191.
+  execution. `MarginLedgerAccountant` stays spot only for now (#191).
 - `backtest::queue_reactive`: a seedable simulator of aggregated queues after
   Huang, Lehalle and Rosenbaum (Model III over Model I), with maximum likelihood
   intensities per queue size, exportable parameters, bounded restorable state,
@@ -241,6 +240,16 @@ project follows [Semantic Versioning](https://semver.org/).
 These signature changes are breaking and ship in 0.7.0, not in a patch
 release.
 
+- `Fill` has a new field, `symbol`, the instrument traded, so a struct literal
+  must set it. With `serde` it defaults to empty, so a record written before it
+  still decodes. `instruments::orders::fill_notional` and
+  `instruments::margin::fill_execution` now refuse a fill whose symbol is not the
+  identifier of the specification (`OrderSpecError::SymbolMismatch`, the new
+  `AdapterError::SymbolMismatch`), an empty one included, where a wrong
+  specification used to give a wrong amount silently (#191).
+- `MockExchangeConnector::next_trade` names the symbol of `subscribe_trades`, and
+  without a subscription it is an error rather than a trade of no instrument;
+  `subscribe_trades` refuses an empty symbol (#191).
 - `ChainMarketMaker::generate_quote` and `refresh_all_quotes` enforce the chain
   risk status: while `RiskStatus::can_quote` is false they refuse with the new
   `MMError::QuotingHalted`, before anything is valued, and when the status

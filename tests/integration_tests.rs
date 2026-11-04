@@ -57,6 +57,7 @@ fn fill(
     ts: u64,
 ) -> Fill {
     Fill {
+        symbol: "BTC-USD".to_string(),
         order_id: OrderId::new(exchange_id),
         trade_id: trade_id.to_string(),
         price,

@@ -17,6 +17,7 @@
 use market_maker_rs::Decimal;
 use market_maker_rs::dec;
 use market_maker_rs::execution::{Action, Fill, OrderId, OrderRequest, OrderType, TimeInForce};
+use market_maker_rs::instruments::MoneyRatio;
 use market_maker_rs::instruments::orders::{OrderSpecError, check_order, fill_notional};
 use market_maker_rs::instruments::reference::{binance_usdm, deribit};
 use market_maker_rs::instruments::{InstrumentError, InstrumentId, InstrumentSpec, Ratio};
@@ -44,6 +45,7 @@ fn deribit_option() -> InstrumentSpec {
 
 fn fill(side: Action, price: Decimal, quantity: Decimal) -> Fill {
     Fill {
+        symbol: String::new(),
         order_id: OrderId::new("o-1"),
         trade_id: "t-1".to_string(),
         price,
@@ -53,6 +55,16 @@ fn fill(side: Action, price: Decimal, quantity: Decimal) -> Fill {
         fee: Decimal::ZERO,
         fee_currency: "USDT".to_string(),
     }
+}
+
+/// `fill_notional` of `f` named for `spec`, for the cases where the instrument
+/// is not what is under test.
+fn notional_of(spec: &InstrumentSpec, f: &Fill) -> Result<MoneyRatio, OrderSpecError> {
+    let named = Fill {
+        symbol: spec.id().as_str().to_string(),
+        ..f.clone()
+    };
+    fill_notional(spec, &named)
 }
 
 fn is_spec_error(result: Result<(), OrderSpecError>, want: fn(&InstrumentError) -> bool) -> bool {
@@ -83,7 +95,7 @@ fn check_order_refuses_another_instrument() {
     assert_eq!(
         check_order(&binance(), &order),
         Err(OrderSpecError::SymbolMismatch {
-            order: "BTC-PERPETUAL".to_string(),
+            symbol: "BTC-PERPETUAL".to_string(),
             instrument: "BTCUSDT".to_string(),
         })
     );
@@ -156,7 +168,7 @@ fn check_order_refuses_what_is_off_the_grid_without_rounding() {
 fn fill_notional_is_in_the_asset_of_the_contract() {
     // Linear: 0.5 BTC x 60000.1 USDT, where `Fill::notional` happens to agree.
     let linear = fill(Action::Buy, dec!(60000.1), dec!(0.5));
-    let notional = fill_notional(&binance(), &linear).unwrap();
+    let notional = notional_of(&binance(), &linear).unwrap();
     assert_eq!(notional.asset.as_str(), "USDT");
     assert!(
         notional
@@ -169,7 +181,7 @@ fn fill_notional_is_in_the_asset_of_the_contract() {
     // Inverse: 1000 contracts of 10 USD at 60000 is 1/6 BTC, not the 60 million
     // that `Fill::notional` gives.
     let inverse = fill(Action::Sell, dec!(60000), dec!(1000));
-    let notional = fill_notional(&deribit_perpetual(), &inverse).unwrap();
+    let notional = notional_of(&deribit_perpetual(), &inverse).unwrap();
     assert_eq!(notional.asset.as_str(), "BTC");
     assert!(
         notional
@@ -184,7 +196,7 @@ fn fill_notional_is_in_the_asset_of_the_contract() {
 fn fill_notional_refuses_an_option_and_what_is_not_positive() {
     let premium = fill(Action::Buy, dec!(0.05), dec!(1));
     assert_eq!(
-        fill_notional(&deribit_option(), &premium).unwrap_err(),
+        notional_of(&deribit_option(), &premium).unwrap_err(),
         OrderSpecError::OptionNotional {
             instrument: "BTC-27NOV26-100000-C".to_string(),
         }
@@ -194,7 +206,7 @@ fn fill_notional_refuses_an_option_and_what_is_not_positive() {
         fill(Action::Buy, dec!(60000), dec!(0)),
     ] {
         assert!(matches!(
-            fill_notional(&binance(), &bad),
+            notional_of(&binance(), &bad),
             Err(OrderSpecError::Spec(InstrumentError::NotPositive { .. }))
         ));
     }
@@ -204,7 +216,7 @@ fn fill_notional_refuses_an_option_and_what_is_not_positive() {
 fn fill_notional_does_not_apply_the_grid_to_a_fill() {
     // Off the tick and the lot of the snapshot: it already happened.
     let off = fill(Action::Buy, dec!(60000.15), dec!(0.0015));
-    let notional = fill_notional(&binance(), &off).unwrap();
+    let notional = notional_of(&binance(), &off).unwrap();
     assert!(
         notional
             .ratio
@@ -213,12 +225,58 @@ fn fill_notional_does_not_apply_the_grid_to_a_fill() {
     );
 }
 
+#[test]
+fn fill_notional_refuses_a_fill_of_another_instrument() {
+    let mut other = fill(Action::Buy, dec!(60000), dec!(1000));
+    other.symbol = "BTC-PERPETUAL".to_string();
+    // The right amount, for the instrument it names.
+    assert!(fill_notional(&deribit_perpetual(), &other).is_ok());
+    // On another specification it would be in the wrong asset.
+    assert_eq!(
+        fill_notional(&binance(), &other).unwrap_err(),
+        OrderSpecError::SymbolMismatch {
+            symbol: "BTC-PERPETUAL".to_string(),
+            instrument: "BTCUSDT".to_string(),
+        }
+    );
+    // Compared exactly, and no symbol is not a match.
+    other.symbol = "btcusdt".to_string();
+    assert!(matches!(
+        fill_notional(&binance(), &other),
+        Err(OrderSpecError::SymbolMismatch { .. })
+    ));
+    other.symbol = String::new();
+    assert!(matches!(
+        fill_notional(&binance(), &other),
+        Err(OrderSpecError::SymbolMismatch { .. })
+    ));
+}
+
+/// A record written before `Fill::symbol`.
+#[cfg(feature = "serde")]
+fn fill_recorded_before_the_symbol() -> Fill {
+    let old = r#"{"order_id":"o-1","trade_id":"t-1","price":"60000","quantity":"1",
+        "side":"Buy","timestamp":1000,"fee":"0","fee_currency":"USDT"}"#;
+    let decoded: Fill = serde_json::from_str(old).unwrap();
+    assert_eq!(decoded.symbol, "");
+    decoded
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_fill_recorded_before_the_symbol_has_no_notional() {
+    assert!(matches!(
+        fill_notional(&binance(), &fill_recorded_before_the_symbol()),
+        Err(OrderSpecError::SymbolMismatch { .. })
+    ));
+}
+
 #[cfg(feature = "margin")]
 mod ledger {
     use super::*;
     use financial_types::Side;
     use financial_types::instrument::fixtures::{self, Case, ErrorKind, Expected, Operation};
-    use margin_rs::ledger::{ExecutionCashflow, Ledger, LedgerConfig};
+    use margin_rs::ledger::{Execution, ExecutionCashflow, Ledger, LedgerConfig};
     use margin_rs::{Asset, MarginError};
     use market_maker_rs::instruments::margin::{
         AdapterError, MarginScales, fill_execution, margin_instrument,
@@ -227,6 +285,15 @@ mod ledger {
         AssetCode, ContractKind, ContractSize, InstrumentDraft, Margining, MoneyRatio, TickSchedule,
     };
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// `fill_execution` of `f` named for `spec`, as [`notional_of`].
+    fn execution_of(spec: &InstrumentSpec, f: &Fill) -> Result<Execution, AdapterError> {
+        let named = Fill {
+            symbol: spec.id().as_str().to_string(),
+            ..f.clone()
+        };
+        fill_execution(spec, &named)
+    }
 
     /// An exact fraction, every operation checked.
     #[derive(Debug, Clone, Copy)]
@@ -291,7 +358,7 @@ mod ledger {
     }
 
     fn book(ledger: &mut Ledger, spec: &InstrumentSpec, f: &Fill) -> ExecutionCashflow {
-        let execution = fill_execution(spec, f).unwrap();
+        let execution = execution_of(spec, f).unwrap();
         let booked = ledger
             .book_execution_allowing_overdraft(&execution, None)
             .unwrap();
@@ -314,7 +381,7 @@ mod ledger {
     fn fill_execution_carries_the_fill_exactly() {
         let mut f = fill(Action::Sell, dec!(60000.1), dec!(0.5));
         f.fee = dec!(1.25);
-        let e = fill_execution(&binance(), &f).unwrap();
+        let e = execution_of(&binance(), &f).unwrap();
         assert_eq!(e.id.as_str(), "7:BTCUSDT:t-1");
         assert_eq!(e.instrument.as_str(), "BTCUSDT");
         assert_eq!(e.side, Action::Sell);
@@ -326,47 +393,88 @@ mod ledger {
         // No fee, whatever the currency says.
         let mut free = fill(Action::Buy, dec!(60000.1), dec!(0.5));
         free.fee_currency = String::new();
-        assert!(fill_execution(&binance(), &free).unwrap().fee.is_none());
+        assert!(execution_of(&binance(), &free).unwrap().fee.is_none());
 
         // A rebate keeps its sign.
         let mut rebate = fill(Action::Buy, dec!(60000.1), dec!(0.5));
         rebate.fee = dec!(-0.1);
-        let fee = fill_execution(&binance(), &rebate).unwrap().fee.unwrap();
+        let fee = execution_of(&binance(), &rebate).unwrap().fee.unwrap();
         assert_eq!(fee.amount, dec!(-0.1));
 
         // Off the grid of the snapshot: it already happened.
         let off = fill(Action::Buy, dec!(60000.15), dec!(0.0015));
         assert_eq!(
-            fill_execution(&binance(), &off).unwrap().price,
+            execution_of(&binance(), &off).unwrap().price,
             dec!(60000.15)
         );
+    }
+
+    #[test]
+    fn fill_execution_refuses_a_fill_of_another_instrument() {
+        let mut other = fill(Action::Buy, dec!(60000), dec!(1000));
+        other.symbol = "BTC-PERPETUAL".to_string();
+        assert_eq!(
+            fill_execution(&deribit_perpetual(), &other)
+                .unwrap()
+                .instrument
+                .as_str(),
+            "BTC-PERPETUAL"
+        );
+        assert_eq!(
+            fill_execution(&binance(), &other).unwrap_err(),
+            AdapterError::SymbolMismatch {
+                symbol: "BTC-PERPETUAL".to_string(),
+                instrument: "BTCUSDT".to_string(),
+            }
+        );
+        // Before anything else about the fill.
+        let mut option_named_wrong = fill(Action::Other, dec!(0), dec!(0));
+        option_named_wrong.symbol = "X".to_string();
+        assert!(matches!(
+            fill_execution(&deribit_option(), &option_named_wrong),
+            Err(AdapterError::SymbolMismatch { .. })
+        ));
+        other.symbol = String::new();
+        assert!(matches!(
+            fill_execution(&binance(), &other),
+            Err(AdapterError::SymbolMismatch { .. })
+        ));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_fill_recorded_before_the_symbol_has_no_execution() {
+        assert!(matches!(
+            fill_execution(&binance(), &fill_recorded_before_the_symbol()),
+            Err(AdapterError::SymbolMismatch { .. })
+        ));
     }
 
     #[test]
     fn fill_execution_refuses_what_cannot_be_booked() {
         let spec = binance();
         assert_eq!(
-            fill_execution(&deribit_option(), &fill(Action::Buy, dec!(0.05), dec!(1))).unwrap_err(),
+            execution_of(&deribit_option(), &fill(Action::Buy, dec!(0.05), dec!(1))).unwrap_err(),
             AdapterError::Unsupported {
                 kind: ContractKind::Option,
                 margining: Margining::Inverse,
             }
         );
         assert_eq!(
-            fill_execution(&spec, &fill(Action::Other, dec!(60000), dec!(1))).unwrap_err(),
+            execution_of(&spec, &fill(Action::Other, dec!(60000), dec!(1))).unwrap_err(),
             AdapterError::UnsupportedSide {
                 side: Action::Other
             }
         );
         assert_eq!(
-            fill_execution(&spec, &fill(Action::Buy, dec!(0), dec!(1))).unwrap_err(),
+            execution_of(&spec, &fill(Action::Buy, dec!(0), dec!(1))).unwrap_err(),
             AdapterError::NotPositive {
                 field: "price",
                 value: dec!(0),
             }
         );
         assert_eq!(
-            fill_execution(&spec, &fill(Action::Buy, dec!(60000), dec!(-1))).unwrap_err(),
+            execution_of(&spec, &fill(Action::Buy, dec!(60000), dec!(-1))).unwrap_err(),
             AdapterError::NotPositive {
                 field: "quantity",
                 value: dec!(-1),
@@ -375,7 +483,7 @@ mod ledger {
         let mut no_id = fill(Action::Buy, dec!(60000), dec!(1));
         no_id.trade_id = String::new();
         assert_eq!(
-            fill_execution(&spec, &no_id).unwrap_err(),
+            execution_of(&spec, &no_id).unwrap_err(),
             AdapterError::EmptyTradeId
         );
         // Refused, never shortened or cleaned up.
@@ -383,7 +491,7 @@ mod ledger {
             let mut bad = fill(Action::Buy, dec!(60000), dec!(1));
             bad.trade_id = trade_id;
             assert!(matches!(
-                fill_execution(&spec, &bad),
+                execution_of(&spec, &bad),
                 Err(AdapterError::Margin(_))
             ));
         }
@@ -391,7 +499,7 @@ mod ledger {
         bad_asset.fee = dec!(1);
         bad_asset.fee_currency = "not an asset".to_string();
         assert!(matches!(
-            fill_execution(&spec, &bad_asset),
+            execution_of(&spec, &bad_asset),
             Err(AdapterError::Margin(_))
         ));
     }
@@ -475,7 +583,7 @@ mod ledger {
         // 0.01 BTC per contract: 5 contracts at 60000 is 3000 USDT, and a move of
         // 1000 on them is 50 USDT, not 5000.
         let spec = linear_spec(Some(dec!(0.01)));
-        let notional = fill_notional(&spec, &fill(Action::Buy, dec!(60000), dec!(5))).unwrap();
+        let notional = notional_of(&spec, &fill(Action::Buy, dec!(60000), dec!(5))).unwrap();
         assert_eq!(notional.asset.as_str(), "USDT");
         assert!(
             notional
@@ -484,7 +592,7 @@ mod ledger {
                 .unwrap()
         );
 
-        let execution = fill_execution(&spec, &fill(Action::Buy, dec!(60000), dec!(5))).unwrap();
+        let execution = execution_of(&spec, &fill(Action::Buy, dec!(60000), dec!(5))).unwrap();
         assert_eq!(execution.quantity, dec!(5), "contracts, not BTC");
 
         let mut ledger = ledger_for(&spec);
@@ -522,7 +630,7 @@ mod ledger {
         let mut ledger = ledger_for(&spec);
         let before = ledger.snapshot();
         let late = at("a", EXPIRY_MS, Action::Buy, dec!(60000), dec!(5));
-        let execution = fill_execution(&spec, &late).unwrap();
+        let execution = execution_of(&spec, &late).unwrap();
         let refused = ledger.book_execution_allowing_overdraft(&execution, None);
         assert!(
             matches!(refused, Err(MarginError::ExecutedAfterExpiry { .. })),
@@ -553,7 +661,7 @@ mod ledger {
         let mut f = fill(Action::Buy, dec!(60000), dec!(0.5));
         f.fee = dec!(1);
         f.fee_currency = "ETH".to_string();
-        let execution = fill_execution(&spec, &f).unwrap();
+        let execution = execution_of(&spec, &f).unwrap();
         let refused = ledger.book_execution_allowing_overdraft(&execution, None);
         assert!(
             matches!(refused, Err(MarginError::UnknownAsset { .. })),
@@ -613,8 +721,8 @@ mod ledger {
             .unwrap()
         };
         let trade = |id: &str| at(id, 1, Action::Buy, dec!(60000), dec!(0.5));
-        let first = fill_execution(&spec_named("A"), &trade("B:C")).unwrap();
-        let second = fill_execution(&spec_named("A:B"), &trade("C")).unwrap();
+        let first = execution_of(&spec_named("A"), &trade("B:C")).unwrap();
+        let second = execution_of(&spec_named("A:B"), &trade("C")).unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(first.id.as_str(), "1:A:B:C");
         assert_eq!(second.id.as_str(), "3:A:B:C");
@@ -628,14 +736,14 @@ mod ledger {
         lower.fee = dec!(1);
         lower.fee_currency = "usdt".to_string();
         assert!(matches!(
-            fill_execution(&spec, &lower),
+            execution_of(&spec, &lower),
             Err(AdapterError::Margin(_))
         ));
         // Digits above the instrument's scales: the ledger refuses, unchanged.
         let mut ledger = ledger_for(&spec);
         let before = ledger.snapshot();
         let fine = fill(Action::Buy, dec!(60000.123456789), dec!(0.5));
-        let execution = fill_execution(&spec, &fine).unwrap();
+        let execution = execution_of(&spec, &fine).unwrap();
         let refused = ledger.book_execution_allowing_overdraft(&execution, None);
         assert!(
             matches!(refused, Err(MarginError::PrecisionExceeded { .. })),
@@ -929,7 +1037,7 @@ mod ledger {
         let Operation::Notional { contracts, price } = &case.operation else {
             panic!("{name}: not a notional");
         };
-        let got = fill_notional(&case.spec, &fill(Action::Buy, *price, *contracts));
+        let got = notional_of(&case.spec, &fill(Action::Buy, *price, *contracts));
         match (&case.expected, got) {
             (Expected::Amount { exact, .. }, Ok(amount)) => {
                 assert!(amount.equals(exact).unwrap(), "{name}: {amount:?}");
@@ -1003,14 +1111,14 @@ mod ledger {
         let f = fill(Action::Buy, dec!(1), dec!(1));
         assert!(
             matches!(
-                fill_execution(&case.spec, &f),
+                execution_of(&case.spec, &f),
                 Err(AdapterError::Unsupported { .. })
             ),
             "{name}"
         );
         assert!(
             matches!(
-                fill_notional(&case.spec, &f),
+                notional_of(&case.spec, &f),
                 Err(OrderSpecError::OptionNotional { .. })
             ),
             "{name}"

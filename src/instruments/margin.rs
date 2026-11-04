@@ -131,6 +131,14 @@ pub enum AdapterError {
     /// A `margin-rs` constructor refused a field.
     #[error(transparent)]
     Margin(MarginError),
+    /// A fill is of another instrument.
+    #[error("fill of {symbol} converted with the specification of {instrument}")]
+    SymbolMismatch {
+        /// The fill's symbol.
+        symbol: String,
+        /// The specification's identifier.
+        instrument: String,
+    },
     /// A fill's side is neither buy nor sell.
     #[error("unsupported fill side {side}: only buy and sell are supported")]
     UnsupportedSide {
@@ -226,14 +234,12 @@ pub fn margin_instrument(
 /// expiry, or, through `Ledger::book_execution`, a balance that does not cover it
 /// (`Ledger::book_execution_allowing_overdraft` books it anyway).
 ///
-/// A `Fill` has no symbol, so nothing here can verify that it belongs to `spec`:
-/// a wrong specification books it on the wrong instrument, and in the wrong
-/// asset for an inverse contract. Carrying the instrument on fills is #191.
-///
 /// # Errors
 ///
 /// Checked in this order:
 ///
+/// - [`AdapterError::SymbolMismatch`] unless the fill's symbol is the identifier
+///   of `spec`, compared exactly;
 /// - [`AdapterError::Unsupported`] for an option;
 /// - [`AdapterError::UnsupportedSide`] for a side other than buy or sell;
 /// - [`AdapterError::EmptyTradeId`] for an empty `trade_id`;
@@ -243,6 +249,12 @@ pub fn margin_instrument(
 ///   asset as written: an execution identifier above 64 bytes or with
 ///   whitespace, never shortened, or an asset code that is not valid.
 pub fn fill_execution(spec: &InstrumentSpec, fill: &Fill) -> Result<Execution, AdapterError> {
+    if fill.symbol != spec.id().as_str() {
+        return Err(AdapterError::SymbolMismatch {
+            symbol: fill.symbol.clone(),
+            instrument: spec.id().as_str().to_string(),
+        });
+    }
     if spec.kind() == ContractKind::Option {
         return Err(AdapterError::Unsupported {
             kind: spec.kind(),

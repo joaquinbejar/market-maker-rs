@@ -183,6 +183,8 @@ pub struct MockExchangeConnector {
     balances: RwLock<HashMap<String, Decimal>>,
     order_counter: AtomicU64,
     current_time: AtomicU64,
+    /// The symbol of the last trade subscription, which simulated trades name.
+    trade_symbol: RwLock<Option<String>>,
 }
 
 impl MockExchangeConnector {
@@ -200,6 +202,7 @@ impl MockExchangeConnector {
             balances,
             order_counter: AtomicU64::new(1),
             current_time: AtomicU64::new(1_000_000),
+            trade_symbol: RwLock::new(None),
         }
     }
 
@@ -553,8 +556,19 @@ impl MarketDataStream for MockExchangeConnector {
         Ok(())
     }
 
-    async fn subscribe_trades(&self, _symbol: &str) -> MMResult<()> {
-        // Mock implementation - always succeeds
+    /// Simulated trades name `symbol`; a later subscription replaces it.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] for an empty symbol, and
+    /// [`MMError::LockPoisoned`] if the lock is poisoned.
+    async fn subscribe_trades(&self, symbol: &str) -> MMResult<()> {
+        if symbol.is_empty() {
+            return Err(MMError::InvalidConfiguration(
+                "cannot subscribe to the trades of an empty symbol".to_string(),
+            ));
+        }
+        *self.trade_symbol.write().map_err(poisoned)? = Some(symbol.to_string());
         Ok(())
     }
 
@@ -563,9 +577,26 @@ impl MarketDataStream for MockExchangeConnector {
         Ok(self.generate_orderbook("BTC-USD", self.config.default_depth))
     }
 
+    /// A simulated trade of the subscribed symbol.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::InvalidConfiguration`] without a trade subscription, since the
+    /// trade would have no instrument to name, and [`MMError::LockPoisoned`] if
+    /// the lock is poisoned.
     async fn next_trade(&self) -> MMResult<Fill> {
-        // Return a simulated trade
+        let symbol = self
+            .trade_symbol
+            .read()
+            .map_err(poisoned)?
+            .clone()
+            .ok_or_else(|| {
+                MMError::InvalidConfiguration(
+                    "no trade subscription: subscribe_trades first".to_string(),
+                )
+            })?;
         Ok(Fill {
+            symbol,
             order_id: OrderId::new("mock-trade"),
             trade_id: format!("trade-{}", self.current_time()),
             price: self.config.base_price,
@@ -582,6 +613,36 @@ impl MarketDataStream for MockExchangeConnector {
 mod tests {
     use super::*;
     use crate::dec;
+
+    #[tokio::test]
+    async fn test_next_trade_names_the_subscribed_symbol() {
+        let connector = MockExchangeConnector::with_defaults();
+        connector.subscribe_trades("ETH-USD").await.unwrap();
+        assert_eq!(connector.next_trade().await.unwrap().symbol, "ETH-USD");
+        // A later subscription replaces it.
+        connector.subscribe_trades("SOL-USD").await.unwrap();
+        assert_eq!(connector.next_trade().await.unwrap().symbol, "SOL-USD");
+    }
+
+    #[tokio::test]
+    async fn test_next_trade_without_a_subscription_names_nothing() {
+        let connector = MockExchangeConnector::with_defaults();
+        assert!(matches!(
+            connector.next_trade().await,
+            Err(MMError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_trades_refuses_an_empty_symbol() {
+        let connector = MockExchangeConnector::with_defaults();
+        assert!(matches!(
+            connector.subscribe_trades("").await,
+            Err(MMError::InvalidConfiguration(_))
+        ));
+        // And the refusal subscribed nothing.
+        assert!(connector.next_trade().await.is_err());
+    }
 
     #[tokio::test]
     async fn test_submit_limit_order() {
