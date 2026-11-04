@@ -717,21 +717,10 @@ impl OrderBookSnapshot {
     /// levels, which keeps the ratio. Zero when the book is empty.
     #[must_use]
     pub fn imbalance(&self) -> Decimal {
-        let levels = Decimal::from(self.bids.len().saturating_add(self.asks.len()));
-        let depth = |side: &[BookLevel], scale: Decimal| {
-            side.iter().try_fold(Decimal::ZERO, |acc, l| {
-                acc.checked_add(l.quantity.checked_div(scale)?)
-            })
-        };
-        let sides = depth(&self.bids, Decimal::ONE)
-            .zip(depth(&self.asks, Decimal::ONE))
-            .or_else(|| depth(&self.bids, levels).zip(depth(&self.asks, levels)));
-        match sides {
-            Some((bid_depth, ask_depth)) if bid_depth.saturating_add(ask_depth) > Decimal::ZERO => {
-                crate::types::decimal::imbalance_ratio(bid_depth, ask_depth)
-            }
-            _ => Decimal::ZERO,
-        }
+        crate::types::decimal::imbalance_of_sides(
+            self.bids.iter().map(|l| l.quantity),
+            self.asks.iter().map(|l| l.quantity),
+        )
     }
 }
 

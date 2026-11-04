@@ -280,9 +280,85 @@ pub(crate) fn imbalance_ratio(a: Decimal, b: Decimal) -> Decimal {
         .unwrap_or(Decimal::ZERO)
 }
 
+/// The totals of two sides, and the scale that recovers them.
+///
+/// The scale is one when both sums fit. Otherwise each term is divided by
+/// the number of terms, so the sums always fit and keep their proportions.
+fn scaled_sides<A, B>(a: A, b: B) -> Option<(Decimal, Decimal, Decimal)>
+where
+    A: Iterator<Item = Decimal> + Clone,
+    B: Iterator<Item = Decimal> + Clone,
+{
+    fn sum(mut terms: impl Iterator<Item = Decimal>, scale: Decimal) -> Option<Decimal> {
+        terms.try_fold(Decimal::ZERO, |total, term| {
+            total.checked_add(term.checked_div(scale)?)
+        })
+    }
+    let direct = sum(a.clone(), Decimal::ONE).zip(sum(b.clone(), Decimal::ONE));
+    if let Some((total_a, total_b)) = direct {
+        return Some((total_a, total_b, Decimal::ONE));
+    }
+    let count = a.clone().count().saturating_add(b.clone().count());
+    let scale = Decimal::from(count);
+    Some((sum(a, scale)?, sum(b, scale)?, scale))
+}
+
+/// The imbalance `(sum(a) - sum(b)) / (sum(a) + sum(b))` of two sides given
+/// term by term, exact in proportion even when a sum is beyond the
+/// `Decimal` bounds. Zero when the combined total is not positive.
+#[must_use]
+pub(crate) fn imbalance_of_sides<A, B>(a: A, b: B) -> Decimal
+where
+    A: Iterator<Item = Decimal> + Clone,
+    B: Iterator<Item = Decimal> + Clone,
+{
+    match scaled_sides(a, b) {
+        Some((total_a, total_b, _)) if total_a.saturating_add(total_b) > Decimal::ZERO => {
+            imbalance_ratio(total_a, total_b)
+        }
+        _ => Decimal::ZERO,
+    }
+}
+
+/// The difference `sum(a) - sum(b)` of two sides given term by term.
+///
+/// Report only: the sides are compared before any bound is hit, so the sign
+/// is right, but the result saturates at the `Decimal` bounds.
+#[must_use]
+pub(crate) fn net_of_sides<A, B>(a: A, b: B) -> Decimal
+where
+    A: Iterator<Item = Decimal> + Clone,
+    B: Iterator<Item = Decimal> + Clone,
+{
+    scaled_sides(a, b).map_or(Decimal::ZERO, |(total_a, total_b, scale)| {
+        total_a.saturating_sub(total_b).saturating_mul(scale)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_imbalance_of_sides_beyond_bounds_keeps_proportions() {
+        let max = Decimal::MAX;
+        let imbalance = imbalance_of_sides([max, max].into_iter(), [max].into_iter());
+        assert_eq!(
+            imbalance.round_dp(20),
+            dec!(1).checked_div(dec!(3)).unwrap().round_dp(20)
+        );
+        assert_eq!(net_of_sides([max, max].into_iter(), [max].into_iter()), max);
+    }
+
+    #[test]
+    fn test_imbalance_of_sides_empty_is_zero() {
+        let none = std::iter::empty::<Decimal>();
+        assert_eq!(
+            imbalance_of_sides(none.clone(), none.clone()),
+            Decimal::ZERO
+        );
+        assert_eq!(net_of_sides(none.clone(), none), Decimal::ZERO);
+    }
 
     #[test]
     fn test_decimal_to_u64_saturating_bounds_clamp() {

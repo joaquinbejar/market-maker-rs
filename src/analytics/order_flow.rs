@@ -168,6 +168,23 @@ pub struct OrderFlowStats {
     pub window_end: u64,
 }
 
+/// The volume weighted average price of one side's trades, or `None` when
+/// the side has no volume or its notional or volume overflows.
+fn side_vwap<'a>(mut trades: impl Iterator<Item = &'a Trade>) -> Option<Decimal> {
+    let (notional, volume) =
+        trades.try_fold((Decimal::ZERO, Decimal::ZERO), |(notional, volume), t| {
+            Some((
+                notional.checked_add(t.price.checked_mul(t.size)?)?,
+                volume.checked_add(t.size)?,
+            ))
+        })?;
+    if volume > Decimal::ZERO {
+        notional.checked_div(volume)
+    } else {
+        None
+    }
+}
+
 impl OrderFlowStats {
     /// Returns the total volume (buy + sell).
     ///
@@ -196,9 +213,14 @@ impl OrderFlowStats {
     }
 
     /// Returns the buy/sell volume ratio.
-    /// Returns None if sell_volume is zero or the ratio overflows.
+    /// Returns None if sell_volume is zero, a volume sits at the `Decimal`
+    /// bound (it may have saturated, so the ratio would be wrong) or the
+    /// ratio overflows.
     #[must_use]
     pub fn volume_ratio(&self) -> Option<Decimal> {
+        if self.buy_volume == Decimal::MAX || self.sell_volume == Decimal::MAX {
+            return None;
+        }
         if self.sell_volume > Decimal::ZERO {
             self.buy_volume.checked_div(self.sell_volume)
         } else {
@@ -363,57 +385,37 @@ impl OrderFlowAnalyzer {
     ///
     /// # Returns
     ///
-    /// `OrderFlowStats` containing all calculated metrics. These are
-    /// report only values: sums saturate at the `Decimal` bounds and a
-    /// ratio that overflows is `None` (or zero for the imbalance).
+    /// `OrderFlowStats` containing all calculated metrics. The imbalance is
+    /// exact in proportion even when a side's volume is beyond the `Decimal`
+    /// bounds. The volumes, notionals and `net_flow` are report only values
+    /// that saturate there, and a VWAP whose inputs overflow is `None`.
     #[must_use]
     pub fn get_stats(&self, current_time: u64) -> OrderFlowStats {
         let window_start = current_time.saturating_sub(self.window_ms);
 
-        let mut buy_volume = Decimal::ZERO;
-        let mut sell_volume = Decimal::ZERO;
-        let mut buy_count = 0u64;
-        let mut sell_count = 0u64;
-        let mut buy_notional = Decimal::ZERO;
-        let mut sell_notional = Decimal::ZERO;
+        let in_window = self
+            .trades
+            .iter()
+            .filter(|t| t.timestamp >= window_start && t.timestamp <= current_time);
+        let buys = in_window.clone().filter(|t| t.side == TradeSide::Buy);
+        let sells = in_window.filter(|t| t.side == TradeSide::Sell);
+        let buy_sizes = buys.clone().map(|t| t.size);
+        let sell_sizes = sells.clone().map(|t| t.size);
 
-        for trade in &self.trades {
-            if trade.timestamp >= window_start && trade.timestamp <= current_time {
-                let notional = trade.notional();
-                match trade.side {
-                    TradeSide::Buy => {
-                        buy_volume = buy_volume.saturating_add(trade.size);
-                        buy_notional = buy_notional.saturating_add(notional);
-                        buy_count = buy_count.saturating_add(1);
-                    }
-                    TradeSide::Sell => {
-                        sell_volume = sell_volume.saturating_add(trade.size);
-                        sell_notional = sell_notional.saturating_add(notional);
-                        sell_count = sell_count.saturating_add(1);
-                    }
-                }
-            }
-        }
-
-        let total_volume = buy_volume.saturating_add(sell_volume);
-        let net_flow = buy_volume.saturating_sub(sell_volume);
-        let imbalance = if total_volume > Decimal::ZERO {
-            crate::types::decimal::imbalance_ratio(buy_volume, sell_volume)
-        } else {
-            Decimal::ZERO
+        let saturated_sum = |sizes: &mut dyn Iterator<Item = Decimal>| {
+            sizes.fold(Decimal::ZERO, |acc, x| acc.saturating_add(x))
         };
+        let buy_volume = saturated_sum(&mut buy_sizes.clone());
+        let sell_volume = saturated_sum(&mut sell_sizes.clone());
+        let buy_notional = saturated_sum(&mut buys.clone().map(|t| t.notional()));
+        let sell_notional = saturated_sum(&mut sells.clone().map(|t| t.notional()));
+        let buy_count = u64::try_from(buys.clone().count()).unwrap_or(u64::MAX);
+        let sell_count = u64::try_from(sells.clone().count()).unwrap_or(u64::MAX);
 
-        let buy_vwap = if buy_volume > Decimal::ZERO {
-            buy_notional.checked_div(buy_volume)
-        } else {
-            None
-        };
-
-        let sell_vwap = if sell_volume > Decimal::ZERO {
-            sell_notional.checked_div(sell_volume)
-        } else {
-            None
-        };
+        let net_flow = crate::types::decimal::net_of_sides(buy_sizes.clone(), sell_sizes.clone());
+        let imbalance = crate::types::decimal::imbalance_of_sides(buy_sizes, sell_sizes);
+        let buy_vwap = side_vwap(buys);
+        let sell_vwap = side_vwap(sells);
 
         OrderFlowStats {
             buy_volume,

@@ -63,6 +63,7 @@ use std::collections::VecDeque;
 
 use crate::Decimal;
 use crate::analytics::order_flow::{Trade, TradeSide};
+use crate::types::decimal::imbalance_of_sides;
 use crate::types::error::{MMError, MMResult};
 
 #[cfg(feature = "serde")]
@@ -208,9 +209,18 @@ impl VolumeBucket {
     }
 
     /// Returns the signed imbalance (positive = buy pressure).
+    ///
+    /// A bucket whose total sits at the `Decimal` bound may have saturated,
+    /// so it takes the magnitude computed when the bucket completed.
     #[must_use]
     pub fn signed_imbalance(&self) -> Decimal {
-        if self.total_volume > Decimal::ZERO {
+        if self.total_volume == Decimal::MAX {
+            if self.buy_volume < self.sell_volume {
+                Decimal::ZERO.saturating_sub(self.imbalance)
+            } else {
+                self.imbalance
+            }
+        } else if self.total_volume > Decimal::ZERO {
             self.buy_volume
                 .saturating_sub(self.sell_volume)
                 .checked_div(self.total_volume)
@@ -348,7 +358,9 @@ impl VPINCalculator {
     /// `Some(vpin)` if enough buckets are available, `None` otherwise.
     ///
     /// The volume and count accumulators are statistics, not balances:
-    /// they saturate at their bounds, where a bucket is complete anyway.
+    /// they saturate at their bounds, where a bucket is complete anyway. The
+    /// bucket's imbalance is computed from the unsaturated volumes, so a
+    /// saturated total does not distort the VPIN.
     pub fn add_trade(&mut self, trade: &Trade) -> Option<Decimal> {
         self.total_trades = self.total_trades.saturating_add(1);
         self.total_volume = self.total_volume.saturating_add(trade.size);
@@ -360,8 +372,10 @@ impl VPINCalculator {
         self.current_bucket.end_time = trade.timestamp;
         self.current_bucket.trade_count = self.current_bucket.trade_count.saturating_add(1);
 
-        // Add volume to appropriate side
+        // The volumes before this trade are exact: a total that saturates
+        // completes the bucket on this very trade.
         let bucket = &mut self.current_bucket;
+        let (prior_buy, prior_sell) = (bucket.buy_volume, bucket.sell_volume);
         match trade.side {
             TradeSide::Buy => {
                 bucket.buy_volume = bucket.buy_volume.saturating_add(trade.size);
@@ -374,27 +388,24 @@ impl VPINCalculator {
 
         // Check if bucket is complete
         if self.current_bucket.total_volume >= self.config.bucket_volume {
-            self.complete_current_bucket();
+            let imbalance = match trade.side {
+                TradeSide::Buy => imbalance_of_sides(
+                    [prior_buy, trade.size].into_iter(),
+                    [prior_sell].into_iter(),
+                ),
+                TradeSide::Sell => imbalance_of_sides(
+                    [prior_buy].into_iter(),
+                    [prior_sell, trade.size].into_iter(),
+                ),
+            };
+            self.complete_current_bucket(imbalance.abs());
         }
 
         self.get_vpin()
     }
 
     /// Completes the current bucket and starts a new one.
-    fn complete_current_bucket(&mut self) {
-        // Calculate imbalance for the bucket
-        let imbalance = if self.current_bucket.total_volume > Decimal::ZERO {
-            let diff = self
-                .current_bucket
-                .buy_volume
-                .saturating_sub(self.current_bucket.sell_volume);
-            // `|buy - sell| <= total`, so the ratio is in [0, 1].
-            diff.abs()
-                .checked_div(self.current_bucket.total_volume)
-                .unwrap_or(Decimal::ONE)
-        } else {
-            Decimal::ZERO
-        };
+    fn complete_current_bucket(&mut self, imbalance: Decimal) {
         self.current_bucket.imbalance = imbalance;
 
         // Handle overflow: if bucket has more than target volume,
