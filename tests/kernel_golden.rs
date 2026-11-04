@@ -20,14 +20,18 @@ mod harness;
 
 use harness::*;
 use market_maker_rs::backtest::kernel::{
-    ExecKind, GateVerdict, KernelAction, KernelEvent, KernelLatency, Observation, Phase, QuoteSide,
-    decode, encode, fingerprint, fnv1a128,
+    ActionStatus, ExecKind, GateVerdict, KernelAction, KernelEvent, KernelLatency, Observation,
+    Phase, QuoteSide, decode, encode, fingerprint, fnv1a128,
 };
 use market_maker_rs::dec;
+use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 
 /// Absolute position, in lots, at which the driver hedges.
 const HEDGE_AT: u64 = 2;
+
+/// The kernel's first order id.
+const FIRST_ORDER_ID: u64 = 1;
 
 /// The script, except that a position of `HEDGE_AT` lots or more is reduced
 /// by an order that crosses the touch, one bounded hedge at a time.
@@ -58,6 +62,7 @@ struct Trajectory {
     states: Vec<State>,
     observations: Vec<Observation>,
     actions: Vec<KernelAction>,
+    outcomes: Vec<ActionStatus>,
     /// Events before each decision.
     marks: Vec<usize>,
     events: Vec<KernelEvent>,
@@ -71,6 +76,7 @@ fn trajectory(k: &Kernel<'_>, sc: &Scenario) -> Trajectory {
         states: Vec::new(),
         observations: Vec::new(),
         actions: Vec::new(),
+        outcomes: Vec::new(),
         marks: Vec::new(),
         events: Vec::new(),
         last: s,
@@ -83,7 +89,8 @@ fn trajectory(k: &Kernel<'_>, sc: &Scenario) -> Trajectory {
         t.observations.push(obs);
         t.actions.push(action);
         t.marks.push(events.len());
-        k.step_with(&mut s, action, &mut events);
+        t.outcomes
+            .push(k.step_with(&mut s, action, &mut events).applied);
         decision += 1;
     }
     t.events = events;
@@ -230,11 +237,9 @@ fn test_kernel_golden_trajectories_match_recorded_hashes() {
                 .iter()
                 .filter(|s| s.queue_lengths().msgs > 0)
                 .count();
-            hedged_down += hedges_that_reduced(&k, &t);
+            hedged_down += hedges_that_reduced(&t);
         }
-        if print {
-            continue;
-        }
+        assert!(!print, "printed the golden values; nothing was compared");
         assert!(fills > 0, "config {c}: fills");
         assert!(cancels > 0, "config {c}: cancels");
         assert!(
@@ -250,21 +255,35 @@ fn test_kernel_golden_trajectories_match_recorded_hashes() {
     }
 }
 
-/// Decisions at which the venue position shrank while the latest order
-/// submitted was a hedge.
-fn hedges_that_reduced(k: &Kernel<'_>, t: &Trajectory) -> u64 {
-    let mut count = 0;
-    let mut hedge_live = false;
-    let abs = |s: &State| k.venue_summary(s).unwrap().position.abs();
-    for (i, action) in t.actions.iter().enumerate() {
+/// Fills of hedge orders that shrank the venue position. Order ids follow
+/// the kernel: sequential from `FIRST_ORDER_ID`, one per submitted leg, none
+/// for a rejected action.
+fn hedges_that_reduced(t: &Trajectory) -> u64 {
+    let mut next_id = FIRST_ORDER_ID;
+    let mut hedge_ids = std::collections::HashSet::new();
+    for (action, outcome) in t.actions.iter().zip(&t.outcomes) {
+        if matches!(outcome, ActionStatus::Rejected(_)) {
+            continue;
+        }
         match action {
-            KernelAction::OneSided { .. } => hedge_live = true,
-            KernelAction::Quote { .. } => hedge_live = false,
+            KernelAction::OneSided { .. } => {
+                hedge_ids.insert(next_id);
+                next_id += 1;
+            }
+            KernelAction::Quote { .. } => next_id += 2,
             KernelAction::Hold | KernelAction::QuoteError(_) => {}
         }
-        let next = t.states.get(i + 1).unwrap_or(&t.last);
-        if hedge_live && abs(next) < abs(&t.states[i]) {
-            count += 1;
+    }
+    let mut position = 0i128;
+    let mut count = 0;
+    for e in &t.events {
+        if let KernelEvent::Fill(f) = e {
+            let before = position;
+            let qty = i128::from(f.qty);
+            position += if f.side == Action::Buy { qty } else { -qty };
+            if hedge_ids.contains(&f.order_id) && position.abs() < before.abs() {
+                count += 1;
+            }
         }
     }
     count
@@ -302,14 +321,18 @@ fn test_kernel_restore_with_pending_messages_reproduces_the_reference() {
             let data = sc.data();
             let k = kernel(&sc, &data);
             let t = trajectory(&k, &sc);
+            // As a new process would: its own dataset and kernel.
+            let fresh_data = sc.data();
+            let fresh = kernel(&sc, &fresh_data);
             for (i, snapshot) in t.states.iter().enumerate() {
                 let q = snapshot.queue_lengths();
                 if q.msgs == 0 && q.deliveries == 0 {
                     continue;
                 }
                 let ctx = format!("seed {seed} dataset {index} decision {i}");
-                let back = decode(&encode(snapshot), &k).unwrap();
-                let (last, events, observations) = replay(&k, back, &t.actions[i..]);
+                let back = decode(&encode(snapshot), &fresh).unwrap();
+                assert_eq!(back, *snapshot, "{ctx}: decoded");
+                let (last, events, observations) = replay(&fresh, back, &t.actions[i..]);
                 assert_eq!(last, t.last, "{ctx}: state");
                 assert_eq!(events, t.events[t.marks[i]..], "{ctx}: events");
                 assert_eq!(observations, t.observations[i..], "{ctx}: observations");
@@ -445,6 +468,51 @@ fn test_kernel_batches_do_not_depend_on_worker_assignment() {
             "{workers} shuffled"
         );
     }
+}
+
+/// Final fingerprint and event hash per latency seed, on one shared kernel.
+fn run_seeds(k: &Kernel<'_>, sc: &Scenario, seeds: &[u64]) -> Vec<(u64, u128, u128)> {
+    seeds
+        .iter()
+        .map(|seed| {
+            let mut one = sc.clone();
+            one.latency_seed = *seed;
+            let t = trajectory(k, &one);
+            (*seed, fingerprint(&t.last), events_hash(&t.events))
+        })
+        .collect()
+}
+
+#[test]
+fn test_kernel_shared_across_threads_matches_sequential_runs() {
+    let seeds: Vec<u64> = (0..40).collect();
+    let mut with_jitter = 0;
+    for index in 0..DATASETS {
+        let sc = scenario(3, index);
+        let data = sc.data();
+        let k = kernel(&sc, &data);
+        let reference = run_seeds(&k, &sc, &seeds);
+        let mut shared: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = seeds
+                .chunks(7)
+                .map(|part| {
+                    let (k, sc) = (&k, &sc);
+                    scope.spawn(move || run_seeds(k, sc, part))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        shared.sort_unstable();
+        assert_eq!(shared, reference, "dataset {index}");
+        if sc.cfg.latency.jitter_q > 0 {
+            let distinct: std::collections::HashSet<u128> = reference.iter().map(|r| r.1).collect();
+            with_jitter += u64::from(distinct.len() > 1);
+        }
+    }
+    assert!(with_jitter > 0, "latency seeds that change a jittered run");
 }
 
 #[test]
