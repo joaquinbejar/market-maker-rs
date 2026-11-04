@@ -8,6 +8,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Derivative contracts in the backtest engine (#191, features `margin` and
+  `instruments`): `BacktestEngine::with_instrument(spec, accountant)` runs a
+  linear or inverse future or perpetual, with `MarginLedgerAccountant` on it, in
+  contracts and in the settlement asset, BTC for an inverse contract, so the
+  initial capital must be too. The run is refused for a pretrade policy, whose
+  limits read `price * quantity`, or for an accountant of other terms, and the
+  checks run again at the start of every run. New `FeeCurrency::Settlement` and
+  `FeeAsset::Settlement`, and `FillAccountant::unrealized_at`,
+  `requires_instrument` and `check_instrument`, all with defaults. Funding,
+  expiry and settlement are not simulated (#94, #97), and neither are margin
+  requirements or liquidation. `AccountingStatus` gains `valuation_failures` and
+  `setup_refused`, and is not consistent with either.
 - Orders and fills against a contract specification (feature `instruments`,
   #93): `instruments::orders::check_order` refuses an order for another
   symbol, off the tick or the lot, or with a missing or unexpected price, with
@@ -15,7 +27,7 @@ project follows [Semantic Versioning](https://semver.org/).
   asset of the contract, where `Fill::notional` is only right for a linear
   contract of multiplier one. With `margin` too,
   `instruments::margin::fill_execution` converts a fill into a `margin-rs`
-  execution. `MarginLedgerAccountant` stays spot only for now (#191).
+  execution.
 - `backtest::queue_reactive`: a seedable simulator of aggregated queues after
   Huang, Lehalle and Rosenbaum (Model III over Model I), with maximum likelihood
   intensities per queue size, exportable parameters, bounded restorable state,
@@ -240,6 +252,10 @@ project follows [Semantic Versioning](https://semver.org/).
 These signature changes are breaking and ship in 0.7.0, not in a patch
 release.
 
+- `FeeCurrency` has a new variant, `Settlement`, and is now `#[non_exhaustive]`.
+  `AccountingStatus` has two new fields, so a struct literal must set them; with
+  `serde` they default. `FeeCurrency::charge` refuses `Settlement`, which needs
+  the contract (#191).
 - `Fill` has a new field, `symbol`, the instrument traded, so a struct literal
   must set it. With `serde` it defaults to empty, so a record written before it
   still decodes. `instruments::orders::fill_notional` and

@@ -1,0 +1,941 @@
+//! Derivative contracts in the backtest engine and `MarginLedgerAccountant`
+//! (#191): hand cases, the shared PnL fixtures, and every refused configuration.
+//!
+//! The expected values are literals from the contract terms, or exact fractions
+//! of the shared fixtures, never recomputed with the code under test.
+
+#![cfg(all(feature = "margin", feature = "instruments"))]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+use financial_types::Side;
+use financial_types::instrument::fixtures::{self, Case, Expected, Operation};
+use margin_rs::instrument::InstrumentScales;
+use margin_rs::ledger::{ExecutionCashflow, Ledger, LedgerConfig};
+use margin_rs::{Asset, Instrument, InstrumentId};
+use market_maker_rs::Decimal;
+use market_maker_rs::backtest::engine::{BacktestConfig, BacktestStrategy, FeeCurrency};
+use market_maker_rs::backtest::{
+    AccountingFill, AccountingSnapshot, BacktestEngine, BacktestResult, FeeAsset, FillAccountant,
+    MarginLedgerAccountant, MarketTick, SimOrderId, SimulatedFill, VecDataSource,
+};
+use market_maker_rs::dec;
+use market_maker_rs::execution::Action;
+use market_maker_rs::instruments::reference::deribit;
+use market_maker_rs::instruments::{
+    AssetCode, ContractKind, ContractSize, InstrumentDraft, InstrumentId as SpecId, InstrumentSpec,
+    Margining, TickSchedule,
+};
+use market_maker_rs::position::inventory::InventoryPosition;
+use market_maker_rs::prelude::OptionStyle;
+use market_maker_rs::risk::RiskLimits;
+use market_maker_rs::risk::pretrade::LimitsPolicy;
+use market_maker_rs::strategy::quote::Quote;
+use market_maker_rs::types::error::{MMError, MMResult};
+
+const EXPIRY_MS: u64 = 1_795_766_400_000;
+
+fn scales() -> InstrumentScales {
+    InstrumentScales {
+        price_scale: 8,
+        contract_scale: 8,
+    }
+}
+
+/// A ledger with BTC and USDT at 8 decimals and `spec` at scales of 8.
+fn ledger_for(spec: &InstrumentSpec) -> Ledger {
+    let mut ledger = Ledger::new(LedgerConfig::default());
+    for asset in ["BTC", "USDT"] {
+        ledger
+            .register_asset(Asset::new(asset).unwrap(), 8)
+            .unwrap();
+    }
+    ledger
+        .register_instrument(Instrument::from_spec(spec, scales()).unwrap())
+        .unwrap();
+    ledger
+}
+
+fn accountant_for(spec: &InstrumentSpec) -> MarginLedgerAccountant {
+    MarginLedgerAccountant::new(
+        ledger_for(spec),
+        InstrumentId::new(spec.id().as_str()).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A linear future or perpetual on BTC settled in USDT, with `multiplier` BTC per
+/// contract, tick 1 and lot 1.
+fn linear(id: &str, multiplier: Decimal, expiry_ms: Option<u64>) -> InstrumentSpec {
+    let asset = |code| AssetCode::new(code).unwrap();
+    InstrumentSpec::new(InstrumentDraft {
+        id: SpecId::new(id).unwrap(),
+        kind: if expiry_ms.is_some() {
+            ContractKind::Future
+        } else {
+            ContractKind::Perpetual
+        },
+        margining: Margining::Linear,
+        underlying: asset("BTC"),
+        price_asset: asset("USDT"),
+        settlement_asset: asset("USDT"),
+        size: ContractSize::base(multiplier, asset("BTC")).unwrap(),
+        price_ticks: TickSchedule::fixed(dec!(1)).unwrap(),
+        lot: dec!(1),
+        expiry_ms,
+        option: None,
+    })
+    .unwrap()
+}
+
+/// A fill, as the engine posts it.
+fn posted(
+    id: u64,
+    side: Action,
+    price: Decimal,
+    quantity: Decimal,
+    fee: Decimal,
+) -> AccountingFill {
+    AccountingFill {
+        execution_id: id,
+        order_id: SimOrderId::default(),
+        side,
+        price,
+        quantity,
+        cumulative_quantity: quantity,
+        fee,
+        fee_asset: FeeAsset::Settlement,
+        timestamp: id,
+    }
+}
+
+/// Quotes from a script, one per tick; `None` leaves the resting orders.
+#[derive(Debug, Clone)]
+struct Scripted(Vec<Option<(Decimal, Decimal, Decimal, Decimal)>>, usize);
+
+impl BacktestStrategy for Scripted {
+    fn on_tick(&mut self, tick: &MarketTick, _position: &InventoryPosition) -> Option<Quote> {
+        let step = self.0.get(self.1).copied().flatten();
+        self.1 += 1;
+        step.map(|(bid_price, bid_size, ask_price, ask_size)| Quote {
+            bid_price,
+            bid_size,
+            ask_price,
+            ask_size,
+            timestamp: tick.timestamp,
+        })
+    }
+
+    fn on_fill(&mut self, _fill: &SimulatedFill) {}
+
+    fn reset(&mut self) {
+        self.1 = 0;
+    }
+}
+
+/// Far enough from any price in these tests never to fill.
+const FAR_LOW: Decimal = dec!(1);
+const FAR_HIGH: Decimal = dec!(10000000);
+
+fn buy_at(price: Decimal, size: Decimal) -> Option<(Decimal, Decimal, Decimal, Decimal)> {
+    Some((price, size, FAR_HIGH, size))
+}
+
+fn sell_at(price: Decimal, size: Decimal) -> Option<(Decimal, Decimal, Decimal, Decimal)> {
+    Some((FAR_LOW, size, price, size))
+}
+
+fn tick(timestamp: u64, bid: Decimal, ask: Decimal) -> MarketTick {
+    MarketTick::new(timestamp, bid, dec!(100000), ask, dec!(100000))
+}
+
+fn config(spec: &InstrumentSpec, fee_rate: Decimal) -> BacktestConfig {
+    BacktestConfig {
+        initial_capital: dec!(1000),
+        fee_rate,
+        fee_currency: FeeCurrency::Settlement { scale: 8 },
+        tick_size: spec.price_ticks().bands()[0].tick,
+        lot_size: spec.lot(),
+        default_order_size: spec.lot(),
+        ..BacktestConfig::default()
+    }
+}
+
+/// A tick whose touch fills an order of `side` at `price`.
+fn crossing(timestamp: u64, side: Side, price: Decimal, half: Decimal) -> MarketTick {
+    match side {
+        Side::Long => tick(timestamp, price - half, price),
+        Side::Short => tick(timestamp, price, price + half),
+    }
+}
+
+/// A run opening on `side` at `entry` from tick 0, filled on tick 1, closing at
+/// `exit` from tick 2 when `close` holds, filled on tick 3, ending at the mid
+/// `last`. Sizes are in contracts.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    spec: &InstrumentSpec,
+    fee_rate: Decimal,
+    side: Side,
+    size: Decimal,
+    entry: Decimal,
+    close: bool,
+    exit: Decimal,
+    last: Decimal,
+) -> BacktestResult {
+    let half = spec.price_ticks().bands()[0].tick;
+    let far = Some((FAR_LOW, spec.lot(), FAR_HIGH, spec.lot()));
+    let (open_order, close_order, close_side) = match side {
+        Side::Long => (buy_at(entry, size), sell_at(exit, size), Side::Short),
+        Side::Short => (sell_at(entry, size), buy_at(exit, size), Side::Long),
+    };
+    let script = vec![
+        open_order,
+        far,
+        if close { close_order } else { far },
+        far,
+        far,
+    ];
+    let ticks = vec![
+        tick(1000, dec!(50000), dec!(70000)),
+        crossing(1001, side, entry, half),
+        tick(1002, entry - half, entry + half),
+        if close {
+            crossing(1003, close_side, exit, half)
+        } else {
+            tick(1003, entry - half, entry + half)
+        },
+        tick(1004, last - half, last + half),
+    ];
+    let mut engine = BacktestEngine::new(
+        config(spec, fee_rate),
+        Scripted(script, 0),
+        VecDataSource::new(ticks),
+    )
+    .with_instrument(spec.clone(), accountant_for(spec))
+    .unwrap();
+    engine.run()
+}
+
+#[test]
+fn linear_contract_is_in_usdt_with_its_multiplier() {
+    // 5 contracts of 0.01 BTC: 3000 USDT at 60000 and 3050 USDT at 61000, so a
+    // move of 1000 is 50 USDT; fees of 0.05% are 1.5 and 1.525 USDT.
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let result = run(
+        &spec,
+        dec!(0.0005),
+        Side::Long,
+        dec!(5),
+        dec!(60000),
+        true,
+        dec!(61000),
+        dec!(62000),
+    );
+    assert!(result.accounting.is_consistent(), "{:?}", result.accounting);
+    assert_eq!(result.num_trades, 2);
+    assert_eq!(result.final_position, dec!(0));
+    assert_eq!(result.total_pnl, dec!(50));
+    assert_eq!(result.total_fees, dec!(3.025));
+    assert_eq!(result.net_pnl, dec!(46.975));
+    // Equity: 1000 + 50 - 3.025, whatever the mark, once flat.
+    assert_eq!(result.equity_curve.last().unwrap().1, dec!(1046.975));
+}
+
+#[test]
+fn inverse_contract_is_in_btc() {
+    // 1000 contracts of 10 USD: 10000/60000 and 10000/61000 BTC, each leg rounded
+    // at 8 decimals, 0.16666667 and 0.16393443. Fees of 0.05%: 1/12000 and
+    // 1/12200 BTC, 0.00008333 and 0.00008197.
+    let spec = deribit::btc_perpetual().unwrap();
+    let result = run(
+        &spec,
+        dec!(0.0005),
+        Side::Long,
+        dec!(1000),
+        dec!(60000),
+        true,
+        dec!(61000),
+        dec!(62000),
+    );
+    assert!(result.accounting.is_consistent(), "{:?}", result.accounting);
+    assert_eq!(result.total_pnl, dec!(0.00273224));
+    assert_eq!(result.total_fees, dec!(0.0001653));
+    assert_eq!(result.net_pnl, dec!(0.00256694));
+    assert_eq!(result.equity_curve.last().unwrap().1, dec!(1000.00256694));
+}
+
+#[test]
+fn an_open_inverse_position_is_marked_in_btc_with_the_sign_of_the_side() {
+    let spec = deribit::btc_perpetual().unwrap();
+    // Long at 60000, marked at 61000: 0.16666667 - 0.16393443.
+    let long = run(
+        &spec,
+        dec!(0),
+        Side::Long,
+        dec!(1000),
+        dec!(60000),
+        false,
+        dec!(60000),
+        dec!(61000),
+    );
+    assert!(long.accounting.is_consistent(), "{:?}", long.accounting);
+    assert_eq!(long.final_position, dec!(1000));
+    assert_eq!(long.total_pnl, dec!(0.00273224));
+    // Short at 60000, marked at 61000: the price rose, so it lost.
+    let short = run(
+        &spec,
+        dec!(0),
+        Side::Short,
+        dec!(1000),
+        dec!(60000),
+        false,
+        dec!(60000),
+        dec!(61000),
+    );
+    assert!(short.accounting.is_consistent(), "{:?}", short.accounting);
+    assert_eq!(short.final_position, dec!(-1000));
+    assert_eq!(short.total_pnl, dec!(-0.00273224));
+}
+
+#[test]
+fn a_rebate_keeps_its_sign_and_reduces_the_fees() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let result = run(
+        &spec,
+        dec!(-0.0001),
+        Side::Long,
+        dec!(5),
+        dec!(60000),
+        false,
+        dec!(60000),
+        dec!(60000),
+    );
+    assert!(result.accounting.is_consistent(), "{:?}", result.accounting);
+    // 3000 USDT x -0.01%.
+    assert_eq!(result.total_fees, dec!(-0.3));
+}
+
+#[test]
+fn adding_a_partial_close_and_a_flip_through_zero_realize_exactly() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let mut a = accountant_for(&spec);
+    let zero = Decimal::ZERO;
+    // Buy 5 at 60000, add 5 at 61000: long 10 at an average of 60500.
+    a.post_fill(&posted(1, Action::Buy, dec!(60000), dec!(5), zero))
+        .unwrap();
+    a.post_fill(&posted(2, Action::Buy, dec!(61000), dec!(5), zero))
+        .unwrap();
+    let s = a.snapshot().unwrap();
+    assert_eq!(s.position, dec!(10));
+    assert_eq!(s.average_entry_price, Some(dec!(60500)));
+    assert_eq!(s.cash_flow, dec!(0));
+    // 10 x 0.01 x (62000 - 60500) = 150 USDT unrealized.
+    assert_eq!(a.unrealized_at(dec!(62000)).unwrap().unwrap(), dec!(150));
+    // Sell 4 at 62000: 4 x 0.01 x 1500 = 60 realized; 6 left at 60500.
+    a.post_fill(&posted(3, Action::Sell, dec!(62000), dec!(4), zero))
+        .unwrap();
+    let s = a.snapshot().unwrap();
+    assert_eq!(s.position, dec!(6));
+    assert_eq!(s.average_entry_price, Some(dec!(60500)));
+    assert_eq!(s.cash_flow, dec!(60));
+    assert_eq!(a.unrealized_at(dec!(62000)).unwrap().unwrap(), dec!(90));
+    // Sell 10 at 60000: closes 6 for 6 x 0.01 x -500 = -30, and opens 4 short at
+    // 60000.
+    a.post_fill(&posted(4, Action::Sell, dec!(60000), dec!(10), zero))
+        .unwrap();
+    let s = a.snapshot().unwrap();
+    assert_eq!(s.position, dec!(-4));
+    assert_eq!(s.average_entry_price, Some(dec!(60000)));
+    assert_eq!(s.cash_flow, dec!(30));
+    assert_eq!(s.fills_posted, 4);
+    // Short 4 from 60000 at 59000: +40.
+    assert_eq!(a.unrealized_at(dec!(59000)).unwrap().unwrap(), dec!(40));
+}
+
+#[test]
+fn marking_at_the_exit_and_then_closing_there_keeps_the_total() {
+    for (spec, size) in [
+        (linear("FUT", dec!(0.01), Some(EXPIRY_MS)), dec!(5)),
+        (deribit::btc_perpetual().unwrap(), dec!(1000)),
+    ] {
+        let mut a = accountant_for(&spec);
+        a.post_fill(&posted(1, Action::Buy, dec!(60000), size, dec!(0)))
+            .unwrap();
+        let before = a.unrealized_at(dec!(61000)).unwrap().unwrap();
+        a.post_fill(&posted(2, Action::Sell, dec!(61000), size, dec!(0)))
+            .unwrap();
+        let s = a.snapshot().unwrap();
+        // Both round the same two values once, so nothing is lost or counted twice.
+        assert_eq!(s.cash_flow, before);
+        assert_eq!(a.unrealized_at(dec!(61000)).unwrap().unwrap(), dec!(0));
+    }
+}
+
+#[test]
+fn a_ledger_that_starts_open_is_marked_at_its_entry_before_any_tick() {
+    // Not at the zero mark a flat start uses, which an open position would refuse.
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let mut seeded = accountant_for(&spec);
+    seeded
+        .post_fill(&posted(1, Action::Buy, dec!(60000), dec!(5), dec!(0)))
+        .unwrap();
+    let engine = BacktestEngine::new(
+        config(&spec, dec!(0)),
+        Scripted(Vec::new(), 0),
+        VecDataSource::new(vec![tick(1000, dec!(60999), dec!(61001))]),
+    )
+    .with_instrument(spec.clone(), seeded);
+    let mut engine = engine.unwrap();
+    assert_eq!(engine.fault_count(), 0);
+    let (position, pnl) = engine.get_state();
+    assert_eq!(position.quantity, dec!(5));
+    assert_eq!(position.avg_entry_price, dec!(60000));
+    assert_eq!(pnl.unrealized, dec!(0));
+    // The tick's mid: 5 x 0.01 x 1000.
+    let result = engine.run();
+    assert!(result.accounting.is_consistent(), "{:?}", result.accounting);
+    assert_eq!(result.total_pnl, dec!(50));
+    assert_eq!(result.net_pnl, dec!(50));
+}
+
+#[test]
+fn reset_returns_to_the_exact_initial_state() {
+    let spec = deribit::btc_perpetual().unwrap();
+    let mut engine = BacktestEngine::new(
+        config(&spec, dec!(0.0005)),
+        Scripted(vec![buy_at(dec!(60000), dec!(1000)); 4], 0),
+        VecDataSource::new(vec![
+            tick(1000, dec!(50000), dec!(70000)),
+            tick(1001, dec!(59999.5), dec!(60000)),
+            tick(1002, dec!(59999.5), dec!(60000)),
+        ]),
+    )
+    .with_instrument(spec.clone(), accountant_for(&spec))
+    .unwrap();
+    let first = engine.run();
+    assert_ne!(first.total_fees, dec!(0));
+    engine.reset();
+    let snapshot = engine.accounting_snapshot().unwrap().unwrap();
+    assert_eq!(snapshot, AccountingSnapshot::default());
+    let (position, pnl) = engine.get_state();
+    assert_eq!(position.quantity, dec!(0));
+    assert_eq!(
+        (pnl.realized, pnl.unrealized, pnl.total),
+        (dec!(0), dec!(0), dec!(0))
+    );
+}
+
+#[test]
+fn a_fill_just_before_the_expiry_books_and_one_at_it_is_refused() {
+    let at = |timestamp: u64| {
+        let spec = linear("FUT", dec!(0.01), Some(1003));
+        let mut engine = BacktestEngine::new(
+            config(&spec, dec!(0)),
+            Scripted(vec![buy_at(dec!(60000), dec!(5))], 0),
+            VecDataSource::new(vec![
+                tick(1000, dec!(50000), dec!(70000)),
+                tick(timestamp, dec!(59999), dec!(60000)),
+            ]),
+        )
+        .with_instrument(spec.clone(), accountant_for(&spec))
+        .unwrap();
+        engine.run()
+    };
+    let before = at(1002);
+    assert!(before.accounting.is_consistent(), "{:?}", before.accounting);
+    assert_eq!(before.final_position, dec!(5));
+    let on = at(1003);
+    assert_eq!(on.accounting.refused_executions, vec![1]);
+    assert!(!on.accounting.is_consistent());
+    assert_eq!(on.final_position, dec!(0));
+}
+
+#[test]
+fn a_fill_at_a_fee_of_another_asset_is_refused_and_changes_nothing() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let mut a = accountant_for(&spec);
+    let before = a.snapshot().unwrap();
+    let mut fill = posted(1, Action::Buy, dec!(60000), dec!(5), dec!(1));
+    for asset in [
+        FeeAsset::Quote,
+        FeeAsset::Base,
+        FeeAsset::Other("BNB".to_string()),
+    ] {
+        fill.fee_asset = asset;
+        assert!(a.post_fill(&fill).is_err());
+        assert_eq!(a.snapshot().unwrap(), before);
+    }
+    // A zero fee has no asset to get wrong.
+    fill.fee = dec!(0);
+    fill.fee_asset = FeeAsset::Quote;
+    a.post_fill(&fill).unwrap();
+    assert_eq!(a.snapshot().unwrap().position, dec!(5));
+}
+
+#[test]
+fn a_spot_accountant_refuses_a_settlement_fee_and_is_not_a_derivative() {
+    let mut ledger = Ledger::new(LedgerConfig::default());
+    for asset in ["BTC", "USDT"] {
+        ledger
+            .register_asset(Asset::new(asset).unwrap(), 8)
+            .unwrap();
+    }
+    let id = InstrumentId::new("BTC-USDT").unwrap();
+    ledger
+        .register_instrument(
+            margin_rs::SpotInstrument::new(
+                id.clone(),
+                Asset::new("BTC").unwrap(),
+                Asset::new("USDT").unwrap(),
+                8,
+                8,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut spot = MarginLedgerAccountant::new(ledger, id).unwrap();
+    assert!(!spot.requires_instrument());
+    assert!(spot.unrealized_at(dec!(100)).is_none());
+    let fill = posted(1, Action::Buy, dec!(100), dec!(1), dec!(1));
+    assert!(spot.post_fill(&fill).is_err());
+    assert_eq!(spot.snapshot().unwrap(), AccountingSnapshot::default());
+}
+
+/// A run with no with_instrument, or a later change, for the refused setups.
+fn engine_without_instrument(config: BacktestConfig) -> BacktestEngine<Scripted, VecDataSource> {
+    BacktestEngine::new(
+        config,
+        Scripted(vec![buy_at(dec!(60000), dec!(5))], 0),
+        VecDataSource::new(vec![
+            tick(1000, dec!(50000), dec!(70000)),
+            tick(1001, dec!(59999), dec!(60000)),
+        ]),
+    )
+}
+
+fn assert_refused(result: &BacktestResult, reason: &str) {
+    let refused = result.accounting.setup_refused.as_deref().unwrap();
+    assert!(refused.contains(reason), "{refused}");
+    assert!(!result.accounting.is_consistent());
+    assert_eq!(result.num_ticks, 0);
+    assert_eq!(result.num_trades, 0);
+    assert_eq!(result.total_pnl, dec!(0));
+}
+
+fn with_instrument_error(
+    spec: &InstrumentSpec,
+    config: BacktestConfig,
+    accountant: impl FillAccountant
+    + Send
+    + Sync
+    + std::panic::UnwindSafe
+    + std::panic::RefUnwindSafe
+    + 'static,
+) -> String {
+    match engine_without_instrument(config).with_instrument(spec.clone(), accountant) {
+        Ok(_) => panic!("accepted"),
+        Err(MMError::InvalidConfiguration(message)) => message,
+        Err(other) => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn with_instrument_refuses_what_it_cannot_book() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let good = config(&spec, dec!(0));
+
+    // Fee currency, lot and tick.
+    let quote_fee = BacktestConfig {
+        fee_currency: FeeCurrency::Quote,
+        ..good.clone()
+    };
+    let e = with_instrument_error(&spec, quote_fee, accountant_for(&spec));
+    assert!(e.contains("Settlement"), "{e}");
+    let lot = BacktestConfig {
+        lot_size: dec!(2),
+        ..good.clone()
+    };
+    let e = with_instrument_error(&spec, lot, accountant_for(&spec));
+    assert!(e.contains("lot"), "{e}");
+    let tick_size = BacktestConfig {
+        tick_size: dec!(2),
+        ..good.clone()
+    };
+    let e = with_instrument_error(&spec, tick_size, accountant_for(&spec));
+    assert!(e.contains("tick"), "{e}");
+    // A fee scale above the settlement asset's 8.
+    let fine = BacktestConfig {
+        fee_currency: FeeCurrency::Settlement { scale: 9 },
+        ..good.clone()
+    };
+    let e = with_instrument_error(&spec, fine, accountant_for(&spec));
+    assert!(e.contains("fee scale"), "{e}");
+
+    // Spot and options are not derivatives of this run.
+    let option = deribit::btc_option(
+        SpecId::new("BTC-27NOV26-100000-C").unwrap(),
+        EXPIRY_MS,
+        dec!(100000),
+        OptionStyle::Call,
+    )
+    .unwrap();
+    let e = with_instrument_error(&option, config(&spec, dec!(0)), accountant_for(&spec));
+    assert!(e.contains("not a future or a perpetual"), "{e}");
+}
+
+#[test]
+fn the_accountant_must_book_the_same_terms_not_only_the_same_id() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let good = config(&spec, dec!(0));
+    // The same id with another contract size, another expiry, or a perpetual.
+    for other in [
+        linear("FUT", dec!(0.1), Some(EXPIRY_MS)),
+        linear("FUT", dec!(0.01), Some(EXPIRY_MS + 1)),
+        linear("FUT", dec!(0.01), None),
+    ] {
+        let e = with_instrument_error(&spec, good.clone(), accountant_for(&other));
+        assert!(e.contains("the terms differ"), "{e}");
+    }
+    // Another instrument.
+    let e = with_instrument_error(
+        &spec,
+        good.clone(),
+        accountant_for(&linear("OTHER", dec!(0.01), Some(EXPIRY_MS))),
+    );
+    assert!(e.contains("the terms differ"), "{e}");
+}
+
+/// A custom accountant, with what it declares chosen by the test.
+#[derive(Debug, Default)]
+struct Custom {
+    snapshot: AccountingSnapshot,
+    opts_in: bool,
+    valuation: Option<Result<Decimal, MMError>>,
+}
+
+impl FillAccountant for Custom {
+    fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
+        self.snapshot.position += fill.signed_quantity()?;
+        self.snapshot.fills_posted += 1;
+        Ok(())
+    }
+
+    fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn reset(&mut self) {
+        self.snapshot = AccountingSnapshot::default();
+    }
+
+    fn unrealized_at(&self, _mark: Decimal) -> Option<MMResult<Decimal>> {
+        self.valuation.clone()
+    }
+
+    fn check_instrument(&self, spec: &InstrumentSpec, _fee_scale: u32) -> MMResult<()> {
+        if self.opts_in {
+            Ok(())
+        } else {
+            Err(MMError::InvalidConfiguration(format!(
+                "cannot book {}",
+                spec.id().as_str()
+            )))
+        }
+    }
+}
+
+/// A custom accountant that keeps every default.
+#[derive(Debug, Default)]
+struct Plain(AccountingSnapshot);
+
+impl FillAccountant for Plain {
+    fn post_fill(&mut self, _fill: &AccountingFill) -> MMResult<()> {
+        Ok(())
+    }
+
+    fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+        Ok(self.0.clone())
+    }
+
+    fn reset(&mut self) {}
+}
+
+#[test]
+fn a_custom_accountant_must_opt_in() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let e = with_instrument_error(&spec, config(&spec, dec!(0)), Plain::default());
+    assert!(e.contains("cannot book instrument FUT"), "{e}");
+}
+
+#[test]
+fn an_accountant_that_cannot_value_never_gets_position_times_mark() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    // Opted in, but with no valuation, or one that fails from the start.
+    for valuation in [
+        None,
+        Some(Err(MMError::NumericalError("no mark".to_string()))),
+    ] {
+        let accountant = Custom {
+            opts_in: true,
+            valuation,
+            ..Custom::default()
+        };
+        let mut engine = engine_without_instrument(config(&spec, dec!(0)))
+            .with_instrument(spec.clone(), accountant)
+            .unwrap();
+        let result = engine.run();
+        assert_eq!(result.total_pnl, dec!(0));
+        // Every mark is counted, without an invented execution id per tick.
+        assert!(result.accounting.valuation_failures >= 2);
+        assert!(result.accounting.snapshot_failures.is_empty());
+        assert!(result.accounting.refused_executions.is_empty());
+        assert!(!result.accounting.is_consistent());
+        // A fault stops new orders, as any other does.
+        assert_eq!(result.num_trades, 0);
+        assert!(engine.fault_count() >= 2);
+    }
+}
+
+/// Values at 7 for the first marks, then fails.
+#[derive(Debug, Default)]
+struct FailsLater {
+    marks: std::sync::atomic::AtomicU64,
+    good_marks: u64,
+}
+
+impl FillAccountant for FailsLater {
+    fn post_fill(&mut self, _fill: &AccountingFill) -> MMResult<()> {
+        Ok(())
+    }
+
+    fn snapshot(&self) -> MMResult<AccountingSnapshot> {
+        Ok(AccountingSnapshot {
+            position: dec!(5),
+            ..AccountingSnapshot::default()
+        })
+    }
+
+    fn reset(&mut self) {}
+
+    fn unrealized_at(&self, _mark: Decimal) -> Option<MMResult<Decimal>> {
+        let mark = self.marks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(if mark < self.good_marks {
+            Ok(dec!(7))
+        } else {
+            Err(MMError::NumericalError("no mark".to_string()))
+        })
+    }
+
+    fn check_instrument(&self, _spec: &InstrumentSpec, _fee_scale: u32) -> MMResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_valuation_that_fails_keeps_the_previous_numbers_and_says_so() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let accountant = FailsLater {
+        good_marks: 2,
+        ..FailsLater::default()
+    };
+    let mut engine = engine_without_instrument(config(&spec, dec!(0)))
+        .with_instrument(spec.clone(), accountant)
+        .unwrap();
+    let result = engine.run();
+    // The last good value, not 5 x the mark of the failed ones. The second tick
+    // marks twice: after its fill and at its end.
+    assert_eq!(result.total_pnl, dec!(7));
+    assert_eq!(result.accounting.valuation_failures, 2);
+    assert!(!result.accounting.is_consistent());
+}
+
+#[test]
+fn a_valuation_uses_what_the_accountant_says() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let accountant = Custom {
+        opts_in: true,
+        valuation: Some(Ok(dec!(7))),
+        ..Custom::default()
+    };
+    let mut engine = engine_without_instrument(config(&spec, dec!(0)))
+        .with_instrument(spec.clone(), accountant)
+        .unwrap();
+    let result = engine.run();
+    assert!(result.accounting.is_consistent(), "{:?}", result.accounting);
+    assert_eq!(result.total_pnl, dec!(7));
+}
+
+#[test]
+fn a_later_builder_call_gets_the_run_refused_before_anything_happens() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let built = || {
+        engine_without_instrument(config(&spec, dec!(0)))
+            .with_instrument(spec.clone(), accountant_for(&spec))
+            .unwrap()
+    };
+
+    let mut policy = built().with_pretrade_policy(LimitsPolicy::new(
+        RiskLimits::new(dec!(100), Decimal::MAX, dec!(0)).unwrap(),
+    ));
+    assert_refused(&policy.run(), "pretrade policy");
+
+    let other = accountant_for(&linear("FUT", dec!(0.1), Some(EXPIRY_MS)));
+    let mut replaced = built().with_accountant(other);
+    assert_refused(&replaced.run(), "the terms differ");
+
+    let mut plain = built().with_accountant(Plain::default());
+    assert_refused(&plain.run(), "cannot book");
+    assert!(plain.fault_count() > 0);
+}
+
+#[test]
+fn settlement_fees_and_derivative_accountants_need_the_contract() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    // A settlement fee, on the built in bookkeeping.
+    let mut built_in = engine_without_instrument(config(&spec, dec!(0.001)));
+    assert_refused(&built_in.run(), "use with_instrument");
+
+    // A derivative accountant, with a fee currency that would be wrong for it.
+    let quote = BacktestConfig {
+        fee_currency: FeeCurrency::Quote,
+        ..config(&spec, dec!(0.001))
+    };
+    let mut accountant_only =
+        engine_without_instrument(quote).with_accountant(accountant_for(&spec));
+    assert_refused(&accountant_only.run(), "use with_instrument");
+
+    assert!(matches!(
+        FeeCurrency::Settlement { scale: 8 }.charge(dec!(1), dec!(1), dec!(0.1)),
+        Err(MMError::InvalidConfiguration(_))
+    ));
+}
+
+/// An exact fraction, every operation checked.
+#[derive(Debug, Clone, Copy)]
+struct Q(i128, i128);
+
+fn gcd(a: i128, b: i128) -> i128 {
+    if b == 0 { a.abs() } else { gcd(b, a % b) }
+}
+
+impl Q {
+    fn new(n: i128, d: i128) -> Self {
+        let g = gcd(n, d).max(1) * d.signum();
+        Self(n / g, d / g)
+    }
+
+    fn dec(value: Decimal) -> Self {
+        Self::new(value.mantissa(), 10_i128.pow(value.scale()))
+    }
+
+    fn ratio(num: Decimal, den: Decimal) -> Self {
+        let (n, d) = (Self::dec(num), Self::dec(den));
+        Self::new(n.0.checked_mul(d.1).unwrap(), n.1.checked_mul(d.0).unwrap())
+    }
+
+    fn add(self, o: Self) -> Self {
+        let n = self.0.checked_mul(o.1).unwrap() + o.0.checked_mul(self.1).unwrap();
+        Self::new(n, self.1.checked_mul(o.1).unwrap())
+    }
+
+    fn neg(self) -> Self {
+        Self(-self.0, self.1)
+    }
+}
+
+impl PartialEq for Q {
+    fn eq(&self, o: &Self) -> bool {
+        self.0 == o.0 && self.1 == o.1
+    }
+}
+
+fn rest(fill: &ExecutionCashflow) -> Q {
+    let residual = fill.derivative.as_ref().unwrap().residual.as_ref().unwrap();
+    Q::ratio(residual.numerator, residual.denominator)
+}
+
+#[test]
+fn the_shared_pnl_fixtures_agree_through_the_ledger_and_the_whole_engine() {
+    let cases: Vec<Case> = fixtures::cases()
+        .unwrap()
+        .into_iter()
+        .filter(|case| matches!(case.operation, Operation::RealizedPnl { .. }))
+        .collect();
+    assert_eq!(cases.len(), 5, "a new PnL fixture must be run here");
+    let (mut linear_cases, mut inverse_cases) = (0, 0);
+    for case in &cases {
+        let Operation::RealizedPnl {
+            side,
+            contracts,
+            entry,
+            exit,
+        } = case.operation
+        else {
+            unreachable!();
+        };
+        let Expected::Amount { exact, .. } = &case.expected else {
+            panic!("{}: expected an amount", case.name);
+        };
+        let exact = Q::ratio(exact.ratio.num(), exact.ratio.den());
+        let (open, close) = match side {
+            Side::Long => (Action::Buy, Action::Sell),
+            Side::Short => (Action::Sell, Action::Buy),
+        };
+        // Through the accountant, whose ledger keeps what each leg rounded.
+        let mut ledger = ledger_for(&case.spec);
+        let id = InstrumentId::new(case.spec.id().as_str()).unwrap();
+        let mut accountant = MarginLedgerAccountant::new(ledger.clone(), id.clone()).unwrap();
+        accountant
+            .post_fill(&posted(1, open, entry, contracts, dec!(0)))
+            .unwrap();
+        accountant
+            .post_fill(&posted(2, close, exit, contracts, dec!(0)))
+            .unwrap();
+        let realized = accountant.snapshot().unwrap().cash_flow;
+        ledger = accountant.ledger().clone();
+        let journal = ledger.journal();
+        match case.spec.margining() {
+            Margining::Linear => {
+                assert_eq!(Q::dec(realized), exact, "{}", case.name);
+                linear_cases += 1;
+            }
+            _ => {
+                // realized + s·(r_open - r_close) = exact: no tolerance.
+                let rests = rest(&journal[0]).add(rest(&journal[1]).neg());
+                let rests = match side {
+                    Side::Long => rests,
+                    Side::Short => rests.neg(),
+                };
+                assert_eq!(Q::dec(realized).add(rests), exact, "{}", case.name);
+                inverse_cases += 1;
+            }
+        }
+
+        // Through the whole engine, the same realized PnL.
+        let result = run(
+            &case.spec,
+            dec!(0),
+            side,
+            contracts,
+            entry,
+            true,
+            exit,
+            exit,
+        );
+        assert!(
+            result.accounting.is_consistent(),
+            "{}: {:?}",
+            case.name,
+            result.accounting
+        );
+        assert_eq!(result.num_trades, 2, "{}", case.name);
+        assert_eq!(result.final_position, dec!(0), "{}", case.name);
+        assert_eq!(result.total_pnl, realized, "{}", case.name);
+    }
+    assert_eq!((linear_cases, inverse_cases), (2, 3));
+}

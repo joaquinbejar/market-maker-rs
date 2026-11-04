@@ -9,7 +9,10 @@
 //! accountant is ever active, so the engine never books a fill twice.
 //!
 //! With the `margin` feature, `MarginLedgerAccountant` posts fills to the
-//! exact ledger of the `margin-rs` crate.
+//! exact ledger of the `margin-rs` crate, on a spot instrument, or on a future
+//! or a perpetual through
+//! `BacktestEngine::with_instrument`
+//! with the `instruments` feature as well.
 //!
 //! # Example
 //!
@@ -175,6 +178,40 @@ pub trait FillAccountant: fmt::Debug {
     fn description(&self) -> String {
         "custom accountant".to_string()
     }
+
+    /// The unrealized PnL of the open position at `mark`, for an accountant
+    /// whose position is not worth `position * mark`, such as one of a derivative
+    /// contract. `None` keeps that formula, which a derivative run refuses to
+    /// fall back to.
+    fn unrealized_at(&self, _mark: Decimal) -> Option<MMResult<Decimal>> {
+        None
+    }
+
+    /// Whether this accountant can only run with
+    /// `BacktestEngine::with_instrument`.
+    fn requires_instrument(&self) -> bool {
+        false
+    }
+
+    /// Checks that this accountant books `spec`, with the same economic terms and
+    /// not only the same identifier, and fees at `fee_scale`.
+    ///
+    /// # Errors
+    ///
+    /// By default [`MMError::InvalidConfiguration`]: an accountant must declare
+    /// that it can book a contract, or the terms could differ silently.
+    #[cfg(feature = "instruments")]
+    fn check_instrument(
+        &self,
+        spec: &financial_types::instrument::InstrumentSpec,
+        _fee_scale: u32,
+    ) -> MMResult<()> {
+        Err(MMError::InvalidConfiguration(format!(
+            "accountant {} cannot book instrument {}",
+            self.description(),
+            spec.id().as_str()
+        )))
+    }
 }
 
 #[cfg(feature = "margin")]
@@ -202,6 +239,11 @@ mod margin_ledger {
     ///   balance goes negative (for example selling base the account never
     ///   held); the resulting shortfalls are kept in
     ///   [`MarginLedgerAccountant::overdrafts`] instead of refusing the fill.
+    /// - On a future or a perpetual, the position is in contracts, the cash flow
+    ///   is the ledger's realized PnL, and a non zero fee must be in the settlement
+    ///   asset ([`FeeAsset::Settlement`]); the engine needs
+    ///   `BacktestEngine::with_instrument`
+    ///   for it. Below, on a spot instrument:
     /// - Fees may be negative (rebates). Quote fees are debited from the
     ///   quote balance and base fees from the base balance; the snapshot
     ///   position is the net base held (traded quantity minus base fees)
@@ -221,6 +263,8 @@ mod margin_ledger {
         instrument: InstrumentId,
         base: Asset,
         quote: Asset,
+        /// A future or a perpetual: `quote` is its settlement asset.
+        derivative: bool,
         overdrafts: BTreeMap<Asset, Decimal>,
         /// Base fees booked on this instrument, kept incrementally so a
         /// snapshot never rescans the journal for them.
@@ -229,23 +273,19 @@ mod margin_ledger {
     }
 
     impl MarginLedgerAccountant {
-        /// Wraps a ledger in which `instrument` is a registered spot
-        /// instrument; its current state is what reset restores.
+        /// Wraps a ledger in which `instrument` is a registered instrument; its
+        /// current state is what reset restores.
         ///
         /// # Errors
         ///
         /// Returns [`MMError::InvalidConfiguration`] if the instrument is not
-        /// a registered spot instrument, or [`MMError::NumericalError`] if
-        /// the base fees already in the ledger overflow.
+        /// registered, or [`MMError::NumericalError`] if the base fees already in
+        /// the ledger overflow.
         pub fn new(ledger: Ledger, instrument: InstrumentId) -> MMResult<Self> {
-            let (base, quote) = match ledger.instrument(&instrument) {
-                Some(Instrument::Spot(spot)) => (spot.base().clone(), spot.quote().clone()),
-                Some(_) => {
-                    return Err(MMError::InvalidConfiguration(format!(
-                        "instrument {} is not a spot instrument",
-                        instrument.as_str()
-                    )));
-                }
+            let (base, quote, derivative) = match ledger.instrument(&instrument) {
+                Some(Instrument::Spot(spot)) => (spot.base().clone(), spot.quote().clone(), false),
+                // A derivative exchanges no base: only its settlement asset moves.
+                Some(other) => (other.quote().clone(), other.quote().clone(), true),
                 None => {
                     return Err(MMError::InvalidConfiguration(format!(
                         "instrument {} is not registered in the ledger",
@@ -266,6 +306,7 @@ mod margin_ledger {
                 instrument,
                 base,
                 quote,
+                derivative,
                 overdrafts: BTreeMap::new(),
                 base_fees,
                 initial_base_fees: base_fees,
@@ -286,14 +327,75 @@ mod margin_ledger {
         }
     }
 
+    /// The scales of a registered derivative.
+    #[cfg(feature = "instruments")]
+    fn registered_scales(
+        instrument: &Instrument,
+    ) -> Option<margin_rs::instrument::InstrumentScales> {
+        let (price_scale, contract_scale) = match instrument.linear_terms() {
+            Some(terms) => (terms.price_scale(), terms.contract_scale()),
+            None => {
+                let terms = instrument.inverse_terms()?;
+                (terms.price_scale(), terms.contract_scale())
+            }
+        };
+        Some(margin_rs::instrument::InstrumentScales {
+            price_scale,
+            contract_scale,
+        })
+    }
+
     fn margin_error(context: &str, error: margin_rs::MarginError) -> MMError {
         MMError::InvalidPositionUpdate(format!("margin ledger {context}: {error}"))
     }
 
+    impl MarginLedgerAccountant {
+        /// The snapshot of a derivative: contracts, the ledger's realized PnL and
+        /// the fees of this instrument, with no notional in it.
+        fn derivative_snapshot(
+            &self,
+            position: Option<&margin_rs::ledger::PositionSnapshot>,
+        ) -> MMResult<AccountingSnapshot> {
+            let mut snapshot = AccountingSnapshot {
+                position: position.map_or(Decimal::ZERO, |p| p.quantity),
+                average_entry_price: position
+                    .and_then(margin_rs::ledger::PositionSnapshot::average_price),
+                cash_flow: position.map_or(Decimal::ZERO, |p| p.realized_pnl),
+                ..AccountingSnapshot::default()
+            };
+            for entry in self
+                .ledger
+                .journal()
+                .iter()
+                .filter(|e| e.instrument == self.instrument)
+            {
+                if let Some(fee) = entry.fee.as_ref().filter(|f| f.asset == self.quote) {
+                    snapshot.fees = snapshot
+                        .fees
+                        .checked_add(fee.amount)
+                        .or_overflow("ledger fees")?;
+                }
+                snapshot.fills_posted = snapshot.fills_posted.saturating_add(1);
+            }
+            Ok(snapshot)
+        }
+    }
+
     impl FillAccountant for MarginLedgerAccountant {
         fn post_fill(&mut self, fill: &AccountingFill) -> MMResult<()> {
+            if self.derivative && !fill.fee.is_zero() && fill.fee_asset != FeeAsset::Settlement {
+                return Err(MMError::InvalidPositionUpdate(format!(
+                    "a derivative fee must be in the settlement asset, got {:?}",
+                    fill.fee_asset
+                )));
+            }
             let fee_asset = match &fill.fee_asset {
-                FeeAsset::Quote => self.quote.clone(),
+                FeeAsset::Settlement if !self.derivative && !fill.fee.is_zero() => {
+                    return Err(MMError::InvalidPositionUpdate(
+                        "a spot instrument has no settlement asset fee".to_string(),
+                    ));
+                }
+                FeeAsset::Quote | FeeAsset::Settlement => self.quote.clone(),
                 FeeAsset::Base => self.base.clone(),
                 FeeAsset::Other(code) => {
                     if fill.fee.is_zero() {
@@ -314,10 +416,13 @@ mod margin_ledger {
                     .base_fees
                     .checked_add(fill.fee)
                     .or_overflow("ledger base fees")?,
-                FeeAsset::Quote | FeeAsset::Other(_) => self.base_fees,
+                FeeAsset::Quote | FeeAsset::Other(_) | FeeAsset::Settlement => self.base_fees,
             };
             let mut execution =
                 Execution::new(id, self.instrument.clone(), side, fill.price, fill.quantity);
+            if self.derivative {
+                execution = execution.with_executed_at(fill.timestamp);
+            }
             // Negative fees are rebates and are booked as such.
             if !fill.fee.is_zero() {
                 execution = execution.with_fee(fee_asset, fill.fee);
@@ -336,6 +441,9 @@ mod margin_ledger {
 
         fn snapshot(&self) -> MMResult<AccountingSnapshot> {
             let position = self.ledger.position(&self.instrument);
+            if self.derivative {
+                return self.derivative_snapshot(position.as_ref());
+            }
             let mut snapshot = AccountingSnapshot {
                 // The account holds the traded quantity minus the base it
                 // paid as fees.
@@ -383,6 +491,62 @@ mod margin_ledger {
 
         fn description(&self) -> String {
             format!("margin-rs ledger for {}", self.instrument.as_str())
+        }
+
+        fn unrealized_at(&self, mark: Decimal) -> Option<MMResult<Decimal>> {
+            if !self.derivative {
+                return None;
+            }
+            let marks = BTreeMap::from([(self.instrument.clone(), mark)]);
+            Some(
+                self.ledger
+                    .valuation(&marks)
+                    .map_err(|e| margin_error("valuation", e))
+                    .map(|valuation| {
+                        valuation
+                            .positions
+                            .get(&self.instrument)
+                            .map_or(Decimal::ZERO, |position| position.unrealized_pnl)
+                    }),
+            )
+        }
+
+        fn requires_instrument(&self) -> bool {
+            self.derivative
+        }
+
+        #[cfg(feature = "instruments")]
+        fn check_instrument(
+            &self,
+            spec: &financial_types::instrument::InstrumentSpec,
+            fee_scale: u32,
+        ) -> MMResult<()> {
+            let refuse = |reason: String| {
+                Err(MMError::InvalidConfiguration(format!(
+                    "ledger instrument {} and specification {}: {reason}",
+                    self.instrument.as_str(),
+                    spec.id().as_str()
+                )))
+            };
+            let Some(registered) = self.ledger.instrument(&self.instrument) else {
+                return refuse("not registered".to_string());
+            };
+            let Some(scales) = registered_scales(registered) else {
+                return refuse("not a derivative".to_string());
+            };
+            // The same scales, so any difference is in the terms.
+            let expected = Instrument::from_spec(spec, scales)
+                .map_err(|e| margin_error("specification", e))?;
+            if expected != *registered {
+                return refuse(format!("the terms differ: {registered:?} and {expected:?}"));
+            }
+            let settlement = self.ledger.snapshot().assets.get(&self.quote).copied();
+            if settlement.is_none_or(|scale| fee_scale > scale) {
+                return refuse(format!(
+                    "fee scale {fee_scale} above the settlement asset's {settlement:?}"
+                ));
+            }
+            Ok(())
         }
     }
 }

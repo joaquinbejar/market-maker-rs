@@ -12,4 +12,6 @@ pub enum FeeAsset {
     Base,
     /// A third asset, named by its code (for example a venue token).
     Other(String),
+    /// The settlement asset of a derivative contract.
+    Settlement,
 }
