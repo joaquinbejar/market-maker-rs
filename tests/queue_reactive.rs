@@ -447,6 +447,9 @@ fn test_reached_size_without_departures_is_refused() {
     assert!(build(vec![(1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 0.0, 0.0)]).is_err());
     let p = build(vec![(1.0, 0.0, 0.0), (0.0, 0.0, 1.0)]).unwrap();
     assert_eq!(p.invariant(0).unwrap(), [0.5, 0.5]);
+    // Size 2 has no departures, but size 1 is never reached, so neither is it.
+    let p = build(vec![(0.0, 0.0, 0.0), (1.0, 0.5, 0.5), (0.0, 0.0, 0.0)]).unwrap();
+    assert_eq!(p.invariant(0).unwrap(), [1.0, 0.0, 0.0]);
     // No arrival at all: the law sits at empty, and that is stationary.
     let p = build(vec![(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]).unwrap();
     assert_eq!(p.invariant(0).unwrap(), [1.0, 0.0]);

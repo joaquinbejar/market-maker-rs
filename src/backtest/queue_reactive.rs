@@ -235,7 +235,8 @@ impl QrParameters {
     /// out of `[0, 1]`; tables of different shapes or above [`MAX_QUEUE_BOUND`]; a
     /// rate that is negative, not finite or above [`MAX_RATE`]; a departure from an empty queue; an
     /// arrival at the cap; a limit with no supported size; or a size that is reached
-    /// and has no departures, which leaves no invariant law.
+    /// and has no departures, which is absorbing and has no law in the supported
+    /// product form.
     pub fn new(
         tick_size: Decimal,
         theta: f64,
@@ -471,7 +472,8 @@ fn resolve(
 }
 
 /// `π(n) ∝ Π ρ(j - 1)`, with `ρ(n) = λL(n) / (λC(n + 1) + λM(n + 1))`, cut where
-/// the chain cannot arrive. A chain that arrives and cannot leave has no such law.
+/// the chain cannot arrive. A chain that arrives and cannot leave is absorbing, and
+/// is refused as outside this product form.
 fn invariant_law(
     table: &[(f64, f64, f64)],
     flags: &[bool],
@@ -488,9 +490,9 @@ fn invariant_law(
                 let departures = cancel + market;
                 if departures > 0.0 {
                     limit / departures
-                } else if limit > 0.0 {
+                } else if limit > 0.0 && weight > 0.0 {
                     return Err(MMError::InvalidConfiguration(format!(
-                        "queue size {n} is reached but has no departures, so no invariant law"
+                        "queue size {n} is reached but has no departures: absorbing, with no law in the supported product form"
                     )));
                 } else {
                     0.0
