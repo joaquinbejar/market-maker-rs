@@ -95,8 +95,8 @@ const FIT_TOLERANCE: f64 = 1e-12;
 /// Fills per second assumed where the predicted rate is lower, so that a fill
 /// the model calls impossible costs a large but finite score.
 const SCORE_RATE_FLOOR: f64 = 1e-12;
-/// Smallest `exp` result kept; below it the rate is under `Decimal` resolution.
-const EXP_ZERO_BELOW: f64 = 1e-28;
+/// Smallest rate kept; below it the rate is under `Decimal` resolution.
+const RATE_ZERO_BELOW: f64 = 1e-28;
 /// Upper bound of the `k` bracket, in 1 / price units.
 const K_BRACKET_LIMIT: f64 = 1e15;
 
@@ -466,13 +466,13 @@ pub struct CalibratedParameters {
 
 impl CalibratedParameters {
     /// Returns `λ(δ) = A · exp(-k · δ) · s(t)` in fills per second. A rate
-    /// below the resolution of `Decimal` reads as zero.
+    /// below 1e-28, the resolution of `Decimal`, reads as zero.
     ///
     /// # Errors
     ///
     /// Returns [`MMError::NumericalError`] when the rate is not representable.
     pub fn rate_per_second(&self, distance: Decimal, timestamp_ms: u64) -> MMResult<Decimal> {
-        let base = intensity(self.intensity_scale_a, self.order_intensity_k, distance)?;
+        let base = intensity_f64(self.intensity_scale_a, self.order_intensity_k, distance)?;
         let buckets = u32::try_from(self.seasonality.len())
             .ok()
             .filter(|b| *b > 0)
@@ -482,8 +482,7 @@ impl CalibratedParameters {
             .get(bucket_of(timestamp_ms, buckets)?)
             .copied()
             .or_overflow("seasonality bucket")?;
-        base.checked_mul(multiplier)
-            .or_overflow("seasonal fill rate")
+        rate_decimal(base * to_f64(multiplier)?)
     }
 }
 
@@ -1176,14 +1175,15 @@ fn score(
     })
 }
 
-/// `A · exp(-k · δ)`.
+/// `A · exp(-k · δ)` as a `Decimal`.
 fn intensity(a: Decimal, k: Decimal, distance: Decimal) -> MMResult<Decimal> {
-    let exponent = k
-        .checked_mul(distance)
-        .and_then(|v| Decimal::ZERO.checked_sub(v))
-        .or_overflow("intensity exponent")?;
-    a.checked_mul(decimal_exp(exponent)?)
-        .or_overflow("fill intensity")
+    rate_decimal(intensity_f64(a, k, distance)?)
+}
+
+/// `A · exp(-k · δ)` in `f64`. A huge `A` and a tiny `exp` must meet before
+/// any rounding to `Decimal`, whose resolution would lose the `exp`.
+fn intensity_f64(a: Decimal, k: Decimal, distance: Decimal) -> MMResult<f64> {
+    Ok(to_f64(a)? * (-to_f64(k)? * to_f64(distance)?).exp())
 }
 
 fn to_f64(value: Decimal) -> MMResult<f64> {
@@ -1200,14 +1200,12 @@ fn from_f64(value: f64) -> MMResult<Decimal> {
         .ok_or_else(|| MMError::NumericalError(format!("{value} is not a decimal")))
 }
 
-/// `exp(value)` through `f64`, as the other statistical estimators do. A
-/// result below the resolution of `Decimal` is zero.
-fn decimal_exp(value: Decimal) -> MMResult<Decimal> {
-    let result = to_f64(value)?.exp();
-    if result < EXP_ZERO_BELOW {
+/// A rate as a `Decimal`. A result below the resolution of `Decimal` is zero.
+fn rate_decimal(rate: f64) -> MMResult<Decimal> {
+    if rate < RATE_ZERO_BELOW {
         return Ok(Decimal::ZERO);
     }
-    from_f64(result)
+    from_f64(rate)
 }
 
 /// A finite, strictly positive `f64` as a `Decimal`, if it stays positive.

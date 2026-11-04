@@ -1086,6 +1086,187 @@ fn test_chronological_splits_too_many_are_refused() {
     );
 }
 
+#[test]
+fn test_rate_per_second_huge_a_and_tiny_exp_keeps_the_rate() {
+    // A about 5e27 and k about 2: exp(-k · 33) alone rounds away in a Decimal.
+    let at = |t: u64, distance, fills| QuoteExposure {
+        timestamp_ms: t,
+        distance,
+        exposure_ms: 6_000_000,
+        fills,
+    };
+    let e = vec![
+        at(40_000_000, dec!(33), 600),
+        at(40_000_000, dec!(34), 81),
+        at(DAY_MS + 40_000_000, dec!(33), 600),
+        at(DAY_MS + 40_000_000, dec!(34), 81),
+    ];
+    let p = prices(7, 0, 2 * DAY_MS, 60_000, 0.5);
+    let split = ChronologicalSplit {
+        train: TimeWindow {
+            start_ms: 0,
+            end_ms: DAY_MS,
+        },
+        test: TimeWindow {
+            start_ms: DAY_MS,
+            end_ms: 2 * DAY_MS,
+        },
+    };
+    let worse = ConstantParameters {
+        volatility: dec!(1),
+        intensity_scale_a: dec!(1),
+        order_intensity_k: dec!(0.1),
+    };
+    let report = walk_forward(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &[split],
+        &config(),
+        "d",
+        &worse,
+    )
+    .unwrap();
+    let fold = &report.folds[0];
+    let rate = fold
+        .record
+        .parameters()
+        .unwrap()
+        .rate_per_second(dec!(33), 40_000_000)
+        .unwrap();
+    assert!((rate.to_f64().unwrap() - 0.1).abs() < 1e-6, "rate {rate}");
+    assert!(fold.calibrated.unwrap().intensity < fold.constant.intensity);
+}
+
+#[test]
+fn test_walk_forward_realized_volatility_needs_samples_and_no_gap() {
+    let train = prices(7, 0, DAY_MS, 60_000, 0.5);
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let split = ChronologicalSplit {
+        train: TimeWindow {
+            start_ms: 0,
+            end_ms: DAY_MS,
+        },
+        test: TimeWindow {
+            start_ms: DAY_MS,
+            end_ms: 2 * DAY_MS,
+        },
+    };
+    let run = |test: Vec<PriceSample>| {
+        let mut p = train.clone();
+        p.extend(test);
+        let report = walk_forward(
+            &CalibrationData::new(&p, &e).unwrap(),
+            &[split],
+            &config(),
+            "d",
+            &constant(),
+        )
+        .unwrap();
+        (
+            report.folds[0].calibrated.unwrap().volatility,
+            report.folds[0].constant.volatility,
+        )
+    };
+    let full = prices(9, DAY_MS, 2 * DAY_MS, 60_000, 0.5);
+    let scored = run(full.clone());
+    assert!(scored.0.is_some() && scored.1.is_some());
+
+    let mut gap = full.clone();
+    gap.retain(|s| !(DAY_MS + 600_000..DAY_MS + 1_200_000).contains(&s.timestamp_ms));
+    assert_eq!(run(gap), (None, None));
+
+    // One sample per 5 grid buckets: within the gap limit, so only counting
+    // the buckets with a sample can refuse them.
+    let cfg_buckets = prices(9, DAY_MS, 2 * DAY_MS, 300_000, 0.5);
+    assert_eq!(cfg_buckets.len(), 288);
+    let few: Vec<_> = full.iter().take(20).copied().collect();
+    assert_eq!(run(few), (None, None));
+    let sparse = |min: usize| {
+        let cfg = config().with_minima(min, 2, 30, 60_000);
+        let mut p = train.clone();
+        p.extend(cfg_buckets.clone());
+        walk_forward(
+            &CalibrationData::new(&p, &e).unwrap(),
+            &[split],
+            &cfg,
+            "d",
+            &constant(),
+        )
+        .unwrap()
+        .folds[0]
+            .constant
+            .volatility
+    };
+    assert!(sparse(288).is_some());
+    assert!(sparse(289).is_none());
+}
+
+#[test]
+fn test_calibrate_window_late_first_sample_is_a_gap() {
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let p = prices(7, 600_000, DAY_MS, 60_000, 0.5);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let record = calibrate_window(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &window,
+        &config(),
+        "d",
+    )
+    .unwrap();
+    assert_eq!(
+        record.outcome,
+        CalibrationOutcome::Insufficient(CalibrationFailure::PriceGap {
+            gap_ms: 600_000,
+            limit_ms: 300_000
+        })
+    );
+}
+
+#[test]
+fn test_walk_forward_fill_at_rate_zero_scores_the_floor() {
+    // The afternoon has exposure and no fills in training, so its multiplier
+    // is 0, and the one test exposure there has a fill.
+    let p = prices(7, 0, DAY_MS, 60_000, 0.5);
+    let mut e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    e.iter_mut()
+        .filter(|x| x.timestamp_ms >= DAY_MS / 2)
+        .for_each(|x| x.fills = 0);
+    e.push(QuoteExposure {
+        timestamp_ms: DAY_MS + DAY_MS / 2 + 60_000,
+        distance: dec!(0.1),
+        exposure_ms: 60_000,
+        fills: 1,
+    });
+    let split = ChronologicalSplit {
+        train: TimeWindow {
+            start_ms: 0,
+            end_ms: DAY_MS,
+        },
+        test: TimeWindow {
+            start_ms: DAY_MS,
+            end_ms: 2 * DAY_MS,
+        },
+    };
+    let cfg = config().with_seasonality(2, 0);
+    let report = walk_forward(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &[split],
+        &cfg,
+        "d",
+        &constant(),
+    )
+    .unwrap();
+    let score = report.folds[0]
+        .calibrated
+        .unwrap()
+        .intensity
+        .unwrap()
+        .to_f64()
+        .unwrap();
+    let mu = 1e-12 * 60.0f64;
+    let expected = (mu - mu.ln()) / 60.0;
+    assert!((score - expected).abs() < 1e-9, "{score} {expected}");
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn test_calibration_record_serde_round_trip_is_identical() {
