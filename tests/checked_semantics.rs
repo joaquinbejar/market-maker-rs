@@ -176,3 +176,25 @@ fn test_vpin_bucket_one_sided_saturated_total_is_fully_imbalanced() {
         assert_eq!(calculator.get_vpin(), Some(Decimal::ONE), "{side:?}");
     }
 }
+
+#[test]
+fn test_market_tick_spread_bps_overflow_is_extreme_not_zero() {
+    let tick = MarketTick::new(
+        0,
+        dec!(-5),
+        dec!(1),
+        dec!(5.0000000000000000000000000002),
+        dec!(1),
+    );
+    assert!(tick.mid_price() > Decimal::ZERO);
+    assert_eq!(tick.spread_bps(), Decimal::MAX);
+    let crossed = MarketTick::new(
+        0,
+        dec!(5.0000000000000000000000000002),
+        dec!(1),
+        dec!(-5),
+        dec!(1),
+    );
+    assert!(crossed.mid_price() > Decimal::ZERO);
+    assert_eq!(crossed.spread_bps(), Decimal::MIN);
+}

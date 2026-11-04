@@ -325,8 +325,10 @@ where
 
 /// The difference `sum(a) - sum(b)` of two sides given term by term.
 ///
-/// Report only: the sides are compared before any bound is hit, so the sign
-/// is right, but the result saturates at the `Decimal` bounds.
+/// Report only: the result saturates at the `Decimal` bounds. When a side's
+/// sum is beyond them, the terms are scaled first and the result carries
+/// rounding error, so its sign is reliable only when the true difference
+/// exceeds that error.
 #[must_use]
 pub(crate) fn net_of_sides<A, B>(a: A, b: B) -> Decimal
 where

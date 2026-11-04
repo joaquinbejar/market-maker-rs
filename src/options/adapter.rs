@@ -105,19 +105,23 @@ impl OptionsAdapter {
     ///
     /// # Returns
     ///
-    /// Time to expiration in milliseconds. Returns 0 if conversion fails.
-    #[must_use]
-    pub fn time_to_terminal_ms(expiration: &ExpirationDate) -> u64 {
-        let years = match expiration.get_years() {
-            Ok(y) => y.to_dec(),
-            Err(_) => return 0,
-        };
+    /// Time to expiration in milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] if the expiration cannot be
+    /// converted to years: zero would read as already expired.
+    pub fn time_to_terminal_ms(expiration: &ExpirationDate) -> MMResult<u64> {
+        let years = expiration
+            .get_years()
+            .map_err(|e| MMError::NumericalError(format!("expiration in years: {e}")))?
+            .to_dec();
         // Years to milliseconds at 365.25 days a year; an overflow saturates,
         // like the conversion to u64.
-        match years.checked_mul(ADAPTER_MS_PER_YEAR) {
+        Ok(match years.checked_mul(ADAPTER_MS_PER_YEAR) {
             Some(ms) => crate::types::decimal::decimal_to_u64_saturating(ms),
             None => u64::MAX,
-        }
+        })
     }
 
     /// Converts milliseconds to years for use with OptionStratLib.
@@ -271,7 +275,7 @@ mod tests {
     #[test]
     fn test_time_to_terminal_ms() {
         let expiration = ExpirationDate::Days(pos_or_panic!(365.0));
-        let ms = OptionsAdapter::time_to_terminal_ms(&expiration);
+        let ms = OptionsAdapter::time_to_terminal_ms(&expiration).unwrap();
 
         // Should be approximately 1 year in milliseconds
         let expected_ms: u64 = 31_557_600_000; // 365.25 days

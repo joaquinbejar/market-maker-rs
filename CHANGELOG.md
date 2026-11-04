@@ -102,9 +102,15 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `MarketTick::spread_bps` and `MarketSnapshot::spread_bps` return the bound
+  with the spread's sign when the ratio overflows, and
+  `ManagedOrder::fill_ratio` saturates at the bound on such an overfill. Both
+  returned 0. Fill rate calibration propagates a failed logarithm instead of
+  regressing on 0.
 - `OrderFlowStats::imbalance`, `VolumeBucket` imbalances and VPIN keep their
-  proportions when a side's volume is beyond the `Decimal` bounds, and
-  `net_flow` keeps its sign. `buy_vwap` and `sell_vwap` are `None` when their
+  proportions when a side's volume is beyond the `Decimal` bounds. There,
+  `net_flow` carries rounding error, so its sign is reliable only when the
+  true net exceeds that error. `buy_vwap` and `sell_vwap` are `None` when their
   inputs overflow, and `volume_ratio` is `None` when a volume sits at the
   bound.
 - `tests/contract_fixtures.rs`: the inverse future fixture uses the Deribit
@@ -179,6 +185,8 @@ project follows [Semantic Versioning](https://semver.org/).
 These signature changes are breaking and ship in 0.7.0, not in a patch
 release.
 
+- `OptionsAdapter::time_to_terminal_ms` returns `MMResult<u64>`: a failed
+  conversion to years is an error, not 0, which reads as already expired.
 - `AccountingStatus` has a new `snapshot_failures` field (`serde(default)`):
   the execution ids after whose post the accountant's snapshot failed, so
   the engine kept stale balances. `is_consistent` is false while it is not

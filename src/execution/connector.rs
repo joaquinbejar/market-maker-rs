@@ -713,8 +713,9 @@ impl OrderBookSnapshot {
     /// Returns the imbalance ratio: (bid_depth - ask_depth) / (bid_depth + ask_depth).
     ///
     /// Scale invariant: when a side's depth is beyond the `Decimal`
-    /// bounds, both sides are summed as quantities divided by the number of
-    /// levels, which keeps the ratio. Zero when the book is empty.
+    /// bounds, both sides are summed as quantities divided by one more than
+    /// the number of levels, which keeps the ratio up to rounding. Zero when
+    /// the book is empty.
     #[must_use]
     pub fn imbalance(&self) -> Decimal {
         crate::types::decimal::imbalance_of_sides(
