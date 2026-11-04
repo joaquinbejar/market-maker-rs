@@ -177,6 +177,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `OptionsAdapter::time_to_terminal_ms` returns `MMResult<u64>`: a failed
+  conversion to years is an error, not 0, which reads as already expired.
 These signature changes are breaking and ship in 0.7.0, not in a patch
 release.
 
