@@ -17,12 +17,13 @@ use market_maker_rs::Decimal;
 use market_maker_rs::backtest::engine::FeeCurrency;
 use market_maker_rs::backtest::kernel::{
     ActionStatus, EventSink, ExecKind, FinancialKernel, GateVerdict, KernelAction, KernelConfig,
-    KernelDataset, KernelEvent, KernelLatency, KernelState, Observation, Origin, Phase,
-    QueueLengths, ReportRec, Status, TermReason,
+    KernelDataset, KernelEvent, KernelFillModel, KernelLatency, KernelState, Observation, Origin,
+    Phase, QueueLengths, ReportRec, Status, TermReason,
 };
 use market_maker_rs::backtest::{
     BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy, ExecutionKind,
-    ExecutionReport, MarketTick, SimLatencyConfig, SimulatedFill, SlippageModel, VecDataSource,
+    ExecutionReport, FillModel, MarketTick, QueuePositionFillModel, SimLatencyConfig,
+    SimulatedFill, SlippageModel, VecDataSource,
 };
 use market_maker_rs::dec;
 use market_maker_rs::execution::Action;
@@ -34,7 +35,7 @@ use market_maker_rs::strategy::quote::Quote;
 /// Capacities used by the seeded runs.
 pub const ORD: usize = 64;
 pub const MSG: usize = 128;
-pub const DLV: usize = 192;
+pub const DLV: usize = crate::HARNESS_DLV;
 pub const OBS: usize = 128;
 
 pub type Kernel<'d> = FinancialKernel<'d, ORD, MSG, DLV, OBS>;
@@ -387,9 +388,25 @@ pub fn run_engine(sc: &Scenario) -> EngineRun {
         record_equity_curve: true,
         record_trades: true,
     };
-    let engine = BacktestEngine::new(config, strategy, VecDataSource::new(sc.ticks.clone()))
-        .with_latency(sc.engine_latency())
-        .unwrap();
+    let data = VecDataSource::new(sc.ticks.clone());
+    match sc.cfg.fill_model {
+        KernelFillModel::QueuePosition { rate, min_queue_ms } => {
+            let model = QueuePositionFillModel::with_min_queue_time(rate, min_queue_ms);
+            let engine = BacktestEngine::with_fill_model(config, strategy, data, model).unwrap();
+            finish_engine(sc, engine, log)
+        }
+        _ => finish_engine(sc, BacktestEngine::new(config, strategy, data), log),
+    }
+}
+
+/// Applies the latency and the limits of `sc`, runs the engine and collects
+/// its results.
+fn finish_engine<F: FillModel>(
+    sc: &Scenario,
+    engine: BacktestEngine<Scripted, VecDataSource, F>,
+    log: Rc<RefCell<EngineLog>>,
+) -> EngineRun {
+    let engine = engine.with_latency(sc.engine_latency()).unwrap();
     let mut engine = match &sc.cfg.limits {
         Some(limits) => engine.with_pretrade_policy(LimitsPolicy::new(limits.clone())),
         None => engine,
@@ -444,6 +461,8 @@ pub fn max_lots(sc: &Scenario) -> u64 {
 pub struct Rec {
     pub events: Vec<KernelEvent>,
     pub probes: u64,
+    /// Partial fill reports allowed per open order, on top of three.
+    pub partial_reports: u64,
 }
 
 impl EventSink for Rec {
@@ -454,13 +473,20 @@ impl EventSink for Rec {
     fn queues(&mut self, q: QueueLengths) {
         assert!(q.orders + q.awaiting <= q.held, "slots {q:?}");
         assert!(q.msgs <= 2 * q.held, "messages {q:?}");
-        assert!(q.deliveries <= 3 * q.held, "deliveries {q:?}");
+        assert!(
+            q.deliveries <= (3 + self.partial_reports) * q.held,
+            "deliveries {q:?}"
+        );
         self.probes += 1;
     }
 }
 
 pub fn run_kernel(k: &Kernel<'_>, sc: &Scenario, keep_states: bool) -> KernelRun {
-    let mut rec = Rec::default();
+    let need = market_maker_rs::backtest::kernel::capacity_need(&sc.cfg, &sc.data()).unwrap();
+    let mut rec = Rec {
+        partial_reports: need.partial_reports_per_order,
+        ..Rec::default()
+    };
     let mut s = k.reset_with(sc.latency_seed, &mut rec);
     let mut run = KernelRun {
         events: Vec::new(),

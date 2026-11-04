@@ -9,6 +9,9 @@
     clippy::indexing_slicing
 )]
 
+/// Deliveries capacity of the harness kernels.
+const HARNESS_DLV: usize = 192;
+
 #[path = "support/kernel_harness.rs"]
 mod harness;
 

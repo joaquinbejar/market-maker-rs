@@ -121,6 +121,36 @@ pub enum KernelFillModel {
     /// The engine's `ImmediateFillModel`: a resting order fills completely
     /// at its limit price when the touch crosses it.
     Immediate,
+    /// The engine's [`QueuePositionFillModel`]
+    /// (`with_min_queue_time(rate, min_queue_ms)`): once the touch crosses a
+    /// resting order, volume clears at `rate` per millisecond in queue, the
+    /// touch size is ahead of an order at the touch and nothing is ahead of one
+    /// the market trades through. What clears beyond that is the order's
+    /// cumulative fill, so an order can fill over several rows
+    /// ([`super::ExecKind::PartialFill`]).
+    ///
+    /// [`QueuePositionFillModel`]: crate::backtest::QueuePositionFillModel
+    QueuePosition {
+        /// Volume cleared per millisecond in queue: positive, on the lot grid
+        /// and at its normalised scale.
+        rate: Decimal,
+        /// Milliseconds in queue before any fill.
+        min_queue_ms: u64,
+    },
+}
+
+/// The validated fill model, in lots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ValidFill {
+    /// [`KernelFillModel::Immediate`].
+    Immediate,
+    /// [`KernelFillModel::QueuePosition`].
+    QueuePosition {
+        /// Lots cleared per millisecond.
+        rate_lots: u64,
+        /// Milliseconds in queue before any fill.
+        min_queue_ms: u64,
+    },
 }
 
 /// User facing kernel configuration, in `Decimal`.
@@ -201,6 +231,13 @@ impl KernelConfig {
         self
     }
 
+    /// Sets the fill model.
+    #[must_use]
+    pub fn with_fill_model(mut self, fill_model: KernelFillModel) -> Self {
+        self.fill_model = fill_model;
+        self
+    }
+
     /// Sets the limits.
     #[must_use]
     pub fn with_limits(mut self, limits: RiskLimits) -> Self {
@@ -250,6 +287,11 @@ impl KernelConfig {
         }
         match self.fill_model {
             KernelFillModel::Immediate => w.u16(1),
+            KernelFillModel::QueuePosition { rate, min_queue_ms } => {
+                w.u16(2);
+                w.decimal(rate);
+                w.u64(min_queue_ms);
+            }
         }
         w.finish()
     }
@@ -284,6 +326,9 @@ pub(super) struct ValidatedConfig {
     pub(super) bound_b: u128,
     pub(super) latency: KernelLatency,
     pub(super) limits: Option<RiskLimits>,
+    pub(super) fill: ValidFill,
+    /// [`CapacityNeed::partial_reports_per_order`] on the dataset.
+    pub(super) partial_reports_per_order: u64,
     pub(super) fingerprint: u128,
 }
 
@@ -384,9 +429,32 @@ pub(super) fn validate(cfg: &KernelConfig, relax: Relax) -> MMResult<ValidatedCo
             )));
         }
     }
-    match cfg.fill_model {
-        KernelFillModel::Immediate => {}
-    }
+    let fill = match cfg.fill_model {
+        KernelFillModel::Immediate => ValidFill::Immediate,
+        KernelFillModel::QueuePosition { rate, min_queue_ms } => {
+            // As the other grid values: the engine computes with raw scales.
+            if rate.scale() != rate.normalize().scale() {
+                return Err(config_error(format!(
+                    "fill rate {rate} has trailing zeros; write it at its normalised scale ({})",
+                    rate.normalize()
+                )));
+            }
+            let rate_lots = lot
+                .count(rate)
+                .and_then(|lots| u64::try_from(lots).ok())
+                .filter(|lots| *lots > 0)
+                .ok_or_else(|| {
+                    config_error(format!(
+                        "fill rate must be a positive number of lots of {}, got {rate}",
+                        cfg.lot_size
+                    ))
+                })?;
+            ValidFill::QueuePosition {
+                rate_lots,
+                min_queue_ms,
+            }
+        }
+    };
     if cfg.latency.quantum_ns == 0 {
         return Err(config_error(
             "latency quantum_ns must be at least 1, got 0".to_string(),
@@ -480,6 +548,8 @@ pub(super) fn validate(cfg: &KernelConfig, relax: Relax) -> MMResult<ValidatedCo
         bound_b,
         latency: cfg.latency,
         limits: cfg.limits.clone(),
+        fill,
+        partial_reports_per_order: 0,
         fingerprint,
     })
 }
@@ -577,12 +647,20 @@ pub struct CapacityNeed {
     /// Most decisions inside one closing window (`D`).
     pub decisions_in_window: u64,
     /// Smallest `ORD`: `2 * (D + 1) + 2`. `MSG` must be at least `2 * ORD`
-    /// and `DLV` at least `3 * ORD`.
+    /// and `DLV` at least `(3 + partial_reports_per_order) * ORD`.
     pub ord: u64,
+    /// Most partial fill reports of one order in flight at once (`R`): the
+    /// most rows within the acknowledgement delay and its jitter, since an
+    /// order reports at most once per row. Zero for the immediate model.
+    pub partial_reports_per_order: u64,
 }
 
 /// Computes the [`CapacityNeed`] from the timestamps and the latency.
-pub(super) fn capacity_need(timestamps: &[u64], latency: &KernelLatency) -> MMResult<CapacityNeed> {
+pub(super) fn capacity_need(
+    timestamps: &[u64],
+    latency: &KernelLatency,
+    fill_model: &KernelFillModel,
+) -> MMResult<CapacityNeed> {
     let overflow = || config_error("capacity window overflows".to_string());
     let obs_window = latency
         .ns(latency
@@ -636,9 +714,42 @@ pub(super) fn capacity_need(timestamps: &[u64], latency: &KernelLatency) -> MMRe
         .and_then(|v| v.checked_mul(2))
         .and_then(|v| v.checked_add(2))
         .ok_or_else(overflow)?;
+    let partial_reports_per_order = match fill_model {
+        KernelFillModel::Immediate => 0,
+        KernelFillModel::QueuePosition { .. } => rows_within(
+            timestamps,
+            latency
+                .ns(latency
+                    .ack_q
+                    .checked_add(latency.jitter_q)
+                    .ok_or_else(overflow)?)
+                .ok_or_else(overflow)?,
+        )?,
+    };
     Ok(CapacityNeed {
         obs,
         decisions_in_window: d,
         ord,
+        partial_reports_per_order,
     })
+}
+
+/// The most rows `i <= j` with `ts_i + window >= ts_j`, at least one per row:
+/// a report of row `i` is delivered by `ts_i + window`, so these are the rows
+/// whose reports can still be in flight when row `j` is matched.
+fn rows_within(timestamps: &[u64], window: u64) -> MMResult<u64> {
+    let mut most = 0u64;
+    let mut lo = 0usize;
+    for (j, ts) in timestamps.iter().enumerate() {
+        while let Some(first) = timestamps.get(lo) {
+            if first.saturating_add(window) >= *ts {
+                break;
+            }
+            lo = lo.saturating_add(1);
+        }
+        let rows = u64::try_from(j.saturating_sub(lo).saturating_add(1))
+            .map_err(|_| config_error("the number of rows does not fit u64".to_string()))?;
+        most = most.max(rows);
+    }
+    Ok(most)
 }

@@ -19,7 +19,8 @@
 //! tolerances:
 //!
 //! - single linear spot instrument on a tick and lot grid;
-//! - the immediate fill model, no slippage, quote currency fees (any sign);
+//! - the immediate or the queue position fill model, on the lot grid, no
+//!   slippage, quote currency fees (any sign);
 //! - no pretrade policy, or the engine's `LimitsPolicy` (no circuit breaker);
 //! - the built-in bookkeeping (no external accountant);
 //! - all four latencies and jitter, in quanta of `quantum_ns`
@@ -52,7 +53,10 @@
 //! engine's report, [`ReportRec::origin`] and [`ReportRec::cancel_pending`],
 //! which let the agent close an order exactly when its last report arrives.
 //! Admission reserves one order slot, two venue messages and three
-//! deliveries per open order, so the internal queues can never overflow.
+//! deliveries per open order, so the internal queues can never overflow:
+//! partial fill reports come on top of those three, and
+//! [`FinancialKernel::new`] requires room for them
+//! ([`CapacityNeed::partial_reports_per_order`]).
 //!
 //! # Exactness bounds
 //!
@@ -60,12 +64,16 @@
 //! `lot = ml·10^-ls`, `rate = r·10^-fs` and the money unit `U = 10^-s`,
 //! `s = ts + ls + fs`:
 //!
-//! - `N = P·mt·Q·ml·10^fs` and `Fee = P·mt·Q·ml·|r|` (per fill, in U),
+//! - `N = P·mt·Q·ml·10^fs` and `Fee = P·mt·Q·ml·|r|` (per order, whose fills
+//!   sum to at most `Q` lots, in U),
 //! - `X_eff = min(max_position / lot, 2·S·Q)`,
 //! - `B = C0 + 2S·(N + Fee) + X_eff·P·mt·ml·10^fs`,
 //!
 //! and requires `s + 1 <= 28`, `2B < 2^96` (`20B < 2^96` when `fs = 0`),
-//! `2P` within `u64`, `2S·Q` within `i64`, and no time overflow. Inside
+//! `2P` within `u64`, `2S·Q` within `i64`, and no time overflow. With the
+//! queue position model it also requires the volume cleared by the last row,
+//! the touch sizes and the largest order to fit a `Decimal` mantissa at the
+//! lot scale, so the engine's model never overflows or rounds them. Inside
 //! these bounds every `Decimal` ledger operation is exact, so the engine's
 //! saturating arithmetic never saturates and the integer shadow equals it.
 //!
@@ -137,7 +145,7 @@ use crate::types::error::{MMError, MMResult};
 
 use account::held;
 use book::Arr;
-use config::{Relax, ValidatedConfig};
+use config::{Relax, ValidFill, ValidatedConfig};
 use gate::GateState;
 use grid::{half_units_decimal, scaled_decimal};
 use ledger::{AgentView, VenueLedger};
@@ -212,7 +220,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         relax: Relax,
         skip_capacity: bool,
     ) -> MMResult<Self> {
-        let validated = config::validate(cfg, relax)?;
+        let mut validated = config::validate(cfg, relax)?;
         let grid = data.grid;
         if grid.tick_m != validated.tick.mantissa
             || grid.tick_s != validated.tick.scale
@@ -246,9 +254,14 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                 )));
             }
         }
-        if !skip_capacity {
-            let need = config::capacity_need(&timestamps(data), &validated.latency)?;
-            check_capacity::<ORD, MSG, DLV, OBS>(&need)?;
+        check_fill_model(&validated, data)?;
+        if matches!(validated.fill, ValidFill::QueuePosition { .. }) || !skip_capacity {
+            let need =
+                config::capacity_need(&timestamps(data), &validated.latency, &cfg.fill_model)?;
+            validated.partial_reports_per_order = need.partial_reports_per_order;
+            if !skip_capacity {
+                check_capacity::<ORD, MSG, DLV, OBS>(&need)?;
+            }
         }
         Ok(Self {
             cfg: validated,
@@ -716,7 +729,37 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
 ///
 /// Returns [`MMError::InvalidConfiguration`] if a window overflows.
 pub fn capacity_need(cfg: &KernelConfig, data: &KernelDataset) -> MMResult<CapacityNeed> {
-    config::capacity_need(&timestamps(data), &cfg.latency)
+    config::capacity_need(&timestamps(data), &cfg.latency, &cfg.fill_model)
+}
+
+/// The queue position model on `data` stays inside the integers the engine's
+/// `Decimal` model computes with: below `2^96` at the lot scale, its mantissa
+/// never overflows or rounds, so its overflow branch cannot be reached.
+fn check_fill_model(cfg: &ValidatedConfig, data: &KernelDataset) -> MMResult<()> {
+    const LIMIT: u128 = 1 << 96;
+    let ValidFill::QueuePosition { rate_lots, .. } = cfg.fill else {
+        return Ok(());
+    };
+    let unit = u128::from(cfg.lot.mantissa);
+    let fits = |lots: u128| lots.checked_mul(unit).is_some_and(|m| m < LIMIT);
+    let last_ms = data.id.last_ts.checked_div(data::NS_PER_MS).unwrap_or(0);
+    let cleared = u128::from(rate_lots).checked_mul(u128::from(last_ms));
+    if !cleared.is_some_and(fits) {
+        return Err(MMError::InvalidConfiguration(format!(
+            "fill rate {rate_lots} lots per ms up to {last_ms} ms is not exact in a Decimal"
+        )));
+    }
+    let largest = data
+        .ticks
+        .iter()
+        .map(|t| t.bid_lots.max(t.ask_lots))
+        .fold(cfg.q, u64::max);
+    if !fits(u128::from(largest)) {
+        return Err(MMError::InvalidConfiguration(format!(
+            "size of {largest} lots is not exact in a Decimal for the queue position model"
+        )));
+    }
+    Ok(())
 }
 
 fn empty_ledger() -> VenueLedger {
@@ -757,7 +800,7 @@ fn check_capacity<const ORD: usize, const MSG: usize, const DLV: usize, const OB
     if msg < msg_need {
         return fail("MSG", msg, msg_need);
     }
-    let dlv_need = ord.saturating_mul(3);
+    let dlv_need = ord.saturating_mul(need.partial_reports_per_order.saturating_add(3));
     if dlv < dlv_need {
         return fail("DLV", dlv, dlv_need);
     }

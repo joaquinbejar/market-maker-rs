@@ -12,7 +12,7 @@ use super::grid::Unit;
 pub const DIGEST_FNV1A128: u16 = 1;
 
 /// Nanoseconds per millisecond, the unit of [`MarketTick::timestamp`].
-const NS_PER_MS: u64 = 1_000_000;
+pub(super) const NS_PER_MS: u64 = 1_000_000;
 
 /// One market row on the kernel grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
