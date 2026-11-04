@@ -57,7 +57,12 @@ pub use crate::types::fee::FeeAsset;
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountingFill {
     /// Engine wide unique execution sequence, starting at 1; stable across
-    /// replays of the same run, so it can serve as an idempotency key.
+    /// replays of the same run, so it can serve as an idempotency key for one
+    /// accountant. An accountant handed to an engine again, or a ledger wrapped
+    /// again, opens another sequence
+    /// ([`FillAccountant::begin_from_current_state`]):
+    /// `MarginLedgerAccountant` then books a replay as new fills, not as
+    /// duplicates, so it is no way to recover a run onto its own ledger.
     pub execution_id: u64,
     /// Order that was filled.
     pub order_id: SimOrderId,
@@ -247,7 +252,8 @@ mod margin_ledger {
     /// `margin-rs`.
     ///
     /// - Each fill becomes a ledger execution with id `sim-<n>`, where `n` is
-    ///   its `execution_id` plus the largest such `n` in the ledger when the run
+    ///   its `execution_id` plus the largest such `n` in any journal of the
+    ///   ledger when the run
     ///   started, so booking is idempotent and a run never reuses an execution
     ///   the ledger started with. Reset returns to that same start: the state
     ///   when an engine took the accountant, or when it was wrapped if none has.
@@ -363,13 +369,17 @@ mod margin_ledger {
         }
     }
 
-    /// The largest `n` among the `sim-<n>` executions of `ledger`. Any other
-    /// identifier cannot collide with one.
+    /// The largest `n` among the `sim-<n>` identifiers of `ledger`, in all the
+    /// journals that share them. Any other identifier cannot collide with one.
     fn largest_execution_number(ledger: &Ledger) -> u64 {
         ledger
             .journal()
             .iter()
-            .filter_map(|e| e.execution_id.as_str().strip_prefix("sim-"))
+            .map(|e| &e.execution_id)
+            .chain(ledger.settlement_journal().iter().map(|e| &e.id))
+            .chain(ledger.funding_journal().iter().map(|e| &e.id))
+            .chain(ledger.expiry_journal().iter().map(|e| &e.id))
+            .filter_map(|id| id.as_str().strip_prefix("sim-"))
             .filter_map(|n| n.parse::<u64>().ok())
             .max()
             .unwrap_or(0)

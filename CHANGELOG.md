@@ -23,8 +23,10 @@ project follows [Semantic Versioning](https://semver.org/).
   with no other open position. New provided
   `FillAccountant::begin_from_current_state`, which the engine calls when it is
   handed an accountant: `MarginLedgerAccountant` then numbers its executions
-  after those already in the ledger, on spot too, so a fill of a run can no
-  longer collide with them. `AccountingStatus::dropped_fills` counts fills
+  after those already in the ledger, in any of its journals and on spot too, so
+  a fill of a run can no longer collide with them (#196), and a replay onto a
+  ledger handed over again books as new fills, not as duplicates, so it is no
+  way to recover a run. `AccountingStatus::dropped_fills` counts fills
   dropped because their fee or booking could not be computed, which used to
   leave `is_consistent` true.
 - Orders and fills against a contract specification (feature `instruments`,
