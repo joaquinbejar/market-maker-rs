@@ -8,6 +8,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `strategy::walk_forward`: chronological splits, causal calibration of
+  absolute volatility per square root of year, fill intensity `A` and `k`,
+  and intraday seasonality, in `CalibrationRecord`s that carry the training
+  interval, resolution and a hash of the training data, plus a walk-forward
+  report against constant parameters (#87).
 - Contract specifications under `instruments` (new feature `instruments`,
   off by default): `financial_types::instrument` re-exported as
   `instruments`. With `margin` as well, `instruments::margin::margin_instrument`
