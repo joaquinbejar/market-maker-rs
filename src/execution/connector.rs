@@ -351,7 +351,8 @@ pub struct OrderRequest {
     pub order_type: OrderType,
     /// Limit price (required for limit and post-only orders).
     pub price: Option<Decimal>,
-    /// Order quantity in base currency.
+    /// Order quantity: in base currency, or in contracts when checked against
+    /// a contract specification (`instruments::orders`).
     pub quantity: Decimal,
     /// Time in force.
     pub time_in_force: TimeInForce,
@@ -522,7 +523,8 @@ pub struct Fill {
     pub trade_id: String,
     /// Fill price.
     pub price: Decimal,
-    /// Fill quantity.
+    /// Fill quantity, in the unit of the order: base currency, or contracts of
+    /// a contract specification (`instruments::orders`).
     pub quantity: Decimal,
     /// Fill side.
     pub side: Action,

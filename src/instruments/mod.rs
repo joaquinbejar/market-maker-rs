@@ -9,10 +9,13 @@
 //! formulas live in `financial_types` only, so every crate that prices a
 //! contract computes the same exact amounts.
 //!
-//! With the `margin` feature as well, the `margin` module converts a
-//! specification into a `margin-rs` instrument.
+//! [`orders`](crate::instruments::orders) checks orders and fills against a
+//! specification. With the `margin` feature as well, the `margin` module
+//! converts a specification into a `margin-rs` instrument and a fill into a
+//! `margin-rs` execution.
 
 pub use financial_types::instrument::*;
 
 #[cfg(feature = "margin")]
 pub mod margin;
+pub mod orders;
