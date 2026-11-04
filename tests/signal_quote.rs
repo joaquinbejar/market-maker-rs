@@ -621,6 +621,36 @@ fn test_simulate_side_crossing_the_quote_is_not_posted_and_is_counted() {
 }
 
 #[test]
+fn test_simulate_post_only_applies_on_arrival_against_the_latest_book() {
+    let cfg = sim().with_latency_ms(100);
+    // The bid decided at 0 arrives at 100, above the ask of the book at 50.
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        top(50, dec!(99.00), dec!(1), dec!(1)),
+        trade(100, dec!(1), dec!(1), TradeSide::Sell),
+    ];
+    let r = simulate(&events, &cfg, &caps(), None).unwrap();
+    assert_eq!((r.fills, r.crossing_sides), (0, 1));
+    // The mirror, for the ask.
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        top(50, dec!(101.00), dec!(1), dec!(1)),
+        trade(100, dec!(1000), dec!(1), TradeSide::Buy),
+    ];
+    let r = simulate(&events, &cfg, &caps(), None).unwrap();
+    assert_eq!((r.fills, r.crossing_sides), (0, 1));
+    // A quote that rests before the book moves is left as it is.
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        top(50, dec!(99.00), dec!(1), dec!(1)),
+        trade(60, dec!(1), dec!(1), TradeSide::Sell),
+    ];
+    let r = simulate(&events, &sim().with_latency_ms(10), &caps(), None).unwrap();
+    assert_eq!(r.crossing_sides, 0);
+    assert_eq!(r.fills, 1);
+}
+
+#[test]
 fn test_simulate_invalid_trade_is_counted_and_reaches_nothing() {
     let mut cfg = sim();
     cfg.vpin = VPINConfig::new(dec!(1), 1, dec!(0.7)).unwrap();

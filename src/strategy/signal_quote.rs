@@ -52,7 +52,8 @@
 //! inventory of that moment, because with latency other fills may come between.
 //! A fill is cut to the position limit. An order that does not increase the
 //! absolute position is never refused. A side that would cross the quote it was
-//! decided on is not posted, as a post-only order, and is counted. A crossed or
+//! decided on, or the latest book when it arrives, is not posted, as a post-only
+//! order, and is counted. A crossed or
 //! empty quote, or a trade without a positive price and size, is counted and
 //! skipped, the same under every configuration. A micro-price model that falls
 //! back to the mid for a quote counts as that feature being missing.
@@ -480,7 +481,8 @@ pub struct SimulationReport {
     pub invalid_quotes: u64,
     /// Trades skipped for a price or size that is not positive.
     pub invalid_trades: u64,
-    /// Sides not posted because they would cross the quote they were decided on.
+    /// Sides not posted because they would cross the book, at the decision or on
+    /// arrival.
     pub crossing_sides: u64,
     /// Fills.
     pub fills: u64,
@@ -613,6 +615,7 @@ pub fn simulate_detailed(
     let mut vpin = VPINCalculator::new(config.vpin.clone());
     let mut last_trade_ms = None;
     let mut last_mid: Option<Decimal> = None;
+    let mut book: Option<(Decimal, Decimal)> = None;
     let mut inventory = Decimal::ZERO;
     let mut pending: Vec<Resting> = Vec::new();
     let mut live: Option<Resting> = None;
@@ -645,7 +648,7 @@ pub fn simulate_detailed(
             pending.clear();
             live = None;
         }
-        activate(&mut pending, &mut live, now);
+        activate(&mut pending, &mut live, now, book, &mut report);
         match event {
             MarketEvent::Trade(trade) => {
                 if trade.price <= Decimal::ZERO || trade.size <= Decimal::ZERO {
@@ -685,6 +688,7 @@ pub fn simulate_detailed(
                         .or_overflow("inventory pnl")?;
                 }
                 last_mid = Some(mid);
+                book = Some((quote.bid, quote.ask));
                 mids.push((now, mid));
                 if now >= config.terminal_ms {
                     continue;
@@ -706,7 +710,7 @@ pub fn simulate_detailed(
                     ask: resting.ask,
                 });
                 pending.push(resting);
-                activate(&mut pending, &mut live, now);
+                activate(&mut pending, &mut live, now, book, &mut report);
             }
         }
     }
@@ -725,12 +729,32 @@ pub fn simulate_detailed(
     })
 }
 
-/// Replaces the live quote with the newest one whose time has come.
-fn activate(pending: &mut Vec<Resting>, live: &mut Option<Resting>, now: u64) {
+/// Replaces the live quote with the newest one whose time has come, without a
+/// side that now crosses the latest book, as post-only. A quote already resting
+/// is not touched when the book moves.
+fn activate(
+    pending: &mut Vec<Resting>,
+    live: &mut Option<Resting>,
+    now: u64,
+    book: Option<(Decimal, Decimal)>,
+    report: &mut SimulationReport,
+) {
     let due = pending.partition_point(|r| r.from_ms <= now);
-    if due > 0 {
-        *live = pending.drain(..due).next_back();
+    if due == 0 {
+        return;
     }
+    let mut newest = pending.drain(..due).next_back();
+    if let (Some(resting), Some((best_bid, best_ask))) = (newest.as_mut(), book) {
+        if resting.bid.is_some_and(|(price, _)| price >= best_ask) {
+            resting.bid = None;
+            report.crossing_sides = report.crossing_sides.saturating_add(1);
+        }
+        if resting.ask.is_some_and(|(price, _)| price <= best_bid) {
+            resting.ask = None;
+            report.crossing_sides = report.crossing_sides.saturating_add(1);
+        }
+    }
+    *live = newest;
 }
 
 fn features_at(
