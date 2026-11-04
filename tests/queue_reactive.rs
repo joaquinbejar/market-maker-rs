@@ -305,7 +305,7 @@ fn test_shift_down_is_the_mirror_of_up() {
 fn test_mid_move_with_the_opposite_queue_occupied_is_not_eligible() {
     // Arrivals only at an empty first queue, which moves the mid toward the other
     // side while that side's first queue holds an order.
-    let rates: RateTable = vec![(1.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)];
+    let rates: RateTable = vec![(1.0, 0.0, 0.0), (0.0, 1e-9, 0.0), (0.0, 0.0, 0.0)];
     let far: RateTable = vec![(0.0, 0.0, 0.0); 3];
     let p = QrParameters::new(
         dec!(0.01),
@@ -369,6 +369,7 @@ fn test_time_that_cannot_advance_is_stalled() {
     let start = QrSimulator::new(p.clone(), 5, 100).unwrap();
     let state = QrState {
         time_seconds: 1e18,
+        clock_seconds: 1e18,
         ..start.state()
     };
     let mut sim = QrSimulator::from_state(p, state).unwrap();
@@ -389,6 +390,13 @@ fn test_run_reports_no_event_past_the_horizon_and_samples_the_prior_book() {
     let t = sim.run(100.0, 1.0).unwrap();
     assert!(t.events.iter().all(|e| e.timestamp_ms <= 100_000));
     assert_eq!(t.samples.len(), 100);
+    assert_eq!(
+        t.events.len(),
+        t.events
+            .iter()
+            .filter(|e| e.timestamp_ms <= 100_000)
+            .count()
+    );
     // Replay by hand: each sample is the book before the first event after it.
     let mut replay = QrSimulator::new(params(), 5, 100).unwrap();
     let mut samples = t.samples.iter();
@@ -401,6 +409,201 @@ fn test_run_reports_no_event_past_the_horizon_and_samples_the_prior_book() {
             next = samples.next();
         }
     }
+}
+
+#[test]
+fn test_run_does_not_apply_the_event_past_the_horizon() {
+    let mut sim = QrSimulator::new(params(), 7, 100).unwrap();
+    let start = sim.state();
+    let t = sim.run(1e-6, 5e-7).unwrap();
+    assert!(t.events.is_empty());
+    assert_eq!(
+        sim.state(),
+        QrState {
+            clock_seconds: 1e-6,
+            ..start
+        }
+    );
+    // Stepping on gives the event a run with no horizon would.
+    let mut whole = QrSimulator::new(params(), 7, 100).unwrap();
+    assert_eq!(sim.step().unwrap(), whole.step().unwrap());
+}
+
+#[test]
+fn test_reached_size_without_departures_is_refused() {
+    let build = |rates: RateTable| {
+        let rows = rates.len();
+        QrParameters::new(
+            dec!(0.01),
+            0.5,
+            0.0,
+            vec![dec!(1)],
+            vec![rates],
+            vec![vec![true; rows]],
+            UnsupportedPolicy::Stop,
+        )
+    };
+    assert!(build(vec![(1.0, 0.0, 0.0), (0.0, 0.0, 0.0)]).is_err());
+    assert!(build(vec![(1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 0.0, 0.0)]).is_err());
+    let p = build(vec![(1.0, 0.0, 0.0), (0.0, 0.0, 1.0)]).unwrap();
+    assert_eq!(p.invariant(0).unwrap(), [0.5, 0.5]);
+    // No arrival at all: the law sits at empty, and that is stationary.
+    let p = build(vec![(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]).unwrap();
+    assert_eq!(p.invariant(0).unwrap(), [1.0, 0.0]);
+}
+
+#[test]
+fn test_consecutive_runs_lose_no_event() {
+    let mut pieces = QrSimulator::new(params(), 5, 100).unwrap();
+    let mut kept = Vec::new();
+    for _ in 0..1_000 {
+        kept.extend(pieces.run(1.0, 1.0).unwrap().events);
+    }
+    assert!(kept.len() > 1_000);
+    assert!((pieces.state().clock_seconds - 1_000.0).abs() < 1e-6);
+    let long = QrSimulator::new(params(), 5, 100)
+        .unwrap()
+        .run(1_000.0, 1.0)
+        .unwrap();
+    assert_eq!(kept.len(), long.events.len());
+    let mut whole = QrSimulator::new(params(), 5, 100).unwrap();
+    for event in &kept {
+        let QrStep::Event { observation, .. } = whole.step().unwrap() else {
+            panic!("stopped");
+        };
+        assert_eq!(observation, *event);
+    }
+}
+
+#[test]
+fn test_shift_caps_a_renormalized_queue() {
+    // Sizes 1 and 100: a queue of 3 at the second limit is 300 at the first,
+    // above the cap of 20.
+    let mut inner: RateTable = vec![(0.0, 0.0, 0.0); 21];
+    inner[1] = (0.0, 1.0, 0.0);
+    let outer: RateTable = vec![(0.0, 0.0, 0.0); 21];
+    let p = QrParameters::new(
+        dec!(0.01),
+        1.0,
+        0.0,
+        vec![dec!(1), dec!(100)],
+        vec![inner, outer],
+        vec![vec![true; 21]; 2],
+        UnsupportedPolicy::Stop,
+    )
+    .unwrap();
+    let start = QrSimulator::new(p.clone(), 5, 100).unwrap();
+    let mut sim =
+        QrSimulator::from_state(p, state_of(&start, [0, 0, 0, 0, 0], [1, 3, 0, 0, 0])).unwrap();
+    sim.step().unwrap();
+    assert_eq!(sim.state().ask[0], 20);
+}
+
+fn flow_event(timestamp_ms: u64, kind: QrEventKind, waiting_seconds: f64) -> QueueObservation {
+    QueueObservation {
+        timestamp_ms,
+        side: QrSide::Bid,
+        depth: 0,
+        kind,
+        queue_before: 1,
+        waiting_seconds,
+    }
+}
+
+fn flow_trajectory(events: Vec<QueueObservation>, start: u64, end: u64) -> Trajectory {
+    let sample = |timestamp_ms| BookSample {
+        timestamp_ms,
+        bid: [1, 0, 0, 0, 0],
+        ask: [1, 0, 0, 0, 0],
+        spread_ticks: 1,
+    };
+    let mut t = Trajectory::default();
+    t.samples = vec![sample(start), sample(end)];
+    t.events = events;
+    t
+}
+
+#[test]
+fn test_compare_flow_is_a_rate_and_a_law_whatever_the_clock() {
+    let p = holes(UnsupportedPolicy::Stop);
+    // Same counts, one on an epoch clock: 4 events in 4 s, in intervals of 1 s.
+    let at = |start: u64| {
+        let events = (0..4)
+            .map(|i| flow_event(start + i * 1_000, QrEventKind::Limit, 1.0))
+            .collect();
+        flow_trajectory(events, start, start + 4_000)
+    };
+    let epoch = 1_700_000_000_000;
+    let r = compare_trajectories(&at(epoch), &at(0), &p, 1_000).unwrap();
+    assert_eq!(r.flow, [0.0; 3]);
+    assert_eq!(r.flow_law, [0.0; 3]);
+
+    // Same mean rate, bursty: 4 in the first interval, against 1 in each.
+    let bursty: Vec<_> = (0..4)
+        .map(|i| flow_event(i, QrEventKind::Limit, 1.0))
+        .collect();
+    let r = compare_trajectories(&at(0), &flow_trajectory(bursty, 0, 4_000), &p, 1_000).unwrap();
+    assert_eq!(r.flow[0], 0.0);
+    assert_eq!(r.flow_law[0], 1.0);
+
+    assert!(compare_trajectories(&at(0), &at(0), &p, 0).is_err());
+    assert!(
+        compare_trajectories(&at(0), &at(0), &p, 5_000).is_err(),
+        "no whole interval"
+    );
+    assert!(compare_trajectories(&at(0), &at(0), &p, 1).is_ok());
+}
+
+#[test]
+fn test_compare_waiting_law_tells_constant_from_varied_with_the_same_mean() {
+    let p = holes(UnsupportedPolicy::Stop);
+    let with = |waits: &[f64]| {
+        let events = waits
+            .iter()
+            .map(|w| flow_event(0, QrEventKind::Limit, *w))
+            .collect();
+        flow_trajectory(events, 0, 4_000)
+    };
+    let r = compare_trajectories(&with(&[1.0, 3.0]), &with(&[2.0, 2.0]), &p, 1_000).unwrap();
+    assert_eq!(r.waiting_time, [0.0]);
+    assert_eq!(r.waiting_law, [0.5]);
+    let same = compare_trajectories(&with(&[1.0, 3.0]), &with(&[3.0, 1.0]), &p, 1_000).unwrap();
+    assert_eq!(same.waiting_law, [0.0]);
+}
+
+#[test]
+fn test_compare_invalid_waiting_is_counted_and_left_out() {
+    let p = holes(UnsupportedPolicy::Stop);
+    let with = |waits: &[f64]| {
+        let events = waits
+            .iter()
+            .map(|w| flow_event(0, QrEventKind::Limit, *w))
+            .collect();
+        flow_trajectory(events, 0, 4_000)
+    };
+    let clean = with(&[2.0, 2.0]);
+    for bad in [f64::NAN, f64::INFINITY, -5.0, 0.0] {
+        let r = compare_trajectories(&with(&[2.0, 2.0, bad]), &clean, &p, 1_000).unwrap();
+        assert_eq!(r.data_invalid_waiting, 1, "{bad}");
+        assert_eq!(r.model_invalid_waiting, 0);
+        assert_eq!(r.waiting_time, [0.0], "{bad}");
+        let r = compare_trajectories(&clean, &with(&[2.0, 2.0, bad]), &p, 1_000).unwrap();
+        assert_eq!(r.model_invalid_waiting, 1, "{bad}");
+        assert_eq!(r.waiting_time, [0.0], "{bad}");
+    }
+}
+
+#[test]
+fn test_compare_reports_a_short_or_stopped_model() {
+    let p = holes(UnsupportedPolicy::Stop);
+    let data = flow_trajectory(vec![flow_event(0, QrEventKind::Limit, 1.0)], 0, 4_000);
+    let mut model = flow_trajectory(vec![flow_event(0, QrEventKind::Limit, 1.0)], 0, 2_000);
+    model.events.push(flow_event(1, QrEventKind::Cancel, 1.0));
+    model.stopped = Some(QrStep::Stalled);
+    let r = compare_trajectories(&data, &model, &p, 1_000).unwrap();
+    assert_eq!((r.data_samples, r.data_events), (2, 1));
+    assert_eq!((r.model_samples, r.model_events), (2, 2));
+    assert_eq!(r.model_stopped, Some(QrStep::Stalled));
 }
 
 #[test]
@@ -601,11 +804,12 @@ fn test_from_state_refuses_a_state_that_does_not_fit() {
     let sim = QrSimulator::new(params(), 5, 100).unwrap();
     let good = sim.state();
     assert!(QrSimulator::from_state(params(), good).is_ok());
-    let edits: [fn(&mut QrState); 6] = [
+    let edits: [fn(&mut QrState); 7] = [
         |s| s.bid[0] = CAP as u32 + 1,
         |s| s.ask[3] = 1,
         |s| s.time_seconds = f64::NAN,
         |s| s.bid_last[0] = 1.0,
+        |s| s.clock_seconds = -1.0,
         |s| s.rng_state = 0,
         |s| s.parameters_fingerprint ^= 1,
     ];
@@ -1008,7 +1212,7 @@ fn test_out_of_sample_report_fits_better_than_constant_intensity() {
     println!(
         "| day | coverage | queue tv 1 fit/const | queue tv 2 fit/const | spread tv fit/const | wait err 1 fit/const | market flow err fit/const |"
     );
-    println!("| --- | --- | --- | --- | --- | --- | --- |");
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- |");
     for (index, seed) in (41..46).enumerate() {
         let data = generate(seed, day);
         let run = |p: &QrParameters, s: u64| {
@@ -1017,10 +1221,10 @@ fn test_out_of_sample_report_fits_better_than_constant_intensity() {
                 .run(day, 5.0)
                 .unwrap()
         };
-        let a = compare_trajectories(&data, &run(fit, seed + 100), fit).unwrap();
-        let b = compare_trajectories(&data, &run(&baseline, seed + 200), fit).unwrap();
+        let a = compare_trajectories(&data, &run(fit, seed + 100), fit, 60_000).unwrap();
+        let b = compare_trajectories(&data, &run(&baseline, seed + 200), fit, 60_000).unwrap();
         println!(
-            "| {index} | {:.4} | {:.4} / {:.4} | {:.4} / {:.4} | {:.4} / {:.4} | {:.4} / {:.4} | {:.4} / {:.4} |",
+            "| {index} | {:.4} | {:.4} / {:.4} | {:.4} / {:.4} | {:.4} / {:.4} | {:.4} / {:.4} | {:.4} / {:.4} | {:.4} / {:.4} |",
             a.coverage,
             a.queue_size[0],
             b.queue_size[0],
@@ -1028,15 +1232,18 @@ fn test_out_of_sample_report_fits_better_than_constant_intensity() {
             b.queue_size[1],
             a.spread,
             b.spread,
-            a.waiting_time[0],
-            b.waiting_time[0],
+            a.waiting_law[0],
+            b.waiting_law[0],
+            a.flow_law[2],
+            b.flow_law[2],
             a.flow[2],
             b.flow[2],
         );
         assert!(a.queue_size[0] < b.queue_size[0], "{a:?} {b:?}");
         assert!(a.queue_size[1] < b.queue_size[1], "{a:?} {b:?}");
         assert!(a.spread < b.spread, "{a:?} {b:?}");
-        assert!(a.waiting_time[0] < b.waiting_time[0], "{a:?} {b:?}");
+        assert!(a.waiting_law[0] < b.waiting_law[0], "{a:?} {b:?}");
+        assert_eq!(a.model_stopped, None);
         assert!(a.coverage > 0.9);
         assert_eq!(a.data_events, data.events.len() as u64);
         assert_eq!(a.data_samples, data.samples.len() as u64);
@@ -1080,7 +1287,7 @@ fn test_compare_hand_values_and_empty_trajectory_is_refused() {
             event(QrEventKind::Cancel, 1.0),
         ],
     );
-    let r = compare_trajectories(&data, &model, &p).unwrap();
+    let r = compare_trajectories(&data, &model, &p, 500).unwrap();
     assert_eq!(r.queue_size, [0.5]);
     assert_eq!(r.spread, 0.5);
     assert_eq!(r.waiting_time, [0.5]);
@@ -1097,12 +1304,14 @@ fn test_compare_hand_values_and_empty_trajectory_is_refused() {
         ],
     );
     assert_eq!(
-        compare_trajectories(&partly, &model, &p).unwrap().coverage,
+        compare_trajectories(&partly, &model, &p, 500)
+            .unwrap()
+            .coverage,
         0.5
     );
     let empty = Trajectory::default();
-    assert!(compare_trajectories(&empty, &model, &p).is_err());
-    assert!(compare_trajectories(&data, &empty, &p).is_err());
+    assert!(compare_trajectories(&empty, &model, &p, 500).is_err());
+    assert!(compare_trajectories(&data, &empty, &p, 500).is_err());
 }
 
 #[test]

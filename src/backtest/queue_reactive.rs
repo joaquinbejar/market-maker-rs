@@ -39,7 +39,9 @@
 //! [`UnsupportedPolicy::Stop`] the simulator stops there with a typed outcome.
 //! Under [`UnsupportedPolicy::NearestSupported`] it uses the rates of the nearest
 //! supported size, without an impossible departure from an empty queue. The
-//! report states the coverage either way.
+//! report states the coverage either way. Under `Stop`, an unsupported size 0
+//! leaves an invariant law with no mass above it, so the simulator stops at once
+//! if a queue starts empty.
 //!
 //! # Determinism
 //!
@@ -232,7 +234,8 @@ impl QrParameters {
     /// [`MAX_LIMITS`]; a tick or event size that is not positive; a probability
     /// out of `[0, 1]`; tables of different shapes or above [`MAX_QUEUE_BOUND`]; a
     /// rate that is negative, not finite or above [`MAX_RATE`]; a departure from an empty queue; an
-    /// arrival at the cap; or a limit with no supported size.
+    /// arrival at the cap; a limit with no supported size; or a size that is reached
+    /// and has no departures, which leaves no invariant law.
     pub fn new(
         tick_size: Decimal,
         theta: f64,
@@ -468,7 +471,7 @@ fn resolve(
 }
 
 /// `π(n) ∝ Π ρ(j - 1)`, with `ρ(n) = λL(n) / (λC(n + 1) + λM(n + 1))`, cut where
-/// the chain cannot pass.
+/// the chain cannot arrive. A chain that arrives and cannot leave has no such law.
 fn invariant_law(
     table: &[(f64, f64, f64)],
     flags: &[bool],
@@ -481,8 +484,17 @@ fn invariant_law(
         let below = resolve(table, flags, policy, n.saturating_sub(1));
         let here = resolve(table, flags, policy, n);
         let ratio = match (below, here) {
-            (Some((limit, _, _)), Some((_, cancel, market))) if cancel + market > 0.0 => {
-                limit / (cancel + market)
+            (Some((limit, _, _)), Some((_, cancel, market))) => {
+                let departures = cancel + market;
+                if departures > 0.0 {
+                    limit / departures
+                } else if limit > 0.0 {
+                    return Err(MMError::InvalidConfiguration(format!(
+                        "queue size {n} is reached but has no departures, so no invariant law"
+                    )));
+                } else {
+                    0.0
+                }
             }
             _ => 0.0,
         };
@@ -512,8 +524,11 @@ pub struct QrState {
     pub ask: [u32; MAX_LIMITS],
     /// Reference price, in ticks.
     pub reference_ticks: i64,
-    /// Simulated time, in seconds.
+    /// Time of the last event, in seconds.
     pub time_seconds: f64,
+    /// How far runs have reached, in seconds; at least `time_seconds`. Between
+    /// events the book does not change, so this only places the next run's grid.
+    pub clock_seconds: f64,
     /// Time of the last event per bid queue, restarted when the reference moves.
     pub bid_last: [f64; MAX_LIMITS],
     /// Time of the last event per ask queue, restarted when the reference moves.
@@ -535,6 +550,7 @@ struct RawState {
     ask: [u32; MAX_LIMITS],
     reference_ticks: i64,
     time_seconds: String,
+    clock_seconds: String,
     bid_last: [String; MAX_LIMITS],
     ask_last: [String; MAX_LIMITS],
     rng_state: u64,
@@ -550,6 +566,7 @@ impl From<QrState> for RawState {
             ask: state.ask,
             reference_ticks: state.reference_ticks,
             time_seconds: float_text(state.time_seconds),
+            clock_seconds: float_text(state.clock_seconds),
             bid_last: state.bid_last.map(float_text),
             ask_last: state.ask_last.map(float_text),
             rng_state: state.rng_state,
@@ -576,6 +593,7 @@ impl TryFrom<RawState> for QrState {
             ask: raw.ask,
             reference_ticks: raw.reference_ticks,
             time_seconds: text_float(&raw.time_seconds)?,
+            clock_seconds: text_float(&raw.clock_seconds)?,
             bid_last: times(&raw.bid_last)?,
             ask_last: times(&raw.ask_last)?,
             rng_state: raw.rng_state,
@@ -668,6 +686,7 @@ impl QrSimulator {
                 ask: [0; MAX_LIMITS],
                 reference_ticks,
                 time_seconds: 0.0,
+                clock_seconds: 0.0,
                 bid_last: [0.0; MAX_LIMITS],
                 ask_last: [0.0; MAX_LIMITS],
                 rng_state: if seed == 0 { ZERO_SEED } else { seed },
@@ -701,6 +720,8 @@ impl QrSimulator {
             || !queues_ok(&state.ask)
             || !state.time_seconds.is_finite()
             || state.time_seconds < 0.0
+            || !state.clock_seconds.is_finite()
+            || state.clock_seconds < state.time_seconds
             || !state
                 .bid_last
                 .iter()
@@ -783,6 +804,7 @@ impl QrSimulator {
             return Ok(QrStep::Stalled);
         }
         self.state.time_seconds = now;
+        self.state.clock_seconds = self.state.clock_seconds.max(now);
         let before = self.queue(side, depth);
         let last = self.last_event(side, depth);
         let observation = QueueObservation {
@@ -1330,8 +1352,9 @@ pub struct Trajectory {
 impl QrSimulator {
     /// Runs until `horizon_seconds`, sampling every `sample_seconds`, keeping at
     /// most [`MAX_RUN_EVENTS`] events. A sample shows the book after every event
-    /// before its time. The event that passes the horizon is not reported, though
-    /// the state has advanced past it.
+    /// before its time. The event that would pass the horizon is not applied: the
+    /// state keeps the generator from before it, with `clock_seconds` at the horizon,
+    /// so a later `run` or step produces it. Consecutive runs equal one long run.
     ///
     /// # Errors
     ///
@@ -1364,9 +1387,9 @@ impl QrSimulator {
             )));
         }
         let mut out = Trajectory::default();
-        let mut next_sample = self.state.time_seconds + sample_seconds;
-        let end = self.state.time_seconds + horizon_seconds;
-        while next_sample <= end {
+        let mut next_sample = self.state.clock_seconds + sample_seconds;
+        let end = self.state.clock_seconds + horizon_seconds;
+        loop {
             if out.events.len() >= max_events {
                 out.stopped = Some(QrStep::EventLimit);
                 break;
@@ -1388,6 +1411,8 @@ impl QrSimulator {
                         next_sample += sample_seconds;
                     }
                     if self.state.time_seconds > end {
+                        self.state = before;
+                        self.state.clock_seconds = end;
                         break;
                     }
                     out.events.push(observation);
@@ -1420,6 +1445,9 @@ fn spread_of(state: &QrState, limits: usize) -> u32 {
 }
 
 /// Discrepancies of a model trajectory from observed data, on one window.
+///
+/// A short or stopped model is not refused, so its counts and reason are here, to
+/// be read with the distances.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
@@ -1430,25 +1458,43 @@ pub struct DiscrepancyReport {
     pub spread: f64,
     /// Relative error of the mean waiting time, per limit.
     pub waiting_time: Vec<f64>,
+    /// Kolmogorov-Smirnov distance of the waiting times, per limit.
+    pub waiting_law: Vec<f64>,
     /// Relative error of the events per second, for limit, cancel and market.
     pub flow: [f64; 3],
+    /// Total variation of the events per interval, for limit, cancel and market.
+    pub flow_law: [f64; 3],
     /// Share of observed events at a size `params` supports.
     pub coverage: f64,
-    /// Samples and events of the data compared, so small windows are visible.
+    /// Samples of the data.
     pub data_samples: u64,
-    /// Events of the data compared.
+    /// Events of the data.
     pub data_events: u64,
+    /// Samples of the model.
+    pub model_samples: u64,
+    /// Events of the model.
+    pub model_events: u64,
+    /// Why the model ended early, if it did.
+    pub model_stopped: Option<QrStep>,
+    /// Data events left out of the waiting times, for a time not positive and finite.
+    pub data_invalid_waiting: u64,
+    /// Model events left out of the waiting times, for a time not positive and finite.
+    pub model_invalid_waiting: u64,
 }
 
-/// Compares `model` with `data`, using `params` only for the coverage.
+/// Compares `model` with `data`, using `params` only for the coverage, and counting
+/// events per `flow_interval_ms` for the flow law.
 ///
 /// # Errors
 ///
-/// Returns [`MMError::InvalidMarketState`] when either has no samples or events.
+/// Returns [`MMError::InvalidMarketState`] when either has no samples or no events,
+/// or spans no time, and [`MMError::InvalidConfiguration`] for an interval of zero
+/// or over a million intervals.
 pub fn compare_trajectories(
     data: &Trajectory,
     model: &Trajectory,
     params: &QrParameters,
+    flow_interval_ms: u64,
 ) -> MMResult<DiscrepancyReport> {
     if data.samples.is_empty()
         || model.samples.is_empty()
@@ -1462,6 +1508,7 @@ pub fn compare_trajectories(
     let limits = params.limits();
     let mut queue_size = Vec::with_capacity(limits);
     let mut waiting_time = Vec::with_capacity(limits);
+    let mut waiting_law = Vec::with_capacity(limits);
     for depth in 0..limits {
         let sizes = |t: &Trajectory| -> Vec<u32> {
             t.samples
@@ -1475,33 +1522,42 @@ pub fn compare_trajectories(
                 .collect()
         };
         queue_size.push(total_variation(&sizes(data), &sizes(model)));
-        let mean_wait = |t: &Trajectory| -> f64 {
-            let (sum, count) = t
-                .events
+        let waits = |t: &Trajectory| -> Vec<f64> {
+            t.events
                 .iter()
-                .filter(|e| usize::from(e.depth) == depth)
-                .fold((0.0f64, 0u64), |(s, c), e| {
-                    (s + e.waiting_seconds, c.saturating_add(1))
-                });
-            if count == 0 {
+                .filter(|e| usize::from(e.depth) == depth && valid_waiting(e))
+                .map(|e| e.waiting_seconds)
+                .collect()
+        };
+        let (first, second) = (waits(data), waits(model));
+        let mean = |values: &[f64]| -> f64 {
+            if values.is_empty() {
                 0.0
             } else {
-                sum / as_float(count)
+                values.iter().sum::<f64>() / as_float(values.len() as u64)
             }
         };
-        waiting_time.push(relative_error(mean_wait(data), mean_wait(model)));
+        waiting_time.push(relative_error(mean(&first), mean(&second)));
+        waiting_law.push(kolmogorov_smirnov(&first, &second));
     }
+    let invalid = |t: &Trajectory| t.events.iter().filter(|e| !valid_waiting(e)).count() as u64;
     let spreads =
         |t: &Trajectory| -> Vec<u32> { t.samples.iter().map(|s| s.spread_ticks).collect() };
-    let rate = |t: &Trajectory, kind: QrEventKind| -> f64 {
-        let span = t
-            .samples
-            .last()
-            .map_or(1.0, |s| as_float(s.timestamp_ms).max(1.0));
-        as_float(t.events.iter().filter(|e| e.kind == kind).count() as u64) / span
-    };
     let kinds = [QrEventKind::Limit, QrEventKind::Cancel, QrEventKind::Market];
-    let flow = kinds.map(|k| relative_error(rate(data, k), rate(model, k)));
+    let mut flow = [0.0; 3];
+    let mut flow_law = [0.0; 3];
+    for ((kind, mean_error), law_distance) in kinds.iter().zip(&mut flow).zip(&mut flow_law) {
+        let (data_counts, data_seconds) = interval_counts(data, *kind, flow_interval_ms)?;
+        let (model_counts, model_seconds) = interval_counts(model, *kind, flow_interval_ms)?;
+        let per_second = |counts: &[u32], seconds: f64| -> f64 {
+            counts.iter().map(|c| f64::from(*c)).sum::<f64>() / seconds
+        };
+        *mean_error = relative_error(
+            per_second(&data_counts, data_seconds),
+            per_second(&model_counts, model_seconds),
+        );
+        *law_distance = total_variation(&data_counts, &model_counts);
+    }
     let covered = data
         .events
         .iter()
@@ -1516,11 +1572,101 @@ pub fn compare_trajectories(
         queue_size,
         spread: total_variation(&spreads(data), &spreads(model)),
         waiting_time,
+        waiting_law,
         flow,
+        flow_law,
         coverage: as_float(covered) / as_float(data.events.len() as u64),
         data_samples: data.samples.len() as u64,
         data_events: data.events.len() as u64,
+        model_samples: model.samples.len() as u64,
+        model_events: model.events.len() as u64,
+        model_stopped: model.stopped,
+        data_invalid_waiting: invalid(data),
+        model_invalid_waiting: invalid(model),
     })
+}
+
+fn valid_waiting(event: &QueueObservation) -> bool {
+    event.waiting_seconds.is_finite() && event.waiting_seconds > 0.0
+}
+
+/// Events of a kind per whole interval from the first time seen, and the seconds
+/// those intervals cover. A partial last interval is dropped, or it would read as
+/// a quiet one.
+fn interval_counts(
+    trajectory: &Trajectory,
+    kind: QrEventKind,
+    interval_ms: u64,
+) -> MMResult<(Vec<u32>, f64)> {
+    let times = || {
+        trajectory
+            .samples
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .chain(trajectory.events.iter().map(|e| e.timestamp_ms))
+    };
+    let start = times().min().or_overflow("trajectory start")?;
+    let end = times().max().or_overflow("trajectory end")?;
+    let span = end.saturating_sub(start);
+    if interval_ms == 0 {
+        return Err(MMError::InvalidConfiguration(
+            "the flow interval must be positive".to_string(),
+        ));
+    }
+    let bins = span.checked_div(interval_ms).or_overflow("flow bins")?;
+    if bins > 1_000_000 {
+        return Err(MMError::InvalidConfiguration(format!(
+            "{bins} flow intervals"
+        )));
+    }
+    if bins == 0 {
+        return Err(MMError::InvalidMarketState(format!(
+            "a trajectory spans {span} ms, less than the interval of {interval_ms} ms"
+        )));
+    }
+    let mut counts = vec![0u32; usize::try_from(bins).map_err(|_| overflow("flow bins"))?];
+    for event in trajectory.events.iter().filter(|e| e.kind == kind) {
+        let bin = event
+            .timestamp_ms
+            .saturating_sub(start)
+            .checked_div(interval_ms)
+            .and_then(|b| usize::try_from(b).ok());
+        if let Some(count) = bin.and_then(|b| counts.get_mut(b)) {
+            *count = count.saturating_add(1);
+        }
+    }
+    let seconds = as_float(bins) * as_float(interval_ms) / 1_000.0;
+    Ok((counts, seconds))
+}
+
+/// The largest gap between two empirical distribution functions; 1 if only one
+/// side has values, and 0 if neither has.
+fn kolmogorov_smirnov(first: &[f64], second: &[f64]) -> f64 {
+    if first.is_empty() || second.is_empty() {
+        return if first.is_empty() && second.is_empty() {
+            0.0
+        } else {
+            1.0
+        };
+    }
+    let mut a = first.to_vec();
+    let mut b = second.to_vec();
+    a.sort_by(f64::total_cmp);
+    b.sort_by(f64::total_cmp);
+    let (na, nb) = (as_float(a.len() as u64), as_float(b.len() as u64));
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut largest = 0.0f64;
+    while let (Some(x), Some(y)) = (a.get(i), b.get(j)) {
+        let value = x.min(*y);
+        while a.get(i).is_some_and(|v| *v <= value) {
+            i = i.saturating_add(1);
+        }
+        while b.get(j).is_some_and(|v| *v <= value) {
+            j = j.saturating_add(1);
+        }
+        largest = largest.max((as_float(i as u64) / na - as_float(j as u64) / nb).abs());
+    }
+    largest.max((as_float(i as u64) / na - as_float(j as u64) / nb).abs())
 }
 
 /// `|a - b| / a`, or `|b|` where `a` is zero.
