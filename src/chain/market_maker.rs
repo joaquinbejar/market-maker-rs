@@ -3,9 +3,6 @@
 //! This module provides the `ChainMarketMaker` for multi-strike quoting
 //! across an entire option chain.
 
-// TODO(#166): legacy pricing arithmetic, converted in #166
-#![allow(clippy::arithmetic_side_effects)]
-
 use std::sync::Arc;
 
 use option_chain_orderbook::orderbook::ExpirationOrderBook;
@@ -17,6 +14,7 @@ use crate::chain::risk::{ChainRiskLimits, ChainRiskManager};
 use crate::options::greeks::PortfolioGreeks;
 use crate::options::market_maker::{HedgeOrder, OptionsMarketMakerConfig};
 use crate::options::pricing::{OptionInputs, OptionPricer, OptionValuation};
+use crate::types::decimal::{OrOverflow, saturating_div};
 use crate::types::error::{MMError, MMResult};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -80,10 +78,12 @@ impl ChainMarketMakerConfig {
     /// Converts the options market maker config for individual options.
     #[must_use]
     pub fn to_options_config(&self) -> OptionsMarketMakerConfig {
+        // A u64 divided by a positive constant above 1 cannot overflow.
+        let fraction = |bps: u64| saturating_div(Decimal::from(bps), dec!(10000.0));
         OptionsMarketMakerConfig {
-            base_spread_pct: Decimal::from(self.base_spread_bps) / dec!(10000.0),
-            min_spread_pct: Decimal::from(self.min_spread_bps) / dec!(10000.0),
-            max_spread_pct: Decimal::from(self.max_spread_bps) / dec!(10000.0),
+            base_spread_pct: fraction(self.base_spread_bps),
+            min_spread_pct: fraction(self.min_spread_bps),
+            max_spread_pct: fraction(self.max_spread_bps),
             gamma_spread_multiplier: self.atm_spread_multiplier,
             vega_spread_multiplier: dec!(0.5),
             theta_spread_multiplier: dec!(0.1),
@@ -176,12 +176,7 @@ impl ChainQuoteUpdate {
     /// Returns the mid price, rounded down; computed without overflow.
     #[must_use]
     pub fn mid_price(&self) -> u64 {
-        let (lo, hi) = if self.bid_price <= self.ask_price {
-            (self.bid_price, self.ask_price)
-        } else {
-            (self.ask_price, self.bid_price)
-        };
-        lo + (hi - lo) / 2
+        self.bid_price.midpoint(self.ask_price)
     }
 
     /// Returns the spread, `ask - bid`, or `None` for a crossed quote.
@@ -643,25 +638,41 @@ impl ChainMarketMaker {
     }
 
     /// Checks the chain-level risk status.
-    #[must_use]
-    pub fn check_chain_risk(&self) -> RiskStatus {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`] for a zero delta, gamma or vega limit that
+    /// is not already breached: the utilization of a zero limit is undefined.
+    pub fn check_chain_risk(&self) -> MMResult<RiskStatus> {
         if self.risk_manager.is_risk_breached() {
-            RiskStatus::Breached
+            Ok(RiskStatus::Breached)
         } else if self.risk_manager.should_hedge() {
-            RiskStatus::HedgeRequired
+            Ok(RiskStatus::HedgeRequired)
         } else {
             // Check if approaching limits (80% threshold)
             let greeks = self.risk_manager.current_greeks();
             let limits = self.risk_manager.limits();
 
-            let delta_util = greeks.delta.abs() / limits.max_chain_delta;
-            let gamma_util = greeks.gamma.abs() / limits.max_chain_gamma;
-            let vega_util = greeks.vega.abs() / limits.max_chain_vega;
+            let delta_util = greeks
+                .delta
+                .abs()
+                .checked_div(limits.max_chain_delta)
+                .or_overflow("chain delta utilization")?;
+            let gamma_util = greeks
+                .gamma
+                .abs()
+                .checked_div(limits.max_chain_gamma)
+                .or_overflow("chain gamma utilization")?;
+            let vega_util = greeks
+                .vega
+                .abs()
+                .checked_div(limits.max_chain_vega)
+                .or_overflow("chain vega utilization")?;
 
             if delta_util > dec!(0.8) || gamma_util > dec!(0.8) || vega_util > dec!(0.8) {
-                RiskStatus::Warning
+                Ok(RiskStatus::Warning)
             } else {
-                RiskStatus::Normal
+                Ok(RiskStatus::Normal)
             }
         }
     }
@@ -671,8 +682,11 @@ impl ChainMarketMaker {
     /// # Arguments
     ///
     /// * `underlying_price` - Current price of the underlying
-    #[must_use]
-    pub fn calculate_hedge(&self, underlying_price: Decimal) -> Vec<HedgeOrder> {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`] when the number of shares overflows.
+    pub fn calculate_hedge(&self, underlying_price: Decimal) -> MMResult<Vec<HedgeOrder>> {
         self.risk_manager.calculate_hedge(underlying_price)
     }
 
@@ -1042,9 +1056,92 @@ mod tests {
         let chain = create_test_chain();
         let mm = ChainMarketMaker::with_defaults(chain);
 
-        let status = mm.check_chain_risk();
+        let status = mm.check_chain_risk().unwrap();
         assert_eq!(status, RiskStatus::Normal);
         assert!(status.can_quote());
+    }
+
+    /// A chain market maker with the given chain risk limits.
+    fn with_limits(limits: ChainRiskLimits) -> ChainMarketMaker {
+        let mut mm = ChainMarketMaker::with_defaults(create_test_chain());
+        *mm.risk_manager_mut() = ChainRiskManager::new("BTC", limits, dec!(100.0));
+        mm
+    }
+
+    #[test]
+    fn test_check_chain_risk_zero_limit_is_an_error_not_a_panic() {
+        for (name, limits) in [
+            (
+                "delta",
+                ChainRiskLimits {
+                    max_chain_delta: Decimal::ZERO,
+                    ..Default::default()
+                },
+            ),
+            (
+                "gamma",
+                ChainRiskLimits {
+                    max_chain_gamma: Decimal::ZERO,
+                    ..Default::default()
+                },
+            ),
+            (
+                "vega",
+                ChainRiskLimits {
+                    max_chain_vega: Decimal::ZERO,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert_eq!(
+                with_limits(limits).check_chain_risk(),
+                Err(MMError::NumericalError(format!(
+                    "chain {name} utilization overflows"
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_chain_risk_breach_is_reported_before_a_zero_limit() {
+        let mut mm = with_limits(ChainRiskLimits {
+            max_chain_delta: Decimal::ZERO,
+            ..Default::default()
+        });
+        mm.risk_manager_mut().update_greeks(PortfolioGreeks {
+            delta: dec!(1),
+            ..PortfolioGreeks::new()
+        });
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Breached));
+    }
+
+    #[test]
+    fn test_calculate_hedge_propagates_overflow() {
+        let mut mm = ChainMarketMaker::with_defaults(create_test_chain());
+        mm.risk_manager_mut().update_greeks(PortfolioGreeks {
+            delta: Decimal::MAX,
+            ..PortfolioGreeks::new()
+        });
+        assert_eq!(
+            mm.calculate_hedge(dec!(50000)).map(|hedges| hedges.len()),
+            Err(MMError::NumericalError(
+                "shares to hedge overflows".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_to_options_config_at_the_bound() {
+        let config = ChainMarketMakerConfig {
+            base_spread_bps: 200,
+            min_spread_bps: 0,
+            max_spread_bps: u64::MAX,
+            ..Default::default()
+        }
+        .to_options_config();
+        assert_eq!(config.base_spread_pct, dec!(0.02));
+        assert_eq!(config.min_spread_pct, Decimal::ZERO);
+        assert_eq!(config.max_spread_pct, Decimal::from(u64::MAX) / dec!(10000));
     }
 
     #[test]

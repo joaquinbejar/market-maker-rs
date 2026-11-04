@@ -193,7 +193,7 @@ fn overflow_error(what: &str) -> MMError {
 /// `numerator / denominator`, saturating at the `Decimal` bound of the
 /// quotient's sign when it overflows, and zero for a zero denominator.
 ///
-/// Used only for report only values.
+/// Used only for report only values, and for divisions that cannot overflow.
 #[must_use]
 #[inline]
 pub(crate) fn saturating_div(numerator: Decimal, denominator: Decimal) -> Decimal {
@@ -206,6 +206,15 @@ pub(crate) fn saturating_div(numerator: Decimal, denominator: Decimal) -> Decima
             Decimal::MIN
         }
     })
+}
+
+/// `-value`, which is always representable: a `Decimal` is a sign and a
+/// magnitude.
+#[cfg(feature = "options")]
+#[must_use]
+#[inline]
+pub(crate) fn negate(value: Decimal) -> Decimal {
+    Decimal::ZERO.saturating_sub(value)
 }
 
 /// The midpoint `(a + b) / 2` of two decimals, never saturated.

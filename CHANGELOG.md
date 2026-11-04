@@ -132,10 +132,8 @@ project follows [Semantic Versioning](https://semver.org/).
   `--no-default-features` (#155).
 - The crate denies `clippy::unwrap_used`, `expect_used`,
   `indexing_slicing`, `panic` and `arithmetic_side_effects` outside tests
-  (#145). Five legacy option files (`options::greeks`, `risk_manager`,
-  `market_maker`, `adapter` and `chain::market_maker`) are exempt from the
-  arithmetic lint until #166 converts them.
-- Arithmetic outside those legacy option files is checked (#135, #144): a function
+  (#145), with no file level exemption.
+- Arithmetic is checked (#135, #144, #166): a function
   that returns `MMResult` reports an overflow or a zero divisor as
   `MMError::NumericalError`; derived display and report values (mid
   prices, spreads, notionals, imbalances, analytics statistics, backtest
@@ -187,6 +185,42 @@ release.
 
 - `OptionsAdapter::time_to_terminal_ms` returns `MMResult<u64>`: a failed
   conversion to years is an error, not 0, which reads as already expired.
+- Checked arithmetic in the legacy options and chain files (#166). These now
+  report an overflow or a zero divisor as `MMError::NumericalError`, where
+  they used to panic:
+  - `OptionsAdapter::moneyness` returns `MMResult<Decimal>`, and `is_atm`
+    returns `MMResult<bool>`. A zero strike is now an error, not a moneyness
+    of 0, which reads as far out of the money;
+  - `PositionGreeks::scale` returns `MMResult<Self>`;
+  - `PortfolioGreeks::add` and `remove` return `MMResult<()>` and leave the
+    portfolio unchanged on error; `dollar_delta`, `dollar_gamma`,
+    `dollar_vega`, `dollar_theta` and `shares_to_hedge` return
+    `MMResult<Decimal>`;
+  - `PortfolioGreeks` no longer implements `Add`, `AddAssign`, `Sub` and
+    `SubAssign`, which cannot report an overflow. Use the new `checked_add`
+    and `checked_sub`, which return `MMResult<Self>`;
+  - `OptionsMarketMaker::calculate_skew_adjustment` returns
+    `MMResult<(Decimal, Decimal)>` (implementors change their signature);
+  - `GreeksCircuitBreaker::check` returns `MMResult<()>`. A check that cannot
+    be computed opens a closed breaker;
+  - `AutoHedger::needs_hedge` returns `MMResult<bool>`, `hedge_urgency`
+    `MMResult<HedgeUrgency>` and `calculate_hedge`
+    `MMResult<Option<HedgeOrder>>`;
+  - `LimitUtilization::calculate` returns `MMResult<Self>`;
+  - `GreeksRiskManager::check_order` returns `MMResult<OrderDecision>`,
+    `limit_utilization` `MMResult<LimitUtilization>`, `needs_hedge`
+    `MMResult<bool>`, `calculate_hedge_order` `MMResult<Option<HedgeOrder>>`
+    and `hedge_urgency` `MMResult<HedgeUrgency>`;
+  - `GreeksRiskManager::update_on_fill` and `update_on_close` return
+    `MMResult<()>`. When the fill cannot be booked, the Greeks are unchanged
+    and so miss it: the circuit breaker opens and stays open until `reset` or
+    `reset_circuit_breaker`;
+  - `ChainRiskManager::add_position_greeks` and `remove_position_greeks`
+    return `MMResult<()>`, `calculate_hedge` `MMResult<Vec<HedgeOrder>>`, and
+    `dollar_delta`, `dollar_gamma`, `dollar_vega` and `dollar_theta`
+    `MMResult<Decimal>`;
+  - `ChainMarketMaker::check_chain_risk` returns `MMResult<RiskStatus>`, and
+    `calculate_hedge` `MMResult<Vec<HedgeOrder>>`.
 - `AccountingStatus` has a new `snapshot_failures` field (`serde(default)`):
   the execution ids after whose post the accountant's snapshot failed, so
   the engine kept stale balances. `is_consistent` is false while it is not

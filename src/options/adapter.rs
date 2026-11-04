@@ -4,11 +4,9 @@
 //! types and `optionstratlib` types, as well as utility functions for
 //! calculating Greeks and theoretical values.
 
-// TODO(#166): legacy pricing arithmetic, converted in #166
-#![allow(clippy::arithmetic_side_effects)]
-
 use crate::Decimal;
 use crate::options::greeks::PositionGreeks;
+use crate::types::decimal::{OrOverflow, saturating_div};
 use crate::types::error::{MMError, MMResult};
 use optionstratlib::greeks::{delta, gamma, rho, theta, vega};
 use optionstratlib::model::ExpirationDate;
@@ -136,7 +134,7 @@ impl OptionsAdapter {
     #[must_use]
     pub fn ms_to_years(ms: u64) -> Decimal {
         // A u64 divided by a positive constant above 1 cannot overflow.
-        Decimal::from(ms) / ADAPTER_MS_PER_YEAR
+        saturating_div(Decimal::from(ms), ADAPTER_MS_PER_YEAR)
     }
 
     /// Calculates the moneyness of an option.
@@ -149,12 +147,20 @@ impl OptionsAdapter {
     /// # Returns
     ///
     /// Moneyness ratio (underlying / strike). Values > 1 indicate ITM for calls.
-    #[must_use]
-    pub fn moneyness(underlying_price: Decimal, strike_price: Decimal) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`] for a zero strike, which has no moneyness,
+    /// and when the ratio overflows.
+    pub fn moneyness(underlying_price: Decimal, strike_price: Decimal) -> MMResult<Decimal> {
         if strike_price.is_zero() {
-            return Decimal::ZERO;
+            return Err(MMError::NumericalError(
+                "moneyness of a zero strike is undefined".to_string(),
+            ));
         }
-        underlying_price / strike_price
+        underlying_price
+            .checked_div(strike_price)
+            .or_overflow("moneyness")
     }
 
     /// Determines if an option is at-the-money within a tolerance.
@@ -168,10 +174,21 @@ impl OptionsAdapter {
     /// # Returns
     ///
     /// `true` if the option is within the ATM tolerance.
-    #[must_use]
-    pub fn is_atm(underlying_price: Decimal, strike_price: Decimal, tolerance: Decimal) -> bool {
-        let moneyness = Self::moneyness(underlying_price, strike_price);
-        (moneyness - dec!(1.0)).abs() <= tolerance
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`] when [`Self::moneyness`] fails or the
+    /// distance from 1 overflows.
+    pub fn is_atm(
+        underlying_price: Decimal,
+        strike_price: Decimal,
+        tolerance: Decimal,
+    ) -> MMResult<bool> {
+        let moneyness = Self::moneyness(underlying_price, strike_price)?;
+        let distance = moneyness
+            .checked_sub(dec!(1.0))
+            .or_overflow("distance from at the money")?;
+        Ok(distance.abs() <= tolerance)
     }
 
     /// Calculates the intrinsic value of an option.
@@ -188,9 +205,10 @@ impl OptionsAdapter {
         let underlying = option.underlying_price.to_dec();
         let strike = option.strike_price.to_dec();
 
+        // Both are non negative, so their difference is representable.
         let intrinsic = match option.option_style {
-            optionstratlib::OptionStyle::Call => underlying - strike,
-            optionstratlib::OptionStyle::Put => strike - underlying,
+            optionstratlib::OptionStyle::Call => underlying.saturating_sub(strike),
+            optionstratlib::OptionStyle::Put => strike.saturating_sub(underlying),
         };
 
         if intrinsic > Decimal::ZERO {
@@ -213,7 +231,9 @@ impl OptionsAdapter {
     #[must_use]
     pub fn time_value(option: &Options, market_price: Decimal) -> Decimal {
         let intrinsic = Self::intrinsic_value(option);
-        let time_val = market_price - intrinsic;
+        // The intrinsic value is non negative, so this can only saturate at
+        // the negative bound, which the floor below turns into the same zero.
+        let time_val = market_price.saturating_sub(intrinsic);
 
         if time_val > Decimal::ZERO {
             time_val
@@ -296,32 +316,84 @@ mod tests {
     fn test_moneyness() {
         // ATM
         assert_eq!(
-            OptionsAdapter::moneyness(dec!(100.0), dec!(100.0)),
+            OptionsAdapter::moneyness(dec!(100.0), dec!(100.0)).unwrap(),
             dec!(1.0)
         );
 
         // ITM call (underlying > strike)
-        assert!(OptionsAdapter::moneyness(dec!(110.0), dec!(100.0)) > dec!(1.0));
+        assert!(OptionsAdapter::moneyness(dec!(110.0), dec!(100.0)).unwrap() > dec!(1.0));
 
         // OTM call (underlying < strike)
-        assert!(OptionsAdapter::moneyness(dec!(90.0), dec!(100.0)) < dec!(1.0));
+        assert!(OptionsAdapter::moneyness(dec!(90.0), dec!(100.0)).unwrap() < dec!(1.0));
+    }
+
+    #[test]
+    fn test_moneyness_overflow_is_a_typed_error() {
+        assert_eq!(
+            OptionsAdapter::moneyness(Decimal::MAX, Decimal::new(1, 28)),
+            Err(MMError::NumericalError("moneyness overflows".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_moneyness_zero_strike_is_a_typed_error() {
+        assert_eq!(
+            OptionsAdapter::moneyness(dec!(100), Decimal::ZERO),
+            Err(MMError::NumericalError(
+                "moneyness of a zero strike is undefined".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_is_atm_propagates_moneyness_errors() {
+        assert!(OptionsAdapter::is_atm(Decimal::MAX, Decimal::new(1, 28), dec!(0.02)).is_err());
+        assert!(OptionsAdapter::is_atm(dec!(100), Decimal::ZERO, dec!(0.02)).is_err());
+    }
+
+    #[test]
+    fn test_is_atm_distance_overflow_is_a_typed_error() {
+        // Moneyness at the negative bound: one below it is not representable.
+        assert_eq!(
+            OptionsAdapter::is_atm(Decimal::MIN, dec!(1), dec!(0.02)),
+            Err(MMError::NumericalError(
+                "distance from at the money overflows".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_ms_to_years_at_the_bound() {
+        let years = OptionsAdapter::ms_to_years(u64::MAX);
+        assert!(years > dec!(584000000) && years < dec!(585000000));
+    }
+
+    #[test]
+    fn test_intrinsic_and_time_value_at_the_bounds() {
+        let mut option = create_test_option();
+        option.underlying_price = optionstratlib::prelude::Positive::MAX;
+        option.strike_price = pos_or_panic!(100.0);
+        let intrinsic = OptionsAdapter::intrinsic_value(&option);
+        assert!(intrinsic > dec!(1e27));
+
+        // A deeply negative price is floored at zero, not an overflow.
+        assert_eq!(
+            OptionsAdapter::time_value(&option, Decimal::MIN),
+            Decimal::ZERO
+        );
     }
 
     #[test]
     fn test_is_atm() {
         // Exactly ATM
-        assert!(OptionsAdapter::is_atm(dec!(100.0), dec!(100.0), dec!(0.02)));
+        assert!(OptionsAdapter::is_atm(dec!(100.0), dec!(100.0), dec!(0.02)).unwrap());
 
         // Within 2% tolerance
-        assert!(OptionsAdapter::is_atm(dec!(101.0), dec!(100.0), dec!(0.02)));
-        assert!(OptionsAdapter::is_atm(dec!(99.0), dec!(100.0), dec!(0.02)));
+        assert!(OptionsAdapter::is_atm(dec!(101.0), dec!(100.0), dec!(0.02)).unwrap());
+        assert!(OptionsAdapter::is_atm(dec!(99.0), dec!(100.0), dec!(0.02)).unwrap());
 
         // Outside tolerance
-        assert!(!OptionsAdapter::is_atm(
-            dec!(105.0),
-            dec!(100.0),
-            dec!(0.02)
-        ));
+        assert!(!OptionsAdapter::is_atm(dec!(105.0), dec!(100.0), dec!(0.02)).unwrap());
     }
 
     #[test]

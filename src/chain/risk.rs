@@ -6,6 +6,7 @@
 use crate::Decimal;
 use crate::options::greeks::PortfolioGreeks;
 use crate::options::market_maker::HedgeOrder;
+use crate::types::error::MMResult;
 use rust_decimal_macros::dec;
 
 #[cfg(feature = "serde")]
@@ -184,21 +185,31 @@ impl ChainRiskManager {
     }
 
     /// Adds Greeks from a position.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// on overflow; the current Greeks are unchanged.
     pub fn add_position_greeks(
         &mut self,
         greeks: &crate::options::greeks::PositionGreeks,
         quantity: Decimal,
-    ) {
-        self.current_greeks.add(greeks, quantity);
+    ) -> MMResult<()> {
+        self.current_greeks.add(greeks, quantity)
     }
 
     /// Removes Greeks from a position.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// on overflow; the current Greeks are unchanged.
     pub fn remove_position_greeks(
         &mut self,
         greeks: &crate::options::greeks::PositionGreeks,
         quantity: Decimal,
-    ) {
-        self.current_greeks.remove(greeks, quantity);
+    ) -> MMResult<()> {
+        self.current_greeks.remove(greeks, quantity)
     }
 
     /// Checks if the chain should hedge delta.
@@ -228,16 +239,20 @@ impl ChainRiskManager {
     /// # Returns
     ///
     /// A vector of hedge orders to neutralize delta exposure.
-    #[must_use]
-    pub fn calculate_hedge(&self, underlying_price: Decimal) -> Vec<HedgeOrder> {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the number of shares overflows.
+    pub fn calculate_hedge(&self, underlying_price: Decimal) -> MMResult<Vec<HedgeOrder>> {
         let mut hedges = Vec::new();
 
         let shares_to_hedge = self
             .current_greeks
-            .shares_to_hedge(self.contract_multiplier);
+            .shares_to_hedge(self.contract_multiplier)?;
 
         if shares_to_hedge.abs() < dec!(1.0) {
-            return hedges;
+            return Ok(hedges);
         }
 
         let hedge = HedgeOrder::underlying(
@@ -247,7 +262,7 @@ impl ChainRiskManager {
         );
 
         hedges.push(hedge);
-        hedges
+        Ok(hedges)
     }
 
     /// Resets the current Greeks to zero.
@@ -256,28 +271,44 @@ impl ChainRiskManager {
     }
 
     /// Returns the dollar delta exposure.
-    #[must_use]
-    pub fn dollar_delta(&self, underlying_price: Decimal) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the exposure overflows.
+    pub fn dollar_delta(&self, underlying_price: Decimal) -> MMResult<Decimal> {
         self.current_greeks
             .dollar_delta(underlying_price, self.contract_multiplier)
     }
 
     /// Returns the dollar gamma exposure.
-    #[must_use]
-    pub fn dollar_gamma(&self, underlying_price: Decimal) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the exposure overflows.
+    pub fn dollar_gamma(&self, underlying_price: Decimal) -> MMResult<Decimal> {
         self.current_greeks
             .dollar_gamma(underlying_price, self.contract_multiplier)
     }
 
     /// Returns the dollar vega exposure.
-    #[must_use]
-    pub fn dollar_vega(&self) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the exposure overflows.
+    pub fn dollar_vega(&self) -> MMResult<Decimal> {
         self.current_greeks.dollar_vega(self.contract_multiplier)
     }
 
     /// Returns the dollar theta exposure.
-    #[must_use]
-    pub fn dollar_theta(&self) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the exposure overflows.
+    pub fn dollar_theta(&self) -> MMResult<Decimal> {
         self.current_greeks.dollar_theta(self.contract_multiplier)
     }
 }
@@ -286,6 +317,7 @@ impl ChainRiskManager {
 mod tests {
     use super::*;
     use crate::options::greeks::PositionGreeks;
+    use crate::types::error::MMError;
 
     #[test]
     fn test_chain_risk_limits_default() {
@@ -333,7 +365,7 @@ mod tests {
         let greeks =
             PositionGreeks::new(dec!(0.5), dec!(0.02), dec!(-0.05), dec!(0.15), dec!(0.08));
 
-        manager.add_position_greeks(&greeks, dec!(10.0));
+        manager.add_position_greeks(&greeks, dec!(10.0)).unwrap();
 
         assert_eq!(manager.current_greeks().delta, dec!(5.0));
         assert_eq!(manager.current_greeks().gamma, dec!(0.2));
@@ -347,11 +379,11 @@ mod tests {
             PositionGreeks::new(dec!(0.5), dec!(0.02), dec!(-0.05), dec!(0.15), dec!(0.08));
 
         // Add enough delta to trigger hedge
-        manager.add_position_greeks(&greeks, dec!(100.0)); // 50 delta
+        manager.add_position_greeks(&greeks, dec!(100.0)).unwrap(); // 50 delta
 
         assert!(manager.should_hedge());
 
-        let hedges = manager.calculate_hedge(dec!(50000.0));
+        let hedges = manager.calculate_hedge(dec!(50000.0)).unwrap();
         assert_eq!(hedges.len(), 1);
         assert_eq!(hedges[0].symbol, "BTC");
     }
@@ -363,10 +395,57 @@ mod tests {
         let greeks =
             PositionGreeks::new(dec!(0.5), dec!(0.02), dec!(-0.05), dec!(0.15), dec!(0.08));
 
-        manager.add_position_greeks(&greeks, dec!(10.0));
+        manager.add_position_greeks(&greeks, dec!(10.0)).unwrap();
         assert!(manager.current_greeks().delta != Decimal::ZERO);
 
         manager.reset();
         assert_eq!(manager.current_greeks().delta, Decimal::ZERO);
+    }
+
+    fn overflow(what: &str) -> MMError {
+        MMError::NumericalError(format!("{what} overflows"))
+    }
+
+    #[test]
+    fn test_chain_risk_manager_position_overflow_leaves_greeks_unchanged() {
+        let mut manager = ChainRiskManager::with_defaults("BTC");
+        let greeks = PositionGreeks::new(Decimal::MAX, dec!(0), dec!(0), dec!(0), dec!(0));
+        let unit = PositionGreeks::new(dec!(1), dec!(0), dec!(0), dec!(0), dec!(0));
+        manager.add_position_greeks(&unit, dec!(5)).unwrap();
+        let before = *manager.current_greeks();
+
+        assert_eq!(
+            manager.add_position_greeks(&greeks, dec!(2)),
+            Err(overflow("scaled delta"))
+        );
+        assert_eq!(
+            manager.remove_position_greeks(&greeks, dec!(2)),
+            Err(overflow("scaled delta"))
+        );
+        assert_eq!(*manager.current_greeks(), before);
+    }
+
+    #[test]
+    fn test_chain_risk_manager_hedge_and_dollar_values_overflow() {
+        let mut manager = ChainRiskManager::with_defaults("BTC");
+        manager.update_greeks(PortfolioGreeks {
+            delta: Decimal::MAX,
+            gamma: Decimal::MAX,
+            theta: Decimal::MAX,
+            vega: Decimal::MAX,
+            rho: dec!(0),
+        });
+        // The default contract multiplier is 100.
+        assert_eq!(
+            manager.calculate_hedge(dec!(1)).map(|hedges| hedges.len()),
+            Err(overflow("shares to hedge"))
+        );
+        assert_eq!(manager.dollar_delta(dec!(1)), Err(overflow("dollar delta")));
+        assert_eq!(
+            manager.dollar_gamma(dec!(100)),
+            Err(overflow("dollar gamma"))
+        );
+        assert_eq!(manager.dollar_vega(), Err(overflow("dollar vega")));
+        assert_eq!(manager.dollar_theta(), Err(overflow("dollar theta")));
     }
 }

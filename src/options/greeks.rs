@@ -2,11 +2,14 @@
 //!
 //! This module provides types for tracking and aggregating Greeks across
 //! multiple options positions in a portfolio.
-
-// TODO(#166): legacy pricing arithmetic, converted in #166
-#![allow(clippy::arithmetic_side_effects)]
+//!
+//! Every computed figure is checked: an overflow is
+//! [`MMError::NumericalError`](crate::types::error::MMError::NumericalError),
+//! and an operation that fails leaves its receiver unchanged.
 
 use crate::Decimal;
+use crate::types::decimal::{OrOverflow, negate};
+use crate::types::error::MMResult;
 use rust_decimal_macros::dec;
 
 #[cfg(feature = "serde")]
@@ -89,15 +92,28 @@ impl PositionGreeks {
     /// # Returns
     ///
     /// A new `PositionGreeks` with all values scaled by the quantity.
-    #[must_use]
-    pub fn scale(&self, quantity: Decimal) -> Self {
-        Self {
-            delta: self.delta * quantity,
-            gamma: self.gamma * quantity,
-            theta: self.theta * quantity,
-            vega: self.vega * quantity,
-            rho: self.rho * quantity,
-        }
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when a scaled value overflows.
+    pub fn scale(&self, quantity: Decimal) -> MMResult<Self> {
+        Ok(Self {
+            delta: self
+                .delta
+                .checked_mul(quantity)
+                .or_overflow("scaled delta")?,
+            gamma: self
+                .gamma
+                .checked_mul(quantity)
+                .or_overflow("scaled gamma")?,
+            theta: self
+                .theta
+                .checked_mul(quantity)
+                .or_overflow("scaled theta")?,
+            vega: self.vega.checked_mul(quantity).or_overflow("scaled vega")?,
+            rho: self.rho.checked_mul(quantity).or_overflow("scaled rho")?,
+        })
     }
 }
 
@@ -122,7 +138,7 @@ impl PositionGreeks {
 ///     dec!(0.15),  // vega
 ///     dec!(0.08),  // rho
 /// );
-/// portfolio.add(&call_greeks, dec!(10.0)); // 10 contracts
+/// portfolio.add(&call_greeks, dec!(10.0)).unwrap(); // 10 contracts
 ///
 /// assert_eq!(portfolio.delta, dec!(5.5)); // 0.55 * 10
 /// ```
@@ -158,12 +174,14 @@ impl PortfolioGreeks {
     ///
     /// * `greeks` - The Greeks of the position to add
     /// * `quantity` - The position quantity (positive for long, negative for short)
-    pub fn add(&mut self, greeks: &PositionGreeks, quantity: Decimal) {
-        self.delta += greeks.delta * quantity;
-        self.gamma += greeks.gamma * quantity;
-        self.theta += greeks.theta * quantity;
-        self.vega += greeks.vega * quantity;
-        self.rho += greeks.rho * quantity;
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when a scaled value or a total overflows; the portfolio is unchanged.
+    pub fn add(&mut self, greeks: &PositionGreeks, quantity: Decimal) -> MMResult<()> {
+        *self = self.checked_add(Self::of_position(greeks.scale(quantity)?))?;
+        Ok(())
     }
 
     /// Removes Greeks from a position from the portfolio.
@@ -172,12 +190,81 @@ impl PortfolioGreeks {
     ///
     /// * `greeks` - The Greeks of the position to remove
     /// * `quantity` - The position quantity that was removed
-    pub fn remove(&mut self, greeks: &PositionGreeks, quantity: Decimal) {
-        self.delta -= greeks.delta * quantity;
-        self.gamma -= greeks.gamma * quantity;
-        self.theta -= greeks.theta * quantity;
-        self.vega -= greeks.vega * quantity;
-        self.rho -= greeks.rho * quantity;
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when a scaled value or a total overflows; the portfolio is unchanged.
+    pub fn remove(&mut self, greeks: &PositionGreeks, quantity: Decimal) -> MMResult<()> {
+        *self = self.checked_sub(Self::of_position(greeks.scale(quantity)?))?;
+        Ok(())
+    }
+
+    /// The field by field sum of two portfolios.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when a total overflows.
+    pub fn checked_add(self, other: Self) -> MMResult<Self> {
+        Ok(Self {
+            delta: self
+                .delta
+                .checked_add(other.delta)
+                .or_overflow("total delta")?,
+            gamma: self
+                .gamma
+                .checked_add(other.gamma)
+                .or_overflow("total gamma")?,
+            theta: self
+                .theta
+                .checked_add(other.theta)
+                .or_overflow("total theta")?,
+            vega: self
+                .vega
+                .checked_add(other.vega)
+                .or_overflow("total vega")?,
+            rho: self.rho.checked_add(other.rho).or_overflow("total rho")?,
+        })
+    }
+
+    /// The field by field difference of two portfolios.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when a total overflows.
+    pub fn checked_sub(self, other: Self) -> MMResult<Self> {
+        Ok(Self {
+            delta: self
+                .delta
+                .checked_sub(other.delta)
+                .or_overflow("total delta")?,
+            gamma: self
+                .gamma
+                .checked_sub(other.gamma)
+                .or_overflow("total gamma")?,
+            theta: self
+                .theta
+                .checked_sub(other.theta)
+                .or_overflow("total theta")?,
+            vega: self
+                .vega
+                .checked_sub(other.vega)
+                .or_overflow("total vega")?,
+            rho: self.rho.checked_sub(other.rho).or_overflow("total rho")?,
+        })
+    }
+
+    /// The Greeks of one position as a portfolio.
+    fn of_position(position: PositionGreeks) -> Self {
+        Self {
+            delta: position.delta,
+            gamma: position.gamma,
+            theta: position.theta,
+            vega: position.vega,
+            rho: position.rho,
+        }
     }
 
     /// Calculates the dollar delta (delta exposure in currency terms).
@@ -190,9 +277,20 @@ impl PortfolioGreeks {
     /// # Returns
     ///
     /// The dollar value of delta exposure.
-    #[must_use]
-    pub fn dollar_delta(&self, underlying_price: Decimal, multiplier: Decimal) -> Decimal {
-        self.delta * underlying_price * multiplier
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the exposure overflows.
+    pub fn dollar_delta(
+        &self,
+        underlying_price: Decimal,
+        multiplier: Decimal,
+    ) -> MMResult<Decimal> {
+        self.delta
+            .checked_mul(underlying_price)
+            .and_then(|x| x.checked_mul(multiplier))
+            .or_overflow("dollar delta")
     }
 
     /// Calculates the dollar gamma (gamma exposure in currency terms).
@@ -205,12 +303,28 @@ impl PortfolioGreeks {
     /// # Returns
     ///
     /// The dollar value of gamma exposure (P&L change for 1% move squared).
-    #[must_use]
-    pub fn dollar_gamma(&self, underlying_price: Decimal, multiplier: Decimal) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the exposure overflows.
+    pub fn dollar_gamma(
+        &self,
+        underlying_price: Decimal,
+        multiplier: Decimal,
+    ) -> MMResult<Decimal> {
         // Dollar gamma = 0.5 * gamma * S^2 * multiplier / 100
         // This gives the P&L impact for a 1% move in the underlying
-        let one_pct_move = underlying_price * dec!(0.01);
-        dec!(0.5) * self.gamma * one_pct_move * one_pct_move * multiplier
+        let one_pct_move = underlying_price.checked_mul(dec!(0.01));
+        one_pct_move
+            .and_then(|m| {
+                dec!(0.5)
+                    .checked_mul(self.gamma)?
+                    .checked_mul(m)?
+                    .checked_mul(m)?
+                    .checked_mul(multiplier)
+            })
+            .or_overflow("dollar gamma")
     }
 
     /// Calculates the dollar vega (vega exposure in currency terms).
@@ -222,9 +336,13 @@ impl PortfolioGreeks {
     /// # Returns
     ///
     /// The dollar value of vega exposure (P&L change for 1% vol move).
-    #[must_use]
-    pub fn dollar_vega(&self, multiplier: Decimal) -> Decimal {
-        self.vega * multiplier
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the exposure overflows.
+    pub fn dollar_vega(&self, multiplier: Decimal) -> MMResult<Decimal> {
+        self.vega.checked_mul(multiplier).or_overflow("dollar vega")
     }
 
     /// Calculates the dollar theta (daily time decay in currency terms).
@@ -236,9 +354,15 @@ impl PortfolioGreeks {
     /// # Returns
     ///
     /// The dollar value of daily theta decay.
-    #[must_use]
-    pub fn dollar_theta(&self, multiplier: Decimal) -> Decimal {
-        self.theta * multiplier
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the exposure overflows.
+    pub fn dollar_theta(&self, multiplier: Decimal) -> MMResult<Decimal> {
+        self.theta
+            .checked_mul(multiplier)
+            .or_overflow("dollar theta")
     }
 
     /// Resets all Greeks to zero.
@@ -273,64 +397,23 @@ impl PortfolioGreeks {
     /// # Returns
     ///
     /// Number of shares to buy (positive) or sell (negative) to neutralize delta.
-    #[must_use]
-    pub fn shares_to_hedge(&self, multiplier: Decimal) -> Decimal {
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// when the number of shares overflows.
+    pub fn shares_to_hedge(&self, multiplier: Decimal) -> MMResult<Decimal> {
         // Negative because we need to take opposite position
-        -self.delta * multiplier
-    }
-}
-
-impl std::ops::Add for PortfolioGreeks {
-    type Output = Self;
-
-    fn add(self, other: Self) -> Self {
-        Self {
-            delta: self.delta + other.delta,
-            gamma: self.gamma + other.gamma,
-            theta: self.theta + other.theta,
-            vega: self.vega + other.vega,
-            rho: self.rho + other.rho,
-        }
-    }
-}
-
-impl std::ops::AddAssign for PortfolioGreeks {
-    fn add_assign(&mut self, other: Self) {
-        self.delta += other.delta;
-        self.gamma += other.gamma;
-        self.theta += other.theta;
-        self.vega += other.vega;
-        self.rho += other.rho;
-    }
-}
-
-impl std::ops::Sub for PortfolioGreeks {
-    type Output = Self;
-
-    fn sub(self, other: Self) -> Self {
-        Self {
-            delta: self.delta - other.delta,
-            gamma: self.gamma - other.gamma,
-            theta: self.theta - other.theta,
-            vega: self.vega - other.vega,
-            rho: self.rho - other.rho,
-        }
-    }
-}
-
-impl std::ops::SubAssign for PortfolioGreeks {
-    fn sub_assign(&mut self, other: Self) {
-        self.delta -= other.delta;
-        self.gamma -= other.gamma;
-        self.theta -= other.theta;
-        self.vega -= other.vega;
-        self.rho -= other.rho;
+        negate(self.delta)
+            .checked_mul(multiplier)
+            .or_overflow("shares to hedge")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::error::MMError;
 
     #[test]
     fn test_position_greeks_new() {
@@ -349,7 +432,7 @@ mod tests {
         let greeks =
             PositionGreeks::new(dec!(0.5), dec!(0.02), dec!(-0.05), dec!(0.15), dec!(0.08));
 
-        let scaled = greeks.scale(dec!(10.0));
+        let scaled = greeks.scale(dec!(10.0)).unwrap();
 
         assert_eq!(scaled.delta, dec!(5.0));
         assert_eq!(scaled.gamma, dec!(0.2));
@@ -365,7 +448,7 @@ mod tests {
         let greeks =
             PositionGreeks::new(dec!(0.5), dec!(0.02), dec!(-0.05), dec!(0.15), dec!(0.08));
 
-        portfolio.add(&greeks, dec!(10.0));
+        portfolio.add(&greeks, dec!(10.0)).unwrap();
 
         assert_eq!(portfolio.delta, dec!(5.0));
         assert_eq!(portfolio.gamma, dec!(0.2));
@@ -381,8 +464,8 @@ mod tests {
         let greeks =
             PositionGreeks::new(dec!(0.5), dec!(0.02), dec!(-0.05), dec!(0.15), dec!(0.08));
 
-        portfolio.add(&greeks, dec!(10.0));
-        portfolio.remove(&greeks, dec!(5.0));
+        portfolio.add(&greeks, dec!(10.0)).unwrap();
+        portfolio.remove(&greeks, dec!(5.0)).unwrap();
 
         assert_eq!(portfolio.delta, dec!(2.5));
         assert_eq!(portfolio.gamma, dec!(0.1));
@@ -396,7 +479,7 @@ mod tests {
         let mut portfolio = PortfolioGreeks::new();
         portfolio.delta = dec!(10.0);
 
-        let dollar_delta = portfolio.dollar_delta(dec!(100.0), dec!(100.0));
+        let dollar_delta = portfolio.dollar_delta(dec!(100.0), dec!(100.0)).unwrap();
 
         assert_eq!(dollar_delta, dec!(100000.0)); // 10 * 100 * 100
     }
@@ -418,7 +501,7 @@ mod tests {
         let mut portfolio = PortfolioGreeks::new();
         portfolio.delta = dec!(10.0);
 
-        let shares = portfolio.shares_to_hedge(dec!(100.0));
+        let shares = portfolio.shares_to_hedge(dec!(100.0)).unwrap();
 
         assert_eq!(shares, dec!(-1000.0)); // Need to sell 1000 shares
     }
@@ -441,11 +524,11 @@ mod tests {
             rho: dec!(0.02),
         };
 
-        let sum = p1 + p2;
+        let sum = p1.checked_add(p2).unwrap();
         assert_eq!(sum.delta, dec!(3.0));
         assert_eq!(sum.gamma, dec!(0.3));
 
-        let diff = p2 - p1;
+        let diff = p2.checked_sub(p1).unwrap();
         assert_eq!(diff.delta, dec!(1.0));
         assert_eq!(diff.gamma, dec!(0.1));
     }
@@ -467,5 +550,196 @@ mod tests {
         assert_eq!(portfolio.theta, Decimal::ZERO);
         assert_eq!(portfolio.vega, Decimal::ZERO);
         assert_eq!(portfolio.rho, Decimal::ZERO);
+    }
+
+    fn overflow(what: &str) -> MMError {
+        MMError::NumericalError(format!("{what} overflows"))
+    }
+
+    /// One position per field, with only that field at the bound.
+    fn each_greek_at_max() -> [(&'static str, PositionGreeks); 5] {
+        let zero = PositionGreeks::zero();
+        [
+            (
+                "delta",
+                PositionGreeks {
+                    delta: Decimal::MAX,
+                    ..zero
+                },
+            ),
+            (
+                "gamma",
+                PositionGreeks {
+                    gamma: Decimal::MAX,
+                    ..zero
+                },
+            ),
+            (
+                "theta",
+                PositionGreeks {
+                    theta: Decimal::MAX,
+                    ..zero
+                },
+            ),
+            (
+                "vega",
+                PositionGreeks {
+                    vega: Decimal::MAX,
+                    ..zero
+                },
+            ),
+            (
+                "rho",
+                PositionGreeks {
+                    rho: Decimal::MAX,
+                    ..zero
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_position_greeks_scale_overflow_names_the_field() {
+        for (name, greeks) in each_greek_at_max() {
+            assert_eq!(
+                greeks.scale(dec!(2)),
+                Err(overflow(&format!("scaled {name}")))
+            );
+        }
+    }
+
+    #[test]
+    fn test_portfolio_add_scale_overflow_leaves_portfolio_unchanged() {
+        let start = PortfolioGreeks {
+            delta: dec!(1),
+            ..PortfolioGreeks::new()
+        };
+        for (name, greeks) in each_greek_at_max() {
+            let expected = Err(overflow(&format!("scaled {name}")));
+            let mut portfolio = start;
+            assert_eq!(portfolio.add(&greeks, dec!(2)), expected);
+            assert_eq!(portfolio, start);
+            assert_eq!(portfolio.remove(&greeks, dec!(2)), expected);
+            assert_eq!(portfolio, start);
+        }
+    }
+
+    #[test]
+    fn test_portfolio_add_total_overflow_leaves_portfolio_unchanged() {
+        // Delta fits; the overflow of the last field must not leave it applied.
+        let mut portfolio = PortfolioGreeks {
+            delta: dec!(1),
+            rho: Decimal::MAX,
+            ..PortfolioGreeks::new()
+        };
+        let start = portfolio;
+        let greeks = PositionGreeks::new(dec!(1), dec!(0), dec!(0), dec!(0), Decimal::MAX);
+        assert_eq!(portfolio.add(&greeks, dec!(1)), Err(overflow("total rho")));
+        assert_eq!(portfolio, start);
+    }
+
+    #[test]
+    fn test_portfolio_remove_total_overflow_leaves_portfolio_unchanged() {
+        let mut portfolio = PortfolioGreeks {
+            delta: dec!(1),
+            rho: Decimal::MIN,
+            ..PortfolioGreeks::new()
+        };
+        let start = portfolio;
+        let greeks = PositionGreeks::new(dec!(1), dec!(0), dec!(0), dec!(0), Decimal::MAX);
+        assert_eq!(
+            portfolio.remove(&greeks, dec!(1)),
+            Err(overflow("total rho"))
+        );
+        assert_eq!(portfolio, start);
+    }
+
+    #[test]
+    fn test_portfolio_checked_ops_overflow_names_the_field() {
+        for (name, greeks) in each_greek_at_max() {
+            let high = PortfolioGreeks::of_position(greeks);
+            let low = PortfolioGreeks::new().checked_sub(high).unwrap();
+            let expected = Err(overflow(&format!("total {name}")));
+            assert_eq!(high.checked_add(high), expected);
+            assert_eq!(low.checked_add(low), expected);
+            assert_eq!(high.checked_sub(low), expected);
+            assert_eq!(low.checked_sub(high), expected);
+        }
+    }
+
+    #[test]
+    fn test_portfolio_dollar_values_overflow() {
+        let max = PortfolioGreeks {
+            delta: Decimal::MAX,
+            gamma: Decimal::MAX,
+            theta: Decimal::MAX,
+            vega: Decimal::MAX,
+            rho: dec!(0),
+        };
+        assert_eq!(
+            max.dollar_delta(dec!(2), dec!(1)),
+            Err(overflow("dollar delta"))
+        );
+        assert_eq!(
+            max.dollar_delta(dec!(1), dec!(2)),
+            Err(overflow("dollar delta"))
+        );
+        assert_eq!(max.dollar_vega(dec!(2)), Err(overflow("dollar vega")));
+        assert_eq!(max.dollar_theta(dec!(2)), Err(overflow("dollar theta")));
+    }
+
+    #[test]
+    fn test_portfolio_dollar_gamma_overflow_at_each_step() {
+        let portfolio = |gamma| PortfolioGreeks {
+            gamma,
+            ..PortfolioGreeks::new()
+        };
+        let expected = Err(overflow("dollar gamma"));
+        // The first product with the 1% move: 5e19 * 1e10.
+        assert_eq!(
+            portfolio(dec!(1e20)).dollar_gamma(dec!(1e12), dec!(1)),
+            expected
+        );
+        // The second: 1 * 1e15 * 1e15.
+        assert_eq!(
+            portfolio(dec!(2)).dollar_gamma(dec!(1e17), dec!(1)),
+            expected
+        );
+        // The product with the multiplier: 1 * 1 * 1 * 2 MAX.
+        assert_eq!(
+            portfolio(dec!(2)).dollar_gamma(dec!(100), Decimal::MAX),
+            Ok(Decimal::MAX)
+        );
+        assert_eq!(
+            portfolio(dec!(4)).dollar_gamma(dec!(100), Decimal::MAX),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_portfolio_dollar_gamma_unchanged_on_ordinary_input() {
+        let portfolio = PortfolioGreeks {
+            gamma: dec!(0.04),
+            ..PortfolioGreeks::new()
+        };
+        // 0.5 * 0.04 * 1 * 1 * 100
+        assert_eq!(
+            portfolio.dollar_gamma(dec!(100), dec!(100)).unwrap(),
+            dec!(2)
+        );
+    }
+
+    #[test]
+    fn test_portfolio_shares_to_hedge_overflow() {
+        let portfolio = PortfolioGreeks {
+            delta: Decimal::MAX,
+            ..PortfolioGreeks::new()
+        };
+        assert_eq!(
+            portfolio.shares_to_hedge(dec!(2)),
+            Err(overflow("shares to hedge"))
+        );
+        // The bound itself negates exactly.
+        assert_eq!(portfolio.shares_to_hedge(dec!(1)), Ok(Decimal::MIN));
     }
 }

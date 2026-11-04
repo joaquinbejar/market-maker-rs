@@ -20,12 +20,10 @@
 //! )?;
 //! ```
 
-// TODO(#166): legacy pricing arithmetic, converted in #166
-#![allow(clippy::arithmetic_side_effects)]
-
 use crate::Decimal;
 use crate::options::adapter::OptionsAdapter;
 use crate::options::greeks::{PortfolioGreeks, PositionGreeks};
+use crate::types::decimal::{OrOverflow, negate};
 use crate::types::error::MMResult;
 use optionstratlib::model::option::Options;
 use rust_decimal_macros::dec;
@@ -137,7 +135,7 @@ impl HedgeOrder {
     /// Creates an underlying hedge order.
     #[must_use]
     pub fn underlying(symbol: String, quantity: Decimal, price: Decimal) -> Self {
-        let delta_impact = -quantity; // Underlying has delta of 1
+        let delta_impact = negate(quantity); // Underlying has delta of 1
         Self {
             symbol,
             quantity,
@@ -282,12 +280,17 @@ pub trait OptionsMarketMaker {
     /// # Returns
     ///
     /// A tuple of (bid_adjustment, ask_adjustment) as multipliers.
+    ///
+    /// # Errors
+    ///
+    /// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+    /// for a zero delta or gamma limit, and when a utilization overflows.
     fn calculate_skew_adjustment(
         &self,
         option_greeks: &PositionGreeks,
         portfolio_greeks: &PortfolioGreeks,
         risk_limits: &GreeksLimits,
-    ) -> (Decimal, Decimal);
+    ) -> MMResult<(Decimal, Decimal)>;
 }
 
 /// Implementation of options market making.
@@ -317,35 +320,43 @@ impl OptionsMarketMakerImpl {
     /// Calculates gamma-based spread adjustment.
     ///
     /// ATM options have higher gamma and require wider spreads.
-    fn gamma_spread_adjustment(&self, option: &Options, gamma: Decimal) -> Decimal {
+    fn gamma_spread_adjustment(&self, option: &Options, gamma: Decimal) -> MMResult<Decimal> {
         let underlying = option.underlying_price.to_dec();
         let strike = option.strike_price.to_dec();
 
         // Check if ATM
-        let is_atm = OptionsAdapter::is_atm(underlying, strike, self.config.atm_tolerance);
+        let is_atm = OptionsAdapter::is_atm(underlying, strike, self.config.atm_tolerance)?;
 
-        if is_atm {
-            // ATM options get wider spreads due to higher gamma risk
-            gamma.abs() * self.config.gamma_spread_multiplier * dec!(0.01)
-        } else {
-            // OTM/ITM options have lower gamma, smaller adjustment
-            gamma.abs() * self.config.gamma_spread_multiplier * dec!(0.005)
-        }
+        // ATM options get wider spreads due to higher gamma risk; OTM/ITM
+        // options have lower gamma, smaller adjustment
+        let rate = if is_atm { dec!(0.01) } else { dec!(0.005) };
+        gamma
+            .abs()
+            .checked_mul(self.config.gamma_spread_multiplier)
+            .and_then(|x| x.checked_mul(rate))
+            .or_overflow("gamma spread adjustment")
     }
 
     /// Calculates vega-based spread adjustment.
     ///
     /// Higher vega options need wider spreads in volatile markets.
-    fn vega_spread_adjustment(&self, vega: Decimal) -> Decimal {
-        vega.abs() * self.config.vega_spread_multiplier * dec!(0.001)
+    fn vega_spread_adjustment(&self, vega: Decimal) -> MMResult<Decimal> {
+        vega.abs()
+            .checked_mul(self.config.vega_spread_multiplier)
+            .and_then(|x| x.checked_mul(dec!(0.001)))
+            .or_overflow("vega spread adjustment")
     }
 
     /// Calculates theta-based spread adjustment.
     ///
     /// Options with high theta decay may need adjusted spreads.
-    fn theta_spread_adjustment(&self, theta: Decimal) -> Decimal {
+    fn theta_spread_adjustment(&self, theta: Decimal) -> MMResult<Decimal> {
         // Theta is typically negative, so we use absolute value
-        theta.abs() * self.config.theta_spread_multiplier * dec!(0.01)
+        theta
+            .abs()
+            .checked_mul(self.config.theta_spread_multiplier)
+            .and_then(|x| x.checked_mul(dec!(0.01)))
+            .or_overflow("theta spread adjustment")
     }
 
     /// Clamps spread to configured min/max bounds.
@@ -358,6 +369,26 @@ impl OptionsMarketMakerImpl {
             spread
         }
     }
+}
+
+/// Makes a quote positive and uncrossed: a bid that is not positive becomes
+/// one cent, and an ask not above the bid becomes one cent above it.
+///
+/// # Errors
+///
+/// [`MMError::NumericalError`](crate::types::error::MMError::NumericalError)
+/// when no representable ask is above the bid.
+fn positive_uncrossed(bid: Decimal, ask: Decimal) -> MMResult<(Decimal, Decimal)> {
+    let final_bid = if bid > Decimal::ZERO { bid } else { dec!(0.01) };
+    if ask > final_bid {
+        return Ok((final_bid, ask));
+    }
+    // The filter catches a cent rounded away at the top of the range.
+    let final_ask = final_bid
+        .checked_add(dec!(0.01))
+        .filter(|ask| *ask > final_bid)
+        .or_overflow("ask above the bid")?;
+    Ok((final_bid, final_ask))
 }
 
 impl OptionsMarketMaker for OptionsMarketMakerImpl {
@@ -378,24 +409,26 @@ impl OptionsMarketMaker for OptionsMarketMakerImpl {
 
         // Calculate skew adjustments based on portfolio exposure
         let (bid_adj, ask_adj) =
-            self.calculate_skew_adjustment(&option_greeks, portfolio_greeks, risk_limits);
+            self.calculate_skew_adjustment(&option_greeks, portfolio_greeks, risk_limits)?;
 
         // Calculate half spread
-        let half_spread = theo * spread_pct / dec!(2.0);
+        let half_spread = theo
+            .checked_mul(spread_pct)
+            .and_then(|x| x.checked_div(dec!(2.0)))
+            .or_overflow("half spread")?;
 
         // Apply skew adjustments
-        let bid = theo - half_spread * bid_adj;
-        let ask = theo + half_spread * ask_adj;
+        let bid = half_spread
+            .checked_mul(bid_adj)
+            .and_then(|x| theo.checked_sub(x))
+            .or_overflow("bid")?;
+        let ask = half_spread
+            .checked_mul(ask_adj)
+            .and_then(|x| theo.checked_add(x))
+            .or_overflow("ask")?;
 
         // Ensure bid < ask and both are positive
-        let final_bid = if bid > Decimal::ZERO { bid } else { dec!(0.01) };
-        let final_ask = if ask > final_bid {
-            ask
-        } else {
-            final_bid + dec!(0.01)
-        };
-
-        Ok((final_bid, final_ask))
+        positive_uncrossed(bid, ask)
     }
 
     fn calculate_options_spread(
@@ -403,21 +436,25 @@ impl OptionsMarketMaker for OptionsMarketMakerImpl {
         option: &Options,
         option_greeks: &PositionGreeks,
     ) -> MMResult<Decimal> {
-        // Start with base spread
-        let mut spread = self.config.base_spread_pct;
+        let gamma_adj = self.gamma_spread_adjustment(option, option_greeks.gamma)?;
+        let vega_adj = self.vega_spread_adjustment(option_greeks.vega)?;
+        let theta_adj = self.theta_spread_adjustment(option_greeks.theta)?;
 
-        // Add gamma-based adjustment
-        spread += self.gamma_spread_adjustment(option, option_greeks.gamma);
-
-        // Add vega-based adjustment
-        spread += self.vega_spread_adjustment(option_greeks.vega);
-
-        // Add theta-based adjustment
-        spread += self.theta_spread_adjustment(option_greeks.theta);
+        // Start with base spread, then add the gamma, vega and theta based
+        // adjustments
+        let mut spread = self
+            .config
+            .base_spread_pct
+            .checked_add(gamma_adj)
+            .and_then(|x| x.checked_add(vega_adj))
+            .and_then(|x| x.checked_add(theta_adj))
+            .or_overflow("options spread")?;
 
         // Apply put/call skew if it's a put
         if option.option_style == optionstratlib::OptionStyle::Put {
-            spread *= self.config.put_call_skew_factor;
+            spread = spread
+                .checked_mul(self.config.put_call_skew_factor)
+                .or_overflow("options spread")?;
         }
 
         // Clamp to bounds
@@ -433,7 +470,7 @@ impl OptionsMarketMaker for OptionsMarketMakerImpl {
         let mut hedges = Vec::new();
 
         // Calculate shares needed to hedge
-        let shares_to_hedge = portfolio_greeks.shares_to_hedge(self.config.contract_multiplier);
+        let shares_to_hedge = portfolio_greeks.shares_to_hedge(self.config.contract_multiplier)?;
 
         if shares_to_hedge.abs() < dec!(1.0) {
             // No significant hedge needed
@@ -457,35 +494,47 @@ impl OptionsMarketMaker for OptionsMarketMakerImpl {
         option_greeks: &PositionGreeks,
         portfolio_greeks: &PortfolioGreeks,
         risk_limits: &GreeksLimits,
-    ) -> (Decimal, Decimal) {
+    ) -> MMResult<(Decimal, Decimal)> {
         let mut bid_adj = dec!(1.0);
         let mut ask_adj = dec!(1.0);
 
+        // A utilization is at most `Decimal::MAX`, so an adjustment is at most
+        // `1 + 0.5 * MAX + 0.3 * MAX`: the saturating operations below never
+        // saturate. Only the utilizations themselves can fail.
+
         // If we're long delta and this option adds more long delta,
         // widen the bid (less aggressive buying) and tighten the ask (more aggressive selling)
-        let delta_utilization = portfolio_greeks.delta / risk_limits.max_delta;
+        let delta_utilization = portfolio_greeks
+            .delta
+            .checked_div(risk_limits.max_delta)
+            .or_overflow("delta utilization")?;
 
         if delta_utilization.abs() > dec!(0.5) {
             // We're using more than 50% of delta capacity
+            let widen = delta_utilization.abs().saturating_mul(dec!(0.5));
+            let tighten = delta_utilization.abs().saturating_mul(dec!(0.2));
             if portfolio_greeks.delta > Decimal::ZERO && option_greeks.delta > Decimal::ZERO {
                 // Long delta portfolio, long delta option - widen bid
-                bid_adj += delta_utilization.abs() * dec!(0.5);
-                ask_adj -= delta_utilization.abs() * dec!(0.2);
+                bid_adj = bid_adj.saturating_add(widen);
+                ask_adj = ask_adj.saturating_sub(tighten);
             } else if portfolio_greeks.delta < Decimal::ZERO && option_greeks.delta < Decimal::ZERO
             {
                 // Short delta portfolio, short delta option - widen ask
-                ask_adj += delta_utilization.abs() * dec!(0.5);
-                bid_adj -= delta_utilization.abs() * dec!(0.2);
+                ask_adj = ask_adj.saturating_add(widen);
+                bid_adj = bid_adj.saturating_sub(tighten);
             }
         }
 
         // Similar logic for gamma
-        let gamma_utilization = portfolio_greeks.gamma / risk_limits.max_gamma;
+        let gamma_utilization = portfolio_greeks
+            .gamma
+            .checked_div(risk_limits.max_gamma)
+            .or_overflow("gamma utilization")?;
         if gamma_utilization.abs() > dec!(0.5) {
             // High gamma exposure - widen both sides
-            let gamma_adj = gamma_utilization.abs() * dec!(0.3);
-            bid_adj += gamma_adj;
-            ask_adj += gamma_adj;
+            let gamma_adj = gamma_utilization.abs().saturating_mul(dec!(0.3));
+            bid_adj = bid_adj.saturating_add(gamma_adj);
+            ask_adj = ask_adj.saturating_add(gamma_adj);
         }
 
         // Ensure adjustments are positive
@@ -500,13 +549,14 @@ impl OptionsMarketMaker for OptionsMarketMakerImpl {
             dec!(0.5)
         };
 
-        (bid_adj, ask_adj)
+        Ok((bid_adj, ask_adj))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::error::MMError;
     use optionstratlib::model::ExpirationDate;
     use optionstratlib::model::types::{OptionStyle, OptionType, Side};
     use optionstratlib::prelude::pos_or_panic;
@@ -649,7 +699,9 @@ mod tests {
             dec!(0.08),  // rho
         );
 
-        let (bid_adj, _ask_adj) = mm.calculate_skew_adjustment(&option_greeks, &portfolio, &limits);
+        let (bid_adj, _ask_adj) = mm
+            .calculate_skew_adjustment(&option_greeks, &portfolio, &limits)
+            .unwrap();
 
         // Bid should be widened (higher multiplier) when adding more long delta
         assert!(bid_adj > dec!(1.0));
@@ -660,13 +712,13 @@ mod tests {
         let mm = OptionsMarketMakerImpl::default_config();
         let option = create_test_option(); // ATM option
 
-        let atm_adjustment = mm.gamma_spread_adjustment(&option, dec!(0.05));
+        let atm_adjustment = mm.gamma_spread_adjustment(&option, dec!(0.05)).unwrap();
 
         // Create OTM option
         let mut otm_option = create_test_option();
         otm_option.strike_price = pos_or_panic!(120.0); // 20% OTM
 
-        let otm_adjustment = mm.gamma_spread_adjustment(&otm_option, dec!(0.05));
+        let otm_adjustment = mm.gamma_spread_adjustment(&otm_option, dec!(0.05)).unwrap();
 
         // ATM should have higher adjustment than OTM
         assert!(atm_adjustment > otm_adjustment);
@@ -684,5 +736,273 @@ mod tests {
 
         // Within bounds
         assert_eq!(mm.clamp_spread(dec!(0.05)), dec!(0.05));
+    }
+
+    fn overflow(what: &str) -> MMError {
+        MMError::NumericalError(format!("{what} overflows"))
+    }
+
+    fn with_config(config: OptionsMarketMakerConfig) -> OptionsMarketMakerImpl {
+        OptionsMarketMakerImpl::new(config)
+    }
+
+    fn unit_greeks() -> PositionGreeks {
+        PositionGreeks::new(dec!(1), dec!(2), dec!(-2), dec!(2), dec!(0))
+    }
+
+    #[test]
+    fn test_hedge_order_underlying_negates_at_the_bound() {
+        let hedge = HedgeOrder::underlying("SPY".to_string(), Decimal::MIN, dec!(1));
+        assert_eq!(hedge.delta_impact, Decimal::MAX);
+    }
+
+    #[test]
+    fn test_spread_adjustments_overflow() {
+        let mm = with_config(OptionsMarketMakerConfig {
+            gamma_spread_multiplier: Decimal::MAX,
+            vega_spread_multiplier: Decimal::MAX,
+            theta_spread_multiplier: Decimal::MAX,
+            ..Default::default()
+        });
+        assert_eq!(
+            mm.gamma_spread_adjustment(&create_test_option(), dec!(2)),
+            Err(overflow("gamma spread adjustment"))
+        );
+        assert_eq!(
+            mm.vega_spread_adjustment(dec!(2)),
+            Err(overflow("vega spread adjustment"))
+        );
+        assert_eq!(
+            mm.theta_spread_adjustment(dec!(-2)),
+            Err(overflow("theta spread adjustment"))
+        );
+    }
+
+    #[test]
+    fn test_calculate_options_spread_propagates_adjustment_overflow() {
+        let option = create_test_option();
+        for (config, what) in [
+            (
+                OptionsMarketMakerConfig {
+                    gamma_spread_multiplier: Decimal::MAX,
+                    ..Default::default()
+                },
+                "gamma spread adjustment",
+            ),
+            (
+                OptionsMarketMakerConfig {
+                    vega_spread_multiplier: Decimal::MAX,
+                    ..Default::default()
+                },
+                "vega spread adjustment",
+            ),
+            (
+                OptionsMarketMakerConfig {
+                    theta_spread_multiplier: Decimal::MAX,
+                    ..Default::default()
+                },
+                "theta spread adjustment",
+            ),
+        ] {
+            assert_eq!(
+                with_config(config).calculate_options_spread(&option, &unit_greeks()),
+                Err(overflow(what))
+            );
+        }
+    }
+
+    #[test]
+    fn test_calculate_options_spread_sum_overflow() {
+        let mm = with_config(OptionsMarketMakerConfig {
+            base_spread_pct: Decimal::MAX,
+            ..Default::default()
+        });
+        // One addend at a time, each large enough not to round away at the
+        // bound: gamma 4, vega 1 and theta 2 with the default multipliers.
+        for greeks in [
+            PositionGreeks::new(dec!(0), dec!(200), dec!(0), dec!(0), dec!(0)),
+            PositionGreeks::new(dec!(0), dec!(0), dec!(0), dec!(2000), dec!(0)),
+            PositionGreeks::new(dec!(0), dec!(0), dec!(-2000), dec!(0), dec!(0)),
+        ] {
+            assert_eq!(
+                mm.calculate_options_spread(&create_test_option(), &greeks),
+                Err(overflow("options spread"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_calculate_options_spread_put_skew_overflow() {
+        let mm = with_config(OptionsMarketMakerConfig {
+            base_spread_pct: dec!(2),
+            put_call_skew_factor: Decimal::MAX,
+            max_spread_pct: Decimal::MAX,
+            ..Default::default()
+        });
+        let mut put = create_test_option();
+        put.option_style = OptionStyle::Put;
+        assert_eq!(
+            mm.calculate_options_spread(&put, &unit_greeks()),
+            Err(overflow("options spread"))
+        );
+    }
+
+    /// A config whose spread is as large as `spread` whatever the Greeks.
+    fn fixed_spread(spread: Decimal) -> OptionsMarketMakerImpl {
+        with_config(OptionsMarketMakerConfig {
+            base_spread_pct: spread,
+            min_spread_pct: spread,
+            max_spread_pct: spread,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_quotes_half_spread_overflow() {
+        // The theoretical value is about 2.5, so its product with half the
+        // bound overflows.
+        let quotes = fixed_spread(Decimal::MAX / dec!(2)).calculate_greeks_adjusted_quotes(
+            &create_test_option(),
+            &PortfolioGreeks::new(),
+            &GreeksLimits::default(),
+        );
+        assert_eq!(quotes, Err(overflow("half spread")));
+    }
+
+    #[test]
+    fn test_quotes_bid_overflow() {
+        // The theoretical value is about 2.5, so the half spread is about
+        // 1/8 of the bound and a skew of 51 overflows.
+        let portfolio = PortfolioGreeks {
+            delta: dec!(10000),
+            ..PortfolioGreeks::new()
+        };
+        let quotes = fixed_spread(Decimal::MAX / dec!(10)).calculate_greeks_adjusted_quotes(
+            &create_test_option(),
+            &portfolio,
+            &GreeksLimits::default(),
+        );
+        assert_eq!(quotes, Err(overflow("bid")));
+    }
+
+    #[test]
+    fn test_quotes_ask_overflow() {
+        // A short delta portfolio and a short delta option widen the ask
+        // only, and the bid adjustment stays at its floor.
+        let portfolio = PortfolioGreeks {
+            delta: dec!(-10000),
+            ..PortfolioGreeks::new()
+        };
+        let mut put = create_test_option();
+        put.option_style = OptionStyle::Put;
+        let quotes = fixed_spread(Decimal::MAX / dec!(10)).calculate_greeks_adjusted_quotes(
+            &put,
+            &portfolio,
+            &GreeksLimits::default(),
+        );
+        assert_eq!(quotes, Err(overflow("ask")));
+    }
+
+    #[test]
+    fn test_positive_uncrossed() {
+        assert_eq!(positive_uncrossed(dec!(1), dec!(2)), Ok((dec!(1), dec!(2))));
+        // A bid that is not positive becomes a cent.
+        assert_eq!(
+            positive_uncrossed(dec!(-1), dec!(2)),
+            Ok((dec!(0.01), dec!(2)))
+        );
+        // A crossed ask becomes a cent above the bid.
+        assert_eq!(
+            positive_uncrossed(dec!(2), dec!(1)),
+            Ok((dec!(2), dec!(2.01)))
+        );
+    }
+
+    #[test]
+    fn test_positive_uncrossed_no_ask_above_the_bid() {
+        assert_eq!(
+            positive_uncrossed(Decimal::MAX, dec!(1)),
+            Err(overflow("ask above the bid"))
+        );
+    }
+
+    #[test]
+    fn test_calculate_delta_hedge_overflow() {
+        let mm = with_config(OptionsMarketMakerConfig {
+            contract_multiplier: Decimal::MAX,
+            ..Default::default()
+        });
+        let portfolio = PortfolioGreeks {
+            delta: dec!(2),
+            ..PortfolioGreeks::new()
+        };
+        assert_eq!(
+            mm.calculate_delta_hedge(&portfolio, dec!(100), "SPY")
+                .map(|hedges| hedges.len()),
+            Err(overflow("shares to hedge"))
+        );
+    }
+
+    #[test]
+    fn test_skew_adjustment_zero_limits_are_errors() {
+        let mm = OptionsMarketMakerImpl::default_config();
+        let portfolio = PortfolioGreeks::new();
+        let greeks = unit_greeks();
+        let zero_delta = GreeksLimits {
+            max_delta: Decimal::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(
+            mm.calculate_skew_adjustment(&greeks, &portfolio, &zero_delta),
+            Err(overflow("delta utilization"))
+        );
+        let zero_gamma = GreeksLimits {
+            max_gamma: Decimal::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(
+            mm.calculate_skew_adjustment(&greeks, &portfolio, &zero_gamma),
+            Err(overflow("gamma utilization"))
+        );
+    }
+
+    #[test]
+    fn test_skew_adjustment_utilization_overflow() {
+        let mm = OptionsMarketMakerImpl::default_config();
+        let tiny = Decimal::new(1, 28);
+        let limits = GreeksLimits {
+            max_delta: tiny,
+            ..Default::default()
+        };
+        let portfolio = PortfolioGreeks {
+            delta: Decimal::MAX,
+            ..PortfolioGreeks::new()
+        };
+        assert_eq!(
+            mm.calculate_skew_adjustment(&unit_greeks(), &portfolio, &limits),
+            Err(overflow("delta utilization"))
+        );
+    }
+
+    #[test]
+    fn test_skew_adjustment_at_maximum_utilization_does_not_saturate() {
+        // Delta and gamma both at the bound with unit limits: the bid
+        // adjustment is 1 + 0.5 MAX + 0.3 MAX.
+        let mm = OptionsMarketMakerImpl::default_config();
+        let limits = GreeksLimits {
+            max_delta: dec!(1),
+            max_gamma: dec!(1),
+            ..Default::default()
+        };
+        let portfolio = PortfolioGreeks {
+            delta: Decimal::MAX,
+            gamma: Decimal::MAX,
+            ..PortfolioGreeks::new()
+        };
+        let (bid_adj, ask_adj) = mm
+            .calculate_skew_adjustment(&unit_greeks(), &portfolio, &limits)
+            .unwrap();
+        assert!(bid_adj < Decimal::MAX);
+        assert!(bid_adj > ask_adj);
     }
 }
