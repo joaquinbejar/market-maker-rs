@@ -901,7 +901,7 @@ mod decoding {
     fn test_decode_model_refuses_inconsistent_states() {
         let base = model_json();
         assert!(model_ok(&base));
-        let edits: [fn(&mut Value); 9] = [
+        let edits: [fn(&mut Value); 11] = [
             |v| {
                 v["states"].as_array_mut().unwrap().pop();
             },
@@ -913,6 +913,8 @@ mod decoding {
             |v| v["states"][0]["fallback_within_moves"] = json!("-1"),
             |v| v["states"][1]["fallback_within_moves"] = json!("0.5"),
             |v| v["states"][1]["adjustment"] = json!("0.001"),
+            |v| v["states"][0]["status"] = json!("OutsideQuotes"),
+            |v| v["states"][0]["observations"] = json!(1),
         ];
         for (i, edit) in edits.iter().enumerate() {
             let mut bad = base.clone();
@@ -938,7 +940,12 @@ mod decoding {
     fn test_decode_calibrator_refuses_broken_counts() {
         let base = calibrator_json();
         assert!(calibrator_ok(&base));
-        let edits: [fn(&mut Value); 5] = [
+        let edits: [fn(&mut Value); 6] = [
+            // Moves a count between two cells, so that the sum still holds.
+            |v| {
+                v["stay"][2 * 3 + 2] = json!(4);
+                v["stay"][2 * 3] = json!(2);
+            },
             |v| v["moved"][2 * 3 + 2] = json!(50),
             |v| v["stay"][2 * 3 + 2] = json!(50),
             |v| v["move_half_ticks"][2] = json!(50),

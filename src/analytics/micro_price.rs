@@ -1531,11 +1531,14 @@ fn state_values_are_consistent(state: &StateEstimate) -> bool {
     in_range && consistent
 }
 
-/// A state's adjustments are the negatives of its mirror's.
+/// A state's adjustments are the negatives of its mirror's, with the same status
+/// and observations, so the signal stays antisymmetric.
 #[cfg(feature = "serde")]
 fn state_mirrors(state: &StateEstimate, mirror: Option<&StateEstimate>) -> bool {
     mirror.is_some_and(|m| {
-        state.adjustment.checked_add(m.adjustment) == Some(Decimal::ZERO)
+        state.status == m.status
+            && state.observations == m.observations
+            && state.adjustment.checked_add(m.adjustment) == Some(Decimal::ZERO)
             && state.first_adjustment.checked_add(m.first_adjustment) == Some(Decimal::ZERO)
     })
 }
