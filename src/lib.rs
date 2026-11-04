@@ -194,7 +194,9 @@
 //! - `instruments`: Contract specifications from `financial_types`
 //!   (`instruments` module): validated specifications, exact money and
 //!   dated venue snapshots; with `margin` too, their conversion into
-//!   `margin-rs` instruments (`instruments::margin`)
+//!   `margin-rs` instruments (`instruments::margin`). Both together need
+//!   `margin-rs` 0.1.1 or later: Cargo does not upgrade a lockfile at 0.1.0
+//!   by itself, so run `cargo update -p margin-rs`
 //! - `kernel`: The financial environment kernel (`backtest::kernel`): the
 //!   backtest engine's loop as a resumable, `Copy` state machine with a
 //!   canonical encoding, an agent-safe observation and an admission mask,

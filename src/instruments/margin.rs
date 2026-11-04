@@ -1,16 +1,20 @@
 //! Conversion of an [`InstrumentSpec`] into a `margin-rs` [`Instrument`].
 //!
-//! [`margin_instrument`] is a conversion only. It maps the fields exactly,
-//! with no rounding, rescaling or currency substitution, and returns a typed
-//! [`AdapterError`] for anything it cannot represent:
+//! [`margin_instrument`] delegates to `margin_rs::Instrument::from_spec`, so
+//! the mapping has one implementation, in `margin-rs`, and this module keeps
+//! the public types of this crate.
+//!
+//! It is a conversion only. It maps the fields exactly, with no rounding,
+//! rescaling or currency substitution, and returns a typed [`AdapterError`]
+//! for anything it cannot represent:
 //!
 //! | specification | `margin-rs` instrument | contract size |
 //! |---|---|---|
-//! | linear spot | [`SpotInstrument`]: base the underlying, quote the price asset | |
-//! | linear future | [`LinearFuture`], settled in the settlement asset | multiplier: the size amount |
-//! | linear perpetual | [`LinearPerpetual`] | multiplier: the size amount |
-//! | inverse future | [`InverseFuture`], settled in the settlement asset (the underlying) | contract value: the size amount |
-//! | inverse perpetual | [`InversePerpetual`] | contract value: the size amount |
+//! | linear spot | [`SpotInstrument`](margin_rs::SpotInstrument): base the underlying, quote the price asset | |
+//! | linear future | [`LinearFuture`](margin_rs::LinearFuture), settled in the settlement asset | multiplier: the size amount |
+//! | linear perpetual | [`LinearPerpetual`](margin_rs::LinearPerpetual) | multiplier: the size amount |
+//! | inverse future | [`InverseFuture`](margin_rs::InverseFuture), settled in the settlement asset (the underlying) | contract value: the size amount |
+//! | inverse perpetual | [`InversePerpetual`](margin_rs::InversePerpetual) | contract value: the size amount |
 //! | option | none: [`AdapterError::Unsupported`] | |
 //!
 //! The identifier and the asset codes go through the `margin-rs`
@@ -51,6 +55,22 @@
 //! Configure `min_quantity` as the lot to make the risk gate agree with the
 //! venue.
 //!
+//! # Which `margin-rs`
+//!
+//! This module needs a `margin-rs` with its `instruments` feature, 0.1.1 or
+//! later. The dependency stays `"0.1"`: with `margin` and `instruments` both
+//! on, Cargo refuses a version without that feature when it resolves, naming
+//! the missing feature, and `margin` alone still accepts 0.1.0. A lockfile
+//! already at 0.1.0 is not upgraded by itself: adding `instruments` fails to
+//! resolve until `cargo update -p margin-rs` is run.
+//!
+//! # Errors from `margin-rs`
+//!
+//! `From<MarginError>` for [`AdapterError`] is the only mapping, so a caller's
+//! own `?` on `Instrument::from_spec` gives the same typed variants as
+//! [`margin_instrument`]. The identifier those two `margin-rs` errors carry
+//! is dropped, because the public variants have no field for it.
+//!
 //! # Checks left to the ledger
 //!
 //! Some checks need the scale of the settlement asset, which a
@@ -64,11 +84,8 @@
 //!   price scale must not exceed 28.
 
 use financial_types::instrument::{ContractKind, InstrumentSpec, Margining};
-use margin_rs::{
-    Asset, Instrument, InstrumentId, InverseFuture, InversePerpetual, InverseTerms, LinearFuture,
-    LinearPerpetual, LinearTerms, MarginError, SpotInstrument,
-};
-use rust_decimal::Decimal;
+use margin_rs::instrument::InstrumentScales;
+use margin_rs::{Instrument, MarginError};
 
 /// The precision of a `margin-rs` instrument: the largest number of
 /// fractional digits it accepts.
@@ -106,30 +123,35 @@ pub enum AdapterError {
     },
     /// A `margin-rs` constructor refused a field.
     #[error(transparent)]
-    Margin(#[from] MarginError),
+    Margin(MarginError),
 }
 
-/// The number of fractional digits of `value`, trailing zeros ignored.
-fn digits(value: Decimal) -> u32 {
-    value.normalize().scale()
-}
-
-/// Checks that `given` holds the `required` digits of `grid`.
-fn check_scale(
-    field: &'static str,
-    grid: &'static str,
-    given: u32,
-    required: u32,
-) -> Result<(), AdapterError> {
-    if given < required {
-        return Err(AdapterError::ScaleBelowGrid {
-            field,
-            grid,
-            given,
-            required,
-        });
+/// The one mapping from a `margin-rs` error: its two specification errors
+/// become the typed variants above, without their instrument identifier, and
+/// everything else is [`AdapterError::Margin`].
+impl From<MarginError> for AdapterError {
+    fn from(error: MarginError) -> Self {
+        match error {
+            MarginError::UnsupportedSpec {
+                kind, margining, ..
+            } => Self::Unsupported { kind, margining },
+            MarginError::ScaleBelowGrid {
+                field,
+                grid,
+                given,
+                required,
+                ..
+            } => Self::ScaleBelowGrid {
+                field,
+                grid,
+                given,
+                required,
+            },
+            // `MarginError` is `#[non_exhaustive]` in `margin-rs`, so this
+            // arm is required; a variant added there stays `Margin`.
+            other => Self::Margin(other),
+        }
     }
-    Ok(())
 }
 
 /// Converts `spec` into a `margin-rs` instrument with the precision
@@ -150,77 +172,94 @@ pub fn margin_instrument(
     spec: &InstrumentSpec,
     scales: MarginScales,
 ) -> Result<Instrument, AdapterError> {
-    let (kind, margining) = (spec.kind(), spec.margining());
-    if kind == ContractKind::Option {
-        return Err(AdapterError::Unsupported { kind, margining });
-    }
-    let tick_digits = spec
-        .price_ticks()
-        .bands()
-        .iter()
-        .map(|band| digits(band.tick))
-        .max()
-        .unwrap_or(0);
-    check_scale(
-        "price_scale",
-        "price ticks",
-        scales.price_scale,
-        tick_digits,
-    )?;
-    check_scale(
-        "contract_scale",
-        "lot",
-        scales.contract_scale,
-        digits(spec.lot()),
-    )?;
+    let scales = InstrumentScales {
+        price_scale: scales.price_scale,
+        contract_scale: scales.contract_scale,
+    };
+    Ok(Instrument::from_spec(spec, scales)?)
+}
 
-    let MarginScales {
-        price_scale,
-        contract_scale,
-    } = scales;
-    let id = InstrumentId::new(spec.id().as_str())?;
-    let settlement = Asset::new(spec.settlement_asset().as_str())?;
-    let size = spec.size().amount();
-    let linear = || {
-        LinearTerms::new(
-            id.clone(),
-            settlement.clone(),
-            size,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use financial_types::OptionStyle;
+    use financial_types::instrument::InstrumentId as SpecId;
+    use financial_types::instrument::reference::{binance_usdm, deribit};
+    use margin_rs::InstrumentId;
+    use rust_decimal_macros::dec;
+
+    fn scales(price_scale: u32, contract_scale: u32) -> InstrumentScales {
+        InstrumentScales {
             price_scale,
             contract_scale,
+        }
+    }
+
+    #[test]
+    fn test_from_margin_error_gives_the_typed_variants() {
+        assert_eq!(
+            AdapterError::from(MarginError::UnsupportedSpec {
+                instrument: InstrumentId::new("X").unwrap(),
+                kind: ContractKind::Option,
+                margining: Margining::Inverse,
+            }),
+            AdapterError::Unsupported {
+                kind: ContractKind::Option,
+                margining: Margining::Inverse,
+            }
+        );
+        assert_eq!(
+            AdapterError::from(MarginError::ScaleBelowGrid {
+                instrument: InstrumentId::new("X").unwrap(),
+                field: "price_scale",
+                grid: "price ticks",
+                given: 0,
+                required: 1,
+            }),
+            AdapterError::ScaleBelowGrid {
+                field: "price_scale",
+                grid: "price ticks",
+                given: 0,
+                required: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_margin_error_keeps_any_other_error_as_margin() {
+        let error = MarginError::invalid_input("price_scale", "scale must be at most 18");
+        assert_eq!(
+            AdapterError::from(error.clone()),
+            AdapterError::Margin(error)
+        );
+    }
+
+    /// A caller's own `?` on `Instrument::from_spec` takes the same path as
+    /// `margin_instrument`.
+    #[test]
+    fn test_from_spec_errors_convert_as_margin_instrument_reports_them() {
+        let option = deribit::btc_option(
+            SpecId::new("BTC-27NOV26-100000-C").unwrap(),
+            1_795_766_400_000,
+            dec!(100000),
+            OptionStyle::Call,
         )
-    };
-    let inverse = || {
-        InverseTerms::new(
-            id.clone(),
-            settlement.clone(),
-            size,
-            price_scale,
-            contract_scale,
-        )
-    };
-    let instrument = match (kind, margining, spec.expiry_ms()) {
-        (ContractKind::Spot, Margining::Linear, None) => SpotInstrument::new(
-            id.clone(),
-            Asset::new(spec.underlying().as_str())?,
-            Asset::new(spec.price_asset().as_str())?,
-            price_scale,
-            contract_scale,
-        )?
-        .into(),
-        (ContractKind::Future, Margining::Linear, Some(expiry_ms)) => {
-            LinearFuture::new(linear()?, expiry_ms).into()
+        .unwrap();
+        let binance = binance_usdm::btcusdt_perpetual().unwrap();
+        for (spec, (price_scale, contract_scale)) in
+            [(&option, (4, 1)), (&binance, (0, 3)), (&binance, (19, 3))]
+        {
+            let direct = Instrument::from_spec(spec, scales(price_scale, contract_scale))
+                .map_err(AdapterError::from);
+            let adapter = margin_instrument(
+                spec,
+                MarginScales {
+                    price_scale,
+                    contract_scale,
+                },
+            );
+            assert!(adapter.is_err());
+            assert_eq!(adapter, direct);
         }
-        (ContractKind::Perpetual, Margining::Linear, None) => {
-            LinearPerpetual::new(linear()?).into()
-        }
-        (ContractKind::Future, Margining::Inverse, Some(expiry_ms)) => {
-            InverseFuture::new(inverse()?, expiry_ms).into()
-        }
-        (ContractKind::Perpetual, Margining::Inverse, None) => {
-            InversePerpetual::new(inverse()?).into()
-        }
-        _ => return Err(AdapterError::Unsupported { kind, margining }),
-    };
-    Ok(instrument)
+    }
 }
