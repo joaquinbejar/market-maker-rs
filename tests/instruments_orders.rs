@@ -95,7 +95,7 @@ fn check_order_refuses_another_instrument() {
     assert_eq!(
         check_order(&binance(), &order),
         Err(OrderSpecError::SymbolMismatch {
-            order: "BTC-PERPETUAL".to_string(),
+            symbol: "BTC-PERPETUAL".to_string(),
             instrument: "BTCUSDT".to_string(),
         })
     );
@@ -235,7 +235,7 @@ fn fill_notional_refuses_a_fill_of_another_instrument() {
     assert_eq!(
         fill_notional(&binance(), &other).unwrap_err(),
         OrderSpecError::SymbolMismatch {
-            order: "BTC-PERPETUAL".to_string(),
+            symbol: "BTC-PERPETUAL".to_string(),
             instrument: "BTCUSDT".to_string(),
         }
     );
@@ -252,15 +252,21 @@ fn fill_notional_refuses_a_fill_of_another_instrument() {
     ));
 }
 
+/// A record written before `Fill::symbol`.
 #[cfg(feature = "serde")]
-#[test]
-fn a_fill_recorded_before_the_symbol_is_refused() {
+fn fill_recorded_before_the_symbol() -> Fill {
     let old = r#"{"order_id":"o-1","trade_id":"t-1","price":"60000","quantity":"1",
         "side":"Buy","timestamp":1000,"fee":"0","fee_currency":"USDT"}"#;
     let decoded: Fill = serde_json::from_str(old).unwrap();
     assert_eq!(decoded.symbol, "");
+    decoded
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_fill_recorded_before_the_symbol_has_no_notional() {
     assert!(matches!(
-        fill_notional(&binance(), &decoded),
+        fill_notional(&binance(), &fill_recorded_before_the_symbol()),
         Err(OrderSpecError::SymbolMismatch { .. })
     ));
 }
@@ -417,7 +423,7 @@ mod ledger {
         assert_eq!(
             fill_execution(&binance(), &other).unwrap_err(),
             AdapterError::SymbolMismatch {
-                fill: "BTC-PERPETUAL".to_string(),
+                symbol: "BTC-PERPETUAL".to_string(),
                 instrument: "BTCUSDT".to_string(),
             }
         );
@@ -431,6 +437,15 @@ mod ledger {
         other.symbol = String::new();
         assert!(matches!(
             fill_execution(&binance(), &other),
+            Err(AdapterError::SymbolMismatch { .. })
+        ));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_fill_recorded_before_the_symbol_has_no_execution() {
+        assert!(matches!(
+            fill_execution(&binance(), &fill_recorded_before_the_symbol()),
             Err(AdapterError::SymbolMismatch { .. })
         ));
     }

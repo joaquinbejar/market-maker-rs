@@ -247,6 +247,9 @@ release.
   identifier of the specification (`OrderSpecError::SymbolMismatch`, the new
   `AdapterError::SymbolMismatch`), an empty one included, where a wrong
   specification used to give a wrong amount silently (#191).
+- `MockExchangeConnector::next_trade` names the symbol of `subscribe_trades`, and
+  without a subscription it is an error rather than a trade of no instrument;
+  `subscribe_trades` refuses an empty symbol (#191).
 - `ChainMarketMaker::generate_quote` and `refresh_all_quotes` enforce the chain
   risk status: while `RiskStatus::can_quote` is false they refuse with the new
   `MMError::QuotingHalted`, before anything is valued, and when the status

@@ -132,10 +132,10 @@ pub enum AdapterError {
     #[error(transparent)]
     Margin(MarginError),
     /// A fill is of another instrument.
-    #[error("fill of {fill} converted with the specification of {instrument}")]
+    #[error("fill of {symbol} converted with the specification of {instrument}")]
     SymbolMismatch {
         /// The fill's symbol.
-        fill: String,
+        symbol: String,
         /// The specification's identifier.
         instrument: String,
     },
@@ -251,7 +251,7 @@ pub fn margin_instrument(
 pub fn fill_execution(spec: &InstrumentSpec, fill: &Fill) -> Result<Execution, AdapterError> {
     if fill.symbol != spec.id().as_str() {
         return Err(AdapterError::SymbolMismatch {
-            fill: fill.symbol.clone(),
+            symbol: fill.symbol.clone(),
             instrument: spec.id().as_str().to_string(),
         });
     }

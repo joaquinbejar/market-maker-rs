@@ -38,10 +38,10 @@ use financial_types::Action;
 #[non_exhaustive]
 pub enum OrderSpecError {
     /// The order or the fill is of another instrument.
-    #[error("{order} checked against instrument {instrument}")]
+    #[error("symbol {symbol} checked against instrument {instrument}")]
     SymbolMismatch {
         /// The symbol of the order or the fill.
-        order: String,
+        symbol: String,
         /// The specification's identifier.
         instrument: String,
     },
@@ -91,7 +91,7 @@ pub enum OrderSpecError {
 pub fn check_order(spec: &InstrumentSpec, order: &OrderRequest) -> Result<(), OrderSpecError> {
     if order.symbol != spec.id().as_str() {
         return Err(OrderSpecError::SymbolMismatch {
-            order: order.symbol.clone(),
+            symbol: order.symbol.clone(),
             instrument: spec.id().as_str().to_string(),
         });
     }
@@ -127,7 +127,7 @@ pub fn check_order(spec: &InstrumentSpec, order: &OrderRequest) -> Result<(), Or
 pub fn fill_notional(spec: &InstrumentSpec, fill: &Fill) -> Result<MoneyRatio, OrderSpecError> {
     if fill.symbol != spec.id().as_str() {
         return Err(OrderSpecError::SymbolMismatch {
-            order: fill.symbol.clone(),
+            symbol: fill.symbol.clone(),
             instrument: spec.id().as_str().to_string(),
         });
     }
