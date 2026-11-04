@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The kernel can fill over several rows: `KernelFillModel::QueuePosition`
+  (with `KernelConfig::with_fill_model`) mirrors `QueuePositionFillModel` on
+  the lot grid, report for report, and produces `ExecKind::PartialFill`.
+  `CapacityNeed` has a new field, `partial_reports_per_order`: `DLV` must be at
+  least `(3 + partial_reports_per_order) * ORD`. It is zero for
+  `KernelFillModel::Immediate`, whose behaviour, encoding and recorded
+  trajectories are unchanged. `decode` checks that the queued fill reports of
+  each order add up (#177).
 - `strategy::signal_quote`: causal, bounded quote adjustment from imbalance,
   micro-price and VPIN features, with a declared policy for missing or stale
   values, composed with the Avellaneda-Stoikov quotes under the risk limits,

@@ -14,8 +14,8 @@ use super::book::{
     Blank, Delivery, ExecKind, FillRec, MsgKind, ObsEntry, OrderState, Origin, ReportRec, VenueMsg,
     VenueOrder,
 };
-use super::config::ValidatedConfig;
-use super::data::{KernelDataset, KernelTick};
+use super::config::{ValidFill, ValidatedConfig};
+use super::data::{KernelDataset, KernelTick, NS_PER_MS};
 use super::encode::insert_by_id;
 use super::gate::{self, GateVerdict};
 use super::grid::{half_units_decimal, scaled_decimal};
@@ -28,9 +28,10 @@ type Halt = HaltReason;
 
 /// Counts the agent-facing events forwarded to the caller's sink.
 ///
-/// A step delivers at most `3 * 2S` reports and `len` observations in the
-/// whole run, below `2^63` for `S <= 2^60` and `len <= u32::MAX`, so the
-/// count cannot overflow; if it did, `overflow` halts the step.
+/// A run delivers at most three status reports per order, a fill report per
+/// lot and `len` observations: `3 * 2S + 2S * Q + len`, below `2^64` for
+/// `S <= 2^60`, `2S * Q` within `i64` and `len <= u32::MAX`, so the count cannot
+/// overflow; if it did, `overflow` halts the step.
 pub(super) struct Em<'a, E: EventSink> {
     sink: &'a mut E,
     pub(super) count: u64,
@@ -454,8 +455,38 @@ fn run_events<
     }
 }
 
+/// Lots of `order` the queue position model fills on `row` it crosses, as
+/// `QueuePositionFillModel::fill_for`: the model's cumulative quantity less
+/// what is already filled, which can leave nothing when the touch grew.
+fn queue_fill_lots(
+    order: &VenueOrder,
+    row: &KernelTick,
+    rate_lots: u64,
+    min_queue_ms: u64,
+) -> Option<u64> {
+    let in_queue_ns = row.ts_ns.saturating_sub(order.active_after_ns);
+    let in_queue_ms = in_queue_ns.checked_div(NS_PER_MS)?;
+    if in_queue_ms < min_queue_ms {
+        return Some(0);
+    }
+    // `bid < ask` on every row, so a price is one level only.
+    let (through, touch_lots) = match order.side {
+        Dir::Buy => (row.ask < order.price, row.ask_lots),
+        Dir::Sell => (row.bid > order.price, row.bid_lots),
+    };
+    let ahead = if through { 0 } else { touch_lots };
+    let cleared = u128::from(rate_lots).checked_mul(u128::from(in_queue_ms))?;
+    let Some(cumulative) = cleared.checked_sub(u128::from(ahead)).filter(|v| *v > 0) else {
+        return Some(0);
+    };
+    if cumulative >= u128::from(order.qty) {
+        return Some(order.remaining());
+    }
+    Some(u64::try_from(cumulative).ok()?.saturating_sub(order.filled))
+}
+
 /// Matches the resting orders against `row`, in book order, as
-/// `match_active_orders` with the immediate model.
+/// `match_active_orders` with the fill model.
 fn match_row<
     const ORD: usize,
     const MSG: usize,
@@ -483,13 +514,29 @@ fn match_row<
             Dir::Buy => row.ask <= order.price,
             Dir::Sell => row.bid >= order.price,
         };
-        let qty = order.remaining();
-        if !crosses || qty == 0 || order.price == 0 {
+        let remaining = order.remaining();
+        if !crosses || remaining == 0 || order.price == 0 {
+            continue;
+        }
+        let qty = match cfg.fill {
+            ValidFill::Immediate => remaining,
+            ValidFill::QueuePosition {
+                rate_lots,
+                min_queue_ms,
+            } => queue_fill_lots(&order, row, rate_lots, min_queue_ms)
+                .ok_or(Halt::CounterOverflow)?,
+        };
+        if qty == 0 {
             continue;
         }
         let fee_u = cfg.fee_u(order.price, qty).ok_or(Halt::LedgerOverflow)?;
         order.filled = order.filled.checked_add(qty).ok_or(Halt::CounterOverflow)?;
-        order.state = OrderState::Filled;
+        let kind = if qty == remaining {
+            order.state = OrderState::Filled;
+            ExecKind::Fill
+        } else {
+            ExecKind::PartialFill
+        };
         let (ts, seq) = stamp(s)?;
         let exec_id = s.next_exec_id;
         let report = ReportRec {
@@ -497,7 +544,7 @@ fn match_row<
             seq,
             order_id: order.id,
             side: order.side.into(),
-            kind: ExecKind::Fill,
+            kind,
             origin: Origin::Venue,
             cancel_pending: order.cancel_inflight,
             price: order.price,
@@ -824,6 +871,11 @@ pub(super) fn admit<const ORD: usize, const MSG: usize, const DLV: usize, const 
 }
 
 /// The capacity part of admission for an account holding `held` orders.
+///
+/// The deliveries check is on what the agent knows, three per open order. It
+/// does not count partial fill reports, which [`super::FinancialKernel::new`]
+/// makes room for: with `DLV >= (3 + R) * ORD` it never binds before the orders
+/// check.
 pub(super) fn capacity_ok<const ORD: usize, const MSG: usize, const DLV: usize>(
     held: u64,
 ) -> Result<(), RejectReason> {

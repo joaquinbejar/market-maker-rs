@@ -3,7 +3,9 @@
 //! Built only from what the agent knows: its own submissions (order ids are
 //! assigned synchronously) and the delivered reports, including their
 //! `origin` and `cancel_pending` fields. Each open order reserves one order
-//! slot, two venue messages and three deliveries until it is closed.
+//! slot, two venue messages and three deliveries until it is closed; partial
+//! fill reports are bounded from the dataset instead, not from what the agent
+//! knows ([`super::CapacityNeed::partial_reports_per_order`]).
 
 use super::book::{Arr, Blank, ExecKind, Full, Origin, ReportRec};
 

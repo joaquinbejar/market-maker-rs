@@ -3,9 +3,9 @@
 //! of how instances are assigned to workers.
 //!
 //! The causality, gate and queue invariants have their own loops in
-//! `kernel_equivalence.rs` and `kernel_bounds.rs`. The kernel fill model
+//! `kernel_equivalence.rs` and `kernel_bounds.rs`. The immediate fill model
 //! fills a resting order completely, so "partial" here means a size reduced
-//! by the risk gate; it does not cover `ExecKind::PartialFill`.
+//! by the risk gate; `kernel_partial.rs` covers `ExecKind::PartialFill`.
 
 #![cfg(feature = "kernel")]
 #![allow(
@@ -15,92 +15,27 @@
     clippy::indexing_slicing
 )]
 
+/// Deliveries capacity of the harness kernels.
+const HARNESS_DLV: usize = 192;
+
 #[path = "support/kernel_harness.rs"]
 mod harness;
 
+#[path = "support/kernel_gate.rs"]
+mod gate;
+
+use gate::*;
 use harness::*;
 use market_maker_rs::backtest::kernel::{
-    ActionStatus, ExecKind, GateVerdict, KernelAction, KernelEvent, KernelLatency, Observation,
-    Phase, QuoteSide, decode, encode, fingerprint, fnv1a128,
+    ActionStatus, ExecKind, GateVerdict, KernelAction, KernelEvent, KernelLatency, decode, encode,
+    fingerprint,
 };
 use market_maker_rs::dec;
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 
-/// Absolute position, in lots, at which the driver hedges.
-const HEDGE_AT: u64 = 2;
-
 /// The kernel's first order id.
 const FIRST_ORDER_ID: u64 = 1;
-
-/// The script, except that a position of `HEDGE_AT` lots or more is reduced
-/// by an order that crosses the touch, one bounded hedge at a time.
-fn hedged(sc: &Scenario, decision: u64, obs: &Observation) -> KernelAction {
-    let lots = u64::try_from(
-        ((obs.position / sc.cfg.lot_size).abs().round())
-            .normalize()
-            .mantissa(),
-    )
-    .unwrap();
-    if lots < HEDGE_AT {
-        return sc.action(decision, obs.bid, obs.ask);
-    }
-    let (side, price) = if obs.position.is_sign_positive() {
-        (QuoteSide::Ask, obs.bid)
-    } else {
-        (QuoteSide::Bid, obs.ask)
-    };
-    KernelAction::OneSided {
-        side,
-        price,
-        lots: lots.min(max_lots(sc)),
-    }
-}
-
-/// One full run of the hedged driver.
-struct Trajectory {
-    states: Vec<State>,
-    observations: Vec<Observation>,
-    actions: Vec<KernelAction>,
-    outcomes: Vec<ActionStatus>,
-    /// Events before each decision.
-    marks: Vec<usize>,
-    events: Vec<KernelEvent>,
-    last: State,
-}
-
-fn trajectory(k: &Kernel<'_>, sc: &Scenario) -> Trajectory {
-    let mut events = Vec::new();
-    let mut s = k.reset_with(sc.latency_seed, &mut events);
-    let mut t = Trajectory {
-        states: Vec::new(),
-        observations: Vec::new(),
-        actions: Vec::new(),
-        outcomes: Vec::new(),
-        marks: Vec::new(),
-        events: Vec::new(),
-        last: s,
-    };
-    let mut decision = 0;
-    while s.phase() == Phase::AwaitDecision {
-        let obs = k.observe(&s);
-        let action = hedged(sc, decision, &obs);
-        t.states.push(s);
-        t.observations.push(obs);
-        t.actions.push(action);
-        t.marks.push(events.len());
-        t.outcomes
-            .push(k.step_with(&mut s, action, &mut events).applied);
-        decision += 1;
-    }
-    t.events = events;
-    t.last = s;
-    t
-}
-
-fn events_hash(events: &[KernelEvent]) -> u128 {
-    fnv1a128(format!("{events:?}").as_bytes())
-}
 
 /// A golden configuration: scenario base, latency and limits.
 #[derive(Clone, Copy)]
@@ -295,29 +230,6 @@ fn hedges_that_reduced(t: &Trajectory) -> u64 {
     count
 }
 
-/// Whether replayed events include a new report, which means venue messages
-/// were scheduled and, with jitter, generator draws consumed.
-fn scheduled(events: &[KernelEvent]) -> bool {
-    events.iter().any(|e| matches!(e, KernelEvent::Report(_)))
-}
-
-/// Replays `actions` from `start`, returning the final state, the events and
-/// the observation at each decision.
-fn replay(
-    k: &Kernel<'_>,
-    start: State,
-    actions: &[KernelAction],
-) -> (State, Vec<KernelEvent>, Vec<Observation>) {
-    let mut s = start;
-    let mut events = Vec::new();
-    let mut observations = Vec::new();
-    for action in actions {
-        observations.push(k.observe(&s));
-        k.step_with(&mut s, *action, &mut events);
-    }
-    (s, events, observations)
-}
-
 #[test]
 fn test_kernel_restore_with_pending_messages_reproduces_the_reference() {
     let (mut restored, mut with_messages, mut with_deliveries, mut with_jitter) = (0, 0, 0, 0);
@@ -403,10 +315,6 @@ fn test_kernel_forks_with_different_actions_do_not_contaminate() {
     assert!(forks > 0, "forks");
     assert!(diverged > 0, "forks that diverge");
     assert!(with_jitter > 0, "forks that schedule messages under jitter");
-}
-
-fn parent_bid(obs: &Observation) -> u64 {
-    obs.bid.saturating_sub(1).max(1)
 }
 
 /// Runs the instances `indices` on one worker.

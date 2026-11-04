@@ -1195,3 +1195,547 @@ fn test_kernel_transaction_halt_reports_rejected_and_rolls_back() {
     assert_eq!(k.step(&mut s, KernelAction::Hold).events, 0);
     assert_eq!(s, halted);
 }
+
+/// Room for the partial fill reports of these tests.
+type QueueKernel<'d> = FinancialKernel<'d, 16, 64, 256, 64>;
+type QueueState = KernelState<16, 64, 256, 64>;
+
+fn lots_tick(ts_ms: u64, bid: u64, bid_lots: u64, ask: u64, ask_lots: u64) -> KernelTick {
+    KernelTick {
+        ts_ns: ts_ms * MS,
+        bid,
+        bid_lots,
+        ask,
+        ask_lots,
+    }
+}
+
+fn queue_model(rate: Decimal, min_queue_ms: u64) -> KernelFillModel {
+    KernelFillModel::QueuePosition { rate, min_queue_ms }
+}
+
+fn queue_config(latency: KernelLatency, rate: Decimal, min_queue_ms: u64) -> KernelConfig {
+    config(latency).with_fill_model(queue_model(rate, min_queue_ms))
+}
+
+fn bid_at(price: u64, lots: u64) -> KernelAction {
+    KernelAction::OneSided {
+        side: QuoteSide::Bid,
+        price,
+        lots,
+    }
+}
+
+fn through_rows(count: u64) -> Vec<KernelTick> {
+    (0..count)
+        .map(|i| lots_tick(1000 + i, 13, 1, 14, 1))
+        .collect()
+}
+
+/// Steps through `actions`, then holds, and returns the state and the events.
+fn drive(k: &QueueKernel<'_>, actions: &[KernelAction]) -> (QueueState, Vec<KernelEvent>) {
+    let mut events = Vec::new();
+    let mut s = k.reset_with(3, &mut events);
+    let mut decision = 0;
+    while s.phase() == Phase::AwaitDecision {
+        let action = actions.get(decision).copied().unwrap_or(KernelAction::Hold);
+        k.step_with(&mut s, action, &mut events);
+        decision += 1;
+    }
+    (s, events)
+}
+
+/// `(kind, last, cum)` of the reports of order 1 after its acceptance, with
+/// `cancel_pending`.
+fn first_order(events: &[KernelEvent]) -> Vec<(ExecKind, u64, u64, bool)> {
+    reports(events, false)
+        .iter()
+        .filter(|r| r.order_id == 1 && r.kind != ExecKind::Accepted)
+        .map(|r| (r.kind, r.last, r.cum, r.cancel_pending))
+        .collect()
+}
+
+#[test]
+fn test_queue_model_fills_the_cleared_volume_beyond_what_is_ahead() {
+    let cfg = queue_config(KernelLatency::zero(MS), dec!(1), 0);
+    let rows = vec![
+        lots_tick(1000, 13, 1, 17, 1),
+        // 1 ms: 1 cleared, 1 ahead at the touch.
+        lots_tick(1001, 14, 1, 15, 1),
+        // 2 ms: 2 cleared, 1 ahead.
+        lots_tick(1002, 14, 1, 15, 1),
+        // 3 ms: the touch grew, nothing beyond it.
+        lots_tick(1003, 14, 1, 15, 5),
+        // 4 ms: it shrank, 2 beyond it.
+        lots_tick(1004, 14, 1, 15, 2),
+        // 5 ms: traded through, nothing ahead.
+        lots_tick(1005, 13, 1, 14, 9),
+        // 6 ms: not crossed.
+        lots_tick(1006, 14, 1, 16, 1),
+        // 7 ms: at the touch again.
+        lots_tick(1007, 14, 1, 15, 1),
+        // 17 ms: more than the order.
+        lots_tick(1017, 13, 1, 14, 1),
+        lots_tick(1018, 13, 1, 14, 1),
+    ];
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let (s, events) = drive(&k, &[bid_at(15, 10)]);
+    assert_eq!(
+        first_order(&events),
+        vec![
+            (ExecKind::PartialFill, 1, 1, false),
+            (ExecKind::PartialFill, 1, 2, false),
+            (ExecKind::PartialFill, 3, 5, false),
+            (ExecKind::PartialFill, 1, 6, false),
+            (ExecKind::Fill, 4, 10, false),
+        ]
+    );
+    assert_eq!(s.counters().venue_fills, 5);
+    assert_eq!(s.queue_lengths().held, 0);
+    assert!(
+        reports(&events, false)
+            .iter()
+            .filter(|r| matches!(r.kind, ExecKind::PartialFill | ExecKind::Fill))
+            .all(|r| r.price == 15 && r.qty == 10)
+    );
+}
+
+#[test]
+fn test_queue_model_min_queue_time_is_inclusive() {
+    let first_fill = |min_queue_ms: u64| {
+        let cfg = queue_config(KernelLatency::zero(MS), dec!(1), min_queue_ms);
+        let data = KernelDataset::from_kernel_ticks(through_rows(6), &cfg).unwrap();
+        let k = QueueKernel::new(&cfg, &data).unwrap();
+        let (_, events) = drive(&k, &[bid_at(15, 10)]);
+        reports(&events, false)
+            .iter()
+            .find(|r| r.kind == ExecKind::PartialFill)
+            .map(|r| (r.ts_ns / MS - 1000, r.cum))
+    };
+    // The cumulative quantity includes the time before the minimum.
+    assert_eq!(first_fill(0), Some((1, 1)));
+    assert_eq!(first_fill(1), Some((1, 1)));
+    assert_eq!(first_fill(2), Some((2, 2)));
+    assert_eq!(first_fill(3), Some((3, 3)));
+}
+
+#[test]
+fn test_queue_model_zero_increment_takes_no_stamp_no_id_and_no_draw() {
+    // Same seed and actions. On row 2 one dataset crosses with the touch hiding
+    // the volume and the other does not cross: neither fills, so the two runs
+    // may not differ in anything the engine consumes.
+    let latency = KernelLatency::zero(MS)
+        .with_delays(1, 1, 1, 1)
+        .with_jitter(3);
+    let cfg = queue_config(latency, dec!(1), 0);
+    let run = |row2: KernelTick| {
+        let rows = vec![
+            lots_tick(1000, 13, 1, 17, 1),
+            lots_tick(1001, 13, 1, 17, 1),
+            row2,
+            lots_tick(1040, 13, 1, 17, 1),
+        ];
+        let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+        let k = QueueKernel::new(&cfg, &data).unwrap();
+        let (s, events) = drive(&k, &[bid_at(15, 3)]);
+        (
+            s.stamp_seq(),
+            s.next_exec_id,
+            s.rng_latency,
+            s.counters().venue_fills,
+            reports(&events, false).len(),
+        )
+    };
+    let hidden = run(lots_tick(1020, 14, 1, 15, 1000));
+    let uncrossed = run(lots_tick(1020, 14, 1, 16, 1000));
+    assert_eq!(hidden, uncrossed);
+    assert_eq!(hidden.3, 0);
+}
+
+#[test]
+fn test_queue_model_cancel_after_a_partial_keeps_the_fill_and_releases_the_rest() {
+    let latency = KernelLatency::zero(MS).with_delays(0, 0, 3, 0);
+    let cfg = queue_config(latency, dec!(1), 0);
+    let data = KernelDataset::from_kernel_ticks(through_rows(8), &cfg).unwrap();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    // Decision 1 sends the cancel, in flight for 3 ms.
+    let (s, events) = drive(&k, &[bid_at(15, 5), bid_at(1, 2)]);
+    assert_eq!(
+        first_order(&events),
+        vec![
+            (ExecKind::PartialFill, 1, 1, false),
+            (ExecKind::PartialFill, 1, 2, true),
+            (ExecKind::PartialFill, 1, 3, true),
+            (ExecKind::Canceled, 0, 3, false),
+        ]
+    );
+    // Only the replacement is still reserved; the position is what filled.
+    assert_eq!(s.gate.live_buy_lots, 2);
+    assert_eq!(s.gate.venue_pos_lots, 3);
+}
+
+#[test]
+fn test_queue_model_last_fill_before_a_cancel_arrives_gets_cancel_rejected() {
+    let latency = KernelLatency::zero(MS).with_delays(0, 0, 3, 0);
+    let cfg = queue_config(latency, dec!(1), 0);
+    let data = KernelDataset::from_kernel_ticks(through_rows(8), &cfg).unwrap();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let (s, events) = drive(&k, &[bid_at(15, 3), bid_at(1, 2)]);
+    assert_eq!(
+        first_order(&events),
+        vec![
+            (ExecKind::PartialFill, 1, 1, false),
+            (ExecKind::PartialFill, 1, 2, true),
+            (ExecKind::Fill, 1, 3, true),
+            (ExecKind::CancelRejected, 0, 3, false),
+        ]
+    );
+    assert_eq!(s.gate.venue_pos_lots, 3);
+}
+
+#[test]
+fn test_queue_model_validation_refuses_what_is_not_on_the_lot_grid() {
+    let refused = |rate: Decimal| {
+        let cfg = queue_config(KernelLatency::zero(MS), rate, 0);
+        match KernelDataset::from_kernel_ticks(vec![tick(1000, 14, 16)], &cfg) {
+            Ok(data) => QueueKernel::new(&cfg, &data).is_err(),
+            Err(_) => true,
+        }
+    };
+    assert!(refused(dec!(0)));
+    assert!(refused(dec!(-1)));
+    assert!(refused(dec!(0.5)));
+    assert!(refused(dec!(1.0)));
+    assert!(!refused(dec!(1)));
+    assert!(!refused(dec!(2)));
+}
+
+#[test]
+fn test_queue_model_cleared_volume_is_exact_at_every_elapsed_time() {
+    // No zero in the product makes it fit: mantissa 7000000001000000007000000001.
+    let lot = dec!(1000000000.000000001);
+    let rate = dec!(7000000001000000007.000000001);
+    let rate_lots: i128 = 7_000_000_001;
+    let cfg = KernelConfig::new(dec!(1), lot, dec!(1000), dec!(10000000000.00000001), 100)
+        .with_fill_model(queue_model(rate, 0));
+    let rows = |last_ms: u64| vec![lots_tick(last_ms, 14, 1, 16, 1)];
+    // The mantissa times 11 is below 2^96, times 12 is not.
+    let data = KernelDataset::from_kernel_ticks(rows(11), &cfg).unwrap();
+    assert!(QueueKernel::new(&cfg, &data).is_ok());
+    let data = KernelDataset::from_kernel_ticks(rows(12), &cfg).unwrap();
+    let error = QueueKernel::new(&cfg, &data).unwrap_err();
+    assert!(error.to_string().contains("not exact"), "{error}");
+    // What the engine's model computes is that integer, at every time.
+    let unit = grid::Unit::new(lot).unwrap();
+    for ms in 0..=11u64 {
+        let cleared = rate.checked_mul(Decimal::from(ms)).unwrap();
+        assert_eq!(
+            unit.count(cleared),
+            Some(rate_lots * i128::from(ms)),
+            "{ms} ms"
+        );
+    }
+}
+
+#[test]
+fn test_queue_model_refuses_a_touch_size_that_is_not_exact_in_a_decimal() {
+    // About 1e18 per lot: 2^96 is between 79 and 80 * 10^9 lots.
+    let lot = dec!(1000000000.000000001);
+    let cfg =
+        KernelConfig::new(dec!(1), lot, dec!(1000), lot, 100).with_fill_model(queue_model(lot, 0));
+    let new_with = |bid_lots: u64, ask_lots: u64| {
+        let rows = vec![lots_tick(1000, 14, bid_lots, 16, ask_lots)];
+        let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+        QueueKernel::new(&cfg, &data).map(|_| ())
+    };
+    let (below, above) = (79_000_000_000, 80_000_000_000);
+    assert_eq!(new_with(below, below), Ok(()));
+    for (bid_lots, ask_lots) in [(above, 1), (1, above)] {
+        let error = new_with(bid_lots, ask_lots).unwrap_err();
+        assert!(error.to_string().contains("not exact"), "{error}");
+    }
+}
+
+#[test]
+fn test_queue_model_refuses_an_order_maximum_that_is_not_exact_in_a_decimal() {
+    let lot = dec!(1000000000.000000001);
+    let new_with = |max_order_size: Decimal| {
+        let cfg = KernelConfig::new(dec!(1), lot, dec!(1000), max_order_size, 100)
+            .with_fill_model(queue_model(lot, 0));
+        let rows = vec![lots_tick(1000, 14, 1, 16, 1)];
+        let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+        // Past the ledger bound, which refuses such an order first: this is
+        // the model's own check.
+        QueueKernel::new_relaxed(&cfg, &data, true, false, false).map(|_| ())
+    };
+    // 10^10 lots fit below 2^96; 10^11 lots do not.
+    let lots = |count: u64| lot.checked_mul(Decimal::from(count)).unwrap();
+    assert!(new_with(lots(10_000_000_000)).is_ok());
+    let error = new_with(lots(100_000_000_000)).unwrap_err();
+    assert!(error.to_string().contains("not exact"), "{error}");
+}
+
+#[test]
+fn test_queue_model_partial_reports_bound_counts_ties_and_the_inclusive_edge() {
+    let latency = KernelLatency::zero(MS).with_delays(0, 0, 0, 3);
+    let queue = queue_config(latency, dec!(1), 0);
+    let rows = vec![
+        tick(1000, 14, 16),
+        tick(1000, 14, 16),
+        tick(1001, 14, 16),
+        // 1000 + 3 >= 1003: both rows at 1000 are still in the window.
+        tick(1003, 14, 16),
+        tick(1004, 14, 16),
+    ];
+    let data = KernelDataset::from_kernel_ticks(rows, &queue).unwrap();
+    let reports_of =
+        |cfg: &KernelConfig| capacity_need(cfg, &data).unwrap().partial_reports_per_order;
+    assert_eq!(reports_of(&queue), 4);
+    assert_eq!(reports_of(&config(latency)), 0);
+    // The jitter widens the window: 1000 + 4 >= 1004.
+    assert_eq!(
+        reports_of(&queue_config(latency.with_jitter(1), dec!(1), 0)),
+        5
+    );
+}
+
+#[test]
+fn test_queue_model_capacity_is_required_and_exact() {
+    let latency = KernelLatency::zero(MS).with_delays(0, 0, 0, 3);
+    let cfg = queue_config(latency, dec!(1), 0);
+    let data = KernelDataset::from_kernel_ticks(through_rows(6), &cfg).unwrap();
+    assert_eq!(
+        capacity_need(&cfg, &data)
+            .unwrap()
+            .partial_reports_per_order,
+        4
+    );
+    // (3 + 4) * 16.
+    assert!(FinancialKernel::<'_, 16, 64, 112, 64>::new(&cfg, &data).is_ok());
+    let error = FinancialKernel::<'_, 16, 64, 111, 64>::new(&cfg, &data).unwrap_err();
+    assert!(error.to_string().contains("DLV"), "{error}");
+}
+
+/// Tracks the largest delivery queue against its open orders.
+#[derive(Default)]
+struct Peak {
+    deliveries: u64,
+    held_at_peak: u64,
+    per_order: u64,
+}
+
+impl EventSink for Peak {
+    fn event(&mut self, _: KernelEvent) {}
+
+    fn queues(&mut self, q: QueueLengths) {
+        assert!(q.deliveries <= self.per_order * q.held, "{q:?}");
+        if q.deliveries > self.deliveries {
+            self.deliveries = q.deliveries;
+            self.held_at_peak = q.held;
+        }
+    }
+}
+
+#[test]
+fn test_queue_model_worst_case_at_the_exact_capacity_never_halts() {
+    // Every order rests until its slow cancel arrives, is traded through and
+    // reports on every row, with the reports held back by the largest delay.
+    let latency = KernelLatency::zero(MS).with_delays(0, 0, 5, 5);
+    let cfg = KernelConfig::new(dec!(1), dec!(1), dec!(1000), dec!(1000), 100)
+        .with_initial_capital(dec!(10000000))
+        .with_latency(latency)
+        .with_fill_model(queue_model(dec!(1), 0));
+    let data = KernelDataset::from_kernel_ticks(through_rows(60), &cfg).unwrap();
+    let need = capacity_need(&cfg, &data).unwrap();
+    assert_eq!(need.ord, 26);
+    assert_eq!(need.partial_reports_per_order, 6);
+    let k: FinancialKernel<'_, 26, 52, 234, 64> = FinancialKernel::new(&cfg, &data).unwrap();
+    assert!(FinancialKernel::<'_, 26, 52, 233, 64>::new(&cfg, &data).is_err());
+    let mut peak = Peak {
+        per_order: 3 + need.partial_reports_per_order,
+        ..Peak::default()
+    };
+    let mut s = k.reset_with(3, &mut peak);
+    while s.phase() == Phase::AwaitDecision {
+        k.step_with(&mut s, bid_at(15, 1000), &mut peak);
+        assert_eq!(decode(&encode(&s), &k).unwrap(), s);
+    }
+    assert_eq!(s.status(), Status::Terminal(TermReason::EndOfData));
+    let rejected = s.counters().rejected;
+    assert_eq!(rejected[RejectReason::CapacityDeliveries.index()], 0);
+    assert_eq!(rejected[RejectReason::CapacityOrders.index()], 0);
+    // The old bound of three per open order would not have held.
+    assert!(
+        peak.deliveries > 3 * peak.held_at_peak,
+        "{} deliveries, {} held",
+        peak.deliveries,
+        peak.held_at_peak
+    );
+}
+
+#[test]
+fn test_queue_model_is_in_the_config_fingerprint() {
+    let base = KernelConfig::new(dec!(1), dec!(1), dec!(1000), dec!(10), 100);
+    let print = |model| base.clone().with_fill_model(model).fingerprint();
+    let immediate = print(KernelFillModel::Immediate);
+    assert_eq!(immediate, base.fingerprint());
+    let queue = print(queue_model(dec!(1), 0));
+    assert_ne!(immediate, queue);
+    assert_ne!(queue, print(queue_model(dec!(2), 0)));
+    assert_ne!(queue, print(queue_model(dec!(1), 1)));
+}
+
+/// A dataset where reports wait 5 ms under the queue model.
+fn queued_partials() -> (KernelConfig, KernelDataset) {
+    let cfg = queue_config(KernelLatency::zero(MS).with_delays(0, 0, 0, 5), dec!(1), 0);
+    let data = KernelDataset::from_kernel_ticks(through_rows(12), &cfg).unwrap();
+    (cfg, data)
+}
+
+/// A decision with two partial fills of order 1 queued.
+fn state_with_two_partials_queued(k: &QueueKernel<'_>) -> QueueState {
+    let mut s = k.reset(3);
+    k.step(&mut s, bid_at(15, 10));
+    while s.phase() == Phase::AwaitDecision {
+        let partials = s
+            .deliveries
+            .as_slice()
+            .iter()
+            .filter(|d| d.report.kind == ExecKind::PartialFill)
+            .count();
+        if partials >= 2 {
+            return s;
+        }
+        k.step(&mut s, KernelAction::Hold);
+    }
+    panic!("no two partial fills in flight");
+}
+
+fn refused(k: &QueueKernel<'_>, s: &QueueState, what: &str) {
+    let error = decode(&encode(s), k).unwrap_err();
+    assert!(error.to_string().contains(what), "{what}: {error}");
+}
+
+#[test]
+fn test_decode_accepts_partials_and_refuses_inconsistent_fill_reports() {
+    let (cfg, data) = queued_partials();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let s = state_with_two_partials_queued(&k);
+    assert_eq!(decode(&encode(&s), &k).unwrap(), s);
+    let partial = |n: usize| {
+        s.deliveries
+            .position(|d| d.report.kind == ExecKind::PartialFill && d.report.cum == n as u64)
+            .unwrap()
+    };
+    let (first, second) = (partial(1), partial(2));
+    let tampered = |change: &dyn Fn(&mut book::Delivery)| {
+        let mut t = s;
+        change(t.deliveries.get_mut(second).unwrap());
+        t
+    };
+    let open = "kind differs from its open quantity";
+    refused(&k, &tampered(&|d| d.report.cum = d.report.qty), open);
+    refused(&k, &tampered(&|d| d.report.kind = ExecKind::Fill), open);
+    let zero = tampered(&|d| {
+        d.report.last = 0;
+        if let Some(fill) = &mut d.fill {
+            fill.qty = 0;
+        }
+    });
+    refused(&k, &zero, "without a quantity");
+    refused(&k, &tampered(&|d| d.report.cum += 1), "do not add up");
+    let mut t = s;
+    t.deliveries.get_mut(first).unwrap().report.last = 9;
+    refused(&k, &t, "beyond the cumulative");
+    let mut t = s;
+    t.orders.get_mut(0).unwrap().filled += 1;
+    t.gate.live_buy_lots -= 1;
+    refused(&k, &t, "differs from its reports");
+}
+
+#[test]
+fn test_decode_refuses_a_cancel_that_differs_from_the_fills() {
+    let (cfg, data) = queued_partials();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let s = state_with_two_partials_queued(&k);
+    let index = s
+        .deliveries
+        .position(|d| d.report.kind == ExecKind::PartialFill)
+        .unwrap();
+    let mut canceled = s.deliveries.get(index).unwrap().report;
+    canceled.kind = ExecKind::Canceled;
+    canceled.last = 0;
+    canceled.cum += 5;
+    let mut t = s;
+    t.deliveries
+        .push(book::Delivery {
+            at_ns: s.deliveries.as_slice().last().unwrap().at_ns,
+            report: canceled,
+            fill: None,
+        })
+        .unwrap();
+    refused(&k, &t, "differs from the fills");
+}
+
+#[test]
+fn test_decode_under_the_immediate_model_refuses_what_only_partials_produce() {
+    let cfg = config(KernelLatency::zero(MS).with_delays(0, 0, 0, 5));
+    let data = KernelDataset::from_kernel_ticks(through_rows(12), &cfg).unwrap();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+
+    // A resting order, accepted, that the market does not cross.
+    let mut resting = k.reset(3);
+    k.step(&mut resting, bid_at(10, 3));
+    k.step(&mut resting, KernelAction::Hold);
+    assert_eq!(decode(&encode(&resting), &k).unwrap(), resting);
+    let mut t = resting;
+    t.orders.get_mut(0).unwrap().filled = 1;
+    t.gate.live_buy_lots -= 1;
+    refused(&k, &t, "partially filled under the immediate model");
+
+    // A fill report relabelled as partial.
+    let mut filled = k.reset(3);
+    k.step(&mut filled, bid_at(15, 3));
+    let at = |s: &QueueState| s.deliveries.position(|d| d.report.kind == ExecKind::Fill);
+    while at(&filled).is_none() {
+        k.step(&mut filled, KernelAction::Hold);
+    }
+    assert_eq!(decode(&encode(&filled), &k).unwrap(), filled);
+    let mut t = filled;
+    let delivery = t.deliveries.get_mut(at(&filled).unwrap()).unwrap();
+    delivery.report.kind = ExecKind::PartialFill;
+    delivery.report.cum -= 1;
+    refused(&k, &t, "under the immediate model");
+}
+
+#[test]
+fn test_decode_refuses_more_fills_than_the_orders_have_lots() {
+    let (cfg, data) = queued_partials();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let s = state_with_two_partials_queued(&k);
+    let created = s.next_order_id() - 1;
+    // Every related counter agrees, so only this bound can refuse it.
+    let extra = created * 10 + 1 - s.counters.venue_fills;
+    let mut t = s;
+    t.counters.venue_fills += extra;
+    t.agent.delivered_fills += extra;
+    t.next_exec_id += extra;
+    t.stamp_seq += extra;
+    refused(&k, &t, "more local rejects and fills than orders");
+}
+
+#[test]
+fn test_decode_stamp_bound_depends_on_the_fill_model() {
+    let (cfg, data) = queued_partials();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let s = state_with_two_partials_queued(&k);
+    let created = s.next_order_id() - 1;
+    // Under the queue model the fills can exceed the orders.
+    assert!(s.counters().venue_fills > created);
+    assert_eq!(decode(&encode(&s), &k).unwrap(), s);
+    // Beyond three per order and one per fill.
+    let mut t = s;
+    t.stamp_seq = 3 * created + s.counters().venue_fills + 1;
+    refused(&k, &t, "stamp_seq");
+}
