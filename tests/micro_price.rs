@@ -800,6 +800,188 @@ fn test_decode_invalid_state_is_refused() {
 }
 
 #[test]
+fn test_fallback_within_moves_matches_the_closed_form() {
+    // From H, per pair: stay 1, to a rare middle state 1, up a tick to L 3, and
+    // the mirror from L. Before each move the chain is absorbed with chance
+    // a = 1/4, so within 10 moves it is 1 - (3/4)^11.
+    let mut quotes = pairs_from_high(&[(1, 0, true), (3, 1, false)]);
+    let time = quotes.last().unwrap().timestamp_ms + 2 * GAP_MS;
+    quotes.push(quote(time, 1000, true));
+    quotes.push(TopOfBook {
+        bid_size: dec!(1),
+        ask_size: dec!(1),
+        ..quote(time + 1, 1000, true)
+    });
+    let model = model_of(&quotes, &config());
+    let got = model.states()[2].fallback_within_moves.to_f64().unwrap();
+    let want = 1.0 - 0.75f64.powi(11);
+    assert!((got - want).abs() < 1e-12, "{got} {want}");
+}
+
+#[test]
+fn test_first_adjustment_is_exactly_antisymmetric() {
+    for buckets in [3, 5, 7, 11] {
+        let cfg = MicroPriceConfig::new(TICK, buckets, 2).with_min_state_observations(1);
+        let model = model_of(&simulated(3, 40_000), &cfg);
+        let n = buckets as usize;
+        for row in model.states().chunks(n) {
+            for i in 0..n {
+                assert_eq!(row[i].first_adjustment, -row[n - 1 - i].first_adjustment);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_largest_mid_move_counts_downward_moves() {
+    let record = record_of(
+        &pairs_from_high(&[(5, 0, true), (2, 1, false), (1, -7, false)]),
+        &config(),
+    );
+    assert_eq!(record.largest_mid_move_ticks, dec!(7));
+}
+
+#[test]
+fn test_calibrated_share_excludes_every_fallback_status() {
+    let mut quotes = pairs_from_high(&[(5, 0, true), (1, 5, false), (1, 0, false)]);
+    let mut time = quotes.last().unwrap().timestamp_ms + 2 * GAP_MS;
+    let wide = |t, bid_ticks, high| {
+        let q = quote(t, bid_ticks, high);
+        TopOfBook {
+            ask: q.ask + TICK,
+            ..q
+        }
+    };
+    for (count, move_ticks, to_high) in [(5, 0, true), (1, 0, false), (3, 1, false), (1, -1, true)]
+    {
+        for _ in 0..count {
+            quotes.push(wide(time, 1000, true));
+            quotes.push(wide(time + 1, 1000 + move_ticks, to_high));
+            time += 2 * GAP_MS;
+        }
+    }
+    let cfg = MicroPriceConfig::new(TICK, 3, 2)
+        .with_min_state_observations(1)
+        .with_max_quote_gap_ms(GAP_MS);
+    // 7 pairs per outer one tick state are OutsideQuotes, 10 per two tick one are not.
+    let share = model_of(&quotes, &cfg).calibrated_share();
+    assert_eq!(share.round_dp(12), (dec!(20) / dec!(34)).round_dp(12));
+}
+
+#[cfg(feature = "serde")]
+mod decoding {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn model_json() -> Value {
+        let text = serde_json::to_string(&model_of(&hand_fixture(), &config())).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn calibrator_json() -> Value {
+        let mut calibrator = MicroPriceCalibrator::new(config()).unwrap();
+        for q in &hand_fixture() {
+            calibrator.observe(q).unwrap();
+        }
+        let text = serde_json::to_string(&calibrator).unwrap();
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        value["hash"] = json!(0);
+        value
+    }
+
+    fn model_ok(value: &Value) -> bool {
+        serde_json::from_value::<MicroPriceModel>(value.clone()).is_ok()
+    }
+
+    fn calibrator_ok(value: &Value) -> bool {
+        serde_json::from_value::<MicroPriceCalibrator>(value.clone()).is_ok()
+    }
+
+    #[test]
+    fn test_decode_model_refuses_inconsistent_states() {
+        let base = model_json();
+        assert!(model_ok(&base));
+        let edits: [fn(&mut Value); 9] = [
+            |v| {
+                v["states"].as_array_mut().unwrap().pop();
+            },
+            |v| v["states"][0]["imbalance_bucket"] = json!(2),
+            |v| v["states"][0]["spread_ticks"] = json!(2),
+            |v| v["states"][0]["adjustment"] = json!("0.0025"),
+            |v| v["states"][0]["first_adjustment"] = json!("0.0025"),
+            |v| v["states"][0]["fallback_within_moves"] = json!("5"),
+            |v| v["states"][0]["fallback_within_moves"] = json!("-1"),
+            |v| v["states"][1]["fallback_within_moves"] = json!("0.5"),
+            |v| v["states"][1]["adjustment"] = json!("0.001"),
+        ];
+        for (i, edit) in edits.iter().enumerate() {
+            let mut bad = base.clone();
+            edit(&mut bad);
+            assert!(!model_ok(&bad), "edit {i}");
+        }
+        // A whole extra row, consistent in itself, for a spread not configured.
+        let mut bad = base.clone();
+        let states = bad["states"].as_array_mut().unwrap();
+        let row: Vec<Value> = states
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                state["spread_ticks"] = json!(2);
+                state
+            })
+            .collect();
+        states.extend(row);
+        assert!(!model_ok(&bad));
+    }
+
+    #[test]
+    fn test_decode_calibrator_refuses_broken_counts() {
+        let base = calibrator_json();
+        assert!(calibrator_ok(&base));
+        let edits: [fn(&mut Value); 5] = [
+            |v| v["moved"][2 * 3 + 2] = json!(50),
+            |v| v["stay"][2 * 3 + 2] = json!(50),
+            |v| v["move_half_ticks"][2] = json!(50),
+            |v| v["pairs"] = json!(1),
+            |v| {
+                v["previous"] = json!({"timestamp_ms": 1, "bid": "2", "ask": "1", "bid_size": "1", "ask_size": "1"});
+            },
+        ];
+        for (i, edit) in edits.iter().enumerate() {
+            let mut bad = base.clone();
+            edit(&mut bad);
+            assert!(!calibrator_ok(&bad), "edit {i}");
+        }
+    }
+
+    #[test]
+    fn test_decode_config_refuses_invalid_values() {
+        let good = json!({
+            "tick_size": "0.01",
+            "imbalance_buckets": 3,
+            "spread_states": 1,
+            "min_state_observations": 1,
+            "max_quote_gap_ms": 1000
+        });
+        assert!(serde_json::from_value::<MicroPriceConfig>(good.clone()).is_ok());
+        for (field, value) in [
+            ("tick_size", json!("0")),
+            ("imbalance_buckets", json!(4)),
+            ("spread_states", json!(0)),
+            ("min_state_observations", json!(0)),
+            ("max_quote_gap_ms", json!(0)),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value;
+            assert!(
+                serde_json::from_value::<MicroPriceConfig>(bad).is_err(),
+                "{field}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_compare_window_not_after_training_is_refused() {
     let record = record_of(&hand_fixture(), &config());
     let inside = TimeWindow::new(TRAIN_END - 1, TRAIN_END + 100).unwrap();

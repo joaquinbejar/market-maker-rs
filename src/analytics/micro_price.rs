@@ -1141,7 +1141,12 @@ fn fit_counts(counts: &MicroPriceCalibrator) -> MMResult<MicroPriceFit> {
                 MicroPriceFailure::Unrepresentable,
             ));
         };
-        let share = fallback_within.get(x).copied().or_overflow("state")?;
+        let absorbing = *status.get(x).or_overflow("state")? != StateStatus::Calibrated;
+        let share = if absorbing {
+            1.0
+        } else {
+            fallback_within.get(x).copied().or_overflow("state")?
+        };
         let Some(fallback_within_moves) = decimal_or_none(share.clamp(0.0, 1.0)) else {
             return Ok(MicroPriceFit::Insufficient(
                 MicroPriceFailure::Unrepresentable,
@@ -1413,6 +1418,7 @@ impl TryFrom<RawCalibrator> for MicroPriceCalibrator {
         if let Some(previous) = &raw.previous {
             raw.config.usable_state(previous)?;
         }
+        check_mirrored_counts(&raw, states)?;
         Ok(Self {
             config: raw.config,
             states,
@@ -1427,6 +1433,44 @@ impl TryFrom<RawCalibrator> for MicroPriceCalibrator {
             hash: raw.hash,
         })
     }
+}
+
+/// Every pair counts twice, once as its mirror, so the tables must show it.
+#[cfg(feature = "serde")]
+fn check_mirrored_counts(raw: &RawCalibrator, states: usize) -> MMResult<()> {
+    let broken = |what: &str| {
+        Err(MMError::InvalidConfiguration(format!(
+            "calibrator {what} do not match their mirrors"
+        )))
+    };
+    let mut total = 0u64;
+    for x in 0..states {
+        let mirror_x = raw.config.mirror(x)?;
+        let moves = raw.move_half_ticks.get(x).or_overflow("state")?;
+        let mirror_moves = raw.move_half_ticks.get(mirror_x).or_overflow("state")?;
+        if moves.checked_neg() != Some(*mirror_moves) {
+            return broken("mid moves");
+        }
+        for y in 0..states {
+            let cell = x.checked_mul(states).and_then(|v| v.checked_add(y));
+            let mirror_y = raw.config.mirror(y)?;
+            let mirror_cell = mirror_x
+                .checked_mul(states)
+                .and_then(|v| v.checked_add(mirror_y));
+            let (cell, mirror_cell) = cell.zip(mirror_cell).or_overflow("transition cell")?;
+            for table in [&raw.stay, &raw.moved] {
+                let value = table.get(cell).or_overflow("transition cell")?;
+                if Some(value) != table.get(mirror_cell) {
+                    return broken("transition counts");
+                }
+                total = total.checked_add(*value).or_overflow("transition counts")?;
+            }
+        }
+    }
+    if raw.pairs.checked_mul(2) != Some(total) {
+        return broken("pair counts");
+    }
+    Ok(())
 }
 
 /// Decoded form of [`MicroPriceModel`], validated before use.
@@ -1458,6 +1502,8 @@ impl TryFrom<RawModel> for MicroPriceModel {
             if bucket != Some(state.imbalance_bucket)
                 || spread != Some(state.spread_ticks)
                 || (state.status == StateStatus::Calibrated && state.adjustment.abs() > half_spread)
+                || !state_values_are_consistent(state)
+                || !state_mirrors(state, raw.states.get(raw.config.mirror(x)?))
             {
                 return Err(MMError::InvalidConfiguration(format!(
                     "invalid state {x}: {state:?}"
@@ -1469,4 +1515,27 @@ impl TryFrom<RawModel> for MicroPriceModel {
             states: raw.states,
         })
     }
+}
+
+/// The probability is in `[0, 1]`, and an absorbing state has 1 and adjustment 0.
+#[cfg(feature = "serde")]
+fn state_values_are_consistent(state: &StateEstimate) -> bool {
+    let share = state.fallback_within_moves;
+    let in_range = share >= Decimal::ZERO && share <= Decimal::ONE;
+    let consistent = match state.status {
+        StateStatus::Calibrated | StateStatus::OutsideQuotes => true,
+        StateStatus::Rare | StateStatus::NoPriceMove => {
+            share == Decimal::ONE && state.adjustment.is_zero()
+        }
+    };
+    in_range && consistent
+}
+
+/// A state's adjustments are the negatives of its mirror's.
+#[cfg(feature = "serde")]
+fn state_mirrors(state: &StateEstimate, mirror: Option<&StateEstimate>) -> bool {
+    mirror.is_some_and(|m| {
+        state.adjustment.checked_add(m.adjustment) == Some(Decimal::ZERO)
+            && state.first_adjustment.checked_add(m.first_adjustment) == Some(Decimal::ZERO)
+    })
 }
