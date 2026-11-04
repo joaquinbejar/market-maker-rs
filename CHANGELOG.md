@@ -103,8 +103,9 @@ project follows [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - `OrderFlowStats::imbalance`, `VolumeBucket` imbalances and VPIN keep their
-  proportions when a side's volume is beyond the `Decimal` bounds, and
-  `net_flow` keeps its sign. `buy_vwap` and `sell_vwap` are `None` when their
+  proportions when a side's volume is beyond the `Decimal` bounds. There,
+  `net_flow` carries rounding error, so its sign is reliable only when the
+  true net exceeds that error. `buy_vwap` and `sell_vwap` are `None` when their
   inputs overflow, and `volume_ratio` is `None` when a volume sits at the
   bound.
 - `tests/contract_fixtures.rs`: the inverse future fixture uses the Deribit
