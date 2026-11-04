@@ -135,6 +135,14 @@ pub enum MMError {
     /// It lasts until the risk manager is explicitly reset or reconciled.
     #[error("{}", GREEKS_MISS_FILL_MESSAGE)]
     GreeksMissFill = 13,
+
+    /// The chain risk status does not allow quoting, so no quote was produced.
+    ///
+    /// Any quote resting from an earlier refresh should be withdrawn. Retrying
+    /// does not help until the status changes, and none of the `is_*` helpers
+    /// is true for it. The message carries the status.
+    #[error("quoting halted: {0}")]
+    QuotingHalted(String) = 14,
 }
 
 /// The message of [`MMError::PriceUnderflow`].
@@ -182,7 +190,8 @@ impl MMError {
             | Self::ConnectionError(msg)
             | Self::LockPoisoned(msg)
             | Self::FillNotBooked(msg)
-            | Self::FillBookedCheckFailed(msg) => msg,
+            | Self::FillBookedCheckFailed(msg)
+            | Self::QuotingHalted(msg) => msg,
             Self::UnsupportedContract { reason } => reason,
             Self::UnsupportedAction { .. } => "only buy and sell are supported",
             Self::PriceUnderflow => PRICE_UNDERFLOW_MESSAGE,
@@ -224,6 +233,12 @@ mod tests {
         assert!(!num_err.is_configuration_error());
         assert!(!num_err.is_market_state_error());
         assert!(num_err.is_numerical_error());
+
+        let halted = MMError::QuotingHalted("Breached".to_string());
+        assert!(!halted.is_configuration_error());
+        assert!(!halted.is_market_state_error());
+        assert!(!halted.is_numerical_error());
+        assert!(!halted.is_connection_error());
     }
 
     #[test]
@@ -294,6 +309,7 @@ mod tests {
             MMError::FillNotBooked("test".to_string()),
             MMError::FillBookedCheckFailed("test".to_string()),
             MMError::GreeksMissFill,
+            MMError::QuotingHalted("test".to_string()),
             MMError::InvalidPositionUpdate("test".to_string()),
             MMError::InvalidQuoteGeneration("test".to_string()),
             MMError::InvalidTimestamp("test".to_string()),

@@ -315,14 +315,20 @@ pub enum RiskStatus {
     Normal,
     /// Approaching risk limits (warning).
     Warning,
-    /// Risk limits breached (should stop quoting).
+    /// Risk limits breached, or a fill could not be booked: quoting is refused.
     Breached,
-    /// Hedge required.
+    /// Hedge required: quoting is refused while the delta is above
+    /// `delta_hedge_threshold`. Nothing here hedges, so it lasts until the
+    /// caller does: execute [`ChainMarketMaker::calculate_hedge`], book the
+    /// fill ([`ChainRiskManager::add_position_greeks`]), and quoting resumes.
     HedgeRequired,
 }
 
 impl RiskStatus {
-    /// Returns true if quoting should continue.
+    /// Returns true if quoting is allowed. While it is false,
+    /// [`ChainMarketMaker::generate_quote`] and
+    /// [`ChainMarketMaker::refresh_all_quotes`] refuse with
+    /// [`MMError::QuotingHalted`].
     #[must_use]
     pub fn can_quote(&self) -> bool {
         matches!(self, RiskStatus::Normal | RiskStatus::Warning)
@@ -405,7 +411,8 @@ impl ChainMarketMaker {
     /// Returns a mutable reference to the risk manager.
     ///
     /// Replacing the whole manager through it also discards a failed booking
-    /// (see [`ChainRiskManager::has_unbooked_fill`]).
+    /// (see [`ChainRiskManager::has_unbooked_fill`]) and, with its Greeks,
+    /// whatever kept [`Self::check_chain_risk`] from allowing quotes.
     pub fn risk_manager_mut(&mut self) -> &mut ChainRiskManager {
         &mut self.risk_manager
     }
@@ -520,10 +527,37 @@ impl ChainMarketMaker {
     ///
     /// # Errors
     ///
+    /// [`MMError::QuotingHalted`] while [`Self::check_chain_risk`] does not
+    /// allow quoting, and its error when it cannot be computed;
     /// [`MMError::InvalidQuoteGeneration`] when the theoretical value rounds
     /// to zero or is not a price unit count, or the quote cannot be built;
     /// [`MMError::NumericalError`] when the spread arithmetic overflows.
     pub fn generate_quote(
+        &self,
+        strike: u64,
+        style: OptionStyle,
+        spot_price: u64,
+        valuation: OptionValuation,
+        is_atm: bool,
+    ) -> MMResult<ChainQuoteUpdate> {
+        self.ensure_can_quote()?;
+        self.quote_contract(strike, style, spot_price, valuation, is_atm)
+    }
+
+    /// Refuses unless the chain risk status allows quoting.
+    fn ensure_can_quote(&self) -> MMResult<()> {
+        let status = self.check_chain_risk()?;
+        if status.can_quote() {
+            Ok(())
+        } else {
+            Err(MMError::QuotingHalted(format!(
+                "chain risk status is {status:?}"
+            )))
+        }
+    }
+
+    /// [`Self::generate_quote`] once the risk status allows quoting.
+    fn quote_contract(
         &self,
         strike: u64,
         style: OptionStyle,
@@ -577,7 +611,9 @@ impl ChainMarketMaker {
     /// it is not quoted (for example a theoretical value below one price
     /// unit, or a strike the surface does not cover); a failed contract
     /// never gets a substitute value. A failure of what the contracts share
-    /// fails the whole refresh and nothing is returned to publish.
+    /// fails the whole refresh and nothing is returned to publish, so any
+    /// resting quote should be withdrawn. That includes a risk status that does
+    /// not allow quoting, checked first, before anything is valued.
     ///
     /// # Arguments
     ///
@@ -587,6 +623,8 @@ impl ChainMarketMaker {
     ///
     /// # Errors
     ///
+    /// [`MMError::QuotingHalted`] while [`Self::check_chain_risk`] does not
+    /// allow quoting, and its error when it cannot be computed;
     /// [`MMError::InvalidMarketState`] for a zero underlying price, and the
     /// error of [`OptionPricer::check_market`] for the inputs every contract
     /// shares (spot, rates, time to expiry and the factors derived from
@@ -597,6 +635,7 @@ impl ChainMarketMaker {
         underlying_price: u64,
         pricing: &ChainPricing,
     ) -> MMResult<Vec<ChainQuoteOutcome>> {
+        self.ensure_can_quote()?;
         if underlying_price == 0 {
             return Err(MMError::InvalidMarketState(
                 "underlying price must be positive".to_string(),
@@ -619,7 +658,7 @@ impl ChainMarketMaker {
                     .pricer
                     .value(&pricing.inputs(underlying_price, strike, style))
                     .and_then(|valuation| {
-                        self.generate_quote(strike, style, underlying_price, valuation, is_atm)
+                        self.quote_contract(strike, style, underlying_price, valuation, is_atm)
                     });
                 outcomes.push(match quote {
                     Ok(q) => ChainQuoteOutcome::Quote(q),
@@ -644,8 +683,8 @@ impl ChainMarketMaker {
     /// [`RiskStatus::can_quote`] is false, while the Greeks miss a fill that
     /// could not be booked (see [`ChainRiskManager::has_unbooked_fill`]).
     ///
-    /// This only reports: the quoting methods do not call it, so stopping
-    /// while [`RiskStatus::can_quote`] is false is up to the caller.
+    /// [`Self::generate_quote`] and [`Self::refresh_all_quotes`] call it first
+    /// and refuse while [`RiskStatus::can_quote`] is false.
     ///
     /// # Errors
     ///
@@ -1069,6 +1108,204 @@ mod tests {
         let status = mm.check_chain_risk().unwrap();
         assert_eq!(status, RiskStatus::Normal);
         assert!(status.can_quote());
+    }
+
+    /// Asserts that both quoting methods refuse, the same way, before anything
+    /// is valued.
+    fn assert_quoting_refused(mm: &ChainMarketMaker, expected: &MMError) {
+        use crate::options::pricing::OptionInputs;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(Arc<AtomicUsize>);
+        impl OptionPricer for Counting {
+            fn value(&self, _: &OptionInputs) -> MMResult<OptionValuation> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(valuation(dec!(1000)))
+            }
+            fn check_market(&self, _: Decimal, _: Decimal, _: Decimal, _: Decimal) -> MMResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pricing = ChainPricing::new(
+            Arc::new(Counting(Arc::clone(&calls))),
+            dec!(0.1),
+            dec!(0),
+            dec!(0),
+        )
+        .unwrap();
+        assert_eq!(
+            mm.refresh_all_quotes(50000, &pricing).as_ref().err(),
+            Some(expected)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            mm.generate_quote(50000, OptionStyle::Call, 50000, valuation(dec!(1000)), true)
+                .as_ref()
+                .err(),
+            Some(expected)
+        );
+    }
+
+    fn assert_quoting_allowed(mm: &ChainMarketMaker) {
+        let pricing = flat_pricing(dec!(0.6), dec!(30) / dec!(365));
+        let outcomes = mm.refresh_all_quotes(50000, &pricing).unwrap();
+        assert_eq!(outcomes.len(), 6);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, ChainQuoteOutcome::Quote(_))),
+            "{outcomes:?}"
+        );
+        mm.generate_quote(50000, OptionStyle::Call, 50000, valuation(dec!(1000)), true)
+            .unwrap();
+    }
+
+    fn halted(status: &str) -> MMError {
+        MMError::QuotingHalted(format!("chain risk status is {status}"))
+    }
+
+    fn with_greeks(greeks: PortfolioGreeks) -> ChainMarketMaker {
+        let mut mm = ChainMarketMaker::with_defaults(create_test_chain());
+        mm.risk_manager_mut().update_greeks(greeks);
+        mm
+    }
+
+    #[test]
+    fn test_quoting_is_allowed_while_normal_or_warning() {
+        let mm = ChainMarketMaker::with_defaults(create_test_chain());
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Normal));
+        assert_quoting_allowed(&mm);
+
+        let mm = with_greeks(PortfolioGreeks {
+            gamma: ChainRiskLimits::default().max_chain_gamma * dec!(0.9),
+            ..PortfolioGreeks::new()
+        });
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Warning));
+        assert_quoting_allowed(&mm);
+    }
+
+    #[test]
+    fn test_quoting_is_refused_while_a_limit_is_breached() {
+        let mm = with_greeks(PortfolioGreeks {
+            delta: ChainRiskLimits::default().max_chain_delta * dec!(2),
+            ..PortfolioGreeks::new()
+        });
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Breached));
+        assert_quoting_refused(&mm, &halted("Breached"));
+    }
+
+    #[test]
+    fn test_quoting_is_refused_while_a_hedge_is_required() {
+        let limits = ChainRiskLimits::default();
+        let mm = with_greeks(PortfolioGreeks {
+            delta: limits.delta_hedge_threshold * dec!(2),
+            ..PortfolioGreeks::new()
+        });
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::HedgeRequired));
+        assert_quoting_refused(&mm, &halted("HedgeRequired"));
+
+        // Reconciling clears a failed booking, not a required hedge.
+        let mut mm = mm;
+        let unhedged = PortfolioGreeks {
+            delta: limits.delta_hedge_threshold * dec!(2),
+            ..PortfolioGreeks::new()
+        };
+        mm.risk_manager_mut().reconcile(unhedged);
+        assert_quoting_refused(&mm, &halted("HedgeRequired"));
+
+        // Once the caller executes the hedge and books it, quotes come back.
+        // A share has a delta of one over the contract multiplier.
+        let hedges = mm.calculate_hedge(dec!(50000)).unwrap();
+        let [hedge] = hedges.as_slice() else {
+            panic!("expected one hedge: {hedges:?}");
+        };
+        let share_delta = -unhedged.delta / hedge.quantity;
+        let share = crate::options::greeks::PositionGreeks::new(
+            share_delta,
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+        );
+        mm.risk_manager_mut()
+            .add_position_greeks(&share, hedge.quantity)
+            .unwrap();
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Normal));
+        assert_quoting_allowed(&mm);
+    }
+
+    #[test]
+    fn test_quoting_is_refused_while_a_failed_booking_is_latched() {
+        let mut mm = ChainMarketMaker::with_defaults(create_test_chain());
+        let huge = crate::options::greeks::PositionGreeks::new(
+            Decimal::MAX,
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+        );
+        assert_quoting_allowed(&mm);
+        mm.risk_manager_mut()
+            .add_position_greeks(&huge, dec!(2))
+            .unwrap_err();
+        assert_quoting_refused(&mm, &halted("Breached"));
+
+        // A plain update does not bring quotes back; reconciling does.
+        mm.risk_manager_mut().update_greeks(PortfolioGreeks::new());
+        assert_quoting_refused(&mm, &halted("Breached"));
+        mm.risk_manager_mut().reconcile(PortfolioGreeks::new());
+        assert_quoting_allowed(&mm);
+    }
+
+    #[test]
+    fn test_quoting_is_refused_when_the_status_cannot_be_computed() {
+        let mm = with_limits(ChainRiskLimits {
+            max_chain_delta: Decimal::ZERO,
+            ..Default::default()
+        });
+        let error = mm.check_chain_risk().unwrap_err();
+        assert!(error.is_numerical_error());
+        assert_quoting_refused(&mm, &error);
+    }
+
+    #[test]
+    fn test_refresh_refusal_comes_before_the_inputs_and_contract_errors_stay_per_contract() {
+        // The status comes first, whatever the inputs.
+        let mm = with_greeks(PortfolioGreeks {
+            delta: dec!(1000),
+            ..PortfolioGreeks::new()
+        });
+        let pricing = flat_pricing(dec!(0.6), dec!(0.1));
+        assert_eq!(
+            mm.refresh_all_quotes(0, &pricing).err(),
+            Some(halted("Breached"))
+        );
+
+        // And it is the refusal, not a list of NotQuoted, even when no contract
+        // can be valued.
+        use crate::options::pricing::OptionInputs;
+        struct NoValue;
+        impl OptionPricer for NoValue {
+            fn value(&self, _: &OptionInputs) -> MMResult<OptionValuation> {
+                Err(MMError::InvalidMarketState("no value".to_string()))
+            }
+        }
+        let pricing = ChainPricing::new(Arc::new(NoValue), dec!(0.1), dec!(0), dec!(0)).unwrap();
+        assert_eq!(
+            mm.refresh_all_quotes(50000, &pricing).err(),
+            Some(halted("Breached"))
+        );
+
+        // While it allows quoting, a contract's own error is still NotQuoted.
+        let mm = ChainMarketMaker::with_defaults(create_test_chain());
+        let outcomes = mm.refresh_all_quotes(50000, &pricing).unwrap();
+        assert_eq!(outcomes.len(), 6);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, ChainQuoteOutcome::NotQuoted { .. }))
+        );
     }
 
     /// A chain market maker with the given chain risk limits.

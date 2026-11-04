@@ -385,10 +385,11 @@ for outcome in mm.refresh_all_quotes(underlying_price, &pricing)? {
     }
 }
 
-// Check chain risk status
+// Check chain risk status. While it does not allow quoting, the refresh
+// above refuses with `MMError::QuotingHalted`.
 let status = mm.check_chain_risk().unwrap();
 if !status.can_quote() {
-    // Stop quoting or hedge
+    // Withdraw resting quotes, and hedge or reconcile
 }
 ```
 
