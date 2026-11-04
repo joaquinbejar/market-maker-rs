@@ -15,8 +15,11 @@
 use financial_types::Side;
 use financial_types::instrument::fixtures::{self, Case, Expected, Operation};
 use margin_rs::instrument::InstrumentScales;
-use margin_rs::ledger::{ExecutionCashflow, Ledger, LedgerConfig};
-use margin_rs::{Asset, Instrument, InstrumentId};
+use margin_rs::ledger::{
+    DerivativeSettlement, Execution, ExecutionCashflow, ExpirySettlement, FundingPayment, Ledger,
+    LedgerConfig,
+};
+use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId};
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::engine::{BacktestConfig, BacktestStrategy, FeeCurrency};
 use market_maker_rs::backtest::{
@@ -498,6 +501,204 @@ fn a_run_never_reuses_an_execution_the_ledger_started_with() {
         assert_eq!(second.final_position, first.final_position);
         assert_eq!(engine.get_state().0.quantity, dec!(10));
     }
+}
+
+/// The id of a first fill posted to `ledger`, on the instrument `traded`, which
+/// must book.
+fn id_of_the_last_fill(ledger: Ledger, traded: &InstrumentId) -> String {
+    let mut a = MarginLedgerAccountant::new(ledger, traded.clone()).unwrap();
+    let before = a.snapshot().unwrap().position;
+    a.post_fill(&posted(1, Action::Buy, dec!(60000), dec!(5), dec!(0)))
+        .unwrap();
+    assert_eq!(a.snapshot().unwrap().position, before + dec!(5));
+    let journal = a.ledger().journal();
+    journal[journal.len() - 1].execution_id.as_str().to_string()
+}
+
+#[test]
+fn execution_ids_continue_after_every_journal_that_shares_them() {
+    // Each journal alone, so that one left out fails its own case.
+    let perp = linear("PERP", dec!(0.01), None);
+    let perp_id = InstrumentId::new("PERP").unwrap();
+    let id = |text: &str| ExecutionId::new(text).unwrap();
+
+    let mut funded = ledger_for(&perp);
+    funded
+        .book_funding(&FundingPayment {
+            id: id("sim-5"),
+            instrument: perp_id.clone(),
+            amount: dec!(1),
+            as_of_ms: 1,
+        })
+        .unwrap();
+    assert_eq!(id_of_the_last_fill(funded, &perp_id), "sim-6");
+
+    let mut settled = ledger_for(&perp);
+    settled
+        .book_settlement(&DerivativeSettlement {
+            id: id("sim-7"),
+            // A settlement is for a derivative held outside the ledger.
+            instrument: InstrumentId::new("OUTSIDE").unwrap(),
+            asset: Asset::new("USDT").unwrap(),
+            realized_pnl: dec!(1),
+            fee: dec!(0),
+        })
+        .unwrap();
+    assert_eq!(id_of_the_last_fill(settled, &perp_id), "sim-8");
+
+    // A flat future that expired, beside the instrument traded.
+    let future = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let mut expired = ledger_for(&perp);
+    expired
+        .register_instrument(Instrument::from_spec(&future, scales()).unwrap())
+        .unwrap();
+    expired
+        .settle_expiry(&ExpirySettlement {
+            id: id("sim-9"),
+            instrument: InstrumentId::new("FUT").unwrap(),
+            price: dec!(60000),
+            as_of_ms: EXPIRY_MS,
+        })
+        .unwrap();
+    assert_eq!(id_of_the_last_fill(expired, &perp_id), "sim-10");
+}
+
+/// A ledger on the perpetual `PERP`, with one identifier in each journal that
+/// shares them: an execution, a funding payment, a settlement and an expiry.
+fn ledger_with_all_journals(execution: &str, funding: &str, settled: &str, expiry: &str) -> Ledger {
+    let id = |text: &str| ExecutionId::new(text).unwrap();
+    let perp_id = InstrumentId::new("PERP").unwrap();
+    let mut ledger = ledger_for(&linear("PERP", dec!(0.01), None));
+    ledger
+        .register_instrument(
+            Instrument::from_spec(&linear("FUT", dec!(0.01), Some(EXPIRY_MS)), scales()).unwrap(),
+        )
+        .unwrap();
+    ledger
+        .book_execution_allowing_overdraft(
+            &Execution::new(
+                id(execution),
+                perp_id.clone(),
+                Action::Buy,
+                dec!(60000),
+                dec!(1),
+            )
+            .with_executed_at(1),
+            None,
+        )
+        .unwrap();
+    ledger
+        .book_funding(&FundingPayment {
+            id: id(funding),
+            instrument: perp_id,
+            amount: dec!(1),
+            as_of_ms: 1,
+        })
+        .unwrap();
+    ledger
+        .book_settlement(&DerivativeSettlement {
+            id: id(settled),
+            instrument: InstrumentId::new("OUTSIDE").unwrap(),
+            asset: Asset::new("USDT").unwrap(),
+            realized_pnl: dec!(1),
+            fee: dec!(0),
+        })
+        .unwrap();
+    ledger
+        .settle_expiry(&ExpirySettlement {
+            id: id(expiry),
+            instrument: InstrumentId::new("FUT").unwrap(),
+            price: dec!(60000),
+            as_of_ms: EXPIRY_MS,
+        })
+        .unwrap();
+    ledger
+}
+
+#[test]
+fn execution_ids_continue_after_the_highest_of_all_the_journals() {
+    let perp_id = InstrumentId::new("PERP").unwrap();
+    // The highest in each journal in turn, so that no order of reading can pass.
+    for ids in [
+        ["sim-50", "sim-2", "sim-3", "sim-4"],
+        ["sim-2", "sim-50", "sim-3", "sim-4"],
+        ["sim-2", "sim-3", "sim-50", "sim-4"],
+        ["sim-2", "sim-3", "sim-4", "sim-50"],
+    ] {
+        let ledger = ledger_with_all_journals(ids[0], ids[1], ids[2], ids[3]);
+        let mut a = MarginLedgerAccountant::new(ledger, perp_id.clone()).unwrap();
+        // Through the handover as well as through the constructor.
+        a.begin_from_current_state();
+        let start = a.ledger().snapshot();
+        let fill = posted(1, Action::Buy, dec!(60000), dec!(5), dec!(0));
+        a.post_fill(&fill).unwrap();
+        // The same fill again is the same execution.
+        a.post_fill(&fill).unwrap();
+        let journal = a.ledger().journal();
+        assert_eq!(journal.len(), 2, "{ids:?}");
+        assert_eq!(journal[1].execution_id.as_str(), "sim-51", "{ids:?}");
+        assert_eq!(a.snapshot().unwrap().position, dec!(6));
+
+        // A reset returns to the same start and the offset does not accumulate.
+        a.reset();
+        assert_eq!(a.ledger().snapshot(), start);
+        a.post_fill(&fill).unwrap();
+        assert_eq!(a.ledger().journal()[1].execution_id.as_str(), "sim-51");
+        // Handed over again, the numbers continue after the run's own.
+        a.begin_from_current_state();
+        a.post_fill(&fill).unwrap();
+        assert_eq!(a.ledger().journal()[2].execution_id.as_str(), "sim-52");
+    }
+}
+
+#[test]
+fn other_identifiers_do_not_move_the_execution_ids() {
+    let perp_id = InstrumentId::new("PERP").unwrap();
+    for ids in [
+        ["sim-x", "simx-9", "SIM-9", "9"],
+        ["sim-", "sim-12x", "xsim-9", "sim-9.5"],
+        // Above u64: it does not parse, and the sequence never reaches it.
+        [
+            "sim-18446744073709551616",
+            "other",
+            "sim-99999999999999999999999",
+            "sim--9",
+        ],
+    ] {
+        let ledger = ledger_with_all_journals(ids[0], ids[1], ids[2], ids[3]);
+        assert_eq!(id_of_the_last_fill(ledger, &perp_id), "sim-1", "{ids:?}");
+    }
+}
+
+#[test]
+fn execution_ids_past_the_largest_number_are_an_error_with_the_ledger_intact() {
+    let perp_id = InstrumentId::new("PERP").unwrap();
+    let last = format!("sim-{}", u64::MAX);
+    let ledger = ledger_with_all_journals("sim-1", &last, "sim-2", "sim-3");
+    let mut a = MarginLedgerAccountant::new(ledger, perp_id).unwrap();
+    let start = a.ledger().snapshot();
+    let before = a.snapshot().unwrap();
+    let error = a
+        .post_fill(&posted(1, Action::Buy, dec!(60000), dec!(5), dec!(0)))
+        .unwrap_err();
+    assert!(matches!(error, MMError::NumericalError(_)), "{error:?}");
+    assert_eq!(a.ledger().snapshot(), start);
+    assert_eq!(a.snapshot().unwrap(), before);
+}
+
+#[test]
+fn a_replay_onto_a_ledger_wrapped_again_books_new_fills() {
+    // The execution id is a key for one accountant, not across ledgers.
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let fill = posted(1, Action::Buy, dec!(60000), dec!(5), dec!(0));
+    let mut a = accountant_for(&spec);
+    a.post_fill(&fill).unwrap();
+    a.post_fill(&fill).unwrap();
+    assert_eq!(a.snapshot().unwrap().position, dec!(5));
+    let mut again =
+        MarginLedgerAccountant::new(a.ledger().clone(), InstrumentId::new("FUT").unwrap()).unwrap();
+    again.post_fill(&fill).unwrap();
+    assert_eq!(again.snapshot().unwrap().position, dec!(10));
 }
 
 #[test]
