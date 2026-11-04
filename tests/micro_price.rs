@@ -282,6 +282,8 @@ fn test_fit_limit_outside_the_quotes_is_a_mid_fallback() {
     let model = model_of(&quotes, &cfg);
     let (narrow, broad) = (model.states()[2], model.states()[5]);
     assert_eq!(narrow.status, StateStatus::OutsideQuotes, "{narrow:?}");
+    // It does not absorb in the matrices, so it is not counted as absorption.
+    assert_eq!(narrow.fallback_within_moves, dec!(0));
     assert!(narrow.adjustment.abs() > TICK / dec!(2));
     assert_eq!(broad.status, StateStatus::Calibrated, "{broad:?}");
     let signal = model.signal(&quote(0, 1000, true)).unwrap();

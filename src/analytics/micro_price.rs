@@ -58,7 +58,7 @@
 //!   be large. The record counts each reason, and
 //!   [`MicroPriceModel::calibrated_share`] gives the coverage of the fit.
 //! - [`StateEstimate::fallback_within_moves`] reports how much a state's
-//!   adjustment depends on absorption by fallback states.
+//!   adjustment depends on absorption by rare or no move states.
 //!
 //! # Invalid quotes
 //!
@@ -555,10 +555,13 @@ pub struct StateEstimate {
     /// [`StateStatus::NoPriceMove`]; for [`StateStatus::OutsideQuotes`], the
     /// value that was refused.
     pub adjustment: Decimal,
-    /// Probability that the chain from this state reaches a fallback state
-    /// within 10 mid moves. Fallback states absorb the chain with adjustment 0,
-    /// so the higher this is, the more the adjustment is shrunk by them and not
-    /// by evidence. 1 for a fallback state.
+    /// Probability that the chain from this state is absorbed by a
+    /// [`StateStatus::Rare`] or [`StateStatus::NoPriceMove`] state within 10 mid
+    /// moves. Those absorb with adjustment 0, so the higher this is, the more
+    /// the adjustment is shrunk by them and not by evidence. It is 1 on those
+    /// states. [`StateStatus::OutsideQuotes`] is decided after the fit and does
+    /// not absorb in the matrices, so it does not count here, even though its
+    /// signal is the mid too.
     pub fallback_within_moves: Decimal,
     /// Whether the signal uses the adjustment.
     pub status: StateStatus,
