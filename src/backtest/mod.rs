@@ -62,6 +62,8 @@ pub mod latency;
 
 pub mod lifecycle;
 
+pub mod queue_reactive;
+
 /// Performance metrics calculator.
 pub mod metrics;
 
