@@ -1267,6 +1267,78 @@ fn test_walk_forward_fill_at_rate_zero_scores_the_floor() {
     assert!((score - expected).abs() < 1e-9, "{score} {expected}");
 }
 
+#[test]
+fn test_walk_forward_score_matches_the_exact_likelihood() {
+    let cell = |timestamp_ms, distance, fills| QuoteExposure {
+        timestamp_ms,
+        distance,
+        exposure_ms: 1_000,
+        fills,
+    };
+    let split = ChronologicalSplit {
+        train: TimeWindow {
+            start_ms: 0,
+            end_ms: DAY_MS,
+        },
+        test: TimeWindow {
+            start_ms: DAY_MS,
+            end_ms: 2 * DAY_MS,
+        },
+    };
+    let p = prices(7, 0, 2 * DAY_MS, 60_000, 0.5);
+    let cfg = config().with_seasonality(2, 0).with_minima(30, 2, 1, 1);
+    for (afternoon_fills, expected) in [(0, -4.018260123027243), (1, 2.889495155954897)] {
+        let mut e = Vec::new();
+        for (day, extra) in [(0, 0), (DAY_MS, afternoon_fills)] {
+            e.push(cell(day + 1_000_000, dec!(0), 10));
+            e.push(cell(day + 1_000_000, dec!(1), 5));
+            e.push(cell(day + 50_000_000, dec!(0), extra));
+            e.push(cell(day + 50_000_000, dec!(1), 0));
+        }
+        let data = CalibrationData::new(&p, &e).unwrap();
+        let report = walk_forward(&data, &[split], &cfg, "d", &constant()).unwrap();
+        let score = report.folds[0]
+            .calibrated
+            .unwrap()
+            .intensity
+            .unwrap()
+            .to_f64()
+            .unwrap();
+        assert!((score - expected).abs() < 1e-9, "{score} {expected}");
+    }
+}
+
+#[test]
+fn test_walk_forward_realized_volatility_gap_at_either_end_is_unscored() {
+    let p = prices(7, 0, 2 * DAY_MS, 60_000, 0.5);
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let split = ChronologicalSplit {
+        train: TimeWindow {
+            start_ms: 0,
+            end_ms: DAY_MS,
+        },
+        test: TimeWindow {
+            start_ms: DAY_MS,
+            end_ms: 2 * DAY_MS,
+        },
+    };
+    let silent: [std::ops::Range<u64>; 2] =
+        [DAY_MS..DAY_MS + 600_000, 2 * DAY_MS - 600_000..2 * DAY_MS];
+    for range in silent {
+        let mut q = p.clone();
+        q.retain(|s| !range.contains(&s.timestamp_ms));
+        let report = walk_forward(
+            &CalibrationData::new(&q, &e).unwrap(),
+            &[split],
+            &config(),
+            "d",
+            &constant(),
+        )
+        .unwrap();
+        assert_eq!(report.folds[0].constant.volatility, None, "{range:?}");
+    }
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn test_calibration_record_serde_round_trip_is_identical() {
