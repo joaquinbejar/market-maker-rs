@@ -607,22 +607,92 @@ fn test_calibrate_window_partial_final_bucket_is_dropped() {
 }
 
 #[test]
-fn test_calibrate_window_thin_seasonal_bucket_is_insufficient() {
+fn test_calibrate_window_thin_or_unobserved_bucket_is_insufficient() {
     let p = prices(7, 0, DAY_MS, 60_000, 0.5);
-    let e = exposures(11, 0, DAY_MS / 2, 2.0, 3.0, |_| 1.0);
-    let data = CalibrationData::new(&p, &e).unwrap();
     let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let morning = exposures(11, 0, DAY_MS / 2, 2.0, 3.0, |_| 1.0);
+    let data = CalibrationData::new(&p, &morning).unwrap();
+    for min_bucket_fills in [0, 30] {
+        let cfg = config().with_seasonality(2, min_bucket_fills);
+        assert_eq!(
+            calibrate_window(&data, &window, &cfg, "d").unwrap().outcome,
+            CalibrationOutcome::Insufficient(CalibrationFailure::UnobservedSeasonalBucket {
+                bucket: 1
+            })
+        );
+    }
+
+    // Exposure without fills in the afternoon is evidence of a zero rate.
+    let mut quiet = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    quiet
+        .iter_mut()
+        .filter(|e| e.timestamp_ms >= DAY_MS / 2)
+        .for_each(|e| e.fills = 0);
+    let data = CalibrationData::new(&p, &quiet).unwrap();
     let thin = calibrate_window(&data, &window, &config().with_seasonality(2, 30), "d").unwrap();
-    assert!(matches!(
+    assert_eq!(
         thin.outcome,
         CalibrationOutcome::Insufficient(CalibrationFailure::ThinSeasonalBucket {
             bucket: 1,
             have: 0,
             need: 30
         })
-    ));
+    );
     let closed = calibrate_window(&data, &window, &config().with_seasonality(2, 0), "d").unwrap();
     assert_eq!(closed.parameters().unwrap().seasonality[1], dec!(0));
+}
+
+/// Two buckets, 12 hours apart, each with `(distance, seconds, fills)` cells.
+fn two_bucket_outcome(cells: [[(Decimal, u64, u64); 2]; 2]) -> CalibrationOutcome {
+    let p = prices(7, 0, DAY_MS, 60_000, 0.5);
+    let mut e = Vec::new();
+    for (bucket, levels) in cells.iter().enumerate() {
+        for (distance, seconds, fills) in levels {
+            e.push(QuoteExposure {
+                timestamp_ms: bucket as u64 * DAY_MS / 2 + 1,
+                distance: *distance,
+                exposure_ms: seconds * 1_000,
+                fills: *fills,
+            });
+        }
+    }
+    e.sort_by_key(|x| x.timestamp_ms);
+    let cfg = config().with_seasonality(2, 1).with_minima(30, 2, 1, 1);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    calibrate_window(&CalibrationData::new(&p, &e).unwrap(), &window, &cfg, "d")
+        .unwrap()
+        .outcome
+}
+
+#[test]
+fn test_calibrate_window_exposure_mix_across_buckets_recovers_k() {
+    // A 2:1 fall per unit of distance in both buckets, with opposite exposure.
+    let outcome = two_bucket_outcome([
+        [(dec!(0), 100, 200), (dec!(1), 1, 1)],
+        [(dec!(0), 1, 8), (dec!(1), 100, 400)],
+    ]);
+    let CalibrationOutcome::Calibrated(fit) = outcome else {
+        panic!("not calibrated: {outcome:?}");
+    };
+    let k = fit.order_intensity_k.to_f64().unwrap();
+    assert!((k - std::f64::consts::LN_2).abs() < 1e-9, "k {k}");
+    // The afternoon's rate at distance zero is 8 against the morning's 2.
+    let ratio = (fit.seasonality[1] / fit.seasonality[0]).to_f64().unwrap();
+    assert!((ratio - 4.0).abs() < 1e-9, "ratio {ratio}");
+    let a = fit.intensity_scale_a.to_f64().unwrap();
+    let morning = a * fit.seasonality[0].to_f64().unwrap();
+    assert!((morning - 2.0).abs() < 1e-9, "morning {morning}");
+}
+
+#[test]
+fn test_calibrate_window_fills_only_at_nearest_distance_is_unbounded() {
+    assert_eq!(
+        two_bucket_outcome([
+            [(dec!(0), 100, 50), (dec!(1), 100, 0)],
+            [(dec!(1), 100, 50), (dec!(2), 100, 0)],
+        ]),
+        CalibrationOutcome::Insufficient(CalibrationFailure::UnboundedIntensity)
+    );
 }
 
 #[test]

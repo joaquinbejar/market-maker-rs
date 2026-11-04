@@ -31,9 +31,9 @@
 //!
 //! # Intensity fit
 //!
-//! `A` and `k` are the Poisson maximum likelihood estimates, so exposures
-//! without fills count as evidence of a low rate and distances may be
-//! continuous. The existing log-linear [`OrderIntensityCalibrator`] cannot
+//! `A`, `k` and `s(t)` are the joint Poisson maximum likelihood estimates, so
+//! exposures without fills count as evidence of a low rate, distances may be
+//! continuous, and `k` is not confused with a bucket that quotes further away. The existing log-linear [`OrderIntensityCalibrator`] cannot
 //! take a level without fills, and does not return `A`.
 //!
 //! [`OrderIntensityCalibrator`]: crate::strategy::calibration::OrderIntensityCalibrator
@@ -49,7 +49,7 @@
 //! assert!(splits.iter().all(|s| s.train.end_ms == s.test.start_ms));
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
@@ -311,8 +311,9 @@ pub struct WalkForwardConfig {
     /// Intraday buckets of the seasonality, from 1 to 1440.
     pub seasonality_buckets: u32,
     /// Fewest fills every bucket needs. With a lower count the window is
-    /// [`CalibrationFailure::ThinSeasonalBucket`]. Zero accepts a closed
-    /// bucket, whose multiplier is then 0.
+    /// [`CalibrationFailure::ThinSeasonalBucket`]. Zero accepts a bucket with
+    /// exposure and no fills, whose multiplier is then 0. A bucket with no
+    /// exposure is always [`CalibrationFailure::UnobservedSeasonalBucket`].
     pub min_bucket_fills: u64,
 }
 
@@ -485,6 +486,14 @@ pub enum CalibrationFailure {
     },
     /// The fitted rate does not fall with distance, so `k` is not positive.
     NonDecayingIntensity,
+    /// Each bucket's fills are all at its nearest distance, so the likelihood
+    /// has no finite `k`.
+    UnboundedIntensity,
+    /// An intraday bucket has no exposure, so nothing is known about its rate.
+    UnobservedSeasonalBucket {
+        /// Bucket index.
+        bucket: usize,
+    },
     /// An intraday bucket has too few fills for a multiplier.
     ThinSeasonalBucket {
         /// Bucket index.
@@ -734,6 +743,13 @@ pub fn walk_forward(
     Ok(WalkForwardReport { folds })
 }
 
+/// Fitted intensity parameters.
+struct IntensityFit {
+    a: Decimal,
+    k: Decimal,
+    seasonality: Vec<Decimal>,
+}
+
 /// Estimates the parameters, or says why the window cannot.
 fn estimate(
     prices: &[PriceSample],
@@ -776,20 +792,16 @@ fn estimate(
             need: config.min_fills,
         }));
     }
-    let (a, k) = match fit_intensity(exposures, config.min_distance_levels)? {
+    let fit = match fit_intensity(exposures, config)? {
         Ok(fit) => fit,
-        Err(failure) => return Ok(Err(failure)),
-    };
-    let seasonality = match fit_seasonality(exposures, a, k, config)? {
-        Ok(seasonality) => seasonality,
         Err(failure) => return Ok(Err(failure)),
     };
     Ok(Ok(CalibratedParameters {
         volatility,
         reference_price,
-        intensity_scale_a: a,
-        order_intensity_k: k,
-        seasonality,
+        intensity_scale_a: fit.a,
+        order_intensity_k: fit.k,
+        seasonality: fit.seasonality,
     }))
 }
 
@@ -871,124 +883,144 @@ fn exposure_totals(exposures: &[QuoteExposure]) -> MMResult<(u64, u64)> {
     })
 }
 
-/// Fills and exposure by distance.
-fn by_distance(exposures: &[QuoteExposure]) -> MMResult<BTreeMap<Decimal, (u64, u64)>> {
-    let mut levels: BTreeMap<Decimal, (u64, u64)> = BTreeMap::new();
+/// One intraday bucket of the fit.
+#[derive(Default)]
+struct BucketFit {
+    /// Distance and seconds of exposure of each level.
+    levels: Vec<(f64, f64)>,
+    fills: f64,
+}
+
+impl BucketFit {
+    /// `Σ T · exp(-k · d)`.
+    fn mass(&self, k: f64) -> f64 {
+        self.levels.iter().map(|(d, t)| t * (-k * d).exp()).sum()
+    }
+
+    /// The bucket's expected fills times its mean distance under `k`, once
+    /// its own multiplier is profiled out.
+    fn fill_moment(&self, k: f64) -> f64 {
+        let mass = self.mass(k);
+        if self.fills == 0.0 || mass <= 0.0 {
+            return 0.0;
+        }
+        let moment: f64 = self
+            .levels
+            .iter()
+            .map(|(d, t)| t * (-k * d).exp() * d)
+            .sum();
+        self.fills * moment / mass
+    }
+}
+
+/// Poisson maximum likelihood of `λ = c_b · exp(-k · δ)`, with a free `c_b`
+/// per intraday bucket.
+///
+/// Each `c_b` is `n_b / Σ T · exp(-k · d)` given `k`. The likelihood in `k` is
+/// then maximal where the observed sum of `n · d` equals the sum of
+/// [`BucketFit::fill_moment`], which falls with `k`, so `k` is found by
+/// bisection. Finally `A = Σ n / Σ T · exp(-k · d)` and `s_b = c_b / A`.
+fn fit_intensity(
+    exposures: &[QuoteExposure],
+    config: &WalkForwardConfig,
+) -> MMResult<Result<IntensityFit, CalibrationFailure>> {
+    let mut cells: BTreeMap<(usize, Decimal), (u64, u64)> = BTreeMap::new();
     for e in exposures {
-        let level = levels.entry(e.distance).or_default();
-        level.0 = level.0.checked_add(e.fills).or_overflow("level fills")?;
-        level.1 = level
+        let bucket = bucket_of(e.timestamp_ms, config.seasonality_buckets)?;
+        let cell = cells.entry((bucket, e.distance)).or_default();
+        cell.0 = cell.0.checked_add(e.fills).or_overflow("level fills")?;
+        cell.1 = cell
             .1
             .checked_add(e.exposure_ms)
             .or_overflow("level exposure")?;
     }
-    Ok(levels)
-}
+    let distances_with_fills = cells
+        .iter()
+        .filter(|(_, (fills, _))| *fills > 0)
+        .map(|((_, distance), _)| *distance)
+        .collect::<BTreeSet<_>>()
+        .len();
+    if distances_with_fills < config.min_distance_levels {
+        return Ok(Err(CalibrationFailure::TooFewDistanceLevels {
+            have: distances_with_fills,
+            need: config.min_distance_levels,
+        }));
+    }
 
-/// Poisson maximum likelihood of `A` and `k` over all levels.
-///
-/// With `n` fills and `T` seconds per level at distance `d`, the likelihood is
-/// maximal where the fills' mean distance equals the mean of `d` weighted by
-/// `T · exp(-k · d)`. That mean falls with `k`, so `k` is found by bisection.
-fn fit_intensity(
-    exposures: &[QuoteExposure],
-    min_levels: usize,
-) -> MMResult<Result<(Decimal, Decimal), CalibrationFailure>> {
-    let mut levels = Vec::new();
-    let mut fills_at_level = 0usize;
-    let mut total_fills = 0.0f64;
-    let mut fill_distance = 0.0f64;
-    for (distance, (fills, exposure_ms)) in by_distance(exposures)? {
+    let bucket_count = usize::try_from(config.seasonality_buckets)
+        .map_err(|_| MMError::InvalidConfiguration("too many buckets".to_string()))?;
+    let mut buckets: Vec<BucketFit> = Vec::with_capacity(bucket_count);
+    buckets.resize_with(bucket_count, BucketFit::default);
+    let mut bucket_fills = vec![0u64; bucket_count];
+    let mut observed = 0.0f64;
+    for ((index, distance), (fills, exposure_ms)) in cells {
         let d = to_f64(distance)?;
         let n = to_f64(Decimal::from(fills))?;
         let seconds = to_f64(Decimal::from(exposure_ms))? / 1_000.0;
-        levels.push((d, seconds));
-        if fills > 0 {
-            fills_at_level = fills_at_level.saturating_add(1);
-        }
-        total_fills += n;
-        fill_distance += n * d;
+        let bucket = buckets.get_mut(index).or_overflow("seasonality bucket")?;
+        bucket.levels.push((d, seconds));
+        bucket.fills += n;
+        let total = bucket_fills
+            .get_mut(index)
+            .or_overflow("seasonality bucket")?;
+        *total = total.checked_add(fills).or_overflow("bucket fills")?;
+        observed += n * d;
     }
-    if fills_at_level < min_levels {
-        return Ok(Err(CalibrationFailure::TooFewDistanceLevels {
-            have: fills_at_level,
-            need: min_levels,
-        }));
-    }
-    let target = fill_distance / total_fills;
-    let tilted_mean = |k: f64| {
-        let (mut mass, mut moment) = (0.0f64, 0.0f64);
-        for (d, seconds) in &levels {
-            let weight = seconds * (-k * d).exp();
-            mass += weight;
-            moment += weight * d;
+    for (bucket, (fit, fills)) in buckets.iter().zip(&bucket_fills).enumerate() {
+        if fit.levels.is_empty() {
+            return Ok(Err(CalibrationFailure::UnobservedSeasonalBucket { bucket }));
         }
-        if mass > 0.0 { moment / mass } else { 0.0 }
-    };
-    if tilted_mean(0.0) <= target {
+        if *fills < config.min_bucket_fills {
+            return Ok(Err(CalibrationFailure::ThinSeasonalBucket {
+                bucket,
+                have: *fills,
+                need: config.min_bucket_fills,
+            }));
+        }
+    }
+
+    let predicted = |k: f64| buckets.iter().map(|b| b.fill_moment(k)).sum::<f64>();
+    if predicted(0.0) <= observed {
         return Ok(Err(CalibrationFailure::NonDecayingIntensity));
     }
+    // As `k` grows, each bucket's mean distance falls to its nearest level. At
+    // that limit rounding would stop the bisection at an arbitrary finite `k`.
+    let limit: f64 = buckets
+        .iter()
+        .map(|b| b.fills * b.levels.first().map_or(0.0, |(d, _)| *d))
+        .sum();
+    if observed <= limit {
+        return Ok(Err(CalibrationFailure::UnboundedIntensity));
+    }
     let (mut low, mut high) = (0.0f64, 1.0f64);
-    while tilted_mean(high) > target {
+    while predicted(high) > observed {
         low = high;
         high *= 2.0;
         if high > K_BRACKET_LIMIT {
-            return Err(MMError::NumericalError(format!(
-                "k above {K_BRACKET_LIMIT} for mean fill distance {target}"
-            )));
+            return Ok(Err(CalibrationFailure::UnboundedIntensity));
         }
     }
     for _ in 0..K_BISECTION_STEPS {
         let middle = 0.5 * (low + high);
-        if tilted_mean(middle) > target {
+        if predicted(middle) > observed {
             low = middle;
         } else {
             high = middle;
         }
     }
     let k = 0.5 * (low + high);
-    let mass: f64 = levels.iter().map(|(d, t)| t * (-k * d).exp()).sum();
-    Ok(Ok((from_f64(total_fills / mass)?, from_f64(k)?)))
-}
-
-/// Observed over fitted fills per intraday bucket.
-fn fit_seasonality(
-    exposures: &[QuoteExposure],
-    a: Decimal,
-    k: Decimal,
-    config: &WalkForwardConfig,
-) -> MMResult<Result<Vec<Decimal>, CalibrationFailure>> {
-    let buckets = usize::try_from(config.seasonality_buckets)
-        .map_err(|_| MMError::InvalidConfiguration("too many buckets".to_string()))?;
-    let mut totals = vec![(0u64, Decimal::ZERO); buckets];
-    for e in exposures {
-        let index = bucket_of(e.timestamp_ms, config.seasonality_buckets)?;
-        let expected = expected_fills(intensity(a, k, e.distance)?, e.exposure_ms)?;
-        let total = totals.get_mut(index).or_overflow("seasonality bucket")?;
-        total.0 = total.0.checked_add(e.fills).or_overflow("bucket fills")?;
-        total.1 = total
-            .1
-            .checked_add(expected)
-            .or_overflow("bucket expected")?;
-    }
-    let mut multipliers = Vec::with_capacity(buckets);
-    for (bucket, (fills, expected)) in totals.into_iter().enumerate() {
-        if fills < config.min_bucket_fills {
-            return Ok(Err(CalibrationFailure::ThinSeasonalBucket {
-                bucket,
-                have: fills,
-                need: config.min_bucket_fills,
-            }));
-        }
-        multipliers.push(if fills == 0 {
-            Decimal::ZERO
-        } else {
-            Decimal::from(fills)
-                .checked_div(expected)
-                .or_overflow("seasonal multiplier")?
-        });
-    }
-    Ok(Ok(multipliers))
+    let total_fills: f64 = buckets.iter().map(|b| b.fills).sum();
+    let total_mass: f64 = buckets.iter().map(|b| b.mass(k)).sum();
+    let a = total_fills / total_mass;
+    let seasonality = buckets
+        .iter()
+        .map(|b| from_f64(b.fills / b.mass(k) / a))
+        .collect::<MMResult<Vec<_>>>()?;
+    Ok(Ok(IntensityFit {
+        a: from_f64(a)?,
+        k: from_f64(k)?,
+        seasonality,
+    }))
 }
 
 /// Scores a volatility and a rate function on a test window.
