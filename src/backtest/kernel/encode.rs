@@ -33,12 +33,15 @@ use crate::Decimal;
 use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
 
+use std::collections::BTreeMap;
+
 use super::FinancialKernel;
 use super::account::OpenOrder;
 use super::book::{
     Arr, Blank, Delivery, ExecKind, FillRec, MsgKind, ObsEntry, OrderState, Origin, ReportRec,
     VenueMsg, VenueOrder, dir_code, dir_from_code,
 };
+use super::config::{ValidFill, ValidatedConfig};
 use super::data::DatasetId;
 use super::gate::GateState;
 use super::grid::scaled_decimal;
@@ -961,6 +964,10 @@ fn validate_state<const ORD: usize, const MSG: usize, const DLV: usize, const OB
         all.iter().all(|o| o.filled <= o.qty),
         "order filled beyond its quantity",
     )?;
+    check(
+        cfg.fill != ValidFill::Immediate || s.orders.as_slice().iter().all(|o| o.filled == 0),
+        "resting order partially filled under the immediate model",
+    )?;
     let flagged: Vec<u64> = {
         let mut v: Vec<u64> = all
             .iter()
@@ -1037,9 +1044,14 @@ fn validate_state<const ORD: usize, const MSG: usize, const DLV: usize, const OB
         msgs.len() <= held.saturating_mul(2),
         "more messages than twice the open orders",
     )?;
+    // A report in flight belongs to an open order, which reports at most once
+    // per row on top of its three status reports.
+    let per_order = usize::try_from(cfg.partial_reports_per_order)
+        .unwrap_or(usize::MAX)
+        .saturating_add(3);
     check(
-        dl.len() <= held.saturating_mul(3),
-        "more deliveries than three times the open orders",
+        dl.len() <= held.saturating_mul(per_order),
+        "more deliveries than the open orders can have in flight",
     )?;
     // Ledger.
     let v = &s.venue;
@@ -1124,6 +1136,7 @@ fn validate_invariants<const ORD: usize, const MSG: usize, const DLV: usize, con
         check(qty_ok(o.qty), "order quantity outside the size range")?;
     }
     let dl = s.deliveries.as_slice();
+    check_report_chains(s, cfg)?;
     for d in dl {
         let r = &d.report;
         check(price_ok(r.price), "report price outside the price range")?;
@@ -1273,6 +1286,65 @@ fn validate_invariants<const ORD: usize, const MSG: usize, const DLV: usize, con
     Ok(())
 }
 
+/// The queued reports of each order against each other and the order: every
+/// fill books lots and raises `cum` by exactly its `last`, a `PartialFill`
+/// leaves quantity open and a `Fill` none, a `Canceled` keeps what was filled
+/// and the last queued `cum` of a venue order is its `filled`. The immediate
+/// model has no partial fill, so nothing is filled before a `Fill`.
+fn check_report_chains<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+    s: &KernelState<ORD, MSG, DLV, OBS>,
+    cfg: &ValidatedConfig,
+) -> MMResult<()> {
+    let immediate = cfg.fill == ValidFill::Immediate;
+    let mut last_cum: BTreeMap<u64, u64> = BTreeMap::new();
+    for d in s.deliveries.as_slice() {
+        let r = &d.report;
+        match r.kind {
+            ExecKind::PartialFill | ExecKind::Fill => {
+                check(r.last > 0, "fill report without a quantity")?;
+                let open = r.kind == ExecKind::PartialFill;
+                check(
+                    !(open && immediate),
+                    "partial fill report under the immediate model",
+                )?;
+                check(
+                    if open { r.cum < r.qty } else { r.cum == r.qty },
+                    "fill report kind differs from its open quantity",
+                )?;
+                check(
+                    !immediate || r.last == r.cum,
+                    "fill after a partial fill under the immediate model",
+                )?;
+                match last_cum.get(&r.order_id) {
+                    Some(prior) => check(
+                        prior.checked_add(r.last) == Some(r.cum),
+                        "fill reports of an order do not add up",
+                    )?,
+                    None => check(r.last <= r.cum, "fill beyond the cumulative quantity")?,
+                }
+                last_cum.insert(r.order_id, r.cum);
+            }
+            ExecKind::Canceled => {
+                check(
+                    !immediate || r.cum == 0,
+                    "filled quantity on a cancel under the immediate model",
+                )?;
+                check(r.cum < r.qty, "cancel of a filled order")?;
+                if let Some(prior) = last_cum.get(&r.order_id) {
+                    check(*prior == r.cum, "cancel report differs from the fills")?;
+                }
+            }
+            ExecKind::Accepted | ExecKind::Rejected | ExecKind::CancelRejected => {}
+        }
+    }
+    for o in s.orders.as_slice().iter().chain(s.awaiting.as_slice()) {
+        if let Some(cum) = last_cum.get(&o.id) {
+            check(*cum == o.filled, "order filled differs from its reports")?;
+        }
+    }
+    Ok(())
+}
+
 /// Counters and sequences against their call-site relations, and the time
 /// clamps against the clock and the rows.
 ///
@@ -1280,11 +1352,15 @@ fn validate_invariants<const ORD: usize, const MSG: usize, const DLV: usize, con
 /// two, a one-sided action one):
 /// - `created <= 2 * step`;
 /// - stamps: an order takes one at submission, a local reject a second one,
-///   a venue order at most three more (activation, fill, cancel outcome),
-///   so `created + local_rejects + venue_fills <= stamp_seq <= 4 * created`;
+///   a venue order at most an activation, a cancel outcome and one per fill,
+///   so `created + local_rejects + venue_fills <= stamp_seq`, and
+///   `stamp_seq <= 4 * created` for the immediate model, with its one fill per
+///   order, or `3 * created + venue_fills` for the queue position model;
 /// - messages: an activation per order not rejected locally and at most one
 ///   cancel per order, so `next_msg_seq <= 2 * created - local_rejects`;
-/// - `local_rejects + venue_fills <= created`, `quote_errors` equals the
+/// - `local_rejects + venue_fills <= created * fills per order` (one for the
+///   immediate model, the largest order for the queue position model, since a
+///   fill books at least one lot), `quote_errors` equals the
 ///   `QuoteError` reject count, and the end-of-data drops are zero before
 ///   the end and bounded by the messages and rows;
 /// - at a decision every venue message and delivery due by `now_ns` was
@@ -1311,7 +1387,12 @@ fn validate_counters<const ORD: usize, const MSG: usize, const DLV: usize, const
     )?;
     let floor = wide(created) + wide(c.local_rejects) + wide(c.venue_fills);
     check(
-        floor <= wide(s.stamp_seq) && wide(s.stamp_seq) <= wide(created) * 4,
+        floor <= wide(s.stamp_seq)
+            && wide(s.stamp_seq)
+                <= match cfg.fill {
+                    ValidFill::Immediate => wide(created) * 4,
+                    ValidFill::QueuePosition { .. } => wide(created) * 3 + wide(c.venue_fills),
+                },
         "stamp_seq outside its call-site bounds",
     )?;
     check(
@@ -1319,7 +1400,12 @@ fn validate_counters<const ORD: usize, const MSG: usize, const DLV: usize, const
         "next_msg_seq beyond two messages per order",
     )?;
     check(
-        wide(c.local_rejects) + wide(c.venue_fills) <= wide(created),
+        wide(c.local_rejects) + wide(c.venue_fills)
+            <= wide(created)
+                * match cfg.fill {
+                    ValidFill::Immediate => 1,
+                    ValidFill::QueuePosition { .. } => wide(cfg.q),
+                },
         "more local rejects and fills than orders",
     )?;
     let quote_rejects = c.rejected.get(RejectReason::QuoteError.index()).copied();

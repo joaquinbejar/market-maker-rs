@@ -242,7 +242,8 @@ pub enum ExecKind {
     Canceled,
     /// Cancel arrived after the order ended.
     CancelRejected,
-    /// Order partially filled (not produced by the immediate model).
+    /// Order partially filled (not produced by the immediate model); it stays
+    /// live, and its last report is a `Fill` or a `Canceled`.
     PartialFill,
     /// Order completely filled.
     Fill,
@@ -303,7 +304,7 @@ impl Origin {
 ///
 /// The fields mirror the engine's `ExecutionReport` (in ticks, lots and
 /// money units), plus two delivered fields the engine does not have:
-/// `origin` and `cancel_pending`. `cancel_pending` is set on a `Fill` or a
+/// `origin` and `cancel_pending`. `cancel_pending` is set on a fill or a
 /// venue `Rejected` when a cancel for the order is still outstanding at the
 /// venue, so a `Canceled` or `CancelRejected` follows while the run keeps
 /// processing venue messages (pending messages are dropped at the end of
