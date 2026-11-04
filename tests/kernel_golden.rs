@@ -143,8 +143,10 @@ fn golden_scenario(config: Config, seed: u64) -> Scenario {
 }
 
 /// `(state fingerprint, event stream hash)` per configuration and seed.
-/// A change here is a change in simulated behaviour or in the state or event
-/// format, and must be explained in the PR that makes it.
+/// A change here is a change in simulated behaviour, in the state encoding,
+/// or in the `Debug` output of the events, which `events_hash` hashes; a
+/// renamed event field changes it with no change in behaviour. Explain it in
+/// the PR that makes it.
 const GOLDEN: [[(u128, u128); 3]; 4] = [
     [
         (
@@ -239,7 +241,9 @@ fn test_kernel_golden_trajectories_match_recorded_hashes() {
                 .count();
             hedged_down += hedges_that_reduced(&t);
         }
-        assert!(!print, "printed the golden values; nothing was compared");
+        if print {
+            continue;
+        }
         assert!(fills > 0, "config {c}: fills");
         assert!(cancels > 0, "config {c}: cancels");
         assert!(
@@ -253,6 +257,7 @@ fn test_kernel_golden_trajectories_match_recorded_hashes() {
             assert!(reduced > 0, "config {c}: reduced orders");
         }
     }
+    assert!(!print, "printed the golden values; nothing was compared");
 }
 
 /// Fills of hedge orders that shrank the venue position. Order ids follow
@@ -274,6 +279,7 @@ fn hedges_that_reduced(t: &Trajectory) -> u64 {
             KernelAction::Hold | KernelAction::QuoteError(_) => {}
         }
     }
+    assert_eq!(next_id, t.last.next_order_id(), "order id derivation");
     let mut position = 0i128;
     let mut count = 0;
     for e in &t.events {
