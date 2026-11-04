@@ -518,9 +518,10 @@ fn test_kernel_hedges_are_what_arbitrage_rs_plans() {
         }
     );
 
-    // The largest order bounds it, as does a touch size when one is given.
+    // The largest order bounds it even with more quoted, and a touch size bounds
+    // it when one is given.
     let small = hedge_fixture(2, Vec::new());
-    let plan = band_plan(&small, &at(dec!(5)), None);
+    let plan = band_plan(&small, &at(dec!(5)), Some(5));
     let plan = plan.plan().unwrap();
     assert_eq!(plan.leg.quantity.value(), dec!(2));
     assert_eq!(plan.expected_exposure_after, dec!(3));
@@ -629,6 +630,42 @@ fn test_kernel_hedge_plan_before_any_row_has_no_quote() {
             ..
         }
     ));
+}
+
+/// An observation of the hedge fixture at `position`.
+fn observed_at(sc: &Scenario, position: market_maker_rs::Decimal) -> Observation {
+    let data = sc.data();
+    let k = kernel(sc, &data);
+    Observation {
+        position,
+        ..k.observe(&k.reset(1))
+    }
+}
+
+#[test]
+fn test_kernel_hedge_rounds_down_to_whole_lots() {
+    let sc = hedge_fixture(10, Vec::new());
+    let decision = band_plan(&sc, &observed_at(&sc, dec!(2.5)), None);
+    assert_eq!(decision.plan().unwrap().leg.quantity.value(), dec!(2));
+}
+
+#[test]
+#[should_panic(expected = "not a multiple")]
+fn test_kernel_hedge_refuses_a_position_off_the_lot_grid() {
+    let sc = hedge_fixture(10, Vec::new());
+    let _ = hedged(&sc, 0, &observed_at(&sc, dec!(1.5)));
+}
+
+#[test]
+#[should_panic(expected = "no hedge for an observed position")]
+fn test_kernel_hedge_refuses_a_position_it_cannot_hedge() {
+    let sc = hedge_fixture(10, Vec::new());
+    let obs = Observation {
+        bid: 0,
+        ask: 0,
+        ..observed_at(&sc, dec!(2))
+    };
+    let _ = hedged(&sc, 0, &obs);
 }
 
 #[test]
