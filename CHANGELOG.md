@@ -8,6 +8,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `strategy::signal_quote`: causal, bounded quote adjustment from imbalance,
+  micro-price and VPIN features, with a declared policy for missing or stale
+  values, composed with the Avellaneda-Stoikov quotes under the risk limits,
+  and a simulation that ablates each feature on the same data, costs and fill
+  rules, with markout, inventory and attributed PnL (#89).
 - `analytics::micro_price`: Stoikov's micro-price (manuscript dated 18 April
   2018) from discretized imbalance and spread transitions, with typed
   fallbacks to the mid, a restorable calibrator, timestamped signals and an

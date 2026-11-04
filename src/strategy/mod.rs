@@ -50,3 +50,5 @@ pub mod glft;
 pub mod calibration;
 
 pub mod walk_forward;
+
+pub mod signal_quote;
