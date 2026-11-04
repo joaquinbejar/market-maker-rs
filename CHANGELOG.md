@@ -21,6 +21,9 @@ project follows [Semantic Versioning](https://semver.org/).
   `KernelFillModel::Immediate`, whose behaviour, encoding and recorded
   trajectories are unchanged. `decode` checks that the queued fill reports of
   each order add up (#177).
+- `tests/kernel_margin.rs` (features `kernel` and `margin`): margin-rs ledger
+  reservations driven by the kernel's events, through restore, forks and worker
+  assignment. The kernel gate itself keeps using `RiskLimits` (#177).
 - `strategy::signal_quote`: causal, bounded quote adjustment from imbalance,
   micro-price and VPIN features, with a declared policy for missing or stale
   values, composed with the Avellaneda-Stoikov quotes under the risk limits,

@@ -21,46 +21,12 @@ mod gate;
 
 use gate::*;
 use harness::*;
-use market_maker_rs::Decimal;
 use market_maker_rs::backtest::kernel::{
-    ExecKind, KernelAction, KernelEvent, KernelFillModel, KernelLatency, RejectReason,
-    capacity_need, decode, encode, fingerprint,
+    ExecKind, KernelAction, KernelEvent, KernelFillModel, KernelLatency, RejectReason, decode,
+    encode, fingerprint,
 };
 use market_maker_rs::dec;
 use std::collections::{HashMap, HashSet};
-
-/// Stack of the threads that hold these states by value: their delivery queue
-/// is several times the size of the other kernel tests'.
-const STACK_BYTES: usize = 64 * 1024 * 1024;
-
-/// Runs `body` on a thread with [`STACK_BYTES`] of stack.
-fn on_large_stack(body: impl FnOnce() + Send) {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(STACK_BYTES)
-            .spawn_scoped(scope, body)
-            .unwrap()
-            .join()
-            .unwrap();
-    });
-}
-
-/// The scenario under the queue position model, when the harness capacity
-/// has room for its partial fill reports.
-fn partial_scenario(seed: u64, index: u64) -> Option<Scenario> {
-    let mut sc = scenario(seed, index);
-    let mix = seed.wrapping_mul(31).wrapping_add(index);
-    let rate_lots = [1u64, 1, 2, 3][usize::try_from(mix % 4).unwrap()];
-    let rate = (Decimal::from(rate_lots) * sc.cfg.lot_size).normalize();
-    let min_queue_ms = [0u64, 0, 1, 3][usize::try_from((mix / 4) % 4).unwrap()];
-    sc.cfg.fill_model = KernelFillModel::QueuePosition { rate, min_queue_ms };
-    fits(&sc).then_some(sc)
-}
-
-fn fits(sc: &Scenario) -> bool {
-    let need = capacity_need(&sc.cfg, &sc.data()).unwrap();
-    (3 + usize::try_from(need.partial_reports_per_order).unwrap()) * ORD <= HARNESS_DLV
-}
 
 #[test]
 fn test_partial_equivalence_seeded_runs_match_engine_exactly() {
