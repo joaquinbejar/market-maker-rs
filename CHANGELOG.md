@@ -112,6 +112,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `instruments::margin::margin_instrument` delegates to
+  `margin_rs::Instrument::from_spec`, so the mapping has one implementation
+  (#176). Its results and errors are unchanged. `margin` and `instruments`
+  together now need `margin-rs` 0.1.1 or later: the dependency stays `"0.1"`,
+  and Cargo refuses 0.1.0 when it resolves. A lockfile at 0.1.0 is not upgraded
+  by itself: run `cargo update -p margin-rs`. `margin` alone still accepts
+  0.1.0.
+- `AdapterError`'s `From<MarginError>` is now a manual impl: the two new
+  `margin-rs` errors `UnsupportedSpec` and `ScaleBelowGrid` convert to
+  `AdapterError::Unsupported` and `AdapterError::ScaleBelowGrid`, not to
+  `AdapterError::Margin`. Every other error still converts to
+  `AdapterError::Margin`.
 - `MarketTick::spread_bps` and `MarketSnapshot::spread_bps` return the bound
   with the spread's sign when the ratio overflows, and
   `ManagedOrder::fill_ratio` saturates at the bound on such an overfill. Both

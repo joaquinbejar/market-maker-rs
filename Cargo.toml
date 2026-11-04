@@ -79,8 +79,11 @@ events = ["dep:tokio", "serde"]
 # Accounting and pretrade risk through margin-rs.
 margin = ["dep:margin-rs"]
 # Contract specifications from financial_types (`instruments` module); with
-# `margin` too, the conversion into margin-rs instruments.
-instruments = ["financial_types/instruments"]
+# `margin` too, the conversion into margin-rs instruments, delegated to
+# margin-rs. Asking for `margin-rs/instruments` is what excludes 0.1.0, which
+# has no such feature, while `margin-rs = "0.1"` keeps it valid for `margin`
+# alone. The `?` keeps `instruments` alone from pulling margin-rs.
+instruments = ["financial_types/instruments", "margin-rs?/instruments"]
 # Deterministic financial kernel for external RL trainers; no dependencies.
 kernel = []
 
