@@ -1255,10 +1255,10 @@ fn window_hash(prices: &[PriceSample], exposures: &[QuoteExposure]) -> u128 {
     hash
 }
 
-const FNV_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+pub(crate) const FNV_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
 const FNV_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
-fn fnv(hash: u128, bytes: &[u8]) -> u128 {
+pub(crate) fn fnv(hash: u128, bytes: &[u8]) -> u128 {
     bytes
         .iter()
         .fold(hash, |h, b| (h ^ u128::from(*b)).wrapping_mul(FNV_PRIME))

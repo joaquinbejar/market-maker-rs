@@ -52,3 +52,5 @@ pub use order_flow::{
 #[cfg(feature = "prometheus")]
 pub use prometheus_export::{MetricsBridge, MetricsServer, PrometheusMetrics};
 pub use vpin::{BucketStats, TradeClassifier, VPINCalculator, VPINConfig, VolumeBucket};
+
+pub mod micro_price;

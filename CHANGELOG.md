@@ -8,6 +8,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `analytics::micro_price`: Stoikov's micro-price (manuscript dated 18 April
+  2018) from discretized imbalance and spread transitions, with typed
+  fallbacks to the mid, a restorable calibrator, timestamped signals and an
+  out-of-sample comparison of mid, weighted mid and micro-price at horizons
+  fixed by the caller (#88).
 - `strategy::walk_forward`: chronological splits, causal calibration of
   absolute volatility per square root of year, fill intensity `A` and `k`,
   and intraday seasonality, in `CalibrationRecord`s that carry the training
