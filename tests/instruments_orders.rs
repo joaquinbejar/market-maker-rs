@@ -223,7 +223,9 @@ mod ledger {
     use market_maker_rs::instruments::margin::{
         AdapterError, MarginScales, fill_execution, margin_instrument,
     };
-    use market_maker_rs::instruments::{ContractKind, InstrumentDraft, Margining, MoneyRatio};
+    use market_maker_rs::instruments::{
+        AssetCode, ContractKind, ContractSize, InstrumentDraft, Margining, MoneyRatio, TickSchedule,
+    };
     use std::collections::{BTreeMap, BTreeSet};
 
     /// An exact fraction, every operation checked.
@@ -443,6 +445,90 @@ mod ledger {
             assert_eq!(total(&ledger, &btc()), pnl);
             assert_eq!(total(&ledger, &usdt()), dec!(0));
         }
+    }
+
+    /// A linear future of `multiplier` BTC per contract, or spot for `None`.
+    fn linear_spec(multiplier: Option<Decimal>) -> InstrumentSpec {
+        let asset = |code| AssetCode::new(code).unwrap();
+        InstrumentSpec::new(InstrumentDraft {
+            id: InstrumentId::new(if multiplier.is_some() { "FUT" } else { "SPOT" }).unwrap(),
+            kind: if multiplier.is_some() {
+                ContractKind::Future
+            } else {
+                ContractKind::Spot
+            },
+            margining: Margining::Linear,
+            underlying: asset("BTC"),
+            price_asset: asset("USDT"),
+            settlement_asset: asset("USDT"),
+            size: ContractSize::base(multiplier.unwrap_or(Decimal::ONE), asset("BTC")).unwrap(),
+            price_ticks: TickSchedule::fixed(dec!(1)).unwrap(),
+            lot: dec!(1),
+            expiry_ms: multiplier.map(|_| EXPIRY_MS),
+            option: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_contract_is_not_a_unit_of_the_underlying() {
+        // 0.01 BTC per contract: 5 contracts at 60000 is 3000 USDT, and a move of
+        // 1000 on them is 50 USDT, not 5000.
+        let spec = linear_spec(Some(dec!(0.01)));
+        let notional = fill_notional(&spec, &fill(Action::Buy, dec!(60000), dec!(5))).unwrap();
+        assert_eq!(notional.asset.as_str(), "USDT");
+        assert!(
+            notional
+                .ratio
+                .equals(&Ratio::from_decimal(dec!(3000)))
+                .unwrap()
+        );
+
+        let execution = fill_execution(&spec, &fill(Action::Buy, dec!(60000), dec!(5))).unwrap();
+        assert_eq!(execution.quantity, dec!(5), "contracts, not BTC");
+
+        let mut ledger = ledger_for(&spec);
+        book(
+            &mut ledger,
+            &spec,
+            &at("a", 1, Action::Buy, dec!(60000), dec!(5)),
+        );
+        let closed = book(
+            &mut ledger,
+            &spec,
+            &at("b", 2, Action::Sell, dec!(61000), dec!(5)),
+        );
+        assert_eq!(closed.realized_pnl, dec!(50));
+        assert_eq!(total(&ledger, &usdt()), dec!(50));
+        assert_eq!(total(&ledger, &btc()), dec!(0));
+    }
+
+    #[test]
+    fn spot_moves_both_assets() {
+        let spec = linear_spec(None);
+        let mut ledger = ledger_for(&spec);
+        book(
+            &mut ledger,
+            &spec,
+            &at("a", 1, Action::Buy, dec!(100), dec!(2)),
+        );
+        assert_eq!(total(&ledger, &btc()), dec!(2));
+        assert_eq!(total(&ledger, &usdt()), dec!(-200));
+    }
+
+    #[test]
+    fn a_fill_at_or_after_the_expiry_is_refused_by_the_ledger() {
+        let spec = linear_spec(Some(dec!(0.01)));
+        let mut ledger = ledger_for(&spec);
+        let before = ledger.snapshot();
+        let late = at("a", EXPIRY_MS, Action::Buy, dec!(60000), dec!(5));
+        let execution = fill_execution(&spec, &late).unwrap();
+        let refused = ledger.book_execution_allowing_overdraft(&execution, None);
+        assert!(
+            matches!(refused, Err(MarginError::ExecutedAfterExpiry { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(ledger.snapshot(), before);
     }
 
     #[test]

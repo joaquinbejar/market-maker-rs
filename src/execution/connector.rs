@@ -539,6 +539,10 @@ pub struct Fill {
 impl Fill {
     /// Returns the notional value of the fill (price * quantity),
     /// saturating at the `Decimal` bounds.
+    ///
+    /// This is only right for a linear contract of multiplier one; on an
+    /// inverse contract it is not an amount at all.
+    /// `instruments::orders::fill_notional` gives the notional of a contract.
     #[must_use]
     pub fn notional(&self) -> Decimal {
         self.price.saturating_mul(self.quantity)
@@ -547,6 +551,9 @@ impl Fill {
     /// Returns the net value after fees.
     /// For buys: notional + fee (cost)
     /// For sells: notional - fee (proceeds)
+    ///
+    /// It is built on the same `price * quantity`, so it is only right where
+    /// [`Fill::notional`] is.
     ///
     /// # Errors
     ///

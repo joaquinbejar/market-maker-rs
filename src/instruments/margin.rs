@@ -1,12 +1,13 @@
-//! Conversion of an [`InstrumentSpec`] into a `margin-rs` [`Instrument`].
+//! Conversion of an [`InstrumentSpec`] into a `margin-rs` [`Instrument`], and of
+//! a fill of it into a `margin-rs` execution ([`fill_execution`]).
 //!
 //! [`margin_instrument`] delegates to `margin_rs::Instrument::from_spec`, so
 //! the mapping has one implementation, in `margin-rs`, and this module keeps
 //! the public types of this crate.
 //!
-//! It is a conversion only. It maps the fields exactly, with no rounding,
-//! rescaling or currency substitution, and returns a typed [`AdapterError`]
-//! for anything it cannot represent:
+//! Both are conversions only. They map the fields exactly, with no rounding,
+//! rescaling or currency substitution, and return a typed [`AdapterError`]
+//! for anything they cannot represent. The instruments:
 //!
 //! | specification | `margin-rs` instrument | contract size |
 //! |---|---|---|
@@ -103,7 +104,7 @@ pub struct MarginScales {
     pub contract_scale: u32,
 }
 
-/// Why a specification has no `margin-rs` instrument.
+/// Why a specification has no `margin-rs` instrument, or a fill no execution.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AdapterError {
@@ -217,11 +218,13 @@ pub fn margin_instrument(
 /// registered, so a fee is never lost.
 ///
 /// A fill already happened, so the tick and the lot of `spec`, which come from
-/// a dated snapshot, are not applied to it. A real fill can still be refused:
-/// here for a `fee_currency` that is not a valid asset code, which is written
-/// exactly (`usdt` is not `USDT`), and by the ledger for digits above the
-/// instrument's scales or an unregistered asset. These errors must not be
-/// dropped, since the fill would be lost.
+/// a dated snapshot, are not applied to it. A real fill can still be refused,
+/// and these errors must not be dropped, since the fill would be lost: here for
+/// example for a `fee_currency` that is not a valid asset code, which is written
+/// exactly (`usdt` is not `USDT`), and by the ledger for example for digits above
+/// the instrument's scales, an unregistered asset, a time at or after a future's
+/// expiry, or, through `Ledger::book_execution`, a balance that does not cover it
+/// (`Ledger::book_execution_allowing_overdraft` books it anyway).
 ///
 /// A `Fill` has no symbol, so nothing here can verify that it belongs to `spec`:
 /// a wrong specification books it on the wrong instrument, and in the wrong
