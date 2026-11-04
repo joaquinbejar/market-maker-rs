@@ -110,3 +110,69 @@ fn test_vpin_bucket_saturated_total_keeps_the_imbalance() {
     let bucket = calculator.get_buckets().front().unwrap();
     assert_eq!(bucket.signed_imbalance().round_dp(20), expected);
 }
+
+fn order_flow_stats_at_max(sides: &[TradeSide]) -> (Decimal, Decimal) {
+    let mut analyzer = OrderFlowAnalyzer::new(1000);
+    for side in sides {
+        analyzer.add_trade(Trade::new(dec!(1), Decimal::MAX, *side, 1));
+    }
+    let stats = analyzer.get_stats(1);
+    (stats.imbalance, stats.net_flow)
+}
+
+#[test]
+fn test_order_flow_stats_one_sided_beyond_bounds_keeps_the_signal() {
+    for count in 2..=7 {
+        let buys = vec![TradeSide::Buy; count];
+        assert_eq!(
+            order_flow_stats_at_max(&buys),
+            (Decimal::ONE, Decimal::MAX),
+            "{count} buys"
+        );
+        let sells = vec![TradeSide::Sell; count];
+        assert_eq!(
+            order_flow_stats_at_max(&sells),
+            (Decimal::NEGATIVE_ONE, Decimal::MIN),
+            "{count} sells"
+        );
+    }
+}
+
+#[test]
+fn test_order_flow_stats_even_and_odd_counts_beyond_bounds_keep_proportions() {
+    use TradeSide::{Buy, Sell};
+    for (sides, expected) in [
+        (vec![Buy, Buy, Sell], dec!(1) / dec!(3)),
+        (vec![Buy, Buy, Buy, Sell], dec!(0.5)),
+        (vec![Buy, Sell, Sell, Sell], dec!(-0.5)),
+        (vec![Buy, Buy, Sell, Sell], dec!(0)),
+    ] {
+        let (imbalance, _) = order_flow_stats_at_max(&sides);
+        assert_eq!(imbalance.round_dp(20), expected.round_dp(20), "{sides:?}");
+    }
+}
+
+#[test]
+fn test_order_flow_stats_max_against_tiny_other_side_stays_near_one() {
+    let mut analyzer = OrderFlowAnalyzer::new(1000);
+    for (size, side) in [
+        (Decimal::MAX, TradeSide::Buy),
+        (Decimal::MAX, TradeSide::Buy),
+        (dec!(0.000001), TradeSide::Sell),
+    ] {
+        analyzer.add_trade(Trade::new(dec!(1), size, side, 1));
+    }
+    assert_eq!(analyzer.get_stats(1).imbalance, Decimal::ONE);
+}
+
+#[test]
+fn test_vpin_bucket_one_sided_saturated_total_is_fully_imbalanced() {
+    for side in [TradeSide::Buy, TradeSide::Sell] {
+        let config = VPINConfig::new(Decimal::MAX, 1, dec!(0.5)).unwrap();
+        let mut calculator = VPINCalculator::new(config);
+        let size = dec!(50000000000000000000000000000);
+        calculator.add_trade(&Trade::new(dec!(1), size, side, 1));
+        calculator.add_trade(&Trade::new(dec!(1), size, side, 1));
+        assert_eq!(calculator.get_vpin(), Some(Decimal::ONE), "{side:?}");
+    }
+}

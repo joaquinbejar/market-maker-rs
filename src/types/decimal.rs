@@ -283,7 +283,8 @@ pub(crate) fn imbalance_ratio(a: Decimal, b: Decimal) -> Decimal {
 /// The totals of two sides, and the scale that recovers them.
 ///
 /// The scale is one when both sums fit. Otherwise each term is divided by
-/// the number of terms, so the sums always fit and keep their proportions.
+/// one more than the number of terms: a quotient can round up, and that
+/// headroom keeps the sums within the bounds, in their proportions.
 fn scaled_sides<A, B>(a: A, b: B) -> Option<(Decimal, Decimal, Decimal)>
 where
     A: Iterator<Item = Decimal> + Clone,
@@ -299,7 +300,7 @@ where
         return Some((total_a, total_b, Decimal::ONE));
     }
     let count = a.clone().count().saturating_add(b.clone().count());
-    let scale = Decimal::from(count);
+    let scale = Decimal::from(count).checked_add(Decimal::ONE)?;
     Some((sum(a, scale)?, sum(b, scale)?, scale))
 }
 
@@ -312,6 +313,8 @@ where
     A: Iterator<Item = Decimal> + Clone,
     B: Iterator<Item = Decimal> + Clone,
 {
+    // `scaled_sides` cannot fail: n terms of at most MAX / (n + 1), each
+    // rounded up by at most 0.5, sum to less than MAX.
     match scaled_sides(a, b) {
         Some((total_a, total_b, _)) if total_a.saturating_add(total_b) > Decimal::ZERO => {
             imbalance_ratio(total_a, total_b)
