@@ -184,6 +184,11 @@ fn test_partial_golden_trajectories_match_recorded_hashes_body() {
             let got = (fingerprint(&t.last), events_hash(&t.events));
             if print {
                 println!("config {c} seed {seed}: (0x{:x}, 0x{:x})", got.0, got.1);
+                println!(
+                    "config {c} seed {seed}: config fingerprint 0x{:x}, dataset digest 0x{:x}",
+                    k.config_fingerprint(),
+                    data.id().digest
+                );
                 continue;
             }
             assert_eq!(

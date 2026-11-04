@@ -24,6 +24,9 @@ project follows [Semantic Versioning](https://semver.org/).
 - `tests/kernel_margin.rs` (features `kernel` and `margin`): margin-rs ledger
   reservations driven by the kernel's events, through restore, forks and worker
   assignment. The kernel gate itself keeps using `RiskLimits` (#177).
+- The hedges of the kernel's replay gate come from arbitrage-rs
+  (`plan_band_hedge`), a new dev-dependency; the recorded trajectories are
+  unchanged (#177).
 - `strategy::signal_quote`: causal, bounded quote adjustment from imbalance,
   micro-price and VPIN features, with a declared policy for missing or stale
   values, composed with the Avellaneda-Stoikov quotes under the risk limits,

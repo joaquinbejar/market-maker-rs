@@ -4,36 +4,97 @@
 #![allow(dead_code)]
 
 use super::harness::*;
+use arbitrage_rs::hedge::{
+    Band, HedgeDecision, HedgePlan, NoHedgeReason, PositionView, plan_band_hedge,
+};
+use arbitrage_rs::{
+    Currency, FeeRate, Instrument, InstrumentId, Level, Price, Quantity, Timestamp, TopOfBook,
+};
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::kernel::{
     ActionStatus, KernelAction, KernelEvent, KernelFillModel, Observation, Phase, QuoteSide,
     capacity_need, fnv1a128,
 };
+use market_maker_rs::execution::Action;
 
 /// Absolute position, in lots, at which the driver hedges.
 pub const HEDGE_AT: u64 = 2;
 
-/// The script, except that a position of `HEDGE_AT` lots or more is reduced
-/// by an order that crosses the touch, one bounded hedge at a time.
-pub fn hedged(sc: &Scenario, decision: u64, obs: &Observation) -> KernelAction {
-    let lots = u64::try_from(
-        ((obs.position / sc.cfg.lot_size).abs().round())
-            .normalize()
-            .mantissa(),
-    )
-    .unwrap();
-    if lots < HEDGE_AT {
-        return sc.action(decision, obs.bid, obs.ask);
-    }
-    let (side, price) = if obs.position.is_sign_positive() {
-        (QuoteSide::Ask, obs.bid)
-    } else {
-        (QuoteSide::Bid, obs.ask)
+/// Whole units of `unit` in `value`.
+fn whole(value: Decimal, unit: Decimal) -> u64 {
+    let count = (value / unit).normalize();
+    assert_eq!(count.scale(), 0, "{value} is not a multiple of {unit}");
+    u64::try_from(count.mantissa()).unwrap()
+}
+
+/// What arbitrage-rs plans for the observed position: a band that hedges from
+/// `HEDGE_AT` lots back to zero, at the observed touch.
+///
+/// The level size is the largest hedge, not the row's touch size. It does not
+/// stand for observed liquidity: the fill models here do not limit an order by
+/// the touch, and this keeps the hedges the recorded trajectories were made
+/// with. `touch_lots` gives a real size, for a direct test of that cap. The fee
+/// is zero because it only changes the plan's estimates, which are not used.
+pub fn band_plan(sc: &Scenario, obs: &Observation, touch_lots: Option<u64>) -> HedgeDecision {
+    let lot = sc.cfg.lot_size;
+    let tick = sc.cfg.tick_size;
+    let quantity = |lots: u64| Quantity::new(Decimal::from(lots) * lot).unwrap();
+    let largest = max_lots(sc);
+    // Zero ticks: no row observed yet, so that side is not quoted.
+    let level = |ticks: u64| {
+        (ticks > 0).then(|| {
+            Level::new(
+                Price::new(Decimal::from(ticks) * tick).unwrap(),
+                quantity(touch_lots.unwrap_or(largest)),
+            )
+        })
+    };
+    plan_band_hedge(&PositionView {
+        as_of: Timestamp::from_millis(i64::try_from(obs.ts_ns / MS).unwrap()),
+        quote_currency: Currency::new("USD").unwrap(),
+        exposure: obs.position,
+        band: Band::symmetric(Decimal::from(HEDGE_AT - 1) * lot).unwrap(),
+        instrument: Instrument {
+            id: InstrumentId::new("BASE-QUOTE").unwrap(),
+            expiry: None,
+        },
+        book: TopOfBook {
+            bid: level(obs.bid),
+            ask: level(obs.ask),
+        },
+        fee: FeeRate::zero(),
+        lot_size: Some(quantity(1)),
+        max_quantity: Some(quantity(largest)),
+    })
+    .unwrap()
+}
+
+/// The order a hedge leg sends: at the leg's price, which is the touch.
+pub fn hedge_action(sc: &Scenario, plan: &HedgePlan) -> KernelAction {
+    let side = match plan.leg.side {
+        Action::Sell => QuoteSide::Ask,
+        Action::Buy => QuoteSide::Bid,
+        other => panic!("hedge side {other:?}"),
     };
     KernelAction::OneSided {
         side,
-        price,
-        lots: lots.min(max_lots(sc)),
+        price: whole(plan.leg.price.value(), sc.cfg.tick_size),
+        lots: whole(plan.leg.quantity.value(), sc.cfg.lot_size),
+    }
+}
+
+/// The script, except that arbitrage-rs reduces a position outside its band by
+/// an order that crosses the touch, one bounded hedge at a time.
+pub fn hedged(sc: &Scenario, decision: u64, obs: &Observation) -> KernelAction {
+    // The band only means "from `HEDGE_AT` lots" for a whole number of lots.
+    whole(obs.position.abs(), sc.cfg.lot_size);
+    match band_plan(sc, obs, None) {
+        HedgeDecision::Hedge(plan) => hedge_action(sc, &plan),
+        HedgeDecision::NoHedge {
+            reason: NoHedgeReason::InsideBand,
+            ..
+        } => sc.action(decision, obs.bid, obs.ask),
+        other => panic!("no hedge for an observed position: {other:?}"),
     }
 }
 
