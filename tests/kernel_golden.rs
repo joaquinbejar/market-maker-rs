@@ -24,11 +24,12 @@ mod harness;
 #[path = "support/kernel_gate.rs"]
 mod gate;
 
+use arbitrage_rs::hedge::{HedgeDecision, NoHedgeReason};
 use gate::*;
 use harness::*;
 use market_maker_rs::backtest::kernel::{
-    ActionStatus, ExecKind, GateVerdict, KernelAction, KernelEvent, KernelLatency, decode, encode,
-    fingerprint,
+    ActionStatus, ExecKind, GateVerdict, KernelAction, KernelEvent, KernelLatency, Observation,
+    QuoteSide, decode, encode, fingerprint,
 };
 use market_maker_rs::dec;
 use market_maker_rs::execution::Action;
@@ -154,6 +155,11 @@ fn test_kernel_golden_trajectories_match_recorded_hashes() {
             let got = (fingerprint(&t.last), events_hash(&t.events));
             if print {
                 println!("config {c} seed {seed}: (0x{:x}, 0x{:x})", got.0, got.1);
+                println!(
+                    "config {c} seed {seed}: config fingerprint 0x{:x}, dataset digest 0x{:x}",
+                    k.config_fingerprint(),
+                    data.id().digest
+                );
                 continue;
             }
             assert_eq!(
@@ -443,4 +449,219 @@ fn test_kernel_batch_throughput_per_instance_and_batched() {
         assert_eq!(batched, reference);
     }
     println!("sequential: {sequential:?} for {} instances", order.len());
+}
+
+/// A market where one lot clears at the touch, and an observation of it.
+fn hedge_fixture(max_order_lots: u64, actions: Vec<KernelAction>) -> Scenario {
+    let cfg = market_maker_rs::backtest::kernel::KernelConfig::new(
+        dec!(1),
+        dec!(1),
+        dec!(1000),
+        market_maker_rs::Decimal::from(max_order_lots),
+        100,
+    )
+    .with_initial_capital(dec!(10000));
+    let ticks = (0..8u64)
+        .map(|i| {
+            market_maker_rs::backtest::MarketTick::new(
+                1000 + i,
+                dec!(13),
+                dec!(5),
+                dec!(14),
+                dec!(5),
+            )
+        })
+        .collect();
+    Scenario::fixed(cfg, ticks, actions)
+}
+
+#[test]
+fn test_kernel_hedges_are_what_arbitrage_rs_plans() {
+    let sc = hedge_fixture(10, Vec::new());
+    let data = sc.data();
+    let k = kernel(&sc, &data);
+    let obs = k.observe(&k.reset(1));
+    let at = |lots: market_maker_rs::Decimal| Observation {
+        position: lots,
+        ..obs
+    };
+
+    // Inside the band, edges included: the script decides, not the hedge.
+    for position in [dec!(0), dec!(1), dec!(-1)] {
+        assert!(matches!(
+            band_plan(&sc, &at(position), None),
+            HedgeDecision::NoHedge {
+                reason: NoHedgeReason::InsideBand,
+                ..
+            }
+        ));
+        assert_eq!(
+            hedged(&sc, 0, &at(position)),
+            sc.action(0, obs.bid, obs.ask)
+        );
+    }
+    // From two lots: back to zero, selling at the bid or buying at the ask.
+    assert_eq!(
+        hedged(&sc, 0, &at(dec!(2))),
+        KernelAction::OneSided {
+            side: QuoteSide::Ask,
+            price: 13,
+            lots: 2,
+        }
+    );
+    assert_eq!(
+        hedged(&sc, 0, &at(dec!(-3))),
+        KernelAction::OneSided {
+            side: QuoteSide::Bid,
+            price: 14,
+            lots: 3,
+        }
+    );
+
+    // The largest order bounds it, as does a touch size when one is given.
+    let small = hedge_fixture(2, Vec::new());
+    let plan = band_plan(&small, &at(dec!(5)), None);
+    let plan = plan.plan().unwrap();
+    assert_eq!(plan.leg.quantity.value(), dec!(2));
+    assert_eq!(plan.expected_exposure_after, dec!(3));
+    let capped = band_plan(&sc, &at(dec!(5)), Some(1));
+    let capped = capped.plan().unwrap();
+    assert_eq!(capped.leg.quantity.value(), dec!(1));
+    assert_eq!(capped.expected_exposure_after, dec!(4));
+}
+
+/// The driver the gate had before arbitrage-rs, for the comparisons below.
+fn hand_written_hedge(sc: &Scenario, decision: u64, obs: &Observation) -> KernelAction {
+    let lots = u64::try_from(
+        ((obs.position / sc.cfg.lot_size).abs().round())
+            .normalize()
+            .mantissa(),
+    )
+    .unwrap();
+    if lots < HEDGE_AT {
+        return sc.action(decision, obs.bid, obs.ask);
+    }
+    let (side, price) = if obs.position.is_sign_positive() {
+        (QuoteSide::Ask, obs.bid)
+    } else {
+        (QuoteSide::Bid, obs.ask)
+    };
+    KernelAction::OneSided {
+        side,
+        price,
+        lots: lots.min(max_lots(sc)),
+    }
+}
+
+#[test]
+fn test_kernel_hedges_equal_the_hand_written_driver() {
+    // Every position from -12 to 12 lots, including beyond the largest order.
+    let sc = hedge_fixture(10, Vec::new());
+    let data = sc.data();
+    let k = kernel(&sc, &data);
+    let obs = k.observe(&k.reset(1));
+    for lots in -12..=12i64 {
+        let at = Observation {
+            position: market_maker_rs::Decimal::from(lots),
+            ..obs
+        };
+        assert_eq!(
+            hedged(&sc, 0, &at),
+            hand_written_hedge(&sc, 0, &at),
+            "{lots} lots"
+        );
+    }
+    // Every decision of the seeded trajectories, on their grids and latencies.
+    let (mut decisions, mut hedges, mut longs, mut shorts) = (0u64, 0u64, 0u64, 0u64);
+    for seed in 0..seeds().min(40) {
+        for index in 0..DATASETS {
+            let sc = scenario(seed, index);
+            let data = sc.data();
+            let k = kernel(&sc, &data);
+            let t = trajectory(&k, &sc);
+            for (i, obs) in t.observations.iter().enumerate() {
+                let decision = u64::try_from(i).unwrap();
+                assert_eq!(
+                    t.actions[i],
+                    hand_written_hedge(&sc, decision, obs),
+                    "seed {seed} dataset {index} decision {i}"
+                );
+                decisions += 1;
+                if matches!(t.actions[i], KernelAction::OneSided { .. }) {
+                    hedges += 1;
+                    longs += u64::from(obs.position.is_sign_positive());
+                    shorts += u64::from(obs.position.is_sign_negative());
+                }
+            }
+        }
+    }
+    println!("decisions {decisions}, hedges {hedges}, long {longs}, short {shorts}");
+    assert!(longs > 0 && shorts > 0, "hedges at both signs");
+}
+
+#[test]
+fn test_kernel_hedge_plan_before_any_row_has_no_quote() {
+    let sc = hedge_fixture(10, Vec::new());
+    let data = sc.data();
+    let k = kernel(&sc, &data);
+    let obs = k.observe(&k.reset(1));
+    let unquoted = |position| Observation {
+        position,
+        row: None,
+        ts_ns: 0,
+        bid: 0,
+        ask: 0,
+        bid_lots: 0,
+        ask_lots: 0,
+        ..obs
+    };
+    assert!(matches!(
+        band_plan(&sc, &unquoted(dec!(0)), None),
+        HedgeDecision::NoHedge {
+            reason: NoHedgeReason::InsideBand,
+            ..
+        }
+    ));
+    assert!(matches!(
+        band_plan(&sc, &unquoted(dec!(2)), None),
+        HedgeDecision::NoHedge {
+            reason: NoHedgeReason::NoLiquidity { side: Action::Sell },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn test_kernel_hedge_ends_where_the_plan_expects_once_its_fill_is_delivered() {
+    let buy = KernelAction::OneSided {
+        side: QuoteSide::Bid,
+        price: 15,
+        lots: 3,
+    };
+    let mut sc = hedge_fixture(10, vec![buy]);
+    sc.cfg.latency = KernelLatency::zero(MS).with_delays(0, 0, 0, 2);
+    let data = sc.data();
+    let k = kernel(&sc, &data);
+    let mut s = k.reset(1);
+    k.step(&mut s, buy);
+    while k.observe(&s).position != dec!(3) {
+        k.step(&mut s, KernelAction::Hold);
+    }
+    let obs = k.observe(&s);
+    let decision = band_plan(&sc, &obs, None);
+    let plan = decision.plan().unwrap();
+    assert_eq!(plan.exposure_before, dec!(3));
+    assert_eq!(plan.leg.side, Action::Sell);
+    assert_eq!(plan.expected_exposure_after, dec!(0));
+    let hedge = hedge_action(&sc, plan);
+    assert_eq!(hedged(&sc, 1, &obs), hedge);
+
+    // Sending it changes nothing the agent sees until the fill arrives.
+    let fills = obs.delivered_fills;
+    k.step(&mut s, hedge);
+    assert_eq!(k.observe(&s).position, dec!(3));
+    while k.observe(&s).delivered_fills == fills {
+        k.step(&mut s, KernelAction::Hold);
+    }
+    assert_eq!(k.observe(&s).position, plan.expected_exposure_after);
 }
