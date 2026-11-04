@@ -188,4 +188,13 @@ fn test_market_tick_spread_bps_overflow_is_extreme_not_zero() {
     );
     assert!(tick.mid_price() > Decimal::ZERO);
     assert_eq!(tick.spread_bps(), Decimal::MAX);
+    let crossed = MarketTick::new(
+        0,
+        dec!(5.0000000000000000000000000002),
+        dec!(1),
+        dec!(-5),
+        dec!(1),
+    );
+    assert!(crossed.mid_price() > Decimal::ZERO);
+    assert_eq!(crossed.spread_bps(), Decimal::MIN);
 }

@@ -126,16 +126,8 @@ impl MarketTick {
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();
         if mid > Decimal::ZERO {
-            let spread = self.spread();
             // An overflow is an extreme spread, never a zero one.
-            let bound = if spread < Decimal::ZERO {
-                Decimal::MIN
-            } else {
-                Decimal::MAX
-            };
-            spread
-                .checked_div(mid)
-                .unwrap_or(bound)
+            crate::types::decimal::saturating_div(self.spread(), mid)
                 .saturating_mul(Decimal::from(10000))
         } else {
             Decimal::ZERO

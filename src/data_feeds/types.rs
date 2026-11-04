@@ -361,16 +361,8 @@ impl MarketSnapshot {
     pub fn spread_bps(&self) -> Decimal {
         let mid = self.mid_price();
         if mid > Decimal::ZERO {
-            let spread = self.spread();
             // An overflow is an extreme spread, never a zero one.
-            let bound = if spread < Decimal::ZERO {
-                Decimal::MIN
-            } else {
-                Decimal::MAX
-            };
-            spread
-                .checked_div(mid)
-                .unwrap_or(bound)
+            crate::types::decimal::saturating_div(self.spread(), mid)
                 .saturating_mul(Decimal::from(10000))
         } else {
             Decimal::ZERO
@@ -382,6 +374,14 @@ impl MarketSnapshot {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_market_snapshot_spread_bps_overflow_is_a_signed_bound() {
+        let wide = |bid, ask| MarketSnapshot::new("BTC", bid, ask, dec!(0), dec!(0), 0);
+        let (low, high) = (dec!(-5), dec!(5.0000000000000000000000000002));
+        assert_eq!(wide(low, high).spread_bps(), Decimal::MAX);
+        assert_eq!(wide(high, low).spread_bps(), Decimal::MIN);
+    }
 
     #[test]
     fn test_price_update_new() {

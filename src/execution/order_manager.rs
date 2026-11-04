@@ -158,12 +158,13 @@ impl ManagedOrder {
     }
 
     /// Returns the fill ratio (filled / original).
+    ///
+    /// Report only: an overfill whose ratio overflows saturates at the
+    /// `Decimal` bound, so it never reads as unfilled.
     #[must_use]
     pub fn fill_ratio(&self) -> Decimal {
         if self.original_quantity > Decimal::ZERO {
-            self.filled_quantity
-                .checked_div(self.original_quantity)
-                .unwrap_or(Decimal::ZERO)
+            crate::types::decimal::saturating_div(self.filled_quantity, self.original_quantity)
         } else {
             Decimal::ZERO
         }
@@ -945,6 +946,25 @@ impl ThreadSafeOrderManager {
 mod tests {
     use super::*;
     use crate::dec;
+
+    #[test]
+    fn test_fill_ratio_overfill_beyond_bounds_saturates() {
+        let id = OrderId::new("OVERFILL");
+        let mut order = ManagedOrder::new(
+            id.clone(),
+            "client".to_string(),
+            "BTC-USD".to_string(),
+            Action::Buy,
+            OrderType::Limit,
+            dec!(1),
+            dec!(0.0000000000000000000000000001),
+            0,
+        );
+        order
+            .record_fill(&create_test_fill(&id, dec!(1), dec!(10)), 1)
+            .unwrap();
+        assert_eq!(order.fill_ratio(), Decimal::MAX);
+    }
 
     fn create_test_request() -> OrderRequest {
         OrderRequest::limit_buy("BTC-USD", dec!(50000.0), dec!(0.1))
