@@ -1502,6 +1502,8 @@ impl TryFrom<RawModel> for MicroPriceModel {
             if bucket != Some(state.imbalance_bucket)
                 || spread != Some(state.spread_ticks)
                 || (state.status == StateStatus::Calibrated && state.adjustment.abs() > half_spread)
+                || (state.status == StateStatus::OutsideQuotes
+                    && state.adjustment.abs() <= half_spread)
                 || !state_values_are_consistent(state)
                 || !state_mirrors(state, raw.states.get(raw.config.mirror(x)?))
             {

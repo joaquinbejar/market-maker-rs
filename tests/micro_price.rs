@@ -901,7 +901,7 @@ mod decoding {
     fn test_decode_model_refuses_inconsistent_states() {
         let base = model_json();
         assert!(model_ok(&base));
-        let edits: [fn(&mut Value); 11] = [
+        let edits: [fn(&mut Value); 12] = [
             |v| {
                 v["states"].as_array_mut().unwrap().pop();
             },
@@ -915,6 +915,11 @@ mod decoding {
             |v| v["states"][1]["adjustment"] = json!("0.001"),
             |v| v["states"][0]["status"] = json!("OutsideQuotes"),
             |v| v["states"][0]["observations"] = json!(1),
+            // OutsideQuotes inside the quotes, on both mirrors.
+            |v| {
+                v["states"][0]["status"] = json!("OutsideQuotes");
+                v["states"][2]["status"] = json!("OutsideQuotes");
+            },
         ];
         for (i, edit) in edits.iter().enumerate() {
             let mut bad = base.clone();
