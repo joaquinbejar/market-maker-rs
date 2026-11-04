@@ -94,6 +94,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `OrderFlowStats::imbalance`, `VolumeBucket` imbalances and VPIN keep their
+  proportions when a side's volume is beyond the `Decimal` bounds, and
+  `net_flow` keeps its sign. `buy_vwap` and `sell_vwap` are `None` when their
+  inputs overflow, and `volume_ratio` is `None` when a volume sits at the
+  bound.
 - With the `margin` feature, a fill whose base fee breaks the fee
   declaration of the gate's limits is recorded in `MarginAccount::errors`
   as a fee breach (the gate then rejects new orders on the instrument),
