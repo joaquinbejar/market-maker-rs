@@ -505,14 +505,13 @@ fn test_simulate_micro_price_feature_moves_the_quotes_when_calibrated() {
         "d",
     )
     .unwrap();
-    let model = record.model().expect("fitted");
-    assert!(model.calibrated_share() > dec!(0.9));
+    assert!(record.model().unwrap().calibrated_share() > dec!(0.9));
     let events: Vec<_> = quotes[split..]
         .iter()
         .map(|q| MarketEvent::Quote(*q))
         .collect();
     let on = caps().with_micro_price(policy(dec!(0.05)));
-    let run = simulate_detailed(&events, &sim(), &on, Some(model)).unwrap();
+    let run = simulate_detailed(&events, &sim(), &on, Some(&record)).unwrap();
     assert!(run.report.micro_price.fresh > 9_000);
     let skewed = run
         .decisions
@@ -520,9 +519,50 @@ fn test_simulate_micro_price_feature_moves_the_quotes_when_calibrated() {
         .filter(|d| !d.adjustment.skew.is_zero())
         .count();
     assert!(skewed > 1_000, "{skewed}");
-    let base = simulate_detailed(&events, &sim(), &caps(), Some(model)).unwrap();
+    let base = simulate_detailed(&events, &sim(), &caps(), Some(&record)).unwrap();
     assert_ne!(run.decisions[0].bid, None);
     assert_ne!(run.decisions, base.decisions);
+}
+
+#[test]
+fn test_simulate_terminal_pulls_quotes_whatever_the_event() {
+    let mut cfg = sim();
+    cfg.terminal_ms = 100;
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        trade(100, dec!(1), dec!(1), TradeSide::Sell),
+    ];
+    assert_eq!(simulate(&events, &cfg, &caps(), None).unwrap().fills, 0);
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        trade(102, dec!(1), dec!(1), TradeSide::Sell),
+    ];
+    let slow = cfg.clone().with_latency_ms(101);
+    assert_eq!(simulate(&events, &slow, &caps(), None).unwrap().fills, 0);
+}
+
+#[test]
+fn test_simulate_record_trained_on_the_events_is_refused() {
+    let quotes = vec![TopOfBook {
+        timestamp_ms: 0,
+        bid: dec!(100),
+        ask: dec!(100.01),
+        bid_size: dec!(1),
+        ask_size: dec!(1),
+    }];
+    let window = TimeWindow::new(0, 100).unwrap();
+    let record = calibrate_micro_price(
+        &quotes,
+        &window,
+        &MicroPriceConfig::new(dec!(0.01), 5, 1),
+        "d",
+    )
+    .unwrap();
+    let on = caps().with_micro_price(policy(dec!(0.01)));
+    let inside = [top(99, dec!(100.00), dec!(1), dec!(1))];
+    assert!(simulate(&inside, &sim(), &on, Some(&record)).is_err());
+    let after = [top(100, dec!(100.00), dec!(1), dec!(1))];
+    assert!(simulate(&after, &sim(), &on, Some(&record)).is_ok());
 }
 
 #[test]
@@ -736,8 +776,21 @@ fn test_ablation_report_on_an_adverse_selection_scenario() {
         "fit",
     )
     .unwrap();
-    let model = record.model().expect("fitted");
     let (_, events) = scenario(22, 20_000);
+    let events: Vec<_> = events
+        .into_iter()
+        .map(|e| match e {
+            MarketEvent::Quote(q) => MarketEvent::Quote(TopOfBook {
+                timestamp_ms: q.timestamp_ms + 2_000_000,
+                ..q
+            }),
+            MarketEvent::Trade(t) => MarketEvent::Trade(Trade {
+                timestamp: t.timestamp + 2_000_000,
+                ..t
+            }),
+            other => other,
+        })
+        .collect();
 
     println!(
         "| latency ms | fee bps | config | fills | final inv | max inv | capture | inventory | fees | total | markout | fresh i/m/t |"
@@ -746,13 +799,18 @@ fn test_ablation_report_on_an_adverse_selection_scenario() {
     // Stated result of this scenario: 12 tick jumps put the informative buckets
     // outside the quotes, so they fall back, and the rest carry no adjustment.
     assert!(
-        model
+        record
+            .model()
+            .unwrap()
             .states()
             .iter()
             .any(|m| m.status == StateStatus::OutsideQuotes)
     );
-    println!("calibrated_share={}", model.calibrated_share().round_dp(4));
-    for state in model.states() {
+    println!(
+        "calibrated_share={}",
+        record.model().unwrap().calibrated_share().round_dp(4)
+    );
+    for state in record.model().unwrap().states() {
         println!(
             "bucket={} status={:?} adjustment_ticks={} observations={}",
             state.imbalance_bucket,
@@ -768,7 +826,7 @@ fn test_ablation_report_on_an_adverse_selection_scenario() {
                 .with_latency_ms(latency)
                 .with_fee_rate(Decimal::from(fee_bps) / dec!(10000));
             for (name, signals) in ablations(true) {
-                let r = simulate(&events, &cfg, &signals, Some(model)).unwrap();
+                let r = simulate(&events, &cfg, &signals, Some(&record)).unwrap();
                 println!(
                     "| {latency} | {fee_bps} | {name} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{}/{} |",
                     r.fills,

@@ -22,8 +22,8 @@
 //! is not quoted. The features are:
 //!
 //! - imbalance `2 I - 1`, in `[-1, 1]`, from the same quote;
-//! - micro-price adjustment over half the spread, in `[-1, 1]`, from a model
-//!   fitted before the simulated data;
+//! - micro-price adjustment over half the spread, in `[-1, 1]`, from a record
+//!   whose training ends before the simulated data, which is checked;
 //! - toxicity, the VPIN of the trades already seen, in `[0, 1]`.
 //!
 //! # Missing and stale values
@@ -59,7 +59,7 @@
 //! nothing about performance on data other than what it was given.
 
 use crate::Decimal;
-use crate::analytics::micro_price::{MicroPriceModel, SignalSource, TopOfBook};
+use crate::analytics::micro_price::{MicroPriceModel, MicroPriceRecord, SignalSource, TopOfBook};
 use crate::analytics::order_flow::{Trade, TradeSide};
 use crate::analytics::vpin::{VPINCalculator, VPINConfig};
 use crate::risk::RiskLimits;
@@ -550,21 +550,22 @@ struct Resting {
 
 /// Replays `events` under `signals`.
 ///
-/// `model` provides the micro-price feature and must have been fitted on data
-/// before `events`. Without it, that feature is absent.
+/// `record` provides the micro-price feature, and its training must end by the
+/// first event. Without a model, that feature is absent.
 ///
 /// # Errors
 ///
-/// Returns [`MMError::InvalidConfiguration`] for an invalid configuration,
+/// Returns [`MMError::InvalidConfiguration`] for an invalid configuration or a
+/// record trained on the events,
 /// [`MMError::InvalidMarketState`] for events out of order or an invalid quote,
 /// and [`MMError::NumericalError`] on arithmetic failure.
 pub fn simulate(
     events: &[MarketEvent],
     config: &SimulationConfig,
     signals: &SignalConfig,
-    model: Option<&MicroPriceModel>,
+    record: Option<&MicroPriceRecord>,
 ) -> MMResult<SimulationReport> {
-    simulate_detailed(events, config, signals, model).map(|run| run.report)
+    simulate_detailed(events, config, signals, record).map(|run| run.report)
 }
 
 /// Replays `events` like [`simulate`], and also returns every decision and fill.
@@ -576,8 +577,18 @@ pub fn simulate_detailed(
     events: &[MarketEvent],
     config: &SimulationConfig,
     signals: &SignalConfig,
-    model: Option<&MicroPriceModel>,
+    record: Option<&MicroPriceRecord>,
 ) -> MMResult<SimulationRun> {
+    let model = record.and_then(MicroPriceRecord::model);
+    if let (Some(record), Some(first)) = (record, events.first())
+        && first.timestamp_ms() < record.training.end_ms
+    {
+        return Err(MMError::InvalidConfiguration(format!(
+            "events start at {} inside the training of {:?}",
+            first.timestamp_ms(),
+            record.training
+        )));
+    }
     config.validate()?;
     signals.validate()?;
     if !events.is_sorted_by_key(MarketEvent::timestamp_ms) {
@@ -615,6 +626,10 @@ pub fn simulate_detailed(
 
     for event in events {
         let now = event.timestamp_ms();
+        if now >= config.terminal_ms {
+            pending.clear();
+            live = None;
+        }
         activate(&mut pending, &mut live, now);
         match event {
             MarketEvent::Trade(trade) => {
@@ -653,8 +668,6 @@ pub fn simulate_detailed(
                 last_mid = Some(mid);
                 mids.push((now, mid));
                 if now >= config.terminal_ms {
-                    pending.clear();
-                    live = None;
                     continue;
                 }
                 let features = features_at(quote, model, &vpin, last_trade_ms, signals)?;
