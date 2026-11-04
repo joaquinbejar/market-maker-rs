@@ -319,7 +319,8 @@ pub enum RiskStatus {
     Breached,
     /// Hedge required: quoting is refused while the delta is above
     /// `delta_hedge_threshold`. Nothing here hedges, so it lasts until the
-    /// caller hedges and updates the Greeks.
+    /// caller does: execute [`ChainMarketMaker::calculate_hedge`], book the
+    /// fill ([`ChainRiskManager::add_position_greeks`]), and quoting resumes.
     HedgeRequired,
 }
 
@@ -410,7 +411,8 @@ impl ChainMarketMaker {
     /// Returns a mutable reference to the risk manager.
     ///
     /// Replacing the whole manager through it also discards a failed booking
-    /// (see [`ChainRiskManager::has_unbooked_fill`]).
+    /// (see [`ChainRiskManager::has_unbooked_fill`]) and, with its Greeks,
+    /// whatever kept [`Self::check_chain_risk`] from allowing quotes.
     pub fn risk_manager_mut(&mut self) -> &mut ChainRiskManager {
         &mut self.risk_manager
     }
@@ -1212,8 +1214,24 @@ mod tests {
         mm.risk_manager_mut().reconcile(unhedged);
         assert_quoting_refused(&mm, &halted("HedgeRequired"));
 
-        // Once the caller has hedged, quotes come back.
-        mm.risk_manager_mut().update_greeks(PortfolioGreeks::new());
+        // Once the caller executes the hedge and books it, quotes come back.
+        // A share has a delta of one over the contract multiplier.
+        let hedges = mm.calculate_hedge(dec!(50000)).unwrap();
+        let [hedge] = hedges.as_slice() else {
+            panic!("expected one hedge: {hedges:?}");
+        };
+        let share_delta = -unhedged.delta / hedge.quantity;
+        let share = crate::options::greeks::PositionGreeks::new(
+            share_delta,
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+        );
+        mm.risk_manager_mut()
+            .add_position_greeks(&share, hedge.quantity)
+            .unwrap();
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Normal));
         assert_quoting_allowed(&mm);
     }
 
@@ -1264,7 +1282,8 @@ mod tests {
             Some(halted("Breached"))
         );
 
-        // While it allows quoting, a contract's own error is still NotQuoted.
+        // And it is the refusal, not a list of NotQuoted, even when no contract
+        // can be valued.
         use crate::options::pricing::OptionInputs;
         struct NoValue;
         impl OptionPricer for NoValue {
@@ -1272,8 +1291,14 @@ mod tests {
                 Err(MMError::InvalidMarketState("no value".to_string()))
             }
         }
-        let mm = ChainMarketMaker::with_defaults(create_test_chain());
         let pricing = ChainPricing::new(Arc::new(NoValue), dec!(0.1), dec!(0), dec!(0)).unwrap();
+        assert_eq!(
+            mm.refresh_all_quotes(50000, &pricing).err(),
+            Some(halted("Breached"))
+        );
+
+        // While it allows quoting, a contract's own error is still NotQuoted.
+        let mm = ChainMarketMaker::with_defaults(create_test_chain());
         let outcomes = mm.refresh_all_quotes(50000, &pricing).unwrap();
         assert_eq!(outcomes.len(), 6);
         assert!(

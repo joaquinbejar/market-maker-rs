@@ -138,8 +138,9 @@ pub enum MMError {
 
     /// The chain risk status does not allow quoting, so no quote was produced.
     ///
-    /// Any quote resting from an earlier refresh should be withdrawn. The
-    /// message carries the status.
+    /// Any quote resting from an earlier refresh should be withdrawn. Retrying
+    /// does not help until the status changes, and none of the `is_*` helpers
+    /// is true for it. The message carries the status.
     #[error("quoting halted: {0}")]
     QuotingHalted(String) = 14,
 }
@@ -232,6 +233,12 @@ mod tests {
         assert!(!num_err.is_configuration_error());
         assert!(!num_err.is_market_state_error());
         assert!(num_err.is_numerical_error());
+
+        let halted = MMError::QuotingHalted("Breached".to_string());
+        assert!(!halted.is_configuration_error());
+        assert!(!halted.is_market_state_error());
+        assert!(!halted.is_numerical_error());
+        assert!(!halted.is_connection_error());
     }
 
     #[test]
