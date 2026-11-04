@@ -121,18 +121,20 @@ impl AccountingFill {
 /// Immutable view of an accountant's state, read by the engine metrics.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccountingSnapshot {
-    /// Net position in base units (positive long).
+    /// Net position in base units (positive long), or in contracts on a
+    /// derivative contract.
     pub position: Decimal,
     /// Average entry price of the open position, if any.
     pub average_entry_price: Option<Decimal>,
-    /// Sum of execution cash flows, excluding fees.
+    /// Sum of execution cash flows, excluding fees. On a derivative contract,
+    /// its realized PnL in the settlement asset, with no notional in it.
     pub cash_flow: Decimal,
     /// Fees fixed in the quote asset (quote fees and third asset fees
-    /// converted to quote).
+    /// converted to quote), or in the settlement asset on a derivative contract.
     pub fees: Decimal,
     /// Fees paid in the base asset, in base units. They are already
     /// deducted from [`AccountingSnapshot::position`]; the engine marks
-    /// them at the current price.
+    /// them at the current price. Zero on a derivative contract.
     pub base_fees: Decimal,
     /// Number of distinct executions booked.
     pub fills_posted: u64,
@@ -171,8 +173,19 @@ pub trait FillAccountant: fmt::Debug {
     /// saturates silently.
     fn snapshot(&self) -> MMResult<AccountingSnapshot>;
 
-    /// Returns to the initial state.
+    /// Returns to the initial state, which is the one
+    /// [`FillAccountant::begin_from_current_state`] last fixed.
     fn reset(&mut self);
+
+    /// Fixes the current state as where a run starts.
+    ///
+    /// The engine calls this when it is handed the accountant, so that its
+    /// first run and a run after [`FillAccountant::reset`] start from the same
+    /// state, whatever was posted before. Execution ids restart at 1 with each
+    /// engine and each reset: after this call, an accountant must not take them
+    /// for ids it booked before. By default nothing happens, for an accountant
+    /// that keeps no such state.
+    fn begin_from_current_state(&mut self) {}
 
     /// Human readable description for result reports.
     fn description(&self) -> String {
@@ -233,8 +246,11 @@ mod margin_ledger {
     /// [`FillAccountant`] backed by the exact single account ledger of
     /// `margin-rs`.
     ///
-    /// - Each fill becomes a ledger execution with id `sim-<execution_id>`,
-    ///   so booking is idempotent.
+    /// - Each fill becomes a ledger execution with id `sim-<n>`, where `n` is
+    ///   its `execution_id` plus the largest such `n` in the ledger when the run
+    ///   started, so booking is idempotent and a run never reuses an execution
+    ///   the ledger started with. Reset returns to that same start: the state
+    ///   when an engine took the accountant, or when it was wrapped if none has.
     /// - Fills already happened at the venue, so they are booked even when a
     ///   balance goes negative (for example selling base the account never
     ///   held); the resulting shortfalls are kept in
@@ -243,7 +259,9 @@ mod margin_ledger {
     ///   is the ledger's realized PnL, and a non zero fee must be in the settlement
     ///   asset ([`FeeAsset::Settlement`]); the engine needs
     ///   `BacktestEngine::with_instrument`
-    ///   for it. Below, on a spot instrument:
+    ///   for it. The ledger must have no other open position, because
+    ///   [`Ledger::valuation`] needs a mark for each and a run has one. Below, on
+    ///   a spot instrument:
     /// - Fees may be negative (rebates). Quote fees are debited from the
     ///   quote balance and base fees from the base balance; the snapshot
     ///   position is the net base held (traded quantity minus base fees)
@@ -265,6 +283,8 @@ mod margin_ledger {
         quote: Asset,
         /// A future or a perpetual: `quote` is its settlement asset.
         derivative: bool,
+        /// Added to each execution id, past those the ledger started with.
+        execution_offset: u64,
         overdrafts: BTreeMap<Asset, Decimal>,
         /// Base fees booked on this instrument, kept incrementally so a
         /// snapshot never rescans the journal for them.
@@ -279,8 +299,9 @@ mod margin_ledger {
         /// # Errors
         ///
         /// Returns [`MMError::InvalidConfiguration`] if the instrument is not
-        /// registered, or [`MMError::NumericalError`] if the base fees already in
-        /// the ledger overflow.
+        /// registered, or is a derivative in a ledger with another open position,
+        /// or [`MMError::NumericalError`] if the base fees already in the ledger
+        /// overflow.
         pub fn new(ledger: Ledger, instrument: InstrumentId) -> MMResult<Self> {
             let (base, quote, derivative) = match ledger.instrument(&instrument) {
                 Some(Instrument::Spot(spot)) => (spot.base().clone(), spot.quote().clone(), false),
@@ -293,6 +314,20 @@ mod margin_ledger {
                     )));
                 }
             };
+            if derivative
+                && let Some((other, _)) = ledger
+                    .snapshot()
+                    .positions
+                    .iter()
+                    .find(|(id, position)| **id != instrument && !position.is_flat())
+            {
+                return Err(MMError::InvalidConfiguration(format!(
+                    "instrument {} cannot be valued with {} open in the same ledger",
+                    instrument.as_str(),
+                    other.as_str()
+                )));
+            }
+            let execution_offset = largest_execution_number(&ledger);
             let base_fees = ledger
                 .journal()
                 .iter()
@@ -307,6 +342,7 @@ mod margin_ledger {
                 base,
                 quote,
                 derivative,
+                execution_offset,
                 overdrafts: BTreeMap::new(),
                 base_fees,
                 initial_base_fees: base_fees,
@@ -325,6 +361,18 @@ mod margin_ledger {
         pub fn overdrafts(&self) -> &BTreeMap<Asset, Decimal> {
             &self.overdrafts
         }
+    }
+
+    /// The largest `n` among the `sim-<n>` executions of `ledger`. Any other
+    /// identifier cannot collide with one.
+    fn largest_execution_number(ledger: &Ledger) -> u64 {
+        ledger
+            .journal()
+            .iter()
+            .filter_map(|e| e.execution_id.as_str().strip_prefix("sim-"))
+            .filter_map(|n| n.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
     }
 
     /// The scales of a registered derivative.
@@ -407,7 +455,11 @@ mod margin_ledger {
                     }
                 }
             };
-            let id = ExecutionId::new(format!("sim-{}", fill.execution_id))
+            let number = self
+                .execution_offset
+                .checked_add(fill.execution_id)
+                .or_overflow("execution id")?;
+            let id = ExecutionId::new(format!("sim-{number}"))
                 .map_err(|e| margin_error("execution id", e))?;
             // Before booking: a rejected post leaves the ledger unchanged.
             let side = Action::from(Dir::try_from(fill.side)?);
@@ -487,6 +539,13 @@ mod margin_ledger {
             self.ledger = self.initial.clone();
             self.overdrafts.clear();
             self.base_fees = self.initial_base_fees;
+        }
+
+        fn begin_from_current_state(&mut self) {
+            self.execution_offset = largest_execution_number(&self.ledger);
+            self.initial = self.ledger.clone();
+            self.initial_base_fees = self.base_fees;
+            self.overdrafts.clear();
         }
 
         fn description(&self) -> String {

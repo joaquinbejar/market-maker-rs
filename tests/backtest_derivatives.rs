@@ -28,7 +28,7 @@ use market_maker_rs::execution::Action;
 use market_maker_rs::instruments::reference::deribit;
 use market_maker_rs::instruments::{
     AssetCode, ContractKind, ContractSize, InstrumentDraft, InstrumentId as SpecId, InstrumentSpec,
-    Margining, TickSchedule,
+    Margining, TickBand, TickSchedule,
 };
 use market_maker_rs::position::inventory::InventoryPosition;
 use market_maker_rs::prelude::OptionStyle;
@@ -358,6 +358,51 @@ fn adding_a_partial_close_and_a_flip_through_zero_realize_exactly() {
 }
 
 #[test]
+fn an_inverse_contract_adds_closes_and_flips_on_its_recorded_rests() {
+    // 10 USD a contract, so 1000 contracts cost 10000 / price BTC, kept at 8
+    // decimals: 0.16666667 at 60000 and 0.16393443 at 61000.
+    let spec = deribit::btc_perpetual().unwrap();
+    let mut a = accountant_for(&spec);
+    let zero = Decimal::ZERO;
+    a.post_fill(&posted(1, Action::Buy, dec!(60000), dec!(1000), zero))
+        .unwrap();
+    a.post_fill(&posted(2, Action::Buy, dec!(61000), dec!(1000), zero))
+        .unwrap();
+    let s = a.snapshot().unwrap();
+    assert_eq!(s.position, dec!(2000));
+    // The harmonic mean: 20000 / 0.3306011.
+    assert_eq!(s.average_entry_price.unwrap().round_dp(2), dec!(60495.87));
+    assert_eq!(s.cash_flow, dec!(0));
+    // A quarter of the cost, 0.082650275, less 5000 / 62000 = 0.08064516.
+    a.post_fill(&posted(3, Action::Sell, dec!(62000), dec!(500), zero))
+        .unwrap();
+    let s = a.snapshot().unwrap();
+    assert_eq!(s.position, dec!(1500));
+    assert_eq!(s.cash_flow, dec!(0.00200512));
+    // The remaining cost, 0.24795082, less 15000 / 60000 = 0.25 is -0.00204918;
+    // the other 500 contracts open short at 60000, for 0.08333333.
+    a.post_fill(&posted(4, Action::Sell, dec!(60000), dec!(2000), zero))
+        .unwrap();
+    let s = a.snapshot().unwrap();
+    assert_eq!(s.position, dec!(-500));
+    // 5000 / 0.08333333, from the rounded rest.
+    assert_eq!(s.average_entry_price.unwrap().round_dp(2), dec!(60000));
+    assert_eq!(s.cash_flow, dec!(-0.00004406));
+    // 5000 / 59000 = 0.08474576, less the 0.08333333 received short, is 0.00141243.
+    assert_eq!(
+        a.unrealized_at(dec!(59000)).unwrap().unwrap(),
+        dec!(0.00141243)
+    );
+    a.post_fill(&posted(5, Action::Buy, dec!(59000), dec!(500), zero))
+        .unwrap();
+    let s = a.snapshot().unwrap();
+    assert_eq!(s.position, dec!(0));
+    assert_eq!(s.cash_flow, dec!(0.00136837));
+    assert_eq!(s.fills_posted, 5);
+    assert_eq!(a.unrealized_at(dec!(59000)).unwrap().unwrap(), dec!(0));
+}
+
+#[test]
 fn marking_at_the_exit_and_then_closing_there_keeps_the_total() {
     for (spec, size) in [
         (linear("FUT", dec!(0.01), Some(EXPIRY_MS)), dec!(5)),
@@ -401,6 +446,94 @@ fn a_ledger_that_starts_open_is_marked_at_its_entry_before_any_tick() {
     assert!(result.accounting.is_consistent(), "{:?}", result.accounting);
     assert_eq!(result.total_pnl, dec!(50));
     assert_eq!(result.net_pnl, dec!(50));
+}
+
+#[test]
+fn a_run_never_reuses_an_execution_the_ledger_started_with() {
+    // Seeded at another price, a reused id would be refused as a conflict. Seeded
+    // with the very fill of the run, it would be a silent duplicate.
+    for (seed_price, average, total) in [
+        (dec!(60000), dec!(60500), dec!(50)),
+        (dec!(61000), dec!(61000), dec!(0)),
+    ] {
+        let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+        let mut seeded = accountant_for(&spec);
+        seeded
+            .post_fill(&AccountingFill {
+                timestamp: 1001,
+                ..posted(1, Action::Buy, seed_price, dec!(5), dec!(0))
+            })
+            .unwrap();
+        let far = Some((FAR_LOW, spec.lot(), FAR_HIGH, spec.lot()));
+        let mut engine = BacktestEngine::new(
+            config(&spec, dec!(0)),
+            Scripted(vec![buy_at(dec!(61000), dec!(5)), far, far], 0),
+            VecDataSource::new(vec![
+                tick(1000, dec!(50000), dec!(70000)),
+                crossing(1001, Side::Long, dec!(61000), dec!(1)),
+                tick(1002, dec!(60999), dec!(61001)),
+            ]),
+        )
+        .with_instrument(spec.clone(), seeded)
+        .unwrap();
+        let first = engine.run();
+        assert!(first.accounting.is_consistent(), "{:?}", first.accounting);
+        assert!(first.accounting.refused_executions.is_empty());
+        let (position, _) = engine.get_state();
+        assert_eq!(position.quantity, dec!(10));
+        assert_eq!(position.avg_entry_price, average);
+        assert_eq!(first.total_pnl, total);
+        // A run after reset starts from the same handover state.
+        engine.reset();
+        let (position, pnl) = engine.get_state();
+        assert_eq!(position.quantity, dec!(5));
+        assert_eq!(position.avg_entry_price, seed_price);
+        assert_eq!(pnl.realized, dec!(0));
+        let second = engine.run();
+        assert_eq!(second.accounting, first.accounting);
+        assert_eq!(second.total_pnl, first.total_pnl);
+        assert_eq!(second.net_pnl, first.net_pnl);
+        assert_eq!(second.total_fees, first.total_fees);
+        assert_eq!(second.num_trades, first.num_trades);
+        assert_eq!(second.final_position, first.final_position);
+        assert_eq!(engine.get_state().0.quantity, dec!(10));
+    }
+}
+
+#[test]
+fn another_open_position_in_the_ledger_is_refused_when_wrapped() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let other = linear("OTHER", dec!(0.01), Some(EXPIRY_MS));
+    let main_id = InstrumentId::new("FUT").unwrap();
+    let other_id = InstrumentId::new("OTHER").unwrap();
+    let mut ledger = ledger_for(&spec);
+    ledger
+        .register_instrument(Instrument::from_spec(&other, scales()).unwrap())
+        .unwrap();
+    let mut on_other = MarginLedgerAccountant::new(ledger, other_id).unwrap();
+    on_other
+        .post_fill(&posted(1, Action::Buy, dec!(60000), dec!(5), dec!(0)))
+        .unwrap();
+    let error =
+        MarginLedgerAccountant::new(on_other.ledger().clone(), main_id.clone()).unwrap_err();
+    assert!(
+        matches!(&error, MMError::InvalidConfiguration(reason) if reason.contains("OTHER")),
+        "{error:?}"
+    );
+    // Flat again, it needs no mark and leaks nothing into this instrument.
+    on_other
+        .post_fill(&posted(2, Action::Sell, dec!(61000), dec!(5), dec!(0)))
+        .unwrap();
+    let mut on_main = MarginLedgerAccountant::new(on_other.ledger().clone(), main_id).unwrap();
+    assert_eq!(on_main.unrealized_at(dec!(61000)), Some(Ok(dec!(0))));
+    on_main
+        .post_fill(&posted(1, Action::Buy, dec!(60000), dec!(5), dec!(0)))
+        .unwrap();
+    assert_eq!(on_main.unrealized_at(dec!(61000)), Some(Ok(dec!(50))));
+    let snapshot = on_main.snapshot().unwrap();
+    assert_eq!(snapshot.position, dec!(5));
+    assert_eq!(snapshot.cash_flow, dec!(0));
+    assert_eq!(snapshot.fills_posted, 1);
 }
 
 #[test]
@@ -720,7 +853,9 @@ impl FillAccountant for FailsLater {
         })
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        *self.marks.get_mut() = 0;
+    }
 
     fn unrealized_at(&self, _mark: Decimal) -> Option<MMResult<Decimal>> {
         let mark = self.marks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -752,6 +887,110 @@ fn a_valuation_that_fails_keeps_the_previous_numbers_and_says_so() {
     assert_eq!(result.total_pnl, dec!(7));
     assert_eq!(result.accounting.valuation_failures, 2);
     assert!(!result.accounting.is_consistent());
+    // Counted afresh after a reset, not added to the last run's.
+    engine.reset();
+    let again = engine.run();
+    assert_eq!(again.accounting.valuation_failures, 2);
+}
+
+#[test]
+fn a_refusal_lasts_only_as_long_as_its_reason() {
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let mut engine = engine_without_instrument(config(&spec, dec!(0)));
+    assert_refused(&engine.run(), "use with_instrument");
+    engine.reset();
+    assert_refused(&engine.run(), "use with_instrument");
+    let mut engine = engine
+        .with_instrument(spec.clone(), accountant_for(&spec))
+        .unwrap();
+    let result = engine.run();
+    assert_eq!(result.accounting.setup_refused, None);
+    assert_eq!(result.num_ticks, 2);
+}
+
+#[test]
+fn a_tick_schedule_with_several_bands_is_refused() {
+    let flat = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let mut draft = InstrumentDraft::from(flat.clone());
+    draft.price_ticks = TickSchedule::new(vec![
+        TickBand {
+            up_to: Some(dec!(1000)),
+            tick: dec!(1),
+        },
+        TickBand {
+            up_to: None,
+            tick: dec!(5),
+        },
+    ])
+    .unwrap();
+    let bands = InstrumentSpec::new(draft).unwrap();
+    // A contract whose first band matches the configured tick, so that only the
+    // number of bands is wrong.
+    assert_eq!(bands.price_ticks().bands()[0].tick, dec!(1));
+    let error = engine_without_instrument(config(&bands, dec!(0)))
+        .with_instrument(bands.clone(), accountant_for(&flat))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(&error, MMError::InvalidConfiguration(reason) if reason.contains("tick")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_fee_that_is_not_exact_drops_the_fill_and_says_so() {
+    // 0.01 x 60001 = 600.01, and 600.01 x 1e-28 needs thirty places.
+    let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));
+    let mut engine = BacktestEngine::new(
+        config(&spec, Decimal::new(1, 28)),
+        Scripted(vec![buy_at(dec!(60001), dec!(1))], 0),
+        VecDataSource::new(vec![
+            tick(1000, dec!(50000), dec!(70000)),
+            tick(1001, dec!(60000), dec!(60001)),
+        ]),
+    )
+    .with_instrument(spec.clone(), accountant_for(&spec))
+    .unwrap();
+    let result = engine.run();
+    assert_eq!(result.num_trades, 0);
+    assert_eq!(result.final_position, dec!(0));
+    assert_eq!(result.accounting.dropped_fills, 1);
+    assert!(!result.accounting.is_consistent());
+    assert_eq!(engine.fault_count(), 1);
+    assert!(matches!(
+        engine.faults().first(),
+        Some(MMError::NumericalError(reason)) if reason.contains("not exact")
+    ));
+    engine.reset();
+    assert_eq!(engine.run().accounting.dropped_fills, 1);
+}
+
+#[test]
+fn trades_and_reports_carry_the_fee_in_the_settlement_asset() {
+    // 1000 contracts of 10 USD at 60000 are 1/6 BTC; 0.05% of it is 0.00008333.
+    let spec = deribit::btc_perpetual().unwrap();
+    let half = spec.price_ticks().bands()[0].tick;
+    let mut engine = BacktestEngine::new(
+        config(&spec, dec!(0.0005)),
+        Scripted(vec![buy_at(dec!(60000), dec!(1000))], 0),
+        VecDataSource::new(vec![
+            tick(1000, dec!(50000), dec!(70000)),
+            crossing(1001, Side::Long, dec!(60000), half),
+        ]),
+    )
+    .with_instrument(spec.clone(), accountant_for(&spec))
+    .unwrap();
+    let result = engine.run();
+    assert_eq!(result.total_fees, dec!(0.00008333));
+    assert_eq!(result.trades.len(), 1);
+    assert_eq!(result.trades[0].fee, dec!(0.00008333));
+    let fees: Vec<Decimal> = engine
+        .execution_reports()
+        .iter()
+        .filter(|report| !report.last_quantity.is_zero())
+        .map(|report| report.fee)
+        .collect();
+    assert_eq!(fees, [dec!(0.00008333)]);
 }
 
 #[test]

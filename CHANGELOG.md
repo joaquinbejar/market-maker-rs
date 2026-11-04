@@ -19,7 +19,14 @@ project follows [Semantic Versioning](https://semver.org/).
   `requires_instrument` and `check_instrument`, all with defaults. Funding,
   expiry and settlement are not simulated (#94, #97), and neither are margin
   requirements or liquidation. `AccountingStatus` gains `valuation_failures` and
-  `setup_refused`, and is not consistent with either.
+  `setup_refused`, and is not consistent with either. A derivative needs a ledger
+  with no other open position. New provided
+  `FillAccountant::begin_from_current_state`, which the engine calls when it is
+  handed an accountant: `MarginLedgerAccountant` then numbers its executions
+  after those already in the ledger, on spot too, so a fill of a run can no
+  longer collide with them. `AccountingStatus::dropped_fills` counts fills
+  dropped because their fee or booking could not be computed, which used to
+  leave `is_consistent` true.
 - Orders and fills against a contract specification (feature `instruments`,
   #93): `instruments::orders::check_order` refuses an order for another
   symbol, off the tick or the lot, or with a missing or unexpected price, with
@@ -253,9 +260,11 @@ These signature changes are breaking and ship in 0.7.0, not in a patch
 release.
 
 - `FeeCurrency` has a new variant, `Settlement`, and is now `#[non_exhaustive]`.
-  `AccountingStatus` has two new fields, so a struct literal must set them; with
+  `AccountingStatus` has three new fields, so a struct literal must set them; with
   `serde` they default. `FeeCurrency::charge` refuses `Settlement`, which needs
-  the contract (#191).
+  the contract. `MarginLedgerAccountant` posted to before it is handed to an
+  engine now resets to the state at the handover, not to the one it was wrapped
+  with (#191).
 - `Fill` has a new field, `symbol`, the instrument traded, so a struct literal
   must set it. With `serde` it defaults to empty, so a record written before it
   still decodes. `instruments::orders::fill_notional` and
