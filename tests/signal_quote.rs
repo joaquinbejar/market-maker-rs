@@ -8,8 +8,9 @@
 )]
 #![allow(clippy::arithmetic_side_effects)]
 
-use market_maker_rs::analytics::micro_price::StateStatus;
+use financial_types::Action;
 use market_maker_rs::analytics::micro_price::{MicroPriceConfig, TopOfBook, calibrate_micro_price};
+use market_maker_rs::analytics::micro_price::{SignalSource, StateStatus};
 use market_maker_rs::analytics::order_flow::{Trade, TradeSide};
 use market_maker_rs::analytics::vpin::VPINConfig;
 use market_maker_rs::dec;
@@ -372,8 +373,13 @@ fn test_simulate_total_matches_a_ledger_of_the_fills() {
     let mut inventory = dec!(0);
     let mut fees = dec!(0);
     for fill in &run.fills {
-        cash -= fill.side * fill.size * fill.price;
-        inventory += fill.side * fill.size;
+        let sign = match fill.side {
+            Action::Buy => dec!(1),
+            Action::Sell => dec!(-1),
+            other => panic!("{other:?}"),
+        };
+        cash -= sign * fill.size * fill.price;
+        inventory += sign * fill.size;
         fees += fill.size * fill.price * dec!(0.0001);
     }
     assert!(run.fills.len() > 100);
@@ -470,32 +476,7 @@ fn test_simulate_unformable_inventory_quote_is_a_halted_decision() {
 
 #[test]
 fn test_simulate_micro_price_feature_moves_the_quotes_when_calibrated() {
-    // A chain where imbalance predicts a one tick move, inside the quotes.
-    let mut rng = Rng(5);
-    let (mut bid, mut imbalance) = (10_000i64, 0.5f64);
-    let mut quotes = Vec::new();
-    for step in 0..30_000u64 {
-        let bid_size = (imbalance * 100.0).round().clamp(1.0, 99.0) as u64;
-        let price = Decimal::from(bid) * dec!(0.01);
-        quotes.push(TopOfBook {
-            timestamp_ms: step * 100,
-            bid: price,
-            ask: price + dec!(0.01),
-            bid_size: Decimal::from(bid_size),
-            ask_size: Decimal::from(100 - bid_size),
-        });
-        if rng.unit() < 0.1 {
-            if rng.unit() < imbalance {
-                bid += 1;
-                imbalance = 0.3 + 0.2 * rng.unit();
-            } else {
-                bid -= 1;
-                imbalance = 0.5 + 0.2 * rng.unit();
-            }
-        } else {
-            imbalance = (imbalance + 0.08 * (rng.unit() - 0.5)).clamp(0.01, 0.99);
-        }
-    }
+    let quotes = small_move_quotes(5, 30_000);
     let split = 20_000usize;
     let window = TimeWindow::new(0, split as u64 * 100).unwrap();
     let record = calibrate_micro_price(
@@ -512,6 +493,21 @@ fn test_simulate_micro_price_feature_moves_the_quotes_when_calibrated() {
         .collect();
     let on = caps().with_micro_price(policy(dec!(0.05)));
     let run = simulate_detailed(&events, &sim(), &on, Some(&record)).unwrap();
+    // Normalization and coverage, against the model directly.
+    let model = record.model().unwrap();
+    let mut fresh = 0u64;
+    for (decision, quote) in run.decisions.iter().zip(&quotes[split..]) {
+        let signal = model.signal(quote).unwrap();
+        let expected = if signal.source == SignalSource::MicroPrice {
+            fresh += 1;
+            (dec!(0.05) * signal.adjustment / dec!(0.005)).clamp(dec!(-0.05), dec!(0.05))
+        } else {
+            dec!(0)
+        };
+        assert_eq!(decision.adjustment.skew.round_dp(12), expected.round_dp(12));
+    }
+    assert_eq!(run.report.micro_price.fresh, fresh);
+    assert_eq!(run.report.micro_price.missing, run.report.decisions - fresh);
     assert!(run.report.micro_price.fresh > 9_000);
     let skewed = run
         .decisions
@@ -563,6 +559,121 @@ fn test_simulate_record_trained_on_the_events_is_refused() {
     assert!(simulate(&inside, &sim(), &on, Some(&record)).is_err());
     let after = [top(100, dec!(100.00), dec!(1), dec!(1))];
     assert!(simulate(&after, &sim(), &on, Some(&record)).is_ok());
+}
+
+#[test]
+fn test_simulate_side_crossing_the_quote_is_not_posted_and_is_counted() {
+    // Up: a skew of 0.5 puts the bid above the best ask; the ask stays.
+    let huge = SignalConfig::baseline(dec!(0.5), dec!(0), dec!(1));
+    let events = [
+        top(0, dec!(100.00), dec!(9), dec!(1)),
+        trade(1, dec!(1), dec!(1), TradeSide::Sell),
+    ];
+    let up = huge.with_imbalance(policy(dec!(10)));
+    let run = simulate_detailed(&events, &sim(), &up, None).unwrap();
+    assert_eq!((run.report.crossing_sides, run.report.fills), (1, 0));
+    assert!(run.decisions[0].bid.is_none() && run.decisions[0].ask.is_some());
+    // Down: the mirror.
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(9)),
+        trade(1, dec!(1000), dec!(1), TradeSide::Buy),
+    ];
+    let run = simulate_detailed(&events, &sim(), &up, None).unwrap();
+    assert_eq!((run.report.crossing_sides, run.report.fills), (1, 0));
+    assert!(run.decisions[0].ask.is_none() && run.decisions[0].bid.is_some());
+    // Touching counts: a bid exactly at the ask.
+    let (base_bid, _) = calculate_optimal_quotes(
+        dec!(100.005),
+        dec!(0),
+        dec!(0.1),
+        dec!(1),
+        TERMINAL,
+        dec!(20),
+    )
+    .unwrap();
+    let floor = (base_bid / dec!(0.01)).floor() * dec!(0.01);
+    let exact = SignalConfig::baseline(dec!(100.01) - floor, dec!(0), dec!(1))
+        .with_imbalance(policy(dec!(10)));
+    let events = [top(0, dec!(100.00), dec!(9), dec!(1))];
+    let run = simulate_detailed(&events, &sim(), &exact, None).unwrap();
+    assert_eq!(run.report.crossing_sides, 1, "{:?}", run.decisions);
+    let shifted_ask = TopOfBook {
+        timestamp_ms: 0,
+        bid: dec!(100.00),
+        ask: dec!(100.01),
+        bid_size: dec!(1),
+        ask_size: dec!(9),
+    };
+    let (_, base_ask) = calculate_optimal_quotes(
+        dec!(100.005),
+        dec!(0),
+        dec!(0.1),
+        dec!(1),
+        TERMINAL,
+        dec!(20),
+    )
+    .unwrap();
+    let ceil = (base_ask / dec!(0.01)).ceil() * dec!(0.01);
+    let exact = SignalConfig::baseline(ceil - dec!(100.00), dec!(0), dec!(1))
+        .with_imbalance(policy(dec!(10)));
+    let run = simulate_detailed(&[MarketEvent::Quote(shifted_ask)], &sim(), &exact, None).unwrap();
+    assert_eq!(run.report.crossing_sides, 1, "{:?}", run.decisions);
+}
+
+#[test]
+fn test_simulate_invalid_trade_is_counted_and_reaches_nothing() {
+    let mut cfg = sim();
+    cfg.vpin = VPINConfig::new(dec!(1), 1, dec!(0.7)).unwrap();
+    let on = caps().with_toxicity(policy(dec!(0.02)));
+    let clean = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        top(5, dec!(100.00), dec!(1), dec!(1)),
+    ];
+    for bad in [
+        trade(1, dec!(1), dec!(-5), TradeSide::Sell),
+        trade(1, dec!(1), dec!(0), TradeSide::Sell),
+        trade(1, dec!(0), dec!(5), TradeSide::Sell),
+        trade(1, dec!(-1), dec!(5), TradeSide::Sell),
+    ] {
+        let events = [clean[0].clone(), bad.clone(), clean[1].clone()];
+        let r = simulate(&events, &cfg, &on, None).unwrap();
+        assert_eq!((r.invalid_trades, r.fills), (1, 0), "{bad:?}");
+        assert_eq!(r.toxicity.fresh, 0, "{bad:?}");
+    }
+}
+
+#[test]
+fn test_simulate_newest_due_quote_rests() {
+    // With latency 100, both are due at 200; the fill is at the second's price.
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        top(50, dec!(110.00), dec!(1), dec!(1)),
+        trade(200, dec!(1), dec!(1), TradeSide::Sell),
+    ];
+    let run = simulate_detailed(&events, &sim().with_latency_ms(100), &caps(), None).unwrap();
+    assert_eq!(run.fills[0].price, run.decisions[1].bid.unwrap().0);
+    assert_ne!(
+        run.decisions[0].bid.unwrap().0,
+        run.decisions[1].bid.unwrap().0
+    );
+}
+
+#[test]
+fn test_simulate_reduction_flipping_to_the_same_size_is_exempt() {
+    // From +1, selling 2 ends at -1: not an increase, at a price where a marked
+    // position of 1 is already above the notional limit.
+    let mut cfg = sim();
+    cfg.base_size = dec!(2);
+    cfg.limits = RiskLimits::new(dec!(10), dec!(250), dec!(0)).unwrap();
+    let events = [
+        top(0, dec!(100.00), dec!(1), dec!(1)),
+        trade(1, dec!(1), dec!(1), TradeSide::Sell),
+        top(2, dec!(300.00), dec!(1), dec!(1)),
+    ];
+    let run = simulate_detailed(&events, &cfg, &caps(), None).unwrap();
+    assert_eq!(run.report.final_inventory, dec!(1));
+    let last = run.decisions.last().unwrap();
+    assert_eq!(last.ask.unwrap().1, dec!(2), "{last:?}");
 }
 
 #[test]
@@ -869,6 +980,20 @@ fn test_ablation_report_on_an_adverse_selection_scenario() {
     };
     // The fixed scenario, stated before the run: leaning away from the informed
     // sweep must reduce adverse selection compared with the same strategy.
+    // A model's fallback counts as the feature missing, not as a zero signal.
+    let micro = at(0, "micro_price");
+    let usable = events
+        .iter()
+        .filter(|e| match e {
+            MarketEvent::Quote(q) => {
+                record.model().unwrap().signal(q).unwrap().source == SignalSource::MicroPrice
+            }
+            _ => false,
+        })
+        .count() as u64;
+    assert_eq!(micro.micro_price.fresh, usable);
+    assert_eq!(micro.micro_price.missing, micro.decisions - usable);
+    assert!(micro.micro_price.missing > 0);
     let (base, lean) = (at(0, "baseline"), at(0, "imbalance"));
     assert!(
         lean.markout.unwrap() > base.markout.unwrap(),
@@ -877,4 +1002,102 @@ fn test_ablation_report_on_an_adverse_selection_scenario() {
     assert_eq!(lean.imbalance.fresh, lean.decisions);
     // Stale quotes: latency must not help the naive strategy on this data.
     assert!(at(200, "baseline").markout.unwrap() <= base.markout.unwrap());
+}
+
+/// A chain where imbalance predicts a one tick move, inside the quotes.
+fn small_move_quotes(seed: u64, count: u64) -> Vec<TopOfBook> {
+    let mut rng = Rng(seed);
+    let (mut bid, mut imbalance) = (10_000i64, 0.5f64);
+    let mut quotes = Vec::new();
+    for step in 0..count {
+        let bid_size = (imbalance * 100.0).round().clamp(1.0, 99.0) as u64;
+        let price = Decimal::from(bid) * dec!(0.01);
+        quotes.push(TopOfBook {
+            timestamp_ms: step * 100,
+            bid: price,
+            ask: price + dec!(0.01),
+            bid_size: Decimal::from(bid_size),
+            ask_size: Decimal::from(100 - bid_size),
+        });
+        if rng.unit() < 0.1 {
+            if rng.unit() < imbalance {
+                bid += 1;
+                imbalance = 0.3 + 0.2 * rng.unit();
+            } else {
+                bid -= 1;
+                imbalance = 0.5 + 0.2 * rng.unit();
+            }
+        } else {
+            imbalance = (imbalance + 0.08 * (rng.unit() - 0.5)).clamp(0.01, 0.99);
+        }
+    }
+    quotes
+}
+
+#[test]
+fn test_ablation_report_with_moves_inside_the_quotes() {
+    // Fitted on the first 40,000 quotes. Uninformed trades reach 6 ticks either
+    // way, so that the features act through the quotes' own distance.
+    let quotes = small_move_quotes(41, 60_000);
+    let split = 40_000usize;
+    let window = TimeWindow::new(0, split as u64 * 100).unwrap();
+    let record = calibrate_micro_price(
+        &quotes,
+        &window,
+        &MicroPriceConfig::new(dec!(0.01), 5, 1),
+        "d",
+    )
+    .unwrap();
+    let share = record.model().unwrap().calibrated_share();
+    println!("small_moves calibrated_share={}", share.round_dp(4));
+    for state in record.model().unwrap().states() {
+        println!(
+            "small_moves bucket={} status={:?} adjustment_ticks={}",
+            state.imbalance_bucket,
+            state.status,
+            (state.adjustment / dec!(0.01)).round_dp(3)
+        );
+    }
+    let mut rng = Rng(43);
+    let mut events = Vec::new();
+    for q in &quotes[split..] {
+        events.push(MarketEvent::Quote(*q));
+        if rng.unit() < 0.5 {
+            let mid = q.mid().unwrap();
+            let (price, side) = if rng.unit() < 0.5 {
+                (mid + dec!(0.06), TradeSide::Buy)
+            } else {
+                (mid - dec!(0.06), TradeSide::Sell)
+            };
+            events.push(trade(q.timestamp_ms + 10, price, dec!(1), side));
+        }
+    }
+    let mut baseline = None;
+    for (name, signals) in ablations(true) {
+        for latency in [0u64, 200] {
+            let cfg = sim().with_latency_ms(latency);
+            let r = simulate(&events, &cfg, &signals, Some(&record)).unwrap();
+            println!(
+                "small_moves latency={latency} {name} fills={} max_inv={} capture={} inventory={} total={} markout={} fresh_micro={} crossing={}",
+                r.fills,
+                r.max_abs_inventory.round_dp(2),
+                r.spread_capture.round_dp(2),
+                r.inventory_pnl.round_dp(2),
+                r.total_pnl.round_dp(2),
+                r.markout.unwrap().round_dp(4),
+                r.micro_price.fresh,
+                r.crossing_sides,
+            );
+            if latency == 0 {
+                match name {
+                    "baseline" => baseline = Some(r),
+                    "micro_price" => {
+                        assert!(r.micro_price.fresh > 0);
+                        assert_ne!(r.total_pnl, baseline.unwrap().total_pnl);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }

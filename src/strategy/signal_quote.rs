@@ -21,10 +21,13 @@
 //! Then the risk limits scale each side's size, and a side the limits refuse
 //! is not quoted. The features are:
 //!
-//! - imbalance `2 I - 1`, in `[-1, 1]`, from the same quote;
+//! - imbalance `2 I - 1`, in `[-1, 1]`, from the same quote. Its horizon is the
+//!   next mid move, with no fixed duration;
 //! - micro-price adjustment over half the spread, in `[-1, 1]`, from a record
-//!   whose training ends before the simulated data, which is checked;
-//! - toxicity, the VPIN of the trades already seen, in `[0, 1]`.
+//!   whose training ends before the simulated data, which is checked. It has no
+//!   horizon by construction: the paper defines it as a limit of expected mids;
+//! - toxicity, the VPIN of the trades already seen, in `[0, 1]`. It describes the
+//!   configured volume buckets behind it, and predicts no price over a horizon.
 //!
 //! # Missing and stale values
 //!
@@ -48,7 +51,9 @@
 //! The limits are checked at the decision and again at the fill, against the
 //! inventory of that moment, because with latency other fills may come between.
 //! A fill is cut to the position limit. An order that does not increase the
-//! absolute position is never refused. A crossed or empty quote is counted and
+//! absolute position is never refused. A side that would cross the quote it was
+//! decided on is not posted, as a post-only order, and is counted. A crossed or
+//! empty quote, or a trade without a positive price and size, is counted and
 //! skipped, the same under every configuration. A micro-price model that falls
 //! back to the mid for a quote counts as that feature being missing.
 //!
@@ -57,6 +62,8 @@
 //! from the last mid at the fill and inventory from later mid changes. The
 //! report states results as they come, including negative ones, and says
 //! nothing about performance on data other than what it was given.
+
+use financial_types::Action;
 
 use crate::Decimal;
 use crate::analytics::micro_price::{MicroPriceModel, MicroPriceRecord, SignalSource, TopOfBook};
@@ -109,6 +116,7 @@ pub enum UnavailablePolicy {
 /// Use of one feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct FeaturePolicy {
     /// Price units per unit of the feature. Not negative.
     pub weight: Decimal,
@@ -121,6 +129,7 @@ pub struct FeaturePolicy {
 /// Which features are on, and the caps of their effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[non_exhaustive]
 pub struct SignalConfig {
     /// Imbalance; `None` ablates it.
@@ -469,6 +478,10 @@ pub struct SimulationReport {
     pub halted_decisions: u64,
     /// Quotes skipped as crossed or empty.
     pub invalid_quotes: u64,
+    /// Trades skipped for a price or size that is not positive.
+    pub invalid_trades: u64,
+    /// Sides not posted because they would cross the quote they were decided on.
+    pub crossing_sides: u64,
     /// Fills.
     pub fills: u64,
     /// Volume filled.
@@ -504,8 +517,8 @@ pub struct SimulationReport {
 pub struct FillRecord {
     /// Time of the trade, in milliseconds.
     pub timestamp_ms: u64,
-    /// +1 for a bought quantity, -1 for a sold one.
-    pub side: Decimal,
+    /// Our side.
+    pub side: Action,
     /// Our price.
     pub price: Decimal,
     /// Quantity filled.
@@ -610,6 +623,8 @@ pub fn simulate_detailed(
         decisions: 0,
         halted_decisions: 0,
         invalid_quotes: 0,
+        invalid_trades: 0,
+        crossing_sides: 0,
         fills: 0,
         volume: Decimal::ZERO,
         final_inventory: Decimal::ZERO,
@@ -633,6 +648,10 @@ pub fn simulate_detailed(
         activate(&mut pending, &mut live, now);
         match event {
             MarketEvent::Trade(trade) => {
+                if trade.price <= Decimal::ZERO || trade.size <= Decimal::ZERO {
+                    report.invalid_trades = report.invalid_trades.saturating_add(1);
+                    continue;
+                }
                 if let (Some(resting), Some(mid)) = (live.as_mut(), last_mid) {
                     apply_trade(
                         trade,
@@ -676,7 +695,7 @@ pub fn simulate_detailed(
                 report.imbalance.add(adjustment.imbalance);
                 report.micro_price.add(adjustment.micro_price);
                 report.toxicity.add(adjustment.toxicity);
-                let resting = decide(now, mid, inventory, &adjustment, config)?;
+                let resting = decide(quote, mid, inventory, &adjustment, config, &mut report)?;
                 if resting.bid.is_none() && resting.ask.is_none() {
                     report.halted_decisions = report.halted_decisions.saturating_add(1);
                 }
@@ -772,12 +791,14 @@ fn features_at(
 
 /// The quote for a decision, under the risk limits.
 fn decide(
-    now: u64,
+    quote: &TopOfBook,
     mid: Decimal,
     inventory: Decimal,
     adjustment: &Adjustment,
     config: &SimulationConfig,
+    report: &mut SimulationReport,
 ) -> MMResult<Resting> {
+    let now = quote.timestamp_ms;
     let from_ms = now
         .checked_add(config.latency_ms)
         .or_overflow("quote time")?;
@@ -855,10 +876,26 @@ fn decide(
             Ok(None)
         }
     };
+    let mut crossing = |crosses: bool| -> bool {
+        if crosses {
+            report.crossing_sides = report.crossing_sides.saturating_add(1);
+        }
+        crosses
+    };
+    let bid_side = if crossing(bid >= quote.ask) {
+        None
+    } else {
+        side_size(true, bid)?
+    };
+    let ask_side = if crossing(ask <= quote.bid) {
+        None
+    } else {
+        side_size(false, ask)?
+    };
     Ok(Resting {
         from_ms,
-        bid: side_size(true, bid)?,
-        ask: side_size(false, ask)?,
+        bid: bid_side,
+        ask: ask_side,
     })
 }
 
@@ -892,9 +929,9 @@ fn apply_trade(
     report: &mut SimulationReport,
     fills: &mut Vec<FillRecord>,
 ) -> MMResult<()> {
-    let (side, level) = match trade.side {
-        TradeSide::Sell => (Decimal::ONE, &mut resting.bid),
-        TradeSide::Buy => (Decimal::NEGATIVE_ONE, &mut resting.ask),
+    let (action, side, level) = match trade.side {
+        TradeSide::Sell => (Action::Buy, Decimal::ONE, &mut resting.bid),
+        TradeSide::Buy => (Action::Sell, Decimal::NEGATIVE_ONE, &mut resting.ask),
     };
     let Some((price, available)) = *level else {
         return Ok(());
@@ -945,7 +982,7 @@ fn apply_trade(
     report.fees = report.fees.checked_add(fee).or_overflow("fees")?;
     fills.push(FillRecord {
         timestamp_ms: trade.timestamp,
-        side,
+        side: action,
         price,
         size,
     });
@@ -976,9 +1013,19 @@ fn markout(
         let Some((_, mid)) = after.checked_sub(1).and_then(|i| mids.get(i)) else {
             continue;
         };
+        // `Action` is non-exhaustive, and this module only ever records these two.
+        let sign = match fill.side {
+            Action::Buy => Decimal::ONE,
+            Action::Sell => Decimal::NEGATIVE_ONE,
+            other => {
+                return Err(MMError::InvalidMarketState(format!(
+                    "unsupported fill side {other:?}"
+                )));
+            }
+        };
         let gain = mid
             .checked_sub(fill.price)
-            .and_then(|edge| edge.checked_mul(fill.side))
+            .and_then(|edge| edge.checked_mul(sign))
             .and_then(|edge| edge.checked_mul(fill.size))
             .or_overflow("markout")?;
         gained = gained.checked_add(gain).or_overflow("markout")?;
