@@ -102,6 +102,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `MarketTick::spread_bps` and `MarketSnapshot::spread_bps` return the bound
+  with the spread's sign when the ratio overflows, and
+  `ManagedOrder::fill_ratio` saturates at the bound on such an overfill. Both
+  returned 0. Fill rate calibration propagates a failed logarithm instead of
+  regressing on 0.
 - `OrderFlowStats::imbalance`, `VolumeBucket` imbalances and VPIN keep their
   proportions when a side's volume is beyond the `Decimal` bounds. There,
   `net_flow` carries rounding error, so its sign is reliable only when the
