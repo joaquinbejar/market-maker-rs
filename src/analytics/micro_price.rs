@@ -29,9 +29,12 @@
 //! book. The rule compares integer multiples of sizes, without rounding a
 //! division, and `G*` is antisymmetric exactly.
 //!
-//! The paper's moves are four values of up to one tick. Here a pair moving the
-//! mid by more than `max_mid_move_ticks` is left out and counted, so that one
-//! bad print cannot move the fit.
+//! The paper's moves are four values of up to one tick. Here any mid move on
+//! the half tick grid is accepted and none is filtered, so one bad print does
+//! move the fit, in proportion to its size: 1000 ticks in 100,000 quotes can
+//! halve the adjustments and more can flip their sign. The record reports
+//! `largest_mid_move_ticks` so that this can be seen; cleaning the data is the
+//! caller's.
 //!
 //! # Fallbacks
 //!
@@ -48,22 +51,23 @@
 //!   does is [`StateStatus::OutsideQuotes`].
 //! - That switch makes the signal non-monotonic in the imbalance: a strong
 //!   imbalance can give the mid while a weaker one gives a large adjustment.
-//! - A pair with a spread above `spread_states`, further apart than
-//!   `max_quote_gap_ms` or with too large a move is not counted, and a spread
-//!   above `spread_states` has no adjustment. Leaving pairs out cuts the
-//!   chains and changes the adjustments, by an amount that grows with the share
-//!   left out and that can be large: check `skipped_pairs` against `pairs`, and
-//!   choose `spread_states` to cover the data.
+//! - A pair with a spread above `spread_states` or further apart than
+//!   `max_quote_gap_ms` is not counted, and a spread above `spread_states` has
+//!   no adjustment. Leaving pairs out cuts the chains and changes the
+//!   adjustments, by an amount that grows with the share left out and that can
+//!   be large. The record counts each reason, and
+//!   [`MicroPriceModel::calibrated_share`] gives the coverage of the fit.
 //! - [`StateEstimate::fallback_within_moves`] reports how much a state's
 //!   adjustment depends on absorption by fallback states.
 //!
 //! # Invalid quotes
 //!
 //! [`calibrate_micro_price`] and [`compare_estimators`] leave out a crossed,
-//! empty, off grid or unrepresentable quote and count it, so one bad quote does not lose a
-//! month's report. [`MicroPriceCalibrator::observe`] and
-//! [`MicroPriceModel::signal`] refuse it. The quotes on either side of it form
-//! a pair if they pass the gap rule.
+//! empty or off grid quote and count it. The quotes on either side of it form
+//! a pair if they pass the gap rule. [`MicroPriceCalibrator::observe`] and
+//! [`MicroPriceModel::signal`] refuse such a quote. A quote whose values overflow
+//! the arithmetic, such as a price too large in ticks for `i64`, is a typed
+//! [`MMError::NumericalError`] that ends the whole call in all four.
 //!
 //! # Causality
 //!
@@ -205,13 +209,11 @@ pub struct MicroPriceConfig {
     pub min_state_observations: u64,
     /// Longest time between two quotes of a pair, in milliseconds. Positive.
     pub max_quote_gap_ms: u64,
-    /// Largest mid move of a pair, in ticks. Positive.
-    pub max_mid_move_ticks: u32,
 }
 
 impl MicroPriceConfig {
-    /// Creates a configuration with a minimum of 100 observations per state, a
-    /// longest gap of one minute and a largest mid move of 10 ticks.
+    /// Creates a configuration with a minimum of 100 observations per state and
+    /// a longest gap of one minute.
     #[must_use]
     pub fn new(tick_size: Decimal, imbalance_buckets: u32, spread_states: u32) -> Self {
         Self {
@@ -220,7 +222,6 @@ impl MicroPriceConfig {
             spread_states,
             min_state_observations: 100,
             max_quote_gap_ms: 60_000,
-            max_mid_move_ticks: 10,
         }
     }
 
@@ -238,13 +239,6 @@ impl MicroPriceConfig {
         self
     }
 
-    /// Sets the largest mid move of a pair, in ticks.
-    #[must_use]
-    pub fn with_max_mid_move_ticks(mut self, ticks: u32) -> Self {
-        self.max_mid_move_ticks = ticks;
-        self
-    }
-
     /// Checks the configuration.
     ///
     /// # Errors
@@ -257,7 +251,6 @@ impl MicroPriceConfig {
         if self.tick_size <= Decimal::ZERO
             || self.imbalance_buckets < 3
             || self.imbalance_buckets.is_multiple_of(2)
-            || self.max_mid_move_ticks == 0
             || self.spread_states == 0
             || self.min_state_observations == 0
             || self.max_quote_gap_ms == 0
@@ -344,20 +337,12 @@ impl MicroPriceConfig {
         Ok(Some(state))
     }
 
-    /// Refuses a quote the estimator cannot use, whatever the reason, as
-    /// [`MMError::InvalidMarketState`].
+    /// Checks everything the estimator computes from a quote.
     fn usable_state(&self, quote: &TopOfBook) -> MMResult<Option<usize>> {
-        let state = self.state_of(quote).and_then(|state| {
-            quote.mid()?;
-            quote.weighted_mid()?;
-            Ok(state)
-        });
-        state.map_err(|error| {
-            MMError::InvalidMarketState(format!(
-                "unusable quote at {}: {error}",
-                quote.timestamp_ms
-            ))
-        })
+        let state = self.state_of(quote)?;
+        quote.mid()?;
+        quote.weighted_mid()?;
+        Ok(state)
     }
 
     /// The state with the imbalance bucket mirrored.
@@ -393,7 +378,9 @@ pub struct MicroPriceCalibrator {
     move_half_ticks: Vec<i64>,
     previous: Option<TopOfBook>,
     pairs: u64,
-    skipped_pairs: u64,
+    skipped_spread_pairs: u64,
+    skipped_gap_pairs: u64,
+    largest_move_half_ticks: u64,
     hash: u128,
 }
 
@@ -414,7 +401,9 @@ impl MicroPriceCalibrator {
             move_half_ticks: vec![0; states],
             previous: None,
             pairs: 0,
-            skipped_pairs: 0,
+            skipped_spread_pairs: 0,
+            skipped_gap_pairs: 0,
+            largest_move_half_ticks: 0,
             hash: FNV_OFFSET,
         })
     }
@@ -428,12 +417,7 @@ impl MicroPriceCalibrator {
     /// and [`MMError::NumericalError`] on overflow.
     pub fn observe(&mut self, quote: &TopOfBook) -> MMResult<()> {
         let to = self.config.usable_state(quote)?;
-        let next_half_ticks = self.half_ticks(quote).map_err(|error| {
-            MMError::InvalidMarketState(format!(
-                "unusable quote at {}: {error}",
-                quote.timestamp_ms
-            ))
-        })?;
+        let next_half_ticks = self.half_ticks(quote)?;
         if let Some(previous) = self.previous {
             if quote.timestamp_ms < previous.timestamp_ms {
                 return Err(MMError::InvalidMarketState(format!(
@@ -446,19 +430,22 @@ impl MicroPriceCalibrator {
             let change = next_half_ticks
                 .checked_sub(self.half_ticks(&previous)?)
                 .or_overflow("mid move")?;
-            let largest = i64::from(self.config.max_mid_move_ticks)
-                .checked_mul(2)
-                .or_overflow("largest mid move")?;
-            let transition = from
-                .zip(to)
-                .filter(|_| gap <= self.config.max_quote_gap_ms && change.abs() <= largest);
-            if let Some((from, to)) = transition {
+            let transition = from.zip(to);
+            if gap > self.config.max_quote_gap_ms {
+                self.skipped_gap_pairs =
+                    self.skipped_gap_pairs.checked_add(1).or_overflow("pairs")?;
+            } else if let Some((from, to)) = transition {
+                self.largest_move_half_ticks =
+                    self.largest_move_half_ticks.max(change.unsigned_abs());
                 self.count(from, to, change)?;
                 let negated = change.checked_neg().or_overflow("mid move")?;
                 self.count(self.config.mirror(from)?, self.config.mirror(to)?, negated)?;
                 self.pairs = self.pairs.checked_add(1).or_overflow("pairs")?;
             } else {
-                self.skipped_pairs = self.skipped_pairs.checked_add(1).or_overflow("pairs")?;
+                self.skipped_spread_pairs = self
+                    .skipped_spread_pairs
+                    .checked_add(1)
+                    .or_overflow("pairs")?;
             }
         }
         self.previous = Some(*quote);
@@ -482,11 +469,24 @@ impl MicroPriceCalibrator {
         self.pairs
     }
 
-    /// Returns the pairs left out for a spread out of range, a gap or too
-    /// large a mid move.
+    /// Returns the pairs left out for a spread out of range.
     #[must_use]
-    pub fn skipped_pairs(&self) -> u64 {
-        self.skipped_pairs
+    pub fn skipped_spread_pairs(&self) -> u64 {
+        self.skipped_spread_pairs
+    }
+
+    /// Returns the pairs left out for a gap above `max_quote_gap_ms`.
+    #[must_use]
+    pub fn skipped_gap_pairs(&self) -> u64 {
+        self.skipped_gap_pairs
+    }
+
+    /// Returns the largest absolute mid move counted, in ticks.
+    #[must_use]
+    pub fn largest_mid_move_ticks(&self) -> Decimal {
+        Decimal::from(self.largest_move_half_ticks)
+            .checked_div(Decimal::TWO)
+            .unwrap_or(Decimal::MAX)
     }
 
     /// Returns the FNV-1a 128 of the quotes observed.
@@ -610,6 +610,24 @@ impl MicroPriceModel {
         &self.states
     }
 
+    /// Returns the share of the training observations, mirrors included, that
+    /// are in [`StateStatus::Calibrated`] states.
+    #[must_use]
+    pub fn calibrated_share(&self) -> Decimal {
+        let total = self
+            .states
+            .iter()
+            .fold(0u64, |sum, s| sum.saturating_add(s.observations));
+        let calibrated = self
+            .states
+            .iter()
+            .filter(|s| s.status == StateStatus::Calibrated)
+            .fold(0u64, |sum, s| sum.saturating_add(s.observations));
+        Decimal::from(calibrated)
+            .checked_div(Decimal::from(total))
+            .unwrap_or(Decimal::ZERO)
+    }
+
     /// Computes the signal of a quote.
     ///
     /// # Errors
@@ -678,8 +696,13 @@ pub struct MicroPriceRecord {
     pub dataset_hash: u128,
     /// Pairs counted, mirrors not included.
     pub pairs: u64,
-    /// Pairs left out for a spread out of range, a gap or too large a mid move.
-    pub skipped_pairs: u64,
+    /// Pairs left out for a spread out of range.
+    pub skipped_spread_pairs: u64,
+    /// Pairs left out for a gap above `max_quote_gap_ms`.
+    pub skipped_gap_pairs: u64,
+    /// Largest absolute mid move counted, in ticks. A large value next to the
+    /// tick grid points to a bad print: see the module docs.
+    pub largest_mid_move_ticks: Decimal,
     /// Quotes left out as invalid or off the grid. They are not in the hash.
     pub invalid_quotes: u64,
     /// The model, or why there is none.
@@ -726,7 +749,9 @@ pub fn calibrate_micro_price(
         dataset_id: dataset_id.to_string(),
         dataset_hash: calibrator.dataset_hash(),
         pairs: calibrator.pairs(),
-        skipped_pairs: calibrator.skipped_pairs(),
+        skipped_spread_pairs: calibrator.skipped_spread_pairs(),
+        skipped_gap_pairs: calibrator.skipped_gap_pairs(),
+        largest_mid_move_ticks: calibrator.largest_mid_move_ticks(),
         invalid_quotes,
         fit: calibrator.fit()?,
     })
@@ -1329,7 +1354,6 @@ struct RawConfig {
     spread_states: u32,
     min_state_observations: u64,
     max_quote_gap_ms: u64,
-    max_mid_move_ticks: u32,
 }
 
 #[cfg(feature = "serde")]
@@ -1343,7 +1367,6 @@ impl TryFrom<RawConfig> for MicroPriceConfig {
             spread_states: raw.spread_states,
             min_state_observations: raw.min_state_observations,
             max_quote_gap_ms: raw.max_quote_gap_ms,
-            max_mid_move_ticks: raw.max_mid_move_ticks,
         };
         config.validate()?;
         Ok(config)
@@ -1362,7 +1385,9 @@ struct RawCalibrator {
     move_half_ticks: Vec<i64>,
     previous: Option<TopOfBook>,
     pairs: u64,
-    skipped_pairs: u64,
+    skipped_spread_pairs: u64,
+    skipped_gap_pairs: u64,
+    largest_move_half_ticks: u64,
     hash: u128,
 }
 
@@ -1393,7 +1418,9 @@ impl TryFrom<RawCalibrator> for MicroPriceCalibrator {
             move_half_ticks: raw.move_half_ticks,
             previous: raw.previous,
             pairs: raw.pairs,
-            skipped_pairs: raw.skipped_pairs,
+            skipped_spread_pairs: raw.skipped_spread_pairs,
+            skipped_gap_pairs: raw.skipped_gap_pairs,
+            largest_move_half_ticks: raw.largest_move_half_ticks,
             hash: raw.hash,
         })
     }

@@ -12,6 +12,7 @@ use market_maker_rs::analytics::micro_price::*;
 use market_maker_rs::dec;
 use market_maker_rs::prelude::Decimal;
 use market_maker_rs::strategy::walk_forward::{TimeWindow, WindowSpec, chronological_splits};
+use market_maker_rs::types::error::MMError;
 use rust_decimal::prelude::ToPrimitive;
 
 const TICK: Decimal = dec!(0.01);
@@ -343,7 +344,6 @@ fn test_config_invalid_values_are_refused() {
         MicroPriceConfig::new(dec!(0), 5, 2),
         MicroPriceConfig::new(TICK, 1, 2),
         MicroPriceConfig::new(TICK, 4, 2),
-        good.with_max_mid_move_ticks(0),
         MicroPriceConfig::new(TICK, 5, 0),
         MicroPriceConfig::new(TICK, 17, 16),
         good.with_min_state_observations(0),
@@ -602,24 +602,27 @@ fn test_bucket_boundaries_follow_the_exact_rule() {
 }
 
 #[test]
-fn test_fit_large_move_pair_is_left_out_and_counted() {
+fn test_fit_large_move_is_kept_and_reported() {
     let clean = simulated(6, 20_000);
     let mut printed = clean.clone();
-    printed[10_000].bid += dec!(1000);
-    printed[10_000].ask += dec!(1000);
+    printed[10_000].bid += dec!(10);
+    printed[10_000].ask += dec!(10);
     let cfg = MicroPriceConfig::new(TICK, 5, 2);
     let (a, b) = (record_of(&clean, &cfg), record_of(&printed, &cfg));
-    assert_eq!(b.skipped_pairs, a.skipped_pairs + 2);
-    let diff =
-        a.model().unwrap().states()[0].adjustment - b.model().unwrap().states()[0].adjustment;
-    assert!(diff.abs() < dec!(0.001), "{diff}");
-    assert_ne!(a.dataset_hash, b.dataset_hash);
+    assert_eq!(a.largest_mid_move_ticks, dec!(1));
+    assert_eq!(b.largest_mid_move_ticks, dec!(1000));
+    assert_eq!(b.pairs, a.pairs);
+    // Not filtered: the print does move the fit.
+    assert_ne!(
+        a.model().unwrap().states()[0].adjustment,
+        b.model().unwrap().states()[0].adjustment
+    );
 }
 
 #[test]
-fn test_calibrate_unrepresentable_quotes_are_counted_not_fatal() {
+fn test_calibrate_unrepresentable_quote_is_a_typed_error() {
     let good = quote(1, 1000, true);
-    let bad = [
+    for bad in [
         TopOfBook {
             ask: Decimal::MAX,
             ..good
@@ -639,29 +642,39 @@ fn test_calibrate_unrepresentable_quotes_are_counted_not_fatal() {
             ask_size: Decimal::MAX,
             ..good
         },
-    ];
-    let mut quotes = bad.to_vec();
-    quotes.extend(hand_fixture().iter().map(|q| TopOfBook {
-        timestamp_ms: q.timestamp_ms + 2,
-        ..*q
-    }));
-    let record = record_of(&quotes, &config());
-    assert_eq!(record.invalid_quotes, 4);
-    assert!(record.model().is_some());
+    ] {
+        let window = TimeWindow::new(0, TRAIN_END).unwrap();
+        let result = calibrate_micro_price(&[bad], &window, &config(), "d");
+        assert!(matches!(result, Err(MMError::NumericalError(_))), "{bad:?}");
+        let record = record_of(&hand_fixture(), &config());
+        let test = [TopOfBook {
+            timestamp_ms: TRAIN_END,
+            ..bad
+        }];
+        let test_window = TimeWindow::new(TRAIN_END, TRAIN_END + 10).unwrap();
+        let result = compare_estimators(&record, &test, &test_window, &[1]);
+        assert!(matches!(result, Err(MMError::NumericalError(_))), "{bad:?}");
+    }
+}
 
-    let t = TRAIN_END;
-    let mut test: Vec<_> = bad
-        .iter()
-        .map(|q| TopOfBook {
-            timestamp_ms: t,
-            ..*q
-        })
-        .collect();
-    test.push(quote(t, 1000, true));
-    test.push(quote(t + 100, 1000, true));
-    let window = TimeWindow::new(t, t + 1_000).unwrap();
-    let report = compare_estimators(&record, &test, &window, &[50]).unwrap();
-    assert_eq!((report[0].invalid_quotes, report[0].samples), (4, 2));
+#[test]
+fn test_record_reports_coverage() {
+    let mut quotes = hand_fixture();
+    let time = quotes.last().unwrap().timestamp_ms + 2 * GAP_MS;
+    let balanced = TopOfBook {
+        bid_size: dec!(1),
+        ask_size: dec!(1),
+        ..quote(time, 1000, true)
+    };
+    quotes.push(balanced);
+    quotes.push(TopOfBook {
+        timestamp_ms: time + 1,
+        ..balanced
+    });
+    let record = record_of(&quotes, &config().with_min_state_observations(3));
+    // 10 from each outer bucket are calibrated; 2 from the middle one are rare.
+    let share = record.model().unwrap().calibrated_share();
+    assert_eq!(share.round_dp(12), (dec!(20) / dec!(22)).round_dp(12));
 }
 
 #[test]
@@ -738,7 +751,9 @@ fn test_skipped_pairs_counts_gap_and_spread() {
         quote(20 + GAP_MS + 2, 1000, true),
     ];
     let record = record_of(&quotes, &config());
-    assert_eq!((record.pairs, record.skipped_pairs), (1, 3));
+    assert_eq!(record.pairs, 1);
+    assert_eq!(record.skipped_spread_pairs, 2);
+    assert_eq!(record.skipped_gap_pairs, 1);
 }
 
 #[test]
