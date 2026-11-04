@@ -194,11 +194,14 @@ fn main() {
     println!("After adding 100 call contracts:");
     println!("  Chain Delta: {}", risk_manager.current_greeks().delta);
     println!("  Chain Gamma: {}", risk_manager.current_greeks().gamma);
-    println!("  Should Hedge: {}", risk_manager.should_hedge());
+    let should_hedge = risk_manager
+        .should_hedge()
+        .expect("Failed to check the hedge");
+    println!("  Should Hedge: {should_hedge}");
     println!();
 
     // Calculate hedge
-    if risk_manager.should_hedge() {
+    if should_hedge {
         let hedges = risk_manager
             .calculate_hedge(dec!(50000.0))
             .expect("Failed to calculate hedge");

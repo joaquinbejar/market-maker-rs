@@ -403,6 +403,9 @@ impl ChainMarketMaker {
     }
 
     /// Returns a mutable reference to the risk manager.
+    ///
+    /// Replacing the whole manager through it also discards a failed booking
+    /// (see [`ChainRiskManager::has_unbooked_fill`]).
     pub fn risk_manager_mut(&mut self) -> &mut ChainRiskManager {
         &mut self.risk_manager
     }
@@ -637,7 +640,12 @@ impl ChainMarketMaker {
         self.risk_manager.current_greeks()
     }
 
-    /// Checks the chain-level risk status.
+    /// Checks the chain-level risk status. It is [`RiskStatus::Breached`], so
+    /// [`RiskStatus::can_quote`] is false, while the Greeks miss a fill that
+    /// could not be booked (see [`ChainRiskManager::has_unbooked_fill`]).
+    ///
+    /// This only reports: the quoting methods do not call it, so stopping
+    /// while [`RiskStatus::can_quote`] is false is up to the caller.
     ///
     /// # Errors
     ///
@@ -646,7 +654,7 @@ impl ChainMarketMaker {
     pub fn check_chain_risk(&self) -> MMResult<RiskStatus> {
         if self.risk_manager.is_risk_breached() {
             Ok(RiskStatus::Breached)
-        } else if self.risk_manager.should_hedge() {
+        } else if self.risk_manager.should_hedge()? {
             Ok(RiskStatus::HedgeRequired)
         } else {
             // Check if approaching limits (80% threshold)
@@ -685,7 +693,9 @@ impl ChainMarketMaker {
     ///
     /// # Errors
     ///
-    /// [`MMError::NumericalError`] when the number of shares overflows.
+    /// [`MMError::GreeksMissFill`] while the Greeks miss a fill that could not
+    /// be booked, and [`MMError::NumericalError`] when the number of shares
+    /// overflows.
     pub fn calculate_hedge(&self, underlying_price: Decimal) -> MMResult<Vec<HedgeOrder>> {
         self.risk_manager.calculate_hedge(underlying_price)
     }
@@ -1100,6 +1110,37 @@ mod tests {
                 )))
             );
         }
+    }
+
+    #[test]
+    fn test_check_chain_risk_stops_quoting_after_a_failed_booking() {
+        let mut mm = with_limits(ChainRiskLimits::default());
+        let huge = crate::options::greeks::PositionGreeks::new(
+            Decimal::MAX,
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+        );
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Normal));
+
+        assert!(matches!(
+            mm.risk_manager_mut().add_position_greeks(&huge, dec!(2)),
+            Err(MMError::FillNotBooked(_))
+        ));
+        let status = mm.check_chain_risk().unwrap();
+        assert_eq!(status, RiskStatus::Breached);
+        assert!(!status.can_quote());
+        assert_eq!(
+            mm.calculate_hedge(dec!(100)).map(|hedges| hedges.len()),
+            Err(MMError::GreeksMissFill)
+        );
+
+        mm.risk_manager_mut().update_greeks(PortfolioGreeks::new());
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Breached));
+
+        mm.risk_manager_mut().reconcile(PortfolioGreeks::new());
+        assert_eq!(mm.check_chain_risk(), Ok(RiskStatus::Normal));
     }
 
     #[test]

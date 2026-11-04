@@ -27,7 +27,11 @@
 //! [`MMError::NumericalError`](crate::types::error::MMError::NumericalError).
 //! A risk check that cannot be computed never allows trading: the circuit
 //! breaker opens, and when a fill cannot be booked it stays open until a manual
-//! reset.
+//! reset. Meanwhile, what would answer from the Greeks is
+//! [`MMError::GreeksMissFill`](crate::types::error::MMError::GreeksMissFill).
+//! The errors of a fill say whether it was booked:
+//! [`MMError::FillNotBooked`](crate::types::error::MMError::FillNotBooked) or
+//! [`MMError::FillBookedCheckFailed`](crate::types::error::MMError::FillBookedCheckFailed).
 
 use crate::Decimal;
 use crate::options::greeks::{PortfolioGreeks, PositionGreeks};
@@ -580,7 +584,8 @@ pub struct GreeksRiskManager {
     /// Underlying symbol.
     underlying_symbol: String,
     /// A fill could not be booked, so `current_greeks` misses it: the circuit
-    /// breaker stays open until a manual reset.
+    /// breaker stays open and the hedge and limit readings fail until a manual
+    /// reset.
     booking_failed: bool,
 }
 
@@ -620,9 +625,29 @@ impl GreeksRiskManager {
     }
 
     /// Returns a reference to the current Greeks.
+    ///
+    /// This is an incomplete snapshot while [`Self::has_unbooked_fill`] is
+    /// true: it misses a real fill.
     #[must_use]
     pub fn current_greeks(&self) -> &PortfolioGreeks {
         &self.current_greeks
+    }
+
+    /// Returns true while the Greeks miss a fill that could not be booked,
+    /// until [`Self::reconcile`], [`Self::reset`] or
+    /// [`Self::reset_circuit_breaker`]. Later fills that book do not clear it.
+    #[must_use]
+    pub fn has_unbooked_fill(&self) -> bool {
+        self.booking_failed
+    }
+
+    /// The current Greeks, unless they are known to miss a fill.
+    fn booked_greeks(&self) -> MMResult<&PortfolioGreeks> {
+        if self.booking_failed {
+            Err(MMError::GreeksMissFill)
+        } else {
+            Ok(&self.current_greeks)
+        }
     }
 
     /// Returns the underlying symbol.
@@ -641,9 +666,10 @@ impl GreeksRiskManager {
     ///
     /// # Errors
     ///
-    /// As [`LimitUtilization::calculate`].
+    /// [`MMError::GreeksMissFill`] while [`Self::has_unbooked_fill`] is true,
+    /// and as [`LimitUtilization::calculate`].
     pub fn limit_utilization(&self) -> MMResult<LimitUtilization> {
-        LimitUtilization::calculate(&self.current_greeks, &self.limits)
+        LimitUtilization::calculate(self.booked_greeks()?, &self.limits)
     }
 
     /// Checks if an order is allowed given current Greeks.
@@ -717,10 +743,14 @@ impl GreeksRiskManager {
     ///
     /// # Errors
     ///
-    /// [`MMError::NumericalError`] when the fill cannot be booked: the Greeks
-    /// are unchanged, so they miss a real fill, and the circuit breaker stays
-    /// open until [`Self::reset`] or [`Self::reset_circuit_breaker`]. Also the
-    /// errors of [`GreeksCircuitBreaker::check`], with the fill booked.
+    /// - [`MMError::FillNotBooked`] when the fill cannot be booked: this call
+    ///   leaves the Greeks unchanged, so they miss a real fill. The circuit
+    ///   breaker stays open, and [`Self::has_unbooked_fill`] true, until
+    ///   [`Self::reconcile`], [`Self::reset`] or
+    ///   [`Self::reset_circuit_breaker`].
+    /// - [`MMError::FillBookedCheckFailed`] when the fill is booked but
+    ///   [`GreeksCircuitBreaker::check`] fails. The Greeks include the fill, so
+    ///   do not book it again.
     pub fn update_on_fill(
         &mut self,
         option_greeks: &PositionGreeks,
@@ -758,45 +788,66 @@ impl GreeksRiskManager {
         if let Err(error) = booked {
             self.booking_failed = true;
             self.circuit_breaker.fault(&error, timestamp);
-            return Err(error);
+            return Err(MMError::FillNotBooked(error.to_string()));
         }
         if self.booking_failed {
             return Ok(());
         }
         self.circuit_breaker
             .check(&self.current_greeks, &self.limits, timestamp)
+            .map_err(|error| MMError::FillBookedCheckFailed(error.to_string()))
     }
 
     /// Checks if hedging is needed.
     ///
     /// # Errors
     ///
-    /// As [`AutoHedger::needs_hedge`].
+    /// [`MMError::GreeksMissFill`] while [`Self::has_unbooked_fill`] is true,
+    /// and as [`AutoHedger::needs_hedge`].
     pub fn needs_hedge(&self) -> MMResult<bool> {
-        self.hedger.needs_hedge(&self.current_greeks, &self.limits)
+        self.hedger.needs_hedge(self.booked_greeks()?, &self.limits)
     }
 
     /// Calculates the hedge order.
     ///
     /// # Errors
     ///
-    /// As [`AutoHedger::calculate_hedge`].
+    /// [`MMError::GreeksMissFill`] while [`Self::has_unbooked_fill`] is true,
+    /// and as [`AutoHedger::calculate_hedge`].
     pub fn calculate_hedge_order(&self, underlying_price: Decimal) -> MMResult<Option<HedgeOrder>> {
         self.hedger
-            .calculate_hedge(&self.current_greeks, &self.limits, underlying_price)
+            .calculate_hedge(self.booked_greeks()?, &self.limits, underlying_price)
     }
 
     /// Returns the hedge urgency.
     ///
     /// # Errors
     ///
-    /// As [`AutoHedger::hedge_urgency`].
+    /// [`MMError::GreeksMissFill`] while [`Self::has_unbooked_fill`] is true,
+    /// and as [`AutoHedger::hedge_urgency`].
     pub fn hedge_urgency(&self) -> MMResult<HedgeUrgency> {
         self.hedger
-            .hedge_urgency(&self.current_greeks, &self.limits)
+            .hedge_urgency(self.booked_greeks()?, &self.limits)
     }
 
-    /// Resets the risk manager state.
+    /// Installs Greeks recomputed from the positions, which include any fill
+    /// that could not be booked, clears the failed booking and runs the
+    /// circuit breaker from closed against them, so a breach reopens it.
+    ///
+    /// # Errors
+    ///
+    /// As [`GreeksCircuitBreaker::check`]: the Greeks are installed, and a
+    /// check that cannot be computed opens the breaker.
+    pub fn reconcile(&mut self, greeks: PortfolioGreeks, timestamp: u64) -> MMResult<()> {
+        self.current_greeks = greeks;
+        self.booking_failed = false;
+        self.circuit_breaker.reset();
+        self.circuit_breaker
+            .check(&self.current_greeks, &self.limits, timestamp)
+    }
+
+    /// Resets the risk manager state: the Greeks go to zero, and a failed
+    /// booking is cleared.
     pub fn reset(&mut self) {
         self.current_greeks.reset();
         self.circuit_breaker.reset();
@@ -804,13 +855,14 @@ impl GreeksRiskManager {
     }
 
     /// Manually resets the circuit breaker, including after a fill that could
-    /// not be booked: the caller accepts Greeks that miss that fill.
+    /// not be booked: the Greeks are kept, and the caller accepts that they
+    /// miss that fill. [`Self::reconcile`] installs correct ones instead.
     pub fn reset_circuit_breaker(&mut self) {
         self.circuit_breaker.reset();
         self.booking_failed = false;
     }
 
-    /// Updates the Greeks limits.
+    /// Updates the Greeks limits. This does not clear a failed booking.
     pub fn update_limits(&mut self, limits: GreeksLimits) {
         self.limits = limits;
     }
@@ -1336,6 +1388,10 @@ mod tests {
         );
     }
 
+    fn not_booked(what: &str) -> MMError {
+        MMError::FillNotBooked(overflow(what).to_string())
+    }
+
     #[test]
     fn test_update_on_fill_booking_failure_holds_the_breaker_open() {
         let mut manager = GreeksRiskManager::with_defaults("BTC");
@@ -1344,9 +1400,10 @@ mod tests {
 
         assert_eq!(
             manager.update_on_fill(&huge, dec!(2), 1000),
-            Err(overflow("scaled delta"))
+            Err(not_booked("scaled delta"))
         );
         assert_eq!(*manager.current_greeks(), PortfolioGreeks::new());
+        assert!(manager.has_unbooked_fill());
         assert_eq!(
             manager.circuit_breaker_status().state,
             GreeksCircuitBreakerState::Open
@@ -1379,8 +1436,9 @@ mod tests {
 
         assert_eq!(
             manager.update_on_close(&huge, dec!(2), 1000),
-            Err(overflow("scaled delta"))
+            Err(not_booked("scaled delta"))
         );
+        assert!(manager.has_unbooked_fill());
         assert_eq!(
             manager.circuit_breaker_status().state,
             GreeksCircuitBreakerState::Open
@@ -1406,13 +1464,167 @@ mod tests {
         let greeks = create_test_greeks();
         assert_eq!(
             manager.update_on_fill(&greeks, dec!(10), 1000),
-            Err(overflow("gamma utilization"))
+            Err(MMError::FillBookedCheckFailed(
+                overflow("gamma utilization").to_string()
+            ))
         );
+        // Booked: replaying it would count it twice.
         assert_eq!(manager.current_greeks().delta, dec!(5));
+        assert!(!manager.has_unbooked_fill());
         assert_eq!(
             manager.circuit_breaker_status().state,
             GreeksCircuitBreakerState::Open
         );
+    }
+
+    #[test]
+    fn test_update_on_close_check_failure_books_the_close() {
+        let mut manager = manager_with(zero_limit("gamma"));
+        let greeks = create_test_greeks();
+        assert_eq!(
+            manager.update_on_close(&greeks, dec!(10), 1000),
+            Err(MMError::FillBookedCheckFailed(
+                overflow("gamma utilization").to_string()
+            ))
+        );
+        assert_eq!(manager.current_greeks().delta, dec!(-5));
+        assert!(!manager.has_unbooked_fill());
+    }
+
+    fn assert_readings_refuse(manager: &GreeksRiskManager) {
+        let refused = MMError::GreeksMissFill;
+        assert_eq!(manager.needs_hedge(), Err(refused.clone()));
+        assert_eq!(
+            manager
+                .calculate_hedge_order(dec!(100))
+                .map(|hedge| hedge.is_some()),
+            Err(refused.clone())
+        );
+        assert_eq!(manager.hedge_urgency(), Err(refused.clone()));
+        assert_eq!(
+            manager.limit_utilization().map(|util| util.delta),
+            Err(refused)
+        );
+        assert!(matches!(
+            manager.check_order(&create_test_greeks(), dec!(1)),
+            Ok(OrderDecision::Rejected { .. })
+        ));
+    }
+
+    #[test]
+    fn test_readings_refuse_after_a_failed_booking_on_a_flat_book() {
+        let huge = PositionGreeks::new(Decimal::MAX, dec!(0), dec!(0), dec!(0), dec!(0));
+        let small = create_test_greeks();
+
+        let mut manager = GreeksRiskManager::with_defaults("BTC");
+        assert!(!manager.needs_hedge().unwrap());
+        assert_eq!(
+            manager.update_on_fill(&huge, dec!(2), 1000),
+            Err(not_booked("scaled delta"))
+        );
+        assert_readings_refuse(&manager);
+
+        // A later fill that books does not clear it, a second failure leaves
+        // it set, and neither do new limits.
+        manager.update_on_fill(&small, dec!(1), 2000).unwrap();
+        assert_eq!(manager.current_greeks().delta, dec!(0.5));
+        assert!(manager.has_unbooked_fill());
+        assert_readings_refuse(&manager);
+        assert_eq!(
+            manager.update_on_fill(&huge, dec!(2), 3000),
+            Err(not_booked("scaled delta"))
+        );
+        assert_eq!(manager.current_greeks().delta, dec!(0.5));
+        assert_readings_refuse(&manager);
+        manager.update_limits(GreeksLimits::default());
+        assert_readings_refuse(&manager);
+
+        // Each explicit reset does.
+        manager.reset_circuit_breaker();
+        assert!(!manager.has_unbooked_fill());
+        assert!(!manager.needs_hedge().unwrap());
+        assert_eq!(manager.current_greeks().delta, dec!(0.5));
+
+        let mut manager = GreeksRiskManager::with_defaults("BTC");
+        assert_eq!(
+            manager.update_on_close(&huge, dec!(2), 1000),
+            Err(not_booked("scaled delta"))
+        );
+        assert_readings_refuse(&manager);
+        manager.reset();
+        assert!(!manager.has_unbooked_fill());
+        assert!(!manager.needs_hedge().unwrap());
+    }
+
+    #[test]
+    fn test_replay_after_fill_not_booked_counts_it_once() {
+        let mut manager = GreeksRiskManager::with_defaults("BTC");
+        let big = PositionGreeks::new(
+            dec!(40000000000000000000000000000),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+        );
+        manager.update_on_fill(&big, dec!(1), 1000).unwrap();
+        assert!(matches!(
+            manager.update_on_fill(&big, dec!(1), 2000),
+            Err(MMError::FillNotBooked(_))
+        ));
+        assert_eq!(manager.current_greeks().delta, big.delta);
+
+        // This call applied nothing, so with room it is counted once. That is
+        // no recovery: nothing proves which fill it was.
+        manager.update_on_close(&big, dec!(1), 3000).unwrap();
+        manager.update_on_fill(&big, dec!(1), 4000).unwrap();
+        assert_eq!(manager.current_greeks().delta, big.delta);
+        assert!(manager.has_unbooked_fill());
+        assert_readings_refuse(&manager);
+
+        // Only an explicit clear ends it.
+        manager.reset_circuit_breaker();
+        assert!(!manager.has_unbooked_fill());
+        assert_eq!(manager.current_greeks().delta, big.delta);
+    }
+
+    #[test]
+    fn test_reconcile_installs_greeks_and_reruns_the_breaker() {
+        let huge = PositionGreeks::new(Decimal::MAX, dec!(0), dec!(0), dec!(0), dec!(0));
+        let failed = || {
+            let mut manager = GreeksRiskManager::with_defaults("BTC");
+            manager.update_on_fill(&huge, dec!(2), 1000).unwrap_err();
+            assert_readings_refuse(&manager);
+            manager
+        };
+
+        // Within the limits: trading again, from the recomputed Greeks.
+        let within = PortfolioGreeks {
+            delta: dec!(1),
+            ..PortfolioGreeks::new()
+        };
+        let mut manager = failed();
+        manager.reconcile(within, 2000).unwrap();
+        assert!(!manager.has_unbooked_fill());
+        assert_eq!(*manager.current_greeks(), within);
+        assert_eq!(
+            manager.circuit_breaker_status().state,
+            GreeksCircuitBreakerState::Closed
+        );
+        assert!(!manager.needs_hedge().unwrap());
+
+        // Far beyond them: readable, but the breaker reopens.
+        let beyond = PortfolioGreeks {
+            delta: dec!(1000),
+            ..PortfolioGreeks::new()
+        };
+        let mut manager = failed();
+        manager.reconcile(beyond, 2000).unwrap();
+        assert!(!manager.has_unbooked_fill());
+        assert_eq!(
+            manager.circuit_breaker_status().state,
+            GreeksCircuitBreakerState::Open
+        );
+        assert!(manager.needs_hedge().unwrap());
     }
 
     #[test]

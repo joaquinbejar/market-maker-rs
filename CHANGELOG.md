@@ -213,14 +213,31 @@ release.
     and `hedge_urgency` `MMResult<HedgeUrgency>`;
   - `GreeksRiskManager::update_on_fill` and `update_on_close` return
     `MMResult<()>`. When the fill cannot be booked, the Greeks are unchanged
-    and so miss it: the circuit breaker opens and stays open until `reset` or
-    `reset_circuit_breaker`;
+    and so miss it: the result is the new `MMError::FillNotBooked`, and the
+    circuit breaker opens and stays open until `reset` or
+    `reset_circuit_breaker`. Meanwhile `needs_hedge`, `calculate_hedge_order`,
+    `hedge_urgency` and `limit_utilization` return the new
+    `MMError::GreeksMissFill`. A fill that is booked when the check after it
+    fails is the new `MMError::FillBookedCheckFailed`, and must not be booked
+    again;
   - `ChainRiskManager::add_position_greeks` and `remove_position_greeks`
-    return `MMResult<()>`, `calculate_hedge` `MMResult<Vec<HedgeOrder>>`, and
+    return `MMResult<()>`, `calculate_hedge` `MMResult<Vec<HedgeOrder>>`,
     `dollar_delta`, `dollar_gamma`, `dollar_vega` and `dollar_theta`
-    `MMResult<Decimal>`;
-  - `ChainMarketMaker::check_chain_risk` returns `MMResult<RiskStatus>`, and
-    `calculate_hedge` `MMResult<Vec<HedgeOrder>>`.
+    `MMResult<Decimal>`, and `should_hedge` `MMResult<bool>`. When a fill
+    cannot be booked, the result is `MMError::FillNotBooked` and the manager
+    fails closed until `reset` or the new `reconcile`: `is_risk_breached` is
+    true, `breached_limits` has an entry for it, and `should_hedge`,
+    `calculate_hedge` and the dollar values return `MMError::GreeksMissFill`.
+    `update_greeks` does not clear it;
+  - `ChainMarketMaker::check_chain_risk` returns `MMResult<RiskStatus>`, which
+    is `Breached` while a fill is missing, so `can_quote` is false, and
+    `calculate_hedge` `MMResult<Vec<HedgeOrder>>`. The quoting methods do not
+    call it, so stopping is up to the caller;
+  - both managers gain `has_unbooked_fill`, and `GreeksRiskManager` gains
+    `reconcile` as well, which installs recomputed Greeks and reruns the
+    breaker. A later fill that books, or a successful retry, does not clear
+    the state: `MMError::FillNotBooked` only promises that booking again
+    cannot count that call twice.
 - `AccountingStatus` has a new `snapshot_failures` field (`serde(default)`):
   the execution ids after whose post the accountant's snapshot failed, so
   the engine kept stale balances. `is_consistent` is false while it is not
