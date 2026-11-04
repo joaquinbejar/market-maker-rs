@@ -1439,6 +1439,44 @@ fn test_queue_model_cleared_volume_is_exact_at_every_elapsed_time() {
 }
 
 #[test]
+fn test_queue_model_refuses_a_touch_size_that_is_not_exact_in_a_decimal() {
+    // About 1e18 per lot: 2^96 is between 79 and 80 * 10^9 lots.
+    let lot = dec!(1000000000.000000001);
+    let cfg =
+        KernelConfig::new(dec!(1), lot, dec!(1000), lot, 100).with_fill_model(queue_model(lot, 0));
+    let new_with = |bid_lots: u64, ask_lots: u64| {
+        let rows = vec![lots_tick(1000, 14, bid_lots, 16, ask_lots)];
+        let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+        QueueKernel::new(&cfg, &data).map(|_| ())
+    };
+    let (below, above) = (79_000_000_000, 80_000_000_000);
+    assert_eq!(new_with(below, below), Ok(()));
+    for (bid_lots, ask_lots) in [(above, 1), (1, above)] {
+        let error = new_with(bid_lots, ask_lots).unwrap_err();
+        assert!(error.to_string().contains("not exact"), "{error}");
+    }
+}
+
+#[test]
+fn test_queue_model_refuses_an_order_maximum_that_is_not_exact_in_a_decimal() {
+    let lot = dec!(1000000000.000000001);
+    let new_with = |max_order_size: Decimal| {
+        let cfg = KernelConfig::new(dec!(1), lot, dec!(1000), max_order_size, 100)
+            .with_fill_model(queue_model(lot, 0));
+        let rows = vec![lots_tick(1000, 14, 1, 16, 1)];
+        let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+        // Past the ledger bound, which refuses such an order first: this is
+        // the model's own check.
+        QueueKernel::new_relaxed(&cfg, &data, true, false, false).map(|_| ())
+    };
+    // 10^10 lots fit below 2^96; 10^11 lots do not.
+    let lots = |count: u64| lot.checked_mul(Decimal::from(count)).unwrap();
+    assert!(new_with(lots(10_000_000_000)).is_ok());
+    let error = new_with(lots(100_000_000_000)).unwrap_err();
+    assert!(error.to_string().contains("not exact"), "{error}");
+}
+
+#[test]
 fn test_queue_model_partial_reports_bound_counts_ties_and_the_inclusive_edge() {
     let latency = KernelLatency::zero(MS).with_delays(0, 0, 0, 3);
     let queue = queue_config(latency, dec!(1), 0);
@@ -1669,6 +1707,22 @@ fn test_decode_under_the_immediate_model_refuses_what_only_partials_produce() {
     delivery.report.kind = ExecKind::PartialFill;
     delivery.report.cum -= 1;
     refused(&k, &t, "under the immediate model");
+}
+
+#[test]
+fn test_decode_refuses_more_fills_than_the_orders_have_lots() {
+    let (cfg, data) = queued_partials();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let s = state_with_two_partials_queued(&k);
+    let created = s.next_order_id() - 1;
+    // Every related counter agrees, so only this bound can refuse it.
+    let extra = created * 10 + 1 - s.counters.venue_fills;
+    let mut t = s;
+    t.counters.venue_fills += extra;
+    t.agent.delivered_fills += extra;
+    t.next_exec_id += extra;
+    t.stamp_seq += extra;
+    refused(&k, &t, "more local rejects and fills than orders");
 }
 
 #[test]
