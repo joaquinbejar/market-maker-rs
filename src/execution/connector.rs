@@ -351,7 +351,8 @@ pub struct OrderRequest {
     pub order_type: OrderType,
     /// Limit price (required for limit and post-only orders).
     pub price: Option<Decimal>,
-    /// Order quantity in base currency.
+    /// Order quantity: in base currency, or in contracts when checked against
+    /// a contract specification (`instruments::orders`).
     pub quantity: Decimal,
     /// Time in force.
     pub time_in_force: TimeInForce,
@@ -522,7 +523,8 @@ pub struct Fill {
     pub trade_id: String,
     /// Fill price.
     pub price: Decimal,
-    /// Fill quantity.
+    /// Fill quantity, in the unit of the order: base currency, or contracts of
+    /// a contract specification (`instruments::orders`).
     pub quantity: Decimal,
     /// Fill side.
     pub side: Action,
@@ -537,6 +539,10 @@ pub struct Fill {
 impl Fill {
     /// Returns the notional value of the fill (price * quantity),
     /// saturating at the `Decimal` bounds.
+    ///
+    /// This is only right for a linear contract of multiplier one; on an
+    /// inverse contract it is not an amount at all.
+    /// `instruments::orders::fill_notional` gives the notional of a contract.
     #[must_use]
     pub fn notional(&self) -> Decimal {
         self.price.saturating_mul(self.quantity)
@@ -545,6 +551,9 @@ impl Fill {
     /// Returns the net value after fees.
     /// For buys: notional + fee (cost)
     /// For sells: notional - fee (proceeds)
+    ///
+    /// It is built on the same `price * quantity`, so it is only right where
+    /// [`Fill::notional`] is.
     ///
     /// # Errors
     ///

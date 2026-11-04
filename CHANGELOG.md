@@ -8,6 +8,15 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Orders and fills against a contract specification (feature `instruments`,
+  #93): `instruments::orders::check_order` refuses an order for another
+  symbol, off the tick or the lot, or with a missing or unexpected price, with
+  a typed `OrderSpecError`, and `fill_notional` gives a fill's notional in the
+  asset of the contract, where `Fill::notional` is only right for a linear
+  contract of multiplier one. With `margin` too,
+  `instruments::margin::fill_execution` converts a fill into a `margin-rs`
+  execution. Orders and fills do not carry a specification, and
+  `MarginLedgerAccountant` stays spot only: both are #191.
 - `backtest::queue_reactive`: a seedable simulator of aggregated queues after
   Huang, Lehalle and Rosenbaum (Model III over Model I), with maximum likelihood
   intensities per queue size, exportable parameters, bounded restorable state,

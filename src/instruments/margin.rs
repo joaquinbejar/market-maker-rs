@@ -1,12 +1,13 @@
-//! Conversion of an [`InstrumentSpec`] into a `margin-rs` [`Instrument`].
+//! Conversion of an [`InstrumentSpec`] into a `margin-rs` [`Instrument`], and of
+//! a fill of it into a `margin-rs` execution ([`fill_execution`]).
 //!
 //! [`margin_instrument`] delegates to `margin_rs::Instrument::from_spec`, so
 //! the mapping has one implementation, in `margin-rs`, and this module keeps
 //! the public types of this crate.
 //!
-//! It is a conversion only. It maps the fields exactly, with no rounding,
-//! rescaling or currency substitution, and returns a typed [`AdapterError`]
-//! for anything it cannot represent:
+//! Both are conversions only. They map the fields exactly, with no rounding,
+//! rescaling or currency substitution, and return a typed [`AdapterError`]
+//! for anything they cannot represent. The instruments:
 //!
 //! | specification | `margin-rs` instrument | contract size |
 //! |---|---|---|
@@ -83,9 +84,15 @@
 //! - the scale of the settlement asset of an inverse instrument plus its
 //!   price scale must not exceed 28.
 
+use financial_types::Action;
 use financial_types::instrument::{ContractKind, InstrumentSpec, Margining};
 use margin_rs::instrument::InstrumentScales;
-use margin_rs::{Instrument, MarginError};
+use margin_rs::ledger::Execution;
+use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId, MarginError};
+
+use crate::Decimal;
+use crate::execution::Fill;
+use crate::types::action::Dir;
 
 /// The precision of a `margin-rs` instrument: the largest number of
 /// fractional digits it accepts.
@@ -97,7 +104,7 @@ pub struct MarginScales {
     pub contract_scale: u32,
 }
 
-/// Why a specification has no `margin-rs` instrument.
+/// Why a specification has no `margin-rs` instrument, or a fill no execution.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AdapterError {
@@ -124,6 +131,23 @@ pub enum AdapterError {
     /// A `margin-rs` constructor refused a field.
     #[error(transparent)]
     Margin(MarginError),
+    /// A fill's side is neither buy nor sell.
+    #[error("unsupported fill side {side}: only buy and sell are supported")]
+    UnsupportedSide {
+        /// The side given.
+        side: Action,
+    },
+    /// A fill has no trade identifier, so it could not be told from another.
+    #[error("fill without a trade id")]
+    EmptyTradeId,
+    /// A fill's price or quantity is not positive.
+    #[error("fill {field} must be positive, got {value}")]
+    NotPositive {
+        /// `"price"` or `"quantity"`.
+        field: &'static str,
+        /// The value given.
+        value: Decimal,
+    },
 }
 
 /// The one mapping from a `margin-rs` error: its two specification errors
@@ -177,6 +201,84 @@ pub fn margin_instrument(
         contract_scale: scales.contract_scale,
     };
     Ok(Instrument::from_spec(spec, scales)?)
+}
+
+/// The `margin-rs` execution of a venue `fill` of `spec`, to book in a ledger.
+///
+/// A ledger keys executions by identifier alone, and a venue may number its
+/// trades per symbol, so the identifier is
+/// `<length of the instrument id>:<instrument id>:<trade_id>`: stable, so booking
+/// the same fill twice counts it once, and with no two pairs giving the same
+/// text. It is unique for one venue and one account, which is what one ledger
+/// holds; a ledger mixing venues would need the venue in the instrument id.
+///
+/// The quantity is in contracts of `spec` and the time is the fill's. A zero fee
+/// is no fee, whatever `fee_currency` says; any other, a negative one being a
+/// rebate, is in `fee_currency`, and the ledger refuses an asset it has not
+/// registered, so a fee is never lost.
+///
+/// A fill already happened, so the tick and the lot of `spec`, which come from
+/// a dated snapshot, are not applied to it. A real fill can still be refused,
+/// and these errors must not be dropped, since the fill would be lost: here for
+/// example for a `fee_currency` that is not a valid asset code, which is written
+/// exactly (`usdt` is not `USDT`), and by the ledger for example for digits above
+/// the instrument's scales, an unregistered asset, a time at or after a future's
+/// expiry, or, through `Ledger::book_execution`, a balance that does not cover it
+/// (`Ledger::book_execution_allowing_overdraft` books it anyway).
+///
+/// A `Fill` has no symbol, so nothing here can verify that it belongs to `spec`:
+/// a wrong specification books it on the wrong instrument, and in the wrong
+/// asset for an inverse contract. Carrying the instrument on fills is #191.
+///
+/// # Errors
+///
+/// Checked in this order:
+///
+/// - [`AdapterError::Unsupported`] for an option;
+/// - [`AdapterError::UnsupportedSide`] for a side other than buy or sell;
+/// - [`AdapterError::EmptyTradeId`] for an empty `trade_id`;
+/// - [`AdapterError::NotPositive`] for a price or a quantity that is not
+///   positive;
+/// - [`AdapterError::Margin`] if `margin-rs` refuses the identifiers or the fee
+///   asset as written: an execution identifier above 64 bytes or with
+///   whitespace, never shortened, or an asset code that is not valid.
+pub fn fill_execution(spec: &InstrumentSpec, fill: &Fill) -> Result<Execution, AdapterError> {
+    if spec.kind() == ContractKind::Option {
+        return Err(AdapterError::Unsupported {
+            kind: spec.kind(),
+            margining: spec.margining(),
+        });
+    }
+    if Dir::try_from(fill.side).is_err() {
+        return Err(AdapterError::UnsupportedSide { side: fill.side });
+    }
+    if fill.trade_id.is_empty() {
+        return Err(AdapterError::EmptyTradeId);
+    }
+    for (field, value) in [("price", fill.price), ("quantity", fill.quantity)] {
+        if value <= Decimal::ZERO {
+            return Err(AdapterError::NotPositive { field, value });
+        }
+    }
+    let instrument = spec.id().as_str();
+    let execution = Execution::new(
+        ExecutionId::new(format!(
+            "{}:{}:{}",
+            instrument.len(),
+            instrument,
+            fill.trade_id
+        ))?,
+        InstrumentId::new(instrument)?,
+        fill.side,
+        fill.price,
+        fill.quantity,
+    )
+    .with_executed_at(fill.timestamp);
+    Ok(if fill.fee.is_zero() {
+        execution
+    } else {
+        execution.with_fee(Asset::new(fill.fee_currency.as_str())?, fill.fee)
+    })
 }
 
 #[cfg(test)]
