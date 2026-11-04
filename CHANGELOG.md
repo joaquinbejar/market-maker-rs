@@ -8,6 +8,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `backtest::queue_reactive`: a seedable simulator of aggregated queues after
+  Huang, Lehalle and Rosenbaum (Model III over Model I), with maximum likelihood
+  intensities per queue size, exportable parameters, bounded restorable state,
+  a declared policy for unsupported states, and distribution discrepancies with
+  state coverage against a constant intensity baseline (#90).
 - `strategy::signal_quote`: causal, bounded quote adjustment from imbalance,
   micro-price and VPIN features, with a declared policy for missing or stale
   values, composed with the Avellaneda-Stoikov quotes under the risk limits,
