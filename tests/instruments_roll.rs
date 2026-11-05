@@ -409,6 +409,23 @@ fn a_real_fill_off_the_lot_stays_and_stops_the_intents() {
 }
 
 #[test]
+fn an_attempt_already_asked_to_cancel_is_not_asked_again_on_a_fault() {
+    let mut plan = long_ten();
+    let at_deadline = apply(
+        &mut plan,
+        RollEvent::Tick {
+            at_ms: NEAR_EXPIRY - 1000,
+        },
+    );
+    assert_eq!(at_deadline.actions.len(), 2);
+    let off_lot = fill(&plan, RollLeg::Near, "n1", dec!(1.5));
+    let report = apply_fill(&mut plan, off_lot);
+    assert!(report.refused.is_some());
+    assert!(report.actions.is_empty(), "{report:?}");
+    assert_eq!(report.near_position, dec!(8.5));
+}
+
+#[test]
 fn a_real_fill_on_a_rejected_attempt_stays() {
     let mut plan = long_ten();
     apply(
@@ -546,7 +563,7 @@ fn only_what_is_no_fill_or_conflicts_is_an_error_and_changes_nothing() {
     assert!(report.duplicate);
     assert!(report.actions.is_empty());
     assert_eq!(plan, before);
-    // The same identifier with other content, also on the other leg.
+    // The same identifier with other content on its leg.
     for conflict in [
         RollFill {
             price: dec!(60001),
@@ -558,11 +575,6 @@ fn only_what_is_no_fill_or_conflicts_is_an_error_and_changes_nothing() {
         },
         RollFill {
             fee: dec!(1),
-            ..good.clone()
-        },
-        RollFill {
-            leg: RollLeg::Far,
-            side: plan.side(RollLeg::Far),
             ..good.clone()
         },
     ] {
@@ -603,6 +615,32 @@ fn only_what_is_no_fill_or_conflicts_is_an_error_and_changes_nothing() {
     assert!(report.refused.is_none());
     assert_eq!(report.near_position, dec!(-2));
     assert_eq!(over.progress().unwrap().unwrap().near_excess, dec!(12));
+}
+
+#[test]
+fn execution_identifiers_are_per_contract() {
+    let mut plan = long_ten();
+    let near = fill(&plan, RollLeg::Near, "42", dec!(10));
+    let far = fill(&plan, RollLeg::Far, "42", dec!(10));
+    assert!(apply_fill(&mut plan, near.clone()).refused.is_none());
+    let report = apply_fill(&mut plan, far.clone());
+    assert!(!report.duplicate);
+    assert!(report.refused.is_none());
+    assert_eq!(report.near_position, dec!(0));
+    assert_eq!(report.far_position, dec!(10));
+    assert_eq!(report.state, RollState::Completed);
+    // Each one's repeat and conflict stay on its own leg.
+    assert!(apply_fill(&mut plan, near).duplicate);
+    assert!(apply_fill(&mut plan, far.clone()).duplicate);
+    assert_eq!(
+        plan.apply(&RollEvent::Fill(RollFill {
+            price: dec!(60001),
+            ..far
+        })),
+        Err(RollError::ConflictingFill {
+            exec_id: "42".to_string(),
+        })
+    );
 }
 
 #[test]
@@ -911,6 +949,40 @@ fn a_settlement_is_declared_and_moves_the_position_by_what_it_closed() {
 }
 
 #[test]
+fn a_settlement_may_arrive_after_the_time_it_carries() {
+    // Publication is not arrival: the plan has already seen a later time.
+    let (near, far) = same_size();
+    let mut plan = RollPlan::new(request(near.clone(), far, dec!(10))).unwrap();
+    let tick = apply(
+        &mut plan,
+        RollEvent::Tick {
+            at_ms: NEAR_EXPIRY + 100,
+        },
+    );
+    assert_eq!(tick.actions.len(), 2);
+    let report = apply(
+        &mut plan,
+        RollEvent::NearSettled {
+            price: settlement(&near, dec!(61000), NEAR_EXPIRY + 5),
+            contracts: dec!(10),
+        },
+    );
+    assert!(report.actions.is_empty());
+    assert_eq!(report.near_position, dec!(0));
+    assert_eq!(plan.near_settled(), Some(dec!(10)));
+    // The same when no time has passed yet, on a fresh plan.
+    let mut fresh = long_ten();
+    let report = apply(
+        &mut fresh,
+        RollEvent::NearSettled {
+            price: settlement(&near, dec!(61000), NEAR_EXPIRY + 5),
+            contracts: dec!(10),
+        },
+    );
+    assert_eq!(report.actions.len(), 2);
+}
+
+#[test]
 fn a_near_fill_after_the_settlement_depends_on_when_it_executed() {
     let (near, far) = same_size();
     let mut plan = RollPlan::new(request(near.clone(), far.clone(), dec!(10))).unwrap();
@@ -1062,6 +1134,7 @@ mod ledger {
             ..fill(&plan, RollLeg::Near, "open", dec!(10))
         };
         book(&mut ledger, &near, &open);
+        let plan = plan.anchored_to(&ledger);
         (near, far, ledger, plan)
     }
 
@@ -1118,6 +1191,7 @@ mod ledger {
             &near,
             &history("h2", FillSide::Sell, dec!(60500), dec!(10)),
         );
+        plan = plan.anchored_to(&ledger);
         // The roll closes 4 at 61000, for 4000.
         let roll = RollFill {
             price: dec!(61000),
@@ -1170,7 +1244,151 @@ mod ledger {
                     quantity: dec!(-2),
                 })
         );
+        assert_eq!(reconciled.near.unexplained_entries, 1);
         let _ = far;
+    }
+
+    #[test]
+    fn a_round_trip_outside_the_plan_is_not_clean_though_the_position_is_the_same() {
+        let (near, far, mut ledger, plan) = opened();
+        let (sold, bought) = (
+            RollFill {
+                price: dec!(61000),
+                fee: dec!(1),
+                attempt: None,
+                ..fill(&plan, RollLeg::Near, "q1", dec!(2))
+            },
+            RollFill {
+                side: FillSide::Buy,
+                price: dec!(60500),
+                fee: dec!(0.5),
+                fee_asset: asset("BNB"),
+                attempt: None,
+                ..fill(&plan, RollLeg::Near, "q2", dec!(2))
+            },
+        );
+        book(&mut ledger, &near, &sold);
+        book(&mut ledger, &near, &bought);
+        let reconciled = plan.reconcile(&ledger).unwrap();
+        assert_eq!(reconciled.near.unexplained, dec!(0));
+        assert!(!reconciled.is_clean());
+        assert_eq!(
+            reconciled.discrepancies,
+            [RollDiscrepancy::UnexplainedEntries {
+                leg: RollLeg::Near,
+                count: 2,
+            }]
+        );
+        assert_eq!(reconciled.near.unexplained_entries, 2);
+        // Sold 2 from 60000 at 61000: 2000; buying back opens no realized PnL.
+        assert_eq!(reconciled.near.unexplained_realized, dec!(2000));
+        assert_eq!(reconciled.near.unexplained_fees["USDT"], dec!(1));
+        assert_eq!(reconciled.near.unexplained_fees["BNB"], dec!(0.5));
+        assert_eq!(reconciled.far.unexplained_entries, 0);
+
+        // Another instrument's entries do not count, and the opening before the anchor
+        // does not either, which `opened` shows by being clean.
+        let (_, _, ledger, plan) = opened();
+        assert!(plan.reconcile(&ledger).unwrap().is_clean());
+        let _ = far;
+    }
+
+    #[test]
+    fn a_split_of_a_late_fill_is_compared_by_quantity() {
+        // A sale outside the plan, a settlement of the other 8, and then a late sale of 5
+        // that the ledger closes whole. The plan takes 2 of it for the residual.
+        let (near, _far, mut ledger, mut plan) = opened();
+        let foreign = RollFill {
+            attempt: None,
+            ..fill(&plan, RollLeg::Near, "foreign", dec!(2))
+        };
+        book(&mut ledger, &near, &foreign);
+        let price = settlement(&near, dec!(62000), NEAR_EXPIRY + 5);
+        near.settle_in_ledger(&mut ledger, &price).unwrap();
+        apply(
+            &mut plan,
+            RollEvent::NearSettled {
+                price,
+                contracts: dec!(8),
+            },
+        );
+        let late = RollFill {
+            at_ms: NEAR_EXPIRY - 1,
+            ..fill(&plan, RollLeg::Near, "late", dec!(5))
+        };
+        book(&mut ledger, &near, &late);
+        let report = apply_fill(&mut plan, late);
+        assert_eq!(report.near_position, dec!(0));
+        assert_eq!(plan.closed_at_settlement(), dec!(-3));
+        let reconciled = plan.reconcile(&ledger).unwrap();
+        assert!(!reconciled.is_clean());
+        assert!(
+            reconciled
+                .discrepancies
+                .contains(&RollDiscrepancy::FillDiffers {
+                    leg: RollLeg::Near,
+                    exec_id: "late".to_string(),
+                    field: "closed_at_settlement",
+                }),
+            "{reconciled:?}"
+        );
+        assert!(
+            reconciled
+                .discrepancies
+                .contains(&RollDiscrepancy::UnexplainedEntries {
+                    leg: RollLeg::Near,
+                    count: 1,
+                })
+        );
+    }
+
+    #[test]
+    fn same_execution_id_on_both_legs_stays_apart_when_one_closes_at_settlement() {
+        let (near, far, mut ledger, mut plan) = opened();
+        let price = settlement(&near, dec!(62000), NEAR_EXPIRY + 5);
+        near.settle_in_ledger(&mut ledger, &price).unwrap();
+        apply(
+            &mut plan,
+            RollEvent::NearSettled {
+                price,
+                contracts: dec!(10),
+            },
+        );
+        let near_late = RollFill {
+            at_ms: NEAR_EXPIRY - 1,
+            ..fill(&plan, RollLeg::Near, "42", dec!(2))
+        };
+        let far_fill = RollFill {
+            at_ms: NEAR_EXPIRY - 1,
+            ..fill(&plan, RollLeg::Far, "42", dec!(2))
+        };
+        book(&mut ledger, &near, &near_late);
+        book(&mut ledger, &far, &far_fill);
+        apply_fill(&mut plan, near_late);
+        apply_fill(&mut plan, far_fill);
+        let reconciled = plan.reconcile(&ledger).unwrap();
+        assert!(reconciled.is_clean(), "{reconciled:?}");
+    }
+
+    #[test]
+    fn same_execution_id_on_both_legs_reconciles_each_on_its_contract() {
+        let (near, far, mut ledger, mut plan) = opened();
+        let near_fill = RollFill {
+            fee: dec!(1),
+            ..fill(&plan, RollLeg::Near, "42", dec!(10))
+        };
+        let far_fill = RollFill {
+            fee: dec!(2),
+            ..fill(&plan, RollLeg::Far, "42", dec!(10))
+        };
+        book(&mut ledger, &near, &near_fill);
+        book(&mut ledger, &far, &far_fill);
+        apply_fill(&mut plan, near_fill);
+        apply_fill(&mut plan, far_fill);
+        let reconciled = plan.reconcile(&ledger).unwrap();
+        assert!(reconciled.is_clean(), "{reconciled:?}");
+        assert_eq!(reconciled.near.roll_fees["USDT"], dec!(1));
+        assert_eq!(reconciled.far.roll_fees["USDT"], dec!(2));
     }
 
     #[test]
@@ -1393,6 +1611,38 @@ mod ledger {
         assert_eq!(reconciled.near.expected_position, dec!(0));
         assert_eq!(plan.closed_at_settlement(), dec!(0));
 
+        // The plan saw the fill first, then a settlement of everything, as the ledger
+        // booked the fill after it: near goes to -2 until reconciled, which says so.
+        let (near_two, _, mut later, mut first_seen) = opened();
+        let seen = RollFill {
+            at_ms: NEAR_EXPIRY - 1,
+            ..fill(&first_seen, RollLeg::Near, "n1", dec!(2))
+        };
+        apply_fill(&mut first_seen, seen.clone());
+        let all = settlement(&near_two, dec!(62000), NEAR_EXPIRY + 5);
+        near_two.settle_in_ledger(&mut later, &all).unwrap();
+        book(&mut later, &near_two, &seen);
+        apply(
+            &mut first_seen,
+            RollEvent::NearSettled {
+                price: all,
+                contracts: dec!(10),
+            },
+        );
+        assert_eq!(first_seen.position(RollLeg::Near), dec!(-2));
+        let reconciled = first_seen.reconcile(&later).unwrap();
+        assert_eq!(reconciled.near.ledger_position, dec!(0));
+        assert_eq!(reconciled.near.unexplained, dec!(2));
+        assert!(
+            reconciled
+                .discrepancies
+                .contains(&RollDiscrepancy::FillDiffers {
+                    leg: RollLeg::Near,
+                    exec_id: "n1".to_string(),
+                    field: "closed_at_settlement",
+                })
+        );
+
         // Told it closed 10, the plan takes that fill as closed, and the entry says no.
         let (_, _, _, mut wrong) = opened();
         apply(
@@ -1443,6 +1693,7 @@ mod ledger {
             ..fill(&plan, RollLeg::Near, "open", dec!(1000))
         };
         book(&mut ledger, &near, &open);
+        plan = plan.anchored_to(&ledger);
         let near_fill = RollFill {
             price: dec!(62000),
             fee: dec!(0.0001),
@@ -1472,6 +1723,12 @@ mod ledger {
         let (near, far) = same_size();
         let other = linear("NEAR", dec!(2), dec!(1), NEAR_EXPIRY);
         let plan = RollPlan::new(request(near, far.clone(), dec!(10))).unwrap();
+        // It must be anchored first.
+        assert_eq!(
+            plan.reconcile(&ledger_of(&[&other, &far])),
+            Err(RollError::NotAnchored)
+        );
+        let plan = plan.anchored_to(&ledger_of(&[]));
         assert!(matches!(
             plan.reconcile(&ledger_of(&[&other, &far])),
             Err(RollError::Future(FutureError::OtherTermsInLedger { .. }))

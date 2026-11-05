@@ -58,6 +58,10 @@
 //! - Executed before the expiry beyond that, a ledger books it after the settlement
 //!   and closes it at the settlement price at once, so the position does not move, and
 //!   the contracts are in [`RollPlan::closed_at_settlement`].
+//!
+//! Which of the last two it was is inferred from the settlement's declared contracts,
+//! so it can be wrong, for example after a fill outside the plan. The record of fills is
+//! not: a reconciliation compares the closed quantity of each fill with a ledger.
 
 use std::collections::BTreeMap;
 
@@ -140,7 +144,7 @@ pub struct RollFill {
     /// for a fill outside the plan's attempts, such as an unwind's: it is recorded,
     /// but not given to the plan's intents.
     pub attempt: Option<u32>,
-    /// The venue's execution identifier.
+    /// The venue's execution identifier, unique within the leg's contract.
     pub exec_id: String,
     /// The side.
     pub side: Action,
@@ -337,7 +341,7 @@ pub enum RollError {
         /// Why not.
         reason: String,
     },
-    /// An execution identifier reused with other content.
+    /// An execution identifier reused on its leg with other content.
     #[error("execution {exec_id} was observed with other content")]
     ConflictingFill {
         /// The identifier.
@@ -346,6 +350,10 @@ pub enum RollError {
     /// A settlement reported again with other data.
     #[error("the near contract's settlement was observed with other data")]
     ConflictingSettlement,
+    /// A reconciliation of a plan that was not anchored to its ledger.
+    #[cfg(feature = "margin")]
+    #[error("the plan was not anchored to a ledger: see RollPlan::anchored_to")]
+    NotAnchored,
     /// A time beyond what the plan can represent.
     #[error("{field} is {value}, beyond the largest time supported")]
     TimeOutOfRange {
@@ -450,7 +458,11 @@ pub struct RollPlan {
     fills: Vec<RollFill>,
     settled: Option<Settled>,
     closed_at_settlement: Decimal,
-    closed_fills: Vec<String>,
+    /// Near fills with a part closed at the settlement, and that part, signed.
+    closed_fills: Vec<(String, Decimal)>,
+    /// The length of a ledger's journal when the plan was anchored to it.
+    #[cfg(feature = "margin")]
+    journal_anchor: Option<u64>,
     intents: PackagePlan,
     fault: Option<String>,
 }
@@ -651,6 +663,8 @@ impl RollPlan {
             settled: None,
             closed_at_settlement: Decimal::ZERO,
             closed_fills: Vec::new(),
+            #[cfg(feature = "margin")]
+            journal_anchor: None,
             intents,
             fault: None,
         })
@@ -915,15 +929,14 @@ impl RollPlan {
         }
         let near = exact_sub(self.near_position, contracts)?;
         self.check_figures(near, self.far_position)?;
-        // The deadline is past, so this can only ask to cancel what is open.
+        // The deadline is past, so this can only ask to cancel what is open. The news may
+        // arrive after the time it carries: the plan's clock does not go back, and whatever
+        // the deadline asked for it already asked.
+        let published = time("published_ms", price.published_ms())?;
         let mut actions = Vec::new();
-        if self.fault.is_none() {
-            let report = self
-                .intents
-                .apply(&PackageEvent::Tick {
-                    at: time("published_ms", price.published_ms())?,
-                })
-                .map_err(upstream)?;
+        if self.fault.is_none()
+            && let Ok(report) = self.intents.apply(&PackageEvent::Tick { at: published })
+        {
             actions = report.actions.iter().map(|a| self.map_action(a)).collect();
         }
         self.settled = Some(Settled {
@@ -952,7 +965,12 @@ impl RollPlan {
                 });
             }
         };
-        if let Some(seen) = self.fills.iter().find(|f| f.exec_id == fill.exec_id) {
+        // A venue's execution identifiers are per contract, so each leg has its own.
+        if let Some(seen) = self
+            .fills
+            .iter()
+            .find(|f| f.leg == fill.leg && f.exec_id == fill.exec_id)
+        {
             if seen == fill {
                 return self.report(Vec::new(), true, None);
             }
@@ -1003,7 +1021,7 @@ impl RollPlan {
         self.far_position = far;
         self.closed_at_settlement = closed;
         if !closed_now.is_zero() {
-            self.closed_fills.push(fill.exec_id.clone());
+            self.closed_fills.push((fill.exec_id.clone(), closed_now));
         }
         self.fills.push(fill.clone());
         self.report(actions, false, refused)
@@ -1034,7 +1052,7 @@ impl RollPlan {
             .apply(&PackageEvent::Fill {
                 leg: index(fill.leg),
                 attempt,
-                exec_id: ExecId(fill.exec_id.clone()),
+                exec_id: ExecId(format!("{:?}:{}", fill.leg, fill.exec_id)),
                 quantity: contracts,
                 cum_qty: cum_contracts,
                 price,
@@ -1045,12 +1063,12 @@ impl RollPlan {
         Ok(report.actions.iter().map(|a| self.map_action(a)).collect())
     }
 
-    /// A cancel of every attempt that is still open.
+    /// A cancel of every attempt that is still open and was not asked to cancel.
     fn live_attempts(&self) -> Vec<RollAction> {
         let mut actions = Vec::new();
         for (i, leg) in self.intents.legs().iter().enumerate() {
             for (attempt, state) in leg.attempts.iter().enumerate() {
-                if state.is_live() {
+                if state.is_live() && !state.cancel_requested {
                     actions.push(RollAction::Cancel {
                         leg: leg_at(i),
                         attempt: u32::try_from(attempt).unwrap_or(u32::MAX),
@@ -1092,6 +1110,13 @@ mod ledger {
         pub roll_fees: BTreeMap<String, Decimal>,
         /// The whole position's realized PnL, with any history before the roll.
         pub position_realized: Decimal,
+        /// The ledger's executions on this contract since the anchor that are not the
+        /// plan's, even if they leave the position as it was.
+        pub unexplained_entries: u64,
+        /// Their realized PnL.
+        pub unexplained_realized: Decimal,
+        /// Their fees, per asset.
+        pub unexplained_fees: BTreeMap<String, Decimal>,
     }
 
     /// The near contract's settlement in a ledger, apart from the fills' cash.
@@ -1126,6 +1151,14 @@ mod ledger {
             /// What differs: `side`, `price`, `contracts`, `fee`, `fee_asset` or
             /// `closed_at_settlement`.
             field: &'static str,
+        },
+        /// Executions since the anchor that are not the plan's: their cash is in
+        /// [`RollLegReconciliation`].
+        UnexplainedEntries {
+            /// The leg.
+            leg: RollLeg,
+            /// How many.
+            count: u64,
         },
         /// A position the plan does not explain.
         UnexplainedPosition {
@@ -1168,7 +1201,8 @@ mod ledger {
     }
 
     impl RollReconciliation {
-        /// Returns `true` if the plan and the ledger agree.
+        /// Returns `true` if the plan and the ledger agree: on positions, on the plan's
+        /// fills and on every execution since the anchor.
         #[must_use]
         pub fn is_clean(&self) -> bool {
             self.discrepancies.is_empty()
@@ -1176,6 +1210,14 @@ mod ledger {
     }
 
     impl RollPlan {
+        /// Anchors the plan to `ledger` as it stands now, so that
+        /// [`RollPlan::reconcile`] can tell what happened since from its history.
+        #[must_use]
+        pub fn anchored_to(mut self, ledger: &Ledger) -> Self {
+            self.journal_anchor = Some(u64::try_from(ledger.journal().len()).unwrap_or(u64::MAX));
+            self
+        }
+
         /// Compares this plan with `ledger`, which it does not change.
         ///
         /// A fill's identifier in the ledger is the one
@@ -1185,9 +1227,13 @@ mod ledger {
         ///
         /// # Errors
         ///
-        /// [`RollError::Future`] if the ledger holds other terms under an identifier,
+        /// [`RollError::NotAnchored`] without [`RollPlan::anchored_to`];
+        /// [`RollError::Future`] if the ledger holds other terms under an identifier;
         /// and [`RollError::Plan`] if a sum overflows.
         pub fn reconcile(&self, ledger: &Ledger) -> Result<RollReconciliation, RollError> {
+            if self.journal_anchor.is_none() {
+                return Err(RollError::NotAnchored);
+            }
             let mut discrepancies = Vec::new();
             let near_id = self.near.terms.identify_in_ledger(ledger)?;
             let settlement = ledger
@@ -1247,13 +1293,9 @@ mod ledger {
             let mut roll_realized = Decimal::ZERO;
             let mut roll_fees = BTreeMap::new();
             for fill in self.fills.iter().filter(|f| f.leg == leg) {
-                let entry = margin_rs::ExecutionId::new(format!(
-                    "{}:{instrument}:{}",
-                    instrument.len(),
-                    fill.exec_id
-                ))
-                .ok()
-                .and_then(|execution| ledger.execution_cashflow(&execution));
+                let entry = crate::instruments::margin::execution_id(instrument, &fill.exec_id)
+                    .ok()
+                    .and_then(|execution| ledger.execution_cashflow(&execution));
                 let Some(entry) = entry else {
                     discrepancies.push(RollDiscrepancy::MissingInLedger {
                         leg,
@@ -1286,11 +1328,28 @@ mod ledger {
                 if !fill.fee.is_zero() && fee_asset != Some(fill.fee_asset.as_str()) {
                     differs("fee_asset");
                 }
-                let closed = entry
+                // The ledger closes such a fill whole. What the plan told apart must be the
+                // same quantity, which a flag alone would not show.
+                let closed_in_ledger = entry
                     .derivative
                     .as_ref()
                     .is_some_and(|d| d.closed_at_settlement.is_some());
-                if closed != self.closed_fills.contains(&fill.exec_id) {
+                let closed_in_plan = self
+                    .closed_fills
+                    .iter()
+                    .find(|(id, _)| leg == RollLeg::Near && *id == fill.exec_id)
+                    .map_or(Decimal::ZERO, |(_, closed)| *closed);
+                let whole = if entry.side == Action::Buy {
+                    entry.quantity
+                } else {
+                    arbitrage_rs::exact::neg(entry.quantity)
+                };
+                let expected = if closed_in_ledger {
+                    whole
+                } else {
+                    Decimal::ZERO
+                };
+                if closed_in_plan != expected {
                     differs("closed_at_settlement");
                 }
                 roll_realized = exact_add(roll_realized, entry.realized_pnl)?;
@@ -1300,6 +1359,37 @@ mod ledger {
                         .or_insert(Decimal::ZERO);
                     *sum = exact_add(*sum, paid.amount)?;
                 }
+            }
+            // Since the anchor, what is on this contract and is not the plan's.
+            let anchor = self.journal_anchor.unwrap_or(u64::MAX);
+            let mut plan_ids = Vec::new();
+            for fill in self.fills.iter().filter(|f| f.leg == leg) {
+                if let Ok(execution) =
+                    crate::instruments::margin::execution_id(instrument, &fill.exec_id)
+                {
+                    plan_ids.push(execution);
+                }
+            }
+            let mut unexplained_entries = 0_u64;
+            let mut unexplained_realized = Decimal::ZERO;
+            let mut unexplained_fees = BTreeMap::new();
+            for entry in ledger.journal().iter().filter(|e| {
+                e.instrument == id && e.sequence >= anchor && !plan_ids.contains(&e.execution_id)
+            }) {
+                unexplained_entries = unexplained_entries.saturating_add(1);
+                unexplained_realized = exact_add(unexplained_realized, entry.realized_pnl)?;
+                if let Some(paid) = &entry.fee {
+                    let sum = unexplained_fees
+                        .entry(paid.asset.as_str().to_string())
+                        .or_insert(Decimal::ZERO);
+                    *sum = exact_add(*sum, paid.amount)?;
+                }
+            }
+            if unexplained_entries > 0 {
+                discrepancies.push(RollDiscrepancy::UnexplainedEntries {
+                    leg,
+                    count: unexplained_entries,
+                });
             }
             let position = ledger.position(&id);
             let ledger_position = position.as_ref().map_or(Decimal::ZERO, |p| p.quantity);
@@ -1318,6 +1408,9 @@ mod ledger {
                 roll_realized,
                 roll_fees,
                 position_realized: position.as_ref().map_or(Decimal::ZERO, |p| p.realized_pnl),
+                unexplained_entries,
+                unexplained_realized,
+                unexplained_fees,
             })
         }
     }

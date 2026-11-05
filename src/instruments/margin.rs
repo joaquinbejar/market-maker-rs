@@ -274,12 +274,7 @@ pub fn fill_execution(spec: &InstrumentSpec, fill: &Fill) -> Result<Execution, A
     }
     let instrument = spec.id().as_str();
     let execution = Execution::new(
-        ExecutionId::new(format!(
-            "{}:{}:{}",
-            instrument.len(),
-            instrument,
-            fill.trade_id
-        ))?,
+        execution_id(instrument, &fill.trade_id)?,
         InstrumentId::new(instrument)?,
         fill.side,
         fill.price,
@@ -291,6 +286,12 @@ pub fn fill_execution(spec: &InstrumentSpec, fill: &Fill) -> Result<Execution, A
     } else {
         execution.with_fee(Asset::new(fill.fee_currency.as_str())?, fill.fee)
     })
+}
+
+/// The ledger's identifier of a trade on a contract: a venue numbers its trades per
+/// contract, so the contract is part of it.
+pub(crate) fn execution_id(instrument: &str, trade_id: &str) -> Result<ExecutionId, MarginError> {
+    ExecutionId::new(format!("{}:{}:{}", instrument.len(), instrument, trade_id))
 }
 
 /// The scales of a registered derivative.
