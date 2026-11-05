@@ -1060,8 +1060,6 @@ fn a_strategy_wakes_with_no_tick_and_each_callback_knows_the_time() {
     assert!(result.is_consistent(), "{result:?}");
 }
 
-/// A time already past is ignored rather than repeated without end, and one past the data
-/// never comes unless a settlement takes the clock there.
 /// A report delivered at the time asked for does not take the wake's place, and it comes
 /// first.
 #[test]
@@ -1175,6 +1173,8 @@ fn a_time_already_woken_at_or_past_does_not_wake_again_until_a_reset() {
     assert_eq!(engine.strategy().0, 1);
 }
 
+/// A time already past is ignored rather than repeated without end, and one past the data
+/// never comes unless a settlement takes the clock there.
 #[test]
 fn a_wake_not_after_the_clock_is_ignored_and_the_data_ending_stops_the_clock() {
     // Asking for a time it already woke at, or one in the past, does nothing.

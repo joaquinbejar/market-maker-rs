@@ -1500,6 +1500,349 @@ fn a_reduced_unwind_is_a_fault() {
     faulted_with(&result, &engine, "was reduced to 4");
 }
 
+/// The observation of its first tick comes after the settlement of the near contract.
+#[test]
+fn settlement_before_the_first_observation_does_not_cancel_unsent_orders() {
+    let run = |ledger: Ledger| {
+        let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+        let mut engine = engine_of(
+            ledger,
+            RollStrategy::new(plan, 100),
+            dec!(0),
+            vec![tick(10, dec!(61000), dec!(61020))],
+            vec![tick(1500, dec!(61980), dec!(62000))],
+        )
+        .with_latency(SimLatencyConfig::new().with_observation_ms(1000))
+        .unwrap()
+        .with_settlement(settlement(&near(), dec!(60000), NEAR_MS))
+        .unwrap();
+        let result = engine.run();
+        (engine, result)
+    };
+    let (engine, result) = run(usdt_ledger());
+    assert_eq!(result.num_trades, 0);
+    assert!(engine.execution_reports().is_empty());
+    assert_eq!(result.fault_count, 0, "{:?}", engine.faults());
+    assert!(result.is_consistent(), "{result:?}");
+    let plan = engine.strategy().plan();
+    assert_eq!(plan.state(), RollState::Aborted);
+    assert_eq!(plan.position(RollLeg::Near), dec!(0));
+    assert_eq!(plan.near_settled(), Some(dec!(10)));
+    assert!(plan.reconcile(engine.ledger()).unwrap().is_clean());
+
+    // The same with less held than the plan says: it is not fit to run.
+    let (engine, result) = run(opened(
+        &near(),
+        &far(),
+        ["BTC", "USDT"],
+        dec!(60000),
+        dec!(5),
+    ));
+    assert!(engine.execution_reports().is_empty());
+    assert_eq!(result.fault_count, 1, "{:?}", engine.faults());
+    faulted_with_settled(&result, &engine);
+}
+
+fn faulted_with_settled(result: &ContractRunResult, engine: &Engine) {
+    assert!(!result.is_consistent());
+    assert!(
+        engine.faults()[0]
+            .to_string()
+            .contains("the ledger holds 5"),
+        "{:?}",
+        engine.faults()
+    );
+    assert_eq!(engine.strategy().plan().near_settled(), None);
+}
+
+/// With no tick of the near contract at all, its settlement comes first, under any policy,
+/// and it agrees with the same plan booked directly. A later first tick sends nothing.
+#[test]
+fn a_settlement_with_no_tick_before_it_agrees_under_each_policy() {
+    let policies = [
+        (RollFailurePolicy::Abort, RollState::Aborted),
+        (RollFailurePolicy::Unwind, RollState::UnwindRequested),
+        (
+            RollFailurePolicy::Complete {
+                max_resubmits: 2,
+                then: RollFallback::Abort,
+            },
+            RollState::Aborted,
+        ),
+    ];
+    for (policy, state) in policies {
+        let ledger = usdt_ledger();
+        let plan = plan_on(&ledger, policy);
+        let price = settlement(&near(), dec!(61500), NEAR_MS);
+        let mut engine = engine_of(
+            ledger.clone(),
+            RollStrategy::new(plan.clone(), 100),
+            dec!(0),
+            vec![],
+            vec![tick(1500, dec!(61980), dec!(62000))],
+        )
+        .with_settlement(price.clone())
+        .unwrap();
+        let result = engine.run();
+        let steps = vec![
+            Step::Settle(near(), price, dec!(10)),
+            Step::Event(RollEvent::CancelAck {
+                leg: RollLeg::Far,
+                attempt: 0,
+                cum_contracts: dec!(0),
+                at_ms: NEAR_MS,
+            }),
+            Step::Event(RollEvent::CancelAck {
+                leg: RollLeg::Near,
+                attempt: 0,
+                cum_contracts: dec!(0),
+                at_ms: NEAR_MS,
+            }),
+        ];
+        let (direct_ledger, direct_plan) = booked_directly(ledger, plan, steps);
+        agree(
+            engine.ledger(),
+            engine.strategy().plan(),
+            &direct_ledger,
+            &direct_plan,
+        );
+        assert_eq!(result.fault_count, 0, "{:?}", engine.faults());
+        assert!(result.is_consistent(), "{result:?}");
+        assert!(engine.execution_reports().is_empty());
+        assert_eq!(engine.strategy().plan().state(), state);
+    }
+}
+
+#[test]
+fn a_settlement_first_still_checks_the_plan() {
+    let run = |ledger: Ledger, plan: RollPlan| {
+        let mut engine = engine_of(
+            ledger,
+            RollStrategy::new(plan, 100),
+            dec!(0),
+            vec![],
+            vec![tick(1500, dec!(61980), dec!(62000))],
+        )
+        .with_settlement(settlement(&near(), dec!(61500), NEAR_MS))
+        .unwrap();
+        let result = engine.run();
+        assert!(engine.execution_reports().is_empty());
+        assert_eq!(engine.strategy().plan().near_settled(), None);
+        (engine, result)
+    };
+    // A plan already in progress.
+    let ledger = usdt_ledger();
+    let mut plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    plan.apply(&RollEvent::Tick { at_ms: 6 }).unwrap();
+    let (engine, result) = run(ledger, plan);
+    assert_eq!(result.fault_count, 1, "{:?}", engine.faults());
+    faulted_with(&result, &engine, "has seen events already");
+
+    // Near: the ledger closed 5, and the plan says 10.
+    let ledger = opened(&near(), &far(), ["BTC", "USDT"], dec!(60000), dec!(5));
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let (engine, result) = run(ledger, plan);
+    assert_eq!(result.fault_count, 1, "{:?}", engine.faults());
+    faulted_with(&result, &engine, "the Near leg, and the ledger holds 5");
+
+    // Far: the ledger holds 1, and the plan says 0.
+    let mut ledger = usdt_ledger();
+    ledger
+        .book_execution_allowing_overdraft(
+            &Execution::new(
+                ExecutionId::new("held").unwrap(),
+                InstrumentId::new("FAR").unwrap(),
+                Action::Buy,
+                dec!(60000),
+                dec!(1),
+            )
+            .with_executed_at(1),
+            None,
+        )
+        .unwrap();
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let (engine, result) = run(ledger, plan);
+    assert_eq!(result.fault_count, 1, "{:?}", engine.faults());
+    faulted_with(&result, &engine, "the Far leg, and the ledger holds 1");
+}
+
+/// A sell unwind crosses the bid: the far leg fills alone while the near one is refused,
+/// and the far excess sells at the far bid, whose own size is what counts.
+fn far_excess(far_book: MarketTick) -> (Ledger, RollPlan, Engine) {
+    let ledger = usdt_ledger();
+    let plan = plan_on(&ledger, RollFailurePolicy::Unwind);
+    let engine = engine_of(
+        ledger.clone(),
+        RollStrategy::new(plan.clone(), 100),
+        dec!(0),
+        vec![tick(10, dec!(59000), dec!(59010))],
+        vec![
+            far_book,
+            tick(30, dec!(61990), dec!(62000)),
+            tick(40, dec!(61980), dec!(61990)),
+        ],
+    )
+    // The near leg's attempt 0, sent first.
+    .with_pretrade_policy(Refusing(vec![0], 0))
+    .unwrap()
+    .with_latency(SimLatencyConfig::new().with_cancel_ms(50))
+    .unwrap();
+    (ledger, plan, engine)
+}
+
+#[test]
+fn a_sell_unwind_crosses_the_bid_of_its_leg_and_agrees() {
+    // A bid of 61980 for 10, with an ask too thin to matter.
+    let (ledger, plan, mut engine) = far_excess(MarketTick::new(
+        20,
+        dec!(61980),
+        dec!(10),
+        dec!(62010),
+        dec!(1),
+    ));
+    let result = engine.run();
+    let steps = vec![
+        Step::Event(RollEvent::Rejected {
+            leg: RollLeg::Near,
+            attempt: 0,
+            at_ms: 10,
+        }),
+        fill_of(
+            &far(),
+            RollLeg::Far,
+            Some(0),
+            "sim-1",
+            Action::Buy,
+            dec!(62000),
+            dec!(10),
+            dec!(0),
+            30,
+        ),
+        fill_of(
+            &far(),
+            RollLeg::Far,
+            None,
+            "sim-2",
+            Action::Sell,
+            dec!(61980),
+            dec!(10),
+            dec!(0),
+            40,
+        ),
+    ];
+    let (direct_ledger, direct_plan) = booked_directly(ledger, plan, steps);
+    agree(
+        engine.ledger(),
+        engine.strategy().plan(),
+        &direct_ledger,
+        &direct_plan,
+    );
+    assert_eq!(result.trades[1].price, dec!(61980));
+    assert!(result.is_consistent(), "{result:?}");
+
+    // A bid too thin, with an ask that would have been enough.
+    let (_, _, mut engine) = far_excess(MarketTick::new(
+        20,
+        dec!(61980),
+        dec!(9),
+        dec!(62010),
+        dec!(100),
+    ));
+    let result = engine.run();
+    assert_eq!(result.num_trades, 1);
+    faulted_with(&result, &engine, "has 9 to Sell, short of 10");
+}
+
+/// Of two ticks at one time, the later is the book.
+#[test]
+fn of_two_books_at_one_time_an_unwind_reads_the_later() {
+    let (_, _, mut engine) = unwinding(
+        vec![
+            tick(10, dec!(60990), dec!(61010)),
+            tick(20, dec!(61000), dec!(61020)),
+            tick(30, dec!(61000), dec!(61010)),
+            tick(30, dec!(61000), dec!(61011)),
+            tick(50, dec!(61000), dec!(61011)),
+        ],
+        100,
+    );
+    let result = engine.run();
+    assert_eq!(result.trades[1].price, dec!(61011));
+}
+
+/// A first run past the deadline must not leave a clock that stops the next one sending.
+#[test]
+fn a_reset_forgets_the_clock_of_the_last_run() {
+    let ledger = usdt_ledger();
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let mut engine = engine_of(
+        ledger,
+        RollStrategy::new(plan, 100),
+        dec!(0),
+        full_near_ticks(),
+        vec![
+            tick(30, dec!(61980), dec!(62000)),
+            tick(DEADLINE_MS + 50, dec!(61980), dec!(62000)),
+        ],
+    );
+    let first = engine.run();
+    assert_eq!(first.num_trades, 2);
+    engine.reset();
+    let second = engine.run();
+    assert_eq!(second.trades, first.trades);
+    assert_eq!(engine.strategy().plan().state(), RollState::Completed);
+}
+
+/// The far contract settling before the first observation still counts as held at the start.
+#[test]
+fn a_far_settlement_before_the_first_observation_is_no_mismatch() {
+    let mut ledger = usdt_ledger();
+    ledger
+        .book_execution_allowing_overdraft(
+            &Execution::new(
+                ExecutionId::new("held").unwrap(),
+                InstrumentId::new("FAR").unwrap(),
+                Action::Buy,
+                dec!(60000),
+                dec!(3),
+            )
+            .with_executed_at(1),
+            None,
+        )
+        .unwrap();
+    let plan = RollPlan::new(RollRequest {
+        far_position: dec!(3),
+        ..request(RollFailurePolicy::Abort)
+    })
+    .unwrap()
+    .anchored_to(&ledger);
+    let mut engine = engine_of(
+        ledger,
+        RollStrategy::new(plan, 100),
+        dec!(0),
+        vec![tick(10, dec!(61000), dec!(61020))],
+        vec![tick(3100, dec!(61980), dec!(62000))],
+    )
+    .with_latency(SimLatencyConfig::new().with_observation_ms(3000))
+    .unwrap()
+    .with_settlement(settlement(&far(), dec!(62000), FAR_MS))
+    .unwrap();
+    let result = engine.run();
+    assert_eq!(result.fault_count, 0, "{:?}", engine.faults());
+    assert!(engine.execution_reports().is_empty());
+    assert_eq!(engine.strategy().plan().state(), RollState::Aborted);
+    assert!(line_settled(&result, "FAR"));
+}
+
+fn line_settled(result: &ContractRunResult, name: &str) -> bool {
+    result
+        .contracts
+        .iter()
+        .find(|c| c.contract.as_str() == name)
+        .unwrap()
+        .settled
+}
+
 /// A plan for a position the ledger does not hold would flip it.
 #[test]
 fn a_plan_for_positions_the_ledger_does_not_hold_sends_nothing() {
@@ -1517,6 +1860,22 @@ fn a_plan_for_positions_the_ledger_does_not_hold_sends_nothing() {
     assert!(engine.execution_reports().is_empty());
     assert_eq!(result.num_trades, 0);
     faulted_with(&result, &engine, "the ledger holds 5");
+
+    // Refused on its first tick, it does not hear of the settlement later either.
+    let ledger = opened(&near(), &far(), ["BTC", "USDT"], dec!(60000), dec!(5));
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let mut engine = engine_of(
+        ledger,
+        RollStrategy::new(plan, 100),
+        dec!(0),
+        full_near_ticks(),
+        full_far_ticks(),
+    )
+    .with_settlement(settlement(&near(), dec!(61000), NEAR_MS))
+    .unwrap();
+    let result = engine.run();
+    assert_eq!(result.fault_count, 1, "{:?}", engine.faults());
+    assert_eq!(engine.strategy().plan().near_settled(), None);
 
     // The ledger holds something on the far contract that the plan does not know of.
     let mut ledger = usdt_ledger();

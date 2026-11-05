@@ -10,7 +10,10 @@
 //!
 //! Only a plan that has seen no event yet, for the positions the ledger holds at the start
 //! on both legs, is run: anything else is a fault and no order, as selling what is not held
-//! would flip a position.
+//! would flip a position. This is judged once, on the first event it sees: a settlement can
+//! reach it before its first tick, when the position it closed still counts as held, and if
+//! that is of the near contract the plan hears that its attempts were cancelled, unfilled,
+//! and nothing is sent.
 //!
 //! When the data ends nothing more can be sent, so a plan may end the run still working,
 //! which [`RollStrategy::plan`] shows.
@@ -163,6 +166,8 @@ pub struct RollStrategy {
     guard: Option<SharedRollGuard>,
     max_book_age_ms: u64,
     started: bool,
+    /// Whether the plan can run, once judged.
+    fit_to_run: Option<bool>,
     now_ms: u64,
     next_tag: u64,
     owned: HashMap<u64, Owned>,
@@ -186,6 +191,7 @@ impl RollStrategy {
             guard: None,
             max_book_age_ms,
             started: false,
+            fit_to_run: None,
             now_ms: 0,
             next_tag: 0,
             owned: HashMap::new(),
@@ -272,25 +278,46 @@ impl RollStrategy {
         )
     }
 
-    /// The first orders, if the plan can still send them.
-    fn start(&mut self, view: &ContractView) -> Vec<ContractCommand> {
-        self.started = true;
-        if !self.plan.history.is_empty() {
+    /// Whether this plan can run on the positions at the start, of which a settlement before
+    /// this first event may have closed `closed` on a leg.
+    fn judge(&mut self, view: &ContractView, closed: Option<(RollLeg, Decimal)>) -> bool {
+        if let Some(fit) = self.fit_to_run {
+            return fit;
+        }
+        let fit = self.fit_now(view, closed);
+        self.fit_to_run = Some(fit);
+        fit
+    }
+
+    fn fit_now(&mut self, view: &ContractView, closed: Option<(RollLeg, Decimal)>) -> bool {
+        if !self.initial.history.is_empty() {
             self.fault("the plan has seen events already, so its attempts are not new".to_string());
-            return Vec::new();
+            return false;
         }
         for leg in [RollLeg::Near, RollLeg::Far] {
             let terms = self.plan.leg(leg);
-            let (planned, held) = (terms.start, view.position(terms.terms.spec().id()));
+            let (planned, mut held) = (terms.start, view.position(terms.terms.spec().id()));
+            if let Some((_, contracts)) = closed.filter(|(on, _)| *on == leg) {
+                held = held.saturating_add(contracts);
+            }
             if planned != held {
                 self.fault(format!(
                     "the plan starts at {planned} on the {leg:?} leg, and the ledger holds {held}"
                 ));
-                return Vec::new();
+                return false;
             }
         }
+        true
+    }
+
+    /// The first orders, if the plan can still send them.
+    fn start(&mut self, view: &ContractView) -> Vec<ContractCommand> {
+        self.started = true;
+        if !self.judge(view, None) {
+            return Vec::new();
+        }
         if self.now_ms >= self.plan.deadline_ms {
-            self.never_sent();
+            self.never_sent(&RollEvent::Tick { at_ms: self.now_ms });
             return Vec::new();
         }
         vec![
@@ -299,10 +326,10 @@ impl RollStrategy {
         ]
     }
 
-    /// Past the deadline before anything was sent: the plan asks to cancel what it believes
-    /// is live, and it is told that was done, with nothing filled.
-    fn never_sent(&mut self) {
-        let mut asked = match self.plan.apply(&RollEvent::Tick { at_ms: self.now_ms }) {
+    /// `first` came before anything was sent, so the plan asks to cancel what it believes is
+    /// live, and it is told that was done, with nothing filled.
+    fn never_sent(&mut self, first: &RollEvent) {
+        let mut asked = match self.plan.apply(first) {
             Ok(report) => report.actions,
             Err(error) => {
                 self.fault(format!("the plan refused an event: {error}"));
@@ -577,18 +604,34 @@ impl ContractStrategy for RollStrategy {
         view: &ContractView,
     ) -> Vec<ContractCommand> {
         self.see_time(view.now_ms());
-        if self.leg_of(contract) != Some(RollLeg::Near) {
+        let Some(leg) = self.leg_of(contract) else {
+            return Vec::new();
+        };
+        if !self.started && !self.judge(view, Some((leg, contracts))) {
             return Vec::new();
         }
-        self.apply(&RollEvent::NearSettled {
+        if leg == RollLeg::Far {
+            return Vec::new();
+        }
+        let event = RollEvent::NearSettled {
             price: price.clone(),
             contracts,
-        })
+        };
+        if !self.started {
+            self.started = true;
+            self.never_sent(&event);
+            return Vec::new();
+        }
+        if self.fit_to_run == Some(false) {
+            return Vec::new();
+        }
+        self.apply(&event)
     }
 
     fn next_wake_ms(&self) -> Option<u64> {
-        // The engine wakes it once, and ignores this once the time has passed.
-        self.started.then_some(self.plan.deadline_ms)
+        // The engine wakes it once, and ignores this once the time has passed. A plan not
+        // fit to run has nothing live to end.
+        (self.started && self.fit_to_run == Some(true)).then_some(self.plan.deadline_ms)
     }
 
     fn on_wake(&mut self, view: &ContractView) -> Vec<ContractCommand> {
@@ -603,6 +646,7 @@ impl ContractStrategy for RollStrategy {
     fn reset(&mut self) {
         self.plan = self.initial.clone();
         self.started = false;
+        self.fit_to_run = None;
         self.now_ms = 0;
         self.next_tag = 0;
         self.owned.clear();
