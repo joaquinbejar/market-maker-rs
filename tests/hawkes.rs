@@ -617,12 +617,12 @@ fn test_fill_rate_by_hand() {
         (4.0, MARKET),
     ]);
     assert_eq!(
-        fill_rate(std::slice::from_ref(&fills), 10.0, 100.0).unwrap(),
+        fill_rate(std::slice::from_ref(&fills), CAP as u32, 10.0, 100.0).unwrap(),
         Some(1.0)
     );
     // A horizon that ends before the third.
     assert_eq!(
-        fill_rate(std::slice::from_ref(&fills), 3.5, 100.0).unwrap(),
+        fill_rate(std::slice::from_ref(&fills), CAP as u32, 3.5, 100.0).unwrap(),
         Some(0.0)
     );
     // A limit behind us does not delay us; a cancel removes half of the two ahead.
@@ -633,23 +633,27 @@ fn test_fill_rate_by_hand() {
         (2.6, LIMIT),
         (3.0, MARKET),
     ]);
-    assert_eq!(fill_rate(&[cancels], 10.0, 100.0).unwrap(), Some(1.0));
+    assert_eq!(
+        fill_rate(&[cancels], CAP as u32, 10.0, 100.0).unwrap(),
+        Some(1.0)
+    );
     // No probe fits.
     assert_eq!(
-        fill_rate(std::slice::from_ref(&fills), 11.0, 1.0).unwrap(),
+        fill_rate(std::slice::from_ref(&fills), CAP as u32, 11.0, 1.0).unwrap(),
         None
     );
-    assert!(fill_rate(&[], 0.0, 1.0).is_err());
-    assert!(fill_rate(&[], 1.0, 0.0).is_err());
+    assert!(fill_rate(&[], CAP as u32, 0.0, 1.0).is_err());
+    assert!(fill_rate(&[], CAP as u32, 1.0, 0.0).is_err());
     // Four probes, 3 s apart, on a horizon of 1 s: only those with a market in reach.
     let spaced = segment(vec![
         (0.5, LIMIT),
+        (3.2, LIMIT),
         (3.5, MARKET),
         (3.6, MARKET),
         (3.7, MARKET),
         (3.8, MARKET),
     ]);
-    let rate = fill_rate(&[spaced], 1.0, 3.0).unwrap().unwrap();
+    let rate = fill_rate(&[spaced], CAP as u32, 1.0, 3.0).unwrap().unwrap();
     assert_eq!(rate, 0.25);
 }
 
@@ -695,7 +699,7 @@ fn compare_models(train_days: usize, other_days: usize, candidates: &[f64]) {
         "| model | params | ll/event | aic | ks limit | ks cancel | ks market | market flow tv | fill rate |"
     );
     println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
-    let data_fill = fill_rate(&holdout, 3.0, 10.0).unwrap().unwrap();
+    let data_fill = fill_rate(&holdout, CAP as u32, 3.0, 10.0).unwrap().unwrap();
     let counts = |segments: &[HawkesSegment]| events_per_interval(segments, MARKET, 10.0).unwrap();
     let data_counts = counts(&holdout);
     println!("| data | | | | | | | | {data_fill:.4} |");
@@ -707,7 +711,9 @@ fn compare_models(train_days: usize, other_days: usize, candidates: &[f64]) {
         let fit = score_flow(&holdout, params).unwrap();
         let simulated = generate(params, seed, other_days, 2_000.0);
         let tv = total_variation(&data_counts, &counts(&simulated));
-        let fills = fill_rate(&simulated, 3.0, 10.0).unwrap().unwrap();
+        let fills = fill_rate(&simulated, CAP as u32, 3.0, 10.0)
+            .unwrap()
+            .unwrap();
         println!(
             "| {name} | {} | {:.5} | {:.0} | {:.4} | {:.4} | {:.4} | {tv:.4} | {fills:.4} |",
             fit.parameter_count,
@@ -821,7 +827,7 @@ fn test_measures_refuse_an_interval_too_small_for_the_segment() {
         Err(MMError::InvalidConfiguration(_))
     ));
     assert!(matches!(
-        fill_rate(&data, 1.0, 1e-9),
+        fill_rate(&data, CAP as u32, 1.0, 1e-9),
         Err(MMError::InvalidConfiguration(_))
     ));
 }
@@ -872,4 +878,46 @@ fn test_a_segment_stopped_at_its_event_limit_claims_no_unsimulated_time() {
     let (next, _) = sim.run(10.0).unwrap();
     assert_eq!(before, segment.duration_seconds);
     assert_eq!(sim.state().clock_seconds, before + next.duration_seconds);
+}
+
+#[test]
+fn test_a_thin_size_borrows_each_baseline_from_where_that_type_is_allowed() {
+    // Sizes 0 and 2 have events and size 1 has none, with one event per short segment.
+    let segment = |initial_queue, kind| HawkesSegment {
+        initial_queue,
+        duration_seconds: 1.0,
+        events: vec![HawkesEvent {
+            time_seconds: 0.5,
+            kind,
+        }],
+    };
+    let mut data = vec![segment(0, LIMIT); 40];
+    data.extend(vec![segment(2, CANCEL); 40]);
+    data.extend(vec![segment(2, MARKET); 40]);
+    let config = HawkesFitConfig::new(2, vec![]).with_min_events(5);
+    let record = fit_hawkes(&data, &config).unwrap();
+    assert_eq!(record.borrowed_sizes, 1);
+    let rates = record.parameters().unwrap().rates();
+    assert!(rates[1].0 > 0.0, "limit from size 0: {:?}", rates[1]);
+    assert!(rates[1].1 > 0.0, "cancel from size 2: {:?}", rates[1]);
+    assert!(rates[1].2 > 0.0, "market from size 2: {:?}", rates[1]);
+    assert_eq!(rates[0].1, 0.0);
+    assert_eq!(rates[2].0, 0.0);
+}
+
+#[test]
+fn test_fill_rate_refuses_what_score_flow_refuses() {
+    let broken = HawkesSegment {
+        initial_queue: 0,
+        duration_seconds: 10.0,
+        events: vec![HawkesEvent {
+            time_seconds: 1.0,
+            kind: MARKET,
+        }],
+    };
+    assert!(matches!(
+        fill_rate(&[broken], CAP as u32, 1.0, 1.0),
+        Err(MMError::InvalidMarketState(_))
+    ));
+    assert!(fill_rate(&[], 0, 1.0, 1.0).is_err());
 }

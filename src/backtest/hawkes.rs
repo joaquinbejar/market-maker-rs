@@ -31,8 +31,9 @@
 //!   non-negative and raises the likelihood at each step; the paper optimizes the
 //!   same convex likelihood numerically.
 //! - The queue is capped at `max_queue`, with `λ^L = 0` there.
-//! - A queue size with fewer than `min_events` training events takes the baseline
-//!   of the nearest supported size, and the record counts them.
+//! - A queue size with fewer than `min_events` training events takes each baseline
+//!   from the nearest supported size where that type is allowed, and the record counts
+//!   them.
 //! - A fill measure, [`fill_rate`], is added. It is a coarse, deterministic
 //!   measure from aggregated queues, not individual queue priority.
 //!
@@ -654,8 +655,7 @@ impl HawkesSimulator {
                 self.state = saved;
                 return Ok(HawkesStep::Stalled);
             }
-            let decays = self.params.decays.clone();
-            decay_excitation(&mut self.state.excitation, &decays, wait);
+            decay_excitation(&mut self.state.excitation, &self.params.decays, wait);
             self.state.time_seconds = next;
             let rates = self.intensities(n);
             let total: f64 = rates.iter().sum();
@@ -886,7 +886,7 @@ pub struct HawkesRecord {
     pub events: u64,
     /// Seconds observed.
     pub seconds: f64,
-    /// Queue sizes that took a baseline from the nearest supported size.
+    /// Queue sizes that took their baselines from the nearest supported sizes.
     pub borrowed_sizes: u32,
     /// Log likelihood before each step, then at the fitted parameters.
     pub likelihood_trace: Vec<f64>,
@@ -1152,24 +1152,30 @@ fn baseline_table(
             _ => (0.0, 0.0, 0.0),
         }
     };
+    // Per type: the row it comes from must be one where that type is allowed.
+    let rate = |n: usize, kind: usize, value: fn((f64, f64, f64)) -> f64| -> f64 {
+        let allowed = |i: usize| if kind == 0 { i < last } else { i > 0 };
+        if !allowed(n) {
+            return 0.0;
+        }
+        let source = if supported.get(n).copied().unwrap_or(false) {
+            Some(n)
+        } else {
+            supported
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| **s && allowed(*i))
+                .map(|(i, _)| i)
+                .min_by_key(|i| i.abs_diff(n))
+        };
+        source.map_or(0.0, |source| value(raw(source)))
+    };
     (0..background.len())
         .map(|n| {
-            let source = if supported.get(n).copied().unwrap_or(false) {
-                n
-            } else {
-                supported
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| **s)
-                    .map(|(i, _)| i)
-                    .min_by_key(|i| i.abs_diff(n))
-                    .unwrap_or(n)
-            };
-            let (l, c, m) = raw(source);
             (
-                if n == last { 0.0 } else { l },
-                if n == 0 { 0.0 } else { c },
-                if n == 0 { 0.0 } else { m },
+                rate(n, 0, |row| row.0),
+                rate(n, 1, |row| row.1),
+                rate(n, 2, |row| row.2),
             )
         })
         .collect()
@@ -1473,10 +1479,12 @@ pub fn events_per_interval(
 ///
 /// # Errors
 ///
-/// Returns [`MMError::InvalidConfiguration`] for a horizon or probe spacing that is
-/// not positive, and [`MMError::NumericalError`] on a failed conversion.
+/// Returns [`MMError::InvalidConfiguration`] for a cap out of range, or a horizon or
+/// probe spacing that is not positive, [`MMError::InvalidMarketState`] for a segment that
+/// breaks the queue rules, and [`MMError::NumericalError`] on a failed conversion.
 pub fn fill_rate(
     segments: &[HawkesSegment],
+    max_queue: u32,
     horizon_seconds: f64,
     probe_seconds: f64,
 ) -> MMResult<Option<f64>> {
@@ -1484,8 +1492,13 @@ pub fn fill_rate(
     if !valid(horizon_seconds) || !valid(probe_seconds) {
         return invalid(format!("horizon {horizon_seconds}, probes {probe_seconds}"));
     }
+    if max_queue == 0 || max_queue > MAX_QUEUE {
+        return invalid(format!("cap {max_queue}"));
+    }
+    let cap = usize::try_from(max_queue).map_err(|_| overflow("cap"))?;
     let (mut probes, mut filled) = (0usize, 0usize);
     for segment in segments {
+        segment.validate(cap)?;
         if segment.duration_seconds / probe_seconds > MAX_INTERVALS {
             return invalid(format!("probes every {probe_seconds} in a segment"));
         }
