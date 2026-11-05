@@ -600,7 +600,8 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
     /// # Errors
     ///
     /// [`MMError::InvalidConfiguration`] for a contract not added, a price the contract
-    /// or the ledger refuses, or a second price for it.
+    /// refuses, or a second price for it. What the ledger refuses depends on the position
+    /// at publication, so it shows then: [`ContractSummary::settlement_failed`] and a fault.
     pub fn with_settlement(mut self, price: SettlementPrice) -> MMResult<Self> {
         let name = price.instrument().as_str().to_string();
         let refuse = |reason: String| {
@@ -623,14 +624,6 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .get(index)
             .map(|lane| lane.terms.check_settlement(&price));
         if let Some(Err(error)) = checked {
-            return refuse(error.to_string());
-        }
-        // What the ledger refuses of the price itself, such as its digits.
-        let tried = self.lanes.get(index).map(|lane| {
-            lane.terms
-                .settle_in_ledger(&mut self.ledger.clone(), &price)
-        });
-        if let Some(Err(error)) = tried {
             return refuse(error.to_string());
         }
         self.declared.push((index, price));

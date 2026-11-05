@@ -1863,14 +1863,22 @@ fn exhausted_execution_number_never_replays_a_seed_fill() {
 
 #[test]
 fn failed_declared_settlement_is_not_a_consistent_run_even_when_flat() {
-    // Its digits are refused when it is declared, flat or not.
-    let error = two_contracts(dec!(0), both_ledger(), Script::default(), vec![], vec![])
-        .with_settlement(settlement(&near(), dec!(0.000000001), NEAR_MS))
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("settlement of NEAR"),
-        "{error:?}"
-    );
+    // More digits than the ledger holds, flat all along.
+    let mut engine = two_contracts(
+        dec!(0),
+        both_ledger(),
+        Script::default(),
+        vec![tick(10, dec!(98), dec!(102))],
+        vec![],
+    )
+    .with_settlement(settlement(&near(), dec!(0.000000001), NEAR_MS))
+    .unwrap();
+    let result = engine.run();
+    let near_line = line(&result, &near_id());
+    assert!(near_line.settlement_failed);
+    assert!(!near_line.settled);
+    assert_eq!(result.fault_count, 1);
+    assert!(!result.is_consistent());
 
     // What only fails on the position it finds, flat when declared.
     let huge = dec!(10000000000000000000);
@@ -1906,6 +1914,35 @@ fn failed_declared_settlement_is_not_a_consistent_run_even_when_flat() {
             .iter()
             .all(|l| !l.starts_with("settled"))
     );
+}
+
+/// Whether a settlement can book depends on the position when it is published, not on
+/// the one when it is declared.
+#[test]
+fn a_future_settlement_can_be_declared_before_the_position_is_closed() {
+    let mut ledger = both_ledger();
+    seed(&mut ledger, "seed-1", "NEAR", Action::Buy, dec!(1), dec!(2));
+    let script = Script::of(vec![vec![order(
+        1,
+        near_id(),
+        Action::Sell,
+        dec!(1),
+        dec!(2),
+    )]]);
+    let mut engine = two_contracts(
+        dec!(0),
+        ledger,
+        script,
+        vec![tick(10, dec!(0.5), dec!(1.5)), tick(20, dec!(1), dec!(3))],
+        vec![],
+    )
+    .with_settlement(settlement(&near(), Decimal::MAX, NEAR_MS))
+    .unwrap();
+    let result = engine.run();
+    let near_line = line(&result, &near_id());
+    assert_eq!(near_line.position, dec!(0));
+    assert!(near_line.settled);
+    assert!(result.is_consistent(), "{result:?}");
 }
 
 /// A tick observed after its contract settled shows the position gone, and an order sent
