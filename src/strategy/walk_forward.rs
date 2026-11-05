@@ -74,6 +74,8 @@
 //!   time at risk in the other buckets. Such a bucket predicts no fills, also
 //!   if the market is open then later, such as training on a half day and
 //!   testing on a full one. The score's floor makes that a large, visible cost.
+//!   A fit therefore holds only for the same intraday calendar: a daylight
+//!   saving change moves a session in UTC and has the same effect.
 //! - An exposure stamped exactly at a session's end counts in the session's
 //!   last intraday bucket, in training and in scoring, as a quote resting until
 //!   the close is not at risk once it has closed. If the next session starts
