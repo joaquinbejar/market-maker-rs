@@ -36,8 +36,8 @@
 //! saw that the plan had not, by leg and execution identifier, so no order of events
 //! counts one twice or loses one. A sync also carries the plan's state and a settlement
 //! with its effect, once, as they are in the plan's positions, and the latest time it
-//! saw. A copy of the plan older than one an earlier sync saw is refused, by the plan's
-//! count of events, whatever those events were, as is a fill with other content.
+//! saw. A copy of the plan that does not descend from what an earlier sync saw is
+//! refused, however many events it has, as is a fill with other content.
 //!
 //! Sync before deciding after a fill the guard could not see or a change in the plan's
 //! state. A settlement is published at or after the near contract's expiry, so a sync
@@ -66,7 +66,10 @@ use arbitrage_rs::Quantity;
 use financial_types::Action;
 use rust_decimal::Decimal;
 
-use super::{RollError, RollLeg, RollPlan, RollState, exact_add, exact_mul, exact_sub, upstream};
+use super::{
+    LegTerms, RollError, RollEvent, RollFailurePolicy, RollLeg, RollPlan, RollState, exact_add,
+    exact_mul, exact_sub, upstream,
+};
 use crate::instruments::futures::FutureTerms;
 use crate::risk::pretrade::{OrderEvent, PretradeDecision, PretradePolicy, PretradeRequest};
 use crate::types::error::{MMError, MMResult};
@@ -92,6 +95,28 @@ struct GuardOrder {
     open: bool,
 }
 
+/// What a plan was made from, which its events do not change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanOrigin {
+    near: LegTerms,
+    far: LegTerms,
+    policy: RollFailurePolicy,
+    created_at_ms: u64,
+    deadline_ms: u64,
+}
+
+impl PlanOrigin {
+    fn of(plan: &RollPlan) -> Self {
+        Self {
+            near: plan.near.clone(),
+            far: plan.far.clone(),
+            policy: plan.policy,
+            created_at_ms: plan.created_at_ms,
+            deadline_ms: plan.deadline_ms,
+        }
+    }
+}
+
 /// What a sync, or the construction, sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlanView {
@@ -101,7 +126,7 @@ struct PlanView {
     state: RollState,
     near_settled: bool,
     latest_ms: u64,
-    revision: u64,
+    history: Vec<RollEvent>,
 }
 
 fn key(leg: RollLeg, exec_id: &str) -> (bool, String) {
@@ -125,7 +150,7 @@ impl PlanView {
             state: plan.state(),
             near_settled: plan.near_settled().is_some(),
             latest_ms: plan.observed_ms,
-            revision: plan.revision,
+            history: plan.history.clone(),
         }
     }
 }
@@ -137,6 +162,7 @@ pub struct RollGuard {
     far: GuardLeg,
     deadline_ms: u64,
     max_exposure: Decimal,
+    origin: PlanOrigin,
     initial: PlanView,
     view: PlanView,
     orders: HashMap<String, GuardOrder>,
@@ -205,6 +231,7 @@ impl RollGuard {
             },
             deadline_ms: plan.deadline_ms,
             max_exposure,
+            origin: PlanOrigin::of(plan),
             latest_ms: view.latest_ms,
             initial: view.clone(),
             view,
@@ -219,28 +246,18 @@ impl RollGuard {
     ///
     /// # Errors
     ///
-    /// [`RollError::OtherPlan`] for a plan of other contracts;
-    /// [`RollError::StalePlan`] for a copy older than one an earlier sync saw, or without
-    /// a fill or the settlement that it saw; and [`RollError::ConflictingFill`] for a fill the plan and
+    /// [`RollError::OtherPlan`] for another plan, by anything in its request;
+    /// [`RollError::StalePlan`] for one whose events do not continue those an
+    /// earlier sync saw; and [`RollError::ConflictingFill`] for a fill the plan and
     /// the guard saw with other content. The guard is then unchanged.
     pub fn sync(&mut self, plan: &RollPlan) -> Result<(), RollError> {
-        if plan.near.terms != self.near.terms || plan.far.terms != self.far.terms {
+        if PlanOrigin::of(plan) != self.origin {
             return Err(RollError::OtherPlan);
         }
         let view = PlanView::of(plan);
-        // An older copy of the plan could undo more than fills: a rejection, say, that
-        // stopped it. The same revision must be the same plan, or it is another copy.
-        let older = view.revision < self.view.revision
-            || (view.revision == self.view.revision && view != self.view);
-        if older {
-            return Err(RollError::StalePlan);
-        }
-        let lost_fill = self
-            .view
-            .fills
-            .iter()
-            .any(|(id, signed)| view.fills.get(id) != Some(signed));
-        if lost_fill || (self.view.near_settled && !view.near_settled) {
+        // Only what descends from what was seen: a copy from before a rejection, however
+        // many events it has since, could otherwise start far opening again.
+        if !view.history.starts_with(&self.view.history) {
             return Err(RollError::StalePlan);
         }
         for (leg, exec_id, signed) in &self.fills {
@@ -456,6 +473,16 @@ impl PretradePolicy for RollGuard {
                     return Ok(());
                 };
                 let leg = order.leg;
+                if *quantity <= Decimal::ZERO {
+                    let error = MMError::InvalidPositionUpdate(format!(
+                        "execution {execution_id} has quantity {quantity}"
+                    ));
+                    self.fault = Some(error.clone());
+                    return Err(error);
+                }
+                // A real execution stays counted, on the side it was on, and the guard
+                // decides nothing more until a reset, as its order did not say that.
+                let wrong_side = order.direction != direction;
                 let figures = exact_add(order.filled, *quantity)
                     .and_then(|filled| Ok((filled, exact_mul(direction, *quantity)?)));
                 let (filled, signed) = match figures {
@@ -485,6 +512,13 @@ impl PretradePolicy for RollGuard {
                 }
                 order.filled = filled;
                 self.fills.push((leg, execution_id.clone(), signed));
+                if wrong_side {
+                    let error = MMError::InvalidPositionUpdate(format!(
+                        "execution {execution_id} is on the other side of its order"
+                    ));
+                    self.fault = Some(error.clone());
+                    return Err(error);
+                }
             }
             OrderEvent::Accepted { .. }
             | OrderEvent::CancelRequested { .. }

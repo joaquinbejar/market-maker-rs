@@ -603,6 +603,94 @@ fn a_fill_is_one_per_leg_and_execution() {
 }
 
 #[test]
+fn more_ticks_on_an_old_branch_cannot_restore_working() {
+    let initial = long_plan();
+    let mut plan = initial.clone();
+    plan.apply(&RollEvent::Rejected {
+        leg: RollLeg::Far,
+        attempt: 0,
+        at_ms: NOW + 2,
+    })
+    .unwrap();
+    let mut guard = guard_of(&initial);
+    guard.sync(&plan).unwrap();
+    assert!(ask(&mut guard, "a", FAR, Action::Buy, dec!(1)).is_rejected());
+    let mut fork = initial;
+    for at_ms in [NOW + 3, NOW + 4] {
+        fork.apply(&RollEvent::Tick { at_ms }).unwrap();
+    }
+    assert_eq!(fork.state(), RollState::Working);
+    assert_eq!(guard.sync(&fork), Err(RollError::StalePlan));
+    assert!(ask_at(&mut guard, "b", FAR, Action::Buy, dec!(1), NOW + 4).is_rejected());
+}
+
+#[test]
+fn a_sync_cannot_switch_the_failure_policy_with_the_same_history() {
+    // Both see the same events, and only the second may add to near as it unwinds.
+    let aborting = in_state(RollState::Aborting, RollFailurePolicy::Abort);
+    let unwinding = in_state(RollState::Unwinding, RollFailurePolicy::Unwind);
+    let mut guard = guard_of(&long_plan());
+    guard.sync(&aborting).unwrap();
+    assert!(ask(&mut guard, "a", NEAR, Action::Buy, dec!(1)).is_rejected());
+    let before = guard.clone();
+    assert_eq!(guard.sync(&unwinding), Err(RollError::OtherPlan));
+    assert_eq!(guard, before);
+    assert!(ask(&mut guard, "b", NEAR, Action::Buy, dec!(1)).is_rejected());
+    // A different time of creation is another plan as well.
+    let later = RollPlan::new(RollRequest {
+        near: future(NEAR, NEAR_EXPIRY),
+        far: future(FAR, FAR_EXPIRY),
+        near_position: dec!(10),
+        far_position: dec!(0),
+        near_price: dec!(60000),
+        far_price: dec!(61000),
+        policy: RollFailurePolicy::Abort,
+        deadline_ms: DEADLINE,
+        created_at_ms: NOW + 1,
+    })
+    .unwrap();
+    assert_eq!(guard.sync(&later), Err(RollError::OtherPlan));
+    assert_eq!(guard, before);
+}
+
+#[test]
+fn a_fill_that_does_not_fit_its_order_stops_everything() {
+    // Not a quantity at all: not counted.
+    for quantity in [dec!(0), dec!(-1)] {
+        let mut guard = guard_of(&long_plan());
+        assert_eq!(
+            ask(&mut guard, "a", NEAR, Action::Sell, dec!(5)),
+            PretradeDecision::Accepted
+        );
+        assert!(
+            guard
+                .on_order_event(&order_fill("a", "e", Action::Sell, quantity, NOW))
+                .is_err()
+        );
+        assert_eq!(guard.position(RollLeg::Near), Ok(dec!(10)));
+        assert!(ask(&mut guard, "b", NEAR, Action::Sell, dec!(1)).is_rejected());
+    }
+    // On the other side of its order: a real execution, counted, and a fault.
+    let mut guard = guard_of(&long_plan());
+    assert_eq!(
+        ask(&mut guard, "a", NEAR, Action::Sell, dec!(5)),
+        PretradeDecision::Accepted
+    );
+    assert!(
+        guard
+            .on_order_event(&order_fill("a", "e", Action::Buy, dec!(2), NOW))
+            .is_err()
+    );
+    assert_eq!(guard.position(RollLeg::Near), Ok(dec!(12)));
+    assert!(ask(&mut guard, "b", NEAR, Action::Sell, dec!(1)).is_rejected());
+    guard.reset();
+    assert_eq!(
+        ask(&mut guard, "b", NEAR, Action::Sell, dec!(1)),
+        PretradeDecision::Accepted
+    );
+}
+
+#[test]
 fn a_fill_on_another_action_stops_everything_and_a_sync_does_not_clear_it() {
     let plan = long_plan();
     let mut guard = guard_of(&plan);
@@ -713,6 +801,26 @@ fn a_sync_refuses_what_is_older_or_different() {
     .unwrap();
     assert_eq!(guard.sync(&other), Err(RollError::OtherPlan));
     assert_eq!(guard, before);
+    // The same contracts, but not the same plan.
+    for different in [
+        plan_of(dec!(9), dec!(0), RollFailurePolicy::Abort),
+        plan_of(dec!(10), dec!(1), RollFailurePolicy::Abort),
+        RollPlan::new(RollRequest {
+            near: future(NEAR, NEAR_EXPIRY),
+            far: future(FAR, FAR_EXPIRY),
+            near_position: dec!(10),
+            far_position: dec!(0),
+            near_price: dec!(60000),
+            far_price: dec!(61000),
+            policy: RollFailurePolicy::Abort,
+            deadline_ms: DEADLINE - 1,
+            created_at_ms: NOW,
+        })
+        .unwrap(),
+    ] {
+        assert_eq!(guard.sync(&different), Err(RollError::OtherPlan));
+        assert_eq!(guard, before);
+    }
 
     // An older copy that differs by no fill: a rejection stopped the plan, and the copy
     // before it would start far opening again.
@@ -736,6 +844,13 @@ fn a_sync_refuses_what_is_older_or_different() {
     let mut fork = working.clone();
     fork.apply(&RollEvent::Tick { at_ms: NOW + 5 }).unwrap();
     assert_eq!(guard.sync(&fork), Err(RollError::StalePlan));
+    // A copy from before the rejection with more events since is no descendant either,
+    // and would reopen far.
+    fork.apply(&RollEvent::Tick { at_ms: NOW + 6 }).unwrap();
+    fork.apply(&RollEvent::Tick { at_ms: NOW + 7 }).unwrap();
+    assert_eq!(fork.state(), RollState::Working);
+    assert_eq!(guard.sync(&fork), Err(RollError::StalePlan));
+    assert!(ask(&mut guard, "c", FAR, Action::Buy, dec!(1)).is_rejected());
     let mut later = stopped.clone();
     later
         .apply(&RollEvent::CancelAck {
@@ -945,7 +1060,7 @@ fn once_the_plan_stops_far_opens_nothing_and_near_can_still_reduce() {
     ] {
         let plan = in_state(state, policy);
         let near_now = plan.position(RollLeg::Near);
-        let mut guard = guard_of(&long_plan());
+        let mut guard = guard_of(&plan_of(dec!(10), dec!(0), policy));
         guard.sync(&plan).unwrap();
         assert!(
             ask(&mut guard, "a", FAR, Action::Buy, dec!(1)).is_rejected(),

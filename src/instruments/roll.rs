@@ -365,11 +365,11 @@ pub enum RollError {
         /// The exposure now, in absolute value.
         exposure: Decimal,
     },
-    /// A guard given a plan of other contracts.
-    #[error("the plan is of other contracts than the guard")]
+    /// A guard given another plan, by anything in its request.
+    #[error("the plan is not the one the guard was made for")]
     OtherPlan,
-    /// A guard given a plan without fills that it saw from an earlier one.
-    #[error("the plan lacks fills that an earlier sync saw")]
+    /// A guard given a plan that does not descend from what an earlier sync saw.
+    #[error("the plan does not descend from what an earlier sync saw")]
     StalePlan,
     /// A reservation on a near contract that settled.
     #[cfg(feature = "margin")]
@@ -481,6 +481,8 @@ pub struct RollPlan {
     package: Decimal,
     uncovered: Decimal,
     grid: Decimal,
+    policy: RollFailurePolicy,
+    created_at_ms: u64,
     deadline_ms: u64,
     start_exposure: Decimal,
     near_position: Decimal,
@@ -490,8 +492,8 @@ pub struct RollPlan {
     closed_at_settlement: Decimal,
     /// Near fills with a part closed at the settlement, and that part, signed.
     closed_fills: Vec<(String, Decimal)>,
-    /// How many events changed the plan, so that an older copy can be told.
-    revision: u64,
+    /// The events that changed the plan, so that a copy can be told to descend from it.
+    history: Vec<RollEvent>,
     /// The latest time in any event, from the plan's creation on.
     observed_ms: u64,
     /// The length of a ledger's journal when the plan was anchored to it.
@@ -690,6 +692,8 @@ impl RollPlan {
             package: package.value(),
             uncovered,
             grid,
+            policy,
+            created_at_ms,
             deadline_ms,
             start_exposure,
             near_position,
@@ -698,7 +702,7 @@ impl RollPlan {
             settled: None,
             closed_at_settlement: Decimal::ZERO,
             closed_fills: Vec::new(),
-            revision: 0,
+            history: Vec::new(),
             observed_ms: created_at_ms,
             #[cfg(feature = "margin")]
             journal_anchor: None,
@@ -908,7 +912,7 @@ impl RollPlan {
     pub fn apply(&mut self, event: &RollEvent) -> Result<RollReport, RollError> {
         let report = self.apply_event(event)?;
         if !report.duplicate {
-            self.revision = self.revision.saturating_add(1);
+            self.history.push(event.clone());
             let at_ms = match event {
                 RollEvent::Fill(fill) => fill.at_ms,
                 RollEvent::Rejected { at_ms, .. }
