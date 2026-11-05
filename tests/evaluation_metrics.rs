@@ -460,6 +460,36 @@ fn test_fill_quality_uses_the_first_mark_at_or_after_the_horizon_within_the_dela
 }
 
 #[test]
+fn test_fill_quality_takes_the_last_of_marks_tied_at_the_horizon() {
+    let marks = [
+        mark(0, dec!(100)),
+        mark(1000, dec!(100)),
+        mark(1000, dec!(102)),
+        mark(1500, dec!(90)),
+    ];
+    let fills = [fill(0, Action::Buy, dec!(100), dec!(1))];
+    let spec = FillQualitySpec {
+        horizon_ms: 1000,
+        max_mark_delay_ms: 0,
+    };
+    let quality = fill_quality(&input(2000, &marks, &fills), spec).unwrap();
+    // 102 - 100, not the 100 before it at the same time, nor the later 90.
+    assert_eq!(quality.all.signed_markout, Some(dec!(2)));
+}
+
+#[test]
+fn test_attribute_daily_counts_a_fill_on_a_day_without_marks_on_the_owner_of_its_mark() {
+    let marks = [mark(0, dec!(100)), mark(2 * DAY, dec!(100))];
+    let fills = [fill(DAY + 1, Action::Buy, dec!(100), dec!(1))];
+    let (_, calendar) = attribute_daily(&input(3 * DAY, &marks, &fills)).unwrap();
+    let count: Vec<(u64, u64)> = calendar
+        .iter()
+        .map(|d| (d.bucket.marks, d.bucket.fills))
+        .collect();
+    assert_eq!(count, [(1, 1), (0, 0), (1, 0)]);
+}
+
+#[test]
 fn test_fill_quality_at_the_window_end_excludes_rather_than_reads_the_next_window() {
     // The validation window ends at 1000, and the holdout starts there with a
     // value that would change the answer. It cannot be passed in, and without it the

@@ -99,7 +99,7 @@ pub struct MetricDefinition {
 ///
 /// `s` is `+1` for one of our buys and `-1` for one of our sells, so `-s` is the
 /// taker's direction on a passive fill. `P` is the fill price, `M_f` the mark in
-/// force at the execution time of the fill and `M_H` the first mark at or after
+/// force at the execution time of the fill and `M_H` the first mark, the last of any tied at its time, at or after
 /// the execution time plus the horizon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

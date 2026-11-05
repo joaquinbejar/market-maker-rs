@@ -477,7 +477,9 @@ pub fn attribute(input: &EvaluationInput<'_>) -> EvalResult<BucketedAttribution<
 pub struct DailyAttribution {
     /// Whole UTC days since the Unix epoch.
     pub day: u64,
-    /// The day. Zero, with `marks == 0`, when nothing was observed.
+    /// The day. Zero, with `marks == 0`, for a day with no marks. Its `fills` count by
+    /// the mark in force and not by execution day, so a fill on a day with no marks
+    /// counts on the earlier day that owns that mark.
     pub bucket: BucketAttribution,
 }
 
@@ -614,7 +616,8 @@ pub fn inventory_stats(input: &EvaluationInput<'_>) -> EvalResult<InventoryStats
 pub struct FillQualitySpec {
     /// Time after the execution, in milliseconds. Positive.
     pub horizon_ms: u64,
-    /// The mark used is the first at or after the horizon, and it may be at most
+    /// The mark used is the first at or after the horizon, the last of them if several
+    /// tie at that time, and it may be at most
     /// this late. A fill with none is excluded and counted: an earlier mark is
     /// never used in its place.
     pub max_mark_delay_ms: u64,
@@ -755,10 +758,18 @@ pub fn fill_quality(
             .ok_or(EvaluationError::FillBeforeFirstMark { timestamp_ms: t })?
             .mid;
         let next = input.marks.partition_point(|m| m.timestamp_ms < due);
+        // Of marks tied at that time the last, as for the mark in force.
         let at_horizon = input
             .marks
             .get(next)
             .filter(|m| m.timestamp_ms <= latest)
+            .map(|first| {
+                input
+                    .marks
+                    .partition_point(|m| m.timestamp_ms <= first.timestamp_ms)
+            })
+            .and_then(|end| end.checked_sub(1))
+            .and_then(|last| input.marks.get(last))
             .map(|m| m.mid);
         let side = if fill.signed_quantity()? > Decimal::ZERO {
             Decimal::ONE

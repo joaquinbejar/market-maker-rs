@@ -46,7 +46,9 @@
 //! midnight belongs to the day it arrives in, and a day's inventory result runs to
 //! that day's last mark. [`attribute_daily`] keeps the whole UTC calendar of the
 //! window: a day without marks and fills has a zero attribution and `marks == 0`,
-//! so a reader can tell it from a flat day that was observed.
+//! so a reader can tell it from a flat day that was observed. Fills count by the
+//! mark in force: a fill on a day with no marks counts on the earlier day that owns
+//! that mark.
 //!
 //! # Limits
 //!
