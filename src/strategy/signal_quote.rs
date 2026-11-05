@@ -71,9 +71,13 @@ use crate::analytics::micro_price::{MicroPriceModel, MicroPriceRecord, SignalSou
 use crate::analytics::order_flow::{Trade, TradeSide};
 use crate::analytics::vpin::{VPINCalculator, VPINConfig};
 use crate::risk::RiskLimits;
+use crate::risk::pretrade::{
+    OrderEvent, OrderPurpose, PretradeDecision, PretradePolicy, PretradeRequest,
+};
 use crate::strategy::avellaneda_stoikov::calculate_optimal_quotes;
 use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
+use crate::types::fee::FeeAsset;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -484,6 +488,17 @@ pub struct SimulationReport {
     /// Sides not posted because they would cross the book, at the decision or on
     /// arrival.
     pub crossing_sides: u64,
+    /// Sides the policy of [`simulate_gated`] reduced. Zero without one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gate_reductions: u64,
+    /// Sides the policy of [`simulate_gated`] rejected, or withheld after it failed on an
+    /// event. Zero without one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gate_rejections: u64,
+    /// Lifecycle events the policy of [`simulate_gated`] could not account for. After the
+    /// first, no new side is sent.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gate_faults: u64,
     /// Fills.
     pub fills: u64,
     /// Volume filled.
@@ -561,6 +576,131 @@ struct Resting {
     from_ms: u64,
     bid: Option<(Decimal, Decimal)>,
     ask: Option<(Decimal, Decimal)>,
+    /// The decision's number, which names its orders to a gate.
+    order: u64,
+    bid_filled: Decimal,
+    ask_filled: Decimal,
+}
+
+impl Resting {
+    fn new(from_ms: u64, bid: Option<(Decimal, Decimal)>, ask: Option<(Decimal, Decimal)>) -> Self {
+        Self {
+            from_ms,
+            bid,
+            ask,
+            order: 0,
+            bid_filled: Decimal::ZERO,
+            ask_filled: Decimal::ZERO,
+        }
+    }
+}
+
+fn order_id(order: u64, side: Action) -> String {
+    let name = if matches!(side, Action::Buy) {
+        "bid"
+    } else {
+        "ask"
+    };
+    format!("sq-{order}-{name}")
+}
+
+/// A policy and what the simulation told it.
+struct Gate<'a> {
+    policy: &'a mut dyn PretradePolicy,
+    next_order: u64,
+    next_execution: u64,
+    faulted: bool,
+}
+
+impl Gate<'_> {
+    fn event(&mut self, event: &OrderEvent, report: &mut SimulationReport) {
+        if self.policy.on_order_event(event).is_err() {
+            self.faulted = true;
+            report.gate_faults = report.gate_faults.saturating_add(1);
+        }
+    }
+
+    /// Puts the sides of a decision to the policy.
+    fn admit(&mut self, resting: &mut Resting, now: u64, report: &mut SimulationReport) {
+        resting.order = self.next_order;
+        self.next_order = self.next_order.saturating_add(1);
+        for (side, level) in [
+            (Action::Buy, &mut resting.bid),
+            (Action::Sell, &mut resting.ask),
+        ] {
+            let Some((price, size)) = *level else {
+                continue;
+            };
+            if self.faulted {
+                *level = None;
+                report.gate_rejections = report.gate_rejections.saturating_add(1);
+                continue;
+            }
+            let request = PretradeRequest::new(
+                order_id(resting.order, side),
+                side,
+                Some(price),
+                size,
+                OrderPurpose::Quote,
+                now,
+            );
+            match self.policy.check(&request) {
+                PretradeDecision::Accepted => {}
+                PretradeDecision::Reduced { quantity, .. } if quantity > Decimal::ZERO => {
+                    *level = Some((price, quantity.min(size)));
+                    report.gate_reductions = report.gate_reductions.saturating_add(1);
+                }
+                PretradeDecision::Reduced { .. } | PretradeDecision::Rejected { .. } => {
+                    *level = None;
+                    report.gate_rejections = report.gate_rejections.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Orders of a quote that will not rest any longer.
+    fn cancel(&mut self, resting: &Resting, report: &mut SimulationReport) {
+        for (side, level) in [(Action::Buy, resting.bid), (Action::Sell, resting.ask)] {
+            if level.is_some() {
+                let order_id = order_id(resting.order, side);
+                self.event(&OrderEvent::Canceled { order_id }, report);
+            }
+        }
+    }
+
+    fn fill(
+        &mut self,
+        resting: &mut Resting,
+        fill: &FillRecord,
+        fee_rate: Decimal,
+        report: &mut SimulationReport,
+    ) -> MMResult<()> {
+        let filled = if matches!(fill.side, Action::Buy) {
+            &mut resting.bid_filled
+        } else {
+            &mut resting.ask_filled
+        };
+        *filled = filled.checked_add(fill.size).or_overflow("order filled")?;
+        let fee = fill
+            .price
+            .checked_mul(fill.size)
+            .and_then(|notional| notional.checked_mul(fee_rate))
+            .or_overflow("fee")?;
+        let event = OrderEvent::Fill {
+            order_id: order_id(resting.order, fill.side),
+            execution_id: format!("sq-fill-{}", self.next_execution),
+            side: fill.side,
+            price: fill.price,
+            quantity: fill.size,
+            cumulative_quantity: *filled,
+            fee,
+            fee_asset: FeeAsset::Quote,
+            timestamp: fill.timestamp_ms,
+        };
+        self.next_execution = self.next_execution.saturating_add(1);
+        self.event(&event, report);
+        Ok(())
+    }
 }
 
 /// Replays `events` under `signals`.
@@ -583,6 +723,37 @@ pub fn simulate(
     simulate_detailed(events, config, signals, record).map(|run| run.report)
 }
 
+/// Replays `events` like [`simulate_detailed`], with `policy` as a pretrade gate after
+/// the raw limits of `config`, which still apply.
+///
+/// The policy is reset first. It then sees each mid, each side of each decision before it
+/// can rest, and each side's life: accepted on arrival, rejected if it would cross by
+/// then, filled, or cancelled when replaced or at the terminal time and the end of the
+/// events. A quote is sent while the last one still rests until its replacement arrives,
+/// so a policy counting live orders counts both. A reduced side rests for the smaller size,
+/// and a rejected one does not rest. If the policy fails on an event, no new side is sent,
+/// and the events still reach it. See [`SimulationReport::gate_rejections`].
+///
+/// # Errors
+///
+/// As [`simulate`].
+pub fn simulate_gated(
+    events: &[MarketEvent],
+    config: &SimulationConfig,
+    signals: &SignalConfig,
+    record: Option<&MicroPriceRecord>,
+    policy: &mut dyn PretradePolicy,
+) -> MMResult<SimulationRun> {
+    policy.reset();
+    let gate = Gate {
+        policy,
+        next_order: 0,
+        next_execution: 0,
+        faulted: false,
+    };
+    replay(events, config, signals, record, Some(gate))
+}
+
 /// Replays `events` like [`simulate`], and also returns every decision and fill.
 ///
 /// # Errors
@@ -593,6 +764,16 @@ pub fn simulate_detailed(
     config: &SimulationConfig,
     signals: &SignalConfig,
     record: Option<&MicroPriceRecord>,
+) -> MMResult<SimulationRun> {
+    replay(events, config, signals, record, None)
+}
+
+fn replay(
+    events: &[MarketEvent],
+    config: &SimulationConfig,
+    signals: &SignalConfig,
+    record: Option<&MicroPriceRecord>,
+    mut gate: Option<Gate<'_>>,
 ) -> MMResult<SimulationRun> {
     let model = record.and_then(MicroPriceRecord::model);
     if let (Some(record), Some(first)) = (record, events.first())
@@ -628,6 +809,9 @@ pub fn simulate_detailed(
         invalid_quotes: 0,
         invalid_trades: 0,
         crossing_sides: 0,
+        gate_reductions: 0,
+        gate_rejections: 0,
+        gate_faults: 0,
         fills: 0,
         volume: Decimal::ZERO,
         final_inventory: Decimal::ZERO,
@@ -645,10 +829,9 @@ pub fn simulate_detailed(
     for event in events {
         let now = event.timestamp_ms();
         if now >= config.terminal_ms {
-            pending.clear();
-            live = None;
+            pull_all(&mut pending, &mut live, &mut gate, &mut report);
         }
-        activate(&mut pending, &mut live, now, book, &mut report);
+        activate(&mut pending, &mut live, now, book, &mut gate, &mut report);
         match event {
             MarketEvent::Trade(trade) => {
                 if trade.price <= Decimal::ZERO || trade.size <= Decimal::ZERO {
@@ -656,6 +839,7 @@ pub fn simulate_detailed(
                     continue;
                 }
                 if let (Some(resting), Some(mid)) = (live.as_mut(), last_mid) {
+                    let before = fills.len();
                     apply_trade(
                         trade,
                         resting,
@@ -665,6 +849,9 @@ pub fn simulate_detailed(
                         &mut report,
                         &mut fills,
                     )?;
+                    if let (Some(gate), Some(fill)) = (gate.as_mut(), fills.get(before)) {
+                        gate.fill(resting, fill, config.fee_rate, &mut report)?;
+                    }
                 }
                 vpin.add_trade(trade);
                 last_trade_ms = Some(trade.timestamp);
@@ -688,6 +875,9 @@ pub fn simulate_detailed(
                         .or_overflow("inventory pnl")?;
                 }
                 last_mid = Some(mid);
+                if let Some(gate) = gate.as_mut() {
+                    gate.policy.on_market_data(mid, now);
+                }
                 book = Some((quote.bid, quote.ask));
                 mids.push((now, mid));
                 if now >= config.terminal_ms {
@@ -699,7 +889,10 @@ pub fn simulate_detailed(
                 report.imbalance.add(adjustment.imbalance);
                 report.micro_price.add(adjustment.micro_price);
                 report.toxicity.add(adjustment.toxicity);
-                let resting = decide(quote, mid, inventory, &adjustment, config, &mut report)?;
+                let mut resting = decide(quote, mid, inventory, &adjustment, config, &mut report)?;
+                if let Some(gate) = gate.as_mut() {
+                    gate.admit(&mut resting, now, &mut report);
+                }
                 if resting.bid.is_none() && resting.ask.is_none() {
                     report.halted_decisions = report.halted_decisions.saturating_add(1);
                 }
@@ -710,11 +903,12 @@ pub fn simulate_detailed(
                     ask: resting.ask,
                 });
                 pending.push(resting);
-                activate(&mut pending, &mut live, now, book, &mut report);
+                activate(&mut pending, &mut live, now, book, &mut gate, &mut report);
             }
         }
     }
 
+    pull_all(&mut pending, &mut live, &mut gate, &mut report);
     report.final_inventory = inventory;
     report.total_pnl = report
         .spread_capture
@@ -737,24 +931,67 @@ fn activate(
     live: &mut Option<Resting>,
     now: u64,
     book: Option<(Decimal, Decimal)>,
+    gate: &mut Option<Gate<'_>>,
     report: &mut SimulationReport,
 ) {
     let due = pending.partition_point(|r| r.from_ms <= now);
     if due == 0 {
         return;
     }
-    let mut newest = pending.drain(..due).next_back();
-    if let (Some(resting), Some((best_bid, best_ask))) = (newest.as_mut(), book) {
-        if resting.bid.is_some_and(|(price, _)| price >= best_ask) {
-            resting.bid = None;
-            report.crossing_sides = report.crossing_sides.saturating_add(1);
+    let mut arrived: Vec<Resting> = pending.drain(..due).collect();
+    let mut newest = arrived.pop();
+    if let Some(gate) = gate.as_mut() {
+        // Those replaced before they rested, and the one replaced now.
+        for resting in arrived.iter().chain(live.iter()) {
+            gate.cancel(resting, report);
         }
-        if resting.ask.is_some_and(|(price, _)| price <= best_bid) {
-            resting.ask = None;
-            report.crossing_sides = report.crossing_sides.saturating_add(1);
+    }
+    if let Some(resting) = newest.as_mut() {
+        let order = resting.order;
+        for (side, level) in [
+            (Action::Buy, &mut resting.bid),
+            (Action::Sell, &mut resting.ask),
+        ] {
+            let Some((price, _)) = *level else {
+                continue;
+            };
+            let crosses = book.is_some_and(|(best_bid, best_ask)| {
+                if matches!(side, Action::Buy) {
+                    price >= best_ask
+                } else {
+                    price <= best_bid
+                }
+            });
+            if crosses {
+                *level = None;
+                report.crossing_sides = report.crossing_sides.saturating_add(1);
+                if let Some(gate) = gate.as_mut() {
+                    let order_id = order_id(order, side);
+                    gate.event(&OrderEvent::VenueRejected { order_id }, report);
+                }
+            } else if let Some(gate) = gate.as_mut() {
+                let order_id = order_id(order, side);
+                gate.event(&OrderEvent::Accepted { order_id }, report);
+            }
         }
     }
     *live = newest;
+}
+
+/// Takes every quote off, at the terminal time and at the end of the events.
+fn pull_all(
+    pending: &mut Vec<Resting>,
+    live: &mut Option<Resting>,
+    gate: &mut Option<Gate<'_>>,
+    report: &mut SimulationReport,
+) {
+    if let Some(gate) = gate.as_mut() {
+        for resting in pending.iter().chain(live.iter()) {
+            gate.cancel(resting, report);
+        }
+    }
+    pending.clear();
+    *live = None;
 }
 
 fn features_at(
@@ -827,11 +1064,7 @@ fn decide(
         .checked_add(config.latency_ms)
         .or_overflow("quote time")?;
     if !adjustment.quoting {
-        return Ok(Resting {
-            from_ms,
-            bid: None,
-            ask: None,
-        });
+        return Ok(Resting::new(from_ms, None, None));
     }
     let remaining = config
         .terminal_ms
@@ -848,11 +1081,7 @@ fn decide(
     let (bid, ask) = match quotes {
         Ok(quotes) => quotes,
         Err(MMError::InvalidQuoteGeneration(_)) => {
-            return Ok(Resting {
-                from_ms,
-                bid: None,
-                ask: None,
-            });
+            return Ok(Resting::new(from_ms, None, None));
         }
         Err(error) => return Err(error),
     };
@@ -916,11 +1145,7 @@ fn decide(
     } else {
         side_size(false, ask)?
     };
-    Ok(Resting {
-        from_ms,
-        bid: bid_side,
-        ask: ask_side,
-    })
+    Ok(Resting::new(from_ms, bid_side, ask_side))
 }
 
 /// The limits, for an order that increases the absolute position.
