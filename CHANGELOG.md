@@ -8,6 +8,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The net result of a calendar spread under an assumed exit (feature `arbitrage`,
+  #202): `instruments::calendar::evaluate_calendar` buys one linear dated future and
+  sells another of the same underlying. As two futures do not converge to each other,
+  the exit spread and its date, before the near expiry, are required inputs, and the
+  result reports the entry spread and that assumption apart, with entry fees, exit
+  costs and carry itemized. Settlement of the near leg is not modelled.
+  A non-positive entry spread can pass. New `BasisError::ExitOutsideWindow`.
 - The lifecycle of a dated future (feature `instruments`, #94):
   `instruments::futures::FutureTerms` joins a specification with how it settles
   and who publishes its settlement price, with a phase by the clock and a cash
