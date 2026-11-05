@@ -8,6 +8,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Example `consistent_time_travel` (#109): chronological replay as the baseline against
+  time travel as a separate labelled mode, on a small synthetic environment whose true
+  values are exact, with no new public API. It reports discontinuities, reuse of the tape
+  and unsupported actions, and shows a negative result: a search on the state mistakes an
+  action for an informed natural move. A replay never leaves its window. No market data
+  was read and no policy was trained.
 - Example `offline_rl_support` (#104): which diagnostics can support an offline evaluation,
   on a small synthetic environment whose true values are exact, with no new public API. It
   covers the shape of a log, action and state coverage, actions out of support, a hidden
