@@ -12,12 +12,12 @@
 
 use financial_types::instrument::InstrumentId as SpecId;
 use margin_rs::instrument::InstrumentScales;
-use margin_rs::ledger::{Execution, Ledger, LedgerConfig};
+use margin_rs::ledger::{DerivativeSettlement, Execution, FundingPayment, Ledger, LedgerConfig};
 use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId};
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::contracts::{
     ContractCommand, ContractConfig, ContractEngine, ContractFill, ContractOrder, ContractReport,
-    ContractRunResult, ContractStrategy, ContractView,
+    ContractRunResult, ContractStrategy, ContractView, MAX_COMMANDS_PER_INSTANT,
 };
 use market_maker_rs::backtest::engine::{
     BacktestConfig, BacktestStrategy, FeeCurrency, SlippageModel,
@@ -854,6 +854,79 @@ fn what_the_ledger_already_held_is_not_counted_again() {
 }
 
 #[test]
+fn settlements_and_funding_the_ledger_already_held_are_not_counted_again() {
+    let asset = |code| AssetCode::new(code).unwrap();
+    let perpetual = InstrumentSpec::new(InstrumentDraft {
+        id: SpecId::new("PERP").unwrap(),
+        kind: ContractKind::Perpetual,
+        margining: Margining::Linear,
+        underlying: asset("BTC"),
+        price_asset: asset("USDT"),
+        settlement_asset: asset("USDT"),
+        size: ContractSize::base(dec!(1), asset("BTC")).unwrap(),
+        price_ticks: TickSchedule::fixed(dec!(1)).unwrap(),
+        lot: dec!(1),
+        expiry_ms: None,
+        option: None,
+    })
+    .unwrap();
+    let mut funded = ledger_of(&[near().spec().clone(), perpetual]);
+    funded
+        .book_funding(&FundingPayment {
+            id: ExecutionId::new("funded").unwrap(),
+            instrument: InstrumentId::new("PERP").unwrap(),
+            amount: dec!(5),
+            as_of_ms: 1,
+        })
+        .unwrap();
+    let mut settled = ledger_of(&[near().spec().clone()]);
+    settled
+        .book_settlement(&DerivativeSettlement {
+            id: ExecutionId::new("settled").unwrap(),
+            // A settlement is for a derivative held outside the ledger.
+            instrument: InstrumentId::new("OUTSIDE").unwrap(),
+            asset: Asset::new("USDT").unwrap(),
+            realized_pnl: dec!(5),
+            fee: dec!(0),
+        })
+        .unwrap();
+    for ledger in [funded, settled] {
+        let mut engine = ContractEngine::new(config(dec!(0)), ledger, Script::default())
+            .with_contract(
+                near(),
+                data(vec![tick(10, dec!(98), dec!(102))]),
+                ImmediateFillModel::new(),
+            )
+            .unwrap();
+        let result = engine.run();
+        assert_eq!(result.total_pnl, dec!(0));
+        assert_eq!(result.equity_curve, vec![(10, dec!(1000))]);
+        assert!(result.is_consistent(), "{result:?}");
+    }
+}
+
+/// With no fee, the journal holds none, rather than a fee of zero.
+#[test]
+fn a_fill_with_no_fee_books_none() {
+    let script = Script::of(vec![vec![order(
+        1,
+        near_id(),
+        Action::Buy,
+        dec!(100),
+        dec!(1),
+    )]]);
+    let mut engine = two_contracts(
+        dec!(0),
+        both_ledger(),
+        script,
+        vec![tick(10, dec!(98), dec!(102)), tick(20, dec!(98), dec!(100))],
+        vec![],
+    );
+    engine.run();
+    assert_eq!(engine.ledger().journal()[0].fee, None);
+}
+
+#[test]
 fn a_cancel_that_crosses_a_fill_is_answered_and_is_no_fault() {
     let mut script = Script::of(vec![vec![order(
         1,
@@ -988,8 +1061,11 @@ fn a_command_that_makes_no_sense_is_a_fault_and_stops_new_orders() {
             vec![tick(10, dec!(98), dec!(102)), tick(20, dec!(98), dec!(102))],
             vec![],
         );
-        engine.run();
+        let result = engine.run();
         assert_eq!(engine.fault_count(), 1, "{reason}");
+        // A run stopped by a fault does not read clean.
+        assert_eq!(result.fault_count, 1, "{reason}");
+        assert!(!result.is_consistent(), "{reason}");
         assert!(
             engine.faults()[0].to_string().contains(reason),
             "{:?}",
@@ -1697,6 +1773,301 @@ fn a_reset_forgets_the_marks_of_the_last_run() {
     let second = engine.run();
     assert_eq!(second.unvalued_ticks, 1);
     assert_eq!(second.equity_curve, first.equity_curve);
+}
+
+#[test]
+fn equity_overflow_is_visible_in_accounting_status() {
+    let mut ledger = both_ledger();
+    seed(
+        &mut ledger,
+        "seed-1",
+        "NEAR",
+        Action::Buy,
+        dec!(100),
+        dec!(1),
+    );
+    let mut config = config(dec!(0));
+    config.initial_capital = Decimal::MAX;
+    let script = Script::of(vec![
+        vec![],
+        vec![order(1, near_id(), Action::Buy, dec!(90), dec!(1))],
+    ]);
+    let mut engine = ContractEngine::new(config, ledger, script)
+        .with_contract(
+            near(),
+            data(vec![
+                tick(10, dec!(100), dec!(102)),
+                tick(20, dec!(100), dec!(102)),
+            ]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap();
+    let result = engine.run();
+    assert!(result.accounting.valuation_failures > 0);
+    assert!(!result.is_consistent());
+    assert!(result.equity_curve.is_empty(), "{:?}", result.equity_curve);
+    assert_eq!(result.total_pnl, dec!(0));
+    // A fault stops new orders.
+    assert_eq!(
+        engine.execution_reports().last().unwrap().report.kind,
+        ExecutionKind::Rejected
+    );
+}
+
+#[test]
+fn exhausted_execution_number_never_replays_a_seed_fill() {
+    let mut ledger = both_ledger();
+    let last = format!("sim-{}", u64::MAX);
+    seed(&mut ledger, &last, "NEAR", Action::Buy, dec!(100), dec!(1));
+    let script = Script::of(vec![vec![order(
+        1,
+        near_id(),
+        Action::Buy,
+        dec!(100),
+        dec!(1),
+    )]]);
+    let policy = Recorded::of(PretradeDecision::Accepted);
+    let mut engine = two_contracts(
+        dec!(0),
+        ledger,
+        script,
+        vec![tick(10, dec!(98), dec!(102)), tick(20, dec!(98), dec!(100))],
+        vec![],
+    )
+    .with_pretrade_policy(policy.clone())
+    .unwrap();
+    let result = engine.run();
+    assert_eq!(result.num_trades, 0);
+    assert_eq!(result.accounting.dropped_fills, 1);
+    assert!(!result.is_consistent());
+    assert_eq!(line(&result, &near_id()).position, dec!(1));
+    assert_eq!(line(&result, &near_id()).fills, 0);
+    assert_eq!(engine.ledger().journal().len(), 1);
+    assert!(engine.faults()[0].to_string().contains("used up"));
+    // Nothing moved: the order is open, and the policy saw no fill.
+    assert!(
+        policy
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event, OrderEvent::Fill { .. }))
+    );
+    assert!(
+        engine
+            .execution_reports()
+            .iter()
+            .all(|r| r.report.kind == ExecutionKind::Accepted)
+    );
+}
+
+#[test]
+fn failed_declared_settlement_is_not_a_consistent_run_even_when_flat() {
+    // Its digits are refused when it is declared, flat or not.
+    let error = two_contracts(dec!(0), both_ledger(), Script::default(), vec![], vec![])
+        .with_settlement(settlement(&near(), dec!(0.000000001), NEAR_MS))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("settlement of NEAR"),
+        "{error:?}"
+    );
+
+    // What only fails on the position it finds, flat when declared.
+    let huge = dec!(10000000000000000000);
+    let script = Script::of(vec![vec![order(1, near_id(), Action::Buy, dec!(1), huge)]]);
+    let mut engine = two_contracts(
+        dec!(0),
+        both_ledger(),
+        script,
+        vec![
+            MarketTick::new(10, dec!(1), huge, dec!(3), huge),
+            MarketTick::new(20, dec!(0), huge, dec!(1), huge),
+        ],
+        vec![],
+    )
+    .with_settlement(settlement(&near(), dec!(10000000000), NEAR_MS))
+    .unwrap();
+    let result = engine.run();
+    let near_line = line(&result, &near_id());
+    assert_eq!(result.num_trades, 1);
+    assert!(near_line.settlement_failed);
+    assert!(!near_line.settled);
+    assert_eq!(near_line.position, huge);
+    assert!(!result.is_consistent());
+    assert!(
+        engine.faults()[0]
+            .to_string()
+            .contains("settlement of NEAR")
+    );
+    assert!(
+        engine
+            .strategy()
+            .log
+            .iter()
+            .all(|l| !l.starts_with("settled"))
+    );
+}
+
+/// A tick observed after its contract settled shows the position gone, and an order sent
+/// on it is rejected locally.
+#[test]
+fn a_late_observation_of_a_contract_already_settled() {
+    let mut ledger = both_ledger();
+    seed(
+        &mut ledger,
+        "seed-1",
+        "NEAR",
+        Action::Buy,
+        dec!(100),
+        dec!(1),
+    );
+    let script = Script::of(vec![vec![order(
+        1,
+        near_id(),
+        Action::Sell,
+        dec!(100),
+        dec!(1),
+    )]]);
+    let mut engine = two_contracts(
+        dec!(0),
+        ledger,
+        script,
+        vec![tick(990, dec!(100), dec!(102))],
+        vec![tick(1100, dec!(105), dec!(107))],
+    )
+    .with_latency(SimLatencyConfig::new().with_observation_ms(50))
+    .unwrap()
+    .with_settlement(settlement(&near(), dec!(103), NEAR_MS))
+    .unwrap();
+    let result = engine.run();
+    let log = &engine.strategy().log;
+    assert_eq!(log[0], "settled NEAR at 103 closing 1");
+    assert_eq!(log[1], "tick NEAR 990 near 0 far 0");
+    assert_eq!(result.num_trades, 0);
+    assert_eq!(result.total_pnl, dec!(3));
+    assert_eq!(
+        engine.execution_reports()[0].report.kind,
+        ExecutionKind::Rejected
+    );
+}
+
+/// A strategy that answers every rejection with two new orders, at zero latency.
+#[derive(Debug, Default)]
+struct Insists {
+    reports: u64,
+    tag: u64,
+}
+
+impl Insists {
+    fn again(&mut self) -> Vec<ContractCommand> {
+        self.tag += 2;
+        vec![
+            order(self.tag - 1, near_id(), Action::Buy, dec!(100.5), dec!(1)),
+            order(self.tag, near_id(), Action::Buy, dec!(100.5), dec!(1)),
+        ]
+    }
+}
+
+impl ContractStrategy for Insists {
+    fn on_tick(
+        &mut self,
+        _contract: &SpecId,
+        _tick: &MarketTick,
+        _view: &ContractView,
+    ) -> Vec<ContractCommand> {
+        self.again()
+    }
+    fn on_report(&mut self, _report: &ContractReport) -> Vec<ContractCommand> {
+        self.reports += 1;
+        self.again()
+    }
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[test]
+fn a_strategy_that_never_stops_answering_is_a_fault_and_the_run_ends() {
+    let mut config = config(dec!(0));
+    config.record_trades = false;
+    let mut engine = ContractEngine::new(config, both_ledger(), Insists::default())
+        .with_contract(
+            near(),
+            data(vec![tick(10, dec!(98), dec!(102))]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap();
+    let result = engine.run();
+    assert_eq!(result.fault_count, 1);
+    assert!(result.discarded_commands > 0);
+    assert!(!result.is_consistent());
+    assert_eq!(engine.strategy().reports, MAX_COMMANDS_PER_INSTANT);
+    assert!(engine.faults()[0].to_string().contains("commands at 10"));
+}
+
+#[test]
+fn up_to_the_budget_commands_run_and_each_time_has_its_own() {
+    // Two ticks whose rejections together pass one budget, but not one each.
+    let half = usize::try_from(MAX_COMMANDS_PER_INSTANT / 2 + 1).unwrap();
+    let many = |from: u64| -> Vec<ContractCommand> {
+        (0..half as u64)
+            .map(|i| order(from + i, near_id(), Action::Buy, dec!(100.5), dec!(1)))
+            .collect()
+    };
+    let script = Script::of(vec![many(0), many(1_000_000)]);
+    let mut config = config(dec!(0));
+    config.record_trades = false;
+    config.record_equity_curve = false;
+    let mut engine = ContractEngine::new(config, both_ledger(), script)
+        .with_contract(
+            near(),
+            data(vec![
+                tick(10, dec!(98), dec!(102)),
+                tick(20, dec!(98), dec!(102)),
+            ]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap();
+    let result = engine.run();
+    assert_eq!(result.fault_count, 0);
+    assert_eq!(result.discarded_commands, 0);
+}
+
+#[test]
+fn a_second_run_needs_a_reset() {
+    let script = Script::of(vec![vec![order(
+        1,
+        near_id(),
+        Action::Buy,
+        dec!(100),
+        dec!(1),
+    )]]);
+    let mut engine = two_contracts(
+        dec!(0.001),
+        both_ledger(),
+        script,
+        vec![tick(10, dec!(98), dec!(102)), tick(20, dec!(98), dec!(100))],
+        vec![],
+    );
+    let first = engine.run();
+    assert!(first.is_consistent(), "{first:?}");
+    let again = engine.run();
+    assert_eq!(again.num_ticks, 0);
+    assert!(
+        again
+            .accounting
+            .setup_refused
+            .as_ref()
+            .unwrap()
+            .contains("needs a reset")
+    );
+    assert!(!again.is_consistent());
+    // The ledger did not move, and a reset opens it again.
+    assert_eq!(engine.ledger().journal().len(), 1);
+    engine.reset();
+    let second = engine.run();
+    assert_eq!(second.net_pnl, first.net_pnl);
+    assert!(second.is_consistent(), "{second:?}");
 }
 
 // The single contract engine and this one, on the same run.

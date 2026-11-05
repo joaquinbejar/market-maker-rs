@@ -35,8 +35,9 @@
 //!
 //! The policy sees a fill before the ledger does, as in the single contract engine. A
 //! command returned by any callback runs after that callback returns and through the same
-//! checks as any other. A strategy that answers each rejection with a new order at zero
-//! latency does not end.
+//! checks as any other. So a strategy could answer each rejection with a new order at zero
+//! latency for ever: past [`MAX_COMMANDS_PER_INSTANT`] commands at one time, that is a fault
+//! and they are discarded, so the run ends.
 //!
 //! # Expiry and settlement
 //!
@@ -70,8 +71,10 @@
 //!
 //! Until each open contract has a mark there is no valuation, no equity point and no fault,
 //! only [`ContractRunResult::unvalued_ticks`]. A contract still open with no mark when the
-//! run ends makes it not consistent. A valuation that fails on a mark it has is a fault, as
-//! in the single contract engine: the previous figures stay, and new orders stop.
+//! run ends makes it not consistent. A valuation that fails on a mark it has, or a figure
+//! that overflows, is a fault counted in `valuation_failures`: the previous figures stay,
+//! new orders stop, and no limit value stands in for a result. The single contract engine
+//! saturates its sums instead.
 //!
 //! # Against the single contract engine
 //!
@@ -83,13 +86,14 @@
 //!   fill and records it;
 //! - realized and fees count from the start of the run, where that engine counts what the
 //!   ledger already held;
+//! - a figure that overflows is a fault, where that engine saturates it;
 //! - it knows the position the ledger started with, where a strategy there starts from zero.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use financial_types::instrument::InstrumentId;
-use margin_rs::ledger::{Booking, Execution, Ledger};
+use margin_rs::ledger::{AssetPnl, Booking, Execution, Ledger};
 use margin_rs::{Asset, ExecutionId};
 
 use super::accounting::largest_execution_number;
@@ -109,6 +113,10 @@ use crate::types::action::Dir;
 use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 use crate::types::fee::FeeAsset;
+
+/// The commands a run carries out at one time, past which they are a fault and are
+/// discarded: see the [module documentation](self).
+pub const MAX_COMMANDS_PER_INSTANT: u64 = 100_000;
 
 /// Configuration of a [`ContractEngine`].
 #[derive(Debug, Clone)]
@@ -282,6 +290,8 @@ pub struct ContractSummary {
     pub expired: bool,
     /// A declared settlement booked.
     pub settled: bool,
+    /// A declared settlement that the ledger refused when it was published.
+    pub settlement_failed: bool,
     /// Past its expiry, with a position and no settlement: it rests on its last mark.
     pub expired_unsettled: bool,
     /// Its ticks ignored, as they came after its expiry.
@@ -328,16 +338,22 @@ pub struct ContractRunResult {
     pub stale_from_ms: Option<u64>,
     /// Largest shortfall per asset from booking fills the balance did not cover.
     pub overdrafts: BTreeMap<Asset, Decimal>,
-    /// Commands returned after the data ended, which nothing could carry out.
+    /// Commands discarded: those returned after the data ended, which nothing could carry
+    /// out, and those past [`MAX_COMMANDS_PER_INSTANT`].
     pub discarded_commands: u64,
+    /// Total faults, the first of which [`ContractEngine::faults`] keeps. From the first
+    /// one on, every new order was refused.
+    pub fault_count: u64,
 }
 
 impl ContractRunResult {
-    /// Whether the run started, booked and valued all it should, with no contract left
-    /// past its expiry without a settlement or open with no mark.
+    /// Whether the run started, booked and valued all it should, with no fault and no
+    /// contract left past its expiry without a settlement, open with no mark, or with a settlement the
+    /// ledger refused.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
         self.accounting.is_consistent()
+            && self.fault_count == 0
             && self.never_valued.is_empty()
             && self.contracts.iter().all(|c| !c.expired_unsettled)
     }
@@ -353,6 +369,7 @@ struct Lane<D, F> {
     mark: Option<(Decimal, u64)>,
     expired: bool,
     settled: bool,
+    settlement_failed: bool,
     max_position: Decimal,
     fills: u64,
     ignored_ticks: u64,
@@ -362,6 +379,16 @@ impl<D, F> Lane<D, F> {
     fn id(&self) -> &InstrumentId {
         self.terms.spec().id()
     }
+}
+
+/// What a valuation gives, all of it exact, or none of it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Figures {
+    total_pnl: Decimal,
+    unrealized: Decimal,
+    fees: Decimal,
+    net_pnl: Decimal,
+    equity: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -426,9 +453,7 @@ pub struct ContractEngine<S: ContractStrategy, D: HistoricalDataSource, F: FillM
     /// Realized PnL and fees the ledger held at the start.
     base_realized: Decimal,
     base_fees: Decimal,
-    realized: Decimal,
-    unrealized: Decimal,
-    fees: Decimal,
+    figures: Figures,
     unvalued_ticks: u64,
     stale_from_ms: Option<u64>,
     overdrafts: BTreeMap<Asset, Decimal>,
@@ -440,6 +465,10 @@ pub struct ContractEngine<S: ContractStrategy, D: HistoricalDataSource, F: FillM
     fault_count: u64,
     data_ended: bool,
     discarded_commands: u64,
+    /// The time of the commands being counted, and how many.
+    commands_now: (u64, u64),
+    /// A run started, and no reset came after it.
+    started: bool,
 }
 
 impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<S, D, F> {
@@ -488,9 +517,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             max_drawdown: Decimal::ZERO,
             base_realized: Decimal::ZERO,
             base_fees: Decimal::ZERO,
-            realized: Decimal::ZERO,
-            unrealized: Decimal::ZERO,
-            fees: Decimal::ZERO,
+            figures: Figures::default(),
             unvalued_ticks: 0,
             stale_from_ms: None,
             overdrafts: BTreeMap::new(),
@@ -502,6 +529,8 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             fault_count: 0,
             data_ended: false,
             discarded_commands: 0,
+            commands_now: (0, 0),
+            started: false,
         }
     }
 
@@ -557,6 +586,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             mark: None,
             expired: false,
             settled: false,
+            settlement_failed: false,
             max_position: Decimal::ZERO,
             fills: 0,
             ignored_ticks: 0,
@@ -570,7 +600,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
     /// # Errors
     ///
     /// [`MMError::InvalidConfiguration`] for a contract not added, a price the contract
-    /// refuses, or a second price for it.
+    /// or the ledger refuses, or a second price for it.
     pub fn with_settlement(mut self, price: SettlementPrice) -> MMResult<Self> {
         let name = price.instrument().as_str().to_string();
         let refuse = |reason: String| {
@@ -593,6 +623,14 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .get(index)
             .map(|lane| lane.terms.check_settlement(&price));
         if let Some(Err(error)) = checked {
+            return refuse(error.to_string());
+        }
+        // What the ledger refuses of the price itself, such as its digits.
+        let tried = self.lanes.get(index).map(|lane| {
+            lane.terms
+                .settle_in_ledger(&mut self.ledger.clone(), &price)
+        });
+        if let Some(Err(error)) = tried {
             return refuse(error.to_string());
         }
         self.declared.push((index, price));
@@ -706,6 +744,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             lane.mark = None;
             lane.expired = false;
             lane.settled = false;
+            lane.settlement_failed = false;
             lane.max_position = Decimal::ZERO;
             lane.fills = 0;
             lane.ignored_ticks = 0;
@@ -739,9 +778,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         self.equity_curve.clear();
         self.peak_equity = self.config.initial_capital;
         self.max_drawdown = Decimal::ZERO;
-        self.realized = Decimal::ZERO;
-        self.unrealized = Decimal::ZERO;
-        self.fees = Decimal::ZERO;
+        self.figures = Figures::default();
         self.unvalued_ticks = 0;
         self.stale_from_ms = None;
         self.overdrafts.clear();
@@ -753,10 +790,17 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         self.fault_count = 0;
         self.data_ended = false;
         self.discarded_commands = 0;
+        self.commands_now = (0, 0);
+        self.started = false;
     }
 
     /// Refuses what cannot be valued, and fixes where the run starts.
     fn start(&mut self) -> MMResult<()> {
+        if self.started {
+            return Err(MMError::InvalidConfiguration(
+                "a contract run needs a reset before running again".to_string(),
+            ));
+        }
         if self.lanes.is_empty() {
             return Err(MMError::InvalidConfiguration(
                 "a contract run needs a contract".to_string(),
@@ -794,6 +838,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .try_fold(Decimal::ZERO, |sum, value| sum.checked_add(value))
             .or_overflow("ledger realized pnl")?;
         self.base_fees = self.ledger.fees_paid(&asset);
+        self.started = true;
         let ledger = &self.ledger;
         self.view.positions = self
             .lanes
@@ -821,7 +866,8 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         Some((index, tick))
     }
 
-    /// Runs the backtest: see the [module documentation](self).
+    /// Runs the backtest: see the [module documentation](self). A second run needs a
+    /// [`ContractEngine::reset`] first, or it is refused, with nothing processed.
     pub fn run(&mut self) -> ContractRunResult {
         let (mut num_ticks, mut start_time, mut end_time) = (0u64, 0u64, 0u64);
         self.setup_refused = None;
@@ -963,6 +1009,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         match lane.terms.settle_in_ledger(&mut self.ledger, &price) {
             Ok(_) => lane.settled = true,
             Err(error) => {
+                lane.settlement_failed = true;
                 self.record_fault(MMError::InvalidPositionUpdate(format!(
                     "settlement of {}: {error}",
                     price.instrument().as_str()
@@ -1076,6 +1123,18 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         charge: &FeeCharge,
         now: u64,
     ) {
+        // Before anything moves: a number used up must not name an execution again.
+        let execution = self.next_execution_id;
+        let numbers = execution
+            .checked_add(1)
+            .zip(self.execution_offset.checked_add(execution));
+        let Some((next_execution_id, number)) = numbers else {
+            self.dropped_fills = self.dropped_fills.saturating_add(1);
+            self.record_fault(MMError::NumericalError(
+                "execution numbers are used up".to_string(),
+            ));
+            return;
+        };
         let Some(lane) = self.lanes.get_mut(index) else {
             return;
         };
@@ -1090,9 +1149,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         let report = ExecutionReport::fill(stamp, order, price, quantity, charge.quote_value);
         let (order_id, cumulative, side) = (order.id, order.filled, order.side);
         let tag = self.owners.get(&order_id).map_or(0, |(_, tag)| *tag);
-        let execution = self.next_execution_id;
-        self.next_execution_id = self.next_execution_id.saturating_add(1);
-        let number = self.execution_offset.saturating_add(execution);
+        self.next_execution_id = next_execution_id;
         let execution_id = format!("sim-{number}");
         self.notify_policy(OrderEvent::Fill {
             order_id: order_id.to_string(),
@@ -1159,9 +1216,13 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .ledger
             .book_execution_allowing_overdraft(&execution, None)
             .map_err(|e| error("booking", e))?;
-        if matches!(booked.booking, Booking::Booked(_)) {
-            lane.fills = lane.fills.saturating_add(1);
+        if !matches!(booked.booking, Booking::Booked(_)) {
+            return Err(MMError::InvalidPositionUpdate(format!(
+                "margin ledger booking: {} was already booked",
+                fill.execution_id
+            )));
         }
+        lane.fills = lane.fills.saturating_add(1);
         for (asset, shortfall) in booked.shortfalls {
             let worst = self.overdrafts.entry(asset).or_insert(Decimal::ZERO);
             *worst = (*worst).max(shortfall);
@@ -1175,8 +1236,22 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
     }
 
     fn apply_commands(&mut self, commands: Vec<ContractCommand>, now: u64) {
+        let count = crate::types::decimal::saturating_u64(commands.len());
         if self.data_ended {
-            let count = crate::types::decimal::saturating_u64(commands.len());
+            self.discarded_commands = self.discarded_commands.saturating_add(count);
+            return;
+        }
+        if self.commands_now.0 != now {
+            self.commands_now = (now, 0);
+        }
+        let so_far = self.commands_now.1;
+        self.commands_now.1 = so_far.saturating_add(count);
+        if self.commands_now.1 > MAX_COMMANDS_PER_INSTANT {
+            if so_far <= MAX_COMMANDS_PER_INSTANT {
+                self.record_fault(MMError::InvalidMarketState(format!(
+                    "more than {MAX_COMMANDS_PER_INSTANT} commands at {now}"
+                )));
+            }
             self.discarded_commands = self.discarded_commands.saturating_add(count);
             return;
         }
@@ -1216,7 +1291,13 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             return;
         }
         let id = self.next_order_id;
-        self.next_order_id = self.next_order_id.saturating_add(1);
+        let Some(next_order_id) = id.checked_add(1) else {
+            self.record_fault(MMError::NumericalError(
+                "order identifiers are used up".to_string(),
+            ));
+            return;
+        };
+        self.next_order_id = next_order_id;
         self.tags.insert(tag, id);
         self.owners.insert(id, (index, tag));
         let stamp = self.clock.stamp();
@@ -1345,7 +1426,13 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
 
     fn schedule(&mut self, effective: u64, action: PendingAction) {
         let key = (effective, self.next_message);
-        self.next_message = self.next_message.saturating_add(1);
+        let Some(next_message) = self.next_message.checked_add(1) else {
+            self.record_fault(MMError::NumericalError(
+                "venue message numbers are used up".to_string(),
+            ));
+            return;
+        };
+        self.next_message = next_message;
         if let PendingAction::Activate(_, order) = &action {
             self.pending_activations.insert(order.id, key);
         }
@@ -1535,8 +1622,23 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         })
     }
 
-    /// Reads realized, unrealized and fees from the ledger at the latest marks. `false`
-    /// if there is no fresh valuation. A failure keeps the previous figures.
+    /// The figures of a valuation line, or `None` if one overflows.
+    fn figures_of(&self, line: &AssetPnl) -> Option<Figures> {
+        let realized = line.realized_pnl.checked_sub(self.base_realized)?;
+        let fees = line.fees_paid.checked_sub(self.base_fees)?;
+        let total_pnl = realized.checked_add(line.unrealized_pnl)?;
+        let net_pnl = total_pnl.checked_sub(fees)?;
+        Some(Figures {
+            total_pnl,
+            unrealized: line.unrealized_pnl,
+            fees,
+            net_pnl,
+            equity: Some(self.config.initial_capital.checked_add(net_pnl)?),
+        })
+    }
+
+    /// Reads the figures from the ledger at the latest marks. `false` if an open contract
+    /// has no mark yet. A failure keeps the previous figures, and is a fault.
     fn value(&mut self) -> bool {
         if self.lacks_mark() {
             return false;
@@ -1546,28 +1648,30 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .iter()
             .filter_map(|lane| lane.mark.map(|(mark, _)| (lane.ledger_id.clone(), mark)))
             .collect();
-        let valued = self.ledger.valuation(&marks).map_err(|error| {
-            MMError::InvalidPositionUpdate(format!("margin ledger valuation: {error}"))
-        });
-        let line = valued.map(|valuation| {
-            self.settlement_asset
-                .as_ref()
-                .and_then(|asset| valuation.by_asset.get(asset).cloned())
-                .unwrap_or_default()
-        });
-        match line {
-            Ok(line) => {
-                self.realized = line.realized_pnl.saturating_sub(self.base_realized);
-                self.unrealized = line.unrealized_pnl;
-                self.fees = line.fees_paid.saturating_sub(self.base_fees);
-                true
-            }
-            Err(error) => {
-                self.valuation_failures = self.valuation_failures.saturating_add(1);
-                self.record_fault(error);
-                true
-            }
+        let figures = self
+            .ledger
+            .valuation(&marks)
+            .map_err(|error| {
+                MMError::InvalidPositionUpdate(format!("margin ledger valuation: {error}"))
+            })
+            .and_then(|valuation| {
+                let line = self
+                    .settlement_asset
+                    .as_ref()
+                    .and_then(|asset| valuation.by_asset.get(asset).cloned())
+                    .unwrap_or_default();
+                self.figures_of(&line).or_overflow("run figures")
+            });
+        match figures {
+            Ok(figures) => self.figures = figures,
+            Err(error) => self.value_failed(error),
         }
+        true
+    }
+
+    fn value_failed(&mut self, error: MMError) {
+        self.valuation_failures = self.valuation_failures.saturating_add(1);
+        self.record_fault(error);
     }
 
     /// One point of the equity curve, if the run can be valued.
@@ -1576,12 +1680,10 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             self.unvalued_ticks = self.unvalued_ticks.saturating_add(1);
             return;
         }
-        let equity = self
-            .config
-            .initial_capital
-            .saturating_add(self.realized)
-            .saturating_add(self.unrealized)
-            .saturating_sub(self.fees);
+        // None only before any valuation succeeded, which leaves no figure to show.
+        let Some(equity) = self.figures.equity else {
+            return;
+        };
         if self.config.record_equity_curve {
             self.equity_curve.push((timestamp, equity));
         }
@@ -1596,9 +1698,11 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         if equity > self.peak_equity {
             self.peak_equity = equity;
         }
-        let drawdown = self.peak_equity.saturating_sub(equity);
-        if drawdown > self.max_drawdown {
-            self.max_drawdown = drawdown;
+        match self.peak_equity.checked_sub(equity) {
+            Some(drawdown) => self.max_drawdown = self.max_drawdown.max(drawdown),
+            None => self.value_failed(MMError::NumericalError(
+                "the run's drawdown overflowed".to_string(),
+            )),
         }
     }
 
@@ -1610,7 +1714,6 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
     }
 
     fn result(&self, num_ticks: u64, start_time: u64, end_time: u64) -> ContractRunResult {
-        let total_pnl = self.realized.saturating_add(self.unrealized);
         let contracts = self
             .lanes
             .iter()
@@ -1626,6 +1729,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
                 last_mark_ms: lane.mark.map(|(_, at)| at),
                 expired: lane.expired,
                 settled: lane.settled,
+                settlement_failed: lane.settlement_failed,
                 expired_unsettled: Self::rests_on_last_mark(&self.ledger, lane),
                 ignored_ticks: lane.ignored_ticks,
             })
@@ -1643,10 +1747,10 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .map(|lane| lane.id().clone())
             .collect();
         ContractRunResult {
-            total_pnl,
-            total_fees: self.fees,
-            net_pnl: total_pnl.saturating_sub(self.fees),
-            unrealized_pnl: self.unrealized,
+            total_pnl: self.figures.total_pnl,
+            total_fees: self.figures.fees,
+            net_pnl: self.figures.net_pnl,
+            unrealized_pnl: self.figures.unrealized,
             num_trades: self.num_trades,
             num_ticks,
             start_time,
@@ -1669,6 +1773,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             stale_from_ms: self.stale_from_ms,
             overdrafts: self.overdrafts.clone(),
             discarded_commands: self.discarded_commands,
+            fault_count: self.fault_count,
         }
     }
 }
