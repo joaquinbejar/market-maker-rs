@@ -16,6 +16,13 @@ project follows [Semantic Versioning](https://semver.org/).
   `phase_in_ledger` reports `Settled` from the ledger's record. `FutureCalendar`
   orders declared contracts of one product. The published price is taken as given:
   its averaging method is not verified or reproduced. Delivery is not supported.
+- What may be quoted and reserved during a roll (feature `arbitrage`, #94):
+  `instruments::roll::RollGuard`, a `PretradePolicy` for the live path that makes the
+  near contract close only and caps the far one at the plan, with a limit on the
+  exposure of both legs. With `margin` too, `RollReserves` holds both legs' margin in
+  a ledger and releases the near contract's orders once it settled, and
+  `FutureTerms::settle_in_gate` settles in a risk gate's ledger. The backtest engine
+  does not run them (#199).
 - A two contract roll plan (feature `arbitrage`, #94):
   `instruments::roll::RollPlan` moves a position from a dated future to a later one,
   preserving `contracts * size`: the underlying on a linear contract, the contract

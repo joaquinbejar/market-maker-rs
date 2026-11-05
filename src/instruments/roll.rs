@@ -1,4 +1,5 @@
-//! A plan to roll a position from a dated future to a later one, in two legs.
+//! A plan to roll a position from a dated future to a later one, in two legs, and what
+//! may be quoted and reserved meanwhile ([`RollGuard`]).
 //!
 //! A [`RollPlan`] closes a position on the near contract and opens it on the far
 //! one. It only emits intents; sending orders is the caller's job, and execution is
@@ -71,6 +72,12 @@ use arbitrage_rs::venues::VenueId;
 use arbitrage_rs::{ArbitrageError, Cost, Currency, Leg, Money, Price, Quantity, Timestamp};
 use financial_types::Action;
 use rust_decimal::Decimal;
+
+pub mod guard;
+
+pub use guard::RollGuard;
+#[cfg(feature = "margin")]
+pub use guard::RollReserves;
 
 use super::AssetCode;
 use super::futures::{FutureCalendar, FutureError, FuturePhase, FutureTerms, SettlementPrice};
@@ -350,6 +357,28 @@ pub enum RollError {
     /// A settlement reported again with other data.
     #[error("the near contract's settlement was observed with other data")]
     ConflictingSettlement,
+    /// An exposure limit below the exposure already held.
+    #[error("exposure limit {max_exposure} is below the exposure of {exposure}")]
+    InvalidExposureLimit {
+        /// The limit.
+        max_exposure: Decimal,
+        /// The exposure now, in absolute value.
+        exposure: Decimal,
+    },
+    /// A guard given another plan, by anything in its request.
+    #[error("the plan is not the one the guard was made for")]
+    OtherPlan,
+    /// A guard given a plan that does not descend from what an earlier sync saw.
+    #[error("the plan does not descend from what an earlier sync saw")]
+    StalePlan,
+    /// A reservation on a near contract that settled.
+    #[cfg(feature = "margin")]
+    #[error("the near contract settled")]
+    NearAlreadySettled,
+    /// A settlement reported of a near contract that a ledger has not settled.
+    #[cfg(feature = "margin")]
+    #[error("the ledger has not settled the near contract")]
+    NearNotSettled,
     /// A reconciliation of a plan that was not anchored to its ledger.
     #[cfg(feature = "margin")]
     #[error("the plan was not anchored to a ledger: see RollPlan::anchored_to")]
@@ -452,6 +481,9 @@ pub struct RollPlan {
     package: Decimal,
     uncovered: Decimal,
     grid: Decimal,
+    policy: RollFailurePolicy,
+    created_at_ms: u64,
+    deadline_ms: u64,
     start_exposure: Decimal,
     near_position: Decimal,
     far_position: Decimal,
@@ -460,6 +492,10 @@ pub struct RollPlan {
     closed_at_settlement: Decimal,
     /// Near fills with a part closed at the settlement, and that part, signed.
     closed_fills: Vec<(String, Decimal)>,
+    /// The events that changed the plan, so that a copy can be told to descend from it.
+    history: Vec<RollEvent>,
+    /// The latest time in any event, from the plan's creation on.
+    observed_ms: u64,
     /// The length of a ledger's journal when the plan was anchored to it.
     #[cfg(feature = "margin")]
     journal_anchor: Option<u64>,
@@ -656,6 +692,9 @@ impl RollPlan {
             package: package.value(),
             uncovered,
             grid,
+            policy,
+            created_at_ms,
+            deadline_ms,
             start_exposure,
             near_position,
             far_position,
@@ -663,6 +702,8 @@ impl RollPlan {
             settled: None,
             closed_at_settlement: Decimal::ZERO,
             closed_fills: Vec::new(),
+            history: Vec::new(),
+            observed_ms: created_at_ms,
             #[cfg(feature = "margin")]
             journal_anchor: None,
             intents,
@@ -869,6 +910,22 @@ impl RollPlan {
     /// [`RollError`]: see the [module documentation](self) for what is an error for a
     /// fill. Any other event the intents refuse is one too, unless the plan is faulted.
     pub fn apply(&mut self, event: &RollEvent) -> Result<RollReport, RollError> {
+        let report = self.apply_event(event)?;
+        if !report.duplicate {
+            self.history.push(event.clone());
+            let at_ms = match event {
+                RollEvent::Fill(fill) => fill.at_ms,
+                RollEvent::Rejected { at_ms, .. }
+                | RollEvent::CancelAck { at_ms, .. }
+                | RollEvent::Tick { at_ms } => *at_ms,
+                RollEvent::NearSettled { price, .. } => price.published_ms(),
+            };
+            self.observed_ms = self.observed_ms.max(at_ms);
+        }
+        Ok(report)
+    }
+
+    fn apply_event(&mut self, event: &RollEvent) -> Result<RollReport, RollError> {
         match event {
             RollEvent::Fill(fill) => self.apply_fill(fill),
             RollEvent::NearSettled { price, contracts } => self.apply_settlement(price, *contracts),
