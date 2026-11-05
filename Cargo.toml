@@ -139,6 +139,10 @@ name = "kernel_glft"
 required-features = ["kernel"]
 
 [[test]]
+name = "hawkes_robustness"
+required-features = ["margin"]
+
+[[test]]
 name = "kernel_margin"
 required-features = ["kernel", "margin"]
 
