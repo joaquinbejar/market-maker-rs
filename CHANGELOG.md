@@ -16,6 +16,14 @@ project follows [Semantic Versioning](https://semver.org/).
   `phase_in_ledger` reports `Settled` from the ledger's record. `FutureCalendar`
   orders declared contracts of one product. The published price is taken as given:
   its averaging method is not verified or reproduced. Delivery is not supported.
+- A two contract roll plan (feature `arbitrage`, #94):
+  `instruments::roll::RollPlan` moves a position from a dated future to a later one,
+  preserving `contracts * size`: the underlying on a linear contract, the contract
+  value on an inverse one. It keeps every observed fill itself, so positions and the
+  exposure gap stay right when one leg fills alone or a fill does not fit its intents,
+  which then fault. With `margin` too, `reconcile` compares it with a ledger, per fill
+  and per leg, reporting what is unexplained as a quantity. It only emits intents, and
+  the backtest engine does not run it (#199).
 - The net edge of a basis trade (new feature `arbitrage`, off by default, #94):
   `instruments::basis::evaluate_basis` buys one leg and sells the other, a spot and
   a linear dated future, through `arbitrage-rs`, whose types stay out of this

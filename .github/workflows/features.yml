@@ -106,7 +106,10 @@ jobs:
 
       # arbitrage-rs is a normal dependency only with this feature.
       - name: Test the basis evaluation
-        run: cargo test --no-default-features --features arbitrage --lib --test instruments_basis
+        run: cargo test --no-default-features --features arbitrage --lib --test instruments_basis --test instruments_roll
+
+      - name: Test the roll plan against a ledger
+        run: cargo test --no-default-features --features arbitrage,margin --test instruments_roll
 
       # The margin-rs adapter is compiled only with both features.
       - name: Test the margin-rs instrument adapter
