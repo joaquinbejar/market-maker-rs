@@ -457,10 +457,11 @@ struct RawRun {
 
 type RunFn = dyn Fn(RunRequest) -> MMResult<RawRun>;
 
-/// An execution assumption: a fill model and a latency.
+/// An execution assumption: a fill model, a latency and optionally a fee rate.
 pub struct Scenario {
     name: String,
     latency: SimLatencyConfig,
+    fee_rate: Option<Decimal>,
     parameters: BTreeMap<String, String>,
     fill_model_description: Box<dyn Fn() -> String>,
     run: Box<RunFn>,
@@ -471,6 +472,7 @@ impl fmt::Debug for Scenario {
         f.debug_struct("Scenario")
             .field("name", &self.name)
             .field("latency", &self.latency)
+            .field("fee_rate", &self.fee_rate)
             .field("parameters", &self.parameters)
             .finish_non_exhaustive()
     }
@@ -497,6 +499,7 @@ impl Scenario {
         Self {
             name: name.into(),
             latency,
+            fee_rate: None,
             parameters,
             fill_model_description: Box::new(move || describe(0).description()),
             run: Box::new(move |request: RunRequest| {
@@ -518,6 +521,16 @@ impl Scenario {
                 })
             }),
         }
+    }
+}
+
+impl Scenario {
+    /// Replaces the experiment's fee rate under this scenario, a negative rate being
+    /// a rebate. The fee currency stays the experiment's. Any other rule is unchanged.
+    #[must_use]
+    pub fn with_fee_rate(mut self, fee_rate: Decimal) -> Self {
+        self.fee_rate = Some(fee_rate);
+        self
     }
 }
 
@@ -616,6 +629,8 @@ pub struct CandidateRecord {
 pub struct ScenarioRecord {
     /// Debug text of the latency configuration, with its seed.
     pub latency: String,
+    /// The fee rate replacing the experiment's, if any.
+    pub fee_rate: Option<Decimal>,
     /// The fill model's own description.
     pub fill_model: String,
     /// Declared parameters.
@@ -739,7 +754,10 @@ pub struct Experiment {
     validation: Vec<MarketTick>,
     holdout: Vec<MarketTick>,
     candidates: BTreeMap<String, Candidate>,
-    scenarios: Vec<Scenario>,
+    /// The first scenario, the only one the holdout runs under.
+    reference: Scenario,
+    /// The scenarios after it, for sensitivity on validation.
+    sensitivity: Vec<Scenario>,
     policy: Option<Box<PolicyFactory>>,
     regimes: Option<Box<RegimeFactory>>,
 }
@@ -780,13 +798,15 @@ impl Experiment {
         if !candidates.iter().any(|c| c.kind == CandidateKind::Baseline) {
             return invalid("an experiment needs a simple baseline".to_string());
         }
-        if scenarios.is_empty() {
-            return invalid("an experiment needs a scenario".to_string());
-        }
         let names: BTreeSet<&str> = scenarios.iter().map(|s| s.name.as_str()).collect();
         if names.len() != scenarios.len() {
             return invalid("scenario names must be different".to_string());
         }
+        let mut scenarios = scenarios.into_iter();
+        let Some(reference) = scenarios.next() else {
+            return invalid("an experiment needs a scenario".to_string());
+        };
+        let sensitivity = scenarios.collect();
         let mut by_name = BTreeMap::new();
         for candidate in candidates {
             let name = candidate.name.clone();
@@ -828,7 +848,8 @@ impl Experiment {
             validation,
             holdout,
             candidates: by_name,
-            scenarios,
+            reference,
+            sensitivity,
             policy: None,
             regimes: None,
         })
@@ -853,13 +874,13 @@ impl Experiment {
 
     fn manifest(&self, selection: Vec<String>, validation_digest: Option<String>) -> Manifest {
         let scenarios = self
-            .scenarios
-            .iter()
+            .scenarios()
             .map(|s| {
                 (
                     s.name.clone(),
                     ScenarioRecord {
                         latency: format!("{:?}", s.latency),
+                        fee_rate: s.fee_rate,
                         fill_model: (s.fill_model_description)(),
                         parameters: s.parameters.clone(),
                         validation_seed: derived_seed(
@@ -902,16 +923,15 @@ impl Experiment {
                 })
                 .collect(),
             scenarios,
-            reference_scenario: self.reference().name.clone(),
+            reference_scenario: self.reference.name.clone(),
             selection,
             validation_digest,
         }
     }
 
-    /// The first scenario; [`Experiment::new`] refuses none.
-    fn reference(&self) -> &Scenario {
-        #[allow(clippy::indexing_slicing)] // `new` refuses an empty list.
-        &self.scenarios[0]
+    /// Every scenario, the reference first.
+    fn scenarios(&self) -> impl Iterator<Item = &Scenario> {
+        std::iter::once(&self.reference).chain(&self.sensitivity)
     }
 
     /// One run, or why not.
@@ -926,6 +946,9 @@ impl Experiment {
         let strategy = (candidate.make)(&self.train).map_err(|e| format!("factory: {e}"))?;
         let mut execution = self.config.execution.clone();
         execution.record_trades = true;
+        if let Some(fee_rate) = scenario.fee_rate {
+            execution.fee_rate = fee_rate;
+        }
         let raw = (scenario.run)(RunRequest {
             execution,
             strategy,
@@ -1066,8 +1089,7 @@ impl Experiment {
     pub fn evaluate_validation(self) -> ValidatedExperiment {
         let names: BTreeSet<&String> = self.candidates.keys().collect();
         let rows = self
-            .scenarios
-            .iter()
+            .scenarios()
             .flat_map(|scenario| self.rows_for(scenario, WindowKind::Validation, &names))
             .collect();
         let report = ValidationReport {
@@ -1140,7 +1162,7 @@ impl ValidatedExperiment {
         if names.is_empty() {
             return invalid("a selection needs a candidate".to_string());
         }
-        let reference = self.experiment.reference().name.clone();
+        let reference = self.experiment.reference.name.clone();
         for name in names {
             if !self.experiment.candidates.contains_key(*name) {
                 return invalid(format!("unknown candidate {name}"));
@@ -1221,7 +1243,7 @@ impl Selection {
             .filter(|(name, c)| c.kind == CandidateKind::Baseline || self.selected.contains(*name))
             .map(|(name, _)| name)
             .collect();
-        let holdout = experiment.rows_for(experiment.reference(), WindowKind::Holdout, &names);
+        let holdout = experiment.rows_for(&experiment.reference, WindowKind::Holdout, &names);
         let not_selected = experiment
             .candidates
             .keys()
@@ -1241,6 +1263,12 @@ impl Selection {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

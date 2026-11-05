@@ -95,6 +95,12 @@ fn immediate() -> Scenario {
     )
 }
 
+fn immediate_named(name: &str) -> Scenario {
+    Scenario::new(name, SimLatencyConfig::new(), BTreeMap::new(), |_| {
+        ImmediateFillModel
+    })
+}
+
 /// A strategy with its own distance from the mid.
 struct Quoter(Decimal);
 
@@ -830,4 +836,70 @@ fn test_two_runs_serialize_to_the_same_bytes() {
         serde_json::to_vec(&report).unwrap()
     };
     assert_eq!(run(), run());
+}
+
+#[test]
+fn test_scenario_fee_rate_replaces_the_rate_and_nothing_else() {
+    let validated = Experiment::new(
+        experiment_config(),
+        ticks(),
+        with(vec![quoter("a", dec!(0.25))]),
+        vec![
+            immediate(),
+            immediate_named("double").with_fee_rate(dec!(0.002)),
+            immediate_named("rebate").with_fee_rate(dec!(-0.001)),
+        ],
+    )
+    .unwrap()
+    .evaluate_validation();
+    let rows = &validated.report().rows;
+    let totals = |scenario: &str| completed(row(rows, "a", scenario)).metrics.attribution;
+    let (base, double, rebate) = (totals("immediate"), totals("double"), totals("rebate"));
+    assert!(base.quote_fees > dec!(0));
+    // The experiment's rate is 0.001: the same fills at twice it and at minus it.
+    assert_eq!(double.quote_fees, base.quote_fees * dec!(2));
+    assert_eq!(rebate.quote_fees, -base.quote_fees);
+    assert_eq!(double.spread_capture, base.spread_capture);
+    assert_eq!(double.inventory_pnl, base.inventory_pnl);
+    assert_eq!(double.net_pnl, base.net_pnl - base.quote_fees);
+    let scenarios = &validated.report().manifest.scenarios;
+    assert_eq!(scenarios["immediate"].fee_rate, None);
+    assert_eq!(scenarios["double"].fee_rate, Some(dec!(0.002)));
+}
+
+#[test]
+fn test_holdout_uses_the_fee_rate_of_the_reference_scenario() {
+    let report = Experiment::new(
+        experiment_config(),
+        ticks(),
+        with(vec![quoter("a", dec!(0.25))]),
+        vec![
+            immediate().with_fee_rate(dec!(0)),
+            immediate_named("charged"),
+        ],
+    )
+    .unwrap()
+    .evaluate_validation()
+    .select(&["a"])
+    .unwrap()
+    .run_holdout();
+    let row = report.holdout.iter().find(|r| r.candidate == "a").unwrap();
+    assert_eq!(completed(row).metrics.attribution.quote_fees, dec!(0));
+}
+
+#[test]
+fn test_difference_to_an_identical_trading_baseline_is_exactly_zero() {
+    let validated = Experiment::new(
+        experiment_config(),
+        ticks(),
+        with(vec![quoter("same", dec!(0.5))]),
+        vec![immediate()],
+    )
+    .unwrap()
+    .evaluate_validation();
+    let metrics = completed(row(&validated.report().rows, "same", "immediate"));
+    assert!(metrics.metrics.fills > 0);
+    assert_eq!(interval(metrics.against_baselines["fixed-spread"]).0, 0.0);
+    let (_, lower, upper, _) = interval(metrics.against_baselines["fixed-spread"]);
+    assert_eq!((lower, upper), (0.0, 0.0));
 }

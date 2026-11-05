@@ -403,6 +403,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             |_| ImmediateFillModel::new(),
         ),
         Scenario::new(
+            "double-fee",
+            SimLatencyConfig::new(),
+            BTreeMap::new(),
+            |_| ImmediateFillModel::new(),
+        )
+        .with_fee_rate(dec!(0.0002)),
+        Scenario::new(
             "one-hour-latency",
             SimLatencyConfig::new().with_submit_ms(HOUR),
             BTreeMap::new(),
