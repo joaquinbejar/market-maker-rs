@@ -416,19 +416,7 @@ impl FutureTerms {
         &self,
         ledger: &Ledger,
     ) -> Result<margin_rs::InstrumentId, FutureError> {
-        let instrument = self.spec.id().as_str();
-        let id = margin_rs::InstrumentId::new(instrument)?;
-        if let Some(registered) = ledger.instrument(&id) {
-            let same = super::margin::registered_scales(registered)
-                .and_then(|scales| margin_rs::Instrument::from_spec(&self.spec, scales).ok())
-                .is_some_and(|expected| expected == *registered);
-            if !same {
-                return Err(FutureError::OtherTermsInLedger {
-                    instrument: instrument.to_string(),
-                });
-            }
-        }
-        Ok(id)
+        identify_spec_in_ledger(&self.spec, ledger)
     }
 
     /// Books the settlement in `ledger`, closing its position at the price, at the
@@ -563,4 +551,26 @@ impl FutureCalendar {
     pub fn trading_at(&self, now_ms: u64) -> impl Iterator<Item = &FutureTerms> {
         self.0.iter().filter(move |c| c.expiry_ms > now_ms)
     }
+}
+
+/// The ledger's identifier of `spec`. An instrument it holds under that identifier with
+/// other terms, at its registered scales, is an error.
+#[cfg(feature = "margin")]
+pub(crate) fn identify_spec_in_ledger(
+    spec: &InstrumentSpec,
+    ledger: &Ledger,
+) -> Result<margin_rs::InstrumentId, FutureError> {
+    let instrument = spec.id().as_str();
+    let id = margin_rs::InstrumentId::new(instrument)?;
+    if let Some(registered) = ledger.instrument(&id) {
+        let same = super::margin::registered_scales(registered)
+            .and_then(|scales| margin_rs::Instrument::from_spec(spec, scales).ok())
+            .is_some_and(|expected| expected == *registered);
+        if !same {
+            return Err(FutureError::OtherTermsInLedger {
+                instrument: instrument.to_string(),
+            });
+        }
+    }
+    Ok(id)
 }
