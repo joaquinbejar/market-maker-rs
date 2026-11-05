@@ -1776,6 +1776,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     /// - trade volume is `price * contracts`, which is not a notional;
     /// - the accountant books with overdraft, with no margin requirement or
     ///   liquidation, and no funding, expiry or settlement;
+    /// - one contract only: a run across contracts, for a roll, is #199;
     /// - a fill at or after a future's expiry is refused by the accountant and
     ///   recorded in [`AccountingStatus::refused_executions`];
     /// - a mark the accountant cannot value is counted in

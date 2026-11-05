@@ -412,7 +412,7 @@ impl FutureTerms {
     /// The ledger's identifier of this contract. An instrument it holds under that
     /// identifier with other terms, at its registered scales, is an error.
     #[cfg(feature = "margin")]
-    pub(super) fn identify_in_ledger(
+    pub(crate) fn identify_in_ledger(
         &self,
         ledger: &Ledger,
     ) -> Result<margin_rs::InstrumentId, FutureError> {
@@ -450,18 +450,45 @@ impl FutureTerms {
         ledger: &mut Ledger,
         price: &SettlementPrice,
     ) -> Result<PostingBooking<ExpiryCashflow>, FutureError> {
+        let settlement = self.expiry_settlement(ledger, price)?;
+        Ok(ledger.settle_expiry(&settlement)?)
+    }
+
+    /// As [`FutureTerms::settle_in_ledger`], in the ledger of a risk gate.
+    ///
+    /// # Errors
+    ///
+    /// As [`FutureTerms::settle_in_ledger`].
+    #[cfg(feature = "margin")]
+    pub fn settle_in_gate(
+        &self,
+        gate: &mut margin_rs::risk::RiskGate,
+        price: &SettlementPrice,
+    ) -> Result<PostingBooking<ExpiryCashflow>, FutureError> {
+        let settlement = self.expiry_settlement(gate.ledger(), price)?;
+        Ok(gate.settle_expiry(&settlement)?)
+    }
+
+    /// What a ledger books for this price, once the price and the ledger's contract
+    /// are checked.
+    #[cfg(feature = "margin")]
+    fn expiry_settlement(
+        &self,
+        ledger: &Ledger,
+        price: &SettlementPrice,
+    ) -> Result<ExpirySettlement, FutureError> {
         self.check_settlement(price)?;
         let id = self.identify_in_ledger(ledger)?;
+        let instrument = self.spec.id().as_str();
         match self.method {
             SettlementMethod::Cash => {}
         }
-        let instrument = self.spec.id().as_str();
-        Ok(ledger.settle_expiry(&ExpirySettlement {
+        Ok(ExpirySettlement {
             id: margin_rs::ExecutionId::new(format!("expiry:{instrument}"))?,
             instrument: id,
             price: price.price,
             as_of_ms: price.published_ms,
-        })?)
+        })
     }
 
     /// The phase at `now_ms`: [`FuturePhase::Settled`] once `ledger` holds the

@@ -1,4 +1,5 @@
-//! A plan to roll a position from a dated future to a later one, in two legs.
+//! A plan to roll a position from a dated future to a later one, in two legs, and what
+//! may be quoted and reserved meanwhile ([`RollGuard`]).
 //!
 //! A [`RollPlan`] closes a position on the near contract and opens it on the far
 //! one. It only emits intents; sending orders is the caller's job, and execution is
@@ -71,6 +72,12 @@ use arbitrage_rs::venues::VenueId;
 use arbitrage_rs::{ArbitrageError, Cost, Currency, Leg, Money, Price, Quantity, Timestamp};
 use financial_types::Action;
 use rust_decimal::Decimal;
+
+pub mod guard;
+
+pub use guard::RollGuard;
+#[cfg(feature = "margin")]
+pub use guard::RollReserves;
 
 use super::AssetCode;
 use super::futures::{FutureCalendar, FutureError, FuturePhase, FutureTerms, SettlementPrice};
@@ -350,6 +357,28 @@ pub enum RollError {
     /// A settlement reported again with other data.
     #[error("the near contract's settlement was observed with other data")]
     ConflictingSettlement,
+    /// An exposure limit below the exposure already held.
+    #[error("exposure limit {max_exposure} is below the exposure of {exposure}")]
+    InvalidExposureLimit {
+        /// The limit.
+        max_exposure: Decimal,
+        /// The exposure now, in absolute value.
+        exposure: Decimal,
+    },
+    /// A guard given a plan of other contracts.
+    #[error("the plan is of other contracts than the guard")]
+    OtherPlan,
+    /// A guard given a plan without fills that it saw from an earlier one.
+    #[error("the plan lacks fills that an earlier sync saw")]
+    StalePlan,
+    /// A reservation on a near contract that settled.
+    #[cfg(feature = "margin")]
+    #[error("the near contract settled")]
+    NearAlreadySettled,
+    /// A settlement reported of a near contract that a ledger has not settled.
+    #[cfg(feature = "margin")]
+    #[error("the ledger has not settled the near contract")]
+    NearNotSettled,
     /// A reconciliation of a plan that was not anchored to its ledger.
     #[cfg(feature = "margin")]
     #[error("the plan was not anchored to a ledger: see RollPlan::anchored_to")]
@@ -452,6 +481,7 @@ pub struct RollPlan {
     package: Decimal,
     uncovered: Decimal,
     grid: Decimal,
+    deadline_ms: u64,
     start_exposure: Decimal,
     near_position: Decimal,
     far_position: Decimal,
@@ -656,6 +686,7 @@ impl RollPlan {
             package: package.value(),
             uncovered,
             grid,
+            deadline_ms,
             start_exposure,
             near_position,
             far_position,
