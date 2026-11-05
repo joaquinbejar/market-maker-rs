@@ -60,6 +60,8 @@ pub const MAX_RATE: f64 = 1e9;
 pub const MAX_THINNING: u32 = 1_000_000;
 /// Most events one run keeps.
 pub const MAX_RUN_EVENTS: usize = 50_000_000;
+/// The most intervals or probes one segment is measured over.
+pub const MAX_INTERVALS: f64 = 100_000_000.0;
 const EVENT_TYPES: usize = 3;
 const KINDS: [QrEventKind; EVENT_TYPES] =
     [QrEventKind::Limit, QrEventKind::Cancel, QrEventKind::Market];
@@ -387,6 +389,7 @@ fn decay_excitation(excitation: &mut Excitation, decays: &[f64], delta: f64) {
 /// Restorable state: fixed size and `Copy`, with the excitation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(into = "RawState", try_from = "RawState"))]
 pub struct HawkesState {
     /// Queue size.
     pub queue: u32,
@@ -404,6 +407,62 @@ pub struct HawkesState {
     pub fingerprint_low: u64,
     /// High half of the parameters' fingerprint.
     pub fingerprint_high: u64,
+}
+
+/// Exported form of [`HawkesState`], with exact floats: a stored state goes on with the
+/// same stream.
+#[cfg(feature = "serde")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawState {
+    queue: u32,
+    time_seconds: String,
+    clock_seconds: String,
+    excitation: [[String; EVENT_TYPES]; MAX_KERNELS],
+    rng_state: u64,
+    events: u64,
+    fingerprint_low: u64,
+    fingerprint_high: u64,
+}
+
+#[cfg(feature = "serde")]
+impl From<HawkesState> for RawState {
+    fn from(state: HawkesState) -> Self {
+        Self {
+            queue: state.queue,
+            time_seconds: float_text(state.time_seconds),
+            clock_seconds: float_text(state.clock_seconds),
+            excitation: state.excitation.map(|row| row.map(float_text)),
+            rng_state: state.rng_state,
+            events: state.events,
+            fingerprint_low: state.fingerprint_low,
+            fingerprint_high: state.fingerprint_high,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawState> for HawkesState {
+    type Error = MMError;
+
+    fn try_from(raw: RawState) -> MMResult<Self> {
+        let mut excitation = [[0.0; EVENT_TYPES]; MAX_KERNELS];
+        for (row, texts) in excitation.iter_mut().zip(&raw.excitation) {
+            for (cell, text) in row.iter_mut().zip(texts) {
+                *cell = text_float(text)?;
+            }
+        }
+        Ok(Self {
+            queue: raw.queue,
+            time_seconds: text_float(&raw.time_seconds)?,
+            clock_seconds: text_float(&raw.clock_seconds)?,
+            excitation,
+            rng_state: raw.rng_state,
+            events: raw.events,
+            fingerprint_low: raw.fingerprint_low,
+            fingerprint_high: raw.fingerprint_high,
+        })
+    }
 }
 
 fn fingerprint_parts(fingerprint: u128) -> (u64, u64) {
@@ -803,7 +862,7 @@ pub struct HawkesRecord {
     pub seconds: f64,
     /// Queue sizes that took a baseline from the nearest supported size.
     pub borrowed_sizes: u32,
-    /// Log likelihood per step, ending at the fitted parameters.
+    /// Log likelihood before each step, then at the fitted parameters.
     pub likelihood_trace: Vec<f64>,
     /// The parameters, or why there are none.
     pub fit: HawkesFit,
@@ -913,14 +972,23 @@ fn expectation(segments: &[HawkesSegment], params: &HawkesParameters) -> MMResul
     Ok(out)
 }
 
-/// Estimates by expectation maximization. Each step cannot lower the likelihood,
-/// apart from the floor and rounding, and the trace in the record shows it.
+/// Estimates by expectation maximization. Each step cannot lower the likelihood, apart
+/// from the floor, rounding and a size that borrows its baseline from another, and the trace
+/// in the record shows it.
 ///
 /// # Errors
 ///
-/// Returns [`MMError::InvalidConfiguration`] for invalid settings, and
+/// Returns [`MMError::InvalidConfiguration`] for invalid settings, decays included, and
 /// [`MMError::InvalidMarketState`] for a segment that breaks the queue rules.
 pub fn fit_hawkes(segments: &[HawkesSegment], config: &HawkesFitConfig) -> MMResult<HawkesRecord> {
+    if config.decays.len() > MAX_KERNELS
+        || config
+            .decays
+            .iter()
+            .any(|decay| !(decay.is_finite() && *decay >= 1.0 / MAX_RATE && *decay <= MAX_RATE))
+    {
+        return invalid(format!("decays {:?}", config.decays));
+    }
     if config.max_queue == 0
         || config.max_queue > MAX_QUEUE
         || config.iterations == 0
@@ -1038,6 +1106,7 @@ pub fn fit_hawkes(segments: &[HawkesSegment], config: &HawkesFitConfig) -> MMRes
             Err(error) => return Err(error),
         }
     }
+    trace.push(expectation(segments, &params)?.log_likelihood);
     let borrowed = supported.iter().filter(|s| !**s).count();
     let borrowed_sizes = u32::try_from(borrowed).unwrap_or(u32::MAX);
     Ok(finish(HawkesFit::Calibrated(params), borrowed_sizes, trace))
@@ -1349,6 +1418,9 @@ pub fn events_per_interval(
     let mut out = Vec::new();
     for segment in segments {
         let whole = (segment.duration_seconds / interval_seconds).floor();
+        if whole > MAX_INTERVALS {
+            return invalid(format!("{whole} intervals in a segment"));
+        }
         let bins = rust_decimal::prelude::ToPrimitive::to_usize(&whole).or_overflow("intervals")?;
         let mut counts = vec![0u32; bins];
         for event in segment.events.iter().filter(|e| e.kind == kind) {
@@ -1388,6 +1460,9 @@ pub fn fill_rate(
     }
     let (mut probes, mut filled) = (0usize, 0usize);
     for segment in segments {
+        if segment.duration_seconds / probe_seconds > MAX_INTERVALS {
+            return invalid(format!("probes every {probe_seconds} in a segment"));
+        }
         let mut queues = Vec::with_capacity(segment.events.len().saturating_add(1));
         let mut queue = f64::from(segment.initial_queue);
         queues.push(queue);

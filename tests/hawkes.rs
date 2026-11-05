@@ -10,6 +10,7 @@
 
 use market_maker_rs::backtest::hawkes::*;
 use market_maker_rs::backtest::queue_reactive::{QrEventKind, RateTable};
+use market_maker_rs::types::error::MMError;
 
 const CAP: usize = 15;
 const LIMIT: QrEventKind = QrEventKind::Limit;
@@ -787,4 +788,53 @@ mod decoding {
             );
         }
     }
+}
+
+#[test]
+fn test_fit_refuses_invalid_decays_as_an_error() {
+    let data = generate(&truth(), 100, 1, 200.0);
+    for decays in [vec![0.0], vec![f64::NAN], vec![1.0; MAX_KERNELS + 1]] {
+        let config = HawkesFitConfig::new(CAP as u32, decays);
+        assert!(matches!(
+            fit_hawkes(&data, &config),
+            Err(MMError::InvalidConfiguration(_))
+        ));
+    }
+}
+
+#[test]
+fn test_trace_ends_at_the_likelihood_of_the_fitted_parameters() {
+    let data = generate(&truth(), 100, 2, 500.0);
+    let config = HawkesFitConfig::new(CAP as u32, vec![2.0]).with_iterations(3);
+    let record = fit_hawkes(&data, &config).unwrap();
+    assert_eq!(record.likelihood_trace.len(), 4);
+    let fit = score_flow(&data, record.parameters().unwrap()).unwrap();
+    let last = *record.likelihood_trace.last().unwrap();
+    assert!((last - fit.log_likelihood).abs() < 1e-6, "{last} {fit:?}");
+}
+
+#[test]
+fn test_measures_refuse_an_interval_too_small_for_the_segment() {
+    let data = generate(&truth(), 100, 1, 200.0);
+    assert!(matches!(
+        events_per_interval(&data, MARKET, 1e-9),
+        Err(MMError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        fill_rate(&data, 1.0, 1e-9),
+        Err(MMError::InvalidConfiguration(_))
+    ));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_a_state_stored_as_json_goes_on_with_the_same_stream() {
+    let mut sim = HawkesSimulator::new(truth(), 9, 3).unwrap();
+    sim.run(50.0).unwrap();
+    let state = sim.state();
+    let restored: HawkesState =
+        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert_eq!(restored, state);
+    let mut other = HawkesSimulator::from_state(truth(), restored).unwrap();
+    assert_eq!(sim.run(50.0).unwrap().0, other.run(50.0).unwrap().0);
 }
