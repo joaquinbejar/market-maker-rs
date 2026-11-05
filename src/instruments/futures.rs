@@ -397,14 +397,35 @@ impl FutureTerms {
         price: &SettlementPrice,
     ) -> Result<CashSettlement, FutureError> {
         self.check_settlement(price)?;
-        Ok(CashSettlement {
-            pnl: self
-                .spec
-                .realized_pnl(side, contracts, entry, price.price)?,
-            price: price.price,
-            expiry_ms: price.expiry_ms,
-            published_ms: price.published_ms,
-        })
+        match self.method {
+            SettlementMethod::Cash => Ok(CashSettlement {
+                pnl: self
+                    .spec
+                    .realized_pnl(side, contracts, entry, price.price)?,
+                price: price.price,
+                expiry_ms: price.expiry_ms,
+                published_ms: price.published_ms,
+            }),
+        }
+    }
+
+    /// The ledger's identifier of this contract. An instrument it holds under that
+    /// identifier with other terms, at its registered scales, is an error.
+    #[cfg(feature = "margin")]
+    fn identify_in_ledger(&self, ledger: &Ledger) -> Result<margin_rs::InstrumentId, FutureError> {
+        let instrument = self.spec.id().as_str();
+        let id = margin_rs::InstrumentId::new(instrument)?;
+        if let Some(registered) = ledger.instrument(&id) {
+            let same = super::margin::registered_scales(registered)
+                .and_then(|scales| margin_rs::Instrument::from_spec(&self.spec, scales).ok())
+                .is_some_and(|expected| expected == *registered);
+            if !same {
+                return Err(FutureError::OtherTermsInLedger {
+                    instrument: instrument.to_string(),
+                });
+            }
+        }
+        Ok(id)
     }
 
     /// Books the settlement in `ledger`, closing its position at the price, at the
@@ -427,21 +448,11 @@ impl FutureTerms {
         price: &SettlementPrice,
     ) -> Result<PostingBooking<ExpiryCashflow>, FutureError> {
         self.check_settlement(price)?;
-        let instrument = self.spec.id().as_str();
-        let id = margin_rs::InstrumentId::new(instrument)?;
-        let registered = ledger
-            .instrument(&id)
-            .ok_or_else(|| MarginError::UnknownInstrument {
-                instrument: id.clone(),
-            })?;
-        let same = super::margin::registered_scales(registered)
-            .and_then(|scales| margin_rs::Instrument::from_spec(&self.spec, scales).ok())
-            .is_some_and(|expected| expected == *registered);
-        if !same {
-            return Err(FutureError::OtherTermsInLedger {
-                instrument: instrument.to_string(),
-            });
+        let id = self.identify_in_ledger(ledger)?;
+        match self.method {
+            SettlementMethod::Cash => {}
         }
+        let instrument = self.spec.id().as_str();
         Ok(ledger.settle_expiry(&ExpirySettlement {
             id: margin_rs::ExecutionId::new(format!("expiry:{instrument}"))?,
             instrument: id,
@@ -451,19 +462,21 @@ impl FutureTerms {
     }
 
     /// The phase at `now_ms`: [`FuturePhase::Settled`] once `ledger` holds the
-    /// settlement, and otherwise [`FutureTerms::phase`].
+    /// settlement of this contract, and otherwise [`FutureTerms::phase`], also for a
+    /// ledger without the instrument.
     ///
     /// # Errors
     ///
-    /// [`FutureError::Ledger`] if the contract's identifier is not valid in a
-    /// ledger.
+    /// [`FutureError::OtherTermsInLedger`] if the ledger has an instrument with this
+    /// identifier and other terms, whose settlement says nothing about this contract,
+    /// and [`FutureError::Ledger`] if the identifier is not valid in a ledger.
     #[cfg(feature = "margin")]
     pub fn phase_in_ledger(
         &self,
         now_ms: u64,
         ledger: &Ledger,
     ) -> Result<FuturePhase, FutureError> {
-        let id = margin_rs::InstrumentId::new(self.spec.id().as_str())?;
+        let id = self.identify_in_ledger(ledger)?;
         Ok(if ledger.is_settled(&id) {
             FuturePhase::Settled
         } else {

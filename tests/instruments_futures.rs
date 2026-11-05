@@ -565,6 +565,111 @@ mod ledger {
     }
 
     #[test]
+    fn a_phase_is_only_read_from_a_ledger_holding_this_contract() {
+        let settled = linear();
+        let mut ledger = ledger_with(&settled, 2, dec!(1000));
+        let price = print(&settled, dec!(61000), RECORD_MS);
+        settled.settle_in_ledger(&mut ledger, &price).unwrap();
+        assert_eq!(
+            settled.phase_in_ledger(EXPIRY_MS - 1, &ledger).unwrap(),
+            FuturePhase::Settled
+        );
+        // The same identifier, a day later: that settlement is not of this contract.
+        let later = terms_of(linear_spec("FUT", "BTC", EXPIRY_MS + 86_400_000));
+        assert_eq!(
+            later.phase_in_ledger(EXPIRY_MS, &ledger).unwrap_err(),
+            FutureError::OtherTermsInLedger {
+                instrument: "FUT".to_string()
+            }
+        );
+        // A ledger without it leaves the clock.
+        let empty = Ledger::new(LedgerConfig::default());
+        assert_eq!(
+            settled.phase_in_ledger(EXPIRY_MS - 1, &empty).unwrap(),
+            FuturePhase::Trading
+        );
+        assert_eq!(
+            settled.phase_in_ledger(EXPIRY_MS, &empty).unwrap(),
+            FuturePhase::AwaitingSettlement
+        );
+    }
+
+    #[test]
+    fn two_contracts_in_one_ledger_settle_each_at_its_own_price() {
+        let near = terms_of(linear_spec("NEAR", "BTC", EXPIRY_MS));
+        let far = terms_of(linear_spec("FAR", "BTC", EXPIRY_MS + 1000));
+        let mut ledger = ledger_with(&near, 2, dec!(1000));
+        ledger
+            .register_instrument(
+                Instrument::from_spec(
+                    far.spec(),
+                    InstrumentScales {
+                        price_scale: 2,
+                        contract_scale: 0,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let fill = |id: &str, name: &str| {
+            Execution::new(
+                ExecutionId::new(id).unwrap(),
+                LedgerId::new(name).unwrap(),
+                Action::Buy,
+                dec!(60000),
+                dec!(5),
+            )
+            .with_executed_at(EXPIRY_MS - 1)
+        };
+        for execution in [fill("a", "NEAR"), fill("b", "FAR")] {
+            ledger
+                .book_execution_allowing_overdraft(&execution, None)
+                .unwrap();
+        }
+        // 5 x 0.01 x 1000 = 50, then 5 x 0.01 x -1000 = -50 on the other.
+        let near_price = print(&near, dec!(61000), RECORD_MS);
+        let first = near.settle_in_ledger(&mut ledger, &near_price).unwrap();
+        assert!(first.is_new);
+        assert_eq!(first.cashflow.realized_pnl, dec!(50));
+        assert_eq!(cash(&ledger, &near), dec!(1050));
+        assert_eq!(position(&ledger, &near), dec!(0));
+        assert_eq!(
+            near.phase_in_ledger(RECORD_MS, &ledger).unwrap(),
+            FuturePhase::Settled
+        );
+        // Settling one says nothing about the other.
+        assert_eq!(
+            far.phase_in_ledger(RECORD_MS, &ledger).unwrap(),
+            FuturePhase::Trading
+        );
+        assert_eq!(position(&ledger, &far), dec!(5));
+        let far_price = print(&far, dec!(59000), RECORD_MS + 1000);
+        let second = far.settle_in_ledger(&mut ledger, &far_price).unwrap();
+        assert!(second.is_new);
+        assert_eq!(second.cashflow.realized_pnl, dec!(-50));
+        assert_eq!(cash(&ledger, &near), dec!(1000));
+        assert_eq!(position(&ledger, &far), dec!(0));
+        assert_eq!(
+            far.phase_in_ledger(RECORD_MS + 1000, &ledger).unwrap(),
+            FuturePhase::Settled
+        );
+        // Each replay is its own duplicate, and changes nothing.
+        let after = ledger.snapshot();
+        assert!(
+            !near
+                .settle_in_ledger(&mut ledger, &near_price)
+                .unwrap()
+                .is_new
+        );
+        assert!(
+            !far.settle_in_ledger(&mut ledger, &far_price)
+                .unwrap()
+                .is_new
+        );
+        assert_eq!(ledger.snapshot(), after);
+    }
+
+    #[test]
     fn a_future_never_receives_funding() {
         let terms = linear();
         let mut ledger = ledger_with(&terms, 2, dec!(1000));
