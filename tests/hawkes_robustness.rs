@@ -54,6 +54,46 @@ const BASE: Scenario = Scenario {
     branching: 1.0,
     impact: 1.0,
 };
+/// Scenarios outside every range of the grid on the axes they move, fixed before they run.
+/// The adversary never sees them, and they are not bounds of plausibility.
+const OFF_GRID: [(&str, Scenario); 4] = [
+    (
+        "buyers 1.6, sellers 0.4",
+        Scenario {
+            bid_market: 0.4,
+            ask_market: 1.6,
+            branching: 1.0,
+            impact: 1.0,
+        },
+    ),
+    (
+        "sellers 1.6, buyers 0.4",
+        Scenario {
+            bid_market: 1.6,
+            ask_market: 0.4,
+            branching: 1.0,
+            impact: 1.0,
+        },
+    ),
+    (
+        "branching 1.5, impact 3",
+        Scenario {
+            bid_market: 1.0,
+            ask_market: 1.0,
+            branching: 1.5,
+            impact: 3.0,
+        },
+    ),
+    (
+        "all at once",
+        Scenario {
+            bid_market: 0.4,
+            ask_market: 1.6,
+            branching: 1.5,
+            impact: 3.0,
+        },
+    ),
+];
 const SELECTION_SEEDS: Range<u64> = 1..401;
 const HOLDOUT_SEEDS: Range<u64> = 1_001..1_401;
 const BOOTSTRAP_SEED: u64 = 77;
@@ -455,6 +495,23 @@ fn test_a_quote_can_go_stale_before_an_order() {
 }
 
 #[test]
+fn test_off_grid_scenarios_are_stable_and_outside_the_grid() {
+    let (low, high) = (GRID_MARKET[0], GRID_MARKET[2]);
+    for (_, scenario) in OFF_GRID {
+        assert!(!grid().contains(&scenario));
+        let off = |market: f64| market < low || market > high;
+        let outside = off(scenario.bid_market)
+            || off(scenario.ask_market)
+            || scenario.branching > GRID_BRANCHING[2]
+            || scenario.impact > GRID_IMPACT[2];
+        assert!(outside, "{scenario:?}");
+        assert!(queue_params(scenario.bid_market, scenario.branching).branching_ratio() < 1.0);
+        assert!(queue_params(scenario.ask_market, scenario.branching).branching_ratio() < 1.0);
+        assert!(run_episode(Policy::Fixed, scenario, 1).max_abs_inventory <= inventory_limit());
+    }
+}
+
+#[test]
 fn test_an_episode_is_a_function_of_its_seed() {
     let one = run_episode(Policy::Fixed, BASE, 5);
     assert_eq!(one, run_episode(Policy::Fixed, BASE, 5));
@@ -835,11 +892,13 @@ fn table_arms(
     policy: Policy,
     pick: impl Fn(Policy, Range<u64>) -> Scenario,
 ) -> Vec<(&'static str, Scenario)> {
-    vec![
+    let mut arms = vec![
         ("base", BASE),
         ("fixed stress", FIXED_STRESS),
         ("adversary", pick(policy, SELECTION_SEEDS)),
-    ]
+    ];
+    arms.extend(OFF_GRID);
+    arms
 }
 
 /// One row of the table.
