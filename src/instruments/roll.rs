@@ -490,6 +490,10 @@ pub struct RollPlan {
     closed_at_settlement: Decimal,
     /// Near fills with a part closed at the settlement, and that part, signed.
     closed_fills: Vec<(String, Decimal)>,
+    /// How many events changed the plan, so that an older copy can be told.
+    revision: u64,
+    /// The latest time in any event, from the plan's creation on.
+    observed_ms: u64,
     /// The length of a ledger's journal when the plan was anchored to it.
     #[cfg(feature = "margin")]
     journal_anchor: Option<u64>,
@@ -694,6 +698,8 @@ impl RollPlan {
             settled: None,
             closed_at_settlement: Decimal::ZERO,
             closed_fills: Vec::new(),
+            revision: 0,
+            observed_ms: created_at_ms,
             #[cfg(feature = "margin")]
             journal_anchor: None,
             intents,
@@ -900,6 +906,22 @@ impl RollPlan {
     /// [`RollError`]: see the [module documentation](self) for what is an error for a
     /// fill. Any other event the intents refuse is one too, unless the plan is faulted.
     pub fn apply(&mut self, event: &RollEvent) -> Result<RollReport, RollError> {
+        let report = self.apply_event(event)?;
+        if !report.duplicate {
+            self.revision = self.revision.saturating_add(1);
+            let at_ms = match event {
+                RollEvent::Fill(fill) => fill.at_ms,
+                RollEvent::Rejected { at_ms, .. }
+                | RollEvent::CancelAck { at_ms, .. }
+                | RollEvent::Tick { at_ms } => *at_ms,
+                RollEvent::NearSettled { price, .. } => price.published_ms(),
+            };
+            self.observed_ms = self.observed_ms.max(at_ms);
+        }
+        Ok(report)
+    }
+
+    fn apply_event(&mut self, event: &RollEvent) -> Result<RollReport, RollError> {
         match event {
             RollEvent::Fill(fill) => self.apply_fill(fill),
             RollEvent::NearSettled { price, contracts } => self.apply_settlement(price, *contracts),

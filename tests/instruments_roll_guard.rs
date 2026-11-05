@@ -376,6 +376,47 @@ fn the_window_closes_at_the_deadline_and_never_reopens() {
     assert!(ask_at(&mut guard, "c", NEAR, Action::Sell, dec!(1), NOW).is_rejected());
     assert!(ask_at(&mut guard, "d", FAR, Action::Buy, dec!(1), NOW).is_rejected());
     assert_eq!(guard.latest_ms(), DEADLINE);
+    // What the plan saw carries over, at a sync and at the construction, with no fill.
+    let mut seen = long_plan();
+    seen.apply(&RollEvent::Tick { at_ms: DEADLINE }).unwrap();
+    let mut synced = guard_of(&long_plan());
+    synced.sync(&seen).unwrap();
+    assert_eq!(synced.latest_ms(), DEADLINE);
+    assert!(ask(&mut synced, "a", NEAR, Action::Sell, dec!(1)).is_rejected());
+    let mut built = guard_of(&seen);
+    assert!(ask(&mut built, "a", NEAR, Action::Sell, dec!(1)).is_rejected());
+    for event in [
+        RollEvent::Rejected {
+            leg: RollLeg::Far,
+            attempt: 0,
+            at_ms: DEADLINE,
+        },
+        RollEvent::CancelAck {
+            leg: RollLeg::Near,
+            attempt: 0,
+            cum_contracts: dec!(0),
+            at_ms: DEADLINE,
+        },
+    ] {
+        let mut plan = long_plan();
+        plan.apply(&event).unwrap();
+        let mut guard = guard_of(&plan);
+        assert!(ask(&mut guard, "a", NEAR, Action::Sell, dec!(1)).is_rejected());
+    }
+    // A fill that executed earlier than the time seen does not take it back.
+    let mut back = long_plan();
+    for (id, at_ms) in [("n1", DEADLINE), ("n2", NOW)] {
+        let event = match plan_fill(&back, RollLeg::Near, id, dec!(1)) {
+            RollEvent::Fill(fill) => RollEvent::Fill(RollFill {
+                at_ms,
+                attempt: None,
+                ..fill
+            }),
+            other => other,
+        };
+        back.apply(&event).unwrap();
+    }
+    assert_eq!(guard_of(&back).latest_ms(), DEADLINE);
     // Market data and fills move the time too.
     let mut by_data = guard_of(&plan);
     by_data.on_market_data(dec!(60000), DEADLINE);
@@ -673,6 +714,69 @@ fn a_sync_refuses_what_is_older_or_different() {
     assert_eq!(guard.sync(&other), Err(RollError::OtherPlan));
     assert_eq!(guard, before);
 
+    // An older copy that differs by no fill: a rejection stopped the plan, and the copy
+    // before it would start far opening again.
+    let working = long_plan();
+    let mut stopped = working.clone();
+    stopped
+        .apply(&RollEvent::Rejected {
+            leg: RollLeg::Far,
+            attempt: 0,
+            at_ms: NOW + 2,
+        })
+        .unwrap();
+    let mut guard = guard_of(&working);
+    guard.sync(&stopped).unwrap();
+    assert!(ask(&mut guard, "a", FAR, Action::Buy, dec!(1)).is_rejected());
+    assert_eq!(guard.sync(&working), Err(RollError::StalePlan));
+    assert!(ask(&mut guard, "b", FAR, Action::Buy, dec!(1)).is_rejected());
+    // Repeating the same copy is fine, and a later one, but another copy of the same age
+    // is not the same plan.
+    guard.sync(&stopped).unwrap();
+    let mut fork = working.clone();
+    fork.apply(&RollEvent::Tick { at_ms: NOW + 5 }).unwrap();
+    assert_eq!(guard.sync(&fork), Err(RollError::StalePlan));
+    let mut later = stopped.clone();
+    later
+        .apply(&RollEvent::CancelAck {
+            leg: RollLeg::Near,
+            attempt: 0,
+            cum_contracts: dec!(0),
+            at_ms: NOW + 3,
+        })
+        .unwrap();
+    guard.sync(&later).unwrap();
+
+    // A repeat does not count as an event, so a copy from before it is the same age.
+    let mut repeated = long_plan();
+    let fill = plan_fill(&repeated, RollLeg::Near, "n1", dec!(2));
+    repeated.apply(&fill).unwrap();
+    let copy = repeated.clone();
+    repeated.apply(&fill).unwrap();
+    assert_eq!(repeated, copy);
+
+    // Another copy further along that lacks a fill or a settlement seen is no later.
+    let start = long_plan();
+    let mut with_fill = start.clone();
+    with_fill
+        .apply(&plan_fill(&start, RollLeg::Near, "n1", dec!(2)))
+        .unwrap();
+    let mut only_ticks = start.clone();
+    only_ticks
+        .apply(&RollEvent::Tick { at_ms: NOW + 1 })
+        .unwrap();
+    only_ticks
+        .apply(&RollEvent::Tick { at_ms: NOW + 2 })
+        .unwrap();
+    let mut guard = guard_of(&start);
+    guard.sync(&with_fill).unwrap();
+    assert_eq!(guard.sync(&only_ticks), Err(RollError::StalePlan));
+    let mut with_settlement = start.clone();
+    settle(&mut with_settlement, dec!(10));
+    let mut guard = guard_of(&start);
+    guard.sync(&with_settlement).unwrap();
+    assert_eq!(guard.sync(&only_ticks), Err(RollError::StalePlan));
+
     // A plan without a settlement an earlier sync saw is older too.
     let near = future(NEAR, NEAR_EXPIRY);
     let unsettled = long_plan();
@@ -888,7 +992,7 @@ fn reset_returns_to_the_construction_undoing_syncs() {
     assert_eq!(guard.position(RollLeg::Near), Ok(dec!(8)));
     guard.reset();
     assert_eq!(guard.position(RollLeg::Near), Ok(dec!(10)));
-    assert_eq!(guard.latest_ms(), 0);
+    assert_eq!(guard.latest_ms(), NOW);
     assert_eq!(guard, guard_of(&at_start));
 }
 

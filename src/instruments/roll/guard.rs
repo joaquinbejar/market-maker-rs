@@ -14,7 +14,8 @@
 //! - A request that names no instrument or another one, on another action, or for a
 //!   quantity that is not positive, is rejected, as is a repeated order identifier.
 //! - From the plan's deadline both legs are rejected, judged on the latest time seen,
-//!   a settlement's publication among them, so a stale request cannot reopen the window.
+//!   in requests, market data, fills or any event the plan saw, so a stale request cannot
+//!   reopen the window.
 //!   Handing over to a normal policy is the caller's act, after retiring what is live.
 //! - An order that reduces a position may do so down to zero, less what already
 //!   reduces it, and never flips it. That holds past any limit: the guard must not trap
@@ -34,8 +35,9 @@
 //! A position is the plan's at the last [`RollGuard::sync`], plus the fills the guard
 //! saw that the plan had not, by leg and execution identifier, so no order of events
 //! counts one twice or loses one. A sync also carries the plan's state and a settlement
-//! with its effect, once, as they are in the plan's positions. A plan that lacks a fill
-//! or the settlement an earlier sync saw is refused, as is a fill with other content.
+//! with its effect, once, as they are in the plan's positions, and the latest time it
+//! saw. A copy of the plan older than one an earlier sync saw is refused, by the plan's
+//! count of events, whatever those events were, as is a fill with other content.
 //!
 //! Sync before deciding after a fill the guard could not see or a change in the plan's
 //! state. A settlement is published at or after the near contract's expiry, so a sync
@@ -99,6 +101,7 @@ struct PlanView {
     state: RollState,
     near_settled: bool,
     latest_ms: u64,
+    revision: u64,
 }
 
 fn key(leg: RollLeg, exec_id: &str) -> (bool, String) {
@@ -121,17 +124,8 @@ impl PlanView {
                 .collect(),
             state: plan.state(),
             near_settled: plan.near_settled().is_some(),
-            latest_ms: plan
-                .fills()
-                .iter()
-                .map(|f| f.at_ms)
-                .chain(
-                    plan.settled
-                        .iter()
-                        .map(|settled| settled.price.published_ms()),
-                )
-                .max()
-                .unwrap_or(0),
+            latest_ms: plan.observed_ms,
+            revision: plan.revision,
         }
     }
 }
@@ -226,14 +220,21 @@ impl RollGuard {
     /// # Errors
     ///
     /// [`RollError::OtherPlan`] for a plan of other contracts;
-    /// [`RollError::StalePlan`] for one without a fill or the settlement that an
-    /// earlier sync saw; and [`RollError::ConflictingFill`] for a fill the plan and
+    /// [`RollError::StalePlan`] for a copy older than one an earlier sync saw, or without
+    /// a fill or the settlement that it saw; and [`RollError::ConflictingFill`] for a fill the plan and
     /// the guard saw with other content. The guard is then unchanged.
     pub fn sync(&mut self, plan: &RollPlan) -> Result<(), RollError> {
         if plan.near.terms != self.near.terms || plan.far.terms != self.far.terms {
             return Err(RollError::OtherPlan);
         }
         let view = PlanView::of(plan);
+        // An older copy of the plan could undo more than fills: a rejection, say, that
+        // stopped it. The same revision must be the same plan, or it is another copy.
+        let older = view.revision < self.view.revision
+            || (view.revision == self.view.revision && view != self.view);
+        if older {
+            return Err(RollError::StalePlan);
+        }
         let lost_fill = self
             .view
             .fills
