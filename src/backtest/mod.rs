@@ -67,6 +67,8 @@ pub mod lifecycle;
 
 pub mod queue_reactive;
 
+pub mod hawkes;
+
 /// Performance metrics calculator.
 pub mod metrics;
 
