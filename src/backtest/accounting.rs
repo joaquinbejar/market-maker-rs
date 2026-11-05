@@ -467,24 +467,6 @@ mod margin_ledger {
             .unwrap_or(0)
     }
 
-    /// The scales of a registered derivative.
-    #[cfg(feature = "instruments")]
-    fn registered_scales(
-        instrument: &Instrument,
-    ) -> Option<margin_rs::instrument::InstrumentScales> {
-        let (price_scale, contract_scale) = match instrument.linear_terms() {
-            Some(terms) => (terms.price_scale(), terms.contract_scale()),
-            None => {
-                let terms = instrument.inverse_terms()?;
-                (terms.price_scale(), terms.contract_scale())
-            }
-        };
-        Some(margin_rs::instrument::InstrumentScales {
-            price_scale,
-            contract_scale,
-        })
-    }
-
     fn margin_error(context: &str, error: margin_rs::MarginError) -> MMError {
         MMError::InvalidPositionUpdate(format!("margin ledger {context}: {error}"))
     }
@@ -654,7 +636,7 @@ mod margin_ledger {
             let Some(registered) = self.ledger.instrument(&self.instrument) else {
                 return refuse("not registered".to_string());
             };
-            let Some(scales) = registered_scales(registered) else {
+            let Some(scales) = crate::instruments::margin::registered_scales(registered) else {
                 return refuse("not a derivative".to_string());
             };
             // The same scales, so any difference is in the terms.

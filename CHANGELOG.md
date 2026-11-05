@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The lifecycle of a dated future (feature `instruments`, #94):
+  `instruments::futures::FutureTerms` joins a specification with how it settles
+  and who publishes its settlement price, with a phase by the clock and a cash
+  settlement against a `SettlementPrice` that declares its contract, source,
+  expiry and publication time. With `margin` too, `settle_in_ledger` books it and
+  `phase_in_ledger` reports `Settled` from the ledger's record. `FutureCalendar`
+  orders declared contracts of one product. The published price is taken as given:
+  its averaging method is not verified or reproduced. Delivery is not supported.
 - Derivative contracts in the backtest engine (#191, features `margin` and
   `instruments`): `BacktestEngine::with_instrument(spec, accountant)` runs a
   linear or inverse future or perpetual, with `MarginLedgerAccountant` on it, in
@@ -17,7 +25,7 @@ project follows [Semantic Versioning](https://semver.org/).
   checks run again at the start of every run. New `FeeCurrency::Settlement` and
   `FeeAsset::Settlement`, and `FillAccountant::unrealized_at`,
   `requires_instrument` and `check_instrument`, all with defaults. Funding,
-  expiry and settlement are not simulated (#94, #97), and neither are margin
+  expiry and settlement are not simulated (#97, #199), and neither are margin
   requirements or liquidation. `AccountingStatus` gains `valuation_failures` and
   `setup_refused`, and is not consistent with either. A derivative needs a ledger
   with no other open position. New provided

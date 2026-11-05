@@ -105,7 +105,7 @@ jobs:
 
       # The margin-rs adapter is compiled only with both features.
       - name: Test the margin-rs instrument adapter
-        run: cargo test --no-default-features --features margin,instruments --lib --test instruments_margin --test instruments_orders --test backtest_derivatives
+        run: cargo test --no-default-features --features margin,instruments --lib --test instruments_margin --test instruments_orders --test instruments_futures --test backtest_derivatives
 
   kernel_tests:
     name: Test (kernel)
