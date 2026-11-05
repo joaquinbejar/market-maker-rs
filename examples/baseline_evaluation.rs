@@ -9,6 +9,10 @@
 //! a fast book mean most moves jump past a resting quote, so the fills are mostly
 //! adverse; that is a property of this setup, not a finding.
 //!
+//! A last row runs the fixed spread baseline on ticks from the Hawkes flow model.
+//! That model holds its reference price fixed, so the steps between its segments
+//! are an assumption of this example, not part of the model.
+//!
 //! Run with `cargo run --release --example baseline_evaluation -- <commit> <toolchain>`.
 //! The commit and the toolchain go to the manifest as declared; they are not checked.
 
@@ -19,8 +23,9 @@ use market_maker_rs::backtest::evaluation::{
     BootstrapConfig, BootstrapOutcome, Candidate, EvaluationRow, Experiment, ExperimentConfig,
     MetricsSpec, Provenance, RowOutcome, Scenario, Splits,
 };
+use market_maker_rs::backtest::hawkes::{HawkesParameters, HawkesSimulator, fill_rate};
 use market_maker_rs::backtest::queue_reactive::{
-    QrParameters, QrSimulator, QrState, QrStep, RateTable, UnsupportedPolicy,
+    QrEventKind, QrParameters, QrSimulator, QrState, QrStep, RateTable, UnsupportedPolicy,
 };
 use market_maker_rs::backtest::{
     BacktestConfig, BacktestStrategy, ImmediateFillModel, MarketTick, ProbabilisticFillModel,
@@ -275,6 +280,46 @@ fn glft() -> Candidate {
     )
 }
 
+/// One independent Hawkes segment per hour, and a seeded step of three ticks between
+/// them. Returns the ticks and the coarse fill measure of the flow.
+fn hawkes_ticks(days: u64, seed: u64) -> MMResult<(Vec<MarketTick>, Option<f64>)> {
+    let weights = [[0.3, 0.05, 0.15], [0.1, 0.25, 0.05], [0.05, 0.05, 0.2]];
+    let params = HawkesParameters::new(rates(1.0), vec![2.0], vec![weights])?;
+    let half = TICK / dec!(2);
+    let mut reference = Decimal::from(2000) * TICK;
+    let mut word = seed | 1;
+    let (mut ticks, mut segments) = (Vec::new(), Vec::new());
+    for hour in 0..days * 24 {
+        let (segment, _) = HawkesSimulator::new(params.clone(), seed + hour, 3)?.run(60.0)?;
+        let queue = segment
+            .events
+            .iter()
+            .fold(3_i64, |queue, event| match event.kind {
+                QrEventKind::Limit => queue + 1,
+                _ => queue - 1,
+            });
+        let size = Decimal::from(queue.max(1));
+        ticks.push(MarketTick::new(
+            hour * HOUR,
+            reference - half,
+            size,
+            reference + half,
+            size,
+        ));
+        segments.push(segment);
+        word ^= word << 13;
+        word ^= word >> 7;
+        word ^= word << 17;
+        let step = TICK * dec!(3);
+        reference = if word & 1 == 0 {
+            reference + step
+        } else {
+            reference - step
+        };
+    }
+    Ok((ticks, fill_rate(&segments, 10.0, 20.0)?))
+}
+
 fn print_row(row: &EvaluationRow) {
     match &row.outcome {
         RowOutcome::Completed(metrics) => {
@@ -324,28 +369,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         toolchain: args.next().unwrap_or_else(|| "undeclared".to_string()),
     };
     let ticks = simulate(60, 20_261_105)?;
-    let config = ExperimentConfig {
-        name: "baseline-evaluation-synthetic".to_string(),
-        execution: BacktestConfig::new()
-            .with_initial_capital(dec!(100000))
-            .with_fee_rate(dec!(0.0001))
-            .with_tick_size(dec!(0.01))
-            .with_lot_size(dec!(0.01)),
-        splits: Splits::new(0, 20 * DAY, 40 * DAY, 60 * DAY)?,
-        metrics: MetricsSpec {
-            horizons_ms: vec![HOUR, 4 * HOUR],
-            max_mark_delay_ms: 0,
-        },
-        bootstrap: BootstrapConfig {
-            replicates: 2000,
-            mean_block_days: 3,
-            confidence_percent: 90,
-            seed: 1,
-            min_days: 10,
-        },
-        seed: 2,
-        provenance,
+    let config = |provenance: Provenance| -> Result<ExperimentConfig, Box<dyn std::error::Error>> {
+        Ok(ExperimentConfig {
+            name: "baseline-evaluation-synthetic".to_string(),
+            execution: BacktestConfig::new()
+                .with_initial_capital(dec!(100000))
+                .with_fee_rate(dec!(0.0001))
+                .with_tick_size(dec!(0.01))
+                .with_lot_size(dec!(0.01)),
+            splits: Splits::new(0, 20 * DAY, 40 * DAY, 60 * DAY)?,
+            metrics: MetricsSpec {
+                horizons_ms: vec![HOUR, 4 * HOUR],
+                max_mark_delay_ms: 0,
+            },
+            bootstrap: BootstrapConfig {
+                replicates: 2000,
+                mean_block_days: 3,
+                confidence_percent: 90,
+                seed: 1,
+                min_days: 10,
+            },
+            seed: 2,
+            provenance,
+        })
     };
+    let hawkes_config = config(provenance.clone())?;
+    let config = config(provenance)?;
     let scenarios = vec![
         Scenario::new(
             "immediate",
@@ -407,5 +456,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_rows(&report.holdout);
     println!("\nDid not reach the holdout: {:?}", report.not_selected);
     println!("\nManifest:\n{:#?}", report.manifest);
+
+    let (ticks, measure) = hawkes_ticks(60, 404)?;
+    println!("\nHawkes flow, coarse fill measure over 10 s: {measure:?}");
+    let scenario = vec![Scenario::new(
+        "immediate",
+        SimLatencyConfig::new(),
+        BTreeMap::new(),
+        |_| ImmediateFillModel::new(),
+    )];
+    let baseline = vec![Candidate::fixed_spread(dec!(1), SIZE)];
+    let validated =
+        Experiment::new(hawkes_config, ticks, baseline, scenario)?.evaluate_validation();
+    print_rows(&validated.report().rows);
+    println!(
+        "Hawkes manifest:
+{:#?}",
+        validated.report().manifest
+    );
     Ok(())
 }
