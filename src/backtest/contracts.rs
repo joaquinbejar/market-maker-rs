@@ -30,7 +30,10 @@
 //! [`ContractRunResult::total_funding`], which
 //! [`ContractRunResult::realized_pnl`] excludes. An instant of the run with no declared rate
 //! is in [`ContractSummary::funding_missing`] and makes the run not consistent. A strategy is
-//! not told of funding, and funding declared past the end of the clock does not book.
+//! not told of funding, and funding declared past the end of the clock does not book. The
+//! clock runs on past the data to the latest declared settlement, so funding up to then
+//! books, on a position nothing can then change, and its instants count as missing if no
+//! rate was declared, whether a position was open or not.
 //!
 //! # Time
 //!
@@ -1172,7 +1175,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         let lane = self.lanes.get_mut(index).or_overflow("funding lane")?;
         let paid = settlement_charge(lane.terms.spec(), scale, mark, position.abs(), rate)?.amount;
         let amount = if position > Decimal::ZERO {
-            -paid
+            Decimal::ZERO.checked_sub(paid).or_overflow("funding")?
         } else {
             paid
         };

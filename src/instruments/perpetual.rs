@@ -106,7 +106,7 @@ impl PerpetualTerms {
         }
         let mut previous: Option<u64> = None;
         for point in &points {
-            if point.at_ms % interval_ms != 0 {
+            if point.at_ms.checked_rem(interval_ms) != Some(0) {
                 return Err(PerpetualError::OffGrid {
                     at_ms: point.at_ms,
                     interval_ms,
@@ -163,8 +163,10 @@ impl PerpetualTerms {
     /// How many instants of the grid in `(after_ms, until_ms]` have no declared rate.
     #[must_use]
     pub fn missing_between(&self, after_ms: u64, until_ms: u64) -> u64 {
-        let on_grid =
-            |from: u64, to: u64| (to / self.interval_ms).saturating_sub(from / self.interval_ms);
+        let on_grid = |from: u64, to: u64| {
+            let index = |at: u64| at.checked_div(self.interval_ms).unwrap_or(0);
+            index(to).saturating_sub(index(from))
+        };
         let total = on_grid(after_ms, until_ms);
         let (Some(first), Some(last)) = (self.points.first(), self.points.last()) else {
             return total;

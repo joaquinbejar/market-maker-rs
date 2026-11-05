@@ -356,6 +356,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `ContractRunResult` and `ContractSummary` have new public fields for funding (#207):
+  `realized_pnl`, `total_funding` and `fundings`; `funding` and `funding_missing`. A
+  `ContractStrategy` is unchanged.
 These signature changes are breaking and ship in 0.7.0, not in a patch
 release.
 
