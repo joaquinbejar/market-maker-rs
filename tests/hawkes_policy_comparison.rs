@@ -206,7 +206,8 @@ fn outcomes(policy: Policy, params: &HawkesParameters, seeds: Range<u64>) -> Vec
         assert!(stop.is_none(), "{stop:?}");
         segment
     };
-    // The price noise is the same in every arm, by the episode's position.
+    // Each episode's generator starts from the same seed in every arm, by its position. The
+    // arms draw from it at their own events, so their paths differ, yet are not independent.
     seeds
         .enumerate()
         .map(|(i, seed)| episode(policy, &run(seed * 2), &run(seed * 2 + 1), i as u64 + 1))
@@ -222,6 +223,13 @@ fn standard_error(values: &[f64]) -> f64 {
     let variance =
         values.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (values.len() as f64 - 1.0);
     (variance / values.len() as f64).sqrt()
+}
+
+/// The mean of the differences by episode, and its standard error, so that what the pairs
+/// share is counted.
+fn paired_gap(arm: &[f64], base: &[f64]) -> (f64, f64) {
+    let differences: Vec<f64> = arm.iter().zip(base).map(|(a, b)| a - b).collect();
+    (mean(&differences), standard_error(&differences))
 }
 
 fn fitted() -> (HawkesParameters, HawkesParameters, HawkesParameters, f64) {
@@ -301,6 +309,16 @@ fn test_avellaneda_stoikov_skews_and_fixed_does_not() {
 }
 
 #[test]
+fn test_the_gap_counts_what_the_pairs_share() {
+    // Moving together, the differences have no spread, though each arm has.
+    let (gap, error) = paired_gap(&[1.0, 3.0, 5.0], &[0.0, 2.0, 4.0]);
+    assert_eq!((gap, error), (1.0, 0.0));
+    // Moving against each other, they have more than each arm.
+    let (_, error) = paired_gap(&[1.0, 3.0], &[3.0, 1.0]);
+    assert_eq!(error, 2.0);
+}
+
+#[test]
 fn test_the_standard_error_by_hand() {
     assert_eq!(mean(&[1.0, 3.0]), 2.0);
     assert_eq!(standard_error(&[1.0, 3.0]), 1.0);
@@ -364,7 +382,8 @@ fn test_policy_comparison_evidence_table() {
     }
     println!(
         "\nPolicy, reported apart: mean [standard error] over {} episodes per arm, and each \
-         model arm's gap to data with its standard error. Same price noise by episode.",
+         model arm's gap to data, with the standard error of the differences by episode. Same \
+         initial noise seed by episode, with different draws at each arm's events.",
         SIM_SEEDS.count()
     );
     println!(
@@ -399,8 +418,7 @@ fn test_policy_comparison_evidence_table() {
                 if name == "data" {
                     row += " |";
                 } else {
-                    let gap = m - mean(&base);
-                    let error = (se * se + standard_error(&base).powi(2)).sqrt();
+                    let (gap, error) = paired_gap(&values, &base);
                     row += &format!(" {gap:.3} [{error:.3}] |");
                 }
             }
