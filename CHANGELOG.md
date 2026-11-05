@@ -16,6 +16,14 @@ project follows [Semantic Versioning](https://semver.org/).
   `phase_in_ledger` reports `Settled` from the ledger's record. `FutureCalendar`
   orders declared contracts of one product. The published price is taken as given:
   its averaging method is not verified or reproduced. Delivery is not supported.
+- The net edge of a basis trade (new feature `arbitrage`, off by default, #94):
+  `instruments::basis::evaluate_basis` buys one leg and sells the other, a spot and
+  a linear dated future, through `arbitrage-rs`, whose types stay out of this
+  crate's public API. It itemizes entry fees, required exit costs and carry, and
+  reports the convergence date and an estimate of the capital given by the caller's
+  rate. Selling spot needs a declared borrow. Expired, missing, stale or off tick
+  quotes, too little size and too little edge are rejections. Two futures are not
+  evaluated, as they do not converge to each other.
 - Derivative contracts in the backtest engine (#191, features `margin` and
   `instruments`): `BacktestEngine::with_instrument(spec, accountant)` runs a
   linear or inverse future or perpetual, with `MarginLedgerAccountant` on it, in

@@ -39,6 +39,7 @@ rust_decimal_macros = "1.40"
 # first release with the `instruments` module.
 financial_types = "0.3.1"
 margin-rs = { version = "0.1", optional = true }
+arbitrage-rs = { version = "0.3", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 pretty-simple-display = { version = "0.1", optional = true }
@@ -86,6 +87,9 @@ margin = ["dep:margin-rs"]
 # has no such feature, while `margin-rs = "0.1"` keeps it valid for `margin`
 # alone. The `?` keeps `instruments` alone from pulling margin-rs.
 instruments = ["financial_types/instruments", "margin-rs?/instruments"]
+# The net edge of a spot and a dated future (`instruments::basis`), through
+# arbitrage-rs, whose types stay out of this crate's public API.
+arbitrage = ["instruments", "dep:arbitrage-rs"]
 # Deterministic financial kernel for external RL trainers; no dependencies.
 kernel = []
 

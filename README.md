@@ -142,7 +142,8 @@ Where:
   declared queue limits (feature: `l3`)
 - `instruments`: Contract specifications shared with `margin-rs` and
   `arbitrage-rs`, and their conversion into `margin-rs` instruments
-  (feature: `instruments`, with `margin` for the conversion)
+  (feature: `instruments`, with `margin` for the conversion), and the net edge
+  of a spot and a dated future (feature: `arbitrage`)
 
 ### Quick Start
 
@@ -213,6 +214,9 @@ crate's own serialization support.
   together need
   `margin-rs` 0.1.1 or later: Cargo does not upgrade a lockfile at 0.1.0
   by itself, so run `cargo update -p margin-rs`
+- `arbitrage`: The net edge of a spot and a linear dated future
+  (`instruments::basis`), through `arbitrage-rs`, whose types stay out of this
+  crate's public API; implies `instruments`
 - `kernel`: The financial environment kernel (`backtest::kernel`): the
   backtest engine's loop as a resumable, `Copy` state machine with a
   canonical encoding, an agent-safe observation and an admission mask,
