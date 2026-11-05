@@ -72,7 +72,7 @@ const UNIT_SCALE: f64 = 1.0 / 9_007_199_254_740_992.0;
 /// Intensity used where the model says zero and an event happened, so that the
 /// likelihood stays finite and such an event costs a large amount.
 const INTENSITY_FLOOR: f64 = 1e-12;
-const POWER_STEPS: usize = 2_000;
+const BISECTION_STEPS: usize = 2_000;
 
 fn index_of(kind: QrEventKind) -> Option<usize> {
     KINDS.iter().position(|k| *k == kind)
@@ -170,27 +170,41 @@ impl TryFrom<RawParameters> for HawkesParameters {
     }
 }
 
-/// The spectral radius of a matrix with non-negative entries, by power iteration on
-/// its shifted form, which also converges for periodic matrices.
+/// Whether the spectral radius of a matrix with non-negative entries is below `t`: for
+/// such a matrix, exactly when every leading principal minor of `t I - A` is positive.
+fn radius_is_below(matrix: &BranchingMatrix, t: f64) -> bool {
+    let [[a, b, c], [d, e, f], [g, h, i]] = *matrix;
+    let (a, e, i) = (t - a, t - e, t - i);
+    let second = a * e - b * d;
+    let third = a * (e * i - f * h) - b * (d * i + f * g) - c * (d * h + e * g);
+    a > 0.0 && second > 0.0 && third > 0.0
+}
+
+/// The spectral radius of a matrix with non-negative entries, by bisection on
+/// [`radius_is_below`], which needs no convergence of the matrix's powers, so a reducible
+/// or nearly critical matrix is measured like any other. The result is not below the radius,
+/// but for rounding.
 fn spectral_radius(matrix: &BranchingMatrix) -> f64 {
-    let mut vector = [1.0f64; EVENT_TYPES];
-    let mut radius = 0.0f64;
-    for _ in 0..POWER_STEPS {
-        let mut next = vector;
-        for (out, row) in next.iter_mut().zip(matrix) {
-            *out += row.iter().zip(&vector).map(|(a, v)| a * v).sum::<f64>();
-        }
-        let largest = next.iter().fold(0.0f64, |m, v| m.max(*v));
-        if !largest.is_finite() || largest <= 0.0 {
-            return f64::INFINITY;
-        }
-        for value in &mut next {
-            *value /= largest;
-        }
-        vector = next;
-        radius = largest - 1.0;
+    let mut high = matrix
+        .iter()
+        .map(|row| row.iter().sum::<f64>())
+        .fold(0.0f64, f64::max);
+    if !high.is_finite() {
+        return f64::INFINITY;
     }
-    radius
+    let mut low = 0.0f64;
+    for _ in 0..BISECTION_STEPS {
+        let middle = low + (high - low) / 2.0;
+        if middle <= low || middle >= high {
+            break;
+        }
+        if radius_is_below(matrix, middle) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    high
 }
 
 impl HawkesParameters {
@@ -711,6 +725,8 @@ impl HawkesSimulator {
     }
 
     /// Runs like [`HawkesSimulator::run`], with a limit of events.
+    /// A stop before the horizon, for any reason, leaves a segment that lasts up to where the
+    /// simulation reached, which may be zero.
     ///
     /// # Errors
     ///
@@ -732,6 +748,7 @@ impl HawkesSimulator {
         };
         loop {
             if segment.events.len() >= max_events {
+                self.stop_early(&mut segment, start);
                 return Ok((segment, Some(HawkesStep::EventLimit)));
             }
             let before = self.state;
@@ -750,10 +767,19 @@ impl HawkesSimulator {
                 stop @ (HawkesStep::Stalled
                 | HawkesStep::ThinningLimit
                 | HawkesStep::EventLimit) => {
+                    self.stop_early(&mut segment, start);
                     return Ok((segment, Some(stop)));
                 }
             }
         }
+    }
+
+    /// A segment that stopped early lasts only as long as was simulated, so its exposure
+    /// claims no time nothing happened in, and the next run starts from there.
+    fn stop_early(&mut self, segment: &mut HawkesSegment, start: f64) {
+        let reached = self.state.time_seconds.max(start);
+        self.state.clock_seconds = reached;
+        segment.duration_seconds = reached - start;
     }
 
     /// A value in `[0, 1)`, by xorshift64*.

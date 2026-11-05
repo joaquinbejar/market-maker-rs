@@ -838,3 +838,38 @@ fn test_a_state_stored_as_json_goes_on_with_the_same_stream() {
     let mut other = HawkesSimulator::from_state(truth(), restored).unwrap();
     assert_eq!(sim.run(50.0).unwrap().0, other.run(50.0).unwrap().0);
 }
+
+#[test]
+fn test_a_stable_nearly_critical_reducible_matrix_is_measured_exactly() {
+    let jordan = [[0.9998, 0.1, 0.0], [0.0, 0.9998, 0.0], [0.0, 0.0, 0.0]];
+    let params = HawkesParameters::new(table(1.0), vec![2.0], vec![jordan]).unwrap();
+    assert!((params.branching_ratio() - 0.9998).abs() < 1e-9);
+    let critical = [[1.0, 0.1, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.0]];
+    assert!(HawkesParameters::new(table(1.0), vec![2.0], vec![critical]).is_err());
+    let zero = [[0.0; 3]; 3];
+    let params = HawkesParameters::new(table(1.0), vec![2.0], vec![zero]).unwrap();
+    assert_eq!(params.branching_ratio(), 0.0);
+    // A cycle of three, whose eigenvalues all have the same modulus: 0.8.
+    let cycle = [[0.0, 0.8, 0.0], [0.0, 0.0, 0.8], [0.8, 0.0, 0.0]];
+    let params = HawkesParameters::new(table(1.0), vec![2.0], vec![cycle]).unwrap();
+    assert!((params.branching_ratio() - 0.8).abs() < 1e-9);
+}
+
+#[test]
+fn test_a_segment_stopped_at_its_event_limit_claims_no_unsimulated_time() {
+    let mut sim = HawkesSimulator::new(truth(), 5, 3).unwrap();
+    let (segment, stop) = sim.run_limited(1_000.0, 1).unwrap();
+    assert_eq!(stop, Some(HawkesStep::EventLimit));
+    let last = segment.events.last().unwrap().time_seconds;
+    assert!(segment.duration_seconds < 1_000.0);
+    assert!(segment.duration_seconds >= last);
+    // No events at all, and nothing simulated.
+    let mut none = HawkesSimulator::new(truth(), 5, 3).unwrap();
+    let (empty, _) = none.run_limited(1_000.0, 0).unwrap();
+    assert_eq!(empty.duration_seconds, 0.0);
+    // The next run goes on from there, and the two lengths add up to the same clock.
+    let before = sim.state().clock_seconds;
+    let (next, _) = sim.run(10.0).unwrap();
+    assert_eq!(before, segment.duration_seconds);
+    assert_eq!(sim.state().clock_seconds, before + next.duration_seconds);
+}
