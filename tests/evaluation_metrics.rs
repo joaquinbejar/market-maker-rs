@@ -768,3 +768,113 @@ fn test_attribution_reconciles_with_the_margin_ledger() {
         })
         .unwrap();
 }
+
+#[test]
+fn test_attribution_reconciles_with_the_engine_with_slippage() {
+    check_against_books(
+        base_config().with_slippage(market_maker_rs::backtest::SlippageModel::Fixed(dec!(0.01))),
+        None,
+    );
+}
+
+#[test]
+fn test_attribution_reconciles_with_the_engine_with_a_third_asset_fee() {
+    check_against_books(
+        base_config().with_fee_rate(dec!(0.001)).with_fee_currency(
+            market_maker_rs::backtest::engine::FeeCurrency::Other {
+                asset: "FEE".to_string(),
+                quote_per_unit: dec!(4),
+                scale: 6,
+            },
+        ),
+        None,
+    );
+}
+
+#[cfg(feature = "margin")]
+#[test]
+fn test_attribution_reconciles_with_base_fees_on_the_margin_ledger() {
+    use margin_rs::ledger::{Ledger, LedgerConfig};
+    use margin_rs::{Asset, InstrumentId, SpotInstrument, TransferId};
+    use market_maker_rs::backtest::MarginLedgerAccountant;
+
+    let (base, quote) = (Asset::new("BASE").unwrap(), Asset::new("QUOTE").unwrap());
+    let instrument = InstrumentId::new("BASE-QUOTE").unwrap();
+    let mut ledger = Ledger::new(LedgerConfig::default());
+    ledger.register_asset(base.clone(), 8).unwrap();
+    ledger.register_asset(quote.clone(), 8).unwrap();
+    ledger
+        .register_instrument(
+            SpotInstrument::new(instrument.clone(), base.clone(), quote.clone(), 2, 2).unwrap(),
+        )
+        .unwrap();
+    ledger
+        .deposit(TransferId::new("quote").unwrap(), quote, dec!(10000000))
+        .unwrap();
+    let ticks = walk(2000);
+    let result = BacktestEngine::new(
+        base_config()
+            .with_fee_rate(dec!(0.001))
+            .with_fee_currency(market_maker_rs::backtest::engine::FeeCurrency::Base { scale: 8 }),
+        TwoSided {
+            half_spread: dec!(0.25),
+            size: dec!(0.5),
+        },
+        VecDataSource::new(ticks.clone()),
+    )
+    .with_accountant(MarginLedgerAccountant::new(ledger, instrument).unwrap())
+    .run();
+    assert!(result.accounting.is_consistent(), "{:?}", result.accounting);
+    assert!(result.trades.iter().any(|t| !t.base_fee.is_zero()));
+    let (marks, fills) = records(&ticks, &result.trades);
+    attribute(&input(4 * DAY, &marks, &fills))
+        .unwrap()
+        .reconcile(LedgerTotals {
+            net_pnl: result.net_pnl,
+            position: result.final_position,
+        })
+        .unwrap();
+}
+
+#[cfg(feature = "instruments")]
+#[test]
+fn test_check_contract_refuses_what_position_times_mark_cannot_value() {
+    use market_maker_rs::backtest::evaluation::check_contract;
+    use market_maker_rs::instruments::{
+        AssetCode, ContractKind, ContractSize, InstrumentDraft, InstrumentId, InstrumentSpec,
+        Margining, TickSchedule,
+    };
+    let asset = |code| AssetCode::new(code).unwrap();
+    let spec = |margining, settlement, size| {
+        InstrumentSpec::new(InstrumentDraft {
+            id: InstrumentId::new("BTC-PERP").unwrap(),
+            kind: ContractKind::Perpetual,
+            margining,
+            underlying: asset("BTC"),
+            price_asset: asset("USDT"),
+            settlement_asset: asset(settlement),
+            size,
+            price_ticks: TickSchedule::fixed(dec!(0.25)).unwrap(),
+            lot: dec!(1),
+            expiry_ms: None,
+            option: None,
+        })
+        .unwrap()
+    };
+    let base = |amount| ContractSize::base(amount, asset("BTC")).unwrap();
+    assert!(check_contract(&spec(Margining::Linear, "USDT", base(dec!(1)))).is_ok());
+    let refused = [
+        spec(Margining::Linear, "USDT", base(dec!(0.5))),
+        spec(
+            Margining::Inverse,
+            "BTC",
+            ContractSize::quote_value(dec!(10), asset("USDT")).unwrap(),
+        ),
+    ];
+    for contract in &refused {
+        assert!(matches!(
+            check_contract(contract),
+            Err(EvaluationError::UnsupportedContract { .. })
+        ));
+    }
+}

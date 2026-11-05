@@ -51,6 +51,8 @@ project follows [Semantic Versioning](https://semver.org/).
 - Seasonality for `backtest::hawkes` (#91): `SeasonalProfile`, a time change of the whole
   flow, `fit_seasonality` from training segments, and `score_flow_seasonal`, with at most
   `MAX_SEASONAL_BUCKETS` buckets and serde for the profile.
+- `backtest::evaluation::check_contract` (feature `instruments`, #92): refuses a contract
+  the attribution cannot value, such as an inverse one, since its records carry no contract.
 - Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`
   takes a new `instruments::perpetual::PerpetualTerms`, with the declared rate and mark of
   each instant on the funding grid. Each instant books through the `margin-rs` ledger,

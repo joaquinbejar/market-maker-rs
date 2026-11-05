@@ -28,7 +28,8 @@
 //!
 //! The formula is linear in the mark, so it does not apply to an inverse contract
 //! or to any position whose value is not `position * mark`. Those runs must not be
-//! given to this module. Hedge costs are not part of `net`:
+//! given to this module: records carry no contract, so `check_contract` (feature
+//! `instruments`) is how a caller refuses a specification first. Hedge costs are not part of `net`:
 //! [`HedgeCosts::NotModelled`] says so, rather than a zero.
 //!
 //! # The mark in force
@@ -57,6 +58,8 @@
 mod attribution;
 mod definitions;
 
+#[cfg(feature = "instruments")]
+pub use attribution::check_contract;
 pub use attribution::{
     Attribution, BucketAttribution, BucketedAttribution, DailyAttribution, EvaluationInput,
     ExecutedFill, FillQualityReport, FillQualitySpec, HedgeCosts, HedgeNotModelledReason,
@@ -95,6 +98,12 @@ pub enum EvaluationError {
     Inexact {
         /// The quantity.
         what: &'static str,
+    },
+    /// The contract's value is not its position times its mark.
+    #[error("unsupported contract: {reason}")]
+    UnsupportedContract {
+        /// Why.
+        reason: String,
     },
     /// The attribution and the books disagree.
     #[error("{what} does not reconcile: attributed {attributed}, booked {booked}")]

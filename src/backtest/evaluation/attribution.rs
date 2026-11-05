@@ -958,3 +958,37 @@ pub fn evaluate_window(
         fill_quality: fill_reports,
     })
 }
+
+/// Checks that a contract is worth its position times its mark, as the attribution
+/// assumes: spot, or a linear future or perpetual of one unit of the underlying.
+///
+/// # Errors
+///
+/// Returns [`EvaluationError::UnsupportedContract`] for anything else, such as an
+/// inverse contract, an option, or a linear contract with another multiplier.
+#[cfg(feature = "instruments")]
+pub fn check_contract(spec: &financial_types::instrument::InstrumentSpec) -> EvalResult<()> {
+    use financial_types::instrument::{ContractKind, Margining, SizeKind};
+    let supported = match spec.kind() {
+        ContractKind::Spot => true,
+        ContractKind::Future | ContractKind::Perpetual => {
+            spec.margining() == Margining::Linear
+                && spec.size().kind() == SizeKind::BaseQuantity
+                && spec.size().amount() == Decimal::ONE
+        }
+        _ => false,
+    };
+    if supported {
+        return Ok(());
+    }
+    Err(EvaluationError::UnsupportedContract {
+        reason: format!(
+            "{} is {:?}, {:?}, sized {:?} {}",
+            spec.id().as_str(),
+            spec.kind(),
+            spec.margining(),
+            spec.size().kind(),
+            spec.size().amount()
+        ),
+    })
+}
