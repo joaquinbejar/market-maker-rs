@@ -6,6 +6,7 @@
 //! - Unified risk view across all positions
 //! - Per-underlying configuration and limits
 //! - Cross-asset hedging suggestions
+//! - Closed-form joint quotes, in the `multi_asset` module
 //!
 //! # Example
 //!
@@ -26,6 +27,7 @@
 
 mod config;
 mod manager;
+pub mod multi_asset;
 mod risk;
 mod types;
 
