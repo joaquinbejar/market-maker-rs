@@ -361,6 +361,62 @@ fn test_offsets_two_assets_follow_the_affine_formula() {
 }
 
 #[test]
+fn test_model_a_with_vanishing_risk_aversion_tends_to_model_b_constant() {
+    // `1 + gamma z / k` rounds to one in `f64` here, and the constant must still
+    // be near `1/e`, so that Gamma keeps the depth of Model B.
+    let build = |gamma, objective| {
+        MultiAssetModel::new(
+            vec![asset(dec!(1), dec!(10), dec!(20), dec!(1))],
+            &[vec![dec!(1)]],
+            gamma,
+            objective,
+            RiskView::Correlated,
+        )
+        .unwrap()
+    };
+    let tiny = build(
+        dec!(0.00000000000000000001),
+        QuotingObjective::ExponentialUtility,
+    );
+    let limit = build(dec!(0.08), QuotingObjective::RiskAdjustedExpectation);
+    let (a, b) = (
+        f(tiny.risk_matrix(0, 0).unwrap()),
+        f(limit.risk_matrix(0, 0).unwrap()),
+    );
+    assert!((a - b).abs() < 1e-12, "{a} against {b}");
+    // The base term is 1 / k and the risk buffer `sqrt(gamma) Gamma / 2` is 4e-12.
+    assert!((f(tiny.half_spread(0).unwrap()) - 1.0 / 20.0).abs() < 1e-11);
+}
+
+#[test]
+fn test_model_a_constant_is_stable_where_the_direct_power_loses_it() {
+    // `(1 + r)^-(1 + 1/r)` read 1.0567 and 0.6065 of the limit at 1e-15 and 1e-16.
+    for ratio in [
+        dec!(0.00000001),
+        dec!(0.000000000000001),
+        dec!(0.0000000000000001),
+    ] {
+        let build = |objective| {
+            MultiAssetModel::new(
+                vec![asset(dec!(1), dec!(10), dec!(1), dec!(1))],
+                &[vec![dec!(1)]],
+                ratio,
+                objective,
+                RiskView::Correlated,
+            )
+            .unwrap()
+        };
+        let a = f(build(QuotingObjective::ExponentialUtility)
+            .risk_matrix(0, 0)
+            .unwrap());
+        let b = f(build(QuotingObjective::RiskAdjustedExpectation)
+            .risk_matrix(0, 0)
+            .unwrap());
+        assert!((a / b - 1.0).abs() < 1e-7, "ratio {ratio}: {}", a / b);
+    }
+}
+
+#[test]
 fn test_half_spread_follows_the_trade_size_in_both_models() {
     let (sigma, a, k, gamma, z) = (1.2_f64, 10.0_f64, 20.0_f64, 0.08_f64, 3.0_f64);
     let ratio = gamma * z / k;
@@ -608,12 +664,15 @@ fn test_asset_params_not_positive_are_refused() {
         (one, one, dec!(-1), one, one),
         (one, one, one, dec!(0), one),
         (one, one, one, one, dec!(0)),
+        // A trade above the limit could never quote; one at the limit can.
+        (one, one, one, dec!(2), one),
     ] {
         assert!(matches!(
             AssetQuotingParams::new(sigma, scale, decay, size, limit),
             Err(MMError::InvalidConfiguration(_))
         ));
     }
+    assert!(AssetQuotingParams::new(one, one, one, one, one).is_ok());
 }
 
 #[test]

@@ -24,4 +24,6 @@ pub use model::{
     AssetQuotingParams, MAX_ASSETS, MultiAssetModel, QuoteOffsets, QuotingObjective, RiskView,
 };
 #[cfg(feature = "margin")]
-pub use quoter::{ActiveConstraint, AdmittedQuote, ConstraintKind, MultiAssetQuoter, QuoteRound};
+pub use quoter::{
+    ActiveConstraint, AdmittedQuote, CapitalUse, ConstraintKind, MultiAssetQuoter, QuoteRound,
+};

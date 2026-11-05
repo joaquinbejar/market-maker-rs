@@ -189,7 +189,7 @@ fn test_quote_every_admitted_quote_is_an_order_the_gate_holds() {
         };
     }
     assert_eq!(reserved_in_ledger(&gate, 2, dec!(100)), expected);
-    assert_eq!(round.reserved_capital, expected);
+    assert_eq!(round.capital.reserved, expected);
 }
 
 #[test]
@@ -208,7 +208,7 @@ fn test_quote_rejected_by_a_halted_gate_produces_no_quote_and_logs_each_side() {
             other => panic!("{other:?}"),
         }
     }
-    assert_eq!(round.reserved_capital, Decimal::ZERO);
+    assert_eq!(round.capital.reserved, Decimal::ZERO);
 }
 
 #[test]
@@ -336,15 +336,197 @@ fn test_quote_inventory_limit_withholds_the_side_that_breaches_it() {
     assert!(quote_of(&round, 0, Action::Buy).is_some());
 }
 
+#[test]
+fn test_quote_inventory_beyond_the_limit_can_still_be_reduced() {
+    let mut gate = gate(1);
+    hold(&mut gate, 0, dec!(8));
+    let mut quoter = MultiAssetQuoter::new(
+        model(1, dec!(0), RiskView::Correlated, dec!(5)),
+        ids(1),
+        AMPLE,
+    )
+    .unwrap();
+    let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    assert!(quote_of(&round, 0, Action::Sell).is_some());
+    assert!(quote_of(&round, 0, Action::Buy).is_none());
+    let mut short = self::gate(1);
+    hold(&mut short, 0, dec!(-8));
+    let round = quoter.quote(&mut short, &marks(1), 1).unwrap();
+    assert!(quote_of(&round, 0, Action::Buy).is_some());
+    assert!(quote_of(&round, 0, Action::Sell).is_none());
+}
+
+#[test]
+fn test_quote_inventory_limit_counts_orders_still_live() {
+    // Flat, limit 1: a bid fits, and a second one must not, on either side.
+    let mut gate = gate(1);
+    let mut quoter = MultiAssetQuoter::new(
+        model(1, dec!(0), RiskView::Correlated, dec!(1)),
+        ids(1),
+        AMPLE,
+    )
+    .unwrap();
+    let first = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    assert_eq!(first.quotes.len(), 2);
+    let second = quoter.quote(&mut gate, &marks(1), 2).unwrap();
+    assert!(second.quotes.is_empty(), "{:?}", second.quotes);
+    assert_eq!(
+        find(&second, 0, Action::Buy)[0].kind,
+        ConstraintKind::InventoryLimit {
+            resulting: dec!(2),
+            limit: dec!(1),
+        }
+    );
+    assert_eq!(
+        find(&second, 0, Action::Sell)[0].kind,
+        ConstraintKind::InventoryLimit {
+            resulting: dec!(-2),
+            limit: dec!(1),
+        }
+    );
+    // A cancelled order no longer counts, while one with a cancel pending does.
+    let buy = &first.quotes[0].order_id;
+    gate.request_cancel(buy).unwrap();
+    let pending = quoter.quote(&mut gate, &marks(1), 3).unwrap();
+    assert!(quote_of(&pending, 0, Action::Buy).is_none());
+    gate.on_cancel_confirmed(buy).unwrap();
+    let replaced = quoter.quote(&mut gate, &marks(1), 4).unwrap();
+    assert!(quote_of(&replaced, 0, Action::Buy).is_some());
+}
+
+/// The live orders of `gate` in the range they can move each inventory.
+fn reachable_box(gate: &RiskGate, count: usize) -> Vec<(Decimal, Decimal)> {
+    (0..count)
+        .map(|index| {
+            let id = instrument_id(index);
+            let held = gate
+                .ledger()
+                .position(&id)
+                .map_or(Decimal::ZERO, |p| p.quantity);
+            let (mut low, mut high) = (held, held);
+            for order in gate.live_orders().filter(|order| order.instrument == id) {
+                let remaining = order.remaining().unwrap();
+                match order.side {
+                    Action::Buy => high += remaining,
+                    _ => low -= remaining,
+                }
+            }
+            (low, high)
+        })
+        .collect()
+}
+
+/// The true largest `q' Sigma q` over the box: a convex function peaks at a vertex.
+fn largest_variance(model: &MultiAssetModel, reach: &[(Decimal, Decimal)]) -> Decimal {
+    let mut largest = Decimal::MIN;
+    for corner in 0..(1_u32 << reach.len()) {
+        let q: Vec<Decimal> = reach
+            .iter()
+            .enumerate()
+            .map(|(i, (low, high))| if corner >> i & 1 == 1 { *high } else { *low })
+            .collect();
+        largest = largest.max(model.portfolio_variance(&q).unwrap());
+    }
+    largest
+}
+
+#[test]
+fn test_portfolio_limit_two_bids_that_can_fill_together_are_not_both_admitted() {
+    let mut gate = gate(2);
+    let mut quoter = MultiAssetQuoter::new(
+        model(2, dec!(0), RiskView::Correlated, dec!(100)),
+        ids(2),
+        AMPLE,
+    )
+    .unwrap()
+    .with_max_portfolio_variance(dec!(1.1))
+    .unwrap();
+    let round = quoter.quote(&mut gate, &marks(2), 1).unwrap();
+    assert!(quote_of(&round, 0, Action::Buy).is_some());
+    assert!(quote_of(&round, 1, Action::Buy).is_none());
+    assert!(matches!(
+        find(&round, 1, Action::Buy)[0].kind,
+        ConstraintKind::PortfolioRisk { .. }
+    ));
+    let reach = reachable_box(&gate, 2);
+    let worst = largest_variance(quoter.model(), &reach);
+    assert!(worst <= dec!(1.1), "{worst} over {reach:?}");
+}
+
+#[test]
+fn test_portfolio_limit_counts_orders_still_live_across_rounds() {
+    let mut gate = gate(1);
+    let mut quoter = quoter(1, dec!(0), AMPLE)
+        .with_max_portfolio_variance(dec!(4))
+        .unwrap();
+    // Variance 1 then 4 are allowed; a third live bid could reach 9.
+    for round in 0..2 {
+        let done = quoter.quote(&mut gate, &marks(1), round).unwrap();
+        assert!(quote_of(&done, 0, Action::Buy).is_some(), "round {round}");
+    }
+    let third = quoter.quote(&mut gate, &marks(1), 2).unwrap();
+    assert!(quote_of(&third, 0, Action::Buy).is_none());
+    assert_eq!(
+        find(&third, 0, Action::Buy)[0].kind,
+        ConstraintKind::PortfolioRisk {
+            variance: dec!(9),
+            limit: dec!(4),
+        }
+    );
+}
+
+#[test]
+fn test_portfolio_limit_holds_or_never_rises_over_every_reachable_state() {
+    // Inventories on both sides of the limit, for every view and correlation, with
+    // orders left live across rounds: the true largest variance, by enumeration,
+    // ends under the limit or no higher than it started.
+    let limit = dec!(12);
+    let start = [
+        [dec!(0), dec!(0), dec!(0)],
+        [dec!(1), dec!(-1), dec!(1)],
+        [dec!(2), dec!(2), dec!(0)],
+        [dec!(4), dec!(4), dec!(4)],
+        [dec!(-5), dec!(3), dec!(-2)],
+    ];
+    for view in [RiskView::Correlated, RiskView::Diagonal] {
+        for rho in [dec!(-0.4), dec!(0), dec!(0.5), dec!(0.9)] {
+            for position in &start {
+                let mut gate = gate(3);
+                for (index, quantity) in position.iter().enumerate() {
+                    if !quantity.is_zero() {
+                        hold(&mut gate, index, *quantity);
+                    }
+                }
+                let mut quoter =
+                    MultiAssetQuoter::new(model(3, rho, view, dec!(100)), ids(3), AMPLE)
+                        .unwrap()
+                        .with_max_portfolio_variance(limit)
+                        .unwrap();
+                let mut before = largest_variance(quoter.model(), &reachable_box(&gate, 3));
+                for round in 0..4 {
+                    quoter.quote(&mut gate, &marks(3), round).unwrap();
+                    let after = largest_variance(quoter.model(), &reachable_box(&gate, 3));
+                    assert!(
+                        after <= limit.max(before),
+                        "{view:?} rho {rho} from {position:?}: {before} to {after}"
+                    );
+                    before = after;
+                }
+            }
+        }
+    }
+}
+
 /// A portfolio of the same size under a variance limit between its hedged and
-/// concentrated variances: `q' Sigma q` is 2 q^2 (1 -/+ rho) in these units.
+/// concentrated variances. The hedged one reaches at most 8.8 when all four sides
+/// fill in any combination, and the bound on that is 11.
 fn risk_round(view: RiskView, position: [Decimal; 2]) -> QuoteRound {
     let mut gate = gate(2);
     hold(&mut gate, 0, position[0]);
     hold(&mut gate, 1, position[1]);
     let mut quoter = MultiAssetQuoter::new(model(2, dec!(0.9), view, dec!(100)), ids(2), AMPLE)
         .unwrap()
-        .with_max_portfolio_variance(dec!(10))
+        .with_max_portfolio_variance(dec!(12))
         .unwrap();
     quoter.quote(&mut gate, &marks(2), 1).unwrap()
 }
@@ -358,7 +540,7 @@ fn test_portfolio_limit_concentrated_withholds_the_risk_raising_sides_only() {
             matches!(
                 &find(&concentrated, asset, Action::Buy)[0].kind,
                 ConstraintKind::PortfolioRisk { variance, limit }
-                    if *variance > *limit && *limit == dec!(10)
+                    if *variance > *limit && *limit == dec!(12)
             ),
             "{:?}",
             concentrated.constraints
@@ -394,7 +576,7 @@ fn test_capital_budget_adding_instruments_does_not_consume_more_capital() {
         // Read from the ledger, not from what the quoter reports.
         let held = reserved_in_ledger(&gate, count, dec!(100));
         assert!(held <= budget, "{count} instruments hold {held}");
-        assert_eq!(round.reserved_capital, held);
+        assert_eq!(round.capital.reserved, held);
         assert_eq!(round.quotes.len(), count * 2);
         sizes.push(quote_of(&round, 0, Action::Buy).unwrap().1);
     }
@@ -436,7 +618,7 @@ fn test_capital_budget_too_small_for_a_lot_withholds_everything() {
     let mut quoter = quoter(1, dec!(0), dec!(0.001));
     let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
     assert!(round.quotes.is_empty());
-    assert_eq!(round.reserved_capital, Decimal::ZERO);
+    assert_eq!(round.capital.committed, Decimal::ZERO);
     assert_eq!(round.constraints.len(), 2);
     assert!(round.constraints.iter().all(|c| matches!(
         c.kind,
@@ -497,7 +679,7 @@ fn test_capital_budget_sizing_counts_a_declared_fee_on_the_side_that_reserves_it
             round.constraints
         );
         assert!(
-            round.reserved_capital > dec!(0.99) * budget,
+            round.capital.reserved > dec!(0.99) * budget,
             "{fee_asset:?}"
         );
     }
@@ -521,7 +703,7 @@ fn test_capital_budget_order_over_budget_after_reservation_rounding_is_released(
     let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
     let held = reserved_in_ledger(&gate, 1, dec!(100));
     assert!(held <= budget, "{held}");
-    assert_eq!(round.reserved_capital, held);
+    assert_eq!(round.capital.reserved, held);
     let released: Vec<_> = round
         .constraints
         .iter()
@@ -535,6 +717,174 @@ fn test_capital_budget_order_over_budget_after_reservation_rounding_is_released(
     assert_eq!(released.len(), 1, "{:?}", round.constraints);
     // The released side left no order standing and no quote.
     assert!(quote_of(&round, 0, released[0].side).is_none());
+}
+
+#[test]
+fn test_capital_budget_counts_inventory_already_deployed() {
+    // Long 50 of each at 100 is 10000 deployed, far beyond the budget: no bid may
+    // add to it, however little the open orders hold.
+    let budget = dec!(150);
+    let mut gate = gate(2);
+    hold(&mut gate, 0, dec!(50));
+    hold(&mut gate, 1, dec!(50));
+    let mut quoter = quoter(2, dec!(0), budget);
+    let round = quoter.quote(&mut gate, &marks(2), 1).unwrap();
+    for asset in 0..2 {
+        assert!(quote_of(&round, asset, Action::Buy).is_none());
+        assert!(matches!(
+            find(&round, asset, Action::Buy)[0].kind,
+            ConstraintKind::CapitalBudget { allowed, .. } if allowed.is_zero()
+        ));
+        // Selling what is held commits nothing new, and it stays at full size.
+        assert_eq!(quote_of(&round, asset, Action::Sell).unwrap().1, dec!(1));
+    }
+    assert_eq!(round.capital.deployed, dec!(10000));
+    assert_eq!(round.capital.reserved, dec!(200));
+    assert_eq!(round.capital.committed, dec!(10000));
+}
+
+#[test]
+fn test_capital_budget_short_inventory_counts_and_its_buy_back_stays() {
+    let budget = dec!(150);
+    let mut gate = gate(1);
+    hold(&mut gate, 0, dec!(-50));
+    let mut quoter = quoter(1, dec!(0), budget);
+    let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    assert_eq!(round.capital.deployed, dec!(5000));
+    assert!(quote_of(&round, 0, Action::Sell).is_none());
+    assert!(matches!(
+        find(&round, 0, Action::Sell)[0].kind,
+        ConstraintKind::CapitalBudget { allowed, .. } if allowed.is_zero()
+    ));
+    let (bid, size) = quote_of(&round, 0, Action::Buy).unwrap();
+    assert_eq!(size, dec!(1));
+    // The bid's cash is counted as covering the short, not added to it.
+    assert_eq!(round.capital.reserved, bid);
+    assert_eq!(round.capital.committed, dec!(5000));
+}
+
+#[test]
+fn test_capital_budget_side_partly_unwinding_keeps_that_part_when_scaled() {
+    // Long 0.4 with a budget of exactly what is deployed: the ask keeps the 0.4 it
+    // unwinds and loses the 0.6 that would go short; the bid has nothing left.
+    let mut gate = gate(1);
+    hold(&mut gate, 0, dec!(0.4));
+    let mut quoter = quoter(1, dec!(0), dec!(40));
+    let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    assert!(quote_of(&round, 0, Action::Buy).is_none());
+    assert_eq!(quote_of(&round, 0, Action::Sell).unwrap().1, dec!(0.4));
+    assert_eq!(
+        find(&round, 0, Action::Sell)[0].kind,
+        ConstraintKind::CapitalBudget {
+            requested: dec!(1),
+            allowed: dec!(0.4),
+            budget: dec!(40),
+        }
+    );
+    assert_eq!(round.capital.committed, dec!(40));
+}
+
+#[test]
+fn test_capital_budget_unwinding_order_over_budget_stands_and_adds_only_its_fee() {
+    let mut gate = gate(1);
+    gate.set_limits(
+        &instrument_id(0),
+        InstrumentLimits {
+            max_fee_rate: dec!(0.01),
+            ..InstrumentLimits::default()
+        },
+    )
+    .unwrap();
+    hold(&mut gate, 0, dec!(-50));
+    let mut quoter = quoter(1, dec!(0), dec!(150));
+    let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    let (bid, size) = quote_of(&round, 0, Action::Buy).unwrap();
+    assert_eq!(size, dec!(1));
+    let committed = round.capital.committed - dec!(5000);
+    assert!(
+        committed > Decimal::ZERO && committed <= (bid * dec!(0.01)).ceil(),
+        "{committed}"
+    );
+}
+
+#[test]
+fn test_capital_use_does_not_double_count_a_sell_of_inventory_held() {
+    let mut gate = gate(1);
+    hold(&mut gate, 0, dec!(5));
+    let mut quoter = quoter(1, dec!(0), AMPLE);
+    let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    let (bid, _) = quote_of(&round, 0, Action::Buy).unwrap();
+    assert_eq!(round.capital.deployed, dec!(500));
+    assert_eq!(round.capital.reserved, bid + dec!(100));
+    // The ask's 100 is part of the 500 already deployed; the bid's cash is new.
+    assert_eq!(round.capital.committed, dec!(500) + bid);
+    assert_eq!(quoter.capital_use(&gate, &marks(1)).unwrap(), round.capital);
+}
+
+#[test]
+fn test_capital_budget_marks_can_pass_the_budget_and_rounds_then_only_reduce() {
+    let budget = dec!(250);
+    let mut gate = gate(1);
+    hold(&mut gate, 0, dec!(1));
+    let mut quoter = quoter(1, dec!(0), budget);
+    let calm = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    assert!(quote_of(&calm, 0, Action::Buy).is_some());
+    for quote in &calm.quotes {
+        gate.on_cancel_confirmed(&quote.order_id).unwrap();
+    }
+    // The same long at a price of 300 is over budget by itself.
+    let round = quoter.quote(&mut gate, &[dec!(300)], 2).unwrap();
+    assert!(quote_of(&round, 0, Action::Buy).is_none());
+    assert_eq!(quote_of(&round, 0, Action::Sell).unwrap().1, dec!(1));
+    assert_eq!(round.capital.committed, dec!(300));
+}
+
+#[test]
+fn test_quote_through_the_reference_is_reported_and_still_stands() {
+    let mut gate = gate(1);
+    hold(&mut gate, 0, dec!(50));
+    let mut quoter = quoter(1, dec!(0), AMPLE);
+    let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    let (ask, _) = quote_of(&round, 0, Action::Sell).unwrap();
+    assert!(ask <= dec!(100), "{ask}");
+    assert_eq!(
+        find(&round, 0, Action::Sell)[0].kind,
+        ConstraintKind::ThroughReference {
+            price: ask,
+            reference: dec!(100),
+        }
+    );
+    assert!(find(&round, 0, Action::Buy).is_empty());
+    let mut short = self::gate(1);
+    hold(&mut short, 0, dec!(-50));
+    let round = quoter.quote(&mut short, &marks(1), 1).unwrap();
+    let (bid, _) = quote_of(&round, 0, Action::Buy).unwrap();
+    assert!(bid >= dec!(100), "{bid}");
+    assert!(matches!(
+        find(&round, 0, Action::Buy)[0].kind,
+        ConstraintKind::ThroughReference { .. }
+    ));
+}
+
+#[test]
+fn test_quote_new_quoter_on_a_used_gate_logs_duplicates_and_loses_nothing() {
+    let mut gate = gate(1);
+    let mut first = quoter(1, dec!(0), AMPLE);
+    assert_eq!(
+        first.quote(&mut gate, &marks(1), 1).unwrap().quotes.len(),
+        2
+    );
+    let mut second = quoter(1, dec!(0), AMPLE);
+    let round = second.quote(&mut gate, &marks(1), 2).unwrap();
+    assert!(round.quotes.is_empty());
+    for constraint in &round.constraints {
+        assert!(matches!(
+            &constraint.kind,
+            ConstraintKind::MarginRejected { reasons }
+                if reasons[0] == RiskReason::DuplicateOrderId
+        ));
+    }
+    assert_eq!(gate.live_orders().count(), 2, "the first quotes stand");
 }
 
 #[test]
@@ -592,7 +942,7 @@ fn test_quote_bad_marks_are_errors_and_leave_the_gate_untouched() {
             Err(MMError::InvalidMarketState(_))
         ));
         assert!(matches!(
-            quoter.reserved_capital(&gate, &bad),
+            quoter.capital_use(&gate, &bad),
             Err(MMError::InvalidMarketState(_))
         ));
     }
@@ -765,10 +1115,13 @@ mod simulation {
         pub mean_risk: f64,
         /// Mean absolute inventory per asset: with linear instruments, the delta.
         pub mean_abs_inventory: [f64; 2],
-        /// Mean of reserved capital over the capital budget.
+        /// Mean of committed capital over the capital budget.
         pub mean_utilization: f64,
-        /// Largest of reserved capital over the capital budget.
+        /// Largest of committed capital over the capital budget. Marks can take it
+        /// past one between rounds; a round cannot.
         pub peak_utilization: f64,
+        /// Mean of reserved capital alone over the capital budget.
+        pub mean_reserved: f64,
         pub fills: usize,
         pub constraints: usize,
     }
@@ -822,13 +1175,27 @@ mod simulation {
 
         let steps = tape.marks.len();
         let (mut risk_sum, mut penalty, mut utilization_sum, mut peak) = (0.0, 0.0, 0.0, 0.0_f64);
+        let mut reserved_sum = 0.0;
         let mut absolute = [0.0_f64; 2];
         let (mut fills, mut constraints) = (0, 0);
         for (step, marks) in tape.marks.iter().enumerate() {
+            let before = quoter.capital_use(&gate, marks).unwrap().committed;
             let round = quoter.quote(&mut gate, marks, step as u64).unwrap();
+            // The only allowance is the fee an unwinding order reserves.
+            let fees: Decimal = round
+                .quotes
+                .iter()
+                .map(|quote| quote.price * quote.quantity * simulation::FEE_RATE + dec!(0.00000001))
+                .sum();
+            assert!(
+                round.capital.committed <= setup.budget.max(before) + fees,
+                "a round raised committed capital past the budget: {before} to {:?}",
+                round.capital
+            );
             constraints += round.constraints.len();
-            let utilization = f64_of(round.reserved_capital) / f64_of(setup.budget);
+            let utilization = f64_of(round.capital.committed) / f64_of(setup.budget);
             utilization_sum += utilization;
+            reserved_sum += f64_of(round.capital.reserved) / f64_of(setup.budget);
             peak = peak.max(utilization);
             for quote in &round.quotes {
                 gate.on_venue_accepted(&quote.order_id).unwrap();
@@ -883,6 +1250,7 @@ mod simulation {
             mean_abs_inventory: absolute.map(|sum| sum / steps as f64),
             mean_utilization: utilization_sum / steps as f64,
             peak_utilization: peak,
+            mean_reserved: reserved_sum / steps as f64,
             fills,
             constraints,
         }
@@ -1036,17 +1404,17 @@ fn test_comparison_correlation_scenarios_print_evidence_table() {
     println!("| true rho | assumed | budget | metric | correlated | diagonal | gap | std err |");
     println!("|---|---|---|---|---|---|---|---|");
     for (rho, assumed, budget) in [
-        (-0.5, -0.5, dec!(1000)),
-        (0.0, 0.0, dec!(1000)),
-        (0.5, 0.5, dec!(1000)),
-        (0.9, 0.9, dec!(1000)),
-        (-0.5, 0.5, dec!(1000)),
-        (0.0, 0.9, dec!(1000)),
-        (0.9, 0.9, dec!(150)),
+        (-0.5, -0.5, dec!(5000)),
+        (0.0, 0.0, dec!(5000)),
+        (0.5, 0.5, dec!(5000)),
+        (0.9, 0.9, dec!(5000)),
+        (-0.5, 0.5, dec!(5000)),
+        (0.0, 0.9, dec!(5000)),
+        (0.9, 0.9, dec!(500)),
     ] {
         let joint = runs(rho, assumed, RiskView::Correlated, budget, paths, steps);
         let separate = runs(rho, assumed, RiskView::Diagonal, budget, paths, steps);
-        let metrics: [Metric; 8] = [
+        let metrics: [Metric; 9] = [
             ("net PnL", |o| o.net_pnl),
             ("objective", |o| o.objective),
             ("mean risk", |o| o.mean_risk),
@@ -1054,6 +1422,7 @@ fn test_comparison_correlation_scenarios_print_evidence_table() {
             ("mean abs inventory 2", |o| o.mean_abs_inventory[1]),
             ("mean utilization", |o| o.mean_utilization),
             ("peak utilization", |o| o.peak_utilization),
+            ("mean reserved over budget", |o| o.mean_reserved),
             ("fills", |o| o.fills as f64),
         ];
         for (name, metric) in metrics {

@@ -58,7 +58,8 @@ impl AssetQuotingParams {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::InvalidConfiguration`] if any value is not positive.
+    /// Returns [`MMError::InvalidConfiguration`] if any value is not positive,
+    /// or if `trade_size` is above `inventory_limit`, which could never quote.
     pub fn new(
         volatility: Decimal,
         intensity_scale: Decimal,
@@ -78,6 +79,11 @@ impl AssetQuotingParams {
                     "{name} must be positive, got {value}"
                 )));
             }
+        }
+        if trade_size > inventory_limit {
+            return Err(MMError::InvalidConfiguration(format!(
+                "trade size {trade_size} is above the inventory limit {inventory_limit}"
+            )));
         }
         Ok(Self {
             volatility,
@@ -273,7 +279,9 @@ impl MultiAssetModel {
                 QuotingObjective::ExponentialUtility => {
                     let ratio = gamma * trade / decay;
                     (
-                        (1.0 + ratio).powf(-(1.0 + 1.0 / ratio)),
+                        // In logarithms: `1 + ratio` rounds to one for a tiny
+                        // ratio, where the constant must tend to `1/e`.
+                        (-(1.0 + ratio.recip()) * ratio.ln_1p()).exp(),
                         ratio.ln_1p() / (gamma * trade),
                     )
                 }

@@ -6,7 +6,7 @@ use margin_rs::risk::{FeeAsset, OrderPurpose, OrderRequest, RiskDecision, RiskGa
 use margin_rs::{Asset, Instrument, InstrumentId, OrderId};
 use rust_decimal::RoundingStrategy;
 
-use super::model::MultiAssetModel;
+use super::model::{AssetQuotingParams, MultiAssetModel};
 use crate::Decimal;
 use crate::types::action::{Action, Dir};
 use crate::types::decimal::OrOverflow;
@@ -41,21 +41,32 @@ pub enum ConstraintKind {
         /// The price after rounding.
         price: Decimal,
     },
-    /// A trade would take the inventory beyond the limit of the model; the side
-    /// is withheld.
+    /// With every live order on this side filled, a trade would take the
+    /// inventory beyond the limit of the model; the side is withheld. A side
+    /// that moves an inventory beyond the limit back towards it is not.
     InventoryLimit {
-        /// The inventory after the trade.
+        /// The worst case inventory after the trade.
         resulting: Decimal,
         /// The limit on its absolute value.
         limit: Decimal,
     },
-    /// A trade would raise the portfolio variance beyond the limit; the side is
-    /// withheld. A side that lowers the variance is never withheld for this.
+    /// Some way for the live orders and this side to fill could take the
+    /// portfolio variance beyond the limit; the side is withheld. A side that
+    /// cannot raise the variance in any such state is never withheld for this.
     PortfolioRisk {
-        /// `q' Sigma q` after the trade, under the model's view.
+        /// Upper bound of `q' Sigma q` over those states, under the model's view.
         variance: Decimal,
         /// The limit.
         limit: Decimal,
+    },
+    /// The quote stands, on the far side of the reference price, as the affine
+    /// formula gives at a large inventory: it would trade at once against that
+    /// price. Reported, not withheld.
+    ThroughReference {
+        /// The quote price.
+        price: Decimal,
+        /// The reference price.
+        reference: Decimal,
     },
     /// The capital budget shared by every quote cut the quantity, to zero when
     /// the side is withheld.
@@ -108,6 +119,9 @@ impl fmt::Display for ActiveConstraint {
             ConstraintKind::PortfolioRisk { variance, limit } => {
                 write!(f, "portfolio variance {variance} would exceed {limit}")
             }
+            ConstraintKind::ThroughReference { price, reference } => {
+                write!(f, "price {price} is through the reference {reference}")
+            }
             ConstraintKind::CapitalBudget {
                 requested,
                 allowed,
@@ -131,9 +145,25 @@ impl fmt::Display for ActiveConstraint {
     }
 }
 
+/// The capital of an account at some marks, in the quote asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CapitalUse {
+    /// Inventory at the marks: `sum |q_i| mark_i`. A long paid for it in quote,
+    /// and a short draws it from a deposit of the base asset.
+    pub deployed: Decimal,
+    /// What the gate's ledger holds for live orders: reserved quote, plus reserved
+    /// base at the marks.
+    pub reserved: Decimal,
+    /// `deployed + reserved`, less the reservations that only unwind inventory: a
+    /// sell of base already held long and a buy that covers a short commit nothing
+    /// new. This is what the capital budget limits.
+    pub committed: Decimal,
+}
+
 /// What one round produced: the quotes standing, and the cause of every side
-/// changed or withheld. The crate does not print: this is the log, for the
-/// caller to keep or forward.
+/// changed, withheld or flagged. The crate does not print: this is the log, for
+/// the caller to keep or forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct QuoteRound {
@@ -141,8 +171,8 @@ pub struct QuoteRound {
     pub quotes: Vec<AdmittedQuote>,
     /// Every active constraint, in the order the stages met them.
     pub constraints: Vec<ActiveConstraint>,
-    /// Capital the gate holds after the round, in the quote asset.
-    pub reserved_capital: Decimal,
+    /// The capital after the round.
+    pub capital: CapitalUse,
 }
 
 /// A side on its way through the stages.
@@ -154,6 +184,16 @@ struct Candidate {
     quantity: Decimal,
     /// Capital one unit of quantity is expected to hold.
     unit_capital: Decimal,
+    /// The part of `quantity` that only unwinds inventory, and commits nothing.
+    covered: Decimal,
+}
+
+/// The live orders of one instrument.
+#[derive(Debug, Clone, Copy, Default)]
+struct LiveOrders {
+    buys: Decimal,
+    sells: Decimal,
+    lowest_bid: Option<Decimal>,
 }
 
 /// The terms of an instrument, read from the gate.
@@ -177,15 +217,32 @@ struct SpotView {
 ///    ledger holds, rounded away from the reference price onto the grid. A
 ///    price that is not positive withholds the side.
 /// 2. **Hard model limits.** The inventory limit, then the optional portfolio
-///    variance limit. A breach withholds the side; a side that lowers the
-///    variance still quotes.
-/// 3. **Size.** All remaining sides share the capital budget left after what
-///    the gate already holds: when they ask for more, each is scaled by the
-///    same factor, rounded down to a lot. A side rounded to nothing is withheld.
+///    variance limit, both on what can still happen and not only on the current
+///    inventory: orders fill independently, so every live order and every side
+///    already admitted this round may fill or not, in any combination. A breach
+///    withholds the side. A side that moves the inventory back towards its limit,
+///    or that cannot raise the variance in any of those states, still quotes.
+/// 3. **Size.** All remaining sides share the capital budget left after what is
+///    already committed ([`CapitalUse::committed`]): when they ask for more, each
+///    is scaled by the same factor, rounded down to a lot. A side rounded to
+///    nothing is withheld. The part of a side that only unwinds inventory commits
+///    nothing, so it is not scaled, and stays when the budget is spent.
 /// 4. **Hard rejection.** Each side is submitted to the gate, which reserves
 ///    for it and may reduce or reject it. Nothing can bypass this stage, and a
 ///    quote exists only if the gate approved it. If rounding in a reservation
-///    takes the capital held past the budget, the order is released.
+///    takes the committed capital past the budget, the order is released.
+///
+/// A round never raises the committed capital above the budget, with one
+/// exception: the fee an unwinding order reserves, which is kept so that an account
+/// over budget can still reduce. Marks can also pass the budget, by revaluing the
+/// inventory, and the next round then has less left to commit. An account already
+/// over budget can only reduce.
+///
+/// The variance limit is conservative. The largest variance over those states
+/// is a hard problem in many assets, so it uses a bound that is exact when one
+/// asset can move and otherwise can exceed the true maximum, withholding a side
+/// that would have stayed under the limit: with `q = c + r u` and `|u_i| <= 1`,
+/// `q' Sigma q <= c' Sigma c + 2 sum |(Sigma c)_i| r_i + (sum r_i sigma_i)^2`.
 ///
 /// There is no hedging stage: a withheld side is reported, and placing a hedge
 /// is left to the caller. The offsets keep assuming the model's trade size when
@@ -196,7 +253,14 @@ struct SpotView {
 /// replaced, since orders still live keep their capital and their limits.
 ///
 /// Short inventory on a spot instrument draws on a deposit of the base asset,
-/// and the ledger's net traded quantity is the inventory the model sees.
+/// and the ledger's net traded quantity is the inventory the model sees. The
+/// deposit itself is outside the model: it carries price risk that the quotes do
+/// not skew for and the limits do not see.
+///
+/// Order ids are `ma-<round>-<asset>-<side>`, with rounds counted per quoter. A new
+/// quoter on a gate an earlier one used repeats them: the gate rejects those orders
+/// as duplicates and the round logs it, so nothing is lost silently, but nothing
+/// quotes either until the rounds pass the earlier ones.
 ///
 /// # Examples
 ///
@@ -246,11 +310,8 @@ pub struct MultiAssetQuoter {
 }
 
 impl MultiAssetQuoter {
-    /// A quoter for `instruments`, one per asset of `model`, in its order, that
-    /// never holds more than `capital_budget` of capital, in the quote asset.
-    ///
-    /// Capital is what the gate reserves for live orders: quote for a bid, and
-    /// base valued at the reference price for an ask.
+    /// A quoter for `instruments`, one per asset of `model`, in its order, under
+    /// `capital_budget`, in the quote asset, on [`CapitalUse::committed`].
     ///
     /// # Errors
     ///
@@ -291,7 +352,10 @@ impl MultiAssetQuoter {
         })
     }
 
-    /// Withholds any side that would raise `q' Sigma q` above `limit`.
+    /// Withholds any side that could raise `q' Sigma q` above `limit`, in any
+    /// combination of fills of the live orders and the sides already admitted. The
+    /// check uses the conservative bound documented on the type, and a side that
+    /// cannot raise the variance in any such state is exempt.
     ///
     /// # Errors
     ///
@@ -387,18 +451,115 @@ impl MultiAssetQuoter {
         }
     }
 
-    /// The capital the gate holds, read from its ledger: reserved quote, plus
-    /// reserved base valued at `marks`, one per asset.
+    /// The capital of the account at `marks`, one per asset, read from the gate.
     ///
     /// # Errors
     ///
     /// Returns [`MMError::InvalidMarketState`] if `marks` does not have one
     /// positive price per asset, [`MMError::InvalidConfiguration`] if the
     /// instruments are not spot instruments with one common quote asset and
-    /// distinct base assets, and [`MMError::NumericalError`] on overflow.
-    pub fn reserved_capital(&self, gate: &RiskGate, marks: &[Decimal]) -> MMResult<Decimal> {
+    /// distinct base assets, [`MMError::NumericalError`] on overflow, and
+    /// [`MMError::InvalidQuoteGeneration`] if an order record cannot be read.
+    pub fn capital_use(&self, gate: &RiskGate, marks: &[Decimal]) -> MMResult<CapitalUse> {
         self.check_marks(marks)?;
-        Self::held_capital(gate, &self.spots(gate)?, marks)
+        let spots = self.spots(gate)?;
+        let inventory = Self::inventory(gate, &spots);
+        let live = Self::live_orders(gate, &spots)?;
+        Self::capital(gate, &spots, marks, &inventory, &live)
+    }
+
+    fn inventory(gate: &RiskGate, spots: &[SpotView]) -> Vec<Decimal> {
+        spots
+            .iter()
+            .map(|spot| {
+                gate.ledger()
+                    .position(&spot.id)
+                    .map_or(Decimal::ZERO, |position| position.quantity)
+            })
+            .collect()
+    }
+
+    /// The live orders per instrument. Orders with a cancel pending count: they
+    /// may still fill, and they keep their reservations.
+    fn live_orders(gate: &RiskGate, spots: &[SpotView]) -> MMResult<Vec<LiveOrders>> {
+        let mut live = vec![LiveOrders::default(); spots.len()];
+        for order in gate.live_orders() {
+            let Some(asset) = spots.iter().position(|spot| spot.id == order.instrument) else {
+                continue;
+            };
+            let remaining = order.remaining().map_err(|error| {
+                MMError::InvalidQuoteGeneration(format!("cannot read order {}: {error}", order.id))
+            })?;
+            let Some(slot) = live.get_mut(asset) else {
+                continue;
+            };
+            match Dir::try_from(order.side)? {
+                Dir::Sell => {
+                    slot.sells = slot
+                        .sells
+                        .checked_add(remaining)
+                        .or_overflow("live sells")?;
+                }
+                Dir::Buy => {
+                    slot.buys = slot.buys.checked_add(remaining).or_overflow("live buys")?;
+                    slot.lowest_bid = Some(
+                        slot.lowest_bid
+                            .map_or(order.price, |lowest| lowest.min(order.price)),
+                    );
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    fn capital(
+        gate: &RiskGate,
+        spots: &[SpotView],
+        marks: &[Decimal],
+        inventory: &[Decimal],
+        live: &[LiveOrders],
+    ) -> MMResult<CapitalUse> {
+        let reserved = Self::held_capital(gate, spots, marks)?;
+        let mut deployed = Decimal::ZERO;
+        let mut covered = Decimal::ZERO;
+        for ((held, mark), orders) in inventory.iter().zip(marks).zip(live) {
+            let value = held
+                .abs()
+                .checked_mul(*mark)
+                .or_overflow("deployed capital")?;
+            deployed = deployed
+                .checked_add(value)
+                .or_overflow("deployed capital")?;
+            // Valued at or below what the gate reserved, so never over-subtracted.
+            let long = (*held).max(Decimal::ZERO);
+            let short = Decimal::ZERO
+                .checked_sub(*held)
+                .or_overflow("short inventory")?
+                .max(Decimal::ZERO);
+            let sold = orders
+                .sells
+                .min(long)
+                .checked_mul(*mark)
+                .or_overflow("covered capital")?;
+            let bought = orders
+                .buys
+                .min(short)
+                .checked_mul(orders.lowest_bid.unwrap_or(Decimal::ZERO))
+                .or_overflow("covered capital")?;
+            covered = covered
+                .checked_add(sold)
+                .and_then(|sum| sum.checked_add(bought))
+                .or_overflow("covered capital")?;
+        }
+        let committed = deployed
+            .checked_add(reserved)
+            .and_then(|sum| sum.checked_sub(covered))
+            .or_overflow("committed capital")?;
+        Ok(CapitalUse {
+            deployed,
+            reserved,
+            committed,
+        })
     }
 
     fn balance_reserved(gate: &RiskGate, asset: &Asset) -> MMResult<Decimal> {
@@ -447,9 +608,17 @@ impl MultiAssetQuoter {
     ) -> MMResult<QuoteRound> {
         self.check_marks(marks)?;
         let spots = self.spots(gate)?;
+        let inventory = Self::inventory(gate, &spots);
         let mut constraints = Vec::new();
-        let candidates = self.candidates(gate, &spots, marks, &mut constraints)?;
-        let sized = self.sized(gate, &spots, marks, candidates, &mut constraints)?;
+        let candidates = self.candidates(gate, &spots, marks, &inventory, &mut constraints)?;
+        let sized = self.sized(
+            gate,
+            &spots,
+            marks,
+            &inventory,
+            candidates,
+            &mut constraints,
+        )?;
 
         let round = self.next_round;
         self.next_round = self.next_round.saturating_add(1);
@@ -495,7 +664,9 @@ impl MultiAssetQuoter {
                     continue;
                 }
             };
-            if Self::held_capital(gate, &spots, marks)? > self.capital_budget {
+            let live = Self::live_orders(gate, &spots)?;
+            let committed = Self::capital(gate, &spots, marks, &inventory, &live)?.committed;
+            if committed > self.capital_budget && candidate.covered < approved {
                 gate.on_venue_rejected(&order_id).map_err(|error| {
                     MMError::InvalidQuoteGeneration(format!(
                         "cannot release order {order_id} over budget: {error}"
@@ -523,7 +694,13 @@ impl MultiAssetQuoter {
         Ok(QuoteRound {
             quotes,
             constraints,
-            reserved_capital: Self::held_capital(gate, &spots, marks)?,
+            capital: Self::capital(
+                gate,
+                &spots,
+                marks,
+                &inventory,
+                &Self::live_orders(gate, &spots)?,
+            )?,
         })
     }
 
@@ -542,17 +719,11 @@ impl MultiAssetQuoter {
         gate: &RiskGate,
         spots: &[SpotView],
         marks: &[Decimal],
+        inventory: &[Decimal],
         constraints: &mut Vec<ActiveConstraint>,
     ) -> MMResult<Vec<Candidate>> {
-        let mut inventory = Vec::with_capacity(spots.len());
-        for spot in spots {
-            let quantity = gate
-                .ledger()
-                .position(&spot.id)
-                .map_or(Decimal::ZERO, |position| position.quantity);
-            inventory.push(quantity);
-        }
-        let variance_now = self.model.portfolio_variance(&inventory)?;
+        let live = Self::live_orders(gate, spots)?;
+        let (mut low, mut high) = Self::reachable(inventory, &live)?;
 
         let mut candidates = Vec::with_capacity(spots.len().saturating_mul(2));
         for (asset, (spot, mark)) in spots.iter().zip(marks).enumerate() {
@@ -567,7 +738,7 @@ impl MultiAssetQuoter {
                     spot.id.as_str()
                 )));
             }
-            let offsets = self.model.offsets(asset, &inventory)?;
+            let offsets = self.model.offsets(asset, inventory)?;
             let bid = mark
                 .checked_sub(offsets.bid)
                 .or_overflow("bid price")?
@@ -588,40 +759,209 @@ impl MultiAssetQuoter {
                     push(ConstraintKind::NonPositivePrice { price });
                     continue;
                 }
-                let held = inventory.get(asset).copied().unwrap_or(Decimal::ZERO);
-                let resulting = match side {
-                    Dir::Sell => held.checked_sub(size),
-                    Dir::Buy => held.checked_add(size),
+                let reach = match side {
+                    Dir::Sell => low.get_mut(asset),
+                    Dir::Buy => high.get_mut(asset),
                 }
-                .or_overflow("inventory after the trade")?;
-                if resulting.abs() > params.inventory_limit() {
+                .ok_or_else(|| {
+                    MMError::InvalidConfiguration(format!("asset {asset} is out of range"))
+                })?;
+                let before = *reach;
+                let (resulting, breach) = match side {
+                    Dir::Sell => {
+                        let after = before
+                            .checked_sub(size)
+                            .or_overflow("worst case inventory")?;
+                        let floor = Decimal::ZERO
+                            .checked_sub(params.inventory_limit())
+                            .or_overflow("inventory limit")?;
+                        (after, after < floor)
+                    }
+                    Dir::Buy => {
+                        let after = before
+                            .checked_add(size)
+                            .or_overflow("worst case inventory")?;
+                        (after, after > params.inventory_limit())
+                    }
+                };
+                if breach {
                     push(ConstraintKind::InventoryLimit {
                         resulting,
                         limit: params.inventory_limit(),
                     });
                     continue;
                 }
-                if let Some(limit) = self.max_portfolio_variance {
-                    let mut after = inventory.clone();
-                    if let Some(slot) = after.get_mut(asset) {
-                        *slot = resulting;
-                    }
-                    let variance = self.model.portfolio_variance(&after)?;
-                    if variance > limit && variance > variance_now {
+                *reach = resulting;
+                if let Some(limit) = self.max_portfolio_variance
+                    && !self.cannot_raise_variance(asset, side, &low, &high)?
+                {
+                    let variance = self.variance_bound(&low, &high)?;
+                    if variance > limit {
                         push(ConstraintKind::PortfolioRisk { variance, limit });
+                        let reach = match side {
+                            Dir::Sell => low.get_mut(asset),
+                            Dir::Buy => high.get_mut(asset),
+                        };
+                        if let Some(reach) = reach {
+                            *reach = before;
+                        }
                         continue;
                     }
                 }
+                let through = match side {
+                    Dir::Sell => price <= *mark,
+                    Dir::Buy => price >= *mark,
+                };
+                if through {
+                    push(ConstraintKind::ThroughReference {
+                        price,
+                        reference: *mark,
+                    });
+                }
+                let held = inventory.get(asset).copied().unwrap_or(Decimal::ZERO);
+                let orders = live.get(asset).copied().unwrap_or_default();
+                let unwinding = match side {
+                    Dir::Sell => held.checked_sub(orders.sells),
+                    Dir::Buy => held
+                        .checked_add(orders.buys)
+                        .and_then(|net| Decimal::ZERO.checked_sub(net)),
+                }
+                .or_overflow("inventory left to unwind")?
+                .max(Decimal::ZERO);
                 candidates.push(Candidate {
                     asset,
                     side,
                     price,
                     quantity: size,
                     unit_capital: Self::unit_capital(spot, side, price, *mark)?,
+                    covered: unwinding.min(size),
                 });
             }
         }
         Ok(candidates)
+    }
+
+    /// The lowest and highest inventory per asset if the live orders fill in any
+    /// combination.
+    fn reachable(
+        inventory: &[Decimal],
+        live: &[LiveOrders],
+    ) -> MMResult<(Vec<Decimal>, Vec<Decimal>)> {
+        let mut low = Vec::with_capacity(inventory.len());
+        let mut high = Vec::with_capacity(inventory.len());
+        for (held, orders) in inventory.iter().zip(live) {
+            low.push(
+                held.checked_sub(orders.sells)
+                    .or_overflow("worst case inventory")?,
+            );
+            high.push(
+                held.checked_add(orders.buys)
+                    .or_overflow("worst case inventory")?,
+            );
+        }
+        Ok((low, high))
+    }
+
+    /// The covariance entry, which exists for assets of the model.
+    fn entry(&self, row: usize, column: usize) -> MMResult<Decimal> {
+        self.model.covariance(row, column).ok_or_else(|| {
+            MMError::InvalidConfiguration(format!("asset {row} or {column} is out of range"))
+        })
+    }
+
+    /// The center of the box of reachable inventories and its half width.
+    fn center_and_radius(
+        low: &[Decimal],
+        high: &[Decimal],
+    ) -> MMResult<(Vec<Decimal>, Vec<Decimal>)> {
+        let mut center = Vec::with_capacity(low.len());
+        let mut radius = Vec::with_capacity(low.len());
+        for (bottom, top) in low.iter().zip(high) {
+            let sum = top.checked_add(*bottom).or_overflow("inventory center")?;
+            let width = top.checked_sub(*bottom).or_overflow("inventory width")?;
+            center.push(
+                sum.checked_div(Decimal::TWO)
+                    .or_overflow("inventory center")?,
+            );
+            radius.push(
+                width
+                    .checked_div(Decimal::TWO)
+                    .or_overflow("inventory width")?,
+            );
+        }
+        Ok((center, radius))
+    }
+
+    /// `(Sigma c)_row`.
+    fn risk_gradient(&self, row: usize, center: &[Decimal]) -> MMResult<Decimal> {
+        let mut gradient = Decimal::ZERO;
+        for (column, position) in center.iter().enumerate() {
+            let term = self
+                .entry(row, column)?
+                .checked_mul(*position)
+                .or_overflow("risk gradient")?;
+            gradient = gradient.checked_add(term).or_overflow("risk gradient")?;
+        }
+        Ok(gradient)
+    }
+
+    /// Whether a fill on this side lowers or keeps `q' Sigma q` from every
+    /// reachable inventory, this side's own fill included. The derivative along
+    /// the side is `2 s (Sigma q)_i`, linear in `q`, so its largest value over the
+    /// box is `s (Sigma c)_i + sum |Sigma_ij| r_j`. When that is not positive,
+    /// admitting the side cannot raise the largest reachable variance.
+    fn cannot_raise_variance(
+        &self,
+        asset: usize,
+        side: Dir,
+        low: &[Decimal],
+        high: &[Decimal],
+    ) -> MMResult<bool> {
+        let (center, radius) = Self::center_and_radius(low, high)?;
+        let gradient = self.risk_gradient(asset, &center)?;
+        let mut largest = match side {
+            Dir::Sell => Decimal::ZERO
+                .checked_sub(gradient)
+                .or_overflow("risk gradient")?,
+            Dir::Buy => gradient,
+        };
+        for (column, width) in radius.iter().enumerate() {
+            let term = self
+                .entry(asset, column)?
+                .abs()
+                .checked_mul(*width)
+                .or_overflow("risk gradient bound")?;
+            largest = largest
+                .checked_add(term)
+                .or_overflow("risk gradient bound")?;
+        }
+        Ok(largest <= Decimal::ZERO)
+    }
+
+    /// The bound of `q' Sigma q` over the box, documented on the type.
+    fn variance_bound(&self, low: &[Decimal], high: &[Decimal]) -> MMResult<Decimal> {
+        let (center, radius) = Self::center_and_radius(low, high)?;
+        let mut bound = self.model.portfolio_variance(&center)?;
+        let mut spread = Decimal::ZERO;
+        for (asset, width) in radius.iter().enumerate() {
+            let linear = self
+                .risk_gradient(asset, &center)?
+                .abs()
+                .checked_mul(*width)
+                .and_then(|term| term.checked_mul(Decimal::TWO))
+                .or_overflow("variance bound")?;
+            bound = bound.checked_add(linear).or_overflow("variance bound")?;
+            let volatility = self
+                .model
+                .asset(asset)
+                .map_or(Decimal::ZERO, AssetQuotingParams::volatility);
+            let term = width
+                .checked_mul(volatility)
+                .or_overflow("variance bound")?;
+            spread = spread.checked_add(term).or_overflow("variance bound")?;
+        }
+        let quadratic = spread.checked_mul(spread).or_overflow("variance bound")?;
+        bound.checked_add(quadratic).or_overflow("variance bound")
     }
 
     /// Capital one unit of an order is expected to hold, before rounding.
@@ -650,20 +990,23 @@ impl MultiAssetQuoter {
         gate: &RiskGate,
         spots: &[SpotView],
         marks: &[Decimal],
+        inventory: &[Decimal],
         candidates: Vec<Candidate>,
         constraints: &mut Vec<ActiveConstraint>,
     ) -> MMResult<Vec<Candidate>> {
-        let held = Self::held_capital(gate, spots, marks)?;
+        let live = Self::live_orders(gate, spots)?;
+        let committed = Self::capital(gate, spots, marks, inventory, &live)?.committed;
         let left = self
             .capital_budget
-            .checked_sub(held)
+            .checked_sub(committed)
             .or_overflow("capital left")?
             .max(Decimal::ZERO);
         let mut demand = Decimal::ZERO;
         for candidate in &candidates {
             let capital = candidate
-                .unit_capital
-                .checked_mul(candidate.quantity)
+                .quantity
+                .checked_sub(candidate.covered)
+                .and_then(|uncovered| uncovered.checked_mul(candidate.unit_capital))
                 .or_overflow("capital demand")?;
             demand = demand.checked_add(capital).or_overflow("capital demand")?;
         }
@@ -678,7 +1021,9 @@ impl MultiAssetQuoter {
                 .map_or(0, |spot| spot.quantity_scale);
             let allowed = candidate
                 .quantity
-                .checked_mul(scale)
+                .checked_sub(candidate.covered)
+                .and_then(|uncovered| uncovered.checked_mul(scale))
+                .and_then(|scaled| scaled.checked_add(candidate.covered))
                 .or_overflow("scaled quantity")?
                 .round_dp_with_strategy(lot_scale, RoundingStrategy::ToZero);
             if allowed < candidate.quantity {
