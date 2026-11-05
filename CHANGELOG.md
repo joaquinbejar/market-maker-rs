@@ -121,6 +121,11 @@ project follows [Semantic Versioning](https://semver.org/).
   contract of multiplier one. With `margin` too,
   `instruments::margin::fill_execution` converts a fill into a `margin-rs`
   execution.
+- `backtest::hawkes`: the QRH-I queue-reactive Hawkes model of Wu, Rambaldi, Muzy
+  and Bacry for one queue, with exponential kernels, a stability check, excitation
+  in a restorable state, expectation maximization, and a comparison of Poisson,
+  queue-reactive and Hawkes models by likelihood, time-rescaled residuals, flow
+  and, reported apart, a simple fill measure (#91).
 - `backtest::queue_reactive`: a seedable simulator of aggregated queues after
   Huang, Lehalle and Rosenbaum (Model III over Model I), with maximum likelihood
   intensities per queue size, exportable parameters, bounded restorable state,
