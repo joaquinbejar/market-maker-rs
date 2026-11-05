@@ -49,13 +49,13 @@
 //!
 //! # Reserves
 //!
-//! [`RollReserves`] holds both legs' margin in a `margin-rs` ledger, with no offset
+//! `RollReserves` (feature `margin`) holds both legs' margin in a `margin-rs` ledger, with no offset
 //! between them. Only a ledger's own positions are supported, as it is the truth for a
 //! settled position, which a service with positions of its own could not drop.
 //!
 //! `Ledger::settle_expiry` moves cash and closes the position, and leaves reservations
 //! alone. So after it, a hold stands and a live near order still counts, until
-//! [`RollReserves::near_settled`] releases those orders and syncs the hold. Marks for
+//! `RollReserves::near_settled` releases those orders and syncs the hold. Marks for
 //! margin come from the caller, and never settle anything.
 
 use std::collections::{BTreeMap, HashMap};
