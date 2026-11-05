@@ -706,6 +706,46 @@ fn test_capital_budget_sizing_counts_a_declared_fee_on_the_side_that_reserves_it
 }
 
 #[test]
+fn test_quote_round_capital_matches_a_fresh_read_with_mixed_outcomes() {
+    // Long inventory, so some of it unwinds, with one side reduced by the gate and
+    // one released over budget: the copy kept during the round must still agree.
+    let budget = dec!(250);
+    let mut gate = gate_with(2, dec!(1000000), dec!(1000), 2);
+    hold(&mut gate, 1, dec!(1));
+    for (index, limit) in [(0, Some(dec!(0.25))), (1, None)] {
+        gate.set_limits(
+            &instrument_id(index),
+            InstrumentLimits {
+                max_fee_rate: dec!(0.001),
+                max_order_quantity: limit,
+                ..InstrumentLimits::default()
+            },
+        )
+        .unwrap();
+    }
+    let mut quoter = quoter(2, dec!(0), budget);
+    let round = quoter.quote(&mut gate, &marks(2), 1).unwrap();
+    assert_eq!(quoter.capital_use(&gate, &marks(2)).unwrap(), round.capital);
+    assert!(round.capital.committed <= budget, "{:?}", round.capital);
+    assert!(
+        round
+            .constraints
+            .iter()
+            .any(|c| matches!(c.kind, ConstraintKind::MarginReduced { .. })),
+        "{:?}",
+        round.constraints
+    );
+    assert!(
+        round.constraints.iter().any(|c| matches!(
+            c.kind,
+            ConstraintKind::CapitalBudget { allowed, .. } if allowed.is_zero()
+        )),
+        "{:?}",
+        round.constraints
+    );
+}
+
+#[test]
 fn test_capital_budget_order_over_budget_after_reservation_rounding_is_released() {
     // A coarse quote grid and a fee: the gate reserves about 10 % more per lot
     // than the notional the sizing stage can see.
@@ -859,6 +899,31 @@ fn test_capital_budget_inventory_unwinds_only_once_across_live_orders() {
     assert_eq!(quote_of(&first, 0, Action::Buy).unwrap().1, dec!(1));
     let second = quoter_short.quote(&mut short, &marks(1), 2).unwrap();
     assert!(quote_of(&second, 0, Action::Buy).is_none());
+}
+
+#[test]
+fn test_capital_use_covers_a_short_at_the_lowest_live_bid() {
+    // Short 3 at a mark of 100, with bids of 1 at 90 and 1 at 80: 300 deployed and
+    // 170 reserved. Valuing the 2 covered at 80 leaves 310 committed; at the higher
+    // bid it would read 290, and the budget would pass more than it should.
+    let mut gate = gate(1);
+    hold(&mut gate, 0, dec!(-3));
+    for (id, price) in [("bid-90", dec!(90)), ("bid-80", dec!(80))] {
+        let request = margin_rs::risk::OrderRequest::new(
+            margin_rs::OrderId::new(id).unwrap(),
+            instrument_id(0),
+            Action::Buy,
+            price,
+            dec!(1),
+        );
+        assert!(!gate.submit(&request, 0).is_rejected());
+    }
+    let use_of = quoter(1, dec!(0), AMPLE)
+        .capital_use(&gate, &marks(1))
+        .unwrap();
+    assert_eq!(use_of.deployed, dec!(300));
+    assert_eq!(use_of.reserved, dec!(170));
+    assert_eq!(use_of.committed, dec!(310));
 }
 
 #[test]
@@ -1248,6 +1313,8 @@ mod simulation {
                 "a round raised committed capital past the budget: {before} to {:?}",
                 round.capital
             );
+            // What the round tracked as it went is what a fresh read finds.
+            assert_eq!(quoter.capital_use(&gate, marks).unwrap(), round.capital);
             constraints += round.constraints.len();
             let utilization = f64_of(round.capital.committed) / f64_of(setup.budget);
             utilization_sum += utilization;

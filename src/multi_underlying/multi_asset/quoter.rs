@@ -196,6 +196,21 @@ struct LiveOrders {
     lowest_bid: Option<Decimal>,
 }
 
+impl LiveOrders {
+    fn add(&mut self, side: Dir, price: Decimal, quantity: Decimal) -> MMResult<()> {
+        match side {
+            Dir::Sell => {
+                self.sells = self.sells.checked_add(quantity).or_overflow("live sells")?;
+            }
+            Dir::Buy => {
+                self.buys = self.buys.checked_add(quantity).or_overflow("live buys")?;
+                self.lowest_bid = Some(self.lowest_bid.map_or(price, |bid| bid.min(price)));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The terms of an instrument, read from the gate.
 #[derive(Debug, Clone)]
 struct SpotView {
@@ -492,21 +507,7 @@ impl MultiAssetQuoter {
             let Some(slot) = live.get_mut(asset) else {
                 continue;
             };
-            match Dir::try_from(order.side)? {
-                Dir::Sell => {
-                    slot.sells = slot
-                        .sells
-                        .checked_add(remaining)
-                        .or_overflow("live sells")?;
-                }
-                Dir::Buy => {
-                    slot.buys = slot.buys.checked_add(remaining).or_overflow("live buys")?;
-                    slot.lowest_bid = Some(
-                        slot.lowest_bid
-                            .map_or(order.price, |lowest| lowest.min(order.price)),
-                    );
-                }
-            }
+            slot.add(Dir::try_from(order.side)?, order.price, remaining)?;
         }
         Ok(live)
     }
@@ -608,16 +609,13 @@ impl MultiAssetQuoter {
         self.check_marks(marks)?;
         let spots = self.spots(gate)?;
         let inventory = Self::inventory(gate, &spots);
+        // Listing the live orders scans every order the gate has seen, and nothing
+        // fills during a round: read them once and keep this copy up to date.
+        let mut live = Self::live_orders(gate, &spots)?;
         let mut constraints = Vec::new();
-        let candidates = self.candidates(gate, &spots, marks, &inventory, &mut constraints)?;
-        let sized = self.sized(
-            gate,
-            &spots,
-            marks,
-            &inventory,
-            candidates,
-            &mut constraints,
-        )?;
+        let candidates = self.candidates(&spots, marks, &inventory, &live, &mut constraints)?;
+        let committed = Self::capital(gate, &spots, marks, &inventory, &live)?.committed;
+        let sized = self.sized(&spots, committed, candidates, &mut constraints)?;
 
         let round = self.free_round(gate, &sized)?;
         let mut quotes = Vec::with_capacity(sized.len());
@@ -662,8 +660,11 @@ impl MultiAssetQuoter {
                     continue;
                 }
             };
-            let live = Self::live_orders(gate, &spots)?;
-            let committed = Self::capital(gate, &spots, marks, &inventory, &live)?.committed;
+            let mut with_order = live.clone();
+            if let Some(slot) = with_order.get_mut(candidate.asset) {
+                slot.add(candidate.side, candidate.price, approved)?;
+            }
+            let committed = Self::capital(gate, &spots, marks, &inventory, &with_order)?.committed;
             if committed > self.capital_budget && candidate.covered < approved {
                 gate.on_venue_rejected(&order_id).map_err(|error| {
                     MMError::InvalidQuoteGeneration(format!(
@@ -681,6 +682,7 @@ impl MultiAssetQuoter {
                 });
                 continue;
             }
+            live = with_order;
             quotes.push(AdmittedQuote {
                 asset: candidate.asset,
                 side: Action::from(candidate.side),
@@ -692,13 +694,7 @@ impl MultiAssetQuoter {
         Ok(QuoteRound {
             quotes,
             constraints,
-            capital: Self::capital(
-                gate,
-                &spots,
-                marks,
-                &inventory,
-                &Self::live_orders(gate, &spots)?,
-            )?,
+            capital: Self::capital(gate, &spots, marks, &inventory, &live)?,
         })
     }
 
@@ -731,14 +727,13 @@ impl MultiAssetQuoter {
     /// Stages 1 and 2: the sides that may quote, with their full size.
     fn candidates(
         &self,
-        gate: &RiskGate,
         spots: &[SpotView],
         marks: &[Decimal],
         inventory: &[Decimal],
+        live: &[LiveOrders],
         constraints: &mut Vec<ActiveConstraint>,
     ) -> MMResult<Vec<Candidate>> {
-        let live = Self::live_orders(gate, spots)?;
-        let (mut low, mut high) = Self::reachable(inventory, &live)?;
+        let (mut low, mut high) = Self::reachable(inventory, live)?;
 
         let mut candidates = Vec::with_capacity(spots.len().saturating_mul(2));
         for (asset, (spot, mark)) in spots.iter().zip(marks).enumerate() {
@@ -1002,15 +997,11 @@ impl MultiAssetQuoter {
     /// Stage 3: one scale for every side, from the budget left.
     fn sized(
         &self,
-        gate: &RiskGate,
         spots: &[SpotView],
-        marks: &[Decimal],
-        inventory: &[Decimal],
+        committed: Decimal,
         candidates: Vec<Candidate>,
         constraints: &mut Vec<ActiveConstraint>,
     ) -> MMResult<Vec<Candidate>> {
-        let live = Self::live_orders(gate, spots)?;
-        let committed = Self::capital(gate, spots, marks, inventory, &live)?.committed;
         let left = self
             .capital_budget
             .checked_sub(committed)
