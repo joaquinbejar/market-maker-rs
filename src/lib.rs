@@ -207,7 +207,8 @@
 //!   (`instruments::basis`), through `arbitrage-rs`, whose types stay out of this
 //!   crate's public API, a calendar spread under an assumed exit
 //!   (`instruments::calendar`), and a two contract roll plan (`instruments::roll`),
-//!   checked against a ledger with `margin` too; implies `instruments`
+//!   checked against a ledger and run in a backtest (`instruments::roll::run`) with
+//!   `margin` too; implies `instruments`
 //! - `kernel`: The financial environment kernel (`backtest::kernel`): the
 //!   backtest engine's loop as a resumable, `Copy` state machine with a
 //!   canonical encoding, an agent-safe observation and an admission mask,

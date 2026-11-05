@@ -18,6 +18,12 @@ project follows [Semantic Versioning](https://semver.org/).
   `PretradePolicy::in_contracts`, false by default and true for `RollGuard`: it refuses
   any other policy. `BacktestEngine` and `with_instrument` do not change, and a test
   holds them equal on one contract.
+- A roll through the backtest (features `arbitrage` and `margin`, #199):
+  `instruments::roll::run::RollStrategy` runs a `RollPlan` on `ContractEngine`, with a
+  `SharedRollGuard` as its policy, and agrees with the same plan booked directly in a
+  ledger. The plan does not price an unwind, so it crosses that leg's latest observed
+  book, within an age the caller gives, or it is a fault. New provided
+  `ContractStrategy::take_fault`.
 - The net result of a calendar spread under an assumed exit (feature `arbitrage`,
   #202): `instruments::calendar::evaluate_calendar` buys one linear dated future and
   sells another of the same underlying. As two futures do not converge to each other,
@@ -39,7 +45,7 @@ project follows [Semantic Versioning](https://semver.org/).
   exposure of both legs. With `margin` too, `RollReserves` holds both legs' margin in
   a ledger and releases the near contract's orders once it settled, and
   `FutureTerms::settle_in_gate` settles in a risk gate's ledger. The backtest engine
-  does not run them (#199).
+  does not run them; `instruments::roll::run` does, through `ContractEngine`.
 - A two contract roll plan (feature `arbitrage`, #94):
   `instruments::roll::RollPlan` moves a position from a dated future to a later one,
   preserving `contracts * size`: the underlying on a linear contract, the contract
@@ -47,7 +53,8 @@ project follows [Semantic Versioning](https://semver.org/).
   exposure gap stay right when one leg fills alone or a fill does not fit its intents,
   which then fault. With `margin` too, `reconcile` compares it with a ledger, per fill
   and per leg, reporting what is unexplained as a quantity. It only emits intents, and
-  the backtest engine does not run it (#199).
+  `instruments::roll::run::RollStrategy` runs it through
+  `backtest::contracts::ContractEngine`, with `SharedRollGuard` as the engine's policy.
 - The net edge of a basis trade (new feature `arbitrage`, off by default, #94):
   `instruments::basis::evaluate_basis` buys one leg and sells the other, a spot and
   a linear dated future, through `arbitrage-rs`, whose types stay out of this
@@ -65,7 +72,8 @@ project follows [Semantic Versioning](https://semver.org/).
   checks run again at the start of every run. New `FeeCurrency::Settlement` and
   `FeeAsset::Settlement`, and `FillAccountant::unrealized_at`,
   `requires_instrument` and `check_instrument`, all with defaults. Funding,
-  expiry and settlement are not simulated (#97, #199), and neither are margin
+  expiry and settlement are not simulated, as funding is #207 and `ContractEngine` runs
+  a dated future's expiry and settlement (#199), and neither are margin
   requirements or liquidation. `AccountingStatus` gains `valuation_failures` and
   `setup_refused`, and is not consistent with either. A derivative needs a ledger
   with no other open position. New provided

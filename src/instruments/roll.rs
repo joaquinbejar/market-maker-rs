@@ -3,8 +3,8 @@
 //!
 //! A [`RollPlan`] closes a position on the near contract and opens it on the far
 //! one. It only emits intents; sending orders is the caller's job, and execution is
-//! never assumed to be atomic, so one leg can fill alone. This is a plan and a ledger
-//! check: the backtest engine does not run it, which is #199.
+//! never assumed to be atomic, so one leg can fill alone. With `margin` too, `run` runs
+//! it through `backtest::contracts::ContractEngine`.
 //!
 //! # Exposure
 //!
@@ -74,6 +74,8 @@ use financial_types::Action;
 use rust_decimal::Decimal;
 
 pub mod guard;
+#[cfg(feature = "margin")]
+pub mod run;
 
 pub use guard::RollGuard;
 #[cfg(feature = "margin")]
@@ -1266,6 +1268,27 @@ mod ledger {
         }
     }
 
+    /// The journal entry of a fill: under the identifier
+    /// [`fill_execution`](crate::instruments::margin::fill_execution) gives, or under its
+    /// `exec_id` alone, as `backtest::contracts::ContractEngine` books them, if that entry
+    /// is on this contract.
+    fn entry_of<'a>(
+        ledger: &'a Ledger,
+        id: &margin_rs::InstrumentId,
+        instrument: &str,
+        exec_id: &str,
+    ) -> Option<&'a margin_rs::ledger::ExecutionCashflow> {
+        let named = crate::instruments::margin::execution_id(instrument, exec_id)
+            .ok()
+            .and_then(|execution| ledger.execution_cashflow(&execution));
+        named.or_else(|| {
+            margin_rs::ExecutionId::new(exec_id)
+                .ok()
+                .and_then(|execution| ledger.execution_cashflow(&execution))
+                .filter(|entry| entry.instrument == *id)
+        })
+    }
+
     impl RollPlan {
         /// Anchors the plan to `ledger` as it stands now, so that
         /// [`RollPlan::reconcile`] can tell what happened since from its history.
@@ -1279,8 +1302,11 @@ mod ledger {
         ///
         /// A fill's identifier in the ledger is the one
         /// [`fill_execution`](crate::instruments::margin::fill_execution) gives, from
-        /// its `exec_id` as the trade identifier. The journal keeps no execution time,
-        /// so that is not compared.
+        /// its `exec_id` as the trade identifier, or its `exec_id` alone on this contract,
+        /// as `backtest::contracts::ContractEngine` books them. The journal keeps no
+        /// execution time, so that is not compared. In a run, the ledger books a fill
+        /// when it matches and the plan hears of it later, so this reads clean only once
+        /// the run ended and every report was delivered.
         ///
         /// # Errors
         ///
@@ -1350,10 +1376,7 @@ mod ledger {
             let mut roll_realized = Decimal::ZERO;
             let mut roll_fees = BTreeMap::new();
             for fill in self.fills.iter().filter(|f| f.leg == leg) {
-                let entry = crate::instruments::margin::execution_id(instrument, &fill.exec_id)
-                    .ok()
-                    .and_then(|execution| ledger.execution_cashflow(&execution));
-                let Some(entry) = entry else {
+                let Some(entry) = entry_of(ledger, &id, instrument, &fill.exec_id) else {
                     discrepancies.push(RollDiscrepancy::MissingInLedger {
                         leg,
                         exec_id: fill.exec_id.clone(),
@@ -1421,10 +1444,8 @@ mod ledger {
             let anchor = self.journal_anchor.unwrap_or(u64::MAX);
             let mut plan_ids = Vec::new();
             for fill in self.fills.iter().filter(|f| f.leg == leg) {
-                if let Ok(execution) =
-                    crate::instruments::margin::execution_id(instrument, &fill.exec_id)
-                {
-                    plan_ids.push(execution);
+                if let Some(entry) = entry_of(ledger, &id, instrument, &fill.exec_id) {
+                    plan_ids.push(entry.execution_id.clone());
                 }
             }
             let mut unexplained_entries = 0_u64;
