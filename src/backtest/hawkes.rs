@@ -1257,7 +1257,8 @@ impl SeasonalProfile {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a bucket out of
-    /// `[1 / MAX_RATE, MAX_RATE]`, no multipliers, or one that is not finite and positive.
+    /// `[1 / MAX_RATE, MAX_RATE]`, no multipliers, or one that is not finite and positive,
+    /// before or after the normalization.
     pub fn new(bucket_seconds: f64, multipliers: Vec<f64>) -> MMResult<Self> {
         if !bucket_seconds.is_finite()
             || !(1.0 / MAX_RATE..=MAX_RATE).contains(&bucket_seconds)
@@ -1270,7 +1271,10 @@ impl SeasonalProfile {
         if !mean.is_finite() || mean <= 0.0 {
             return invalid(format!("profile mean {mean}"));
         }
-        let multipliers = multipliers.iter().map(|m| m / mean).collect();
+        let multipliers: Vec<f64> = multipliers.iter().map(|m| m / mean).collect();
+        if multipliers.iter().any(|m| !m.is_finite() || *m <= 0.0) {
+            return invalid(format!("profile out of range: {multipliers:?}"));
+        }
         Ok(Self {
             bucket_seconds,
             multipliers,
@@ -1377,7 +1381,8 @@ impl SeasonalProfile {
 ///
 /// # Errors
 ///
-/// Returns [`MMError::InvalidConfiguration`] for an invalid bucket or no buckets, and
+/// Returns [`MMError::InvalidConfiguration`] for an invalid bucket, no buckets or a segment
+/// of more than [`MAX_INTERVALS`] buckets, and
 /// [`MMError::InvalidMarketState`] for a segment out of order, or a bucket with no time
 /// observed or too few events, which is refused rather than filled in.
 pub fn fit_seasonality(
@@ -1407,6 +1412,12 @@ pub fn fit_seasonality(
             let (_, index) = flat.bucket_of(event.time_seconds);
             let count = counts.get_mut(index).or_overflow("bucket")?;
             *count = count.saturating_add(1);
+        }
+        if segment.duration_seconds / bucket_seconds > MAX_INTERVALS {
+            return invalid(format!(
+                "{} seconds in buckets of {bucket_seconds}",
+                segment.duration_seconds
+            ));
         }
         // By whole buckets, as a time at an edge can round into the bucket before it.
         let mut whole = 0.0f64;

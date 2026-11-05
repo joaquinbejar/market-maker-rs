@@ -1122,3 +1122,29 @@ fn test_fit_seasonality_divides_by_the_time_each_bucket_was_seen() {
     let fit = fit_seasonality(&[segment], 100, 10.0, 2, 1).unwrap();
     assert_eq!(fit.multipliers(), [1.0, 1.0]);
 }
+
+#[test]
+fn test_profile_refuses_a_range_that_normalizes_to_nothing() {
+    assert!(SeasonalProfile::new(1.0, vec![1e-200, 1e200]).is_err());
+    assert!(SeasonalProfile::new(1.0, vec![f64::MAX, f64::MAX]).is_err());
+}
+
+#[test]
+fn test_fit_seasonality_bounds_the_work_of_a_long_segment() {
+    let segment = |duration_seconds| HawkesSegment {
+        initial_queue: 0,
+        duration_seconds,
+        events: vec![],
+    };
+    for (duration, bucket) in [(1e100, 1.0), (86_400.0, 1e-9)] {
+        assert!(matches!(
+            fit_seasonality(&[segment(duration)], 1, bucket, 1, 1),
+            Err(MMError::InvalidConfiguration(_))
+        ));
+    }
+    // At the limit it runs, and finds no events.
+    assert!(matches!(
+        fit_seasonality(&[segment(1_000.0)], 1, 1.0, 1, 1),
+        Err(MMError::InvalidMarketState(_))
+    ));
+}
