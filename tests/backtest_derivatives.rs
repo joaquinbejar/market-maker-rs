@@ -701,6 +701,578 @@ fn a_replay_onto_a_ledger_wrapped_again_books_new_fills() {
     assert_eq!(again.snapshot().unwrap().position, dec!(10));
 }
 
+/// What a snapshot of `traded` must say, from a walk over the journal in the test
+/// and not through the accountant's sums.
+fn walked(a: &MarginLedgerAccountant, traded: &str, base: &str, quote: &str) -> AccountingSnapshot {
+    let traded = InstrumentId::new(traded).unwrap();
+    let base = Asset::new(base).unwrap();
+    let quote = Asset::new(quote).unwrap();
+    let derivative = base == quote;
+    let mut walk = AccountingSnapshot::default();
+    for entry in a
+        .ledger()
+        .journal()
+        .iter()
+        .filter(|entry| entry.instrument == traded)
+    {
+        if !derivative {
+            match entry.side {
+                Action::Buy => walk.cash_flow -= entry.notional,
+                _ => walk.cash_flow += entry.notional,
+            }
+        }
+        if let Some(fee) = &entry.fee {
+            if fee.asset == quote {
+                walk.fees += fee.amount;
+            } else if fee.asset == base {
+                walk.base_fees += fee.amount;
+            }
+        }
+        walk.fills_posted += 1;
+    }
+    let position = a.ledger().position(&traded).unwrap();
+    walk.position = position.quantity - walk.base_fees;
+    walk.average_entry_price = position.average_price();
+    if derivative {
+        walk.cash_flow = position.realized_pnl;
+    }
+    walk
+}
+
+/// A ledger with two spot pairs of BTC against USDT, and BNB, which is neither base
+/// nor quote of them.
+fn spot_ledger(asset_scale: u32) -> Ledger {
+    let mut ledger = Ledger::new(LedgerConfig::default());
+    for asset in ["BTC", "USDT", "BNB"] {
+        ledger
+            .register_asset(Asset::new(asset).unwrap(), asset_scale)
+            .unwrap();
+    }
+    for id in ["BTC-USDT", "BTC-OTHER"] {
+        ledger
+            .register_instrument(
+                margin_rs::SpotInstrument::new(
+                    InstrumentId::new(id).unwrap(),
+                    Asset::new("BTC").unwrap(),
+                    Asset::new("USDT").unwrap(),
+                    2,
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    ledger
+}
+
+/// One execution, booked directly in the ledger.
+fn book(
+    ledger: &mut Ledger,
+    id: &str,
+    traded: &str,
+    side: Action,
+    price: Decimal,
+    quantity: Decimal,
+    fee: Option<(&str, Decimal)>,
+) {
+    let mut execution = Execution::new(
+        ExecutionId::new(id).unwrap(),
+        InstrumentId::new(traded).unwrap(),
+        side,
+        price,
+        quantity,
+    )
+    .with_executed_at(1);
+    if let Some((asset, amount)) = fee {
+        execution = execution.with_fee(Asset::new(asset).unwrap(), amount);
+    }
+    ledger
+        .book_execution_allowing_overdraft(&execution, None)
+        .unwrap();
+}
+
+fn spot_fill(
+    id: u64,
+    side: Action,
+    price: Decimal,
+    fee: Decimal,
+    asset: FeeAsset,
+) -> AccountingFill {
+    AccountingFill {
+        fee_asset: asset,
+        ..posted(id, side, price, dec!(1), fee)
+    }
+}
+
+#[test]
+fn a_spot_snapshot_says_what_a_walk_over_the_journal_says() {
+    // Seeded with another instrument's entries, a fee in a third asset and a base
+    // fee, none of which the sums may take wrongly.
+    let mut ledger = spot_ledger(8);
+    book(
+        &mut ledger,
+        "x-1",
+        "BTC-OTHER",
+        Action::Buy,
+        dec!(7),
+        dec!(3),
+        Some(("USDT", dec!(9))),
+    );
+    book(
+        &mut ledger,
+        "x-2",
+        "BTC-OTHER",
+        Action::Buy,
+        dec!(7),
+        dec!(3),
+        Some(("BTC", dec!(9))),
+    );
+    book(
+        &mut ledger,
+        "x-3",
+        "BTC-USDT",
+        Action::Buy,
+        dec!(100),
+        dec!(2),
+        Some(("BNB", dec!(4))),
+    );
+    book(
+        &mut ledger,
+        "x-4",
+        "BTC-USDT",
+        Action::Buy,
+        dec!(100),
+        dec!(1),
+        Some(("BTC", dec!(0.25))),
+    );
+    book(
+        &mut ledger,
+        "x-5",
+        "BTC-USDT",
+        Action::Sell,
+        dec!(110),
+        dec!(1),
+        Some(("USDT", dec!(0.5))),
+    );
+    let mut a =
+        MarginLedgerAccountant::new(ledger, InstrumentId::new("BTC-USDT").unwrap()).unwrap();
+    let check = |a: &MarginLedgerAccountant| {
+        assert_eq!(a.snapshot().unwrap(), walked(a, "BTC-USDT", "BTC", "USDT"));
+    };
+    check(&a);
+    // By hand: -200 - 100 + 110, fees of 0.5 in USDT and 0.25 in BTC, 2 + 1 - 1 - 0.25.
+    let seeded = a.snapshot().unwrap();
+    assert_eq!(seeded.cash_flow, dec!(-190));
+    assert_eq!(seeded.fees, dec!(0.5));
+    assert_eq!(seeded.base_fees, dec!(0.25));
+    assert_eq!(seeded.position, dec!(1.75));
+    assert_eq!(seeded.fills_posted, 3);
+
+    let quote_fee = spot_fill(1, Action::Buy, dec!(120), dec!(0.1), FeeAsset::Quote);
+    let base_fee = spot_fill(2, Action::Buy, dec!(90), dec!(0.01), FeeAsset::Base);
+    let rebate = spot_fill(3, Action::Sell, dec!(130), dec!(-0.2), FeeAsset::Quote);
+    let base_rebate = spot_fill(4, Action::Sell, dec!(130), dec!(-0.02), FeeAsset::Base);
+    for fill in [&quote_fee, &base_fee, &rebate, &base_rebate] {
+        a.post_fill(fill).unwrap();
+        check(&a);
+        // Replayed, it is the same execution.
+        a.post_fill(fill).unwrap();
+        check(&a);
+    }
+    // -190 - 120 - 90 + 130 + 130 = -140; fees 0.5 + 0.1 - 0.2; base 0.25 + 0.01 - 0.02.
+    let run = a.snapshot().unwrap();
+    assert_eq!(run.cash_flow, dec!(-140));
+    assert_eq!(run.fees, dec!(0.4));
+    assert_eq!(run.base_fees, dec!(0.24));
+    assert_eq!(run.position, dec!(1.76));
+    assert_eq!(run.fills_posted, 7);
+
+    // Refused posts: other terms under the same id, and a price off the scale.
+    let other_terms = spot_fill(1, Action::Buy, dec!(121), dec!(0.1), FeeAsset::Quote);
+    assert!(a.post_fill(&other_terms).is_err());
+    assert_eq!(a.snapshot().unwrap(), run);
+    let off_scale = spot_fill(5, Action::Buy, dec!(1.001), dec!(0.1), FeeAsset::Base);
+    assert!(a.post_fill(&off_scale).is_err());
+    assert_eq!(a.snapshot().unwrap(), run);
+    check(&a);
+
+    a.reset();
+    assert_eq!(a.snapshot().unwrap(), seeded);
+    check(&a);
+    a.post_fill(&quote_fee).unwrap();
+    a.begin_from_current_state();
+    let handed = a.snapshot().unwrap();
+    check(&a);
+    a.post_fill(&base_fee).unwrap();
+    check(&a);
+    a.reset();
+    assert_eq!(a.snapshot().unwrap(), handed);
+    check(&a);
+}
+
+#[test]
+fn a_derivative_snapshot_says_what_a_walk_over_the_journal_says() {
+    for (spec, id, base, size, settlement) in [
+        (
+            linear("PERP", dec!(0.01), None),
+            "PERP",
+            "USDT",
+            dec!(5),
+            "USDT",
+        ),
+        (
+            deribit::btc_perpetual().unwrap(),
+            "",
+            "BTC",
+            dec!(1000),
+            "BTC",
+        ),
+    ] {
+        let name = if id.is_empty() {
+            spec.id().as_str().to_string()
+        } else {
+            id.to_string()
+        };
+        let traded = InstrumentId::new(&name).unwrap();
+        // Seeded with its own fill and fee, funding, and an expired future beside it.
+        let mut ledger = ledger_for(&spec);
+        ledger
+            .register_instrument(
+                Instrument::from_spec(&linear("FUT", dec!(0.01), Some(EXPIRY_MS)), scales())
+                    .unwrap(),
+            )
+            .unwrap();
+        book(
+            &mut ledger,
+            "x-1",
+            &name,
+            Action::Buy,
+            dec!(60000),
+            size,
+            Some((settlement, dec!(0.0001))),
+        );
+        ledger
+            .book_funding(&FundingPayment {
+                id: ExecutionId::new("x-2").unwrap(),
+                instrument: traded.clone(),
+                amount: dec!(1),
+                as_of_ms: 1,
+            })
+            .unwrap();
+        ledger
+            .settle_expiry(&ExpirySettlement {
+                id: ExecutionId::new("x-3").unwrap(),
+                instrument: InstrumentId::new("FUT").unwrap(),
+                price: dec!(60000),
+                as_of_ms: EXPIRY_MS,
+            })
+            .unwrap();
+        let mut a = MarginLedgerAccountant::new(ledger, traded).unwrap();
+        let check = |a: &MarginLedgerAccountant| {
+            let snapshot = a.snapshot().unwrap();
+            assert_eq!(snapshot, walked(a, &name, base, base), "{name}");
+            // A settlement asset fee is a fee, and never also a base fee.
+            assert_eq!(snapshot.base_fees, dec!(0), "{name}");
+        };
+        check(&a);
+        let seeded = a.snapshot().unwrap();
+        assert_eq!(seeded.fees, dec!(0.0001));
+        assert_eq!(seeded.fills_posted, 1);
+
+        let open = posted(1, Action::Buy, dec!(61000), size, dec!(0.0002));
+        let close = posted(2, Action::Sell, dec!(62000), size, dec!(-0.0001));
+        for fill in [&open, &close] {
+            a.post_fill(fill).unwrap();
+            check(&a);
+            a.post_fill(fill).unwrap();
+            check(&a);
+        }
+        let run = a.snapshot().unwrap();
+        assert_eq!(run.fees, dec!(0.0002));
+        assert_eq!(run.fills_posted, 3);
+        assert_ne!(run.cash_flow, seeded.cash_flow);
+
+        let other_terms = posted(2, Action::Sell, dec!(62001), size, dec!(-0.0001));
+        assert!(a.post_fill(&other_terms).is_err());
+        assert_eq!(a.snapshot().unwrap(), run);
+
+        a.reset();
+        assert_eq!(a.snapshot().unwrap(), seeded);
+        a.post_fill(&open).unwrap();
+        a.begin_from_current_state();
+        let handed = a.snapshot().unwrap();
+        a.post_fill(&close).unwrap();
+        check(&a);
+        a.reset();
+        assert_eq!(a.snapshot().unwrap(), handed);
+        check(&a);
+    }
+}
+
+const HUGE: Decimal = dec!(50000000000000000000000000000);
+
+#[test]
+fn a_cash_flow_that_overflows_stays_an_error_until_a_reset() {
+    // Another pair's purchase leaves the balance low enough to take it, so that
+    // only the sum of this instrument overflows, and the ledger books every fill.
+    let mut ledger = spot_ledger(2);
+    book(
+        &mut ledger,
+        "x-1",
+        "BTC-OTHER",
+        Action::Buy,
+        HUGE,
+        dec!(1),
+        None,
+    );
+    let wrapped = ledger.clone();
+    let mut a =
+        MarginLedgerAccountant::new(ledger, InstrumentId::new("BTC-USDT").unwrap()).unwrap();
+    let start = a.snapshot().unwrap();
+    let post = |a: &mut MarginLedgerAccountant, id, side, price| {
+        a.post_fill(&posted(id, side, price, dec!(1), dec!(0)))
+    };
+    post(&mut a, 1, Action::Sell, HUGE).unwrap();
+    post(&mut a, 2, Action::Buy, dec!(1)).unwrap();
+    assert_eq!(a.snapshot().unwrap().cash_flow, HUGE - dec!(1));
+    // Booked, and past the bound by the sum alone.
+    post(&mut a, 3, Action::Sell, HUGE).unwrap();
+    let overflowed = |a: &MarginLedgerAccountant, what: &str| {
+        assert_eq!(
+            a.snapshot().unwrap_err(),
+            MMError::NumericalError(format!("{what} overflows"))
+        );
+    };
+    overflowed(&a, "ledger cash flow");
+    overflowed(&a, "ledger cash flow");
+    assert_eq!(a.ledger().journal().len(), 4);
+    // A later fill would bring the sum back in range: it stays an error, as a walk
+    // that stops at the first overflow would.
+    post(&mut a, 4, Action::Buy, HUGE).unwrap();
+    overflowed(&a, "ledger cash flow");
+
+    // Wrapping such a ledger is not refused; its snapshot fails the same way, and
+    // a reset returns to that state.
+    let mut rewrapped =
+        MarginLedgerAccountant::new(a.ledger().clone(), InstrumentId::new("BTC-USDT").unwrap())
+            .unwrap();
+    overflowed(&rewrapped, "ledger cash flow");
+    rewrapped.reset();
+    overflowed(&rewrapped, "ledger cash flow");
+
+    // A reset to a clean start clears it.
+    a.reset();
+    assert_eq!(a.snapshot().unwrap(), start);
+    assert_eq!(a.ledger().snapshot(), wrapped.snapshot());
+    // A handover while it stands keeps it, on the next reset too.
+    post(&mut a, 1, Action::Sell, HUGE).unwrap();
+    post(&mut a, 2, Action::Buy, dec!(1)).unwrap();
+    post(&mut a, 3, Action::Sell, HUGE).unwrap();
+    a.begin_from_current_state();
+    overflowed(&a, "ledger cash flow");
+    a.reset();
+    overflowed(&a, "ledger cash flow");
+}
+
+#[test]
+fn fees_that_overflow_are_an_error_with_the_fill_booked() {
+    // A rebate on another pair keeps the ledger's own total of fees in range.
+    let mut ledger = spot_ledger(2);
+    book(
+        &mut ledger,
+        "x-1",
+        "BTC-OTHER",
+        Action::Buy,
+        dec!(1),
+        dec!(1),
+        Some(("USDT", -HUGE)),
+    );
+    let mut a =
+        MarginLedgerAccountant::new(ledger, InstrumentId::new("BTC-USDT").unwrap()).unwrap();
+    let start = a.snapshot().unwrap();
+    let fill = |id| spot_fill(id, Action::Buy, dec!(1), HUGE, FeeAsset::Quote);
+    a.post_fill(&fill(1)).unwrap();
+    assert_eq!(a.snapshot().unwrap().fees, HUGE);
+    a.post_fill(&fill(2)).unwrap();
+    assert_eq!(a.ledger().journal().len(), 3);
+    assert_eq!(
+        a.snapshot().unwrap_err(),
+        MMError::NumericalError("ledger fees overflows".to_string())
+    );
+    // A rebate that would bring it back does not.
+    a.post_fill(&spot_fill(3, Action::Buy, dec!(1), -HUGE, FeeAsset::Quote))
+        .unwrap();
+    assert!(a.snapshot().is_err());
+    a.reset();
+    assert_eq!(a.snapshot().unwrap(), start);
+
+    // A later overflow of another sum does not replace the first.
+    a.post_fill(&fill(1)).unwrap();
+    a.post_fill(&fill(2)).unwrap();
+    for (id, side, price) in [
+        (3, Action::Sell, dec!(1)),
+        (4, Action::Sell, dec!(1)),
+        (5, Action::Sell, HUGE),
+        (6, Action::Buy, dec!(1)),
+        (7, Action::Sell, HUGE),
+    ] {
+        a.post_fill(&posted(id, side, price, dec!(1), dec!(0)))
+            .unwrap();
+    }
+    assert_eq!(
+        a.snapshot().unwrap_err(),
+        MMError::NumericalError("ledger fees overflows".to_string())
+    );
+    a.reset();
+    assert_eq!(a.snapshot().unwrap(), start);
+}
+
+#[test]
+fn a_derivative_with_fees_that_overflow_is_an_error_with_the_fill_booked() {
+    let spec = linear("PERP", dec!(0.01), None);
+    let other = linear("OTHER", dec!(0.01), None);
+    let traded = InstrumentId::new("PERP").unwrap();
+    let mut seeded = ledger_for(&spec);
+    seeded
+        .register_instrument(Instrument::from_spec(&other, scales()).unwrap())
+        .unwrap();
+    // Flat again, and with a rebate that keeps the ledger's total of fees in range.
+    book(
+        &mut seeded,
+        "x-1",
+        "OTHER",
+        Action::Buy,
+        dec!(1),
+        dec!(1),
+        Some(("USDT", -HUGE)),
+    );
+    book(
+        &mut seeded,
+        "x-2",
+        "OTHER",
+        Action::Sell,
+        dec!(1),
+        dec!(1),
+        None,
+    );
+    let wrapped = seeded.clone();
+    let mut a = MarginLedgerAccountant::new(seeded, traded.clone()).unwrap();
+    let start = a.snapshot().unwrap();
+    a.post_fill(&posted(1, Action::Buy, dec!(1), dec!(1), HUGE))
+        .unwrap();
+    assert_eq!(a.snapshot().unwrap().fees, HUGE);
+    a.post_fill(&posted(2, Action::Sell, dec!(1), dec!(1), HUGE))
+        .unwrap();
+    assert_eq!(a.ledger().journal().len(), 4);
+    assert_eq!(
+        a.snapshot().unwrap_err(),
+        MMError::NumericalError("ledger fees overflows".to_string())
+    );
+    a.reset();
+    assert_eq!(a.snapshot().unwrap(), start);
+    assert_eq!(a.ledger().snapshot(), wrapped.snapshot());
+
+    // A ledger already past it is refused when wrapped, as it was.
+    let mut past = wrapped;
+    book(
+        &mut past,
+        "x-3",
+        "PERP",
+        Action::Buy,
+        dec!(1),
+        dec!(1),
+        Some(("USDT", HUGE)),
+    );
+    book(
+        &mut past,
+        "x-4",
+        "PERP",
+        Action::Sell,
+        dec!(1),
+        dec!(1),
+        Some(("USDT", HUGE)),
+    );
+    assert!(matches!(
+        MarginLedgerAccountant::new(past, traded),
+        Err(MMError::NumericalError(_))
+    ));
+}
+
+#[test]
+fn base_fees_that_would_overflow_are_refused_but_a_replay_is_not() {
+    let mut ledger = spot_ledger(2);
+    book(
+        &mut ledger,
+        "x-1",
+        "BTC-OTHER",
+        Action::Buy,
+        dec!(1),
+        dec!(1),
+        Some(("BTC", -HUGE)),
+    );
+    let mut a =
+        MarginLedgerAccountant::new(ledger, InstrumentId::new("BTC-USDT").unwrap()).unwrap();
+    let fill = |id, fee| spot_fill(id, Action::Buy, dec!(1), fee, FeeAsset::Base);
+    a.post_fill(&fill(1, HUGE)).unwrap();
+    let booked = a.snapshot().unwrap();
+    assert_eq!(booked.base_fees, HUGE);
+    let ledger_state = a.ledger().snapshot();
+
+    // Near the bound, the identical fill is a duplicate and not an overflow.
+    a.post_fill(&fill(1, HUGE)).unwrap();
+    assert_eq!(a.snapshot().unwrap(), booked);
+    assert_eq!(a.ledger().snapshot(), ledger_state);
+    // The same id with other terms is a conflict, not an overflow.
+    let error = a.post_fill(&fill(1, HUGE - dec!(1))).unwrap_err();
+    assert!(
+        matches!(error, MMError::InvalidPositionUpdate(_)),
+        "{error:?}"
+    );
+    assert_eq!(a.snapshot().unwrap(), booked);
+    assert_eq!(a.ledger().snapshot(), ledger_state);
+    // A new fill past the bound is refused before anything is booked.
+    assert_eq!(
+        a.post_fill(&fill(2, HUGE)).unwrap_err(),
+        MMError::NumericalError("ledger base fees overflows".to_string())
+    );
+    assert_eq!(a.snapshot().unwrap(), booked);
+    assert_eq!(a.ledger().snapshot(), ledger_state);
+
+    // A ledger already past it is refused when wrapped, as it was.
+    let mut past = spot_ledger(2);
+    book(
+        &mut past,
+        "x-1",
+        "BTC-OTHER",
+        Action::Buy,
+        dec!(1),
+        dec!(1),
+        Some(("BTC", -HUGE)),
+    );
+    book(
+        &mut past,
+        "x-2",
+        "BTC-USDT",
+        Action::Buy,
+        dec!(1),
+        dec!(1),
+        Some(("BTC", HUGE)),
+    );
+    book(
+        &mut past,
+        "x-3",
+        "BTC-USDT",
+        Action::Buy,
+        dec!(1),
+        dec!(1),
+        Some(("BTC", HUGE)),
+    );
+    assert!(matches!(
+        MarginLedgerAccountant::new(past, InstrumentId::new("BTC-USDT").unwrap()),
+        Err(MMError::NumericalError(_))
+    ));
+}
+
 #[test]
 fn another_open_position_in_the_ledger_is_refused_when_wrapped() {
     let spec = linear("FUT", dec!(0.01), Some(EXPIRY_MS));

@@ -165,6 +165,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `MarginLedgerAccountant::snapshot` keeps running sums instead of walking the
+  journal, so a run costs linear rather than quadratic time in its fills. The
+  values and the errors are the same: a sum that overflows stays an error until
+  a reset (#195).
 - `make test`, so `make pre-push` and the Run Tests workflow, also runs
   `cargo test --all-features`: the tests behind a feature such as `chain` or
   `options` did not run in it before (#183).
@@ -240,6 +244,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `MarginLedgerAccountant` adds a replayed fill's base fee only once. A duplicate
+  used to add it again, to `base_fees` and against the position; the engine never
+  posts twice, so this reached direct callers only (#195).
 - `ProbabilisticFillModel` draws its uniform number from the top 32 bits
   of the generator state scaled by 2^32, so it covers [0, 1). The draw used
   to stay below 0.5, so a fill with probability p happened with
