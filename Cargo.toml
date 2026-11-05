@@ -111,6 +111,10 @@ required-features = ["options"]
 test = true
 
 [[example]]
+name = "offline_rl_support"
+test = true
+
+[[example]]
 name = "options_market_making"
 required-features = ["options"]
 

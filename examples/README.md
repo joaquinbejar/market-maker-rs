@@ -17,6 +17,9 @@ cargo run --example full_strategy
 
 # With serde feature (for Display/Debug formatting)
 cargo run --example display_example --features serde
+
+# Research, on synthetic data only
+cargo run --example offline_rl_support
 ```
 
 ## Examples Overview

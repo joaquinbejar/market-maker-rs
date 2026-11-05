@@ -8,6 +8,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Example `offline_rl_support` (#104): which diagnostics can support an offline evaluation,
+  on a small synthetic environment whose true values are exact, with no new public API. It
+  covers the shape of a log, action and state coverage, actions out of support, a hidden
+  confounder that passes the support checks, a log of fills only, and a go or no-go from
+  reproducible diagnostics, with the truth never an input. No market log was read and no
+  policy was trained, so the comparison with interactive simulation stays open.
 - Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`
   takes a new `instruments::perpetual::PerpetualTerms`, with the declared rate and mark of
   each instant on the funding grid. Each instant books through the `margin-rs` ledger,
