@@ -42,6 +42,8 @@
 
 pub mod accounting;
 
+pub mod calibrated;
+
 #[cfg(all(feature = "margin", feature = "instruments"))]
 pub mod contracts;
 

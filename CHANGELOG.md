@@ -14,6 +14,15 @@ project follows [Semantic Versioning](https://semver.org/).
   confounder that passes the support checks, a log of fills only, and a go or no-go from
   reproducible diagnostics, with the truth never an input. No market log was read and no
   policy was trained, so the comparison with interactive simulation stays open.
+- Calibrated parameters in the causal replay (#87): `backtest::calibrated::CalibratedQuoter`
+  quotes the validated Avellaneda-Stoikov baseline in `BacktestEngine` from a
+  `ParameterSchedule`, built from a `WalkForwardReport` or from constant parameters to
+  compare under the same rules. Each fold's parameters hold only during its test window, and
+  outside one, or in a fold that could not calibrate, it is silent and cancels what rests,
+  although an order already out can still fill until then, later under latency. New provided
+  `BacktestStrategy::cancels_when_silent`, false by default, so other strategies do not
+  change, and outside what the financial kernel reproduces when true. The intensity scale and
+  the seasonality do not enter these quotes. Checked on synthetic processes only.
 - Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`
   takes a new `instruments::perpetual::PerpetualTerms`, with the declared rate and mark of
   each instant on the funding grid. Each instant books through the `margin-rs` ledger,

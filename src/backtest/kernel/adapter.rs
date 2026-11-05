@@ -9,6 +9,8 @@
 //! refuses to act for another.
 //!
 //! Outside the equivalence subset:
+//! - a strategy whose `BacktestStrategy::cancels_when_silent` is true, as nothing here
+//!   cancels on silence;
 //!
 //! - a rounded price outside `1..=max_price` ticks or a rounded size outside
 //!   `1..=max_order_size` lots becomes a `QuoteError` (the engine would
