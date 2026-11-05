@@ -81,7 +81,7 @@ pub struct BasisCarry {
     /// What it pays for.
     pub kind: CarryKind,
     /// The leg it is charged on: [`Action::Buy`] or [`Action::Sell`]. Any other
-    /// action is a [`BasisError::Evaluation`].
+    /// action is a [`BasisError::CarryOnNeitherLeg`].
     pub on: Action,
     /// The rate for the whole period, in basis points of that notional.
     pub period_bps: Decimal,
@@ -285,6 +285,12 @@ pub enum BasisError {
         /// The sell leg's `lot * multiplier`.
         sell: Decimal,
     },
+    /// A carry on an action that is neither leg.
+    #[error("a carry on {on} is neither leg")]
+    CarryOnNeitherLeg {
+        /// The action.
+        on: Action,
+    },
     /// A value out of its range.
     #[error("{field} is {value}: {reason}")]
     InvalidValue {
@@ -321,11 +327,10 @@ pub enum BasisError {
     },
 }
 
-impl From<ArbitrageError> for BasisError {
-    fn from(error: ArbitrageError) -> Self {
-        Self::Evaluation {
-            reason: error.to_string(),
-        }
+/// Private, so that no `arbitrage-rs` type is in this crate's public API.
+fn upstream(error: ArbitrageError) -> BasisError {
+    BasisError::Evaluation {
+        reason: error.to_string(),
     }
 }
 
@@ -404,11 +409,10 @@ fn check_legs(input: &BasisInput) -> Result<u64, BasisError> {
 
 /// The coarser lot exposure, if the other one divides it.
 fn common_lot(buy: &InstrumentSpec, sell: &InstrumentSpec) -> Result<Quantity, BasisError> {
-    let exposure = |spec: &InstrumentSpec| -> Result<Quantity, BasisError> {
-        Ok(Quantity::new(arbitrage_rs::exact::mul(
-            spec.lot(),
-            multiplier(spec),
-        )?)?)
+    let exposure = |spec: &InstrumentSpec| {
+        arbitrage_rs::exact::mul(spec.lot(), multiplier(spec))
+            .and_then(Quantity::new)
+            .map_err(upstream)
     };
     let (a, b) = (exposure(buy)?, exposure(sell)?);
     let (coarse, fine) = if a.value() >= b.value() {
@@ -416,7 +420,7 @@ fn common_lot(buy: &InstrumentSpec, sell: &InstrumentSpec) -> Result<Quantity, B
     } else {
         (b, a)
     };
-    if coarse.floor_to_lot(fine)? != Some(coarse) {
+    if coarse.floor_to_lot(fine).map_err(upstream)? != Some(coarse) {
         return Err(BasisError::LotsNotNested {
             buy: a.value(),
             sell: b.value(),
@@ -433,7 +437,7 @@ fn contracts_for(spec: &InstrumentSpec, quantity: Decimal) -> Result<Decimal, Ba
             .ok_or_else(|| BasisError::Evaluation {
                 reason: format!("{quantity} contracts of {} overflow", spec.id().as_str()),
             })?;
-    if arbitrage_rs::exact::mul(contracts, multiplier(spec))? != quantity {
+    if arbitrage_rs::exact::mul(contracts, multiplier(spec)).map_err(upstream)? != quantity {
         return Err(BasisError::Evaluation {
             reason: format!(
                 "{quantity} of the underlying is not exact in contracts of {}",
@@ -507,7 +511,7 @@ fn check_quote(
 }
 
 fn upstream_instrument(spec: &InstrumentSpec) -> Result<Instrument, BasisError> {
-    let id = arbitrage_rs::InstrumentId::new(spec.id().as_str())?;
+    let id = arbitrage_rs::InstrumentId::new(spec.id().as_str()).map_err(upstream)?;
     Ok(match spec.expiry_ms() {
         Some(expiry_ms) => Instrument::dated(id, time("expiry_ms", expiry_ms)?),
         None => Instrument::undated(id),
@@ -515,7 +519,7 @@ fn upstream_instrument(spec: &InstrumentSpec) -> Result<Instrument, BasisError> 
 }
 
 fn upstream_book(side: Action, level: BasisLevel, size: Quantity) -> Result<TopOfBook, BasisError> {
-    let level = Level::new(Price::new(level.price)?, size);
+    let level = Level::new(Price::new(level.price).map_err(upstream)?, size);
     Ok(match side {
         Action::Buy => TopOfBook {
             bid: None,
@@ -534,10 +538,11 @@ fn amount(cost: Cost) -> Decimal {
 
 /// Our costs from upstream's: the last two carry items are the exit costs.
 fn costs_from(breakdown: &CostBreakdown, carried: &[BasisCarry]) -> Result<BasisCosts, BasisError> {
-    let (held, exits) = breakdown.carry.split_at(carried.len());
-    let [buy_exit, sell_exit] = exits else {
+    // The count is exact, as these pair by position with what was given.
+    let Some((held, [buy_exit, sell_exit])) = breakdown.carry.split_at_checked(carried.len())
+    else {
         return Err(BasisError::Evaluation {
-            reason: "the evaluation did not itemize both exit costs".to_string(),
+            reason: "the evaluation did not itemize every carry and exit cost".to_string(),
         });
     };
     let exit = |item: &CarryCost| amount(item.cost);
@@ -568,14 +573,19 @@ fn capital(
     currency: Currency,
 ) -> Result<Decimal, BasisError> {
     let leg = |(spec, price): (&InstrumentSpec, Decimal)| -> Result<Money, BasisError> {
-        let notional = Price::new(price)?.notional(quantity, currency)?;
-        Ok(if spec.kind() == ContractKind::Spot {
-            notional
+        let notional = Price::new(price)
+            .and_then(|price| price.notional(quantity, currency))
+            .map_err(upstream)?;
+        if spec.kind() == ContractKind::Spot {
+            Ok(notional)
         } else {
-            notional.checked_scale(rate)?
-        })
+            notional.checked_scale(rate).map_err(upstream)
+        }
     };
-    Ok(leg(buy)?.checked_add(leg(sell)?)?.amount())
+    Ok(leg(buy)?
+        .checked_add(leg(sell)?)
+        .map_err(upstream)?
+        .amount())
 }
 
 /// Evaluates buying one leg and selling the other: see the
@@ -590,7 +600,7 @@ pub fn evaluate_basis(input: &BasisInput) -> Result<BasisEvaluation, BasisError>
     let (buy, sell) = (&input.buy, &input.sell);
     let (buy_spec, sell_spec) = (&buy.spec, &sell.spec);
     let lot = common_lot(buy_spec, sell_spec)?;
-    let currency = Currency::new(buy_spec.price_asset().as_str())?;
+    let currency = Currency::new(buy_spec.price_asset().as_str()).map_err(upstream)?;
     if input.future_margin_rate < Decimal::ZERO || input.future_margin_rate > Decimal::ONE {
         return Err(BasisError::InvalidValue {
             field: "future_margin_rate",
@@ -616,6 +626,10 @@ pub fn evaluate_basis(input: &BasisInput) -> Result<BasisEvaluation, BasisError>
     }
     let mut carry = Vec::with_capacity(input.carry.len().saturating_add(2));
     for item in &input.carry {
+        // Here, as a request that cannot be answered must not depend on the market.
+        if !matches!(item.on, Action::Buy | Action::Sell) {
+            return Err(BasisError::CarryOnNeitherLeg { on: item.on });
+        }
         carry.push(Carry {
             kind: match item.kind {
                 CarryKind::Financing => opportunity::CarryKind::Financing,
@@ -663,13 +677,13 @@ pub fn evaluate_basis(input: &BasisInput) -> Result<BasisEvaluation, BasisError>
 
     // What both legs can execute, in the underlying, on both lot grids.
     let units = |spec: &InstrumentSpec, level: BasisLevel| -> Result<Decimal, BasisError> {
-        Ok(arbitrage_rs::exact::mul(level.contracts, multiplier(spec))?)
+        arbitrage_rs::exact::mul(level.contracts, multiplier(spec)).map_err(upstream)
     };
     let available = units(buy_spec, buy_level)?
         .min(units(sell_spec, sell_level)?)
         .min(target.value());
     let floored = match Quantity::new(available) {
-        Ok(quantity) => quantity.floor_to_lot(lot)?,
+        Ok(quantity) => quantity.floor_to_lot(lot).map_err(upstream)?,
         Err(_) => None,
     };
     let quantity = match floored {
@@ -701,7 +715,8 @@ pub fn evaluate_basis(input: &BasisInput) -> Result<BasisEvaluation, BasisError>
         min_quantity: quantity,
         carry,
         min_net_edge: Money::new(input.min_net_edge, currency),
-    })?;
+    })
+    .map_err(upstream)?;
     let opportunity = match evaluation {
         Evaluation::Accepted(opportunity) => opportunity,
         Evaluation::Rejected(RejectReason::NoGrossEdge { gross }) => {
@@ -748,4 +763,53 @@ pub fn evaluate_basis(input: &BasisInput) -> Result<BasisEvaluation, BasisError>
             currency,
         )?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Upstream items that do not match what was given are an error, in any number.
+    #[test]
+    fn test_costs_need_every_carry_and_exit_item() {
+        let usdt = Currency::new("USDT").unwrap();
+        let cost = |amount| Cost::new(Money::new(amount, usdt));
+        let item = |amount| CarryCost {
+            kind: opportunity::CarryKind::Other,
+            leg: Action::Buy,
+            cost: cost(amount),
+        };
+        let breakdown = |items: Vec<CarryCost>| CostBreakdown {
+            buy_fee: cost(Decimal::ONE),
+            sell_fee: cost(Decimal::TWO),
+            carry: items,
+            total: cost(Decimal::TEN),
+        };
+        let given = [BasisCarry {
+            kind: CarryKind::Borrow,
+            on: Action::Sell,
+            period_bps: Decimal::ONE,
+        }];
+        let costs = costs_from(
+            &breakdown(vec![
+                item(Decimal::new(3, 0)),
+                item(Decimal::new(4, 0)),
+                item(Decimal::new(5, 0)),
+            ]),
+            &given,
+        )
+        .unwrap();
+        assert_eq!(costs.carry[0].amount, Decimal::new(3, 0));
+        assert_eq!(costs.carry[0].kind, CarryKind::Borrow);
+        assert_eq!(costs.carry[0].on, Action::Sell);
+        assert_eq!(costs.buy_exit, Decimal::new(4, 0));
+        assert_eq!(costs.sell_exit, Decimal::new(5, 0));
+        for count in [0, 1, 2, 4] {
+            let items = vec![item(Decimal::ONE); count];
+            assert!(matches!(
+                costs_from(&breakdown(items), &given),
+                Err(BasisError::Evaluation { .. })
+            ));
+        }
+    }
 }

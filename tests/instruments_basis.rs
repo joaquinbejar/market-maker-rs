@@ -648,8 +648,77 @@ fn a_value_out_of_range_is_refused() {
         on: Action::Other,
         period_bps: dec!(1),
     }];
-    assert!(matches!(
+    assert_eq!(
         evaluate_basis(&input),
-        Err(BasisError::Evaluation { .. })
-    ));
+        Err(BasisError::CarryOnNeitherLeg { on: Action::Other })
+    );
+}
+
+#[test]
+fn a_request_that_cannot_be_answered_does_not_depend_on_the_market() {
+    // Each of these would be discarded by the market, and each is still refused.
+    let markets: [fn(&mut BasisInput); 5] = [
+        |input| input.buy.quoted_at_ms = AS_OF_MS - 1001,
+        |input| input.buy.level = None,
+        |input| {
+            input.sell.level = Some(BasisLevel {
+                price: dec!(81389.75),
+                contracts: dec!(0.003),
+            });
+        },
+        |input| {
+            input.buy.level = Some(BasisLevel {
+                price: dec!(80794.02),
+                contracts: dec!(0),
+            });
+        },
+        |input| {
+            input.as_of_ms = DELIVERY_MS;
+            input.buy.quoted_at_ms = DELIVERY_MS;
+            input.sell.quoted_at_ms = DELIVERY_MS;
+        },
+    ];
+    for market in markets {
+        let mut discarded = cash_and_carry();
+        market(&mut discarded);
+        assert!(matches!(
+            evaluate_basis(&discarded),
+            Ok(BasisEvaluation::Rejected(_))
+        ));
+
+        let mut carry_on_neither = discarded.clone();
+        carry_on_neither.carry = vec![BasisCarry {
+            kind: CarryKind::Other,
+            on: Action::Other,
+            period_bps: dec!(1),
+        }];
+        assert_eq!(
+            evaluate_basis(&carry_on_neither),
+            Err(BasisError::CarryOnNeitherLeg { on: Action::Other })
+        );
+        let mut bad_rate = discarded.clone();
+        bad_rate.sell.fee_bps = dec!(10001);
+        assert!(matches!(
+            evaluate_basis(&bad_rate),
+            Err(BasisError::InvalidValue { .. })
+        ));
+        let mut bad_margin = discarded.clone();
+        bad_margin.future_margin_rate = dec!(2);
+        assert!(matches!(
+            evaluate_basis(&bad_margin),
+            Err(BasisError::InvalidValue { .. })
+        ));
+        let mut bad_edge = discarded.clone();
+        bad_edge.min_net_edge = dec!(-1);
+        assert!(matches!(
+            evaluate_basis(&bad_edge),
+            Err(BasisError::InvalidValue { .. })
+        ));
+        let mut future_dated = discarded;
+        future_dated.sell.quoted_at_ms = future_dated.as_of_ms + 1;
+        assert!(matches!(
+            evaluate_basis(&future_dated),
+            Err(BasisError::QuoteFromTheFuture { .. })
+        ));
+    }
 }
