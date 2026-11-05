@@ -921,3 +921,204 @@ fn test_fill_rate_refuses_what_score_flow_refuses() {
     ));
     assert!(fill_rate(&[], 0, 1.0, 1.0).is_err());
 }
+
+fn busy_profile() -> SeasonalProfile {
+    SeasonalProfile::new(100.0, vec![3.0, 1.0, 0.5, 1.5]).unwrap()
+}
+
+#[test]
+fn test_profile_is_normalized_and_refuses_bad_input() {
+    let p = SeasonalProfile::new(10.0, vec![2.0, 6.0]).unwrap();
+    assert_eq!(p.multipliers(), [0.5, 1.5]);
+    assert_eq!(p.bucket_seconds(), 10.0);
+    for (bucket, m) in [
+        (0.0, vec![1.0]),
+        (f64::NAN, vec![1.0]),
+        (1.0, vec![]),
+        (1.0, vec![1.0, 0.0]),
+        (1.0, vec![1.0, -1.0]),
+        (1.0, vec![f64::INFINITY]),
+    ] {
+        assert!(SeasonalProfile::new(bucket, m).is_err());
+    }
+}
+
+#[test]
+fn test_profile_time_change_by_hand_and_inverse() {
+    let p = SeasonalProfile::new(10.0, vec![0.5, 1.5]).unwrap();
+    assert_eq!(p.to_model_time(0.0), 0.0);
+    assert_eq!(p.to_model_time(4.0), 2.0);
+    assert_eq!(p.to_model_time(10.0), 5.0);
+    assert_eq!(p.to_model_time(14.0), 11.0);
+    assert_eq!(p.to_model_time(20.0), 20.0);
+    assert_eq!(p.to_model_time(24.0), 22.0);
+    assert_eq!(p.multiplier(14.0), 1.5);
+    assert_eq!(p.multiplier(24.0), 0.5);
+    for t in [0.0, 3.0, 10.0, 17.5, 20.0, 93.25] {
+        assert!(
+            (p.to_clock_time(p.to_model_time(t)) - t).abs() < 1e-9,
+            "{t}"
+        );
+    }
+}
+
+/// Days simulated in model time and mapped to clock time.
+fn seasonal_days(profile: &SeasonalProfile, seed: u64, days: u64) -> Vec<HawkesSegment> {
+    let horizon = profile.bucket_seconds() * profile.multipliers().len() as f64;
+    (0..days)
+        .map(|day| {
+            let mut sim = HawkesSimulator::new(truth(), seed + day, 5).unwrap();
+            let (segment, _) = sim.run(horizon).unwrap();
+            profile.segment_to_clock_time(&segment)
+        })
+        .collect()
+}
+
+#[test]
+fn test_fit_seasonality_recovers_a_known_profile_from_training_only() {
+    let profile_truth = busy_profile();
+    let train = seasonal_days(&profile_truth, 100, 40);
+    let fit = fit_seasonality(&train, CAP as u32, 100.0, 4, 30).unwrap();
+    for (found, known) in fit.multipliers().iter().zip(profile_truth.multipliers()) {
+        assert!((found / known - 1.0).abs() < 0.1, "{found} {known}");
+    }
+    // It reads the segments it is given: more of them move it.
+    let more = [train.clone(), seasonal_days(&profile_truth, 500, 5)].concat();
+    assert_ne!(
+        fit,
+        fit_seasonality(&more, CAP as u32, 100.0, 4, 30).unwrap()
+    );
+}
+
+#[test]
+fn test_fit_seasonality_refuses_a_thin_or_unseen_bucket() {
+    let profile_truth = busy_profile();
+    let train = seasonal_days(&profile_truth, 100, 2);
+    assert!(matches!(
+        fit_seasonality(&train, CAP as u32, 100.0, 4, 1_000_000),
+        Err(MMError::InvalidMarketState(_))
+    ));
+    assert!(matches!(
+        fit_seasonality(&train, CAP as u32, 400.0, 4, 1),
+        Err(MMError::InvalidMarketState(_))
+    ));
+    assert!(fit_seasonality(&train, CAP as u32, 100.0, 0, 1).is_err());
+    assert!(fit_seasonality(&train, 0, 100.0, 4, 1).is_err());
+}
+
+#[test]
+fn test_seasonal_score_beats_the_flat_one_out_of_sample_on_seasonal_flow() {
+    let profile_truth = busy_profile();
+    let train = seasonal_days(&profile_truth, 100, 40);
+    let holdout = seasonal_days(&profile_truth, 900, 20);
+    let config = HawkesFitConfig::new(CAP as u32, vec![2.0]).with_iterations(40);
+    let flat = fit_hawkes(&train, &config).unwrap();
+    let flat = score_flow(&holdout, flat.parameters().unwrap()).unwrap();
+    let profile = fit_seasonality(&train, CAP as u32, 100.0, 4, 30).unwrap();
+    let mapped: Vec<_> = train
+        .iter()
+        .map(|s| profile.segment_to_model_time(s))
+        .collect();
+    let seasonal = fit_hawkes(&mapped, &config).unwrap();
+    let seasonal = score_flow_seasonal(&holdout, seasonal.parameters().unwrap(), &profile).unwrap();
+    assert!(seasonal.log_likelihood > flat.log_likelihood);
+    assert!(seasonal.aic < flat.aic);
+}
+
+#[test]
+fn test_a_flat_profile_changes_no_score() {
+    let days = seasonal_days(&SeasonalProfile::new(100.0, vec![1.0; 4]).unwrap(), 5, 5);
+    let flat = SeasonalProfile::new(100.0, vec![1.0; 4]).unwrap();
+    let params = truth();
+    let plain = score_flow(&days, &params).unwrap();
+    let seasonal = score_flow_seasonal(&days, &params, &flat).unwrap();
+    assert!((plain.log_likelihood - seasonal.log_likelihood).abs() < 1e-6);
+    assert_eq!(plain.residual_ks, seasonal.residual_ks);
+}
+
+#[test]
+fn test_seasonal_score_is_the_model_time_score_plus_the_change_of_time() {
+    let profile = busy_profile();
+    let days = seasonal_days(&profile, 7, 5);
+    let mapped: Vec<_> = days
+        .iter()
+        .map(|s| profile.segment_to_model_time(s))
+        .collect();
+    let params = truth();
+    let plain = score_flow(&mapped, &params).unwrap();
+    let seasonal = score_flow_seasonal(&days, &params, &profile).unwrap();
+    let jacobian: f64 = days
+        .iter()
+        .flat_map(|d| &d.events)
+        .map(|e| profile.multiplier(e.time_seconds).ln())
+        .sum();
+    assert!(jacobian != 0.0);
+    assert!((seasonal.log_likelihood - plain.log_likelihood - jacobian).abs() < 1e-9);
+    assert_eq!(seasonal.residual_ks, plain.residual_ks);
+    assert_eq!(seasonal.parameter_count, plain.parameter_count + 3);
+    assert_eq!(
+        seasonal.aic,
+        2.0 * seasonal.parameter_count as f64 - 2.0 * seasonal.log_likelihood
+    );
+    assert_eq!(
+        seasonal.log_likelihood_per_event,
+        seasonal.log_likelihood / seasonal.events as f64
+    );
+}
+
+#[test]
+fn test_profile_inverse_at_edges_and_several_periods_out() {
+    let p = busy_profile();
+    let period = 400.0;
+    for clock in [0.0, 100.0, 200.0, 300.0, 400.0, 3.0 * period + 250.0] {
+        assert!((p.to_clock_time(p.to_model_time(clock)) - clock).abs() < 1e-9);
+    }
+    assert_eq!(p.to_clock_time(2.0 * period), 2.0 * period);
+    for tau in [5.0, 240.0, 299.0, 1_000.5] {
+        assert!((p.to_model_time(p.to_clock_time(tau)) - tau).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn test_fit_seasonality_with_a_fractional_bucket_and_an_event_at_the_end() {
+    let event = |t: f64, kind| HawkesEvent {
+        time_seconds: t,
+        kind,
+    };
+    // 3 * 0.3 rounds below 0.9, and 0.9 / 0.3 below 3.
+    let segment = HawkesSegment {
+        initial_queue: 5,
+        duration_seconds: 1.2,
+        events: vec![
+            event(0.1, LIMIT),
+            event(0.4, LIMIT),
+            event(0.5, LIMIT),
+            event(0.7, LIMIT),
+            event(1.0, LIMIT),
+            event(1.2, CANCEL),
+        ],
+    };
+    let fit = fit_seasonality(&[segment], CAP as u32, 0.3, 4, 1).unwrap();
+    // The event at the end counts in no bucket: rates 1, 2, 1, 1 over their mean 1.25.
+    for (found, known) in fit.multipliers().iter().zip([0.8, 1.6, 0.8, 0.8]) {
+        assert!((found - known).abs() < 1e-9, "{:?}", fit.multipliers());
+    }
+}
+
+#[test]
+fn test_fit_seasonality_divides_by_the_time_each_bucket_was_seen() {
+    // Two buckets of 10 s, seen for 10 s and 5 s, with a rate of 1 per second each.
+    let events = (0..15)
+        .map(|i| HawkesEvent {
+            time_seconds: f64::from(i) + 0.5,
+            kind: LIMIT,
+        })
+        .collect();
+    let segment = HawkesSegment {
+        initial_queue: 0,
+        duration_seconds: 15.0,
+        events,
+    };
+    let fit = fit_seasonality(&[segment], 100, 10.0, 2, 1).unwrap();
+    assert_eq!(fit.multipliers(), [1.0, 1.0]);
+}

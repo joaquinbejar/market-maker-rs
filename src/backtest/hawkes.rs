@@ -1237,6 +1237,231 @@ pub fn fit_poisson(segments: &[HawkesSegment], max_queue: u32) -> MMResult<Hawke
     HawkesParameters::new(rates, Vec::new(), Vec::new())
 }
 
+/// An intraday profile of activity: a time change of the whole flow.
+///
+/// With `s(t)` piecewise constant, of mean 1 over the period, and `τ(t) = ∫ s`, a seasonal
+/// flow is a stationary model in `τ`: `λ(t) = s(t) λ̃(τ(t))`. So busy hours speed up the
+/// baseline and the kernels' decay alike, which is a departure from the paper, whose
+/// kernels stay in clock time. Calibrate it on training only with [`fit_seasonality`], fit
+/// and simulate in model time, and score with [`score_flow_seasonal`]. A segment's time 0 is
+/// the start of the period, so segments must be aligned to it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeasonalProfile {
+    bucket_seconds: f64,
+    multipliers: Vec<f64>,
+}
+
+impl SeasonalProfile {
+    /// A profile of equal buckets, repeating. The multipliers are normalized to mean 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] for a bucket out of
+    /// `[1 / MAX_RATE, MAX_RATE]`, no multipliers, or one that is not finite and positive.
+    pub fn new(bucket_seconds: f64, multipliers: Vec<f64>) -> MMResult<Self> {
+        if !bucket_seconds.is_finite()
+            || !(1.0 / MAX_RATE..=MAX_RATE).contains(&bucket_seconds)
+            || multipliers.is_empty()
+            || multipliers.iter().any(|m| !m.is_finite() || *m <= 0.0)
+        {
+            return invalid(format!("profile {bucket_seconds} {multipliers:?}"));
+        }
+        let mean = multipliers.iter().sum::<f64>() / as_float(multipliers.len());
+        if !mean.is_finite() || mean <= 0.0 {
+            return invalid(format!("profile mean {mean}"));
+        }
+        let multipliers = multipliers.iter().map(|m| m / mean).collect();
+        Ok(Self {
+            bucket_seconds,
+            multipliers,
+        })
+    }
+
+    /// Returns the length of a bucket, in seconds.
+    #[must_use]
+    pub fn bucket_seconds(&self) -> f64 {
+        self.bucket_seconds
+    }
+
+    /// Returns the multipliers, of mean 1.
+    #[must_use]
+    pub fn multipliers(&self) -> &[f64] {
+        &self.multipliers
+    }
+
+    fn period(&self) -> f64 {
+        self.bucket_seconds * as_float(self.multipliers.len())
+    }
+
+    /// Whole buckets before `t`, and the bucket holding it. Time cannot be negative here.
+    fn bucket_of(&self, t: f64) -> (f64, usize) {
+        let whole = (t / self.bucket_seconds).floor().max(0.0);
+        (whole, self.index_of_bucket(whole))
+    }
+
+    fn index_of_bucket(&self, whole: f64) -> usize {
+        let count = as_float(self.multipliers.len());
+        let index = whole - (whole / count).floor() * count;
+        let index = rust_decimal::prelude::ToPrimitive::to_usize(&index).unwrap_or(0);
+        index.min(self.multipliers.len().saturating_sub(1))
+    }
+
+    /// `s(t)`.
+    #[must_use]
+    pub fn multiplier(&self, t: f64) -> f64 {
+        let (_, index) = self.bucket_of(t);
+        self.multipliers.get(index).copied().unwrap_or(1.0)
+    }
+
+    /// `τ(t)`, of clock time `t`.
+    #[must_use]
+    pub fn to_model_time(&self, t: f64) -> f64 {
+        let (whole, index) = self.bucket_of(t);
+        let periods = (whole / as_float(self.multipliers.len())).floor();
+        let before: f64 = self.multipliers.iter().take(index).sum();
+        let start = whole * self.bucket_seconds;
+        // The mean is 1, so a whole period takes as long in either time.
+        periods * self.period() + before * self.bucket_seconds + self.multiplier(t) * (t - start)
+    }
+
+    /// The clock time of model time `tau`, the inverse of [`Self::to_model_time`].
+    #[must_use]
+    pub fn to_clock_time(&self, tau: f64) -> f64 {
+        let period = self.period();
+        let periods = (tau / period).floor().max(0.0);
+        let mut left = tau - periods * period;
+        let mut clock = periods * period;
+        for multiplier in &self.multipliers {
+            let span = multiplier * self.bucket_seconds;
+            if left < span {
+                return clock + left / multiplier;
+            }
+            left -= span;
+            clock += self.bucket_seconds;
+        }
+        clock
+    }
+
+    /// A segment in model time, to fit or to score.
+    #[must_use]
+    pub fn segment_to_model_time(&self, segment: &HawkesSegment) -> HawkesSegment {
+        self.map_segment(segment, |t| self.to_model_time(t))
+    }
+
+    /// A segment simulated in model time, in clock time.
+    #[must_use]
+    pub fn segment_to_clock_time(&self, segment: &HawkesSegment) -> HawkesSegment {
+        self.map_segment(segment, |t| self.to_clock_time(t))
+    }
+
+    fn map_segment(&self, segment: &HawkesSegment, map: impl Fn(f64) -> f64) -> HawkesSegment {
+        HawkesSegment {
+            initial_queue: segment.initial_queue,
+            duration_seconds: map(segment.duration_seconds),
+            events: segment
+                .events
+                .iter()
+                .map(|event| HawkesEvent {
+                    time_seconds: map(event.time_seconds),
+                    kind: event.kind,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Calibrates a profile as the event rate per bucket over the mean, from `segments` alone,
+/// so pass training only. This is a moment estimate, not a joint fit, and it is confounded
+/// with the flow's own state: excitation inflates a bucket's count, each segment starts
+/// with no memory, which deflates the first bucket, and departures stop at an empty queue.
+///
+/// # Errors
+///
+/// Returns [`MMError::InvalidConfiguration`] for an invalid bucket or no buckets, and
+/// [`MMError::InvalidMarketState`] for a segment out of order, or a bucket with no time
+/// observed or too few events, which is refused rather than filled in.
+pub fn fit_seasonality(
+    segments: &[HawkesSegment],
+    max_queue: u32,
+    bucket_seconds: f64,
+    buckets: usize,
+    min_events: u64,
+) -> MMResult<SeasonalProfile> {
+    if max_queue == 0 || max_queue > MAX_QUEUE || min_events == 0 {
+        return invalid(format!(
+            "{buckets} buckets, cap {max_queue}, {min_events} events"
+        ));
+    }
+    let flat = SeasonalProfile::new(bucket_seconds, vec![1.0; buckets])?;
+    let cap = usize::try_from(max_queue).map_err(|_| overflow("cap"))?;
+    let mut counts = vec![0u64; buckets];
+    let mut exposure = vec![0.0f64; buckets];
+    for segment in segments {
+        segment.validate(cap)?;
+        // An event at the very end has no exposure in the bucket after it.
+        for event in segment
+            .events
+            .iter()
+            .filter(|event| event.time_seconds < segment.duration_seconds)
+        {
+            let (_, index) = flat.bucket_of(event.time_seconds);
+            let count = counts.get_mut(index).or_overflow("bucket")?;
+            *count = count.saturating_add(1);
+        }
+        // By whole buckets, as a time at an edge can round into the bucket before it.
+        let mut whole = 0.0f64;
+        let mut start = 0.0f64;
+        while start < segment.duration_seconds {
+            let end = ((whole + 1.0) * bucket_seconds).min(segment.duration_seconds);
+            let index = flat.index_of_bucket(whole);
+            *exposure.get_mut(index).or_overflow("bucket")? += end - start;
+            whole += 1.0;
+            start = end;
+        }
+    }
+    let mut rates = Vec::with_capacity(buckets);
+    for (index, (count, time)) in counts.iter().zip(&exposure).enumerate() {
+        if *count < min_events {
+            return Err(MMError::InvalidMarketState(format!(
+                "bucket {index}: {count} events in {time} seconds"
+            )));
+        }
+        rates.push(count_as_float(*count) / time);
+    }
+    SeasonalProfile::new(bucket_seconds, rates)
+}
+
+/// Scores `params`, fitted in model time, on clock time `segments` under `profile`: the
+/// likelihood gains `Σ ln s(t_i)` from the change of time, and the residuals are unchanged.
+/// So it is comparable with [`score_flow`] on the same segments. The parameter count adds the
+/// profile's free multipliers.
+///
+/// # Errors
+///
+/// As [`score_flow`].
+pub fn score_flow_seasonal(
+    segments: &[HawkesSegment],
+    params: &HawkesParameters,
+    profile: &SeasonalProfile,
+) -> MMResult<FlowFit> {
+    let mapped: Vec<HawkesSegment> = segments
+        .iter()
+        .map(|segment| profile.segment_to_model_time(segment))
+        .collect();
+    let mut fit = score_flow(&mapped, params)?;
+    let jacobian: f64 = segments
+        .iter()
+        .flat_map(|segment| &segment.events)
+        .map(|event| profile.multiplier(event.time_seconds).ln())
+        .sum();
+    let extra = profile.multipliers().len().saturating_sub(1);
+    fit.log_likelihood += jacobian;
+    fit.log_likelihood_per_event = fit.log_likelihood / count_as_float(fit.events);
+    fit.parameter_count = fit.parameter_count.saturating_add(extra);
+    fit.aic = 2.0 * as_float(fit.parameter_count) - 2.0 * fit.log_likelihood;
+    Ok(fit)
+}
+
 /// Goodness of fit of parameters on some segments.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
