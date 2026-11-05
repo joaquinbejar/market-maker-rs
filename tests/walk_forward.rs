@@ -1613,6 +1613,981 @@ fn test_walk_forward_report_serde_keeps_out_of_support_and_reads_older_reports()
     );
 }
 
+const HOUR_MS: u64 = 3_600_000;
+
+/// 09:00 to 17:00 UTC on each of the first `days` days.
+fn day_sessions(days: u64) -> Vec<TimeWindow> {
+    (0..days)
+        .map(|d| TimeWindow {
+            start_ms: d * DAY_MS + 9 * HOUR_MS,
+            end_ms: d * DAY_MS + 17 * HOUR_MS,
+        })
+        .collect()
+}
+
+/// One path of one minute prices, cut across the sessions, so that the price
+/// does not move while the market is closed.
+fn session_prices(sessions: &[TimeWindow], sigma: f64) -> Vec<PriceSample> {
+    let open_ms: u64 = sessions.iter().map(|s| s.end_ms - s.start_ms).sum();
+    let mut path = prices(7, 0, open_ms, 60_000, sigma).into_iter();
+    sessions
+        .iter()
+        .flat_map(|s| {
+            let steps = (s.end_ms - s.start_ms) / 60_000;
+            (0..steps)
+                .map(|i| PriceSample {
+                    timestamp_ms: s.start_ms + i * 60_000,
+                    price: path.next().unwrap().price,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Exposures of one minute inside each session.
+fn session_exposures(sessions: &[TimeWindow]) -> Vec<QuoteExposure> {
+    sessions
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| exposures(11 + i as u64, s.start_ms, s.end_ms, 2.0, 3.0, |_| 1.0))
+        .collect()
+}
+
+fn in_sessions<'a>(
+    p: &'a [PriceSample],
+    e: &'a [QuoteExposure],
+    sessions: &'a [TimeWindow],
+) -> CalibrationData<'a> {
+    CalibrationData::new(p, e)
+        .unwrap()
+        .with_sessions(sessions)
+        .unwrap()
+}
+
+/// Four prices of one minute from `from`, with log returns `+r`, `-r`, `+r`.
+fn zigzag(from: u64, level: f64, r: f64) -> Vec<PriceSample> {
+    (0..4u64)
+        .map(|i| PriceSample {
+            timestamp_ms: from + i * 60_000,
+            price: Decimal::from_f64(if i % 2 == 0 { level } else { level * r.exp() }).unwrap(),
+        })
+        .collect()
+}
+
+#[test]
+fn test_calibrate_window_overnight_closure_neither_fails_nor_dilutes() {
+    let sigma = 0.5;
+    let sessions = day_sessions(3);
+    let p = session_prices(&sessions, sigma);
+    let e = session_exposures(&sessions);
+    let window = TimeWindow::new(0, 3 * DAY_MS).unwrap();
+    let relative = |outcome: &CalibrationOutcome| match outcome {
+        CalibrationOutcome::Calibrated(fit) => {
+            (fit.volatility / fit.reference_price).to_f64().unwrap()
+        }
+        other => panic!("{other:?}"),
+    };
+
+    // Continuous by default: the closure fails the window.
+    let plain = CalibrationData::new(&p, &e).unwrap();
+    let continuous = calibrate_window(&plain, &window, &config(), "d").unwrap();
+    assert!(matches!(
+        continuous.outcome,
+        CalibrationOutcome::Insufficient(CalibrationFailure::PriceGap { gap_ms, .. })
+            if gap_ms > 15 * HOUR_MS
+    ));
+    // And raising the limit to pass it dilutes the volatility with zero returns,
+    // by the square root of the open share of the grid, 24 of its 63 hours, as
+    // it starts at the first sample.
+    let lax = config().with_max_gap_buckets(2_000);
+    let diluted = relative(
+        &calibrate_window(&plain, &window, &lax, "d")
+            .unwrap()
+            .outcome,
+    );
+    let open_share = 24.0f64 / 63.0;
+    assert!(
+        (diluted / (sigma * open_share.sqrt()) - 1.0).abs() < 0.06,
+        "{diluted}"
+    );
+
+    // With sessions, the diffusion is recovered at the same limit.
+    let data = in_sessions(&p, &e, &sessions);
+    let record = calibrate_window(&data, &window, &config(), "d").unwrap();
+    let recovered = relative(&record.outcome);
+    assert!((recovered / sigma - 1.0).abs() < 0.06, "{recovered}");
+    let fit = record.parameters().unwrap();
+    assert!((fit.order_intensity_k.to_f64().unwrap() / 3.0 - 1.0).abs() < 0.1);
+    assert!((fit.intensity_scale_a.to_f64().unwrap() / 2.0 - 1.0).abs() < 0.2);
+    assert_eq!(fit.reference_price, p.last().unwrap().price);
+}
+
+#[test]
+fn test_calibrate_window_no_return_crosses_a_closure_by_hand() {
+    // Log returns +r, -r, +r in each session, with a jump of 50% between them.
+    let r = 0.001f64;
+    let sessions = [
+        TimeWindow::new(0, 240_000).unwrap(),
+        TimeWindow::new(HOUR_MS, HOUR_MS + 240_000).unwrap(),
+    ];
+    let mut p = zigzag(0, 100.0, r);
+    p.extend(zigzag(HOUR_MS, 150.0, r));
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let data = in_sessions(&p, &e, &sessions);
+    let steps_per_year = 31_536_000_000.0f64 / 60_000.0;
+    let reference = p.last().unwrap().price;
+    let reference_f64 = reference.to_f64().unwrap();
+    let cfg = config().with_minima(3, 2, 1, 1);
+
+    let record = calibrate_window(&data, &window, &cfg, "d").unwrap();
+    let fit = record.parameters().unwrap();
+    assert_eq!(fit.reference_price, reference);
+    // Six returns of mean r/3: the squared deviations add up to 48 r² / 9.
+    let variance = 48.0 * r * r / 9.0 / 5.0;
+    let expected = reference_f64 * (variance * steps_per_year).sqrt();
+    let got = fit.volatility.to_f64().unwrap();
+    assert!((got / expected - 1.0).abs() < 1e-6, "{got} {expected}");
+
+    // The EWMA recursion runs over the same returns, from their variance.
+    let ewma = cfg.with_volatility_rule(VolatilityRule::Ewma { lambda: dec!(0.5) });
+    let record = calibrate_window(&data, &window, &ewma, "d").unwrap();
+    // The first five returns have mean r/5 and squared deviations of 4.8 r².
+    let mut variance = 4.8 * r * r / 4.0;
+    for step in [r, -r, r, r, -r, r] {
+        variance = 0.5 * variance + 0.5 * step * step;
+    }
+    let expected = reference_f64 * (variance * steps_per_year).sqrt();
+    let got = record.parameters().unwrap().volatility.to_f64().unwrap();
+    assert!((got / expected - 1.0).abs() < 1e-6, "{got} {expected}");
+}
+
+#[test]
+fn test_calibrate_window_session_grids_share_no_price() {
+    // The first session ends in a partial bucket with a wild price, and the
+    // second has no sample in its first bucket. Neither may reach its grid.
+    let sessions = [
+        TimeWindow::new(0, 240_000 + 30_000).unwrap(),
+        TimeWindow::new(HOUR_MS, HOUR_MS + 300_000).unwrap(),
+    ];
+    let r = 0.001f64;
+    let quiet: Vec<_> = zigzag(0, 100.0, r)
+        .into_iter()
+        .chain(zigzag(HOUR_MS + 60_000, 150.0, r))
+        .collect();
+    let mut wild = quiet.clone();
+    wild.insert(
+        4,
+        PriceSample {
+            timestamp_ms: 250_000,
+            price: dec!(1000),
+        },
+    );
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let cfg = config().with_minima(3, 2, 1, 1);
+    let run = |p: &[PriceSample]| {
+        calibrate_window(&in_sessions(p, &e, &sessions), &window, &cfg, "d").unwrap()
+    };
+    let quiet_fit = run(&quiet);
+    let wild_fit = run(&wild);
+    assert_eq!(quiet_fit.outcome, wild_fit.outcome);
+    // Hand value of the same six returns, so the runs did not just agree.
+    let variance = 48.0 * r * r / 9.0 / 5.0;
+    let expected = quiet.last().unwrap().price.to_f64().unwrap() * (variance * 525_600.0f64).sqrt();
+    let got = quiet_fit.parameters().unwrap().volatility.to_f64().unwrap();
+    assert!((got / expected - 1.0).abs() < 1e-6, "{got} {expected}");
+}
+
+#[test]
+fn test_calibrate_window_silence_inside_a_session_stays_a_gap() {
+    let sessions = day_sessions(2);
+    let e = session_exposures(&sessions);
+    let window = TimeWindow::new(0, 2 * DAY_MS).unwrap();
+    let run = |p: &[PriceSample]| {
+        calibrate_window(&in_sessions(p, &e, &sessions), &window, &config(), "d")
+            .unwrap()
+            .outcome
+    };
+    let limit_ms = 300_000;
+
+    // A feed outage of two hours during the second session.
+    let mut outage = session_prices(&sessions, 0.5);
+    let (from, to) = (DAY_MS + 10 * HOUR_MS, DAY_MS + 12 * HOUR_MS);
+    outage.retain(|s| !(from..to).contains(&s.timestamp_ms));
+    assert_eq!(
+        run(&outage),
+        CalibrationOutcome::Insufficient(CalibrationFailure::PriceGap {
+            gap_ms: 2 * HOUR_MS + 60_000,
+            limit_ms,
+        })
+    );
+
+    // A declared session with no prices at all.
+    let mut silent = session_prices(&sessions, 0.5);
+    silent.retain(|s| s.timestamp_ms < DAY_MS);
+    assert_eq!(
+        run(&silent),
+        CalibrationOutcome::Insufficient(CalibrationFailure::PriceGap {
+            gap_ms: 8 * HOUR_MS,
+            limit_ms,
+        })
+    );
+
+    // A late open, and a feed that stops before the close, each in one session.
+    let mut late = session_prices(&sessions, 0.5);
+    late.retain(|s| s.timestamp_ms >= 9 * HOUR_MS + 600_000);
+    assert_eq!(
+        run(&late),
+        CalibrationOutcome::Insufficient(CalibrationFailure::PriceGap {
+            gap_ms: 600_000,
+            limit_ms,
+        })
+    );
+    let mut early = session_prices(&sessions, 0.5);
+    early.retain(|s| s.timestamp_ms < 16 * HOUR_MS || s.timestamp_ms >= DAY_MS);
+    assert_eq!(
+        run(&early),
+        CalibrationOutcome::Insufficient(CalibrationFailure::PriceGap {
+            gap_ms: HOUR_MS + 60_000,
+            limit_ms,
+        })
+    );
+}
+
+#[test]
+fn test_calibrate_window_returns_inside_sessions_are_counted() {
+    let e = exposures(11, 0, DAY_MS, 2.0, 3.0, |_| 1.0);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let cfg = config().with_minima(3, 2, 1, 1);
+    let sample = |timestamp_ms, price| PriceSample {
+        timestamp_ms,
+        price,
+    };
+    let session =
+        |start: u64, minutes: u64| TimeWindow::new(start, start + minutes * 60_000).unwrap();
+    let run = |p: &[PriceSample], s: &[TimeWindow]| {
+        calibrate_window(&in_sessions(p, &e, s), &window, &cfg, "d")
+            .unwrap()
+            .outcome
+    };
+
+    // Enough grid prices, but each session has only one.
+    let singles = [session(0, 1), session(HOUR_MS, 1), session(2 * HOUR_MS, 1)];
+    let p = [
+        sample(0, dec!(100)),
+        sample(HOUR_MS, dec!(101)),
+        sample(2 * HOUR_MS, dec!(102)),
+    ];
+    assert_eq!(
+        run(&p, &singles),
+        CalibrationOutcome::Insufficient(CalibrationFailure::TooFewReturns { have: 0, need: 2 })
+    );
+
+    // One return is not enough for a variance, and two are.
+    let pair = [session(0, 2), session(HOUR_MS, 1)];
+    let p = [
+        sample(0, dec!(100)),
+        sample(60_000, dec!(101)),
+        sample(HOUR_MS, dec!(102)),
+    ];
+    assert_eq!(
+        run(&p, &pair),
+        CalibrationOutcome::Insufficient(CalibrationFailure::TooFewReturns { have: 1, need: 2 })
+    );
+    let pairs = [session(0, 2), session(HOUR_MS, 2)];
+    let p = [
+        sample(0, dec!(100)),
+        sample(60_000, dec!(101)),
+        sample(HOUR_MS, dec!(102)),
+        sample(HOUR_MS + 60_000, dec!(102.5)),
+    ];
+    assert!(matches!(run(&p, &pairs), CalibrationOutcome::Calibrated(_)));
+
+    // A session shorter than a bucket gives no grid price; the reference price
+    // is still the last one on the grid.
+    let short = [
+        session(0, 2),
+        session(HOUR_MS, 2),
+        TimeWindow::new(2 * HOUR_MS, 2 * HOUR_MS + 30_000).unwrap(),
+    ];
+    let mut with_short = p.to_vec();
+    with_short.push(sample(2 * HOUR_MS, dec!(500)));
+    match run(&with_short, &short) {
+        CalibrationOutcome::Calibrated(fit) => assert_eq!(fit.reference_price, dec!(102.5)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_calibration_data_invalid_sessions_are_refused() {
+    let e: Vec<QuoteExposure> = Vec::new();
+    let window = |start_ms, end_ms| TimeWindow { start_ms, end_ms };
+    let sample = |timestamp_ms| PriceSample {
+        timestamp_ms,
+        price: dec!(100),
+    };
+    let declare = |p: &[PriceSample], s: &[TimeWindow]| {
+        CalibrationData::new(p, &e)
+            .unwrap()
+            .with_sessions(s)
+            .map(|_| ())
+    };
+    let configuration = |r: Result<(), market_maker_rs::types::error::MMError>| {
+        matches!(
+            r,
+            Err(market_maker_rs::types::error::MMError::InvalidConfiguration(_))
+        )
+    };
+    let market = |r: Result<(), market_maker_rs::types::error::MMError>| {
+        matches!(
+            r,
+            Err(market_maker_rs::types::error::MMError::InvalidMarketState(
+                _
+            ))
+        )
+    };
+
+    // No sessions would otherwise read as always open.
+    assert!(configuration(declare(&[], &[])));
+    assert!(configuration(declare(&[], &[window(5, 5)])));
+    assert!(configuration(declare(&[], &[window(6, 5)])));
+    assert!(configuration(declare(&[], &[window(0, 10), window(9, 20)])));
+    assert!(configuration(declare(&[], &[window(10, 20), window(0, 5)])));
+    // Touching sessions are two sessions.
+    assert!(declare(&[], &[window(0, 10), window(10, 20)]).is_ok());
+
+    // Each session is half open, and a sample outside them all is refused.
+    let sessions = [window(10, 20), window(30, 40)];
+    assert!(declare(&[sample(10), sample(19), sample(30), sample(39)], &sessions).is_ok());
+    assert!(market(declare(&[sample(9)], &sessions)));
+    assert!(market(declare(&[sample(20)], &sessions)));
+    assert!(market(declare(&[sample(29)], &sessions)));
+    assert!(market(declare(&[sample(40)], &sessions)));
+    assert!(market(declare(&[sample(10), sample(25)], &sessions)));
+
+    // Exposures say how long the quotes were at risk, and are not checked.
+    let outside = [QuoteExposure {
+        timestamp_ms: 25,
+        distance: dec!(0.1),
+        exposure_ms: 1,
+        fills: 0,
+    }];
+    assert!(
+        CalibrationData::new(&[], &outside)
+            .unwrap()
+            .with_sessions(&sessions)
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_calibrate_window_sessions_are_part_of_what_the_record_hashes() {
+    let sessions = day_sessions(2);
+    let p = session_prices(&sessions[..1], 0.5);
+    let e = session_exposures(&sessions[..1]);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let run = |s: &[TimeWindow]| {
+        calibrate_window(&in_sessions(&p, &e, s), &window, &config(), "d").unwrap()
+    };
+    let base = run(&sessions);
+
+    // A session the window does not reach, or the part of one past its end, is
+    // later data, so the record does not depend on it.
+    let mut later = sessions.clone();
+    later[1].end_ms += HOUR_MS;
+    assert_eq!(run(&later), base);
+    let mut past_the_end = sessions.clone();
+    past_the_end[0].end_ms = 17 * HOUR_MS + 60_000;
+    let narrow = TimeWindow::new(0, 17 * HOUR_MS).unwrap();
+    let clipped = |s: &[TimeWindow]| {
+        calibrate_window(&in_sessions(&p, &e, s), &narrow, &config(), "d").unwrap()
+    };
+    assert_eq!(clipped(&past_the_end), clipped(&sessions));
+
+    // A session the window does reach changes what the data means.
+    let mut earlier = sessions.clone();
+    earlier[0].start_ms -= 60_000;
+    assert_ne!(run(&earlier).dataset_hash, base.dataset_hash);
+    let mut later_close = sessions.clone();
+    later_close[0].end_ms += 60_000;
+    assert_ne!(run(&later_close).dataset_hash, base.dataset_hash);
+
+    // Without sessions the hash is what it was: a plain record is unaffected.
+    let plain = calibrate_window(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &window,
+        &config(),
+        "d",
+    )
+    .unwrap();
+    assert_ne!(plain.dataset_hash, base.dataset_hash);
+}
+
+#[test]
+fn test_calibrate_window_session_touching_the_window_is_not_part_of_it() {
+    // Windows are half open: a session ending where the window starts, or
+    // starting where it ends, has no time in common with it.
+    let inside = TimeWindow::new(DAY_MS + 9 * HOUR_MS, DAY_MS + 17 * HOUR_MS).unwrap();
+    let p = session_prices(&[inside], 0.5);
+    let e = session_exposures(&[inside]);
+    let window = TimeWindow::new(DAY_MS, 2 * DAY_MS).unwrap();
+    let run = |s: &[TimeWindow]| {
+        calibrate_window(&in_sessions(&p, &e, s), &window, &config(), "d").unwrap()
+    };
+    let before = TimeWindow::new(9 * HOUR_MS, DAY_MS).unwrap();
+    let after = TimeWindow::new(2 * DAY_MS, 2 * DAY_MS + HOUR_MS).unwrap();
+    assert_eq!(run(&[before, inside, after]), run(&[inside]));
+}
+
+#[test]
+fn test_calibrate_window_session_ending_at_the_start_changes_the_hash_if_it_moves_a_stamp() {
+    // An exposure stamped at the window's start counts in the session that ended
+    // then, which is otherwise outside the window, so the hash must see it.
+    let inside = TimeWindow::new(DAY_MS + 9 * HOUR_MS, DAY_MS + 17 * HOUR_MS).unwrap();
+    let before = TimeWindow::new(DAY_MS - 60_000, DAY_MS).unwrap();
+    let p = session_prices(&[inside], 0.5);
+    let plain = session_exposures(&[inside]);
+    let mut stamped = plain.clone();
+    stamped.insert(
+        0,
+        QuoteExposure {
+            timestamp_ms: DAY_MS,
+            distance: dec!(0.1),
+            exposure_ms: 60_000,
+            fills: 2,
+        },
+    );
+    let window = TimeWindow::new(DAY_MS, 2 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 1);
+    let run = |e: &[QuoteExposure], s: &[TimeWindow]| {
+        calibrate_window(&in_sessions(&p, e, s), &window, &cfg, "d").unwrap()
+    };
+    let alone = run(&stamped, &[inside]);
+    let with_before = run(&stamped, &[before, inside]);
+    assert!(alone.parameters().unwrap().seasonality[0] > Decimal::ZERO);
+    assert_eq!(alone.parameters().unwrap().seasonality[23], Decimal::ZERO);
+    assert!(with_before.parameters().unwrap().seasonality[23] > Decimal::ZERO);
+    assert_eq!(
+        with_before.parameters().unwrap().seasonality[0],
+        Decimal::ZERO
+    );
+    assert_ne!(alone.dataset_hash, with_before.dataset_hash);
+
+    // Without such a stamp that session decides nothing, and neither record moves.
+    let cfg_day = config();
+    let unstamped = |s: &[TimeWindow]| {
+        calibrate_window(&in_sessions(&p, &plain, s), &window, &cfg_day, "d").unwrap()
+    };
+    assert_eq!(unstamped(&[before, inside]), unstamped(&[inside]));
+}
+
+#[test]
+fn test_calibrate_window_without_sessions_hashes_only_the_samples() {
+    // FNV-1a 128 of the samples alone: records written before sessions existed
+    // keep their hash.
+    let p = prices(7, 0, 3_600_000, 60_000, 0.5);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let record = calibrate_window(
+        &CalibrationData::new(&p, &[]).unwrap(),
+        &window,
+        &config(),
+        "d",
+    )
+    .unwrap();
+    let mut expected = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128;
+    for s in &p {
+        let bytes = s.timestamp_ms.to_le_bytes();
+        let price = s.price.normalize().serialize();
+        for b in bytes.iter().chain(&price) {
+            expected =
+                (expected ^ u128::from(*b)).wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+        }
+    }
+    assert_eq!(record.dataset_hash, expected);
+}
+
+#[test]
+fn test_calibrate_window_grid_limit_counts_every_session() {
+    // Each session is under the limit of ten million points, but not the sum.
+    let sessions = [
+        TimeWindow::new(0, 6_000_000).unwrap(),
+        TimeWindow::new(7_000_000, 13_000_000).unwrap(),
+    ];
+    let cfg = config().with_resolution_ms(1);
+    let data = CalibrationData::new(&[], &[])
+        .unwrap()
+        .with_sessions(&sessions)
+        .unwrap();
+    let whole = TimeWindow::new(0, 13_000_000).unwrap();
+    assert!(matches!(
+        calibrate_window(&data, &whole, &cfg, "d"),
+        Err(market_maker_rs::types::error::MMError::InvalidConfiguration(_))
+    ));
+    let one = TimeWindow::new(0, 6_000_000).unwrap();
+    assert!(calibrate_window(&data, &one, &cfg, "d").is_ok());
+}
+
+#[test]
+fn test_calibrate_window_session_wider_than_the_window_equals_no_session() {
+    // Clipped to the window, the session covers it, so nothing may change.
+    let session = [TimeWindow::new(0, DAY_MS).unwrap()];
+    let p = session_prices(&session, 0.5);
+    let e = session_exposures(&session);
+    let window = TimeWindow::new(HOUR_MS, 5 * HOUR_MS + 30_000).unwrap();
+    let declared = calibrate_window(&in_sessions(&p, &e, &session), &window, &config(), "d");
+    let plain = calibrate_window(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &window,
+        &config(),
+        "d",
+    );
+    assert_eq!(declared.unwrap().outcome, plain.unwrap().outcome);
+}
+
+#[test]
+fn test_walk_forward_realized_volatility_uses_the_sessions() {
+    let sessions = day_sessions(4);
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let split = ChronologicalSplit {
+        train: TimeWindow::new(0, 2 * DAY_MS).unwrap(),
+        test: TimeWindow::new(2 * DAY_MS, 4 * DAY_MS).unwrap(),
+    };
+    let data = in_sessions(&p, &e, &sessions);
+    let report = walk_forward(&data, &[split], &config(), "d", &constant()).unwrap();
+    let on_test = calibrate_window(&data, &split.test, &config(), "d").unwrap();
+    let realized = on_test.parameters().unwrap().volatility;
+    assert_eq!(
+        report.folds[0].constant.volatility,
+        Some((constant().volatility - realized).abs())
+    );
+    assert!(report.folds[0].calibrated.unwrap().volatility.is_some());
+
+    // The same closures unscore the test window when they are not declared,
+    // and the training window of that fold fails as well.
+    let plain = CalibrationData::new(&p, &e).unwrap();
+    let report = walk_forward(&plain, &[split], &config(), "d", &constant()).unwrap();
+    assert_eq!(report.folds[0].constant.volatility, None);
+    assert!(report.folds[0].calibrated.is_none());
+}
+
+#[test]
+fn test_walk_forward_realized_volatility_needs_returns_inside_sessions() {
+    // Three test sessions of one bucket each pass the minimum of grid prices
+    // and the gap limit, and give no return to measure.
+    let day = |i: u64| i * DAY_MS;
+    let mut sessions = day_sessions(2);
+    let singles = [day(2), day(2) + HOUR_MS, day(2) + 2 * HOUR_MS];
+    sessions.extend(
+        singles
+            .iter()
+            .map(|s| TimeWindow::new(*s, s + 60_000).unwrap()),
+    );
+    let mut p = session_prices(&sessions[..2], 0.5);
+    p.extend(singles.iter().map(|s| PriceSample {
+        timestamp_ms: *s,
+        price: dec!(100),
+    }));
+    let e = session_exposures(&sessions[..2]);
+    let split = ChronologicalSplit {
+        train: TimeWindow::new(0, day(2)).unwrap(),
+        test: TimeWindow::new(day(2), day(3)).unwrap(),
+    };
+    let cfg = config().with_minima(3, 2, 1, 1);
+    let report = walk_forward(
+        &in_sessions(&p, &e, &sessions),
+        &[split],
+        &cfg,
+        "d",
+        &constant(),
+    )
+    .unwrap();
+    assert!(report.folds[0].record.parameters().is_some());
+    assert_eq!(report.folds[0].constant.volatility, None);
+    assert_eq!(report.folds[0].calibrated.unwrap().volatility, None);
+}
+
+#[test]
+fn test_calibrate_window_closed_seasonal_buckets_are_not_a_failure() {
+    let sessions = day_sessions(3);
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let window = TimeWindow::new(0, 3 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 30);
+
+    let plain = CalibrationData::new(&p, &e).unwrap();
+    let lax = cfg.with_max_gap_buckets(2_000);
+    assert_eq!(
+        calibrate_window(&plain, &window, &lax, "d")
+            .unwrap()
+            .outcome,
+        CalibrationOutcome::Insufficient(CalibrationFailure::UnobservedSeasonalBucket {
+            bucket: 0
+        })
+    );
+
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    let fit = record.parameters().unwrap();
+    assert_eq!(fit.seasonality.len(), 24);
+    for (bucket, multiplier) in fit.seasonality.iter().enumerate() {
+        if (9..17).contains(&bucket) {
+            assert!(
+                (multiplier.to_f64().unwrap() - 1.0).abs() < 0.2,
+                "{multiplier}"
+            );
+        } else {
+            assert_eq!(*multiplier, Decimal::ZERO, "bucket {bucket}");
+        }
+    }
+    // `A` is per second at risk: the closed hours do not dilute it.
+    assert!((fit.intensity_scale_a.to_f64().unwrap() / 2.0 - 1.0).abs() < 0.2);
+    assert_eq!(
+        fit.rate_per_second(dec!(0.1), 3 * HOUR_MS).unwrap(),
+        Decimal::ZERO
+    );
+    assert!(fit.rate_per_second(dec!(0.1), 12 * HOUR_MS).unwrap() > Decimal::ZERO);
+}
+
+#[test]
+fn test_calibrate_window_unobserved_bucket_stays_a_failure_unless_closed() {
+    let cfg = config().with_seasonality(24, 1).with_minima(30, 2, 1, 1);
+    let unobserved = |bucket| {
+        CalibrationOutcome::Insufficient(CalibrationFailure::UnobservedSeasonalBucket { bucket })
+    };
+
+    // An open bucket without exposure is unknown, not closed.
+    let sessions = day_sessions(2);
+    let p = session_prices(&sessions, 0.5);
+    let window = TimeWindow::new(0, 2 * DAY_MS).unwrap();
+    let mut e = session_exposures(&sessions);
+    e.retain(|x| !(12 * HOUR_MS..13 * HOUR_MS).contains(&(x.timestamp_ms % DAY_MS)));
+    assert_eq!(
+        calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        unobserved(12)
+    );
+
+    // So is one open for only part of the hour: the session opens at 09:30.
+    let half_hour = [TimeWindow::new(9 * HOUR_MS + 1_800_000, 17 * HOUR_MS).unwrap()];
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let p = session_prices(&half_hour, 0.5);
+    let mut e = session_exposures(&half_hour);
+    e.retain(|x| x.timestamp_ms >= 10 * HOUR_MS);
+    assert_eq!(
+        calibrate_window(&in_sessions(&p, &e, &half_hour), &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        unobserved(9)
+    );
+
+    // And a bucket the window never reaches says nothing about the venue.
+    let sessions = day_sessions(1);
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let window = TimeWindow::new(9 * HOUR_MS, 17 * HOUR_MS).unwrap();
+    assert_eq!(
+        calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        unobserved(0)
+    );
+
+    // An exposure stamped in a closed hour makes that bucket observed.
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let mut e = session_exposures(&sessions);
+    e.push(QuoteExposure {
+        timestamp_ms: 20 * HOUR_MS,
+        distance: dec!(0.1),
+        exposure_ms: 60_000,
+        fills: 0,
+    });
+    assert_eq!(
+        calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        CalibrationOutcome::Insufficient(CalibrationFailure::ThinSeasonalBucket {
+            bucket: 20,
+            have: 0,
+            need: 1,
+        })
+    );
+}
+
+#[test]
+fn test_calibrate_window_session_across_midnight_opens_both_days_buckets() {
+    // 22:00 to 02:00, on two nights.
+    let sessions: Vec<_> = (0..2u64)
+        .map(|d| {
+            TimeWindow::new(d * DAY_MS + 22 * HOUR_MS, (d + 1) * DAY_MS + 2 * HOUR_MS).unwrap()
+        })
+        .collect();
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let window = TimeWindow::new(0, 3 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 30);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    let fit = record.parameters().unwrap();
+    for (bucket, multiplier) in fit.seasonality.iter().enumerate() {
+        let open = !(2..22).contains(&bucket);
+        assert_eq!(*multiplier > Decimal::ZERO, open, "bucket {bucket}");
+    }
+}
+
+/// One exposure of a minute with fills, stamped at each session's end.
+fn exposures_at_the_close(sessions: &[TimeWindow], fills: u64) -> Vec<QuoteExposure> {
+    sessions
+        .iter()
+        .map(|s| QuoteExposure {
+            timestamp_ms: s.end_ms,
+            distance: dec!(0.1),
+            exposure_ms: 60_000,
+            fills,
+        })
+        .collect()
+}
+
+fn with_closing_exposures(sessions: &[TimeWindow], fills: u64) -> Vec<QuoteExposure> {
+    let mut e = session_exposures(sessions);
+    e.extend(exposures_at_the_close(sessions, fills));
+    e.sort_by_key(|x| x.timestamp_ms);
+    e
+}
+
+#[test]
+fn test_calibrate_window_exposure_at_the_close_keeps_the_closed_bucket_closed() {
+    let sessions = day_sessions(3);
+    let p = session_prices(&sessions, 0.5);
+    let window = TimeWindow::new(0, 3 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 30);
+
+    // A few fills at the close do not make the next hour a thin bucket.
+    let e = with_closing_exposures(&sessions, 2);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    let fit = record.parameters().unwrap();
+    assert_eq!(fit.seasonality[17], Decimal::ZERO);
+    assert!(fit.seasonality[16] > Decimal::ZERO);
+
+    // Nor do many give the closed hour a multiplier, and they count in the last.
+    let e = with_closing_exposures(&sessions, 20_000);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    let fit = record.parameters().unwrap();
+    assert_eq!(fit.seasonality[17], Decimal::ZERO);
+    assert!(fit.seasonality[16] > dec!(1.5) * fit.seasonality[15]);
+}
+
+#[test]
+fn test_calibrate_window_session_ending_inside_a_bucket_keeps_its_stamp_there() {
+    // The close at 17:30 is in the hour of 17:00 either way, and it stays open.
+    let sessions: Vec<_> = (0..2u64)
+        .map(|d| {
+            TimeWindow::new(
+                d * DAY_MS + 9 * HOUR_MS,
+                d * DAY_MS + 17 * HOUR_MS + 1_800_000,
+            )
+            .unwrap()
+        })
+        .collect();
+    let p = session_prices(&sessions, 0.5);
+    let e = with_closing_exposures(&sessions, 2);
+    let window = TimeWindow::new(0, 2 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 1);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    assert!(record.parameters().unwrap().seasonality[17] > Decimal::ZERO);
+}
+
+#[test]
+fn test_calibrate_window_stamp_at_adjacent_sessions_stays_in_the_later_one() {
+    // 09:00 to 12:00 and 12:00 to 17:00: the market does not close at noon, so
+    // an exposure stamped then is in the hour after it. No other exposure is.
+    let sessions: Vec<_> = (0..2u64)
+        .flat_map(|d| {
+            [
+                TimeWindow::new(d * DAY_MS + 9 * HOUR_MS, d * DAY_MS + 12 * HOUR_MS).unwrap(),
+                TimeWindow::new(d * DAY_MS + 12 * HOUR_MS, d * DAY_MS + 17 * HOUR_MS).unwrap(),
+            ]
+        })
+        .collect();
+    let p = session_prices(&sessions, 0.5);
+    let mut e = session_exposures(&sessions);
+    e.retain(|x| x.timestamp_ms % DAY_MS / HOUR_MS != 12);
+    for d in 0..2u64 {
+        for (level, fills) in [(dec!(0.1), 30), (dec!(0.3), 15)] {
+            e.push(QuoteExposure {
+                timestamp_ms: d * DAY_MS + 12 * HOUR_MS,
+                distance: level,
+                exposure_ms: 60_000,
+                fills,
+            });
+        }
+    }
+    e.sort_by_key(|x| x.timestamp_ms);
+    let window = TimeWindow::new(0, 2 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 1);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    assert!(record.parameters().unwrap().seasonality[12] > Decimal::ZERO);
+}
+
+#[test]
+fn test_calibrate_window_without_sessions_a_stamp_stays_in_its_own_bucket() {
+    let p = prices(7, 0, DAY_MS, 60_000, 0.5);
+    let mut e = exposures(11, 0, DAY_MS / 2, 2.0, 3.0, |_| 1.0);
+    e.push(QuoteExposure {
+        timestamp_ms: DAY_MS / 2,
+        distance: dec!(0.1),
+        exposure_ms: 60_000,
+        fills: 0,
+    });
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let cfg = config().with_seasonality(2, 1).with_minima(30, 2, 1, 1);
+    assert_eq!(
+        calibrate_window(&CalibrationData::new(&p, &e).unwrap(), &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        CalibrationOutcome::Insufficient(CalibrationFailure::ThinSeasonalBucket {
+            bucket: 1,
+            have: 0,
+            need: 1,
+        })
+    );
+}
+
+#[test]
+fn test_walk_forward_exposure_at_the_close_scores_at_the_last_bucket() {
+    let sessions = day_sessions(2);
+    let p = session_prices(&sessions, 0.5);
+    let mut e = session_exposures(&sessions[..1]);
+    let close = sessions[1].end_ms;
+    e.push(QuoteExposure {
+        timestamp_ms: close,
+        distance: dec!(0.1),
+        exposure_ms: 60_000,
+        fills: 1,
+    });
+    let split = ChronologicalSplit {
+        train: TimeWindow::new(0, DAY_MS).unwrap(),
+        test: TimeWindow::new(DAY_MS, 2 * DAY_MS).unwrap(),
+    };
+    let cfg = config().with_seasonality(24, 1);
+    let report = walk_forward(
+        &in_sessions(&p, &e, &sessions),
+        &[split],
+        &cfg,
+        "d",
+        &constant(),
+    )
+    .unwrap();
+    let fit = report.folds[0].record.parameters().unwrap();
+    let rate = fit
+        .rate_per_second(dec!(0.1), close - 1)
+        .unwrap()
+        .to_f64()
+        .unwrap();
+    assert!(rate > 0.0);
+    let mu = rate * 60.0;
+    let expected = (mu - mu.ln()) / 60.0;
+    let score = report.folds[0]
+        .calibrated
+        .unwrap()
+        .intensity
+        .unwrap()
+        .to_f64()
+        .unwrap();
+    assert!((score - expected).abs() < 1e-6, "{score} {expected}");
+}
+
+#[test]
+fn test_walk_forward_bucket_closed_in_training_predicts_no_fills_at_a_visible_cost() {
+    // A half day in training, and a full day in the test.
+    let sessions = [
+        TimeWindow::new(9 * HOUR_MS, 13 * HOUR_MS).unwrap(),
+        TimeWindow::new(DAY_MS + 9 * HOUR_MS, DAY_MS + 17 * HOUR_MS).unwrap(),
+    ];
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let split = ChronologicalSplit {
+        train: TimeWindow::new(0, DAY_MS).unwrap(),
+        test: TimeWindow::new(DAY_MS, 2 * DAY_MS).unwrap(),
+    };
+    let cfg = config().with_seasonality(24, 1);
+    let report = walk_forward(
+        &in_sessions(&p, &e, &sessions),
+        &[split],
+        &cfg,
+        "d",
+        &constant(),
+    )
+    .unwrap();
+    let fold = &report.folds[0];
+    let fit = fold.record.parameters().unwrap();
+    assert_eq!(
+        fit.rate_per_second(dec!(0.1), DAY_MS + 15 * HOUR_MS)
+            .unwrap(),
+        Decimal::ZERO
+    );
+    // The fills of those open hours cost far more than a constant's error.
+    let calibrated = fold.calibrated.unwrap().intensity.unwrap();
+    let constant_score = fold.constant.intensity.unwrap();
+    assert!(
+        calibrated > constant_score + dec!(1),
+        "{calibrated} {constant_score}"
+    );
+}
+
+#[test]
+fn test_calibration_record_open_ms_says_how_much_was_open() {
+    let sessions = day_sessions(3);
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let data = in_sessions(&p, &e, &sessions);
+    let open_ms = |start, end| {
+        calibrate_window(&data, &TimeWindow::new(start, end).unwrap(), &config(), "d")
+            .unwrap()
+            .open_ms
+    };
+    assert_eq!(open_ms(0, 3 * DAY_MS), Some(24 * HOUR_MS));
+    // Clipped to the window at both ends.
+    assert_eq!(
+        open_ms(10 * HOUR_MS, DAY_MS + 12 * HOUR_MS),
+        Some(7 * HOUR_MS + 3 * HOUR_MS)
+    );
+    // Sessions were declared, and none was open: zero, not unknown.
+    assert_eq!(open_ms(18 * HOUR_MS, 20 * HOUR_MS), Some(0));
+    let plain = calibrate_window(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &TimeWindow::new(0, DAY_MS).unwrap(),
+        &config(),
+        "d",
+    )
+    .unwrap();
+    assert_eq!(plain.open_ms, None);
+}
+
+#[test]
+fn test_calibrate_window_at_the_end_of_the_clock_is_not_an_error() {
+    // The next intraday bucket does not fit in a u64, with or without sessions.
+    let window = TimeWindow::new(u64::MAX - 1_000, u64::MAX).unwrap();
+    let cfg = config().with_seasonality(24, 1);
+    let plain = CalibrationData::new(&[], &[]).unwrap();
+    let insufficient =
+        CalibrationOutcome::Insufficient(CalibrationFailure::TooFewPrices { have: 0, need: 30 });
+    assert_eq!(
+        calibrate_window(&plain, &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        insufficient
+    );
+    let sessions = [window];
+    let declared = plain.with_sessions(&sessions).unwrap();
+    assert_eq!(
+        calibrate_window(&declared, &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        insufficient
+    );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn test_calibration_record_serde_round_trip_is_identical() {
@@ -1630,5 +2605,37 @@ fn test_calibration_record_serde_round_trip_is_identical() {
     assert_eq!(
         serde_json::from_str::<CalibrationRecord>(&json).unwrap(),
         record
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_calibration_record_serde_keeps_open_ms_and_reads_older_records() {
+    let sessions = day_sessions(1);
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let declared =
+        calibrate_window(&in_sessions(&p, &e, &sessions), &window, &config(), "d").unwrap();
+    let json = serde_json::to_string(&declared).unwrap();
+    assert_eq!(
+        serde_json::from_str::<CalibrationRecord>(&json).unwrap(),
+        declared
+    );
+
+    // A record from before the field existed reads as having no sessions.
+    let plain = calibrate_window(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &window,
+        &config(),
+        "d",
+    )
+    .unwrap();
+    let json = serde_json::to_string(&plain).unwrap();
+    let older = json.replace(",\"open_ms\":null", "");
+    assert_ne!(older, json);
+    assert_eq!(
+        serde_json::from_str::<CalibrationRecord>(&older).unwrap(),
+        plain
     );
 }
