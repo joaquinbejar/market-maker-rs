@@ -39,12 +39,14 @@
 //! # Decision
 //!
 //! [`decide`] takes the thresholds as constants, fixed before any run, and the
-//! truth is never an input. A go says only that the estimators can be read for
-//! that target on that log, not that the policy is good. No reward can remove a
+//! truth is never an input. A go says only that these checks found nothing
+//! against reading the estimators for that target on that log. It does not say
+//! that they are right, or that the policy is good. No reward can remove a
 //! reason of censoring, unrecorded probabilities or missing support. Rewards do
 //! reach it in one way: whether the two estimators' intervals overlap, which is
-//! a coarse check. Intervals can overlap for estimators that differ, and rewards
-//! that moved in holdout alone could hide a disagreement.
+//! a coarse check. A wide interval overlaps a biased estimate, which happens here
+//! on one target of one seed, and rewards that moved in holdout alone could hide
+//! a disagreement.
 //!
 //! Run with: `cargo run --example offline_rl_support`
 
@@ -1361,6 +1363,20 @@ mod tests {
             }
         }
         assert_eq!(assess(&moved, 0, FIRST_SEED).decision, Decision::Go);
+    }
+
+    #[test]
+    fn test_wide_interval_lets_a_biased_model_through() {
+        // A stated negative result, on a planned seed: a go whose model is far from
+        // the truth, as importance sampling has few effective trajectories here,
+        // above the minimum, and so an interval wide enough to overlap it.
+        let log = log_of(Behaviour::RegimeAware, LogShape::Full, 71);
+        let assessment = assess(&log, 2, 71);
+        assert_eq!(assessment.decision, Decision::Go);
+        let truth = true_value(2, HORIZON);
+        assert!(truth - assessment.model.unwrap().value > 1.0);
+        assert!(assessment.importance.unwrap().contains(truth));
+        assert!(!assessment.model.unwrap().contains(truth));
     }
 
     #[test]
