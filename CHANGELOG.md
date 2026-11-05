@@ -18,6 +18,15 @@ project follows [Semantic Versioning](https://semver.org/).
   inventory and drawdown, each with a declared unit, sign, horizon and capital
   denominator (`MetricId::definition`). It covers linear spot positions. Hedge costs
   are reported as `HedgeCosts::NotModelled`, not as zero.
+- Experiments that compare strategies under one set of rules (#92):
+  `backtest::evaluation::Experiment` holds the fees, fill model, latency and windows, and
+  a `Candidate` brings only a strategy built from the training ticks. A simple baseline
+  is required. Validation, selection and the holdout consume each other, so one
+  experiment looks at its holdout once. Every run reconciles with the engine's books; a
+  run that does not, or that has a fault, stays in the report as a failed row. Scenarios
+  after the first are sensitivity runs on validation only. Reports are per UTC day and per
+  regime, with stationary bootstrap intervals, paired against each baseline, and a
+  manifest of seeds, parameters and data hashes. Example: `baseline_evaluation`.
 - Several dated futures in one backtest run (features `margin` and `instruments`,
   #199): `backtest::contracts::ContractEngine` gives each contract its own data, fill
   model and orders, on one clock and one `margin-rs` ledger, with one sided orders and
