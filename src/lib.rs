@@ -129,7 +129,8 @@
 //! - `instruments`: Contract specifications shared with `margin-rs` and
 //!   `arbitrage-rs`, and their conversion into `margin-rs` instruments
 //!   (feature: `instruments`, with `margin` for the conversion), and the net edge
-//!   of a spot and a dated future and a roll plan (feature: `arbitrage`)
+//!   of a spot and a dated future, a calendar spread under an assumed exit and a
+//!   roll plan (feature: `arbitrage`)
 //!
 //! ## Quick Start
 //!
@@ -202,8 +203,9 @@
 //!   by itself, so run `cargo update -p margin-rs`
 //! - `arbitrage`: The net edge of a spot and a linear dated future
 //!   (`instruments::basis`), through `arbitrage-rs`, whose types stay out of this
-//!   crate's public API, and a two contract roll plan (`instruments::roll`), checked
-//!   against a ledger with `margin` too; implies `instruments`
+//!   crate's public API, a calendar spread under an assumed exit
+//!   (`instruments::calendar`), and a two contract roll plan (`instruments::roll`),
+//!   checked against a ledger with `margin` too; implies `instruments`
 //! - `kernel`: The financial environment kernel (`backtest::kernel`): the
 //!   backtest engine's loop as a resumable, `Copy` state machine with a
 //!   canonical encoding, an agent-safe observation and an admission mask,

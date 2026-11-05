@@ -12,8 +12,9 @@
 //! [`orders`](crate::instruments::orders) checks orders and fills against a
 //! specification, and [`futures`](crate::instruments::futures) follows a dated
 //! future through its expiry and settlement. With the `arbitrage` feature, `basis`
-//! evaluates a spot and a dated future against each other, and `roll` plans moving a
-//! position from one dated future to the next. With the `margin` feature as well, the `margin` module
+//! evaluates a spot and a dated future against each other, `calendar` two dated
+//! futures under an assumed exit spread, and `roll` plans moving a position from one
+//! dated future to the next. With the `margin` feature as well, the `margin` module
 //! converts a specification into a `margin-rs` instrument and a fill into a
 //! `margin-rs` execution.
 
@@ -21,6 +22,8 @@ pub use financial_types::instrument::*;
 
 #[cfg(feature = "arbitrage")]
 pub mod basis;
+#[cfg(feature = "arbitrage")]
+pub mod calendar;
 pub mod futures;
 #[cfg(feature = "margin")]
 pub mod margin;
