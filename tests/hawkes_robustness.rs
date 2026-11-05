@@ -1051,3 +1051,13 @@ fn test_robustness_evidence_table() {
         }
     }
 }
+
+/// A shortfall met on the way and gone by the end still counts: the measure is a maximum.
+#[test]
+fn test_a_shortfall_gone_by_the_end_still_counts() {
+    let episode = (1..400)
+        .map(|seed| run_episode(Policy::Fixed, BASE, seed))
+        .find(|e| e.terminal_inventory.abs() < dec!(4) && e.max_shortfall > 0.0)
+        .expect("an episode that fell short and came back");
+    assert!(episode.left_healthy);
+}
