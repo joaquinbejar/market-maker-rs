@@ -1148,3 +1148,15 @@ fn test_fit_seasonality_bounds_the_work_of_a_long_segment() {
         Err(MMError::InvalidMarketState(_))
     ));
 }
+
+#[test]
+fn test_profile_keeps_each_bucket_a_span_in_model_time() {
+    assert!(SeasonalProfile::new(1e-9, vec![1e-320, 1.0]).is_err());
+    assert!(SeasonalProfile::new(1.0, vec![1e-12, 1.0]).is_err());
+    // Inside the bound, the smallest bucket still inverts.
+    let p = SeasonalProfile::new(1e-9, vec![1e-8, 1.0]).unwrap();
+    assert_eq!(p.to_clock_time(0.0), 0.0);
+    let inside = 0.5e-9;
+    let back = p.to_clock_time(p.to_model_time(inside));
+    assert!((back - inside).abs() < 1e-15, "{back}");
+}

@@ -1258,7 +1258,7 @@ impl SeasonalProfile {
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a bucket out of
     /// `[1 / MAX_RATE, MAX_RATE]`, no multipliers, or one that is not finite and positive,
-    /// before or after the normalization.
+    /// or out of `[1 / MAX_RATE, MAX_RATE]` after the normalization.
     pub fn new(bucket_seconds: f64, multipliers: Vec<f64>) -> MMResult<Self> {
         if !bucket_seconds.is_finite()
             || !(1.0 / MAX_RATE..=MAX_RATE).contains(&bucket_seconds)
@@ -1272,7 +1272,11 @@ impl SeasonalProfile {
             return invalid(format!("profile mean {mean}"));
         }
         let multipliers: Vec<f64> = multipliers.iter().map(|m| m / mean).collect();
-        if multipliers.iter().any(|m| !m.is_finite() || *m <= 0.0) {
+        // Bounded, so that each bucket keeps a span in model time and the change inverts.
+        if multipliers
+            .iter()
+            .any(|m| !(1.0 / MAX_RATE..=MAX_RATE).contains(m))
+        {
             return invalid(format!("profile out of range: {multipliers:?}"));
         }
         Ok(Self {
