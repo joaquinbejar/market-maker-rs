@@ -8,9 +8,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- A fold of `strategy::walk_forward` whose predicted fill rate is above the range of
-  `Decimal` no longer fails the whole report (#179): `walk_forward` leaves that fold's
-  intensity score out and names the first such exposure in the new
+- A fold of `strategy::walk_forward` whose predicted fill rate or score is above the
+  range of `Decimal` no longer fails the whole report (#179): `walk_forward` leaves that
+  fold's intensity score out and names the exposure with the highest rate in the new
   `OutOfSampleError::intensity_out_of_support`, with
   `WalkForwardReport::out_of_support_folds` to count them. The rate is not capped, and
   `CalibratedParameters::rate_per_second` keeps its typed error for it.

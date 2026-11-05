@@ -1467,17 +1467,26 @@ fn test_walk_forward_rate_above_decimal_range_marks_only_that_fold() {
 }
 
 #[test]
-fn test_walk_forward_out_of_support_names_the_first_exposure() {
+fn test_walk_forward_out_of_support_names_the_highest_rate() {
     let p = prices(7, 0, 3 * DAY_MS, 60_000, 0.5);
-    // Distance 33 is in range, then 0.5 overflows, then 0 overflows further.
-    let report = out_of_support_report(&p, &[dec!(33), dec!(0.5), dec!(0)]);
+    // Distance 33 is in range, then 0.5 overflows, and 0 overflows further.
+    let report = out_of_support_report(&p, &[dec!(33), dec!(0.5), dec!(0), dec!(0.5)]);
     let forecast = report.folds[0]
         .calibrated
         .unwrap()
         .intensity_out_of_support
         .unwrap();
-    assert_eq!(forecast.timestamp_ms, DAY_MS + 20_000_001);
-    assert_eq!(forecast.distance, dec!(0.5));
+    assert_eq!(forecast.timestamp_ms, DAY_MS + 20_000_002);
+    assert_eq!(forecast.distance, dec!(0));
+
+    // On a tie, the earliest.
+    let report = out_of_support_report(&p, &[dec!(0.5), dec!(0.5)]);
+    let forecast = report.folds[0]
+        .calibrated
+        .unwrap()
+        .intensity_out_of_support
+        .unwrap();
+    assert_eq!(forecast.timestamp_ms, DAY_MS + 20_000_000);
 }
 
 #[test]
@@ -1533,6 +1542,53 @@ fn test_walk_forward_constant_at_the_range_limit_keeps_the_report() {
     assert_eq!(report.folds[1].constant.intensity_out_of_support, None);
     // That counts calibrated forecasts only.
     assert_eq!(report.out_of_support_folds(), 0);
+}
+
+#[test]
+fn test_walk_forward_score_rounding_above_the_range_marks_only_that_fold() {
+    // The rate is the largest f64 under the range, so each exposure is in range
+    // and only the rounding of their mean reaches 2^96. These durations do it.
+    let p = prices(7, 0, 3 * DAY_MS, 60_000, 0.5);
+    let top = ConstantParameters {
+        volatility: dec!(1),
+        intensity_scale_a: Decimal::from_str_exact("79228162514264328797450928128").unwrap(),
+        order_intensity_k: dec!(1),
+    };
+    let durations: [&[u64]; 3] = [
+        &[182_409, 116_756],
+        &[440_241, 335_367],
+        &[114_790, 129_975, 144_929],
+    ];
+    for exposure_times in durations {
+        let at = |timestamp_ms, distance, exposure_ms| QuoteExposure {
+            timestamp_ms,
+            distance,
+            exposure_ms,
+            fills: 0,
+        };
+        let mut e: Vec<_> = exposure_times
+            .iter()
+            .enumerate()
+            .map(|(i, ms)| at(DAY_MS + 1 + i as u64, dec!(0), *ms))
+            .collect();
+        e.push(at(2 * DAY_MS + 1, dec!(10), 60_000));
+        let report = walk_forward(
+            &CalibrationData::new(&p, &e).unwrap(),
+            &frozen_folds_over_three_days(),
+            &config(),
+            "d",
+            &top,
+        )
+        .unwrap();
+        let marked = report.folds[0].constant;
+        assert_eq!(marked.intensity, None, "{exposure_times:?}");
+        let forecast = marked.intensity_out_of_support.unwrap();
+        assert_eq!(forecast.timestamp_ms, DAY_MS + 1);
+        assert_eq!(forecast.distance, dec!(0));
+        // The other fold keeps its score.
+        assert!(report.folds[1].constant.intensity.is_some());
+        assert_eq!(report.folds[1].constant.intensity_out_of_support, None);
+    }
 }
 
 #[cfg(feature = "serde")]

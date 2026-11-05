@@ -679,12 +679,14 @@ pub struct OutOfSampleError {
     /// amount. `None` without test exposure, or when
     /// [`Self::intensity_out_of_support`] is set.
     pub intensity: Option<Decimal>,
-    /// First test exposure whose predicted rate is above the range of
-    /// `Decimal`, which leaves the window without an intensity score.
+    /// Set when a predicted rate or their score is above the range of `Decimal`,
+    /// which leaves the window without an intensity score. It names the test
+    /// exposure with the highest predicted rate, the earliest on a tie.
     pub intensity_out_of_support: Option<OutOfSupportForecast>,
 }
 
-/// A test exposure whose predicted rate cannot be scored.
+/// The test exposure with the highest predicted rate in a window that cannot
+/// be scored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
@@ -1201,32 +1203,42 @@ fn score(
 
     let mut likelihood = 0.0f64;
     let mut total_seconds = 0.0f64;
+    let mut highest: Option<(f64, &QuoteExposure)> = None;
+    let mut in_range = true;
     for e in exposures {
         let seconds = to_f64(Decimal::from(e.exposure_ms))? / 1_000.0;
-        let Some(forecast) = representable_rate(rate(e.distance, e.timestamp_ms)?) else {
-            return Ok(OutOfSampleError {
-                volatility,
-                intensity: None,
-                intensity_out_of_support: Some(OutOfSupportForecast {
-                    timestamp_ms: e.timestamp_ms,
-                    distance: e.distance,
-                }),
-            });
+        let predicted = rate(e.distance, e.timestamp_ms)?;
+        if highest.is_none_or(|(rate, _)| predicted > rate) {
+            highest = Some((predicted, e));
+        }
+        let Some(forecast) = representable_rate(predicted) else {
+            in_range = false;
+            continue;
         };
         let per_second = to_f64(forecast)?.max(SCORE_RATE_FLOOR);
         let expected = per_second * seconds;
         likelihood += expected - to_f64(Decimal::from(e.fills))? * expected.ln();
         total_seconds += seconds;
     }
-    let intensity = if total_seconds > 0.0 {
-        Some(from_f64(likelihood / total_seconds)?)
-    } else {
-        None
+    let Some((_, highest)) = highest else {
+        return Ok(OutOfSampleError {
+            volatility,
+            intensity: None,
+            intensity_out_of_support: None,
+        });
     };
+    // The score is a mean of terms that are in range, but rounding in `f64`
+    // can take it just above the range, so it is checked as well.
+    let score = in_range
+        .then_some(likelihood / total_seconds)
+        .and_then(Decimal::from_f64);
     Ok(OutOfSampleError {
         volatility,
-        intensity,
-        intensity_out_of_support: None,
+        intensity: score,
+        intensity_out_of_support: score.is_none().then_some(OutOfSupportForecast {
+            timestamp_ms: highest.timestamp_ms,
+            distance: highest.distance,
+        }),
     })
 }
 
@@ -1241,13 +1253,6 @@ fn to_f64(value: Decimal) -> MMResult<f64> {
         .to_f64()
         .filter(|v| v.is_finite())
         .ok_or_else(|| MMError::NumericalError(format!("{value} is not a finite f64")))
-}
-
-fn from_f64(value: f64) -> MMResult<Decimal> {
-    Some(value)
-        .filter(|v| v.is_finite())
-        .and_then(Decimal::from_f64)
-        .ok_or_else(|| MMError::NumericalError(format!("{value} is not a decimal")))
 }
 
 /// A rate as a `Decimal`. A result below the resolution of `Decimal` is zero,
