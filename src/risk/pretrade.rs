@@ -245,6 +245,14 @@ pub trait PretradePolicy: fmt::Debug {
     fn description(&self) -> String {
         "custom pretrade policy".to_string()
     }
+
+    /// Whether it decides on quantities in contracts, on requests that name their
+    /// contract, without reading `price * quantity` as a notional, across contracts,
+    /// with a [`PretradePolicy::on_market_data`] mark that may be of any of them.
+    /// `backtest::contracts::ContractEngine` refuses a policy that does not declare it.
+    fn in_contracts(&self) -> bool {
+        false
+    }
 }
 
 /// Outcome of [`limits_capacity`] for one order.

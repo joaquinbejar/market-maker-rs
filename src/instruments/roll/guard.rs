@@ -443,6 +443,10 @@ impl PretradePolicy for RollGuard {
         decision
     }
 
+    fn in_contracts(&self) -> bool {
+        true
+    }
+
     fn on_market_data(&mut self, _mark: Decimal, timestamp: u64) {
         self.latest_ms = self.latest_ms.max(timestamp);
     }
