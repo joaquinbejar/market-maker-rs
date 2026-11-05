@@ -1,4 +1,5 @@
-//! A backtest of several dated futures in one run, against one `margin-rs` ledger.
+//! A backtest of several dated futures and perpetuals in one run, against one `margin-rs`
+//! ledger.
 //!
 //! [`ContractEngine`] is the path for a run across contracts, such as a roll, which
 //! [`BacktestEngine::with_instrument`](super::BacktestEngine::with_instrument) does not
@@ -9,10 +10,27 @@
 //!
 //! # What is simulated
 //!
-//! Matching, latency, expiry and a declared cash settlement. There is no margin
+//! Matching, latency, expiry, a declared cash settlement and declared perpetual funding.
+//! There is no margin
 //! requirement and no liquidation: fills book with overdraft, reported in
 //! [`ContractRunResult::overdrafts`], and a pretrade policy in contracts is no simulation
-//! of solvency. Perpetuals are not taken, as funding is not simulated.
+//! of solvency.
+//!
+//! # Funding
+//!
+//! [`ContractEngine::with_perpetual`] takes a perpetual with its declared funding. At each
+//! instant in the run the position pays or receives its notional at the declared mark times
+//! the declared rate, rounded half to even once at the settlement asset's scale, and books
+//! through the ledger, with overdraft if the balance does not cover it. An instant runs
+//! before anything at that time can match, so a position pays the instants in
+//! `(opened, closed]`. Only instants after the first tick count, as what came before belongs
+//! to no position this run knows the age of.
+//!
+//! Funding is in [`ContractRunResult::total_pnl`] and apart in
+//! [`ContractRunResult::total_funding`], which
+//! [`ContractRunResult::realized_pnl`] excludes. An instant of the run with no declared rate
+//! is in [`ContractSummary::funding_missing`] and makes the run not consistent. A strategy is
+//! not told of funding, and funding declared past the end of the clock does not book.
 //!
 //! # Time
 //!
@@ -22,7 +40,7 @@
 //! may only match a tick strictly after it became active, so one sent on a tick of
 //! another contract at the same time waits for a later tick.
 //!
-//! At one time, events run in this order: expiries, venue messages, settlements, report
+//! At one time, events run in this order: funding, expiries, venue messages, settlements, report
 //! deliveries, a strategy's wake, observations. So nothing executes on a contract at its
 //! expiry. A strategy that must act at a time with no tick says so in
 //! [`ContractStrategy::next_wake_ms`], and every callback has the time of the decision in
@@ -96,7 +114,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use financial_types::instrument::InstrumentId;
-use margin_rs::ledger::{AssetPnl, Booking, Execution, Ledger};
+use margin_rs::ledger::{AssetPnl, Booking, Execution, FundingPayment, Ledger};
 use margin_rs::{Asset, ExecutionId};
 
 use super::accounting::largest_execution_number;
@@ -110,7 +128,8 @@ use super::latency::{JitterRng, SimLatencyConfig};
 use super::lifecycle::{ExecutionKind, ExecutionReport, SimClock, SimOrder, SimOrderId};
 use crate::Decimal;
 use crate::execution::Action;
-use crate::instruments::futures::{FutureTerms, SettlementPrice};
+use crate::instruments::futures::{FutureTerms, SettlementPrice, identify_spec_in_ledger};
+use crate::instruments::perpetual::PerpetualTerms;
 use crate::risk::pretrade::{OrderEvent, OrderPurpose, PretradePolicy, PretradeRequest};
 use crate::types::action::Dir;
 use crate::types::decimal::OrOverflow;
@@ -334,13 +353,40 @@ pub struct ContractSummary {
     pub expired_unsettled: bool,
     /// Its ticks ignored, as they came after its expiry.
     pub ignored_ticks: u64,
+    /// Funding on this contract in this run: positive is received.
+    pub funding: Decimal,
+    /// Funding instants of the run with no declared rate.
+    pub funding_missing: u64,
+}
+
+/// One funding instant a position was open on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractFunding {
+    /// The contract.
+    pub contract: InstrumentId,
+    /// The instant, in milliseconds.
+    pub at_ms: u64,
+    /// The position that paid or received, in contracts.
+    pub position: Decimal,
+    /// The declared mark.
+    pub mark: Decimal,
+    /// The declared rate.
+    pub rate: Decimal,
+    /// The amount: positive is received. Zero if it rounded to nothing, with no ledger entry.
+    pub amount: Decimal,
 }
 
 /// The result of a [`ContractEngine`] run.
 #[derive(Debug, Clone, Default)]
 pub struct ContractRunResult {
-    /// PnL before fees in this run.
+    /// PnL before fees in this run, funding included.
     pub total_pnl: Decimal,
+    /// The realized part of [`ContractRunResult::total_pnl`], without funding.
+    pub realized_pnl: Decimal,
+    /// The funding part of [`ContractRunResult::total_pnl`]: positive is received.
+    pub total_funding: Decimal,
+    /// Each funding instant a position was open on, if trades are recorded.
+    pub fundings: Vec<ContractFunding>,
     /// Fees paid in this run.
     pub total_fees: Decimal,
     /// `total_pnl - total_fees`.
@@ -386,20 +432,39 @@ pub struct ContractRunResult {
 
 impl ContractRunResult {
     /// Whether the run started, booked and valued all it should, with no fault and no
-    /// contract left past its expiry without a settlement, open with no mark, or with a settlement the
-    /// ledger refused.
+    /// contract left past its expiry without a settlement, open with no mark, with a settlement the
+    /// ledger refused, or with a funding instant of no declared rate.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
         self.accounting.is_consistent()
             && self.fault_count == 0
             && self.never_valued.is_empty()
-            && self.contracts.iter().all(|c| !c.expired_unsettled)
+            && self
+                .contracts
+                .iter()
+                .all(|c| !c.expired_unsettled && c.funding_missing == 0)
+    }
+}
+
+/// What kind of contract a lane is.
+#[derive(Debug)]
+enum LaneTerms {
+    Future(FutureTerms),
+    Perpetual(PerpetualTerms),
+}
+
+impl LaneTerms {
+    fn spec(&self) -> &financial_types::instrument::InstrumentSpec {
+        match self {
+            Self::Future(terms) => terms.spec(),
+            Self::Perpetual(terms) => terms.spec(),
+        }
     }
 }
 
 #[derive(Debug)]
 struct Lane<D, F> {
-    terms: FutureTerms,
+    terms: LaneTerms,
     ledger_id: margin_rs::InstrumentId,
     data: D,
     fill_model: F,
@@ -411,6 +476,7 @@ struct Lane<D, F> {
     max_position: Decimal,
     fills: u64,
     ignored_ticks: u64,
+    funding: Decimal,
 }
 
 impl<D, F> Lane<D, F> {
@@ -423,6 +489,8 @@ impl<D, F> Lane<D, F> {
 #[derive(Debug, Clone, Copy, Default)]
 struct Figures {
     total_pnl: Decimal,
+    realized: Decimal,
+    funding: Decimal,
     unrealized: Decimal,
     fees: Decimal,
     net_pnl: Decimal,
@@ -459,6 +527,9 @@ pub struct ContractEngine<S: ContractStrategy, D: HistoricalDataSource, F: FillM
     declared: Vec<(usize, SettlementPrice)>,
     expiries: BTreeMap<(u64, usize), ()>,
     settlements: BTreeMap<(u64, usize), SettlementPrice>,
+    /// The funding still to run: its mark and rate.
+    funding_due: BTreeMap<(u64, usize), (Decimal, Decimal)>,
+    fundings: Vec<ContractFunding>,
     clock: SimClock,
     latency: SimLatencyConfig,
     jitter: JitterRng,
@@ -495,6 +566,8 @@ pub struct ContractEngine<S: ContractStrategy, D: HistoricalDataSource, F: FillM
     /// Realized PnL and fees the ledger held at the start.
     base_realized: Decimal,
     base_fees: Decimal,
+    /// Funding the ledger held at the start.
+    base_funding: Decimal,
     figures: Figures,
     unvalued_ticks: u64,
     stale_from_ms: Option<u64>,
@@ -530,6 +603,8 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             declared: Vec::new(),
             expiries: BTreeMap::new(),
             settlements: BTreeMap::new(),
+            funding_due: BTreeMap::new(),
+            fundings: Vec::new(),
             clock: SimClock::new(),
             latency: SimLatencyConfig::default(),
             jitter: JitterRng::new(0),
@@ -561,6 +636,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             max_drawdown: Decimal::ZERO,
             base_realized: Decimal::ZERO,
             base_fees: Decimal::ZERO,
+            base_funding: Decimal::ZERO,
             figures: Figures::default(),
             unvalued_ticks: 0,
             stale_from_ms: None,
@@ -587,7 +663,21 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
     /// in the ledger or of other terms there, in another settlement asset than the
     /// others, or a fee scale above that asset's; and the error of
     /// [`FillModel::validate`].
-    pub fn with_contract(mut self, terms: FutureTerms, data: D, fill_model: F) -> MMResult<Self> {
+    pub fn with_contract(self, terms: FutureTerms, data: D, fill_model: F) -> MMResult<Self> {
+        self.add_lane(LaneTerms::Future(terms), data, fill_model)
+    }
+
+    /// Adds a perpetual with its declared funding, its data and its own fill model: see the
+    /// [module documentation](self#funding).
+    ///
+    /// # Errors
+    ///
+    /// As [`ContractEngine::with_contract`].
+    pub fn with_perpetual(self, terms: PerpetualTerms, data: D, fill_model: F) -> MMResult<Self> {
+        self.add_lane(LaneTerms::Perpetual(terms), data, fill_model)
+    }
+
+    fn add_lane(mut self, terms: LaneTerms, data: D, fill_model: F) -> MMResult<Self> {
         fill_model.validate()?;
         let name = terms.spec().id().as_str().to_string();
         let refuse = |reason: String| {
@@ -598,7 +688,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         if self.lanes.iter().any(|lane| lane.id() == terms.spec().id()) {
             return refuse("already added".to_string());
         }
-        let ledger_id = match terms.identify_in_ledger(&self.ledger) {
+        let ledger_id = match identify_spec_in_ledger(terms.spec(), &self.ledger) {
             Ok(id) => id,
             Err(error) => return refuse(error.to_string()),
         };
@@ -634,6 +724,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             max_position: Decimal::ZERO,
             fills: 0,
             ignored_ticks: 0,
+            funding: Decimal::ZERO,
         });
         self.schedule_contract_events();
         Ok(self)
@@ -643,8 +734,8 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
     ///
     /// # Errors
     ///
-    /// [`MMError::InvalidConfiguration`] for a contract not added, a price the contract
-    /// refuses, or a second price for it. What the ledger refuses depends on the position
+    /// [`MMError::InvalidConfiguration`] for a contract not added or a perpetual, a price
+    /// the contract refuses, or a second price for it. What the ledger refuses depends on the position
     /// at publication, so it shows then: [`ContractSummary::settlement_failed`] and a fault.
     pub fn with_settlement(mut self, price: SettlementPrice) -> MMResult<Self> {
         let name = price.instrument().as_str().to_string();
@@ -663,12 +754,13 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         if self.declared.iter().any(|(known, _)| *known == index) {
             return refuse("already declared".to_string());
         }
-        let checked = self
-            .lanes
-            .get(index)
-            .map(|lane| lane.terms.check_settlement(&price));
-        if let Some(Err(error)) = checked {
-            return refuse(error.to_string());
+        match self.lanes.get(index).map(|lane| &lane.terms) {
+            Some(LaneTerms::Future(terms)) => {
+                if let Err(error) = terms.check_settlement(&price) {
+                    return refuse(error.to_string());
+                }
+            }
+            _ => return refuse("a perpetual does not settle".to_string()),
         }
         self.declared.push((index, price));
         self.schedule_contract_events();
@@ -713,7 +805,25 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .lanes
             .iter()
             .enumerate()
-            .map(|(index, lane)| ((lane.terms.expiry_ms(), index), ()))
+            .filter_map(|(index, lane)| match &lane.terms {
+                LaneTerms::Future(terms) => Some(((terms.expiry_ms(), index), ())),
+                LaneTerms::Perpetual(_) => None,
+            })
+            .collect();
+        self.funding_due = self
+            .lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, lane)| match &lane.terms {
+                LaneTerms::Perpetual(terms) => Some((index, terms)),
+                LaneTerms::Future(_) => None,
+            })
+            .flat_map(|(index, terms)| {
+                terms
+                    .points()
+                    .iter()
+                    .map(move |point| ((point.at_ms, index), (point.mark, point.rate)))
+            })
             .collect();
         self.settlements = self
             .declared
@@ -785,7 +895,9 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             lane.max_position = Decimal::ZERO;
             lane.fills = 0;
             lane.ignored_ticks = 0;
+            lane.funding = Decimal::ZERO;
         }
+        self.fundings.clear();
         self.schedule_contract_events();
         self.strategy.reset();
         if let Some(policy) = self.policy.as_mut() {
@@ -876,6 +988,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .try_fold(Decimal::ZERO, |sum, value| sum.checked_add(value))
             .or_overflow("ledger realized pnl")?;
         self.base_fees = self.ledger.fees_paid(&asset);
+        self.base_funding = self.ledger.funding(&asset);
         self.started = true;
         let ledger = &self.ledger;
         self.view.positions = self
@@ -918,6 +1031,9 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         while let Some((index, tick)) = self.next_tick() {
             if num_ticks == 0 {
                 start_time = tick.timestamp;
+                self.funding_due = self
+                    .funding_due
+                    .split_off(&(start_time.saturating_add(1), 0));
             }
             end_time = tick.timestamp;
             num_ticks = num_ticks.saturating_add(1);
@@ -971,6 +1087,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
     fn advance_events(&mut self, until: u64) {
         loop {
             let times = [
+                self.funding_due.keys().next().map(|key| key.0),
                 self.expiries.keys().next().map(|key| key.0),
                 self.pending.keys().next().map(|key| key.0),
                 self.settlements.keys().next().map(|key| key.0),
@@ -984,14 +1101,105 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             let at = time.max(self.clock.now());
             let _ = self.clock.advance_to(at);
             match class {
-                0 => self.expire_next(),
-                1 => self.apply_next_venue_message(),
-                2 => self.settle_next(),
-                3 => self.deliver_next(),
-                4 => self.wake_strategy(at),
+                0 => self.fund_next(),
+                1 => self.expire_next(),
+                2 => self.apply_next_venue_message(),
+                3 => self.settle_next(),
+                4 => self.deliver_next(),
+                5 => self.wake_strategy(at),
                 _ => self.observe_next(at),
             }
         }
+    }
+
+    /// The position pays or receives one funding instant, through the ledger.
+    fn fund_next(&mut self) {
+        let Some(((at_ms, index), (mark, rate))) = self.funding_due.pop_first() else {
+            return;
+        };
+        let Some(lane) = self.lanes.get(index) else {
+            return;
+        };
+        let position = self
+            .ledger
+            .position(&lane.ledger_id)
+            .map_or(Decimal::ZERO, |p| p.quantity);
+        if position.is_zero() {
+            return;
+        }
+        match self.book_funding(index, at_ms, position, mark, rate) {
+            Ok(amount) => {
+                if self.config.record_trades
+                    && let Some(lane) = self.lanes.get(index)
+                {
+                    self.fundings.push(ContractFunding {
+                        contract: lane.id().clone(),
+                        at_ms,
+                        position,
+                        mark,
+                        rate,
+                        amount,
+                    });
+                }
+            }
+            Err(error) => self.record_fault(error),
+        }
+        self.sample(at_ms);
+    }
+
+    fn book_funding(
+        &mut self,
+        index: usize,
+        at_ms: u64,
+        position: Decimal,
+        mark: Decimal,
+        rate: Decimal,
+    ) -> MMResult<Decimal> {
+        let error = |context: &str, error: margin_rs::MarginError| {
+            MMError::InvalidPositionUpdate(format!("margin ledger funding {context}: {error}"))
+        };
+        let asset = self
+            .settlement_asset
+            .clone()
+            .or_overflow("settlement asset")?;
+        let scale = self
+            .ledger
+            .snapshot()
+            .assets
+            .get(&asset)
+            .copied()
+            .or_overflow("settlement scale")?;
+        let lane = self.lanes.get_mut(index).or_overflow("funding lane")?;
+        let paid = settlement_charge(lane.terms.spec(), scale, mark, position.abs(), rate)?.amount;
+        let amount = if position > Decimal::ZERO {
+            -paid
+        } else {
+            paid
+        };
+        if amount.is_zero() {
+            return Ok(amount);
+        }
+        let id = format!("funding-{}-{at_ms}", lane.ledger_id.as_str());
+        let booked = self
+            .ledger
+            .book_funding(&FundingPayment {
+                id: ExecutionId::new(id.clone()).map_err(|e| error("id", e))?,
+                instrument: lane.ledger_id.clone(),
+                amount,
+                as_of_ms: at_ms,
+            })
+            .map_err(|e| error("booking", e))?;
+        if !booked.is_new {
+            return Err(MMError::InvalidPositionUpdate(format!(
+                "margin ledger funding booking: {id} was already booked"
+            )));
+        }
+        lane.funding = lane.funding.checked_add(amount).or_overflow("funding")?;
+        if let Some(shortfall) = booked.shortfall {
+            let worst = self.overdrafts.entry(asset).or_insert(Decimal::ZERO);
+            *worst = (*worst).max(shortfall);
+        }
+        Ok(amount)
     }
 
     /// The venue closes a contract at its expiry.
@@ -1047,7 +1255,10 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .ledger
             .position(&lane.ledger_id)
             .map_or(Decimal::ZERO, |p| p.quantity);
-        match lane.terms.settle_in_ledger(&mut self.ledger, &price) {
+        let LaneTerms::Future(terms) = &lane.terms else {
+            return;
+        };
+        match terms.settle_in_ledger(&mut self.ledger, &price) {
             Ok(_) => lane.settled = true,
             Err(error) => {
                 lane.settlement_failed = true;
@@ -1699,11 +1910,18 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
     /// The figures of a valuation line, or `None` if one overflows.
     fn figures_of(&self, line: &AssetPnl) -> Option<Figures> {
         let realized = line.realized_pnl.checked_sub(self.base_realized)?;
+        let funding = self
+            .settlement_asset
+            .as_ref()
+            .map(|asset| self.ledger.funding(asset))?
+            .checked_sub(self.base_funding)?;
         let fees = line.fees_paid.checked_sub(self.base_fees)?;
         let total_pnl = realized.checked_add(line.unrealized_pnl)?;
         let net_pnl = total_pnl.checked_sub(fees)?;
         Some(Figures {
             total_pnl,
+            realized: realized.checked_sub(funding)?,
+            funding,
             unrealized: line.unrealized_pnl,
             fees,
             net_pnl,
@@ -1806,6 +2024,13 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
                 settlement_failed: lane.settlement_failed,
                 expired_unsettled: Self::rests_on_last_mark(&self.ledger, lane),
                 ignored_ticks: lane.ignored_ticks,
+                funding: lane.funding,
+                funding_missing: match &lane.terms {
+                    LaneTerms::Perpetual(terms) if num_ticks > 0 => {
+                        terms.missing_between(start_time, self.clock.now())
+                    }
+                    _ => 0,
+                },
             })
             .collect();
         let never_valued = self
@@ -1822,6 +2047,9 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             .collect();
         ContractRunResult {
             total_pnl: self.figures.total_pnl,
+            realized_pnl: self.figures.realized,
+            total_funding: self.figures.funding,
+            fundings: self.fundings.clone(),
             total_fees: self.figures.fees,
             net_pnl: self.figures.net_pnl,
             unrealized_pnl: self.figures.unrealized,

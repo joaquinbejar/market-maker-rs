@@ -8,6 +8,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`
+  takes a new `instruments::perpetual::PerpetualTerms`, with the declared rate and mark of
+  each instant on the funding grid. Each instant books through the `margin-rs` ledger,
+  rounded half to even once at the settlement asset's scale, and a position pays the
+  instants in `(opened, closed]`. `ContractRunResult::total_funding` reports it apart from
+  `realized_pnl` and the fees, `fundings` lists the instants, and an instant of the run with
+  no declared rate is in `ContractSummary::funding_missing` and makes the run not consistent.
 - A fold of `strategy::walk_forward` whose predicted fill rate or score is above the
   range of `Decimal` no longer fails the whole report (#179): `walk_forward` leaves that
   fold's intensity score out and names the exposure with the highest rate in the new
