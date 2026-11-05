@@ -449,6 +449,20 @@ impl ContractRunResult {
     }
 }
 
+/// The ledger's identifier of a funding payment, the same for an instrument and an instant
+/// in any run. An instrument name may be as long as an identifier can be, so it enters as
+/// its 128 bit FNV-1a hash. A collision would be refused by the ledger as a fault, and no
+/// payment would be lost silently.
+fn funding_id(instrument: &str, at_ms: u64) -> String {
+    let hash = instrument.bytes().fold(
+        0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128,
+        |hash, byte| {
+            (hash ^ u128::from(byte)).wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b)
+        },
+    );
+    format!("funding-{hash:032x}-{at_ms}")
+}
+
 /// What kind of contract a lane is.
 #[derive(Debug)]
 enum LaneTerms {
@@ -1034,9 +1048,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         while let Some((index, tick)) = self.next_tick() {
             if num_ticks == 0 {
                 start_time = tick.timestamp;
-                self.funding_due = self
-                    .funding_due
-                    .split_off(&(start_time.saturating_add(1), 0));
+                self.funding_due.retain(|(at_ms, _), _| *at_ms > start_time);
             }
             end_time = tick.timestamp;
             num_ticks = num_ticks.saturating_add(1);
@@ -1182,8 +1194,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         if amount.is_zero() {
             return Ok(amount);
         }
-        // The lane, not the name: a valid name may be as long as an identifier can be.
-        let id = format!("funding-{index}-{at_ms}");
+        let id = funding_id(lane.ledger_id.as_str(), at_ms);
         let booked = self
             .ledger
             .book_funding(&FundingPayment {

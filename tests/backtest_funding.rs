@@ -402,7 +402,7 @@ fn funding_the_ledger_already_held_is_not_counted_again_and_a_clash_is_a_fault()
     assert_eq!(result.realized_pnl, dec!(0));
 
     // Another payment under the identifier this run would use.
-    let clash = format!("funding-0-{}", T0 + STEP);
+    let clash = funding_id_at_instant_1();
     ledger.book_funding(&held(&clash, dec!(-1))).unwrap();
     let result = engine(ledger, Script::default(), terms(spec, points), &times).run();
     assert_eq!(result.fault_count, 1);
@@ -564,7 +564,7 @@ fn the_identical_payment_already_in_the_ledger_is_a_fault_not_a_free_instant() {
     seed(&mut ledger, "PERP", Action::Buy, dec!(60000), dec!(2));
     ledger
         .book_funding(&FundingPayment {
-            id: ExecutionId::new(format!("funding-0-{}", T0 + STEP)).unwrap(),
+            id: ExecutionId::new(funding_id_at_instant_1()).unwrap(),
             instrument: InstrumentId::new("PERP").unwrap(),
             amount: dec!(-12),
             as_of_ms: T0 + STEP,
@@ -598,4 +598,111 @@ fn funding_books_for_the_longest_identifier_a_ledger_takes() {
     .run();
     assert!(result.is_consistent(), "{result:?}");
     assert_eq!(result.total_funding, dec!(-30.5));
+}
+
+/// The identifier a run gives instant 1 of `PERP`.
+fn funding_id_at_instant_1() -> String {
+    let spec = perp(dec!(1));
+    let mut ledger = ledger_of(&spec, 8);
+    seed(&mut ledger, "PERP", Action::Buy, dec!(60000), dec!(2));
+    let points = vec![point(T0 + STEP, dec!(60000), dec!(0.0001))];
+    let mut run = engine(
+        ledger,
+        Script::default(),
+        terms(spec, points),
+        &[T0, T0 + STEP],
+    );
+    run.run();
+    run.ledger().funding_journal()[0].id.as_str().to_string()
+}
+
+#[test]
+fn funding_at_the_first_tick_is_excluded_at_the_end_of_the_clock() {
+    let spec = perp(dec!(1));
+    let mut ledger = ledger_of(&spec, 8);
+    seed(&mut ledger, "PERP", Action::Buy, dec!(60000), dec!(2));
+    let points = vec![point(u64::MAX, dec!(60000), dec!(0.0001))];
+    let result = ContractEngine::new(
+        ContractConfig::new(dec!(1000), dec!(0), 2),
+        ledger,
+        Script::default(),
+    )
+    .with_perpetual(
+        PerpetualTerms::new(spec, 1, source(), points).unwrap(),
+        ticks_at(&[u64::MAX]),
+        ImmediateFillModel::new(),
+    )
+    .unwrap()
+    .run();
+    assert!(result.fundings.is_empty(), "{:?}", result.fundings);
+}
+
+#[test]
+fn replaying_an_instant_on_a_funded_ledger_is_a_fault_whatever_the_lane_order() {
+    let asset = |code| AssetCode::new(code).unwrap();
+    let future = InstrumentSpec::new(InstrumentDraft {
+        id: SpecId::new("FUT").unwrap(),
+        kind: ContractKind::Future,
+        margining: Margining::Linear,
+        underlying: asset("BTC"),
+        price_asset: asset("USDT"),
+        settlement_asset: asset("USDT"),
+        size: ContractSize::base(dec!(1), asset("BTC")).unwrap(),
+        price_ticks: TickSchedule::fixed(dec!(1)).unwrap(),
+        lot: dec!(1),
+        expiry_ms: Some(T0 + 100 * STEP),
+        option: None,
+    })
+    .unwrap();
+    let spec = perp(dec!(1));
+    let mut ledger = ledger_of(&spec, 8);
+    ledger
+        .register_instrument(
+            Instrument::from_spec(
+                &future,
+                InstrumentScales {
+                    price_scale: 8,
+                    contract_scale: 8,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    seed(&mut ledger, "PERP", Action::Buy, dec!(60000), dec!(2));
+    let points = vec![point(T0 + STEP, dec!(60000), dec!(0.0001))];
+    let times = [T0, T0 + STEP];
+    // The perpetual is the first lane here and the second below.
+    let mut first = engine(
+        ledger,
+        Script::default(),
+        terms(spec.clone(), points.clone()),
+        &times,
+    );
+    assert_eq!(first.run().total_funding, dec!(-12));
+    let funded = first.ledger().clone();
+    let again = ContractEngine::new(
+        ContractConfig::new(dec!(1000), dec!(0), 2),
+        funded,
+        Script::default(),
+    )
+    .with_contract(
+        market_maker_rs::instruments::futures::FutureTerms::new(
+            future,
+            market_maker_rs::instruments::futures::SettlementMethod::Cash,
+            source(),
+        )
+        .unwrap(),
+        ticks_at(&times),
+        ImmediateFillModel::new(),
+    )
+    .unwrap()
+    .with_perpetual(
+        terms(spec, points),
+        ticks_at(&times),
+        ImmediateFillModel::new(),
+    )
+    .unwrap()
+    .run();
+    assert_eq!(again.fault_count, 1);
+    assert_eq!(again.contracts[1].funding, dec!(0));
 }
