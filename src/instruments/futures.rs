@@ -412,7 +412,10 @@ impl FutureTerms {
     /// The ledger's identifier of this contract. An instrument it holds under that
     /// identifier with other terms, at its registered scales, is an error.
     #[cfg(feature = "margin")]
-    fn identify_in_ledger(&self, ledger: &Ledger) -> Result<margin_rs::InstrumentId, FutureError> {
+    pub(super) fn identify_in_ledger(
+        &self,
+        ledger: &Ledger,
+    ) -> Result<margin_rs::InstrumentId, FutureError> {
         let instrument = self.spec.id().as_str();
         let id = margin_rs::InstrumentId::new(instrument)?;
         if let Some(registered) = ledger.instrument(&id) {
