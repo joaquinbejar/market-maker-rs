@@ -476,6 +476,26 @@ fn test_portfolio_limit_counts_orders_still_live_across_rounds() {
 }
 
 #[test]
+fn test_portfolio_limit_withheld_side_does_not_count_against_the_next_side() {
+    // Long 2 of asset 0, independent assets. Its bid could reach 9 and goes. The bid
+    // of asset 1 is measured without it: the bound is 5.5, not the 8.75 and more it
+    // would be if the bid withheld still counted.
+    let mut gate = gate(2);
+    hold(&mut gate, 0, dec!(2));
+    let mut quoter = MultiAssetQuoter::new(
+        model(2, dec!(0), RiskView::Correlated, dec!(100)),
+        ids(2),
+        AMPLE,
+    )
+    .unwrap()
+    .with_max_portfolio_variance(dec!(6))
+    .unwrap();
+    let round = quoter.quote(&mut gate, &marks(2), 1).unwrap();
+    assert!(quote_of(&round, 0, Action::Buy).is_none());
+    assert!(quote_of(&round, 1, Action::Buy).is_some());
+}
+
+#[test]
 fn test_portfolio_limit_holds_or_never_rises_over_every_reachable_state() {
     // Inventories on both sides of the limit, for every view and correlation, with
     // orders left live across rounds: the true largest variance, by enumeration,
@@ -805,6 +825,40 @@ fn test_capital_budget_unwinding_order_over_budget_stands_and_adds_only_its_fee(
         committed > Decimal::ZERO && committed <= (bid * dec!(0.01)).ceil(),
         "{committed}"
     );
+}
+
+#[test]
+fn test_capital_budget_unwinding_part_leaves_the_rest_of_the_budget_alone() {
+    // Long 2 at 100, budget 350: 150 left. The ask only unwinds, so the bid has all
+    // of it and neither side is scaled.
+    let mut gate = gate(1);
+    hold(&mut gate, 0, dec!(2));
+    let mut quoter = quoter(1, dec!(0), dec!(350));
+    let round = quoter.quote(&mut gate, &marks(1), 1).unwrap();
+    assert_eq!(quote_of(&round, 0, Action::Buy).unwrap().1, dec!(1));
+    assert_eq!(quote_of(&round, 0, Action::Sell).unwrap().1, dec!(1));
+    assert!(round.constraints.is_empty(), "{:?}", round.constraints);
+}
+
+#[test]
+fn test_capital_budget_inventory_unwinds_only_once_across_live_orders() {
+    // Long 1, budget all deployed: the first ask unwinds it and stands. A second
+    // ask left beside it would go short, so it needs capital there is not.
+    let mut long = gate(1);
+    hold(&mut long, 0, dec!(1));
+    let mut quoter_long = quoter(1, dec!(0), dec!(100));
+    let first = quoter_long.quote(&mut long, &marks(1), 1).unwrap();
+    assert_eq!(quote_of(&first, 0, Action::Sell).unwrap().1, dec!(1));
+    let second = quoter_long.quote(&mut long, &marks(1), 2).unwrap();
+    assert!(quote_of(&second, 0, Action::Sell).is_none());
+    // The same for a bid that covers a short.
+    let mut short = gate(1);
+    hold(&mut short, 0, dec!(-1));
+    let mut quoter_short = quoter(1, dec!(0), dec!(100));
+    let first = quoter_short.quote(&mut short, &marks(1), 1).unwrap();
+    assert_eq!(quote_of(&first, 0, Action::Buy).unwrap().1, dec!(1));
+    let second = quoter_short.quote(&mut short, &marks(1), 2).unwrap();
+    assert!(quote_of(&second, 0, Action::Buy).is_none());
 }
 
 #[test]
@@ -1399,7 +1453,7 @@ fn test_comparison_correlation_scenarios_print_evidence_table() {
         simulation::FEE_RATE,
     );
     println!(
-        "Capital utilization: reserved capital (ledger) / capital budget. The Greek of linear instruments is delta = inventory."
+        "Utilization: committed capital (deployed inventory plus reservations, without counting an unwinding order twice) / capital budget, read from the ledger after each round; mean reserved over budget is the same with reservations alone. Marks can pass the budget between rounds. The Greek of linear instruments is delta = inventory."
     );
     println!("| true rho | assumed | budget | metric | correlated | diagonal | gap | std err |");
     println!("|---|---|---|---|---|---|---|---|");
