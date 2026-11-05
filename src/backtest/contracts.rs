@@ -1081,6 +1081,10 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             }
             self.sample(tick.timestamp);
         }
+        if num_ticks == 0 {
+            // No first tick, so no instant is after it.
+            self.funding_due.clear();
+        }
         self.finish();
         self.result(num_ticks, start_time, end_time)
     }

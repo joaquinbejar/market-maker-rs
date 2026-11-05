@@ -706,3 +706,63 @@ fn replaying_an_instant_on_a_funded_ledger_is_a_fault_whatever_the_lane_order() 
     assert_eq!(again.fault_count, 1);
     assert_eq!(again.contracts[1].funding, dec!(0));
 }
+
+#[test]
+fn a_run_with_no_ticks_pays_no_funding_even_if_a_settlement_runs_the_clock() {
+    use market_maker_rs::instruments::futures::{FutureTerms, SettlementMethod, SettlementPrice};
+    let asset = |code| AssetCode::new(code).unwrap();
+    let expiry = T0 + 3 * STEP;
+    let future = InstrumentSpec::new(InstrumentDraft {
+        id: SpecId::new("FUT").unwrap(),
+        kind: ContractKind::Future,
+        margining: Margining::Linear,
+        underlying: asset("BTC"),
+        price_asset: asset("USDT"),
+        settlement_asset: asset("USDT"),
+        size: ContractSize::base(dec!(1), asset("BTC")).unwrap(),
+        price_ticks: TickSchedule::fixed(dec!(1)).unwrap(),
+        lot: dec!(1),
+        expiry_ms: Some(expiry),
+        option: None,
+    })
+    .unwrap();
+    let spec = perp(dec!(1));
+    let mut ledger = ledger_of(&spec, 8);
+    ledger
+        .register_instrument(
+            Instrument::from_spec(
+                &future,
+                InstrumentScales {
+                    price_scale: 8,
+                    contract_scale: 8,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    seed(&mut ledger, "PERP", Action::Buy, dec!(60000), dec!(2));
+    let id = future.id().clone();
+    let mut run = ContractEngine::new(
+        ContractConfig::new(dec!(1000), dec!(0), 2),
+        ledger,
+        Script::default(),
+    )
+    .with_perpetual(
+        terms(spec, fixture_points()),
+        ticks_at(&[]),
+        ImmediateFillModel::new(),
+    )
+    .unwrap()
+    .with_contract(
+        FutureTerms::new(future, SettlementMethod::Cash, source()).unwrap(),
+        ticks_at(&[]),
+        ImmediateFillModel::new(),
+    )
+    .unwrap()
+    .with_settlement(SettlementPrice::new(id, source(), expiry, dec!(1), expiry).unwrap())
+    .unwrap();
+    let result = run.run();
+    assert!(result.contracts[1].settled);
+    assert!(result.fundings.is_empty(), "{:?}", result.fundings);
+    assert!(run.ledger().funding_journal().is_empty());
+}
