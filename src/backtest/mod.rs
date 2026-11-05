@@ -42,6 +42,9 @@
 
 pub mod accounting;
 
+#[cfg(all(feature = "margin", feature = "instruments"))]
+pub mod contracts;
+
 /// `margin-rs` risk gate behind the pretrade and accounting ports.
 #[cfg(feature = "margin")]
 pub mod margin;

@@ -197,7 +197,9 @@
 //!   (`instruments` module): validated specifications, exact money and
 //!   dated venue snapshots, and orders and fills checked against them
 //!   (`instruments::orders`); with `margin` too, their conversion into
-//!   `margin-rs` instruments and executions (`instruments::margin`). Both
+//!   `margin-rs` instruments and executions (`instruments::margin`), and several
+//!   dated futures in one backtest run against one ledger
+//!   (`backtest::contracts`). Both
 //!   together need
 //!   `margin-rs` 0.1.1 or later: Cargo does not upgrade a lockfile at 0.1.0
 //!   by itself, so run `cargo update -p margin-rs`

@@ -234,6 +234,8 @@ pub trait FillAccountant: fmt::Debug {
 
 #[cfg(feature = "margin")]
 pub use margin_ledger::MarginLedgerAccountant;
+#[cfg(all(feature = "margin", feature = "instruments"))]
+pub(super) use margin_ledger::largest_execution_number;
 
 #[cfg(feature = "margin")]
 mod margin_ledger {
@@ -453,7 +455,7 @@ mod margin_ledger {
 
     /// The largest `n` among the `sim-<n>` identifiers of `ledger`, in all the
     /// journals that share them. Any other identifier cannot collide with one.
-    fn largest_execution_number(ledger: &Ledger) -> u64 {
+    pub(in crate::backtest) fn largest_execution_number(ledger: &Ledger) -> u64 {
         ledger
             .journal()
             .iter()

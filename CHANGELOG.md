@@ -8,6 +8,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Several dated futures in one backtest run (features `margin` and `instruments`,
+  #199): `backtest::contracts::ContractEngine` gives each contract its own data, fill
+  model and orders, on one clock and one `margin-rs` ledger, with one sided orders and
+  a `ContractStrategy` that may answer any report with commands. It values each contract
+  at its own latest mid, closes a contract at its expiry and books a declared
+  `SettlementPrice` when published, and a position past its expiry with none makes the
+  run not consistent. There is no margin requirement or liquidation. New provided
+  `PretradePolicy::in_contracts`, false by default and true for `RollGuard`: it refuses
+  any other policy. `BacktestEngine` and `with_instrument` do not change, and a test
+  holds them equal on one contract.
 - The net result of a calendar spread under an assumed exit (feature `arbitrage`,
   #202): `instruments::calendar::evaluate_calendar` buys one linear dated future and
   sells another of the same underlying. As two futures do not converge to each other,

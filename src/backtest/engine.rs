@@ -1139,19 +1139,12 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     /// scheduling a zero delay submission) are picked up in the same pass.
     fn advance_events(&mut self, until: u64) {
         loop {
-            let venue = self.pending.first_key_value().map(|(key, _)| key.0);
-            let report = self.deliveries.front().map(|d| d.at);
-            let observation = self.observed.front().map(|(at, _)| *at);
-            let mut next: Option<(u64, u8)> = None;
-            for (time, class) in [(venue, 0u8), (report, 1), (observation, 2)] {
-                if let Some(t) = time
-                    && t <= until
-                    && next.is_none_or(|n| (t, class) < n)
-                {
-                    next = Some((t, class));
-                }
-            }
-            let Some((time, class)) = next else {
+            let times = [
+                self.pending.first_key_value().map(|(key, _)| key.0),
+                self.deliveries.front().map(|d| d.at),
+                self.observed.front().map(|(at, _)| *at),
+            ];
+            let Some((time, class)) = next_due(&times, until) else {
                 break;
             };
             // Out of order data can schedule an event before the clock;
@@ -1211,23 +1204,13 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
                     continue;
                 }
             };
-            let (quantity, model_price) = match outcome {
-                FillResult::NoFill => continue,
-                FillResult::FullFill { fill_price } => (order.remaining(), fill_price),
-                FillResult::PartialFill {
-                    filled_quantity,
-                    fill_price,
-                } => (
-                    filled_quantity
-                        .min(order.quantity)
-                        .saturating_sub(order.filled),
-                    fill_price,
-                ),
+            let Some((quantity, model_price)) = fill_increment(order, outcome) else {
+                continue;
             };
             if quantity <= Decimal::ZERO {
                 continue;
             }
-            let price = self.apply_slippage(model_price, dir);
+            let price = slipped_price(&self.config.slippage, model_price, dir);
             // A model or slippage output that is not a valid price is
             // ignored: it would book negative proceeds and fees.
             if price <= Decimal::ZERO {
@@ -1549,18 +1532,6 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         self.deliveries.push_back(Delivery { at, report, fill });
     }
 
-    /// Applies slippage to a fill price.
-    fn apply_slippage(&self, price: Decimal, dir: Dir) -> Decimal {
-        let slippage = self
-            .config
-            .slippage
-            .calculate_slippage(price, Decimal::ZERO);
-        match dir {
-            Dir::Buy => price.saturating_add(slippage),
-            Dir::Sell => price.saturating_sub(slippage),
-        }
-    }
-
     /// Processes a fill: updates position, PnL, and notifies strategy.
     fn process_fill(
         &mut self,
@@ -1776,7 +1747,8 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     /// - trade volume is `price * contracts`, which is not a notional;
     /// - the accountant books with overdraft, with no margin requirement or
     ///   liquidation, and no funding, expiry or settlement;
-    /// - one contract only: a run across contracts, for a roll, is #199;
+    /// - one contract only: a run across contracts, for a roll, is
+    ///   `backtest::contracts::ContractEngine`;
     /// - a fill at or after a future's expiry is refused by the accountant and
     ///   recorded in [`AccountingStatus::refused_executions`];
     /// - a mark the accountant cannot value is counted in
@@ -2099,6 +2071,48 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     }
 }
 
+/// The class and time of the next event at or before `until`: the earliest, and at
+/// equal times the first class in `times`.
+pub(super) fn next_due(times: &[Option<u64>], until: u64) -> Option<(u64, usize)> {
+    let mut next: Option<(u64, usize)> = None;
+    for (class, time) in times.iter().enumerate() {
+        if let Some(t) = *time
+            && t <= until
+            && next.is_none_or(|n| (t, class) < n)
+        {
+            next = Some((t, class));
+        }
+    }
+    next
+}
+
+/// What a fill model's outcome adds to an order, and at what price: fill quantities are
+/// cumulative per order, so only the increase counts. `None` for no fill.
+pub(super) fn fill_increment(order: &SimOrder, outcome: FillResult) -> Option<(Decimal, Decimal)> {
+    match outcome {
+        FillResult::NoFill => None,
+        FillResult::FullFill { fill_price } => Some((order.remaining(), fill_price)),
+        FillResult::PartialFill {
+            filled_quantity,
+            fill_price,
+        } => Some((
+            filled_quantity
+                .min(order.quantity)
+                .saturating_sub(order.filled),
+            fill_price,
+        )),
+    }
+}
+
+/// A fill price with slippage applied against the taker.
+pub(super) fn slipped_price(slippage: &SlippageModel, price: Decimal, dir: Dir) -> Decimal {
+    let slip = slippage.calculate_slippage(price, Decimal::ZERO);
+    match dir {
+        Dir::Buy => price.saturating_add(slip),
+        Dir::Sell => price.saturating_sub(slip),
+    }
+}
+
 /// The fee of one execution of a derivative contract, in its settlement asset:
 /// the exact notional times `rate`, rounded half to even to `scale` once.
 ///
@@ -2106,7 +2120,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
 ///
 /// [`MMError::NumericalError`] if the notional or the product is not exact.
 #[cfg(feature = "instruments")]
-fn settlement_charge(
+pub(super) fn settlement_charge(
     spec: &financial_types::instrument::InstrumentSpec,
     scale: u32,
     price: Decimal,
@@ -2193,7 +2207,7 @@ pub(crate) fn round_to_step(value: Decimal, step: Decimal, up: bool) -> Decimal 
 /// Approximate Sharpe ratio of an equity curve (mean over standard
 /// deviation of per step returns), or `None` when it is undefined or a
 /// step overflows.
-fn sharpe_ratio(equity_curve: &[(u64, Decimal)]) -> Option<Decimal> {
+pub(super) fn sharpe_ratio(equity_curve: &[(u64, Decimal)]) -> Option<Decimal> {
     // A window whose previous equity is not positive has no return and is
     // skipped; a return that overflows makes the whole ratio `None`.
     let returns: Vec<Decimal> = equity_curve
