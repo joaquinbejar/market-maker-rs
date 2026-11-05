@@ -14,6 +14,15 @@ project follows [Semantic Versioning](https://semver.org/).
   `OutOfSampleError::intensity_out_of_support`, with
   `WalkForwardReport::out_of_support_folds` to count them. The rate is not capped, and
   `CalibratedParameters::rate_per_second` keeps its typed error for it.
+- Venues that close, in `strategy::walk_forward` (#180):
+  `CalibrationData::with_sessions` declares when the market is open. Each session gets
+  its own price grid and gap limit, and no return crosses a closure, so an overnight
+  stop neither fails a window nor dilutes the volatility with zero returns. The
+  volatility is then per square root of a year of open time, which leaves the move
+  across a closure out of it. A silence during a declared session is still a `PriceGap`.
+  An intraday bucket reached only while closed has a multiplier of 0. New
+  `CalibrationFailure::TooFewReturns`. Without sessions nothing changes. Checked on
+  synthetic prices only: validation on real sessions is pending.
 - Several dated futures in one backtest run (features `margin` and `instruments`,
   #199): `backtest::contracts::ContractEngine` gives each contract its own data, fill
   model and orders, on one clock and one `margin-rs` ledger, with one sided orders and

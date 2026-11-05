@@ -146,8 +146,18 @@ impl VolatilityEstimator {
         // Calculate log returns
         let log_returns = log_returns(prices)?;
 
+        self.simple_of_returns(&log_returns)
+    }
+
+    /// Annualized sample standard deviation of log returns already computed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] with fewer than 2 returns or on
+    /// arithmetic failure.
+    pub(crate) fn simple_of_returns(&self, log_returns: &[Decimal]) -> MMResult<Decimal> {
         // Sample variance of the log returns
-        let variance = sample_variance(&log_returns)?;
+        let variance = sample_variance(log_returns)?;
 
         // Calculate standard deviation
         let std_dev = decimal_sqrt(variance)?;
@@ -209,18 +219,33 @@ impl VolatilityEstimator {
         // Calculate log returns
         let log_returns = log_returns(prices)?;
 
+        self.ewma_of_returns(&log_returns, lambda)
+    }
+
+    /// Annualized EWMA of log returns already computed, in chronological order.
+    /// `lambda` is in `(0, 1)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] with fewer than 2 returns or on
+    /// arithmetic failure.
+    pub(crate) fn ewma_of_returns(
+        &self,
+        log_returns: &[Decimal],
+        lambda: Decimal,
+    ) -> MMResult<Decimal> {
         // Initialize variance with simple variance of first few returns
         let initial_variance = if log_returns.len() >= 5 {
             sample_variance(log_returns.get(..5).unwrap_or_default())?
         } else {
-            sample_variance(&log_returns)?
+            sample_variance(log_returns)?
         };
 
         // EWMA recursion. `0 < lambda < 1`, so `1 - lambda` cannot overflow.
         let one_minus_lambda = Decimal::ONE.saturating_sub(lambda);
         let mut variance = initial_variance;
 
-        for &log_return in &log_returns {
+        for &log_return in log_returns {
             variance = log_return
                 .checked_mul(log_return)
                 .and_then(|sq| one_minus_lambda.checked_mul(sq))
@@ -367,6 +392,23 @@ fn sample_variance(returns: &[Decimal]) -> MMResult<Decimal> {
 /// Returns `MMError::InvalidMarketState` if any price is not positive or
 /// there are fewer than 2 returns.
 fn log_returns(prices: &[Decimal]) -> MMResult<Vec<Decimal>> {
+    let log_returns = consecutive_log_returns(prices)?;
+    // The sample variance divides by `n - 1`.
+    if log_returns.len() < 2 {
+        return Err(MMError::InvalidMarketState(format!(
+            "need at least 2 log returns (3 prices), got {}",
+            log_returns.len()
+        )));
+    }
+    Ok(log_returns)
+}
+
+/// Computes the log returns of a price series, however few.
+///
+/// # Errors
+///
+/// Returns `MMError::InvalidMarketState` if any price is not positive.
+pub(crate) fn consecutive_log_returns(prices: &[Decimal]) -> MMResult<Vec<Decimal>> {
     let mut log_returns = Vec::with_capacity(prices.len().saturating_sub(1));
     for window in prices.windows(2) {
         let [prev, next] = window else {
@@ -380,13 +422,6 @@ fn log_returns(prices: &[Decimal]) -> MMResult<Vec<Decimal>> {
         log_returns.push(decimal_ln(
             next.checked_div(*prev).or_overflow("price ratio")?,
         )?);
-    }
-    // The sample variance divides by `n - 1`.
-    if log_returns.len() < 2 {
-        return Err(MMError::InvalidMarketState(format!(
-            "need at least 2 log returns (3 prices), got {}",
-            log_returns.len()
-        )));
     }
     Ok(log_returns)
 }

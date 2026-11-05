@@ -10,7 +10,8 @@
 //! millisecond simulator clock:
 //!
 //! - timestamps and durations: milliseconds;
-//! - `volatility`: absolute price units per √year, with a 365 day year;
+//! - `volatility`: absolute price units per √year, with a 365 day year. With
+//!   declared sessions the year is of open time: see [Sessions](#sessions);
 //! - `intensity_scale_a`: fills per second, at distance zero;
 //! - `order_intensity_k`: 1 / price units, in `λ(δ) = A · exp(-k · δ) · s(t)`;
 //! - `s(t)`: dimensionless multiplier per bucket of the UTC day, so timestamps
@@ -49,10 +50,29 @@
 //! a window with a longer silence than `max_gap_buckets` allows, including at
 //! its start or end, is [`CalibrationFailure::PriceGap`].
 //!
-//! The grid assumes a continuous session. A venue that stops printing
-//! overnight fails a one day window with `PriceGap`, and raising
-//! `max_gap_buckets` to pass it deflates the volatility with those zero
-//! returns. Computing returns across sampled buckets only is a follow-up.
+//! # Sessions
+//!
+//! By default the market is taken as always open, so a venue that stops
+//! printing overnight fails a one day window with `PriceGap`, and raising
+//! `max_gap_buckets` to pass it deflates the volatility with zero returns.
+//! [`CalibrationData::with_sessions`] declares when the market is open instead.
+//! Only the caller's calendar makes a silence a closure, so a feed that fails
+//! during a session stays a `PriceGap` however long it lasts.
+//!
+//! With sessions, each one has its own grid, from its start or the window's,
+//! and its own partial final bucket dropped. The gap limit applies inside
+//! each session and no return crosses two of them. Therefore:
+//!
+//! - `volatility` is the diffusion while open, per √year of open time. Use it
+//!   with a horizon in open time. It is not comparable to a close to close
+//!   volatility, as the move across a closure is in neither the estimate nor
+//!   the score, and inventory held through a closure bears that risk unpriced.
+//! - The estimators pool the returns in order, so EWMA decays per return and
+//!   not per unit of clock time across a closure.
+//! - An intraday bucket with no exposure that the window reaches only while
+//!   closed gets a multiplier of 0, not a failure. `A` is then per second of
+//!   time at risk in the other buckets. An exposure counts in the bucket where
+//!   it ends, so one stamped exactly at a session's end may fall in the next.
 //!
 //! # Forecasts out of support
 //!
@@ -78,7 +98,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 use crate::Decimal;
-use crate::market_state::volatility::VolatilityEstimator;
+use crate::market_state::volatility::{VolatilityEstimator, consecutive_log_returns};
 use crate::types::decimal::{OrOverflow, decimal_sqrt};
 use crate::types::error::{MMError, MMResult};
 
@@ -101,6 +121,8 @@ const MIN_DISTANCE_LEVELS: usize = 2;
 const MAX_SEASONALITY_BUCKETS: u32 = 1_440;
 /// Bisection steps of the `k` fit; each halves the bracket.
 const K_BISECTION_STEPS: u32 = 200;
+/// Fewest returns that give a sample variance.
+const MIN_RETURNS: usize = 2;
 /// Most splits accepted from one call.
 const MAX_SPLITS: usize = 1_000_000;
 /// Relative margin under which the fit cannot tell a difference from rounding.
@@ -246,6 +268,8 @@ pub struct QuoteExposure {
 pub struct CalibrationData<'a> {
     prices: &'a [PriceSample],
     exposures: &'a [QuoteExposure],
+    /// Declared sessions, ordered and apart. Empty means always open.
+    sessions: &'a [TimeWindow],
 }
 
 impl<'a> CalibrationData<'a> {
@@ -278,17 +302,97 @@ impl<'a> CalibrationData<'a> {
                 "samples are not in chronological order".to_string(),
             ));
         }
-        Ok(Self { prices, exposures })
+        Ok(Self {
+            prices,
+            exposures,
+            sessions: &[],
+        })
+    }
+
+    /// Declares the half-open intervals when the market is open, for a venue
+    /// that closes. See [Sessions](self#sessions). Exposures are not checked
+    /// against them, as they already say how long the quotes were at risk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] for no sessions, an empty
+    /// session, or sessions that overlap or go back; and
+    /// [`MMError::InvalidMarketState`] for a price sample outside every session,
+    /// which contradicts the declaration, and is not dropped silently.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use market_maker_rs::dec;
+    /// use market_maker_rs::strategy::walk_forward::{CalibrationData, PriceSample, TimeWindow};
+    ///
+    /// let sessions = [TimeWindow::new(1_000, 2_000).unwrap(), TimeWindow::new(5_000, 6_000).unwrap()];
+    /// let prices = [PriceSample { timestamp_ms: 1_000, price: dec!(100) }];
+    /// assert!(CalibrationData::new(&prices, &[]).unwrap().with_sessions(&sessions).is_ok());
+    ///
+    /// let closed = [PriceSample { timestamp_ms: 3_000, price: dec!(100) }];
+    /// assert!(CalibrationData::new(&closed, &[]).unwrap().with_sessions(&sessions).is_err());
+    /// ```
+    pub fn with_sessions(mut self, sessions: &'a [TimeWindow]) -> MMResult<Self> {
+        if sessions.is_empty() {
+            return Err(MMError::InvalidConfiguration(
+                "no sessions declared".to_string(),
+            ));
+        }
+        if let Some(bad) = sessions.iter().find(|s| s.start_ms >= s.end_ms) {
+            return Err(MMError::InvalidConfiguration(format!(
+                "empty session: {bad:?}"
+            )));
+        }
+        if let Some(bad) = sessions
+            .windows(2)
+            .find(|pair| matches!(pair, [a, b] if b.start_ms < a.end_ms))
+        {
+            return Err(MMError::InvalidConfiguration(format!(
+                "sessions overlap or go back: {bad:?}"
+            )));
+        }
+        let mut open = sessions.iter().peekable();
+        for sample in self.prices {
+            while open.next_if(|s| s.end_ms <= sample.timestamp_ms).is_some() {}
+            if !open
+                .peek()
+                .is_some_and(|s| s.start_ms <= sample.timestamp_ms)
+            {
+                return Err(MMError::InvalidMarketState(format!(
+                    "price at {} is outside every session",
+                    sample.timestamp_ms
+                )));
+            }
+        }
+        self.sessions = sessions;
+        Ok(self)
     }
 
     fn prices_in(&self, window: &TimeWindow) -> &'a [PriceSample] {
+        samples_in(self.prices, window)
+    }
+
+    /// The parts of `window` when the market is open, in order.
+    fn open_parts(&self, window: &TimeWindow) -> Vec<TimeWindow> {
+        if self.sessions.is_empty() {
+            return vec![*window];
+        }
         let from = self
-            .prices
-            .partition_point(|s| s.timestamp_ms < window.start_ms);
+            .sessions
+            .partition_point(|s| s.end_ms <= window.start_ms);
         let to = self
-            .prices
-            .partition_point(|s| s.timestamp_ms < window.end_ms);
-        self.prices.get(from..to).unwrap_or_default()
+            .sessions
+            .partition_point(|s| s.start_ms < window.end_ms);
+        self.sessions
+            .get(from..to)
+            .unwrap_or_default()
+            .iter()
+            .map(|s| TimeWindow {
+                start_ms: s.start_ms.max(window.start_ms),
+                end_ms: s.end_ms.min(window.end_ms),
+            })
+            .collect()
     }
 
     fn exposures_in(&self, window: &TimeWindow) -> &'a [QuoteExposure] {
@@ -341,7 +445,7 @@ pub struct WalkForwardConfig {
     pub update_rule: UpdateRule,
     /// Fewest grid buckets with a sample for a volatility. At least 3.
     pub min_grid_prices: usize,
-    /// Longest silence between samples, in grid buckets. Positive.
+    /// Longest silence between samples of a session, in grid buckets. Positive.
     pub max_gap_buckets: u32,
     /// Fewest distance levels with fills for an intensity. At least 2.
     pub min_distance_levels: usize,
@@ -354,7 +458,8 @@ pub struct WalkForwardConfig {
     /// Fewest fills every bucket needs. With a lower count the window is
     /// [`CalibrationFailure::ThinSeasonalBucket`]. Zero accepts a bucket with
     /// exposure and no fills, whose multiplier is then 0. A bucket with no
-    /// exposure is always [`CalibrationFailure::UnobservedSeasonalBucket`].
+    /// exposure is [`CalibrationFailure::UnobservedSeasonalBucket`], unless
+    /// declared sessions show it closed.
     pub min_bucket_fills: u64,
 }
 
@@ -519,6 +624,13 @@ pub enum CalibrationFailure {
         /// Grid prices required.
         need: usize,
     },
+    /// Enough grid prices, but too few returns inside sessions.
+    TooFewReturns {
+        /// Returns available.
+        have: usize,
+        /// Returns required.
+        need: usize,
+    },
     /// A silence in the prices is longer than allowed.
     PriceGap {
         /// Longest silence in the window, in milliseconds.
@@ -634,8 +746,18 @@ pub fn calibrate_window(
     config.validate()?;
     let prices = data.prices_in(window);
     let exposures = data.exposures_in(window);
+    let parts = data.open_parts(window);
+    let closed = closed_buckets(window, &parts, config.seasonality_buckets)?;
     let (fills, exposure_ms) = exposure_totals(exposures)?;
-    let outcome = match estimate(prices, exposures, fills, exposure_ms, window, config)? {
+    let outcome = match estimate(
+        prices,
+        exposures,
+        fills,
+        exposure_ms,
+        &parts,
+        &closed,
+        config,
+    )? {
         Ok(parameters) => CalibrationOutcome::Calibrated(parameters),
         Err(failure) => CalibrationOutcome::Insufficient(failure),
     };
@@ -643,7 +765,15 @@ pub fn calibrate_window(
         training: *window,
         resolution_ms: config.resolution_ms,
         dataset_id: dataset_id.to_string(),
-        dataset_hash: window_hash(prices, exposures),
+        dataset_hash: window_hash(
+            prices,
+            exposures,
+            if data.sessions.is_empty() {
+                &[]
+            } else {
+                &parts
+            },
+        ),
         price_samples: prices.len(),
         fills,
         exposure_ms,
@@ -810,7 +940,7 @@ pub fn walk_forward(
 
         let prices = data.prices_in(&split.test);
         let exposures = data.exposures_in(&split.test);
-        let realized = realized_volatility(prices, &split.test, config)?;
+        let realized = realized_volatility(prices, &data.open_parts(&split.test), config)?;
         let calibrated = record
             .parameters()
             .map(|p| score(p.volatility, realized, exposures, |d, t| p.rate_f64(d, t)))
@@ -854,28 +984,36 @@ fn estimate(
     exposures: &[QuoteExposure],
     fills: u64,
     exposure_ms: u64,
-    window: &TimeWindow,
+    parts: &[TimeWindow],
+    closed: &[bool],
     config: &WalkForwardConfig,
 ) -> MMResult<Result<CalibratedParameters, CalibrationFailure>> {
-    let (grid, observed) = grid_prices(prices, window, config.resolution_ms)?;
-    if observed < config.min_grid_prices {
+    let grid = grid_prices(prices, parts, config.resolution_ms)?;
+    if grid.observed < config.min_grid_prices {
         return Ok(Err(CalibrationFailure::TooFewPrices {
-            have: observed,
+            have: grid.observed,
             need: config.min_grid_prices,
         }));
     }
     let limit_ms = gap_limit_ms(config)?;
-    let gap_ms = longest_gap_ms(prices, window)?;
+    let gap_ms = longest_gap_ms(prices, parts)?;
     if gap_ms > limit_ms {
         return Ok(Err(CalibrationFailure::PriceGap { gap_ms, limit_ms }));
     }
-    let Some(&reference_price) = grid.last() else {
+    let returns = grid.log_returns()?;
+    if returns.len() < MIN_RETURNS {
+        return Ok(Err(CalibrationFailure::TooFewReturns {
+            have: returns.len(),
+            need: MIN_RETURNS,
+        }));
+    }
+    let Some(reference_price) = grid.last_price() else {
         return Ok(Err(CalibrationFailure::TooFewPrices {
-            have: observed,
+            have: grid.observed,
             need: config.min_grid_prices,
         }));
     };
-    let relative = relative_volatility(&grid, config.resolution_ms, config.volatility_rule)?;
+    let relative = relative_volatility(&returns, config.resolution_ms, config.volatility_rule)?;
     if relative.is_zero() {
         return Ok(Err(CalibrationFailure::FlatPrices));
     }
@@ -895,7 +1033,7 @@ fn estimate(
             need: config.min_fills,
         }));
     }
-    let fit = match fit_intensity(exposures, config)? {
+    let fit = match fit_intensity(exposures, closed, config)? {
         Ok(fit) => fit,
         Err(failure) => return Ok(Err(failure)),
     };
@@ -908,45 +1046,90 @@ fn estimate(
     }))
 }
 
-/// Resamples to the last price before each complete grid bucket's end, and
-/// counts the buckets with a sample of their own.
+/// Grid prices of a window.
+struct PriceGrid {
+    /// One run of prices per session with any; no return crosses two runs.
+    runs: Vec<Vec<Decimal>>,
+    /// Buckets with a sample of their own.
+    observed: usize,
+}
+
+impl PriceGrid {
+    /// Log returns inside each run, in order.
+    fn log_returns(&self) -> MMResult<Vec<Decimal>> {
+        let mut returns = Vec::new();
+        for run in &self.runs {
+            returns.extend(consecutive_log_returns(run)?);
+        }
+        Ok(returns)
+    }
+
+    /// The last grid price.
+    fn last_price(&self) -> Option<Decimal> {
+        self.runs.last().and_then(|run| run.last()).copied()
+    }
+}
+
+/// Resamples each part to the last price before each complete grid bucket's
+/// end, and counts the buckets with a sample of their own.
 fn grid_prices(
     prices: &[PriceSample],
-    window: &TimeWindow,
+    parts: &[TimeWindow],
     resolution_ms: u64,
-) -> MMResult<(Vec<Decimal>, usize)> {
-    let span = window
-        .end_ms
-        .checked_sub(window.start_ms)
-        .or_overflow("window length")?;
-    let points = span.checked_div(resolution_ms).or_overflow("grid points")?;
-    if points > MAX_GRID_POINTS {
+) -> MMResult<PriceGrid> {
+    let mut points = Vec::with_capacity(parts.len());
+    let mut total = 0u64;
+    for part in parts {
+        let span = part
+            .end_ms
+            .checked_sub(part.start_ms)
+            .or_overflow("window length")?;
+        let part_points = span.checked_div(resolution_ms).or_overflow("grid points")?;
+        total = total.checked_add(part_points).or_overflow("grid points")?;
+        points.push(part_points);
+    }
+    if total > MAX_GRID_POINTS {
         return Err(MMError::InvalidConfiguration(format!(
-            "grid of {points} points exceeds {MAX_GRID_POINTS}"
+            "grid of {total} points exceeds {MAX_GRID_POINTS}"
         )));
     }
-    let mut grid = Vec::new();
-    let mut samples = prices.iter().peekable();
-    let mut last = None;
-    let mut observed = 0usize;
-    for point in 1..=points {
-        let bucket_end = point
-            .checked_mul(resolution_ms)
-            .and_then(|offset| window.start_ms.checked_add(offset))
-            .or_overflow("grid bucket end")?;
-        let mut sampled = false;
-        while let Some(sample) = samples.next_if(|s| s.timestamp_ms < bucket_end) {
-            last = Some(sample.price);
-            sampled = true;
+    let mut grid = PriceGrid {
+        runs: Vec::new(),
+        observed: 0,
+    };
+    for (part, part_points) in parts.iter().zip(points) {
+        let mut run = Vec::new();
+        let mut samples = samples_in(prices, part).iter().peekable();
+        let mut last = None;
+        for point in 1..=part_points {
+            let bucket_end = point
+                .checked_mul(resolution_ms)
+                .and_then(|offset| part.start_ms.checked_add(offset))
+                .or_overflow("grid bucket end")?;
+            let mut sampled = false;
+            while let Some(sample) = samples.next_if(|s| s.timestamp_ms < bucket_end) {
+                last = Some(sample.price);
+                sampled = true;
+            }
+            if sampled {
+                grid.observed = grid.observed.saturating_add(1);
+            }
+            if let Some(price) = last {
+                run.push(price);
+            }
         }
-        if sampled {
-            observed = observed.saturating_add(1);
-        }
-        if let Some(price) = last {
-            grid.push(price);
+        if !run.is_empty() {
+            grid.runs.push(run);
         }
     }
-    Ok((grid, observed))
+    Ok(grid)
+}
+
+/// The samples inside `window`. `prices` is in chronological order.
+fn samples_in<'a>(prices: &'a [PriceSample], window: &TimeWindow) -> &'a [PriceSample] {
+    let from = prices.partition_point(|s| s.timestamp_ms < window.start_ms);
+    let to = prices.partition_point(|s| s.timestamp_ms < window.end_ms);
+    prices.get(from..to).unwrap_or_default()
 }
 
 /// Longest silence allowed by the configuration.
@@ -957,25 +1140,28 @@ fn gap_limit_ms(config: &WalkForwardConfig) -> MMResult<u64> {
         .or_overflow("price gap limit")
 }
 
-/// Longest time without a sample, counting from the window's start to its end.
-fn longest_gap_ms(prices: &[PriceSample], window: &TimeWindow) -> MMResult<u64> {
+/// Longest time without a sample inside a part, counting from each part's
+/// start to its end.
+fn longest_gap_ms(prices: &[PriceSample], parts: &[TimeWindow]) -> MMResult<u64> {
     let mut longest = 0u64;
-    let mut previous = window.start_ms;
-    let times = prices
-        .iter()
-        .map(|s| s.timestamp_ms)
-        .chain(std::iter::once(window.end_ms));
-    for time in times {
-        let gap = time.checked_sub(previous).or_overflow("price gap")?;
-        longest = longest.max(gap);
-        previous = time;
+    for part in parts {
+        let mut previous = part.start_ms;
+        let times = samples_in(prices, part)
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .chain(std::iter::once(part.end_ms));
+        for time in times {
+            let gap = time.checked_sub(previous).or_overflow("price gap")?;
+            longest = longest.max(gap);
+            previous = time;
+        }
     }
     Ok(longest)
 }
 
-/// Relative volatility per √year of a regular grid.
+/// Relative volatility per √year of the returns of a regular grid.
 fn relative_volatility(
-    grid: &[Decimal],
+    returns: &[Decimal],
     resolution_ms: u64,
     rule: VolatilityRule,
 ) -> MMResult<Decimal> {
@@ -984,28 +1170,30 @@ fn relative_volatility(
         .or_overflow("grid steps per year")?;
     let estimator = VolatilityEstimator::with_annualization_factor(decimal_sqrt(steps_per_year)?);
     match rule {
-        VolatilityRule::Simple => estimator.calculate_simple(grid),
-        VolatilityRule::Ewma { lambda } => estimator.calculate_ewma(grid, lambda),
+        VolatilityRule::Simple => estimator.simple_of_returns(returns),
+        VolatilityRule::Ewma { lambda } => estimator.ewma_of_returns(returns, lambda),
     }
 }
 
 /// Absolute volatility realized on a test window, by the simple estimator
 /// whatever the training rule. `None` when the window's prices would not pass
-/// the training minimum or gap limit.
+/// the training minimum or gap limit, or give too few returns.
 fn realized_volatility(
     prices: &[PriceSample],
-    window: &TimeWindow,
+    parts: &[TimeWindow],
     config: &WalkForwardConfig,
 ) -> MMResult<Option<Decimal>> {
-    let (grid, observed) = grid_prices(prices, window, config.resolution_ms)?;
-    if observed < config.min_grid_prices || longest_gap_ms(prices, window)? > gap_limit_ms(config)?
+    let grid = grid_prices(prices, parts, config.resolution_ms)?;
+    if grid.observed < config.min_grid_prices
+        || longest_gap_ms(prices, parts)? > gap_limit_ms(config)?
     {
         return Ok(None);
     }
-    let Some(&last) = grid.last() else {
+    let returns = grid.log_returns()?;
+    let Some(last) = grid.last_price().filter(|_| returns.len() >= MIN_RETURNS) else {
         return Ok(None);
     };
-    relative_volatility(&grid, config.resolution_ms, VolatilityRule::Simple)?
+    relative_volatility(&returns, config.resolution_ms, VolatilityRule::Simple)?
         .checked_mul(last)
         .or_overflow("realized volatility")
         .map(Some)
@@ -1077,6 +1265,7 @@ impl BucketFit {
 /// bisection. Finally `A = Σ n / Σ T · exp(-k · d)` and `s_b = c_b / A`.
 fn fit_intensity(
     exposures: &[QuoteExposure],
+    closed: &[bool],
     config: &WalkForwardConfig,
 ) -> MMResult<Result<IntensityFit, CalibrationFailure>> {
     let mut cells: BTreeMap<(usize, Decimal), (u64, u64)> = BTreeMap::new();
@@ -1123,6 +1312,9 @@ fn fit_intensity(
     }
     for (bucket, (fit, fills)) in buckets.iter().zip(&bucket_fills).enumerate() {
         if fit.levels.is_empty() {
+            if closed.get(bucket).copied().unwrap_or(false) {
+                continue;
+            }
             return Ok(Err(CalibrationFailure::UnobservedSeasonalBucket { bucket }));
         }
         if *fills < config.min_bucket_fills {
@@ -1284,6 +1476,54 @@ fn bucket_of(timestamp_ms: u64, buckets: u32) -> MMResult<usize> {
     usize::try_from(index).map_err(|_| MMError::NumericalError(format!("bucket {index}")))
 }
 
+/// Which intraday buckets the window reaches only while closed. A bucket the
+/// window never reaches is unknown, not closed, and without sessions the one
+/// part is the window, so none is closed.
+fn closed_buckets(window: &TimeWindow, parts: &[TimeWindow], buckets: u32) -> MMResult<Vec<bool>> {
+    let count = usize::try_from(buckets)
+        .map_err(|_| MMError::InvalidConfiguration("too many buckets".to_string()))?;
+    let mut reached = vec![false; count];
+    mark_buckets(window, buckets, &mut reached)?;
+    let mut open = vec![false; count];
+    for part in parts {
+        mark_buckets(part, buckets, &mut open)?;
+    }
+    Ok(reached
+        .iter()
+        .zip(&open)
+        .map(|(reached, open)| *reached && !*open)
+        .collect())
+}
+
+/// Marks the intraday buckets that `interval` overlaps. `flags` has `buckets`
+/// positive entries.
+fn mark_buckets(interval: &TimeWindow, buckets: u32, flags: &mut [bool]) -> MMResult<()> {
+    // One day reaches every bucket.
+    let end_ms = interval
+        .end_ms
+        .min(interval.start_ms.saturating_add(MS_PER_DAY));
+    let mut time = interval.start_ms;
+    while time < end_ms {
+        let index = bucket_of(time, buckets)?;
+        *flags.get_mut(index).or_overflow("seasonality bucket")? = true;
+        // The first millisecond of the next bucket, or of the next day.
+        let next_bucket = u64::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_add(1))
+            .and_then(|i| i.checked_mul(MS_PER_DAY))
+            .map(|ms| ms.div_ceil(u64::from(buckets)))
+            .or_overflow("next intraday bucket")?;
+        let day_start = time
+            .checked_div(MS_PER_DAY)
+            .and_then(|day| day.checked_mul(MS_PER_DAY))
+            .or_overflow("day start")?;
+        time = day_start
+            .checked_add(next_bucket)
+            .or_overflow("next intraday bucket")?;
+    }
+    Ok(())
+}
+
 /// `|a - b|`.
 fn abs_diff(a: Decimal, b: Decimal) -> MMResult<Decimal> {
     a.checked_sub(b).map(|d| d.abs()).or_overflow("difference")
@@ -1291,7 +1531,11 @@ fn abs_diff(a: Decimal, b: Decimal) -> MMResult<Decimal> {
 
 /// FNV-1a 128 of the samples, independent of the scale of their decimals. It
 /// is the digest of the `kernel` feature, which this module does not require.
-fn window_hash(prices: &[PriceSample], exposures: &[QuoteExposure]) -> u128 {
+fn window_hash(
+    prices: &[PriceSample],
+    exposures: &[QuoteExposure],
+    sessions: &[TimeWindow],
+) -> u128 {
     let mut hash = FNV_OFFSET;
     for s in prices {
         hash = fnv(hash, &s.timestamp_ms.to_le_bytes());
@@ -1303,6 +1547,10 @@ fn window_hash(prices: &[PriceSample], exposures: &[QuoteExposure]) -> u128 {
         hash = fnv(hash, &e.exposure_ms.to_le_bytes());
         hash = fnv(hash, &e.fills.to_le_bytes());
     }
+    for s in sessions {
+        hash = fnv(hash, &s.start_ms.to_le_bytes());
+        hash = fnv(hash, &s.end_ms.to_le_bytes());
+    }
     hash
 }
 
@@ -1313,4 +1561,74 @@ pub(crate) fn fnv(hash: u128, bytes: &[u8]) -> u128 {
     bytes
         .iter()
         .fold(hash, |h, b| (h ^ u128::from(*b)).wrapping_mul(FNV_PRIME))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
+    use super::*;
+
+    /// Buckets holding some millisecond of the interval, by `bucket_of` itself.
+    fn scanned(interval: &TimeWindow, buckets: u32) -> Vec<bool> {
+        let mut flags = vec![false; buckets as usize];
+        for time in interval.start_ms..interval.end_ms {
+            flags[bucket_of(time, buckets).unwrap()] = true;
+        }
+        flags
+    }
+
+    fn marked(interval: &TimeWindow, buckets: u32) -> Vec<bool> {
+        let mut flags = vec![false; buckets as usize];
+        mark_buckets(interval, buckets, &mut flags).unwrap();
+        flags
+    }
+
+    #[test]
+    fn test_mark_buckets_inexact_width_matches_bucket_of_at_each_edge() {
+        // A seventh of a day is not a whole number of milliseconds.
+        let edge = MS_PER_DAY.div_ceil(7);
+        for (start_ms, end_ms) in [
+            (0, 1),
+            (0, edge),
+            (0, edge + 1),
+            (edge - 1, edge),
+            (edge - 1, edge + 1),
+            (edge, edge + 1),
+            (2 * edge - 2, 2 * edge + 2),
+        ] {
+            let interval = TimeWindow { start_ms, end_ms };
+            assert_eq!(marked(&interval, 7), scanned(&interval, 7), "{interval:?}");
+        }
+    }
+
+    #[test]
+    fn test_mark_buckets_crossing_midnight_wraps_to_the_first_buckets() {
+        let interval = TimeWindow {
+            start_ms: MS_PER_DAY - 1,
+            end_ms: MS_PER_DAY + 1,
+        };
+        let flags = marked(&interval, 24);
+        assert!(flags[23] && flags[0]);
+        assert_eq!(flags.iter().filter(|f| **f).count(), 2);
+    }
+
+    #[test]
+    fn test_mark_buckets_a_day_or_more_reaches_every_bucket() {
+        for span in [MS_PER_DAY, 400 * MS_PER_DAY] {
+            let interval = TimeWindow {
+                start_ms: 12_345,
+                end_ms: 12_345 + span,
+            };
+            assert!(marked(&interval, 1_440).iter().all(|f| *f));
+        }
+        // Just under a day from inside a bucket misses nothing either: the
+        // start bucket is reached again at its other edge.
+        let interval = TimeWindow {
+            start_ms: 3_600_000 + 1,
+            end_ms: 3_600_000 + MS_PER_DAY,
+        };
+        assert!(marked(&interval, 24).iter().all(|f| *f));
+    }
 }
