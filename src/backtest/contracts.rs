@@ -23,7 +23,10 @@
 //! another contract at the same time waits for a later tick.
 //!
 //! At one time, events run in this order: expiries, venue messages, settlements, report
-//! deliveries, observations. So nothing executes on a contract at its expiry.
+//! deliveries, a strategy's wake, observations. So nothing executes on a contract at its
+//! expiry. A strategy that must act at a time with no tick says so in
+//! [`ContractStrategy::next_wake_ms`], and every callback has the time of the decision in
+//! [`ContractView::now_ms`], which a report's or a tick's own time may be well behind.
 //!
 //! # Execution and delivery
 //!
@@ -117,6 +120,9 @@ use crate::types::fee::FeeAsset;
 /// The commands a run carries out at one time, past which they are a fault and are
 /// discarded: see the [module documentation](self).
 pub const MAX_COMMANDS_PER_INSTANT: u64 = 100_000;
+
+/// The faults taken from a strategy after one callback.
+pub const MAX_STRATEGY_FAULTS_PER_CALLBACK: usize = 64;
 
 /// Configuration of a [`ContractEngine`].
 #[derive(Debug, Clone)]
@@ -224,9 +230,16 @@ pub struct ContractFill {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContractView {
     positions: Vec<(InstrumentId, Decimal)>,
+    now_ms: u64,
 }
 
 impl ContractView {
+    /// The time of this decision, in milliseconds: when the event reached the strategy.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms
+    }
+
     /// The position on `contract`, in contracts.
     #[must_use]
     pub fn position(&self, contract: &InstrumentId) -> Decimal {
@@ -248,7 +261,11 @@ pub trait ContractStrategy {
     ) -> Vec<ContractCommand>;
 
     /// An order changed.
-    fn on_report(&mut self, _report: &ContractReport) -> Vec<ContractCommand> {
+    fn on_report(
+        &mut self,
+        _report: &ContractReport,
+        _view: &ContractView,
+    ) -> Vec<ContractCommand> {
         Vec::new()
     }
 
@@ -263,8 +280,29 @@ pub trait ContractStrategy {
         _contract: &InstrumentId,
         _price: &SettlementPrice,
         _contracts: Decimal,
+        _view: &ContractView,
     ) -> Vec<ContractCommand> {
         Vec::new()
+    }
+
+    /// When to call [`ContractStrategy::on_wake`], which the engine asks after each
+    /// callback and at the start of a run. A time before the clock, or one it already woke
+    /// the strategy at, is ignored. At the time itself it runs after the deliveries of
+    /// that time, so a report arriving then does not take its place.
+    fn next_wake_ms(&self) -> Option<u64> {
+        None
+    }
+
+    /// The time asked for in [`ContractStrategy::next_wake_ms`] came.
+    fn on_wake(&mut self, _view: &ContractView) -> Vec<ContractCommand> {
+        Vec::new()
+    }
+
+    /// What went wrong in the strategy, which the engine asks after each callback and
+    /// before its commands, as a fault: new orders then stop, and the run is not consistent.
+    /// At most [`MAX_STRATEGY_FAULTS_PER_CALLBACK`] are taken each time.
+    fn take_fault(&mut self) -> Option<MMError> {
+        None
     }
 
     /// Returns to the initial state.
@@ -439,6 +477,10 @@ pub struct ContractEngine<S: ContractStrategy, D: HistoricalDataSource, F: FillM
     awaiting_cancel: HashMap<SimOrderId, SimOrder>,
     deliveries: VecDeque<Delivery>,
     observed: VecDeque<(u64, usize, MarketTick)>,
+    /// The time the strategy asked to be woken at.
+    wake: Option<u64>,
+    /// The last time it was woken at, so that asking for it again does not repeat it.
+    woken_at: Option<u64>,
     view: ContractView,
     last_delivery_at: u64,
     last_observed_at: u64,
@@ -504,6 +546,8 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             awaiting_cancel: HashMap::new(),
             deliveries: VecDeque::new(),
             observed: VecDeque::new(),
+            wake: None,
+            woken_at: None,
             view: ContractView::default(),
             last_delivery_at: 0,
             last_observed_at: 0,
@@ -761,6 +805,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         self.awaiting_cancel.clear();
         self.deliveries.clear();
         self.observed.clear();
+        self.woken_at = None;
         self.view = ContractView::default();
         self.last_delivery_at = 0;
         self.last_observed_at = 0;
@@ -844,6 +889,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
                 (lane.id().clone(), position)
             })
             .collect();
+        self.ask_wake();
         Ok(())
     }
 
@@ -929,6 +975,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
                 self.pending.keys().next().map(|key| key.0),
                 self.settlements.keys().next().map(|key| key.0),
                 self.deliveries.front().map(|d| d.at),
+                self.wake,
                 self.observed.front().map(|(at, _, _)| *at),
             ];
             let Some((time, class)) = next_due(&times, until) else {
@@ -941,6 +988,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
                 1 => self.apply_next_venue_message(),
                 2 => self.settle_next(),
                 3 => self.deliver_next(),
+                4 => self.wake_strategy(at),
                 _ => self.observe_next(at),
             }
         }
@@ -1029,8 +1077,9 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             return;
         };
         let contract = lane.id().clone();
+        self.view.now_ms = at;
         let commands = self.strategy.on_tick(&contract, &tick, &self.view);
-        self.apply_commands(commands, at);
+        self.after_callback(commands, at);
     }
 
     fn match_active_orders(&mut self, index: usize, tick: &MarketTick, now: u64) {
@@ -1538,15 +1587,16 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         let Some(delivery) = self.deliveries.pop_front() else {
             return;
         };
-        let at = delivery.at;
+        let at = delivery.at.max(self.clock.now());
+        self.view.now_ms = at;
         match delivery.payload {
             Payload::Report(report, fill) => {
-                let commands = self.strategy.on_report(&report);
-                self.apply_commands(commands, at);
+                let commands = self.strategy.on_report(&report, &self.view);
+                self.after_callback(commands, at);
                 if let Some((dir, fill)) = fill {
                     self.see_fill(dir, &fill);
                     let commands = self.strategy.on_fill(&fill, &self.view);
-                    self.apply_commands(commands, at);
+                    self.after_callback(commands, at);
                 }
             }
             Payload::Settlement(index, price, contracts) => {
@@ -1561,10 +1611,41 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
                 {
                     *position = Decimal::ZERO;
                 }
-                let commands = self.strategy.on_settlement(&contract, &price, contracts);
-                self.apply_commands(commands, at);
+                let commands = self
+                    .strategy
+                    .on_settlement(&contract, &price, contracts, &self.view);
+                self.after_callback(commands, at);
             }
         }
+    }
+
+    fn wake_strategy(&mut self, at: u64) {
+        self.wake = None;
+        self.woken_at = Some(at);
+        self.view.now_ms = at;
+        let commands = self.strategy.on_wake(&self.view);
+        self.after_callback(commands, at);
+    }
+
+    /// What every callback leaves: its faults first, as they stop its commands.
+    fn after_callback(&mut self, commands: Vec<ContractCommand>, at: u64) {
+        for _ in 0..MAX_STRATEGY_FAULTS_PER_CALLBACK {
+            let Some(error) = self.strategy.take_fault() else {
+                break;
+            };
+            self.record_fault(error);
+        }
+        self.apply_commands(commands, at);
+        self.ask_wake();
+    }
+
+    fn ask_wake(&mut self) {
+        let now = self.clock.now();
+        let woken_at = self.woken_at;
+        self.wake = self
+            .strategy
+            .next_wake_ms()
+            .filter(|wake| *wake >= now && woken_at != Some(*wake));
     }
 
     /// A delivered fill moves what the strategy knows.

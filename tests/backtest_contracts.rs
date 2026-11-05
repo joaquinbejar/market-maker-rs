@@ -18,6 +18,7 @@ use market_maker_rs::Decimal;
 use market_maker_rs::backtest::contracts::{
     ContractCommand, ContractConfig, ContractEngine, ContractFill, ContractOrder, ContractReport,
     ContractRunResult, ContractStrategy, ContractView, MAX_COMMANDS_PER_INSTANT,
+    MAX_STRATEGY_FAULTS_PER_CALLBACK,
 };
 use market_maker_rs::backtest::engine::{
     BacktestConfig, BacktestStrategy, FeeCurrency, SlippageModel,
@@ -212,7 +213,7 @@ impl ContractStrategy for Script {
         step
     }
 
-    fn on_report(&mut self, report: &ContractReport) -> Vec<ContractCommand> {
+    fn on_report(&mut self, report: &ContractReport, _view: &ContractView) -> Vec<ContractCommand> {
         self.log.push(format!(
             "{:?} {} tag {}",
             report.report.kind,
@@ -237,6 +238,7 @@ impl ContractStrategy for Script {
         contract: &SpecId,
         price: &SettlementPrice,
         contracts: Decimal,
+        _view: &ContractView,
     ) -> Vec<ContractCommand> {
         self.log.push(format!(
             "settled {} at {} closing {contracts}",
@@ -958,6 +960,310 @@ fn a_cancel_that_crosses_a_fill_is_answered_and_is_no_fault() {
             ExecutionKind::Fill,
             ExecutionKind::CancelRejected
         ]
+    );
+}
+
+/// Wakes at the times it was given, and logs what it saw.
+#[derive(Debug, Default)]
+struct Wakes {
+    at: Vec<u64>,
+    seen: Vec<String>,
+    orders: Vec<ContractCommand>,
+}
+
+impl ContractStrategy for Wakes {
+    fn on_tick(
+        &mut self,
+        _contract: &SpecId,
+        tick: &MarketTick,
+        view: &ContractView,
+    ) -> Vec<ContractCommand> {
+        self.seen
+            .push(format!("tick {} at {}", tick.timestamp, view.now_ms()));
+        Vec::new()
+    }
+    fn on_report(&mut self, report: &ContractReport, view: &ContractView) -> Vec<ContractCommand> {
+        self.seen.push(format!(
+            "{:?} of {} at {}",
+            report.report.kind,
+            report.report.stamp.timestamp,
+            view.now_ms()
+        ));
+        Vec::new()
+    }
+    fn on_fill(&mut self, fill: &ContractFill, view: &ContractView) -> Vec<ContractCommand> {
+        self.seen
+            .push(format!("fill of {} at {}", fill.timestamp, view.now_ms()));
+        Vec::new()
+    }
+    fn on_settlement(
+        &mut self,
+        _contract: &SpecId,
+        price: &SettlementPrice,
+        _contracts: Decimal,
+        view: &ContractView,
+    ) -> Vec<ContractCommand> {
+        self.seen.push(format!(
+            "settled of {} at {}",
+            price.published_ms(),
+            view.now_ms()
+        ));
+        Vec::new()
+    }
+    fn next_wake_ms(&self) -> Option<u64> {
+        self.at.first().copied()
+    }
+    fn on_wake(&mut self, view: &ContractView) -> Vec<ContractCommand> {
+        self.seen.push(format!("wake at {}", view.now_ms()));
+        // Each entry is asked for until it is its turn, and a repeat is dropped.
+        while self.at.first().is_some_and(|at| *at <= view.now_ms()) {
+            self.at.remove(0);
+        }
+        std::mem::take(&mut self.orders)
+    }
+    fn reset(&mut self) {}
+}
+
+#[test]
+fn a_strategy_wakes_with_no_tick_and_each_callback_knows_the_time() {
+    let strategy = Wakes {
+        at: vec![15, 25],
+        orders: vec![order(1, near_id(), Action::Buy, dec!(100), dec!(1))],
+        ..Wakes::default()
+    };
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), strategy)
+        .with_contract(
+            near(),
+            data(vec![
+                tick(10, dec!(98), dec!(102)),
+                tick(30, dec!(98), dec!(100)),
+            ]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap()
+        .with_latency(SimLatencyConfig::new().with_ack_ms(100))
+        .unwrap();
+    let result = engine.run();
+    assert_eq!(result.num_trades, 1);
+    assert_eq!(
+        engine.strategy().seen,
+        vec![
+            "tick 10 at 10",
+            "wake at 15",
+            "wake at 25",
+            "tick 30 at 30",
+            "Accepted of 15 at 115",
+            "Fill of 30 at 130",
+            "fill of 30 at 130",
+        ]
+    );
+    assert!(result.is_consistent(), "{result:?}");
+}
+
+/// A report delivered at the time asked for does not take the wake's place, and it comes
+/// first.
+#[test]
+fn a_wake_at_the_time_of_a_delivery_runs_after_it() {
+    let strategy = Wakes {
+        at: vec![5, 110],
+        orders: vec![order(1, near_id(), Action::Buy, dec!(90), dec!(1))],
+        ..Wakes::default()
+    };
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), strategy)
+        .with_contract(
+            near(),
+            data(vec![
+                tick(10, dec!(98), dec!(102)),
+                tick(200, dec!(98), dec!(102)),
+            ]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap()
+        .with_latency(SimLatencyConfig::new().with_ack_ms(105))
+        .unwrap();
+    engine.run();
+    assert_eq!(
+        engine.strategy().seen,
+        vec![
+            "wake at 5",
+            "tick 10 at 10",
+            "Accepted of 5 at 110",
+            "wake at 110",
+            "tick 200 at 200",
+        ]
+    );
+}
+
+/// Keeps asking for one time, and then for one in the past.
+#[derive(Debug, Default)]
+struct KeepsAsking(u32);
+
+impl ContractStrategy for KeepsAsking {
+    fn on_tick(
+        &mut self,
+        _contract: &SpecId,
+        _tick: &MarketTick,
+        _view: &ContractView,
+    ) -> Vec<ContractCommand> {
+        Vec::new()
+    }
+    fn next_wake_ms(&self) -> Option<u64> {
+        Some(if self.0 == 0 { 5 } else { 1 })
+    }
+    fn on_wake(&mut self, _view: &ContractView) -> Vec<ContractCommand> {
+        self.0 += 1;
+        assert!(self.0 < 3, "woken again and again");
+        Vec::new()
+    }
+    fn reset(&mut self) {
+        self.0 = 0;
+    }
+}
+
+/// Keeps asking for the time it was woken at.
+#[derive(Debug, Default)]
+struct KeepsAskingSame(u32);
+
+impl ContractStrategy for KeepsAskingSame {
+    fn on_tick(
+        &mut self,
+        _contract: &SpecId,
+        _tick: &MarketTick,
+        _view: &ContractView,
+    ) -> Vec<ContractCommand> {
+        Vec::new()
+    }
+    fn next_wake_ms(&self) -> Option<u64> {
+        Some(5)
+    }
+    fn on_wake(&mut self, _view: &ContractView) -> Vec<ContractCommand> {
+        self.0 += 1;
+        assert!(self.0 < 3, "woken again and again");
+        Vec::new()
+    }
+    fn reset(&mut self) {
+        self.0 = 0;
+    }
+}
+
+#[test]
+fn a_time_already_woken_at_or_past_does_not_wake_again_until_a_reset() {
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), KeepsAsking::default())
+        .with_contract(
+            near(),
+            data(vec![tick(10, dec!(98), dec!(102))]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap();
+    engine.run();
+    assert_eq!(engine.strategy().0, 1);
+
+    let mut engine =
+        ContractEngine::new(config(dec!(0)), both_ledger(), KeepsAskingSame::default())
+            .with_contract(
+                near(),
+                data(vec![tick(10, dec!(98), dec!(102))]),
+                ImmediateFillModel::new(),
+            )
+            .unwrap();
+    engine.run();
+    assert_eq!(engine.strategy().0, 1);
+    engine.reset();
+    engine.run();
+    assert_eq!(engine.strategy().0, 1);
+}
+
+/// A time already past is ignored rather than repeated without end, and one past the data
+/// never comes unless a settlement takes the clock there.
+#[test]
+fn a_wake_not_after_the_clock_is_ignored_and_the_data_ending_stops_the_clock() {
+    // Asking for a time it already woke at, or one in the past, does nothing.
+    let strategy = Wakes {
+        at: vec![5, 5, 1],
+        ..Wakes::default()
+    };
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), strategy)
+        .with_contract(
+            near(),
+            data(vec![tick(10, dec!(98), dec!(102))]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap();
+    engine.run();
+    assert_eq!(engine.strategy().seen, vec!["wake at 5", "tick 10 at 10"]);
+
+    let strategy = Wakes {
+        at: vec![500],
+        ..Wakes::default()
+    };
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), strategy)
+        .with_contract(
+            near(),
+            data(vec![tick(10, dec!(98), dec!(102))]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap();
+    engine.run();
+    assert_eq!(engine.strategy().seen, vec!["tick 10 at 10"]);
+
+    let strategy = Wakes {
+        at: vec![500],
+        ..Wakes::default()
+    };
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), strategy)
+        .with_contract(
+            near(),
+            data(vec![tick(10, dec!(98), dec!(102))]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap()
+        .with_settlement(settlement(&near(), dec!(100), NEAR_MS))
+        .unwrap();
+    engine.run();
+    assert_eq!(
+        engine.strategy().seen,
+        vec!["tick 10 at 10", "wake at 500", "settled of 1000 at 1000"]
+    );
+}
+
+/// A strategy with more faults than one callback takes.
+#[derive(Debug, Default)]
+struct Faulty(u32);
+
+impl ContractStrategy for Faulty {
+    fn on_tick(
+        &mut self,
+        _contract: &SpecId,
+        _tick: &MarketTick,
+        _view: &ContractView,
+    ) -> Vec<ContractCommand> {
+        vec![order(1, near_id(), Action::Buy, dec!(90), dec!(1))]
+    }
+    fn take_fault(&mut self) -> Option<MMError> {
+        self.0 += 1;
+        Some(MMError::InvalidMarketState("always".to_string()))
+    }
+    fn reset(&mut self) {}
+}
+
+#[test]
+fn what_a_strategy_reports_is_a_fault_that_stops_its_own_commands_and_is_bounded() {
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), Faulty::default())
+        .with_contract(
+            near(),
+            data(vec![tick(10, dec!(98), dec!(102))]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap();
+    let result = engine.run();
+    assert!(!result.is_consistent());
+    assert_eq!(
+        engine.strategy().0,
+        MAX_STRATEGY_FAULTS_PER_CALLBACK as u32 + MAX_STRATEGY_FAULTS_PER_CALLBACK as u32
+    );
+    assert_eq!(
+        engine.execution_reports()[0].report.kind,
+        ExecutionKind::Rejected
     );
 }
 
@@ -2014,7 +2320,11 @@ impl ContractStrategy for Insists {
     ) -> Vec<ContractCommand> {
         self.again()
     }
-    fn on_report(&mut self, _report: &ContractReport) -> Vec<ContractCommand> {
+    fn on_report(
+        &mut self,
+        _report: &ContractReport,
+        _view: &ContractView,
+    ) -> Vec<ContractCommand> {
         self.reports += 1;
         self.again()
     }
@@ -2174,7 +2484,7 @@ impl ContractStrategy for OrderScript {
             order(self.2, contract.clone(), Action::Sell, ask_price, ask_size),
         ]
     }
-    fn on_report(&mut self, report: &ContractReport) -> Vec<ContractCommand> {
+    fn on_report(&mut self, report: &ContractReport, _view: &ContractView) -> Vec<ContractCommand> {
         self.3.push(format!(
             "{} {:?}",
             report.report.order_id, report.report.kind

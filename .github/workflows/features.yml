@@ -109,7 +109,7 @@ jobs:
         run: cargo test --no-default-features --features arbitrage --lib --test instruments_basis --test instruments_calendar --test instruments_roll --test instruments_roll_guard
 
       - name: Test the roll plan against a ledger
-        run: cargo test --no-default-features --features arbitrage,margin --test instruments_roll --test instruments_roll_guard
+        run: cargo test --no-default-features --features arbitrage,margin --test instruments_roll --test instruments_roll_guard --test backtest_roll
 
       # The margin-rs adapter is compiled only with both features.
       - name: Test the margin-rs instrument adapter

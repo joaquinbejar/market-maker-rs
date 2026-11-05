@@ -2,8 +2,8 @@
 //!
 //! [`RollGuard`] is a [`PretradePolicy`] for the window of a roll, for the live path
 //! ([`OrderManager::register_order_checked`](crate::execution::OrderManager::register_order_checked))
-//! and for direct callers. The backtest engine refuses a pretrade policy on a
-//! derivative run, and running a roll there is #199.
+//! and for direct callers. `BacktestEngine::with_instrument` refuses a pretrade policy,
+//! and `backtest::contracts::ContractEngine` takes this one, through `run::SharedRollGuard`.
 //!
 //! # The rules
 //!
