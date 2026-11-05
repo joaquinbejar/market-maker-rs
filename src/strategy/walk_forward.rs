@@ -715,8 +715,9 @@ pub struct CalibrationRecord {
     pub resolution_ms: u64,
     /// Caller's name for the dataset.
     pub dataset_id: String,
-    /// FNV-1a 128 of the samples inside the training interval, and of the
-    /// declared sessions clipped to it.
+    /// FNV-1a 128 of the samples inside the training interval and, with
+    /// sessions, of the sessions clipped to it and the intraday time each
+    /// exposure counts at.
     pub dataset_hash: u128,
     /// Price samples inside the interval.
     pub price_samples: usize,
@@ -780,15 +781,7 @@ pub fn calibrate_window(
         training: *window,
         resolution_ms: config.resolution_ms,
         dataset_id: dataset_id.to_string(),
-        dataset_hash: window_hash(
-            prices,
-            exposures,
-            if data.sessions.is_empty() {
-                &[]
-            } else {
-                &parts
-            },
-        ),
+        dataset_hash: window_hash(prices, exposures, &parts, data.sessions),
         price_samples: prices.len(),
         fills,
         exposure_ms,
@@ -1590,9 +1583,13 @@ fn abs_diff(a: Decimal, b: Decimal) -> MMResult<Decimal> {
 
 /// FNV-1a 128 of the samples, independent of the scale of their decimals. It
 /// is the digest of the `kernel` feature, which this module does not require.
+/// With sessions it covers what they decide inside the window: its open parts,
+/// and the intraday time of each exposure, which a session ending at the
+/// window's start can move.
 fn window_hash(
     prices: &[PriceSample],
     exposures: &[QuoteExposure],
+    parts: &[TimeWindow],
     sessions: &[TimeWindow],
 ) -> u128 {
     let mut hash = FNV_OFFSET;
@@ -1606,9 +1603,15 @@ fn window_hash(
         hash = fnv(hash, &e.exposure_ms.to_le_bytes());
         hash = fnv(hash, &e.fills.to_le_bytes());
     }
-    for s in sessions {
-        hash = fnv(hash, &s.start_ms.to_le_bytes());
-        hash = fnv(hash, &s.end_ms.to_le_bytes());
+    if sessions.is_empty() {
+        return hash;
+    }
+    for part in parts {
+        hash = fnv(hash, &part.start_ms.to_le_bytes());
+        hash = fnv(hash, &part.end_ms.to_le_bytes());
+    }
+    for e in exposures {
+        hash = fnv(hash, &intraday_time(sessions, e.timestamp_ms).to_le_bytes());
     }
     hash
 }

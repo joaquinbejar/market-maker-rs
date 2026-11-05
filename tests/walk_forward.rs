@@ -2041,6 +2041,48 @@ fn test_calibrate_window_session_touching_the_window_is_not_part_of_it() {
 }
 
 #[test]
+fn test_calibrate_window_session_ending_at_the_start_changes_the_hash_if_it_moves_a_stamp() {
+    // An exposure stamped at the window's start counts in the session that ended
+    // then, which is otherwise outside the window, so the hash must see it.
+    let inside = TimeWindow::new(DAY_MS + 9 * HOUR_MS, DAY_MS + 17 * HOUR_MS).unwrap();
+    let before = TimeWindow::new(DAY_MS - 60_000, DAY_MS).unwrap();
+    let p = session_prices(&[inside], 0.5);
+    let plain = session_exposures(&[inside]);
+    let mut stamped = plain.clone();
+    stamped.insert(
+        0,
+        QuoteExposure {
+            timestamp_ms: DAY_MS,
+            distance: dec!(0.1),
+            exposure_ms: 60_000,
+            fills: 2,
+        },
+    );
+    let window = TimeWindow::new(DAY_MS, 2 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 1);
+    let run = |e: &[QuoteExposure], s: &[TimeWindow]| {
+        calibrate_window(&in_sessions(&p, e, s), &window, &cfg, "d").unwrap()
+    };
+    let alone = run(&stamped, &[inside]);
+    let with_before = run(&stamped, &[before, inside]);
+    assert!(alone.parameters().unwrap().seasonality[0] > Decimal::ZERO);
+    assert_eq!(alone.parameters().unwrap().seasonality[23], Decimal::ZERO);
+    assert!(with_before.parameters().unwrap().seasonality[23] > Decimal::ZERO);
+    assert_eq!(
+        with_before.parameters().unwrap().seasonality[0],
+        Decimal::ZERO
+    );
+    assert_ne!(alone.dataset_hash, with_before.dataset_hash);
+
+    // Without such a stamp that session decides nothing, and neither record moves.
+    let cfg_day = config();
+    let unstamped = |s: &[TimeWindow]| {
+        calibrate_window(&in_sessions(&p, &plain, s), &window, &cfg_day, "d").unwrap()
+    };
+    assert_eq!(unstamped(&[before, inside]), unstamped(&[inside]));
+}
+
+#[test]
 fn test_calibrate_window_without_sessions_hashes_only_the_samples() {
     // FNV-1a 128 of the samples alone: records written before sessions existed
     // keep their hash.
