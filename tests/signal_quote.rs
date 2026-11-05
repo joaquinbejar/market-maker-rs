@@ -1409,3 +1409,47 @@ fn test_simulate_gated_the_terminal_time_cancels_what_rests() {
         ]
     );
 }
+
+#[cfg(feature = "margin")]
+#[test]
+fn test_simulate_gated_margin_policy_books_fills_and_cancels_cleanly() {
+    use margin_rs::ledger::Ledger;
+    use margin_rs::risk::{InstrumentLimits, RiskGate};
+    use margin_rs::{Asset, InstrumentId, SpotInstrument, TransferId};
+    use market_maker_rs::backtest::MarginAccount;
+    let quote = Asset::new("USDC").unwrap();
+    let base = Asset::new("BTC").unwrap();
+    let pair = InstrumentId::new("BTC-USDC").unwrap();
+    let mut ledger = Ledger::default();
+    ledger.register_asset(quote.clone(), 8).unwrap();
+    ledger.register_asset(base.clone(), 8).unwrap();
+    ledger
+        .register_instrument(
+            SpotInstrument::new(pair.clone(), base.clone(), quote.clone(), 4, 4).unwrap(),
+        )
+        .unwrap();
+    let mut gate = RiskGate::new(ledger);
+    gate.deposit(TransferId::new("quote").unwrap(), quote, dec!(100000))
+        .unwrap();
+    gate.deposit(TransferId::new("base").unwrap(), base, dec!(100))
+        .unwrap();
+    gate.set_limits(
+        &pair,
+        InstrumentLimits {
+            max_fee_rate: dec!(0.001),
+            ..InstrumentLimits::default()
+        },
+    )
+    .unwrap();
+    let account = MarginAccount::new(gate, pair).unwrap();
+    let mut policy = account.policy();
+    let run = simulate_gated(&gated_events(), &sim(), &caps(), None, &mut policy).unwrap();
+    assert!(run.report.fills > 0, "{:?}", run.report);
+    assert_eq!(run.report.gate_faults, 0);
+    assert!(account.errors().is_empty(), "{:?}", account.errors());
+    assert!(account.fault().is_none());
+    assert_eq!(
+        account.with_gate(|g| g.ledger().journal().len()),
+        run.fills.len()
+    );
+}
