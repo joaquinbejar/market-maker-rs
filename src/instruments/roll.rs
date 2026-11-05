@@ -1270,8 +1270,8 @@ mod ledger {
 
     /// The journal entry of a fill: under the identifier
     /// [`fill_execution`](crate::instruments::margin::fill_execution) gives, or under its
-    /// `exec_id` alone, as `backtest::contracts::ContractEngine` books them, if that entry
-    /// is on this contract.
+    /// `exec_id` alone, as `backtest::contracts::ContractEngine` books them, and only if
+    /// that entry is on this contract.
     fn entry_of<'a>(
         ledger: &'a Ledger,
         id: &margin_rs::InstrumentId,
@@ -1281,12 +1281,13 @@ mod ledger {
         let named = crate::instruments::margin::execution_id(instrument, exec_id)
             .ok()
             .and_then(|execution| ledger.execution_cashflow(&execution));
-        named.or_else(|| {
-            margin_rs::ExecutionId::new(exec_id)
-                .ok()
-                .and_then(|execution| ledger.execution_cashflow(&execution))
-                .filter(|entry| entry.instrument == *id)
-        })
+        named
+            .or_else(|| {
+                margin_rs::ExecutionId::new(exec_id)
+                    .ok()
+                    .and_then(|execution| ledger.execution_cashflow(&execution))
+            })
+            .filter(|entry| entry.instrument == *id)
     }
 
     impl RollPlan {

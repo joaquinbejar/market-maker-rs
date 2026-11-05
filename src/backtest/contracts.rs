@@ -286,7 +286,9 @@ pub trait ContractStrategy {
     }
 
     /// When to call [`ContractStrategy::on_wake`], which the engine asks after each
-    /// callback and at the start of a run. A time that is not after the clock is ignored.
+    /// callback and at the start of a run. A time before the clock, or one it already woke
+    /// the strategy at, is ignored. At the time itself it runs after the deliveries of
+    /// that time, so a report arriving then does not take its place.
     fn next_wake_ms(&self) -> Option<u64> {
         None
     }
@@ -477,6 +479,8 @@ pub struct ContractEngine<S: ContractStrategy, D: HistoricalDataSource, F: FillM
     observed: VecDeque<(u64, usize, MarketTick)>,
     /// The time the strategy asked to be woken at.
     wake: Option<u64>,
+    /// The last time it was woken at, so that asking for it again does not repeat it.
+    woken_at: Option<u64>,
     view: ContractView,
     last_delivery_at: u64,
     last_observed_at: u64,
@@ -543,6 +547,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
             deliveries: VecDeque::new(),
             observed: VecDeque::new(),
             wake: None,
+            woken_at: None,
             view: ContractView::default(),
             last_delivery_at: 0,
             last_observed_at: 0,
@@ -800,6 +805,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         self.awaiting_cancel.clear();
         self.deliveries.clear();
         self.observed.clear();
+        self.woken_at = None;
         self.view = ContractView::default();
         self.last_delivery_at = 0;
         self.last_observed_at = 0;
@@ -1615,6 +1621,7 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
 
     fn wake_strategy(&mut self, at: u64) {
         self.wake = None;
+        self.woken_at = Some(at);
         self.view.now_ms = at;
         let commands = self.strategy.on_wake(&self.view);
         self.after_callback(commands, at);
@@ -1634,7 +1641,11 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
 
     fn ask_wake(&mut self) {
         let now = self.clock.now();
-        self.wake = self.strategy.next_wake_ms().filter(|wake| *wake > now);
+        let woken_at = self.woken_at;
+        self.wake = self
+            .strategy
+            .next_wake_ms()
+            .filter(|wake| *wake >= now && woken_at != Some(*wake));
     }
 
     /// A delivered fill moves what the strategy knows.

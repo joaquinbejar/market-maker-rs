@@ -8,7 +8,9 @@
 //! Every fill, rejection, cancellation and settlement of the near contract goes to the
 //! plan. It sends nothing the plan did not ask for, and it does not quote.
 //!
-//! Only a plan that has seen no event yet is run: one in progress is a fault and no order.
+//! Only a plan that has seen no event yet, for the positions the ledger holds at the start
+//! on both legs, is run: anything else is a fault and no order, as selling what is not held
+//! would flip a position.
 //!
 //! When the data ends nothing more can be sent, so a plan may end the run still working,
 //! which [`RollStrategy::plan`] shows.
@@ -271,11 +273,21 @@ impl RollStrategy {
     }
 
     /// The first orders, if the plan can still send them.
-    fn start(&mut self) -> Vec<ContractCommand> {
+    fn start(&mut self, view: &ContractView) -> Vec<ContractCommand> {
         self.started = true;
         if !self.plan.history.is_empty() {
             self.fault("the plan has seen events already, so its attempts are not new".to_string());
             return Vec::new();
+        }
+        for leg in [RollLeg::Near, RollLeg::Far] {
+            let terms = self.plan.leg(leg);
+            let (planned, held) = (terms.start, view.position(terms.terms.spec().id()));
+            if planned != held {
+                self.fault(format!(
+                    "the plan starts at {planned} on the {leg:?} leg, and the ledger holds {held}"
+                ));
+                return Vec::new();
+            }
         }
         if self.now_ms >= self.plan.deadline_ms {
             self.never_sent();
@@ -350,7 +362,8 @@ impl RollStrategy {
         }
         let (price, size) = match side {
             Action::Buy => (book.ask_price, book.ask_size),
-            _ => (book.bid_price, book.bid_size),
+            Action::Sell => (book.bid_price, book.bid_size),
+            other => return Err(format!("an unwind on {other}")),
         };
         if price <= Decimal::ZERO {
             return Err(format!(
@@ -452,7 +465,7 @@ impl ContractStrategy for RollStrategy {
         if self.started {
             return Vec::new();
         }
-        self.start()
+        self.start(view)
     }
 
     fn on_report(&mut self, report: &ContractReport, view: &ContractView) -> Vec<ContractCommand> {
@@ -465,48 +478,53 @@ impl ContractStrategy for RollStrategy {
         };
         self.see_time(view.now_ms());
         let at_ms = self.now_ms;
-        let (kind, remaining) = (report.report.kind, report.report.remaining);
-        match (owned.attempt, kind) {
-            (Some(attempt), ExecutionKind::Rejected) => self.apply(&RollEvent::Rejected {
-                leg: owned.leg,
-                attempt,
-                at_ms,
-            }),
-            (Some(attempt), ExecutionKind::Canceled) => self.apply(&RollEvent::CancelAck {
-                leg: owned.leg,
-                attempt,
-                cum_contracts: report.report.cumulative_quantity,
-                at_ms,
-            }),
-            (None, ExecutionKind::Rejected) => {
+        let remaining = report.report.remaining;
+        match report.report.kind {
+            ExecutionKind::Rejected => {
+                if let Some(attempt) = owned.attempt {
+                    return self.apply(&RollEvent::Rejected {
+                        leg: owned.leg,
+                        attempt,
+                        at_ms,
+                    });
+                }
                 self.fault(format!("an unwind of the {:?} leg was rejected", owned.leg));
-                Vec::new()
             }
-            (None, ExecutionKind::Canceled) if remaining > Decimal::ZERO => {
-                self.fault(format!(
-                    "an unwind of the {:?} leg was cancelled with {remaining} left",
-                    owned.leg
-                ));
-                Vec::new()
+            ExecutionKind::Canceled => {
+                if let Some(attempt) = owned.attempt {
+                    return self.apply(&RollEvent::CancelAck {
+                        leg: owned.leg,
+                        attempt,
+                        cum_contracts: report.report.cumulative_quantity,
+                        at_ms,
+                    });
+                }
+                if remaining > Decimal::ZERO {
+                    self.fault(format!(
+                        "an unwind of the {:?} leg was cancelled with {remaining} left",
+                        owned.leg
+                    ));
+                }
             }
-            (attempt, ExecutionKind::Accepted)
-                if self
+            ExecutionKind::Accepted => {
+                let reduced = self
                     .asked
                     .get(&report.tag)
-                    .is_some_and(|asked| remaining < *asked) =>
-            {
-                if attempt.is_some() {
+                    .is_some_and(|asked| remaining < *asked);
+                if reduced && owned.attempt.is_some() {
                     self.reduced.insert(report.tag, remaining);
-                } else {
+                } else if reduced {
                     self.fault(format!(
                         "an unwind of the {:?} leg was reduced to {remaining}",
                         owned.leg
                     ));
                 }
-                Vec::new()
             }
-            _ => Vec::new(),
+            // A fill reaches the plan in its own callback, and a cancel that came too
+            // late changes nothing it does not hear from that fill.
+            ExecutionKind::PartialFill | ExecutionKind::Fill | ExecutionKind::CancelRejected => {}
         }
+        Vec::new()
     }
 
     fn on_fill(&mut self, fill: &ContractFill, view: &ContractView) -> Vec<ContractCommand> {
@@ -569,7 +587,8 @@ impl ContractStrategy for RollStrategy {
     }
 
     fn next_wake_ms(&self) -> Option<u64> {
-        (self.started && self.now_ms < self.plan.deadline_ms).then_some(self.plan.deadline_ms)
+        // The engine wakes it once, and ignores this once the time has passed.
+        self.started.then_some(self.plan.deadline_ms)
     }
 
     fn on_wake(&mut self, view: &ContractView) -> Vec<ContractCommand> {

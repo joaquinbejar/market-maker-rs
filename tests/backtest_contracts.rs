@@ -1015,7 +1015,10 @@ impl ContractStrategy for Wakes {
     }
     fn on_wake(&mut self, view: &ContractView) -> Vec<ContractCommand> {
         self.seen.push(format!("wake at {}", view.now_ms()));
-        self.at.remove(0);
+        // Each entry is asked for until it is its turn, and a repeat is dropped.
+        while self.at.first().is_some_and(|at| *at <= view.now_ms()) {
+            self.at.remove(0);
+        }
         std::mem::take(&mut self.orders)
     }
     fn reset(&mut self) {}
@@ -1059,10 +1062,124 @@ fn a_strategy_wakes_with_no_tick_and_each_callback_knows_the_time() {
 
 /// A time already past is ignored rather than repeated without end, and one past the data
 /// never comes unless a settlement takes the clock there.
+/// A report delivered at the time asked for does not take the wake's place, and it comes
+/// first.
+#[test]
+fn a_wake_at_the_time_of_a_delivery_runs_after_it() {
+    let strategy = Wakes {
+        at: vec![5, 110],
+        orders: vec![order(1, near_id(), Action::Buy, dec!(90), dec!(1))],
+        ..Wakes::default()
+    };
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), strategy)
+        .with_contract(
+            near(),
+            data(vec![
+                tick(10, dec!(98), dec!(102)),
+                tick(200, dec!(98), dec!(102)),
+            ]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap()
+        .with_latency(SimLatencyConfig::new().with_ack_ms(105))
+        .unwrap();
+    engine.run();
+    assert_eq!(
+        engine.strategy().seen,
+        vec![
+            "wake at 5",
+            "tick 10 at 10",
+            "Accepted of 5 at 110",
+            "wake at 110",
+            "tick 200 at 200",
+        ]
+    );
+}
+
+/// Keeps asking for one time, and then for one in the past.
+#[derive(Debug, Default)]
+struct KeepsAsking(u32);
+
+impl ContractStrategy for KeepsAsking {
+    fn on_tick(
+        &mut self,
+        _contract: &SpecId,
+        _tick: &MarketTick,
+        _view: &ContractView,
+    ) -> Vec<ContractCommand> {
+        Vec::new()
+    }
+    fn next_wake_ms(&self) -> Option<u64> {
+        Some(if self.0 == 0 { 5 } else { 1 })
+    }
+    fn on_wake(&mut self, _view: &ContractView) -> Vec<ContractCommand> {
+        self.0 += 1;
+        assert!(self.0 < 3, "woken again and again");
+        Vec::new()
+    }
+    fn reset(&mut self) {
+        self.0 = 0;
+    }
+}
+
+/// Keeps asking for the time it was woken at.
+#[derive(Debug, Default)]
+struct KeepsAskingSame(u32);
+
+impl ContractStrategy for KeepsAskingSame {
+    fn on_tick(
+        &mut self,
+        _contract: &SpecId,
+        _tick: &MarketTick,
+        _view: &ContractView,
+    ) -> Vec<ContractCommand> {
+        Vec::new()
+    }
+    fn next_wake_ms(&self) -> Option<u64> {
+        Some(5)
+    }
+    fn on_wake(&mut self, _view: &ContractView) -> Vec<ContractCommand> {
+        self.0 += 1;
+        assert!(self.0 < 3, "woken again and again");
+        Vec::new()
+    }
+    fn reset(&mut self) {
+        self.0 = 0;
+    }
+}
+
+#[test]
+fn a_time_already_woken_at_or_past_does_not_wake_again_until_a_reset() {
+    let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), KeepsAsking::default())
+        .with_contract(
+            near(),
+            data(vec![tick(10, dec!(98), dec!(102))]),
+            ImmediateFillModel::new(),
+        )
+        .unwrap();
+    engine.run();
+    assert_eq!(engine.strategy().0, 1);
+
+    let mut engine =
+        ContractEngine::new(config(dec!(0)), both_ledger(), KeepsAskingSame::default())
+            .with_contract(
+                near(),
+                data(vec![tick(10, dec!(98), dec!(102))]),
+                ImmediateFillModel::new(),
+            )
+            .unwrap();
+    engine.run();
+    assert_eq!(engine.strategy().0, 1);
+    engine.reset();
+    engine.run();
+    assert_eq!(engine.strategy().0, 1);
+}
+
 #[test]
 fn a_wake_not_after_the_clock_is_ignored_and_the_data_ending_stops_the_clock() {
+    // Asking for a time it already woke at, or one in the past, does nothing.
     let strategy = Wakes {
-        at: vec![5, 1],
+        at: vec![5, 5, 1],
         ..Wakes::default()
     };
     let mut engine = ContractEngine::new(config(dec!(0)), both_ledger(), strategy)

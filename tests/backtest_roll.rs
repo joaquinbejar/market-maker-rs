@@ -1134,6 +1134,58 @@ fn the_deadline_cancels_with_no_tick_at_that_time() {
     assert!(result.is_consistent(), "{result:?}");
 }
 
+/// A report delivered exactly at the deadline does not take the place of its wake, and the
+/// orders are cancelled before later ticks that would fill them.
+#[test]
+fn an_ack_at_the_deadline_cannot_suppress_the_deadline_wake() {
+    let ledger = usdt_ledger();
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let mut engine = engine_of(
+        ledger,
+        RollStrategy::new(plan, 100),
+        dec!(0),
+        vec![
+            tick(10, dec!(59000), dec!(59010)),
+            tick(950, dec!(61000), dec!(61020)),
+        ],
+        vec![tick(951, dec!(61980), dec!(62000))],
+    )
+    .with_latency(SimLatencyConfig::new().with_ack_ms(890))
+    .unwrap();
+    let result = engine.run();
+    assert_eq!(result.num_trades, 0);
+    assert!(result.is_consistent(), "{result:?}");
+    let canceled = engine
+        .execution_reports()
+        .iter()
+        .filter(|r| r.report.kind == market_maker_rs::backtest::ExecutionKind::Canceled)
+        .count();
+    assert_eq!(canceled, 2);
+}
+
+/// A fill delivered exactly at the deadline, with the far leg still live.
+#[test]
+fn a_fill_delivered_at_the_deadline_cannot_suppress_the_wake() {
+    let ledger = usdt_ledger();
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let mut engine = engine_of(
+        ledger,
+        RollStrategy::new(plan, 100),
+        dec!(0),
+        vec![
+            tick(10, dec!(60990), dec!(61010)),
+            tick(400, dec!(61000), dec!(61020)),
+        ],
+        vec![tick(950, dec!(61980), dec!(62000))],
+    )
+    .with_latency(SimLatencyConfig::new().with_ack_ms(500))
+    .unwrap();
+    let result = engine.run();
+    assert_eq!(result.num_trades, 1);
+    assert_eq!(result.trades[0].contract.as_str(), "NEAR");
+    assert_eq!(engine.strategy().plan().position(RollLeg::Far), dec!(0));
+}
+
 #[test]
 fn a_first_tick_past_the_deadline_sends_nothing_and_the_plan_ends() {
     let ledger = usdt_ledger();
@@ -1446,6 +1498,93 @@ fn a_reduced_unwind_is_a_fault() {
     .unwrap();
     let result = engine.run();
     faulted_with(&result, &engine, "was reduced to 4");
+}
+
+/// A plan for a position the ledger does not hold would flip it.
+#[test]
+fn a_plan_for_positions_the_ledger_does_not_hold_sends_nothing() {
+    // The ledger is long 5 of the near contract, and the plan says 10.
+    let ledger = opened(&near(), &far(), ["BTC", "USDT"], dec!(60000), dec!(5));
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let mut engine = engine_of(
+        ledger,
+        RollStrategy::new(plan, 100),
+        dec!(0),
+        full_near_ticks(),
+        full_far_ticks(),
+    );
+    let result = engine.run();
+    assert!(engine.execution_reports().is_empty());
+    assert_eq!(result.num_trades, 0);
+    faulted_with(&result, &engine, "the ledger holds 5");
+
+    // The ledger holds something on the far contract that the plan does not know of.
+    let mut ledger = usdt_ledger();
+    ledger
+        .book_execution_allowing_overdraft(
+            &Execution::new(
+                ExecutionId::new("held").unwrap(),
+                InstrumentId::new("FAR").unwrap(),
+                Action::Buy,
+                dec!(60000),
+                dec!(1),
+            )
+            .with_executed_at(1),
+            None,
+        )
+        .unwrap();
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let mut engine = engine_of(
+        ledger,
+        RollStrategy::new(plan, 100),
+        dec!(0),
+        full_near_ticks(),
+        full_far_ticks(),
+    );
+    let result = engine.run();
+    assert!(engine.execution_reports().is_empty());
+    faulted_with(&result, &engine, "the Far leg, and the ledger holds 1");
+}
+
+/// A fill's identifier, however it is written, stands only for an entry on its contract.
+#[test]
+fn reconcile_refuses_a_named_entry_on_another_contract() {
+    let ledger = usdt_ledger();
+    let plan = plan_on(&ledger, RollFailurePolicy::Abort);
+    let far_fill = roll_fill_of(
+        &far(),
+        RollLeg::Far,
+        Some(0),
+        "x",
+        Action::Buy,
+        dec!(62000),
+        dec!(10),
+        30,
+    );
+    let mut ledger = ledger;
+    ledger
+        .book_execution_allowing_overdraft(
+            &Execution::new(
+                ExecutionId::new("3:FAR:x").unwrap(),
+                InstrumentId::new("NEAR").unwrap(),
+                Action::Buy,
+                dec!(62000),
+                dec!(10),
+            )
+            .with_executed_at(30),
+            None,
+        )
+        .unwrap();
+    let mut plan = plan;
+    plan.apply(&RollEvent::Fill(far_fill)).unwrap();
+    let reconciled = plan.reconcile(&ledger).unwrap();
+    assert!(
+        reconciled.discrepancies.iter().any(|d| matches!(
+            d,
+            market_maker_rs::instruments::roll::RollDiscrepancy::MissingInLedger { .. }
+        )),
+        "{reconciled:?}"
+    );
 }
 
 /// A fill booked under the identifier `fill_execution` gives on another contract does not

@@ -22,8 +22,11 @@ project follows [Semantic Versioning](https://semver.org/).
   `instruments::roll::run::RollStrategy` runs a `RollPlan` on `ContractEngine`, with a
   `SharedRollGuard` as its policy, and agrees with the same plan booked directly in a
   ledger. The plan does not price an unwind, so it crosses that leg's latest observed
-  book, within an age the caller gives, or it is a fault. New provided
-  `ContractStrategy::take_fault`.
+  book, within an age the caller gives, or it is a fault. A plan for positions the
+  ledger does not hold is a fault and sends nothing. New `ContractView::now_ms`, the
+  time of a decision, on every `ContractStrategy` callback, and new provided
+  `ContractStrategy::next_wake_ms`, `on_wake` and `take_fault`, with
+  `MAX_STRATEGY_FAULTS_PER_CALLBACK`.
 - The net result of a calendar spread under an assumed exit (feature `arbitrage`,
   #202): `instruments::calendar::evaluate_calendar` buys one linear dated future and
   sells another of the same underlying. As two futures do not converge to each other,
