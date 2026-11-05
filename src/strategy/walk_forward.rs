@@ -54,6 +54,14 @@
 //! `max_gap_buckets` to pass it deflates the volatility with those zero
 //! returns. Computing returns across sampled buckets only is a follow-up.
 //!
+//! # Forecasts out of support
+//!
+//! A fit extrapolates to distances it never saw, and `A · s(t)` can pass the
+//! range of `Decimal`. [`walk_forward`] then reports that fold's intensity as
+//! out of support, in [`OutOfSampleError::intensity_out_of_support`], and keeps
+//! the other folds. The score is left out rather than saturated, since a
+//! capped rate would read as a plausible number.
+//!
 //! # Example
 //!
 //! ```
@@ -475,8 +483,16 @@ impl CalibratedParameters {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::NumericalError`] when the rate is not representable.
+    /// Returns [`MMError::NumericalError`] when the rate is above the range of
+    /// `Decimal`, or on arithmetic failure.
     pub fn rate_per_second(&self, distance: Decimal, timestamp_ms: u64) -> MMResult<Decimal> {
+        let rate = self.rate_f64(distance, timestamp_ms)?;
+        representable_rate(rate)
+            .ok_or_else(|| MMError::NumericalError(format!("{rate} is not a decimal")))
+    }
+
+    /// `λ(δ)` before any rounding to `Decimal`.
+    fn rate_f64(&self, distance: Decimal, timestamp_ms: u64) -> MMResult<f64> {
         let base = intensity_f64(self.intensity_scale_a, self.order_intensity_k, distance)?;
         let buckets = u32::try_from(self.seasonality.len())
             .ok()
@@ -487,7 +503,7 @@ impl CalibratedParameters {
             .get(bucket_of(timestamp_ms, buckets)?)
             .copied()
             .or_overflow("seasonality bucket")?;
-        rate_decimal(base * to_f64(multiplier)?)
+        Ok(base * to_f64(multiplier)?)
     }
 }
 
@@ -660,8 +676,23 @@ pub struct OutOfSampleError {
     /// depends only on the data. Lower is better, it may be negative, and it
     /// compares models on one window only. A predicted rate below 1e-12 fills
     /// per second counts as 1e-12, so a fill at rate zero costs a large finite
-    /// amount. `None` without test exposure.
+    /// amount. `None` without test exposure, or when
+    /// [`Self::intensity_out_of_support`] is set.
     pub intensity: Option<Decimal>,
+    /// First test exposure whose predicted rate is above the range of
+    /// `Decimal`, which leaves the window without an intensity score.
+    pub intensity_out_of_support: Option<OutOfSupportForecast>,
+}
+
+/// A test exposure whose predicted rate cannot be scored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct OutOfSupportForecast {
+    /// Time the exposure ended, in milliseconds.
+    pub timestamp_ms: u64,
+    /// Distance from the reference price, in price units.
+    pub distance: Decimal,
 }
 
 /// One walk-forward fold.
@@ -702,6 +733,18 @@ impl WalkForwardReport {
             .filter(|f| {
                 f.calibrated
                     .is_some_and(|e| e.volatility.is_some() || e.intensity.is_some())
+            })
+            .count()
+    }
+
+    /// Returns the folds whose calibrated intensity forecast is out of support.
+    #[must_use]
+    pub fn out_of_support_folds(&self) -> usize {
+        self.folds
+            .iter()
+            .filter(|f| {
+                f.calibrated
+                    .is_some_and(|e| e.intensity_out_of_support.is_some())
             })
             .count()
     }
@@ -768,14 +811,10 @@ pub fn walk_forward(
         let realized = realized_volatility(prices, &split.test, config)?;
         let calibrated = record
             .parameters()
-            .map(|p| {
-                score(p.volatility, realized, exposures, |d, t| {
-                    p.rate_per_second(d, t)
-                })
-            })
+            .map(|p| score(p.volatility, realized, exposures, |d, t| p.rate_f64(d, t)))
             .transpose()?;
         let constant_error = score(constant.volatility, realized, exposures, |d, _| {
-            intensity(constant.intensity_scale_a, constant.order_intensity_k, d)
+            intensity_f64(constant.intensity_scale_a, constant.order_intensity_k, d)
         })?;
 
         let (k_change, volatility_change) = match (&previous, record.parameters()) {
@@ -1156,7 +1195,7 @@ fn score(
     volatility: Decimal,
     realized: Option<Decimal>,
     exposures: &[QuoteExposure],
-    rate: impl Fn(Decimal, u64) -> MMResult<Decimal>,
+    rate: impl Fn(Decimal, u64) -> MMResult<f64>,
 ) -> MMResult<OutOfSampleError> {
     let volatility = realized.map(|r| abs_diff(volatility, r)).transpose()?;
 
@@ -1164,7 +1203,17 @@ fn score(
     let mut total_seconds = 0.0f64;
     for e in exposures {
         let seconds = to_f64(Decimal::from(e.exposure_ms))? / 1_000.0;
-        let per_second = to_f64(rate(e.distance, e.timestamp_ms)?)?.max(SCORE_RATE_FLOOR);
+        let Some(forecast) = representable_rate(rate(e.distance, e.timestamp_ms)?) else {
+            return Ok(OutOfSampleError {
+                volatility,
+                intensity: None,
+                intensity_out_of_support: Some(OutOfSupportForecast {
+                    timestamp_ms: e.timestamp_ms,
+                    distance: e.distance,
+                }),
+            });
+        };
+        let per_second = to_f64(forecast)?.max(SCORE_RATE_FLOOR);
         let expected = per_second * seconds;
         likelihood += expected - to_f64(Decimal::from(e.fills))? * expected.ln();
         total_seconds += seconds;
@@ -1177,12 +1226,8 @@ fn score(
     Ok(OutOfSampleError {
         volatility,
         intensity,
+        intensity_out_of_support: None,
     })
-}
-
-/// `A · exp(-k · δ)` as a `Decimal`.
-fn intensity(a: Decimal, k: Decimal, distance: Decimal) -> MMResult<Decimal> {
-    rate_decimal(intensity_f64(a, k, distance)?)
 }
 
 /// `A · exp(-k · δ)` in `f64`. A huge `A` and a tiny `exp` must meet before
@@ -1205,12 +1250,13 @@ fn from_f64(value: f64) -> MMResult<Decimal> {
         .ok_or_else(|| MMError::NumericalError(format!("{value} is not a decimal")))
 }
 
-/// A rate as a `Decimal`. A result below the resolution of `Decimal` is zero.
-fn rate_decimal(rate: f64) -> MMResult<Decimal> {
+/// A rate as a `Decimal`. A result below the resolution of `Decimal` is zero,
+/// and `None` means it is above the range.
+fn representable_rate(rate: f64) -> Option<Decimal> {
     if rate < RATE_ZERO_BELOW {
-        return Ok(Decimal::ZERO);
+        return Some(Decimal::ZERO);
     }
-    from_f64(rate)
+    Decimal::from_f64(rate)
 }
 
 /// A finite, strictly positive `f64` as a `Decimal`, if it stays positive.
