@@ -12,6 +12,7 @@ use market_maker_rs::backtest::queue_reactive::*;
 use market_maker_rs::dec;
 use market_maker_rs::prelude::Decimal;
 use market_maker_rs::strategy::walk_forward::TimeWindow;
+use market_maker_rs::types::error::MMError;
 
 const CAP: usize = 12;
 
@@ -1434,4 +1435,140 @@ mod decoding {
         let mut restored = QrSimulator::from_state(params(), state).unwrap();
         assert_eq!(sim.step().unwrap(), restored.step().unwrap());
     }
+}
+
+fn sized(timestamp_ms: u64, depth: u8, size: Decimal) -> SizedEvent {
+    SizedEvent {
+        timestamp_ms,
+        depth,
+        size,
+    }
+}
+
+fn size_window() -> TimeWindow {
+    TimeWindow::new(100, 200).unwrap()
+}
+
+#[test]
+fn test_event_sizes_are_the_mean_per_limit_inside_the_window() {
+    let events = [
+        sized(99, 0, dec!(1000)),
+        sized(100, 0, dec!(1)),
+        sized(110, 1, dec!(10)),
+        sized(120, 0, dec!(2)),
+        sized(199, 1, dec!(20)),
+        sized(200, 0, dec!(1000)),
+    ];
+    let record = estimate_event_sizes(&events, &size_window(), 2, 2).unwrap();
+    assert_eq!(record.sizes, Ok(vec![dec!(1.5), dec!(15)]));
+    assert_eq!(record.events, [2, 2]);
+    assert_eq!(record.excluded_events, 0);
+}
+
+#[test]
+fn test_event_sizes_a_later_event_does_not_change_the_record() {
+    let mut events = vec![sized(100, 0, dec!(1))];
+    let first = estimate_event_sizes(&events, &size_window(), 1, 1).unwrap();
+    events.push(sized(200, 0, dec!(5)));
+    assert_eq!(
+        first,
+        estimate_event_sizes(&events, &size_window(), 1, 1).unwrap()
+    );
+    events.insert(1, sized(150, 0, dec!(5)));
+    let other = estimate_event_sizes(&events, &size_window(), 1, 1).unwrap();
+    assert_ne!(first.dataset_hash, other.dataset_hash);
+    // The scale of a decimal does not name another dataset.
+    let scaled = [sized(100, 0, dec!(1.00))];
+    assert_eq!(
+        first.dataset_hash,
+        estimate_event_sizes(&scaled, &size_window(), 1, 1)
+            .unwrap()
+            .dataset_hash
+    );
+}
+
+#[test]
+fn test_event_sizes_leave_out_what_is_not_a_size_at_a_limit() {
+    let events = [
+        sized(100, 0, dec!(0)),
+        sized(101, 0, dec!(-3)),
+        sized(102, 2, dec!(9)),
+        sized(103, 0, dec!(4)),
+        sized(104, 1, dec!(6)),
+    ];
+    let record = estimate_event_sizes(&events, &size_window(), 2, 1).unwrap();
+    assert_eq!(record.excluded_events, 3);
+    assert_eq!(record.sizes, Ok(vec![dec!(4), dec!(6)]));
+}
+
+#[test]
+fn test_event_sizes_a_thin_limit_names_itself() {
+    let events = [
+        sized(100, 0, dec!(1)),
+        sized(101, 0, dec!(1)),
+        sized(102, 1, dec!(1)),
+    ];
+    let record = estimate_event_sizes(&events, &size_window(), 2, 2).unwrap();
+    assert_eq!(
+        record.sizes,
+        Err(QrFailure::TooFewSizedEvents {
+            depth: 1,
+            have: 1,
+            need: 2,
+        })
+    );
+    // At the minimum exactly, it is enough.
+    assert!(
+        estimate_event_sizes(&events, &size_window(), 2, 1)
+            .unwrap()
+            .sizes
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_event_sizes_refuse_bad_settings_order_and_overflow() {
+    let ok = [sized(100, 0, dec!(1))];
+    for (limits, min) in [(0, 1), (MAX_LIMITS as u8 + 1, 1), (1, 0)] {
+        assert!(matches!(
+            estimate_event_sizes(&ok, &size_window(), limits, min),
+            Err(MMError::InvalidConfiguration(_))
+        ));
+    }
+    assert!(estimate_event_sizes(&ok, &size_window(), MAX_LIMITS as u8, 1).is_ok());
+    let unordered = [sized(101, 0, dec!(1)), sized(100, 0, dec!(1))];
+    assert!(matches!(
+        estimate_event_sizes(&unordered, &size_window(), 1, 1),
+        Err(MMError::InvalidMarketState(_))
+    ));
+    let huge = [sized(100, 0, Decimal::MAX), sized(101, 0, Decimal::MAX)];
+    assert!(matches!(
+        estimate_event_sizes(&huge, &size_window(), 1, 1),
+        Err(MMError::NumericalError(_))
+    ));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_event_size_record_serde_round_trip_both_outcomes() {
+    let events = [sized(100, 0, dec!(1.5))];
+    for min in [1, 2] {
+        let record = estimate_event_sizes(&events, &size_window(), 1, min).unwrap();
+        assert_eq!(record.sizes.is_ok(), min == 1);
+        let json = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            serde_json::from_str::<EventSizeRecord>(&json).unwrap(),
+            record
+        );
+    }
+}
+
+#[test]
+fn test_event_sizes_the_hash_covers_the_size() {
+    let hash = |size| {
+        estimate_event_sizes(&[sized(100, 0, size)], &size_window(), 1, 1)
+            .unwrap()
+            .dataset_hash
+    };
+    assert_ne!(hash(dec!(1)), hash(dec!(2)));
 }
