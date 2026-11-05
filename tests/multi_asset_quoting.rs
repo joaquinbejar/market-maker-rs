@@ -921,24 +921,26 @@ fn test_quote_through_the_reference_is_reported_and_still_stands() {
 }
 
 #[test]
-fn test_quote_new_quoter_on_a_used_gate_logs_duplicates_and_loses_nothing() {
+fn test_quote_new_quoter_on_a_used_gate_does_not_collide_with_the_earlier_orders() {
     let mut gate = gate(1);
     let mut first = quoter(1, dec!(0), AMPLE);
-    assert_eq!(
-        first.quote(&mut gate, &marks(1), 1).unwrap().quotes.len(),
-        2
-    );
+    let earlier = first.quote(&mut gate, &marks(1), 1).unwrap();
+    assert_eq!(earlier.quotes.len(), 2);
     let mut second = quoter(1, dec!(0), AMPLE);
     let round = second.quote(&mut gate, &marks(1), 2).unwrap();
-    assert!(round.quotes.is_empty());
-    for constraint in &round.constraints {
-        assert!(matches!(
-            &constraint.kind,
-            ConstraintKind::MarginRejected { reasons }
-                if reasons[0] == RiskReason::DuplicateOrderId
-        ));
+    assert_eq!(round.quotes.len(), 2, "{:?}", round.constraints);
+    assert!(round.constraints.is_empty());
+    for (old, new) in earlier.quotes.iter().zip(&round.quotes) {
+        assert_ne!(old.order_id, new.order_id);
     }
-    assert_eq!(gate.live_orders().count(), 2, "the first quotes stand");
+    assert_eq!(
+        gate.live_orders().count(),
+        4,
+        "the earlier quotes still stand"
+    );
+    // The first quoter resumes past the ids the second one used.
+    let again = first.quote(&mut gate, &marks(1), 3).unwrap();
+    assert_eq!(again.quotes.len(), 2, "{:?}", again.constraints);
 }
 
 #[test]

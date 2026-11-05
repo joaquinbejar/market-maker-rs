@@ -257,10 +257,9 @@ struct SpotView {
 /// deposit itself is outside the model: it carries price risk that the quotes do
 /// not skew for and the limits do not see.
 ///
-/// Order ids are `ma-<round>-<asset>-<side>`, with rounds counted per quoter. A new
-/// quoter on a gate an earlier one used repeats them: the gate rejects those orders
-/// as duplicates and the round logs it, so nothing is lost silently, but nothing
-/// quotes either until the rounds pass the earlier ones.
+/// Order ids are `ma-<round>-<asset>-<side>`. A round number the gate has already
+/// seen is skipped, so a new quoter on a used gate, after a restart for instance,
+/// does not collide with the orders of an earlier one.
 ///
 /// # Examples
 ///
@@ -620,8 +619,7 @@ impl MultiAssetQuoter {
             &mut constraints,
         )?;
 
-        let round = self.next_round;
-        self.next_round = self.next_round.saturating_add(1);
+        let round = self.free_round(gate, &sized)?;
         let mut quotes = Vec::with_capacity(sized.len());
         for candidate in sized {
             let order_id = Self::order_id(round, &candidate)?;
@@ -702,6 +700,23 @@ impl MultiAssetQuoter {
                 &Self::live_orders(gate, &spots)?,
             )?,
         })
+    }
+
+    /// The next round whose order ids the gate has not seen, for these sides.
+    fn free_round(&mut self, gate: &RiskGate, sized: &[Candidate]) -> MMResult<u64> {
+        loop {
+            let round = self.next_round;
+            self.next_round = round.saturating_add(1);
+            let mut used = false;
+            for candidate in sized {
+                used = used || gate.order(&Self::order_id(round, candidate)?).is_some();
+            }
+            // At the end of the range the ids cannot be told apart any more, and
+            // the gate rejects the duplicates, which the round then logs.
+            if !used || round == u64::MAX {
+                return Ok(round);
+            }
+        }
     }
 
     fn order_id(round: u64, candidate: &Candidate) -> MMResult<OrderId> {
