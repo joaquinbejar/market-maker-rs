@@ -2293,6 +2293,259 @@ fn test_calibrate_window_session_across_midnight_opens_both_days_buckets() {
     }
 }
 
+/// One exposure of a minute with fills, stamped at each session's end.
+fn exposures_at_the_close(sessions: &[TimeWindow], fills: u64) -> Vec<QuoteExposure> {
+    sessions
+        .iter()
+        .map(|s| QuoteExposure {
+            timestamp_ms: s.end_ms,
+            distance: dec!(0.1),
+            exposure_ms: 60_000,
+            fills,
+        })
+        .collect()
+}
+
+fn with_closing_exposures(sessions: &[TimeWindow], fills: u64) -> Vec<QuoteExposure> {
+    let mut e = session_exposures(sessions);
+    e.extend(exposures_at_the_close(sessions, fills));
+    e.sort_by_key(|x| x.timestamp_ms);
+    e
+}
+
+#[test]
+fn test_calibrate_window_exposure_at_the_close_keeps_the_closed_bucket_closed() {
+    let sessions = day_sessions(3);
+    let p = session_prices(&sessions, 0.5);
+    let window = TimeWindow::new(0, 3 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 30);
+
+    // A few fills at the close do not make the next hour a thin bucket.
+    let e = with_closing_exposures(&sessions, 2);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    let fit = record.parameters().unwrap();
+    assert_eq!(fit.seasonality[17], Decimal::ZERO);
+    assert!(fit.seasonality[16] > Decimal::ZERO);
+
+    // Nor do many give the closed hour a multiplier, and they count in the last.
+    let e = with_closing_exposures(&sessions, 20_000);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    let fit = record.parameters().unwrap();
+    assert_eq!(fit.seasonality[17], Decimal::ZERO);
+    assert!(fit.seasonality[16] > dec!(1.5) * fit.seasonality[15]);
+}
+
+#[test]
+fn test_calibrate_window_session_ending_inside_a_bucket_keeps_its_stamp_there() {
+    // The close at 17:30 is in the hour of 17:00 either way, and it stays open.
+    let sessions: Vec<_> = (0..2u64)
+        .map(|d| {
+            TimeWindow::new(
+                d * DAY_MS + 9 * HOUR_MS,
+                d * DAY_MS + 17 * HOUR_MS + 1_800_000,
+            )
+            .unwrap()
+        })
+        .collect();
+    let p = session_prices(&sessions, 0.5);
+    let e = with_closing_exposures(&sessions, 2);
+    let window = TimeWindow::new(0, 2 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 1);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    assert!(record.parameters().unwrap().seasonality[17] > Decimal::ZERO);
+}
+
+#[test]
+fn test_calibrate_window_stamp_at_adjacent_sessions_stays_in_the_later_one() {
+    // 09:00 to 12:00 and 12:00 to 17:00: the market does not close at noon, so
+    // an exposure stamped then is in the hour after it. No other exposure is.
+    let sessions: Vec<_> = (0..2u64)
+        .flat_map(|d| {
+            [
+                TimeWindow::new(d * DAY_MS + 9 * HOUR_MS, d * DAY_MS + 12 * HOUR_MS).unwrap(),
+                TimeWindow::new(d * DAY_MS + 12 * HOUR_MS, d * DAY_MS + 17 * HOUR_MS).unwrap(),
+            ]
+        })
+        .collect();
+    let p = session_prices(&sessions, 0.5);
+    let mut e = session_exposures(&sessions);
+    e.retain(|x| x.timestamp_ms % DAY_MS / HOUR_MS != 12);
+    for d in 0..2u64 {
+        for (level, fills) in [(dec!(0.1), 30), (dec!(0.3), 15)] {
+            e.push(QuoteExposure {
+                timestamp_ms: d * DAY_MS + 12 * HOUR_MS,
+                distance: level,
+                exposure_ms: 60_000,
+                fills,
+            });
+        }
+    }
+    e.sort_by_key(|x| x.timestamp_ms);
+    let window = TimeWindow::new(0, 2 * DAY_MS).unwrap();
+    let cfg = config().with_seasonality(24, 1);
+    let record = calibrate_window(&in_sessions(&p, &e, &sessions), &window, &cfg, "d").unwrap();
+    assert!(record.parameters().unwrap().seasonality[12] > Decimal::ZERO);
+}
+
+#[test]
+fn test_calibrate_window_without_sessions_a_stamp_stays_in_its_own_bucket() {
+    let p = prices(7, 0, DAY_MS, 60_000, 0.5);
+    let mut e = exposures(11, 0, DAY_MS / 2, 2.0, 3.0, |_| 1.0);
+    e.push(QuoteExposure {
+        timestamp_ms: DAY_MS / 2,
+        distance: dec!(0.1),
+        exposure_ms: 60_000,
+        fills: 0,
+    });
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let cfg = config().with_seasonality(2, 1).with_minima(30, 2, 1, 1);
+    assert_eq!(
+        calibrate_window(&CalibrationData::new(&p, &e).unwrap(), &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        CalibrationOutcome::Insufficient(CalibrationFailure::ThinSeasonalBucket {
+            bucket: 1,
+            have: 0,
+            need: 1,
+        })
+    );
+}
+
+#[test]
+fn test_walk_forward_exposure_at_the_close_scores_at_the_last_bucket() {
+    let sessions = day_sessions(2);
+    let p = session_prices(&sessions, 0.5);
+    let mut e = session_exposures(&sessions[..1]);
+    let close = sessions[1].end_ms;
+    e.push(QuoteExposure {
+        timestamp_ms: close,
+        distance: dec!(0.1),
+        exposure_ms: 60_000,
+        fills: 1,
+    });
+    let split = ChronologicalSplit {
+        train: TimeWindow::new(0, DAY_MS).unwrap(),
+        test: TimeWindow::new(DAY_MS, 2 * DAY_MS).unwrap(),
+    };
+    let cfg = config().with_seasonality(24, 1);
+    let report = walk_forward(
+        &in_sessions(&p, &e, &sessions),
+        &[split],
+        &cfg,
+        "d",
+        &constant(),
+    )
+    .unwrap();
+    let fit = report.folds[0].record.parameters().unwrap();
+    let rate = fit
+        .rate_per_second(dec!(0.1), close - 1)
+        .unwrap()
+        .to_f64()
+        .unwrap();
+    assert!(rate > 0.0);
+    let mu = rate * 60.0;
+    let expected = (mu - mu.ln()) / 60.0;
+    let score = report.folds[0]
+        .calibrated
+        .unwrap()
+        .intensity
+        .unwrap()
+        .to_f64()
+        .unwrap();
+    assert!((score - expected).abs() < 1e-6, "{score} {expected}");
+}
+
+#[test]
+fn test_walk_forward_bucket_closed_in_training_predicts_no_fills_at_a_visible_cost() {
+    // A half day in training, and a full day in the test.
+    let sessions = [
+        TimeWindow::new(9 * HOUR_MS, 13 * HOUR_MS).unwrap(),
+        TimeWindow::new(DAY_MS + 9 * HOUR_MS, DAY_MS + 17 * HOUR_MS).unwrap(),
+    ];
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let split = ChronologicalSplit {
+        train: TimeWindow::new(0, DAY_MS).unwrap(),
+        test: TimeWindow::new(DAY_MS, 2 * DAY_MS).unwrap(),
+    };
+    let cfg = config().with_seasonality(24, 1);
+    let report = walk_forward(
+        &in_sessions(&p, &e, &sessions),
+        &[split],
+        &cfg,
+        "d",
+        &constant(),
+    )
+    .unwrap();
+    let fold = &report.folds[0];
+    let fit = fold.record.parameters().unwrap();
+    assert_eq!(
+        fit.rate_per_second(dec!(0.1), DAY_MS + 15 * HOUR_MS)
+            .unwrap(),
+        Decimal::ZERO
+    );
+    // The fills of those open hours cost far more than a constant's error.
+    let calibrated = fold.calibrated.unwrap().intensity.unwrap();
+    let constant_score = fold.constant.intensity.unwrap();
+    assert!(
+        calibrated > constant_score + dec!(1),
+        "{calibrated} {constant_score}"
+    );
+}
+
+#[test]
+fn test_calibration_record_open_ms_says_how_much_was_open() {
+    let sessions = day_sessions(3);
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let data = in_sessions(&p, &e, &sessions);
+    let open_ms = |start, end| {
+        calibrate_window(&data, &TimeWindow::new(start, end).unwrap(), &config(), "d")
+            .unwrap()
+            .open_ms
+    };
+    assert_eq!(open_ms(0, 3 * DAY_MS), Some(24 * HOUR_MS));
+    // Clipped to the window at both ends.
+    assert_eq!(
+        open_ms(10 * HOUR_MS, DAY_MS + 12 * HOUR_MS),
+        Some(7 * HOUR_MS + 3 * HOUR_MS)
+    );
+    // Sessions were declared, and none was open: zero, not unknown.
+    assert_eq!(open_ms(18 * HOUR_MS, 20 * HOUR_MS), Some(0));
+    let plain = calibrate_window(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &TimeWindow::new(0, DAY_MS).unwrap(),
+        &config(),
+        "d",
+    )
+    .unwrap();
+    assert_eq!(plain.open_ms, None);
+}
+
+#[test]
+fn test_calibrate_window_at_the_end_of_the_clock_is_not_an_error() {
+    // The next intraday bucket does not fit in a u64, with or without sessions.
+    let window = TimeWindow::new(u64::MAX - 1_000, u64::MAX).unwrap();
+    let cfg = config().with_seasonality(24, 1);
+    let plain = CalibrationData::new(&[], &[]).unwrap();
+    let insufficient =
+        CalibrationOutcome::Insufficient(CalibrationFailure::TooFewPrices { have: 0, need: 30 });
+    assert_eq!(
+        calibrate_window(&plain, &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        insufficient
+    );
+    let sessions = [window];
+    let declared = plain.with_sessions(&sessions).unwrap();
+    assert_eq!(
+        calibrate_window(&declared, &window, &cfg, "d")
+            .unwrap()
+            .outcome,
+        insufficient
+    );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn test_calibration_record_serde_round_trip_is_identical() {
@@ -2310,5 +2563,37 @@ fn test_calibration_record_serde_round_trip_is_identical() {
     assert_eq!(
         serde_json::from_str::<CalibrationRecord>(&json).unwrap(),
         record
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_calibration_record_serde_keeps_open_ms_and_reads_older_records() {
+    let sessions = day_sessions(1);
+    let p = session_prices(&sessions, 0.5);
+    let e = session_exposures(&sessions);
+    let window = TimeWindow::new(0, DAY_MS).unwrap();
+    let declared =
+        calibrate_window(&in_sessions(&p, &e, &sessions), &window, &config(), "d").unwrap();
+    let json = serde_json::to_string(&declared).unwrap();
+    assert_eq!(
+        serde_json::from_str::<CalibrationRecord>(&json).unwrap(),
+        declared
+    );
+
+    // A record from before the field existed reads as having no sessions.
+    let plain = calibrate_window(
+        &CalibrationData::new(&p, &e).unwrap(),
+        &window,
+        &config(),
+        "d",
+    )
+    .unwrap();
+    let json = serde_json::to_string(&plain).unwrap();
+    let older = json.replace(",\"open_ms\":null", "");
+    assert_ne!(older, json);
+    assert_eq!(
+        serde_json::from_str::<CalibrationRecord>(&older).unwrap(),
+        plain
     );
 }

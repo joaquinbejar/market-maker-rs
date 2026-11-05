@@ -71,8 +71,14 @@
 //!   not per unit of clock time across a closure.
 //! - An intraday bucket with no exposure that the window reaches only while
 //!   closed gets a multiplier of 0, not a failure. `A` is then per second of
-//!   time at risk in the other buckets. An exposure counts in the bucket where
-//!   it ends, so one stamped exactly at a session's end may fall in the next.
+//!   time at risk in the other buckets. Such a bucket predicts no fills, also
+//!   if the market is open then later, such as training on a half day and
+//!   testing on a full one. The score's floor makes that a large, visible cost.
+//! - An exposure stamped exactly at a session's end counts in the session's
+//!   last intraday bucket, in training and in scoring, as a quote resting until
+//!   the close is not at risk once it has closed. If the next session starts
+//!   at that instant, it counts in that session.
+//! - [`CalibrationRecord::open_ms`] says how much of the window was open.
 //!
 //! # Forecasts out of support
 //!
@@ -584,7 +590,9 @@ pub struct CalibratedParameters {
 
 impl CalibratedParameters {
     /// Returns `λ(δ) = A · exp(-k · δ) · s(t)` in fills per second. A rate
-    /// below 1e-28, the resolution of `Decimal`, reads as zero.
+    /// below 1e-28, the resolution of `Decimal`, reads as zero, and so does a
+    /// time in an intraday bucket that was closed in training, whether or not
+    /// the market is open at `timestamp_ms`.
     ///
     /// # Errors
     ///
@@ -707,7 +715,8 @@ pub struct CalibrationRecord {
     pub resolution_ms: u64,
     /// Caller's name for the dataset.
     pub dataset_id: String,
-    /// FNV-1a 128 of the samples inside the training interval.
+    /// FNV-1a 128 of the samples inside the training interval, and of the
+    /// declared sessions clipped to it.
     pub dataset_hash: u128,
     /// Price samples inside the interval.
     pub price_samples: usize,
@@ -715,6 +724,11 @@ pub struct CalibrationRecord {
     pub fills: u64,
     /// Exposure inside the interval, in milliseconds.
     pub exposure_ms: u64,
+    /// Time the market was declared open inside the interval, in milliseconds.
+    /// When set, `volatility` is per √year of open time. `None` when no sessions
+    /// were declared, as in a record from before they existed: the market is
+    /// taken as always open, and the year is of clock time.
+    pub open_ms: Option<u64>,
     /// Estimated parameters, or why there are none.
     pub outcome: CalibrationOutcome,
 }
@@ -748,13 +762,14 @@ pub fn calibrate_window(
     let exposures = data.exposures_in(window);
     let parts = data.open_parts(window);
     let closed = closed_buckets(window, &parts, config.seasonality_buckets)?;
-    let (fills, exposure_ms) = exposure_totals(exposures)?;
+    let totals = exposure_totals(exposures)?;
+    let (fills, exposure_ms) = totals;
     let outcome = match estimate(
         prices,
         exposures,
-        fills,
-        exposure_ms,
+        totals,
         &parts,
+        data.sessions,
         &closed,
         config,
     )? {
@@ -777,6 +792,11 @@ pub fn calibrate_window(
         price_samples: prices.len(),
         fills,
         exposure_ms,
+        open_ms: if data.sessions.is_empty() {
+            None
+        } else {
+            Some(open_time_ms(&parts)?)
+        },
         outcome,
     })
 }
@@ -943,7 +963,11 @@ pub fn walk_forward(
         let realized = realized_volatility(prices, &data.open_parts(&split.test), config)?;
         let calibrated = record
             .parameters()
-            .map(|p| score(p.volatility, realized, exposures, |d, t| p.rate_f64(d, t)))
+            .map(|p| {
+                score(p.volatility, realized, exposures, |d, t| {
+                    p.rate_f64(d, intraday_time(data.sessions, t))
+                })
+            })
             .transpose()?;
         let constant_error = score(constant.volatility, realized, exposures, |d, _| {
             intensity_f64(constant.intensity_scale_a, constant.order_intensity_k, d)
@@ -982,9 +1006,9 @@ struct IntensityFit {
 fn estimate(
     prices: &[PriceSample],
     exposures: &[QuoteExposure],
-    fills: u64,
-    exposure_ms: u64,
+    (fills, exposure_ms): (u64, u64),
     parts: &[TimeWindow],
+    sessions: &[TimeWindow],
     closed: &[bool],
     config: &WalkForwardConfig,
 ) -> MMResult<Result<CalibratedParameters, CalibrationFailure>> {
@@ -1033,7 +1057,7 @@ fn estimate(
             need: config.min_fills,
         }));
     }
-    let fit = match fit_intensity(exposures, closed, config)? {
+    let fit = match fit_intensity(exposures, sessions, closed, config)? {
         Ok(fit) => fit,
         Err(failure) => return Ok(Err(failure)),
     };
@@ -1265,12 +1289,16 @@ impl BucketFit {
 /// bisection. Finally `A = Σ n / Σ T · exp(-k · d)` and `s_b = c_b / A`.
 fn fit_intensity(
     exposures: &[QuoteExposure],
+    sessions: &[TimeWindow],
     closed: &[bool],
     config: &WalkForwardConfig,
 ) -> MMResult<Result<IntensityFit, CalibrationFailure>> {
     let mut cells: BTreeMap<(usize, Decimal), (u64, u64)> = BTreeMap::new();
     for e in exposures {
-        let bucket = bucket_of(e.timestamp_ms, config.seasonality_buckets)?;
+        let bucket = bucket_of(
+            intraday_time(sessions, e.timestamp_ms),
+            config.seasonality_buckets,
+        )?;
         let cell = cells.entry((bucket, e.distance)).or_default();
         cell.0 = cell.0.checked_add(e.fills).or_overflow("level fills")?;
         cell.1 = cell
@@ -1476,6 +1504,35 @@ fn bucket_of(timestamp_ms: u64, buckets: u32) -> MMResult<usize> {
     usize::try_from(index).map_err(|_| MMError::NumericalError(format!("bucket {index}")))
 }
 
+/// Time the market is open in the parts of a window.
+fn open_time_ms(parts: &[TimeWindow]) -> MMResult<u64> {
+    parts.iter().try_fold(0u64, |total, part| {
+        part.end_ms
+            .checked_sub(part.start_ms)
+            .and_then(|span| total.checked_add(span))
+            .or_overflow("open time")
+    })
+}
+
+/// The time that places an exposure in an intraday bucket. An exposure stamped
+/// exactly at a session's end was at risk until then, so it counts in that
+/// session's last millisecond, unless the next session starts at that instant.
+fn intraday_time(sessions: &[TimeWindow], timestamp_ms: u64) -> u64 {
+    let ending = sessions.partition_point(|s| s.end_ms < timestamp_ms);
+    let closes_here = sessions
+        .get(ending)
+        .is_some_and(|s| s.end_ms == timestamp_ms);
+    let next_opens_here = ending
+        .checked_add(1)
+        .and_then(|next| sessions.get(next))
+        .is_some_and(|s| s.start_ms == timestamp_ms);
+    if closes_here && !next_opens_here {
+        timestamp_ms.saturating_sub(1)
+    } else {
+        timestamp_ms
+    }
+}
+
 /// Which intraday buckets the window reaches only while closed. A bucket the
 /// window never reaches is unknown, not closed, and without sessions the one
 /// part is the window, so none is closed.
@@ -1517,9 +1574,11 @@ fn mark_buckets(interval: &TimeWindow, buckets: u32, flags: &mut [bool]) -> MMRe
             .checked_div(MS_PER_DAY)
             .and_then(|day| day.checked_mul(MS_PER_DAY))
             .or_overflow("day start")?;
-        time = day_start
-            .checked_add(next_bucket)
-            .or_overflow("next intraday bucket")?;
+        // The clock may end before the next bucket does.
+        let Some(next) = day_start.checked_add(next_bucket) else {
+            break;
+        };
+        time = next;
     }
     Ok(())
 }

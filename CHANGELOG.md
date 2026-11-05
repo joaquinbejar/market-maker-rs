@@ -20,8 +20,10 @@ project follows [Semantic Versioning](https://semver.org/).
   stop neither fails a window nor dilutes the volatility with zero returns. The
   volatility is then per square root of a year of open time, which leaves the move
   across a closure out of it. A silence during a declared session is still a `PriceGap`.
-  An intraday bucket reached only while closed has a multiplier of 0. New
-  `CalibrationFailure::TooFewReturns`. Without sessions nothing changes. Checked on
+  An intraday bucket reached only while closed has a multiplier of 0, and an exposure
+  stamped at the close counts in the session's last bucket. New
+  `CalibrationFailure::TooFewReturns`, and `CalibrationRecord::open_ms` for the time
+  the market was declared open. Without sessions the results do not change. Checked on
   synthetic prices only: validation on real sessions is pending.
 - Several dated futures in one backtest run (features `margin` and `instruments`,
   #199): `backtest::contracts::ContractEngine` gives each contract its own data, fill
