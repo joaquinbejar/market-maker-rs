@@ -54,6 +54,8 @@ pub mod margin;
 /// Data types for market data.
 pub mod data;
 
+pub mod evaluation;
+
 /// Backtesting engine implementation.
 pub mod engine;
 
