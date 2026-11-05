@@ -50,6 +50,27 @@
 //! mark in force: a fill on a day with no marks counts on the earlier day that owns
 //! that mark.
 //!
+//! # Experiments
+//!
+//! [`Experiment`] holds one copy of the execution rules. A [`Candidate`] brings only a
+//! strategy built from the training ticks, so two candidates cannot differ in fees,
+//! fills, latency or windows. The steps consume each other:
+//!
+//! ```text
+//! Experiment::new -> evaluate_validation -> select -> run_holdout
+//! ```
+//!
+//! Each run gets a new strategy, fill model and policy, with seeds from the
+//! experiment, the window and the scenario, so the order of the candidates changes
+//! nothing. A run that does not reconcile, has an engine fault or stops early is a
+//! failed row with its reason, and the others go on. The experiment builds its own
+//! spot engine and takes no instrument, so an inverse contract cannot enter it.
+//!
+//! Sensitivity is the [`Scenario`]s after the first: every candidate runs under each
+//! of them on validation, and none on the holdout. The bootstrap uses the days with
+//! ticks only, and the same resampled days for every row, so a difference to a
+//! baseline is a paired one.
+//!
 //! # Limits
 //!
 //! A window starts flat and nothing carries over from another window. The input
@@ -59,6 +80,7 @@
 
 mod attribution;
 mod definitions;
+mod experiment;
 
 #[cfg(feature = "instruments")]
 pub use attribution::check_contract;
@@ -72,6 +94,13 @@ pub use attribution::{
 pub use definitions::{
     Aggregation, CapitalDenominator, Direction, MetricDefinition, MetricHorizon, MetricId,
     MetricUnit,
+};
+
+pub use experiment::{
+    BootstrapConfig, BootstrapOutcome, Candidate, CandidateKind, CandidateRecord, EvaluationRow,
+    Experiment, ExperimentConfig, HoldoutReport, Manifest, Provenance, RegimeLabeller, RowMetrics,
+    RowOutcome, Scenario, ScenarioRecord, Selection, SharedPolicy, Splits, ValidatedExperiment,
+    ValidationReport, WindowKind,
 };
 
 use crate::Decimal;

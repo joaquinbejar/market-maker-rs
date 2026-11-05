@@ -32,7 +32,7 @@ fn negated(mut value: Decimal) -> Decimal {
     value
 }
 
-fn sub(a: Decimal, b: Decimal, what: &'static str) -> EvalResult<Decimal> {
+pub(super) fn sub(a: Decimal, b: Decimal, what: &'static str) -> EvalResult<Decimal> {
     add(a, negated(b), what)
 }
 

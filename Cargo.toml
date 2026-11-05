@@ -143,6 +143,9 @@ name = "event_system"
 required-features = ["events"]
 
 [[example]]
+name = "baseline_evaluation"
+
+[[example]]
 name = "kernel_avellaneda"
 required-features = ["kernel"]
 
