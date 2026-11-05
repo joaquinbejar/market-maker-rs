@@ -1182,7 +1182,8 @@ impl<S: ContractStrategy, D: HistoricalDataSource, F: FillModel> ContractEngine<
         if amount.is_zero() {
             return Ok(amount);
         }
-        let id = format!("funding-{}-{at_ms}", lane.ledger_id.as_str());
+        // The lane, not the name: a valid name may be as long as an identifier can be.
+        let id = format!("funding-{index}-{at_ms}");
         let booked = self
             .ledger
             .book_funding(&FundingPayment {

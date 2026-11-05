@@ -34,9 +34,13 @@ const STEP: u64 = 28_800_000;
 const T0: u64 = 59_027 * STEP;
 
 fn perp(multiplier: Decimal) -> InstrumentSpec {
+    perp_named("PERP", multiplier)
+}
+
+fn perp_named(name: &str, multiplier: Decimal) -> InstrumentSpec {
     let asset = |code| AssetCode::new(code).unwrap();
     InstrumentSpec::new(InstrumentDraft {
-        id: SpecId::new("PERP").unwrap(),
+        id: SpecId::new(name).unwrap(),
         kind: ContractKind::Perpetual,
         margining: Margining::Linear,
         underlying: asset("BTC"),
@@ -398,7 +402,7 @@ fn funding_the_ledger_already_held_is_not_counted_again_and_a_clash_is_a_fault()
     assert_eq!(result.realized_pnl, dec!(0));
 
     // Another payment under the identifier this run would use.
-    let clash = format!("funding-PERP-{}", T0 + STEP);
+    let clash = format!("funding-0-{}", T0 + STEP);
     ledger.book_funding(&held(&clash, dec!(-1))).unwrap();
     let result = engine(ledger, Script::default(), terms(spec, points), &times).run();
     assert_eq!(result.fault_count, 1);
@@ -560,7 +564,7 @@ fn the_identical_payment_already_in_the_ledger_is_a_fault_not_a_free_instant() {
     seed(&mut ledger, "PERP", Action::Buy, dec!(60000), dec!(2));
     ledger
         .book_funding(&FundingPayment {
-            id: ExecutionId::new(format!("funding-PERP-{}", T0 + STEP)).unwrap(),
+            id: ExecutionId::new(format!("funding-0-{}", T0 + STEP)).unwrap(),
             instrument: InstrumentId::new("PERP").unwrap(),
             amount: dec!(-12),
             as_of_ms: T0 + STEP,
@@ -577,4 +581,21 @@ fn the_identical_payment_already_in_the_ledger_is_a_fault_not_a_free_instant() {
     assert_eq!(result.fault_count, 1);
     assert!(!result.is_consistent());
     assert_eq!(result.contracts[0].funding, dec!(0));
+}
+
+#[test]
+fn funding_books_for_the_longest_identifier_a_ledger_takes() {
+    let name = "P".repeat(64);
+    let spec = perp_named(&name, dec!(1));
+    let mut ledger = ledger_of(&spec, 8);
+    seed(&mut ledger, &name, Action::Buy, dec!(60000), dec!(2));
+    let result = engine(
+        ledger,
+        Script::default(),
+        terms(spec, fixture_points()),
+        &[T0, T0 + 3 * STEP],
+    )
+    .run();
+    assert!(result.is_consistent(), "{result:?}");
+    assert_eq!(result.total_funding, dec!(-30.5));
 }
