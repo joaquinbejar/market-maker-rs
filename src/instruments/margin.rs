@@ -293,6 +293,21 @@ pub fn fill_execution(spec: &InstrumentSpec, fill: &Fill) -> Result<Execution, A
     })
 }
 
+/// The scales of a registered derivative.
+pub(crate) fn registered_scales(instrument: &Instrument) -> Option<InstrumentScales> {
+    let (price_scale, contract_scale) = match instrument.linear_terms() {
+        Some(terms) => (terms.price_scale(), terms.contract_scale()),
+        None => {
+            let terms = instrument.inverse_terms()?;
+            (terms.price_scale(), terms.contract_scale())
+        }
+    };
+    Some(InstrumentScales {
+        price_scale,
+        contract_scale,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

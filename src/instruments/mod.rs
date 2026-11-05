@@ -10,12 +10,14 @@
 //! contract computes the same exact amounts.
 //!
 //! [`orders`](crate::instruments::orders) checks orders and fills against a
-//! specification. With the `margin` feature as well, the `margin` module
+//! specification, and [`futures`](crate::instruments::futures) follows a dated
+//! future through its expiry and settlement. With the `margin` feature as well, the `margin` module
 //! converts a specification into a `margin-rs` instrument and a fill into a
 //! `margin-rs` execution.
 
 pub use financial_types::instrument::*;
 
+pub mod futures;
 #[cfg(feature = "margin")]
 pub mod margin;
 pub mod orders;
