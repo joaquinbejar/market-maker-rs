@@ -135,7 +135,7 @@ Where:
 - `chain`: Option chain integration and multi-strike quoting (feature: `chain`)
 - `api`: REST/WebSocket API layer (feature: `api`)
 - `persistence`: Data persistence layer (feature: `persistence`)
-- `multi_underlying`: Multi-asset management (feature: `multi-underlying`)
+- `multi_underlying`: Multi-asset management and closed-form joint quotes (feature: `multi-underlying`; with `margin`, each quote through a `margin-rs` gate)
 - `events`: Event broadcasting system (feature: `events`)
 - `data_feeds`: Real-time market data feeds (feature: `data-feeds`)
 - `l3`: Order by order book reconstruction with a quality manifest and

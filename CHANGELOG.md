@@ -25,6 +25,14 @@ project follows [Semantic Versioning](https://semver.org/).
   `CalibrationFailure::TooFewReturns`, and `CalibrationRecord::open_ms` for the time
   the market was declared open. Without sessions the results do not change. Checked on
   synthetic prices only: validation on real sessions is pending.
+- Closed-form joint quotes for correlated assets (feature `multi-underlying`, #98):
+  `multi_underlying::multi_asset::MultiAssetModel` implements the asymptotic quotes of
+  section 3.3.3 of Bergault, Evangelista, Gueant and Vieira, arXiv:1810.04383v5, for
+  symmetric exponential intensities, with `RiskView::Diagonal` as the comparison without
+  correlations. With `margin` too, `MultiAssetQuoter` submits every quote to a
+  `margin-rs` `RiskGate`, shares one capital budget across instruments and reports the
+  cause of each active constraint. Spot instruments only. There is no option logic and
+  no hedging stage: a withheld side is reported and hedging is left to the caller.
 - Several dated futures in one backtest run (features `margin` and `instruments`,
   #199): `backtest::contracts::ContractEngine` gives each contract its own data, fill
   model and orders, on one clock and one `margin-rs` ledger, with one sided orders and
