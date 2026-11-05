@@ -190,6 +190,46 @@ fn overflow_error(what: &str) -> MMError {
     MMError::NumericalError(format!("{what} overflows"))
 }
 
+/// The `Decimal` of `mantissa * 10^-scale` if one holds it exactly, or `None`.
+fn exact_fit(mut mantissa: i128, mut scale: u32) -> Option<Decimal> {
+    loop {
+        if let Ok(value) = Decimal::try_from_i128_with_scale(mantissa, scale) {
+            return Some(value);
+        }
+        if mantissa % 10 != 0 {
+            return None;
+        }
+        mantissa /= 10;
+        scale = scale.checked_sub(1)?;
+    }
+}
+
+/// `a * b` if a `Decimal` holds it exactly, or `None`.
+///
+/// `Decimal::checked_mul` rounds a product with more than 28 decimal places.
+pub(crate) fn exact_product(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let (a, b) = (a.normalize(), b.normalize());
+    exact_fit(
+        a.mantissa().checked_mul(b.mantissa())?,
+        a.scale().checked_add(b.scale())?,
+    )
+}
+
+/// `a + b` if a `Decimal` holds it exactly, or `None`.
+///
+/// `Decimal::checked_add` rounds a sum that does not fit: `1e28 + 1e-28` loses the
+/// small term.
+pub(crate) fn exact_add(a: Decimal, b: Decimal) -> Option<Decimal> {
+    let (a, b) = (a.normalize(), b.normalize());
+    let scale = a.scale().max(b.scale());
+    let aligned = |value: Decimal| {
+        10_i128
+            .checked_pow(scale.checked_sub(value.scale())?)
+            .and_then(|factor| value.mantissa().checked_mul(factor))
+    };
+    exact_fit(aligned(a)?.checked_add(aligned(b)?)?, scale)
+}
+
 /// `numerator / denominator`, saturating at the `Decimal` bound of the
 /// quotient's sign when it overflows, and zero for a zero denominator.
 ///
@@ -380,6 +420,18 @@ mod tests {
         assert_eq!(decimal_to_u64_saturating(dec!(-3.5)), 0);
         assert_eq!(decimal_to_u64_saturating(dec!(-0.5)), 0);
         assert_eq!(decimal_to_u64_saturating(Decimal::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn test_exact_add_refuses_what_checked_add_rounds() {
+        assert_eq!(exact_add(dec!(1.5), dec!(2.25)), Some(dec!(3.75)));
+        assert_eq!(exact_add(dec!(1.5), dec!(-1.5)), Some(Decimal::ZERO));
+        let tiny = Decimal::new(1, 28);
+        let huge = Decimal::from(10_u64.pow(18));
+        assert_eq!(exact_add(tiny, tiny), Some(Decimal::new(2, 28)));
+        assert_eq!(exact_add(huge, tiny), None);
+        assert!(huge.checked_add(tiny).is_some());
+        assert_eq!(exact_add(Decimal::MAX, Decimal::ONE), None);
     }
 
     #[test]

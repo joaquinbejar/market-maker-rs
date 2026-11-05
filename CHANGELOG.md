@@ -8,6 +8,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Metric definitions and attribution for comparing strategies (#92):
+  `backtest::evaluation` measures one window from plain marks and fills, with no
+  engine types in its arithmetic. Net result is split into spread capture, inventory
+  and fees, exactly in `Decimal`: a sum that would round is an error, and
+  `Attribution::reconcile` compares the result with the books to the last digit.
+  Buckets by UTC day or by a caller's label sum exactly to the run. It reports signed
+  markout, realized and effective spread, price impact, fills, volume, time weighted
+  inventory and drawdown, each with a declared unit, sign, horizon and capital
+  denominator (`MetricId::definition`). It covers linear spot positions. Hedge costs
+  are reported as `HedgeCosts::NotModelled`, not as zero.
 - Several dated futures in one backtest run (features `margin` and `instruments`,
   #199): `backtest::contracts::ContractEngine` gives each contract its own data, fill
   model and orders, on one clock and one `margin-rs` ledger, with one sided orders and
