@@ -26,6 +26,7 @@ cargo run --example offline_rl_support
 cargo run --example consistent_time_travel
 cargo run --release --example quote_duration
 cargo run --release --features chain --example chain_pricing_evaluation -- <commit> <toolchain>
+cargo run --release --features options,margin,multi-underlying --example option_quoting
 ```
 
 ## Examples Overview

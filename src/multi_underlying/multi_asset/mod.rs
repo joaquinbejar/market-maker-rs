@@ -12,16 +12,27 @@
 //! feature too, `MultiAssetQuoter` turns them into quotes, each submitted to a
 //! `margin-rs` risk gate, and reports the cause of each active constraint.
 //!
-//! This covers linear exposures only. There is no option logic here, and with
-//! linear instruments the only Greek is the delta, which is the inventory.
+//! Those cover linear exposures, where the only Greek is the delta, which is the
+//! inventory. With `options` and `margin`, `OptionQuoter` runs the same model over
+//! option contracts, from their sensitivities to a declared factor covariance, and
+//! holds each quote in a `margin-rs` ledger under one budget. Option values come
+//! from the pricer, and none are computed here.
 
 mod matrix;
 mod model;
+#[cfg(all(feature = "options", feature = "margin"))]
+mod option_quoter;
 #[cfg(feature = "margin")]
 mod quoter;
 
 pub use model::{
     AssetQuotingParams, MAX_ASSETS, MultiAssetModel, QuoteOffsets, QuotingObjective, RiskView,
+};
+#[cfg(all(feature = "options", feature = "margin"))]
+pub use option_quoter::{
+    AdmittedOptionQuote, ContractTerms, FactorRisk, LimitedGreek, OptionCapital, OptionConstraint,
+    OptionConstraintKind, OptionFill, OptionMarket, OptionQuoteRound, OptionQuoter,
+    OptionQuoterConfig, RiskScenario, UnderlyingTerms,
 };
 #[cfg(feature = "margin")]
 pub use quoter::{

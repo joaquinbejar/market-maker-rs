@@ -126,8 +126,16 @@ project follows [Semantic Versioning](https://semver.org/).
   symmetric exponential intensities, with `RiskView::Diagonal` as the comparison without
   correlations. With `margin` too, `MultiAssetQuoter` submits every quote to a
   `margin-rs` `RiskGate`, shares one capital budget across instruments and reports the
-  cause of each active constraint. Spot instruments only. There is no option logic and
+  cause of each active constraint. Spot instruments only, with no option logic and
   no hedging stage: a withheld side is reported and hedging is left to the caller.
+- Joint option quotes (features `multi-underlying`, `options` and `margin`, #98):
+  `multi_underlying::multi_asset::OptionQuoter` turns each contract's delta and vega under a
+  declared factor covariance into the inputs of `MultiAssetModel`, so a hedged book is skewed less
+  than a concentrated one. Greek and scenario limits hold on every way live orders can fill, one
+  budget is shared across contracts, every quote holds a `margin-rs` ledger reservation, each change
+  to a side is logged with its cause, and a hedge is sized and reported. Capital for a sale is the
+  worst of declared scenarios, repriced by the pricer: an internal budget, not a venue's margin,
+  since `margin-rs` has no option instrument. Example `option_quoting`, on synthetic data.
 - Metric definitions and attribution for comparing strategies (#92):
   `backtest::evaluation` measures one window from plain marks and fills, with no
   engine types in its arithmetic. Net result is split into spread capture, inventory
