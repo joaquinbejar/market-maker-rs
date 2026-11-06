@@ -30,6 +30,9 @@ project follows [Semantic Versioning](https://semver.org/).
   an order like any other: the kernel's admission, gate and limits decide on it, and its cost
   reaches the reward only through the kernel's ledger. A hedge in another instrument is not
   modelled (#256). Checked on synthetic data only.
+- `backtest::evaluation::block_bootstrap` (#255): the harness's stationary block bootstrap of a
+  mean over a daily series, the one `Experiment` gives on the mean daily net result and on the
+  daily difference to a baseline, for runs that do not go through `Experiment`.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are
