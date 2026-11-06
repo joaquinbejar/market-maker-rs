@@ -708,3 +708,60 @@ fn test_in_the_engine_a_fill_before_the_cancel_takes_effect_stands_and_later_non
     // After the effect there is no order, and nothing is held.
     assert_eq!(run(1150), (dec!(0), dec!(0)));
 }
+
+#[test]
+fn test_new_refuses_a_model_in_another_currency() {
+    let spec = perpetual(dec!(0.01));
+    let built = DerivativeMarginAccount::new(
+        TieredLinearIm::linear_v1(Asset::new("BTC").unwrap(), 8).unwrap(),
+        RiskGate::new(ledger_for(&spec, dec!(1000))),
+        id(),
+        AccountId::new("a").unwrap(),
+        VenueId::new("v").unwrap(),
+        ReservationId::new("margin").unwrap(),
+    );
+    assert!(built.is_err());
+}
+
+#[test]
+fn test_a_refusal_for_margin_says_so_with_the_figures() {
+    let spec = perpetual(dec!(0.01));
+    let account = account(&spec, dec!(1000));
+    let mut policy = account.policy();
+    policy.on_market_data(dec!(60000), 0);
+    let PretradeDecision::Rejected { reason } = policy.check(&request("1", Action::Buy, dec!(17)))
+    else {
+        panic!("not refused");
+    };
+    assert!(reason.contains("InsufficientMargin"), "{reason}");
+    assert!(reason.contains("1020"), "{reason}");
+    assert_eq!(account.hold_shortfalls(), 0);
+}
+
+#[test]
+fn test_no_unit_of_cash_is_held_by_margin_and_a_spot_reservation() {
+    let spec = perpetual(dec!(0.01));
+    let mut ledger = ledger_for(&spec, dec!(1000));
+    // 500 of the cash is reserved for something else before the account starts.
+    ledger
+        .reserve(
+            margin_rs::ReservationId::new("other").unwrap(),
+            usdt(),
+            dec!(500),
+        )
+        .unwrap();
+    let account = account_from(ledger);
+    let mut policy = account.policy();
+    policy.on_market_data(dec!(60000), 0);
+    // 500 is left: 8 contracts ask 480, and 9 would ask 540.
+    assert!(
+        policy
+            .check(&request("1", Action::Buy, dec!(9)))
+            .is_rejected()
+    );
+    assert!(
+        !policy
+            .check(&request("2", Action::Buy, dec!(8)))
+            .is_rejected()
+    );
+}

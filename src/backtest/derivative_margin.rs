@@ -15,6 +15,9 @@
 //! It takes every mark as its own contract's, so it runs in `BacktestEngine::with_instrument`
 //! and `ContractEngine`, whose marks are of several contracts, refuses it.
 //!
+//! The policy needs `BacktestEngine::with_instrument` and this account's accountant: it books
+//! in contracts, which the engine's own bookkeeping does not.
+//!
 //! The service accepts or refuses an order, so a proposal beyond the margin is refused whole,
 //! never cut. A requirement that a mark move takes beyond the cash keeps the previous hold and
 //! is counted in [`DerivativeMarginAccount::hold_shortfalls`]. Nothing liquidates: funding,
@@ -24,7 +27,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use margin_rs::initial_margin::{InitialMarginModel, ProductKind};
+use margin_rs::initial_margin::{ExposurePosition, ExposureView, InitialMarginModel, ProductKind};
 use margin_rs::ledger::{Booking, Execution};
 use margin_rs::margin_reservations::{
     BookedFill, MarginDecision, MarginInstrument, MarginOrder, MarginReservationService,
@@ -127,7 +130,8 @@ impl<M: InitialMarginModel + Clone> DerivativeMarginAccount<M> {
     ///
     /// Returns [`MMError::InvalidConfiguration`] if `instrument` is not a future or a
     /// perpetual registered in the gate's ledger, if the ledger already holds an execution,
-    /// whose id a run could repeat, or if the service refuses its terms.
+    /// whose id a run could repeat, or if the service or the model refuses its terms, such
+    /// as a model in another currency.
     pub fn new(
         model: M,
         gate: RiskGate,
@@ -152,6 +156,20 @@ impl<M: InitialMarginModel + Clone> DerivativeMarginAccount<M> {
             return refuse("the ledger already holds executions");
         }
         let settlement = terms.settlement.clone();
+        model
+            .requirement(&ExposureView {
+                account: account.clone(),
+                venue: venue.clone(),
+                positions: vec![ExposurePosition {
+                    instrument: instrument.clone(),
+                    product: terms.product,
+                    settlement: settlement.clone(),
+                    contracts: Decimal::ONE,
+                    size: terms.size,
+                    mark: Decimal::ONE,
+                }],
+            })
+            .map_err(|e| config_error("model", e))?;
         let mut service = MarginReservationService::on_ledger(model, account, venue, hold.clone());
         service
             .register(instrument.clone(), terms)
@@ -252,12 +270,20 @@ impl<M: InitialMarginModel + Clone> Shared<M> {
     /// Sets the hold to the requirement now.
     fn sync_hold(&mut self) {
         let state = &mut self.state;
-        if state
+        match state
             .service
             .sync_hold(&mut state.gate, &self.hold, &state.marks)
-            .is_err()
         {
-            state.hold_shortfalls = state.hold_shortfalls.saturating_add(1);
+            Ok(_) => {}
+            Err(margin_rs::MarginError::InsufficientBalance { .. }) => {
+                state.hold_shortfalls = state.hold_shortfalls.saturating_add(1);
+            }
+            // Anything else is not about the cash, and new orders must not go on.
+            Err(error) => {
+                let error = MMError::InvalidPositionUpdate(format!("derivative hold: {error}"));
+                state.errors.push(error.to_string());
+                state.fault = Some(error);
+            }
         }
     }
 
