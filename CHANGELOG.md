@@ -29,6 +29,11 @@ project follows [Semantic Versioning](https://semver.org/).
   `BacktestStrategy::cancels_when_silent`, false by default, so other strategies do not
   change, and outside what the financial kernel reproduces when true. The intensity scale and
   the seasonality do not enter these quotes. Checked on synthetic processes only.
+- Example `quote_duration` (#110): holding a quote for a chosen time in the continuous causal
+  engine, against requoting at every tick, under several delays, with fills, cancels, markout
+  and inventory, and with race fixtures showing that a fill before the effective cancel stands.
+  Synthetic only, with no new public API. No teacher or predictor is learned, nothing here is a
+  batch market, and its delays are inputs, not measurements of a venue.
 - Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`
   takes a new `instruments::perpetual::PerpetualTerms`, with the declared rate and mark of
   each instant on the funding grid. Each instant books through the `margin-rs` ledger,
