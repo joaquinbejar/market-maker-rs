@@ -26,8 +26,8 @@ use std::ops::Range;
 
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::hawkes::{
-    HawkesEvent, HawkesFitConfig, HawkesParameters, HawkesSegment, HawkesSimulator, fit_hawkes,
-    fit_poisson, score_flow, select_decay,
+    DecayScore, HawkesEvent, HawkesFitConfig, HawkesParameters, HawkesSegment, HawkesSimulator,
+    fit_hawkes, fit_poisson, score_flow, select_decay,
 };
 use market_maker_rs::backtest::queue_reactive::QrEventKind;
 use market_maker_rs::dec;
@@ -284,12 +284,19 @@ fn arm_seeds(name: &str) -> Range<u64> {
     }
 }
 
-fn fitted() -> (HawkesParameters, HawkesParameters, HawkesParameters, f64) {
+/// The three fits, the decay chosen, and the scores it was chosen on.
+fn fitted() -> (
+    HawkesParameters,
+    HawkesParameters,
+    HawkesParameters,
+    f64,
+    Vec<DecayScore>,
+) {
     let (train, validation) = fit_seeds();
     let train = segments(&truth(), train);
     let validation = segments(&truth(), validation);
     let config = HawkesFitConfig::new(CAP as u32, vec![]).with_iterations(100);
-    let (_, best) = select_decay(&train, &validation, &DECAYS, &config).unwrap();
+    let (scores, best) = select_decay(&train, &validation, &DECAYS, &config).unwrap();
     let decay = DECAYS[best.unwrap()];
     let poisson = fit_poisson(&train, CAP as u32).unwrap();
     let qr = fit_hawkes(&train, &config).unwrap();
@@ -303,6 +310,7 @@ fn fitted() -> (HawkesParameters, HawkesParameters, HawkesParameters, f64) {
         qr.parameters().unwrap().clone(),
         hawkes.parameters().unwrap().clone(),
         decay,
+        scores,
     )
 }
 
@@ -578,7 +586,7 @@ fn test_the_arms_use_their_own_seeds_and_the_fits_stay_off_the_holdout() {
 
 #[test]
 fn test_each_arm_is_the_model_it_names() {
-    let (poisson, qr, hawkes, decay) = fitted();
+    let (poisson, qr, hawkes, decay, _) = fitted();
     assert!(DECAYS.contains(&decay));
     assert_eq!(poisson.branching_ratio(), 0.0);
     assert_eq!(qr.branching_ratio(), 0.0);
@@ -594,7 +602,7 @@ fn test_each_arm_is_the_model_it_names() {
 #[test]
 #[ignore = "fits the models and runs every arm"]
 fn test_market_order_rates_and_fills_through_the_mid() {
-    let (poisson, qr, hawkes, _) = fitted();
+    let (poisson, qr, hawkes, _, _) = fitted();
     for (name, params) in [
         ("data", &truth()),
         ("poisson", &poisson),
@@ -625,11 +633,129 @@ fn test_market_order_rates_and_fills_through_the_mid() {
     }
 }
 
+/// One row of the policy table: each metric, and its gap to the data but on the data's own row.
+fn policy_row(
+    policy: Policy,
+    name: &str,
+    branching: f64,
+    runs: &[Outcome],
+    data: &[Outcome],
+) -> String {
+    let picks: [fn(&Outcome) -> f64; 4] = [
+        |o| o.pnl,
+        |o| o.fills,
+        |o| o.abs_inventory,
+        |o| o.max_drawdown,
+    ];
+    let mut row = String::new();
+    for pick in picks {
+        let values: Vec<f64> = runs.iter().map(pick).collect();
+        let base: Vec<f64> = data.iter().map(pick).collect();
+        let (m, se) = (mean(&values), standard_error(&values));
+        row += &format!(" {m:.3} [{se:.3}] |");
+        if name == "data" {
+            row += " |";
+        } else {
+            let (gap, error) = paired_gap(&values, &base);
+            row += &format!(" {gap:.3} [{error:.3}] |");
+        }
+    }
+    format!("| {policy:?} | {name} | {branching:.3} |{row}")
+}
+
+#[test]
+fn test_a_policy_row_prints_each_metric_and_the_gap_with_its_sign() {
+    let outcome = |pnl, fills, abs_inventory, max_drawdown| Outcome {
+        pnl,
+        fills,
+        abs_inventory,
+        max_drawdown,
+        peak_inventory: Decimal::ZERO,
+        through_when_set: 0.0,
+    };
+    let data = [outcome(1.0, 10.0, 3.0, 5.0), outcome(3.0, 10.0, 3.0, 5.0)];
+    // The arm runs above the data on PnL and below on the rest, each by its own amount.
+    let arm = [outcome(4.0, 9.0, 2.5, 4.0), outcome(6.0, 9.0, 2.5, 4.0)];
+    let row = policy_row(Policy::Fixed, "qr", 0.25, &arm, &data);
+    let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+    assert_eq!(&cells[1..4], ["Fixed", "qr", "0.250"]);
+    assert!(cells[4].starts_with("5.000 "), "{}", cells[4]);
+    assert!(cells[5].starts_with("3.000 "), "{}", cells[5]);
+    assert!(cells[6].starts_with("9.000 "), "{}", cells[6]);
+    assert!(cells[7].starts_with("-1.000 "), "{}", cells[7]);
+    assert!(cells[8].starts_with("2.500 "), "{}", cells[8]);
+    assert!(cells[9].starts_with("-0.500 "), "{}", cells[9]);
+    assert!(cells[10].starts_with("4.000 "), "{}", cells[10]);
+    assert!(cells[11].starts_with("-1.000 "), "{}", cells[11]);
+    // The data has no gap to itself.
+    let own = policy_row(Policy::Fixed, "data", 0.25, &data, &data);
+    assert_eq!(own.split('|').map(str::trim).nth(5), Some(""));
+}
+
+#[test]
+fn test_the_fill_chance_is_read_at_the_mid_when_the_order_comes() {
+    // With the mid at 100.2 the bid of 99.95 is 0.25 away: e^-5 is under a draw of 0.1. From
+    // the mid when it was set it would be 0.05 away, and e^-1 is over it.
+    let mut draws = Scripted {
+        normals: [1.0].into(),
+        units: [0.1].into(),
+    };
+    let o = episode_with(
+        Policy::Fixed,
+        &at_times(&[100.0]),
+        &at_times(&[]),
+        &mut draws,
+    );
+    assert_eq!(o.fills, 0.0);
+}
+
+#[test]
+fn test_a_quote_the_mid_fell_through_after_it_was_set_is_not_through_when_set() {
+    // SIGMA * sqrt(100) * -10 = -2, so the mid is 98 under the bid of 99.95 at the order.
+    let mut draws = Scripted {
+        normals: [-10.0].into(),
+        ..Scripted::default()
+    };
+    let o = episode_with(
+        Policy::Fixed,
+        &at_times(&[100.0]),
+        &at_times(&[]),
+        &mut draws,
+    );
+    assert_eq!((o.fills, o.through_when_set), (1.0, 0.0));
+}
+
+#[test]
+fn test_fitted_trains_and_validates_on_its_own_seeds_and_uses_the_chosen_decay() {
+    let (poisson, qr, hawkes, decay, scores) = fitted();
+    let train = segments(&truth(), TRAIN);
+    let validation = segments(&truth(), VALIDATION);
+    let config = HawkesFitConfig::new(CAP as u32, vec![]).with_iterations(100);
+    let (expected, best) = select_decay(&train, &validation, &DECAYS, &config).unwrap();
+    // The same decay could win on other data, so the scores tell which data it was.
+    assert_eq!(scores, expected);
+    assert_eq!(decay, DECAYS[best.unwrap()]);
+    assert_eq!(poisson, fit_poisson(&train, CAP as u32).unwrap());
+    assert_eq!(
+        &qr,
+        fit_hawkes(&train, &config).unwrap().parameters().unwrap()
+    );
+    let with_decay = HawkesFitConfig::new(CAP as u32, vec![decay]).with_iterations(100);
+    assert_eq!(
+        &hawkes,
+        fit_hawkes(&train, &with_decay)
+            .unwrap()
+            .parameters()
+            .unwrap()
+    );
+    assert_eq!(hawkes.decays(), [decay]);
+}
+
 /// The evidence table. `--ignored --nocapture`, in release.
 #[test]
 #[ignore = "the study itself: slow without --release"]
 fn test_policy_comparison_evidence_table() {
-    let (poisson, qr, hawkes, decay) = fitted();
+    let (poisson, qr, hawkes, decay, _) = fitted();
     let holdout = segments(&truth(), DATA_HOLDOUT);
     println!("SYNTHETIC. decay {decay} chosen on validation. Flow fit, on holdout:");
     println!("| model | params | ll/event | aic |\n| --- | --- | --- | --- |");
@@ -650,12 +776,6 @@ fn test_policy_comparison_evidence_table() {
         "| policy | flow | branching | pnl | gap | fills | gap | abs inventory | gap | drawdown | gap |"
     );
     println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
-    let picks: [fn(&Outcome) -> f64; 4] = [
-        |o| o.pnl,
-        |o| o.fills,
-        |o| o.abs_inventory,
-        |o| o.max_drawdown,
-    ];
     for policy in [Policy::Fixed, Policy::AvellanedaStoikov] {
         let data = outcomes(policy, &truth(), arm_seeds("data"));
         for (name, params) in [
@@ -669,22 +789,9 @@ fn test_policy_comparison_evidence_table() {
             } else {
                 outcomes(policy, params, arm_seeds(name))
             };
-            let mut row = String::new();
-            for pick in picks {
-                let values: Vec<f64> = runs.iter().map(pick).collect();
-                let base: Vec<f64> = data.iter().map(pick).collect();
-                let (m, se) = (mean(&values), standard_error(&values));
-                row += &format!(" {m:.3} [{se:.3}] |");
-                if name == "data" {
-                    row += " |";
-                } else {
-                    let (gap, error) = paired_gap(&values, &base);
-                    row += &format!(" {gap:.3} [{error:.3}] |");
-                }
-            }
             println!(
-                "| {policy:?} | {name} | {:.3} |{row}",
-                params.branching_ratio()
+                "{}",
+                policy_row(policy, name, params.branching_ratio(), &runs, &data)
             );
         }
     }
