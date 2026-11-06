@@ -1244,3 +1244,31 @@ fn test_parse_time_ns_refuses_extra_parts_and_signs() {
         assert!(parse_time_ns(bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn test_a_level_going_below_zero_is_counted() {
+    // No consistent stream does this: a remaining size below zero is malformed, and this is the
+    // count that would show a size known wrongly.
+    let (statuses, mut diffs) = opening();
+    let negative = update(1, "B", "100", "2", "-1");
+    diffs.push(negative);
+    let mut replay = Replay::new(config(0));
+    replay.ingest(&statuses, &diffs, &[]).unwrap();
+    assert_eq!(replay.coverage().negative_levels, 1);
+    // A level that reaches exactly zero is no breach.
+    let (statuses, mut diffs) = opening();
+    diffs.push(remove(1, "B", "100"));
+    let mut replay = Replay::new(config(0));
+    replay.ingest(&statuses, &diffs, &[]).unwrap();
+    assert_eq!(replay.coverage().negative_levels, 0);
+}
+
+#[test]
+fn test_decode_fixed_keeps_bit_28_as_part_of_the_value() {
+    // The sign bit of the dataset's other, signed encoding; here it is a value bit.
+    assert_eq!(decode_fixed(1 << 28).unwrap(), Decimal::from(1u32 << 28));
+    assert_eq!(
+        decode_fixed((1 << 29) | (1 << 28)).unwrap(),
+        dec!(26843545.6)
+    );
+}
