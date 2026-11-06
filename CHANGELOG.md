@@ -38,6 +38,9 @@ project follows [Semantic Versioning](https://semver.org/).
   `PretradePolicy` as a gate after the raw limits, with its reductions, rejections and
   faults on `SimulationReport` (#89). `simulate` and `simulate_detailed` give the same
   results as before.
+- `backtest::queue_reactive::estimate_event_sizes` estimates the event size of each limit
+  from the sizes in the data, inside a window, for `estimate_parameters` (#90). New
+  `SizedEvent`, `EventSizeRecord` and `QrFailure::TooFewSizedEvents`.
 - Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`
   takes a new `instruments::perpetual::PerpetualTerms`, with the declared rate and mark of
   each instant on the funding grid. Each instant books through the `margin-rs` ledger,

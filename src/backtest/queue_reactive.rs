@@ -626,6 +626,35 @@ pub struct QueueObservation {
     pub waiting_seconds: f64,
 }
 
+/// The size of one queue event in the data, in units of the asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SizedEvent {
+    /// Time of the event, in milliseconds.
+    pub timestamp_ms: u64,
+    /// Limit from 0, nearest first. Both sides pool, as the rates do.
+    pub depth: u8,
+    /// Its size.
+    pub size: Decimal,
+}
+
+/// Event sizes together with what they were estimated from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct EventSizeRecord {
+    /// The interval estimated on.
+    pub training: TimeWindow,
+    /// FNV-1a 128 of the events inside it.
+    pub dataset_hash: u128,
+    /// Events used, per limit.
+    pub events: Vec<u64>,
+    /// Events left out for a size that is not positive or a limit out of range.
+    pub excluded_events: u64,
+    /// The mean size per limit, for [`estimate_parameters`], or why there are none.
+    pub sizes: Result<Vec<Decimal>, QrFailure>,
+}
+
 /// A mid move while the opposite first queue was empty, and what followed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1082,6 +1111,15 @@ pub enum QrFailure {
         /// Limit from 0.
         depth: u8,
     },
+    /// A limit has too few events with a size for the mean of [`estimate_event_sizes`].
+    TooFewSizedEvents {
+        /// Limit from 0.
+        depth: u8,
+        /// Events available.
+        have: u64,
+        /// Events required.
+        need: u64,
+    },
     /// Enough eligible mid moves, but the reference never followed one.
     ReferenceNeverMoved,
     /// Too few eligible mid moves for `θ`.
@@ -1135,6 +1173,80 @@ impl QrRecord {
             QrFit::Insufficient(_) => None,
         }
     }
+}
+
+/// Estimates the event size of each limit as the mean size of its events inside `window`
+/// and nothing else, the average event size in which the model counts its queues.
+///
+/// [`QueueObservation::queue_before`] is in these units, so build those observations from
+/// this result on the same window.
+///
+/// # Errors
+///
+/// Returns [`MMError::InvalidConfiguration`] for limits out of range or a `min_events` of
+/// zero, [`MMError::InvalidMarketState`] for events out of order, and
+/// [`MMError::NumericalError`] if a sum or a mean overflows. A limit with too few events
+/// gives [`QrFailure::TooFewSizedEvents`].
+pub fn estimate_event_sizes(
+    events: &[SizedEvent],
+    window: &TimeWindow,
+    limits: u8,
+    min_events: u64,
+) -> MMResult<EventSizeRecord> {
+    if limits == 0 || usize::from(limits) > MAX_LIMITS || min_events == 0 {
+        return Err(MMError::InvalidConfiguration(format!(
+            "invalid event size settings: {limits} limits, {min_events} events"
+        )));
+    }
+    if !events.is_sorted_by_key(|e| e.timestamp_ms) {
+        return Err(MMError::InvalidMarketState(
+            "events are not in chronological order".to_string(),
+        ));
+    }
+    let mut totals = vec![Decimal::ZERO; usize::from(limits)];
+    let mut counts = vec![0u64; usize::from(limits)];
+    let mut excluded = 0u64;
+    let mut hash = FNV_OFFSET;
+    for event in inside(events, window, |e| e.timestamp_ms) {
+        hash = fnv(hash, &event.timestamp_ms.to_le_bytes());
+        hash = fnv(hash, &[event.depth]);
+        hash = fnv(hash, &event.size.normalize().serialize());
+        let depth = usize::from(event.depth);
+        let (Some(total), Some(count), true) = (
+            totals.get_mut(depth),
+            counts.get_mut(depth),
+            event.size > Decimal::ZERO,
+        ) else {
+            excluded = excluded.saturating_add(1);
+            continue;
+        };
+        *total = total.checked_add(event.size).or_overflow("event sizes")?;
+        *count = count.saturating_add(1);
+    }
+    let mut sizes = Vec::with_capacity(totals.len());
+    let mut failure = None;
+    for (depth, (total, count)) in totals.iter().zip(&counts).enumerate() {
+        if *count < min_events {
+            failure = Some(QrFailure::TooFewSizedEvents {
+                depth: u8::try_from(depth).unwrap_or(u8::MAX),
+                have: *count,
+                need: min_events,
+            });
+            break;
+        }
+        sizes.push(
+            total
+                .checked_div(Decimal::from(*count))
+                .or_overflow("mean event size")?,
+        );
+    }
+    Ok(EventSizeRecord {
+        training: *window,
+        dataset_hash: hash,
+        events: counts,
+        excluded_events: excluded,
+        sizes: failure.map_or(Ok(sizes), Err),
+    })
 }
 
 /// Estimates on the observations inside `window` and nothing else.
