@@ -8,6 +8,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Example `regime_adaptation` (#112): fixed parameters against a simple causal adaptation over
+  synthetic regime changes on queue-reactive and Hawkes flow, with detection delay, false alarms,
+  a labelled oracle, transfer between the simulators and a go or no-go rule fixed before the
+  holdout, which says no-go here. No new public API, and nothing learned.
 - A true expiry in the example `quote_duration` (#110): `Hold::Expire` decides at the rate of
   `Hold::For` and cancels each quote after a shorter life through
   `BacktestStrategy::cancels_when_silent`, leaving the book empty until the next decision.
