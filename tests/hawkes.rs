@@ -1260,21 +1260,151 @@ fn test_a_mapped_segment_stays_in_order_across_bucket_edges() {
     }
 }
 
-#[cfg(feature = "serde")]
 #[test]
-fn test_profile_serde_reads_back_equal_and_refuses_what_new_refuses() {
-    let p = busy_profile();
-    let json = serde_json::to_string(&p).unwrap();
-    assert_eq!(serde_json::from_str::<SeasonalProfile>(&json).unwrap(), p);
-    for bad in [
-        r#"{"bucket_seconds":0.0,"multipliers":[1.0]}"#,
-        r#"{"bucket_seconds":1.0,"multipliers":[]}"#,
-        r#"{"bucket_seconds":1.0,"multipliers":[2.0,2.0]}"#,
-        r#"{"bucket_seconds":1.0,"multipliers":[1.0],"x":1}"#,
-    ] {
+fn test_score_flow_seasonal_refuses_what_score_flow_refuses() {
+    let p = SeasonalProfile::new(10.0, vec![0.5, 1.5]).unwrap();
+    let at = |time_seconds| HawkesEvent {
+        time_seconds,
+        kind: QrEventKind::Limit,
+    };
+    let segment = |duration_seconds, events| HawkesSegment {
+        initial_queue: 0,
+        duration_seconds,
+        events,
+    };
+    let params = truth();
+    let cases = [
+        segment(20.0, vec![at(5.0), at(4.0)]),
+        segment(20.0, vec![at(5.0), at(5.0f64.next_down())]),
+        segment(20.0, vec![at(25.0)]),
+        segment(20.0, vec![at(f64::NAN)]),
+        segment(20.0, vec![at(-1.0)]),
+        segment(-1.0, vec![]),
+        segment(f64::NAN, vec![]),
+    ];
+    for case in cases {
         assert!(
-            serde_json::from_str::<SeasonalProfile>(bad).is_err(),
-            "{bad}"
+            matches!(
+                score_flow_seasonal(std::slice::from_ref(&case), &params, &p),
+                Err(MMError::InvalidMarketState(_))
+            ),
+            "{case:?}"
         );
+        assert!(score_flow(std::slice::from_ref(&case), &params).is_err());
+    }
+}
+
+#[test]
+fn test_a_mapped_segment_stays_out_of_order_if_it_was() {
+    let p = SeasonalProfile::new(10.0, vec![0.5, 1.5]).unwrap();
+    let at = |time_seconds| HawkesEvent {
+        time_seconds,
+        kind: QrEventKind::Limit,
+    };
+    let mapped = p.segment_to_model_time(&HawkesSegment {
+        initial_queue: 0,
+        duration_seconds: 4.0,
+        events: vec![at(14.0), at(4.0)],
+    });
+    // 11 and 2, and the duration 2 under the event at 11: nothing is smoothed over.
+    assert_eq!(mapped.events[0].time_seconds, 11.0);
+    assert_eq!(mapped.events[1].time_seconds, 2.0);
+    assert_eq!(mapped.duration_seconds, 2.0);
+    // An event past the end stays past it.
+    let past = p.segment_to_model_time(&HawkesSegment {
+        initial_queue: 0,
+        duration_seconds: 4.0,
+        events: vec![at(14.0)],
+    });
+    assert_eq!(past.duration_seconds, 2.0);
+    assert_eq!(past.events[0].time_seconds, 11.0);
+}
+
+#[test]
+fn test_a_mapped_duration_stays_above_an_event_that_rounded_past_it() {
+    let p = SeasonalProfile::new(0.3, vec![0.7, 1.3, 1.1]).unwrap();
+    let mut seen = 0;
+    for edge in 1..200_000u32 {
+        let end = f64::from(edge) * 0.3;
+        let before = end.next_down();
+        if p.to_model_time(before) <= p.to_model_time(end) {
+            continue;
+        }
+        seen += 1;
+        let mapped = p.segment_to_model_time(&HawkesSegment {
+            initial_queue: 0,
+            duration_seconds: end,
+            events: vec![HawkesEvent {
+                time_seconds: before,
+                kind: QrEventKind::Limit,
+            }],
+        });
+        assert!(mapped.duration_seconds >= mapped.events[0].time_seconds);
+    }
+    assert!(seen > 0, "no edge rounded back, so this tested nothing");
+}
+
+#[cfg(feature = "serde")]
+mod seasonal_serde {
+    use super::*;
+
+    fn text(bucket: f64, multipliers: &[f64]) -> String {
+        let quoted: Vec<String> = multipliers.iter().map(|m| format!("\"{m:?}\"")).collect();
+        format!(
+            r#"{{"bucket_seconds":"{bucket:?}","multipliers":[{}]}}"#,
+            quoted.join(",")
+        )
+    }
+
+    #[test]
+    fn test_profile_reads_back_equal_for_many_profiles() {
+        // A plain generator: the multipliers of a normalized profile are not short decimals.
+        let mut state = 7u64;
+        let mut unit = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 11) as f64 / 9_007_199_254_740_992.0
+        };
+        let mut moved_by_rounding = 0;
+        for _ in 0..2000 {
+            let count = 1 + (unit() * 50.0) as usize;
+            let multipliers: Vec<f64> = (0..count).map(|_| 0.01 + unit() * 10.0).collect();
+            let p = SeasonalProfile::new(0.1 + unit() * 1000.0, multipliers).unwrap();
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(serde_json::from_str::<SeasonalProfile>(&json).unwrap(), p);
+            let mean = p.multipliers().iter().sum::<f64>() / count as f64;
+            moved_by_rounding += usize::from(mean != 1.0);
+        }
+        // So a tolerance of zero on the mean would refuse real profiles.
+        assert!(moved_by_rounding > 0);
+    }
+
+    #[test]
+    fn test_profile_read_holds_the_invariants_of_new() {
+        for bad in [
+            text(0.0, &[1.0]),
+            text(1.0, &[]),
+            text(1.0, &[2.0, 2.0]),
+            text(1e9, &[1.0000000005]),
+            text(1.0, &[1.0 + 1e-11]),
+            text(1.0, &[f64::NAN]),
+            r#"{"bucket_seconds":"x","multipliers":["1.0"]}"#.to_string(),
+            r#"{"bucket_seconds":"1.0","multipliers":["1.0"],"x":1}"#.to_string(),
+        ] {
+            assert!(
+                serde_json::from_str::<SeasonalProfile>(&bad).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(serde_json::from_str::<SeasonalProfile>(&text(1.0, &[1.0])).is_ok());
+    }
+
+    #[test]
+    fn test_a_profile_read_within_the_tolerance_does_not_step_at_a_period_edge() {
+        let read: SeasonalProfile = serde_json::from_str(&text(1e9, &[1.0 + 5e-13])).unwrap();
+        let (before, at) = (1e9f64.next_down(), 1e9);
+        assert!(read.to_model_time(before) <= read.to_model_time(at) + 1e-6);
+        // The two maps agree on the period, so a time past the edge comes back.
+        let t = 1.5e9;
+        assert!((read.to_clock_time(read.to_model_time(t)) - t).abs() < 1e-6);
     }
 }

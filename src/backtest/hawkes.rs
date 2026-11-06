@@ -1255,40 +1255,50 @@ pub struct SeasonalProfile {
     multipliers: Vec<f64>,
 }
 
-/// The stored form of a [`SeasonalProfile`], checked when read back.
+/// Exported form of a [`SeasonalProfile`], with exact floats, checked when read back.
 #[cfg(feature = "serde")]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProfile {
-    bucket_seconds: f64,
-    multipliers: Vec<f64>,
+    bucket_seconds: String,
+    multipliers: Vec<String>,
 }
 
 #[cfg(feature = "serde")]
 impl From<SeasonalProfile> for RawProfile {
     fn from(profile: SeasonalProfile) -> Self {
         Self {
-            bucket_seconds: profile.bucket_seconds,
-            multipliers: profile.multipliers,
+            bucket_seconds: float_text(profile.bucket_seconds),
+            multipliers: profile.multipliers.iter().map(|m| float_text(*m)).collect(),
         }
     }
 }
+
+/// How far from 1 the mean of stored multipliers may be: the rounding of a normalization.
+#[cfg(feature = "serde")]
+const STORED_MEAN_TOLERANCE: f64 = 1e-12;
 
 #[cfg(feature = "serde")]
 impl TryFrom<RawProfile> for SeasonalProfile {
     type Error = MMError;
 
-    /// Keeps the stored multipliers as they are, so that a profile reads back equal: a
-    /// second normalization could move them by a rounding.
+    /// Holds a profile to what [`SeasonalProfile::new`] gives, and keeps its multipliers as
+    /// stored, so that it reads back equal: a second normalization could move them.
     fn try_from(raw: RawProfile) -> MMResult<Self> {
-        check_profile(raw.bucket_seconds, &raw.multipliers)?;
-        let mean = raw.multipliers.iter().sum::<f64>() / as_float(raw.multipliers.len());
-        if (mean - 1.0).abs() > 1e-9 {
+        let bucket_seconds = text_float(&raw.bucket_seconds)?;
+        let multipliers = raw
+            .multipliers
+            .iter()
+            .map(|m| text_float(m))
+            .collect::<MMResult<Vec<f64>>>()?;
+        check_profile(bucket_seconds, &multipliers)?;
+        let mean = multipliers.iter().sum::<f64>() / as_float(multipliers.len());
+        if (mean - 1.0).abs() > STORED_MEAN_TOLERANCE {
             return invalid(format!("stored profile of mean {mean}"));
         }
         Ok(Self {
-            bucket_seconds: raw.bucket_seconds,
-            multipliers: raw.multipliers,
+            bucket_seconds,
+            multipliers,
         })
     }
 }
@@ -1353,6 +1363,12 @@ impl SeasonalProfile {
         self.bucket_seconds * as_float(self.multipliers.len())
     }
 
+    /// A period in model time. The period itself, but for the rounding of the normalization,
+    /// which the maps must share or they would step at a period's edge.
+    fn model_period(&self) -> f64 {
+        self.multipliers.iter().sum::<f64>() * self.bucket_seconds
+    }
+
     /// Whole buckets before `t`, and the bucket holding it. Time cannot be negative here.
     fn bucket_of(&self, t: f64) -> (f64, usize) {
         let whole = (t / self.bucket_seconds).floor().max(0.0);
@@ -1383,17 +1399,18 @@ impl SeasonalProfile {
         let periods = (whole / as_float(self.multipliers.len())).floor();
         let before: f64 = self.multipliers.iter().take(index).sum();
         let start = whole * self.bucket_seconds;
-        // The mean is 1, so a whole period takes as long in either time.
-        periods * self.period() + before * self.bucket_seconds + self.multiplier(t) * (t - start)
+        periods * self.model_period()
+            + before * self.bucket_seconds
+            + self.multiplier(t) * (t - start)
     }
 
     /// The clock time of model time `tau`, the inverse of [`Self::to_model_time`].
     #[must_use]
     pub fn to_clock_time(&self, tau: f64) -> f64 {
-        let period = self.period();
-        let periods = (tau / period).floor().max(0.0);
-        let mut left = tau - periods * period;
-        let mut clock = periods * period;
+        let model_period = self.model_period();
+        let periods = (tau / model_period).floor().max(0.0);
+        let mut left = tau - periods * model_period;
+        let mut clock = periods * self.period();
         for multiplier in &self.multipliers {
             let span = multiplier * self.bucket_seconds;
             if left < span {
@@ -1406,7 +1423,8 @@ impl SeasonalProfile {
     }
 
     /// A segment in model time, to fit or to score. Its order survives the rounding of the
-    /// map: an event that would step back takes the time of the one before it.
+    /// map: an event that would step back by a rounding takes the time of the one before it.
+    /// A segment out of order stays out of order, for its validation to refuse.
     #[must_use]
     pub fn segment_to_model_time(&self, segment: &HawkesSegment) -> HawkesSegment {
         self.map_segment(segment, |t| self.to_model_time(t))
@@ -1424,7 +1442,7 @@ impl SeasonalProfile {
             .events
             .iter()
             .map(|event| {
-                last = last.max(map(event.time_seconds));
+                last = after_rounding(map(event.time_seconds), last);
                 HawkesEvent {
                     time_seconds: last,
                     kind: event.kind,
@@ -1433,9 +1451,19 @@ impl SeasonalProfile {
             .collect();
         HawkesSegment {
             initial_queue: segment.initial_queue,
-            duration_seconds: map(segment.duration_seconds).max(last),
+            duration_seconds: after_rounding(map(segment.duration_seconds), last),
             events,
         }
+    }
+}
+
+/// `mapped`, or `last` if it stepped back from it by no more than the rounding of a time map.
+fn after_rounding(mapped: f64, last: f64) -> f64 {
+    let rounding = 16.0 * f64::EPSILON * last.abs().max(1.0);
+    if mapped < last && last - mapped <= rounding {
+        last
+    } else {
+        mapped
     }
 }
 
@@ -1511,7 +1539,8 @@ pub fn fit_seasonality(
 
 /// Scores `params`, fitted in model time, on clock time `segments` under `profile`: the
 /// likelihood gains `Σ ln s(t_i)` from the change of time, and the residuals are unchanged.
-/// So it is comparable with [`score_flow`] on the same segments. The parameter count adds the
+/// So it is comparable with [`score_flow`] on the same segments, and it refuses what that
+/// refuses. The parameter count adds the
 /// profile's free multipliers.
 ///
 /// # Errors
@@ -1522,6 +1551,10 @@ pub fn score_flow_seasonal(
     params: &HawkesParameters,
     profile: &SeasonalProfile,
 ) -> MMResult<FlowFit> {
+    // Before the map, whose rounding allowance must not read as an order.
+    for segment in segments {
+        segment.validate(params.max_queue())?;
+    }
     let mapped: Vec<HawkesSegment> = segments
         .iter()
         .map(|segment| profile.segment_to_model_time(segment))
