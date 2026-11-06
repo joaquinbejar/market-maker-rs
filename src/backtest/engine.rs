@@ -746,6 +746,16 @@ pub trait BacktestStrategy {
     /// cancel), in event order. The default implementation ignores reports.
     fn on_execution_report(&mut self, _report: &ExecutionReport) {}
 
+    /// Whether returning `None` from [`Self::on_tick`] also cancels every
+    /// resting order, as for a strategy that must not leave a quote live once it
+    /// no longer has grounds for one. False by default: `None` leaves them in
+    /// place. Cancels take the simulated cancel latency, as any other. The
+    /// financial kernel has no such path, so its equivalence with this engine
+    /// holds only while this is false.
+    fn cancels_when_silent(&self) -> bool {
+        false
+    }
+
     /// Resets the strategy state.
     fn reset(&mut self);
 }
@@ -1166,6 +1176,32 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         };
         if let Some(quote) = self.strategy.on_tick(&seen, &self.agent_position) {
             self.replace_quotes(&quote, at);
+        } else if self.strategy.cancels_when_silent() {
+            self.cancel_resting(at);
+        }
+    }
+
+    /// Requests the cancel of every live or pending order not already being
+    /// cancelled.
+    fn cancel_resting(&mut self, now: u64) {
+        let mut targets: Vec<SimOrderId> = self
+            .orders
+            .iter()
+            .filter(|o| !o.state.is_terminal())
+            .map(|o| o.id)
+            .collect();
+        targets.extend(self.pending_activations.keys().copied());
+        targets.retain(|id| !self.cancel_targets.contains(id));
+        // Ids are allocated in order, so sorting keeps scheduling (and the
+        // jitter draws) deterministic.
+        targets.sort_unstable();
+        for id in targets {
+            let effective = self.delayed(now, self.latency.cancel_ms);
+            self.cancel_targets.insert(id);
+            self.notify_policy(OrderEvent::CancelRequested {
+                order_id: id.to_string(),
+            });
+            self.schedule(effective, PendingAction::Cancel(id));
         }
     }
 
@@ -1292,25 +1328,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     /// rejected locally on both sides at decision time, so the engine never
     /// rests two orders that could trade with each other.
     fn replace_quotes(&mut self, quote: &Quote, now: u64) {
-        let mut targets: Vec<SimOrderId> = self
-            .orders
-            .iter()
-            .filter(|o| !o.state.is_terminal())
-            .map(|o| o.id)
-            .collect();
-        targets.extend(self.pending_activations.keys().copied());
-        targets.retain(|id| !self.cancel_targets.contains(id));
-        // Ids are allocated in order, so sorting keeps scheduling (and the
-        // jitter draws) deterministic.
-        targets.sort_unstable();
-        for id in targets {
-            let effective = self.delayed(now, self.latency.cancel_ms);
-            self.cancel_targets.insert(id);
-            self.notify_policy(OrderEvent::CancelRequested {
-                order_id: id.to_string(),
-            });
-            self.schedule(effective, PendingAction::Cancel(id));
-        }
+        self.cancel_resting(now);
 
         let tick = self.config.tick_size;
         let bid_price = round_to_step(quote.bid_price, tick, false);

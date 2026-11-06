@@ -90,6 +90,12 @@
 //! the other folds. The score is left out rather than saturated, since a
 //! capped rate would read as a plausible number.
 //!
+//! # In the replay
+//!
+//! [`crate::backtest::calibrated`] quotes the Avellaneda-Stoikov baseline from a
+//! [`WalkForwardReport`] in the causal replay, each fold's parameters holding only
+//! during its test window.
+//!
 //! # Example
 //!
 //! ```
