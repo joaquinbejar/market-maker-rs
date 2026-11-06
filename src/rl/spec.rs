@@ -560,6 +560,16 @@ pub struct RlSpec {
     pub episode: EpisodeSpec,
 }
 
+const fn metric_unit_code(unit: MetricUnit) -> u16 {
+    match unit {
+        MetricUnit::Quote => 1,
+        MetricUnit::QuotePerBase => 2,
+        MetricUnit::Base => 3,
+        MetricUnit::Count => 4,
+        MetricUnit::Ratio => 5,
+    }
+}
+
 fn put_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -623,9 +633,11 @@ impl RlSpec {
                 .position(|m| *m == r.metric)
                 .unwrap_or(usize::MAX),
         );
+        put_u16(&mut out, metric_unit_code(r.unit));
         put_u16(&mut out, r.mark.code());
         put_decimal(&mut out, r.invalid_action_penalty);
         put_decimal(&mut out, r.f32_unit);
+        put_u16(&mut out, u16::from(r.policy_input));
         let e = &self.episode;
         put_u16(&mut out, e.version);
         put_u64(&mut out, e.max_steps);

@@ -12,7 +12,7 @@
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::MarketTick;
 use market_maker_rs::backtest::evaluation::{
-    Direction, EvaluationInput, MetricHorizon, MetricId, attribute,
+    Direction, EvaluationInput, MetricHorizon, MetricId, MetricUnit, attribute,
 };
 use market_maker_rs::backtest::kernel::{
     ActionGrid, ActionStatus, FinancialKernel, KernelAction, KernelConfig, KernelDataset,
@@ -25,7 +25,7 @@ use market_maker_rs::rl::{
     ACTION_SPACE_VERSION, AsOf, EPISODE_VERSION, ERR_ACTION_OFF_GRID, EpisodeRecorder,
     FEATURE_COUNT, FeatureHorizon, FeatureId, FeatureUnit, InvalidActionPolicy,
     OBSERVATION_SPACE_VERSION, ObservationScales, REWARD_VERSION, RlAction, RlConfig, RlEnv,
-    StateMemory, TerminalValuation,
+    RlSpec, StateMemory, TerminalValuation,
 };
 use market_maker_rs::types::error::MMError;
 
@@ -1254,7 +1254,7 @@ fn test_spec_states_the_table_of_features() {
 fn test_spec_fingerprint_is_pinned_so_a_change_needs_a_new_version() {
     let spec = spec_of(&long_config(), long_grid(), config());
     let id = spec.id();
-    assert_eq!(id.fingerprint, 96120757497526146900007022102799719875);
+    assert_eq!(id.fingerprint, 281796423096009772465355244436229638458);
     assert_eq!(
         market_maker_rs::backtest::kernel::fnv1a128(&spec.to_bytes()),
         id.fingerprint
@@ -1372,6 +1372,67 @@ fn test_spec_fingerprint_covers_every_choice() {
         )),
         "max price",
     );
+}
+
+#[test]
+fn test_spec_fingerprint_covers_every_public_field() {
+    let base = spec_of(&long_config(), long_grid(), config());
+    let id = base.id();
+    type Change = fn(&mut RlSpec);
+    let changes: [(&str, Change); 27] = [
+        ("observation version", |s| s.observation.version += 1),
+        ("feature id", |s| s.observation.features.swap(0, 1)),
+        ("feature unit", |s| {
+            s.observation.features[0].unit = FeatureUnit::Count;
+        }),
+        ("feature time", |s| {
+            s.observation.features[0].as_of = AsOf::DecisionCount;
+        }),
+        ("feature horizon", |s| {
+            s.observation.features[0].horizon = FeatureHorizon::EpisodeSoFar;
+        }),
+        ("feature memory", |s| {
+            s.observation.features[0].memory = StateMemory::PreviousDecision;
+        }),
+        ("feature divisor", |s| {
+            s.observation.features[0].divisor = dec!(11);
+        }),
+        ("action version", |s| s.action.version += 1),
+        ("tick", |s| s.action.tick_size = dec!(0.25)),
+        ("lot", |s| s.action.lot_size = dec!(2)),
+        ("max price", |s| s.action.max_price = dec!(1001)),
+        ("max order", |s| s.action.max_order_size = dec!(11)),
+        ("bid offsets", |s| s.action.bid_offsets_ticks[0] = 9),
+        ("ask offsets", |s| s.action.ask_offsets_ticks[0] = 9),
+        ("sizes", |s| s.action.sizes_lots[0] = 9),
+        ("invalid action", |s| {
+            s.action.invalid_action = InvalidActionPolicy::Reject;
+        }),
+        ("reward version", |s| s.reward.version += 1),
+        ("metric", |s| s.reward.metric = MetricId::SpreadCapture),
+        ("reward unit", |s| s.reward.unit = MetricUnit::Base),
+        ("penalty", |s| s.reward.invalid_action_penalty = dec!(1)),
+        ("f32 unit", |s| s.reward.f32_unit = dec!(2)),
+        ("policy input", |s| s.reward.policy_input = true),
+        ("episode version", |s| s.episode.version += 1),
+        ("max steps", |s| s.episode.max_steps += 1),
+        ("terminal", |s| {
+            s.episode.terminal = TerminalValuation::CloseAtTouch;
+        }),
+        ("fewer bid offsets", |s| {
+            s.action.bid_offsets_ticks.pop();
+        }),
+        ("more sizes", |s| s.action.sizes_lots.push(3)),
+    ];
+    let mut seen = vec![id.fingerprint];
+    for (what, change) in changes {
+        let mut changed = base.clone();
+        change(&mut changed);
+        let fingerprint = changed.id().fingerprint;
+        assert!(!seen.contains(&fingerprint), "{what}");
+        seen.push(fingerprint);
+        assert!(changed.ensure(id).is_err(), "{what}");
+    }
 }
 
 #[test]
