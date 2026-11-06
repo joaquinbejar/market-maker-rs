@@ -272,7 +272,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     /// A kernel without the bound and capacity checks, for tests that
     /// reach the halts and capacity rejects.
     #[cfg(test)]
-    pub(super) fn new_relaxed(
+    pub(crate) fn new_relaxed(
         cfg: &KernelConfig,
         data: &'d KernelDataset,
         bounds: bool,
