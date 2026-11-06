@@ -336,5 +336,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnv>()?;
     module.add("BridgeFailure", py.get_type::<BridgeFailure>())?;
     module.add("RESIDUAL_VERSION", market_maker_rs::rl::RESIDUAL_VERSION)?;
+    module.add("BRIDGE_VERSION", env!("CARGO_PKG_VERSION"))?;
+    module.add("LIBRARY_VERSION", market_maker_rs::rl::LIBRARY_VERSION)?;
     Ok(())
 }

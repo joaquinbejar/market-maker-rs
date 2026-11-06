@@ -2,6 +2,7 @@
 
 import json
 import pathlib
+import tomllib
 from decimal import Decimal
 
 import numpy as np
@@ -33,6 +34,17 @@ def maskable(rows=None, **kwargs):
 
 def boxed(rows=None, **kwargs):
     return BoxMarketMakingEnv(config(policy="reject", max_steps=1000), rows or walk(), **kwargs)
+
+
+def test_versions_name_the_library_and_the_bridge_as_their_manifests_do():
+    bridge = pathlib.Path(__file__).parents[1]
+    manifests = [bridge.parents[1] / "Cargo.toml", bridge / "Cargo.toml"]
+    library_version, bridge_version = (
+        tomllib.loads(manifest.read_text())["package"]["version"] for manifest in manifests
+    )
+    assert library_version != bridge_version
+    assert versions()["market_maker_rs"] == library_version
+    assert versions()["bridge"] == bridge_version
 
 
 def test_trainer_is_the_pinned_version():

@@ -28,7 +28,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from ._native import RESIDUAL_VERSION
+from ._native import BRIDGE_VERSION, LIBRARY_VERSION, RESIDUAL_VERSION
 from .envs import BoxMarketMakingEnv, MaskableMarketMakingEnv, ResidualMarketMakingEnv
 
 TRAINER_VERSION = "2.9.2"
@@ -42,8 +42,10 @@ _ALGORITHMS = {
 
 
 def versions():
-    """The versions of everything a run depends on outside this repository."""
+    """The versions of everything a run depends on, the library and this bridge included."""
     return {
+        "market_maker_rs": LIBRARY_VERSION,
+        "bridge": BRIDGE_VERSION,
         "python": platform.python_version(),
         "gymnasium": gymnasium.__version__,
         "numpy": np.__version__,
