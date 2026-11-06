@@ -61,6 +61,9 @@ mod special;
 /// Greeks-based risk management.
 pub mod risk_manager;
 
+#[cfg(feature = "margin")]
+pub mod settlement;
+
 /// Volatility surfaces as total implied variance: the shared surface
 /// trait, raw SVI slices, static diagnostics and shock scenarios.
 pub mod surface;

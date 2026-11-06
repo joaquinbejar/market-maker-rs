@@ -18,6 +18,12 @@ project follows [Semantic Versioning](https://semver.org/).
   `HawkesSegment` and `QuoteExposure`, with no new dependency. Book diffs have no timestamp, so
   their times are inferred and marked. Example `hyperliquid_hour` reports what could and could
   not be established. No data is in the repository, and the book starts empty.
+- `options::settlement` (#97), behind `options` and `margin`: `OptionBook` keeps option positions
+  beside a `margin-rs` ledger, and books an expiry, exercise or assignment computed by
+  OptionStratLib as one transaction: open orders' reservations released, cash as a settlement or
+  the underlying as a spot execution at the strike, the position extinguished. An obligation is
+  booked even if it leaves a shortfall, which is reported. Any error leaves all of it as it was.
+  Fixtures are synthetic.
 - A true expiry in the example `quote_duration` (#110): `Hold::Expire` decides at the rate of
   `Hold::For` and cancels each quote after a shorter life through
   `BacktestStrategy::cancels_when_silent`, leaving the book empty until the next decision.

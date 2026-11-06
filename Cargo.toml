@@ -173,6 +173,10 @@ name = "hyperliquid"
 required-features = ["serde"]
 
 [[test]]
+name = "option_settlement"
+required-features = ["options", "margin"]
+
+[[test]]
 name = "hawkes_robustness"
 required-features = ["margin"]
 
