@@ -1321,6 +1321,89 @@ fn test_a_mapped_segment_stays_out_of_order_if_it_was() {
 }
 
 #[test]
+fn test_an_ordered_segment_stays_ordered_for_many_profiles() {
+    let mut state = 11u64;
+    let mut unit = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (state >> 11) as f64 / 9_007_199_254_740_992.0
+    };
+    for _ in 0..400 {
+        let count = 1 + (unit() * 20.0) as usize;
+        let multipliers: Vec<f64> = (0..count).map(|_| 0.01 + unit() * 10.0).collect();
+        let bucket = 0.1 + unit() * 100.0;
+        let p = SeasonalProfile::new(bucket, multipliers).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..2000 {
+            let edge = (unit() * 1e5).floor() * bucket;
+            times.extend([edge.next_down(), edge, edge.next_up()]);
+            let inside = unit() * 1e5 * bucket;
+            times.extend([inside, inside.next_up(), inside.next_up().next_up()]);
+        }
+        times.sort_by(f64::total_cmp);
+        let events: Vec<HawkesEvent> = times
+            .iter()
+            .filter(|t| **t >= 0.0)
+            .map(|&time_seconds| HawkesEvent {
+                time_seconds,
+                kind: QrEventKind::Limit,
+            })
+            .collect();
+        let mapped = p.segment_to_model_time(&HawkesSegment {
+            initial_queue: 0,
+            duration_seconds: 1e5 * bucket,
+            events,
+        });
+        assert!(
+            mapped
+                .events
+                .windows(2)
+                .all(|w| w[0].time_seconds <= w[1].time_seconds)
+        );
+    }
+}
+
+/// Two times one float apart whose model times step back by 1.66 epsilon of the time.
+#[test]
+fn test_a_step_back_above_one_epsilon_is_absorbed() {
+    let p = SeasonalProfile::new(
+        0.2845512768607465,
+        vec![
+            239.99824988007933,
+            7.9206389936465404,
+            0.012312631405157908,
+            0.6260097999572359,
+            0.735898669898175,
+            1.0645153725281677,
+            0.17912309764152748,
+            0.06620341688644195,
+            0.00019949309355531952,
+            7204.743159862191,
+            0.0006930553994369046,
+            0.8782140251135744,
+            0.08626805830325544,
+            0.0018301430877892511,
+            0.00024168680519148954,
+            0.22009310820970146,
+            47.33219458690915,
+        ],
+    )
+    .unwrap();
+    let (a, t) = (8.82108958268314, 8.821089582683141);
+    assert!(p.to_model_time(a) > p.to_model_time(t));
+    let mapped = p.segment_to_model_time(&HawkesSegment {
+        initial_queue: 0,
+        duration_seconds: t * 2.0,
+        events: [a, t]
+            .map(|time_seconds| HawkesEvent {
+                time_seconds,
+                kind: QrEventKind::Limit,
+            })
+            .to_vec(),
+    });
+    assert!(mapped.events[0].time_seconds <= mapped.events[1].time_seconds);
+}
+
+#[test]
 fn test_a_step_back_larger_than_a_rounding_is_not_absorbed() {
     let p = SeasonalProfile::new(1e6, vec![1.0]).unwrap();
     let later = 1000.0;
@@ -1406,6 +1489,18 @@ mod seasonal_serde {
         assert!((mean - 1.0).abs() > 1e-12, "{mean}");
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(serde_json::from_str::<SeasonalProfile>(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn test_a_large_profile_just_over_its_tolerance_is_refused() {
+        // n * EPSILON for this size is 2.2e-10; a mean off by 1e-9 is over it.
+        let mut multipliers = vec![1.0; MAX_SEASONAL_BUCKETS];
+        multipliers[0] = 1.0 + 1e-9 * MAX_SEASONAL_BUCKETS as f64;
+        let json = serde_json::json!({
+            "bucket_seconds": "1.0",
+            "multipliers": multipliers.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>(),
+        });
+        assert!(serde_json::from_value::<SeasonalProfile>(json).is_err());
     }
 
     #[test]
