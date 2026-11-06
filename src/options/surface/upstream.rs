@@ -73,7 +73,12 @@ fn number(value: Decimal, name: &str) -> MMResult<f64> {
         .ok_or_else(|| MMError::NumericalError(format!("{name} {value} has no finite value")))
 }
 
+/// `at` in ms, which it must be exactly: truncating a finer time would let data be available in
+/// the millisecond before it existed.
 fn millis(at: DateTime<Utc>) -> MMResult<u64> {
+    if !at.timestamp_subsec_nanos().is_multiple_of(1_000_000) {
+        return Err(invalid(format!("{at} is finer than a millisecond")));
+    }
     u64::try_from(at.timestamp_millis())
         .map_err(|_| invalid(format!("{at} is before the Unix epoch")))
 }
@@ -277,7 +282,7 @@ impl UpstreamAttempt {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidMarketState`] if it is available before its as-of time, or that
-    /// time is before the Unix epoch.
+    /// time is before the Unix epoch or finer than a millisecond.
     pub fn calibrated(surface: UpstreamSurface, available_at_ms: u64) -> MMResult<Self> {
         let as_of_ms = millis(surface.surface().as_of())?;
         Self::checked(as_of_ms, available_at_ms, Ok(surface))

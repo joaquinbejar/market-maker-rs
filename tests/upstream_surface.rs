@@ -799,3 +799,39 @@ fn test_the_report_counts_a_violation_and_says_when_the_calendar_could_not_be_ch
     let single = SurfaceQuality::of(&calibrated(&[expiry(91, dec!(0.02))]));
     assert!(!single.calendar_checked);
 }
+
+#[test]
+fn test_data_finer_than_a_millisecond_is_refused_and_whole_milliseconds_are_not() {
+    let fine = as_of() + TimeDelta::microseconds(500);
+    let surface = UpstreamSurface::new(
+        calibrated_at(
+            &three(),
+            dec!(0),
+            dec!(0),
+            &ImpliedVolatilitySurfaceConfig::default(),
+            fine,
+        ),
+        UpstreamPolicy::default(),
+    )
+    .unwrap();
+    // Truncated, it would be available in the millisecond before its data.
+    let refused = UpstreamAttempt::calibrated(surface, as_of_ms()).unwrap_err();
+    assert!(
+        refused.to_string().contains("finer than a millisecond"),
+        "{refused}"
+    );
+
+    let whole = UpstreamSurface::new(
+        calibrated_at(
+            &three(),
+            dec!(0),
+            dec!(0),
+            &ImpliedVolatilitySurfaceConfig::default(),
+            as_of() + TimeDelta::milliseconds(1),
+        ),
+        UpstreamPolicy::default(),
+    )
+    .unwrap();
+    let attempt = UpstreamAttempt::calibrated(whole, as_of_ms() + 1).unwrap();
+    assert_eq!(attempt.as_of_ms(), as_of_ms() + 1);
+}
