@@ -155,6 +155,10 @@ name = "hawkes_robustness"
 required-features = ["margin"]
 
 [[test]]
+name = "constraint_costs"
+required-features = ["margin"]
+
+[[test]]
 name = "kernel_margin"
 required-features = ["kernel", "margin"]
 
