@@ -1,9 +1,14 @@
 """Runs a step of the out-of-sample comparison of #102 from its committed design.
 
-`python experiments/m4_05/run.py <step> <data dir> <out dir> <commit>`, from `bridges/python`,
-after `qr_days` wrote the rows. Every day's rows are checked against `digests.json` before
-use. This file implements the reduced step, which trains on the training days and scores on
-the validation days only; it never opens the holdout's directory.
+From `bridges/python`, after `qr_days` wrote the rows:
+
+    python experiments/m4_05/run.py <step> <data dir> <out dir> <commit>
+
+Steps: `check_ppo_hold`, `selection`, `ablations`, then `holdout`. The reduced step ran at
+commit da14f8f with the runner of that commit. Every day's rows are checked against
+`digests.json` before use. Only `holdout` reads the holdout, and only once every checkpoint
+and configuration is frozen: it takes the frozen manifest that `freeze` writes, and refuses
+any checkpoint, configuration or design whose hash differs.
 
 Everything here is synthetic. One synthetic simulator, made-up parameters and 24 days per
 regime bound what it can show.
@@ -29,10 +34,12 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from mm_rl_bridge import MaskableMarketMakingEnv, ResidualMarketMakingEnv
-from mm_rl_bridge.training import ZeroResidual, evaluate, versions
+from mm_rl_bridge.training import ZeroResidual, versions
 
 HERE = pathlib.Path(__file__).resolve().parent
 DAY_MS = 86_400_000
+SECONDS_PER_YEAR = 31_536_000
+POSITION_FEATURE = 6
 SCALES = {
     "spread_ticks": "10",
     "mid_change_ticks": "10",
@@ -41,10 +48,18 @@ SCALES = {
     "position": "20",
     "entry_gap": "1",
 }
+LEARNED = {
+    "maskable_ppo": {"encoding": "maskable", "algorithm": "maskable_ppo"},
+    "sac_residual_avellaneda_stoikov": {"encoding": "residual", "algorithm": "sac_residual"},
+}
 
 
 def sha256(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+
+def text_sha256(text):
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def load_design():
@@ -56,14 +71,18 @@ def load_design():
     return design, by_day
 
 
+def regimes_of(design):
+    return [regime["name"] for regime in design["simulator"]["regimes"]]
+
+
 def days_of(design, split):
     first, last = design["splits"][split]
     return list(range(first, last + 1))
 
 
-def read_rows(data_dir, design, digests, regime, day, split):
-    if split == "holdout":
-        raise PermissionError("this step does not read the holdout")
+def read_rows(data_dir, digests, regime, day, split, holdout_allowed=False):
+    if split == "holdout" and not holdout_allowed:
+        raise PermissionError("only the holdout step reads the holdout")
     record = digests[(regime, day)]
     if record["split"] != split:
         raise ValueError(f"{regime} day {day} is in {record['split']}, not {split}")
@@ -75,9 +94,9 @@ def read_rows(data_dir, design, digests, regime, day, split):
 def execution(design, variant):
     chosen = dict(design["execution"]["main"])
     if variant != "main":
-        chosen.update(
-            {k: v for k, v in design["execution"]["ablations"][variant].items() if k in chosen}
-        )
+        for key, value in design["execution"]["ablations"][variant].items():
+            if key in chosen:
+                chosen[key] = value
     return chosen
 
 
@@ -144,16 +163,13 @@ def residual_config(design, variant, kind, params, day, bounds):
     return config
 
 
-SECONDS_PER_YEAR = 31_536_000
-
-
 def volatility(data_dir, design, digests, regime):
     """The design's rule, over the training days only: absolute price units per square root
     of a 365 day year, from the changes of the mid between consecutive rows of a day."""
     tick = Decimal(design["kernel"]["tick_size"])
     changes = []
     for day in days_of(design, "train"):
-        rows, _ = read_rows(data_dir, design, digests, regime, day, "train")
+        rows, _ = read_rows(data_dir, digests, regime, day, "train")
         mids = [Decimal(row[1] + row[3]) / 2 * tick for row in rows]
         changes.extend(float(b - a) for a, b in zip(mids, mids[1:]))
     mean = sum(changes) / len(changes)
@@ -183,11 +199,12 @@ class DayCycle(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, envs, seed):
+    def __init__(self, envs, seed, penalty=None):
         super().__init__()
         self._envs = envs
         self._rng = np.random.default_rng(seed)
         self._current = envs[0]
+        self._penalty = penalty
         self.observation_space = envs[0].observation_space
         self.action_space = envs[0].action_space
 
@@ -197,7 +214,14 @@ class DayCycle(gym.Env):
         return self._current.reset(seed=int(self._rng.integers(2**63)))
 
     def step(self, action):
-        return self._current.step(action)
+        observation, reward, terminated, truncated, info = self._current.step(action)
+        if self._penalty is not None:
+            # Training only: the exact net in `info` is untouched, and evaluation never
+            # sees this term.
+            position = info["raw_observation"][POSITION_FEATURE]
+            if position is not None:
+                reward -= self._penalty * float(position) ** 2
+        return observation, reward, terminated, truncated, info
 
     def action_masks(self):
         return self._current.action_masks()
@@ -217,26 +241,33 @@ class Constant:
         return self._action, None
 
 
-def build_env(job, data_dir, design, digests, day, split):
-    rows, record = read_rows(data_dir, design, digests, job["regime"], day, split)
+def build_env(job, digests, regime, day, split, holdout_allowed=False):
+    rows, record = read_rows(job["data_dir"], digests, regime, day, split, holdout_allowed)
+    design, _ = load_design()
     if job["encoding"] == "maskable":
         env = MaskableMarketMakingEnv(job["config"], rows)
     else:
         config = residual_config(
-            design, job["variant"], job["baseline_kind"], job["baseline"], day, job["bounds"]
+            design,
+            job["variant"],
+            job["baseline_kind"],
+            job["baselines"][regime],
+            day,
+            job["bounds"],
         )
         env = ResidualMarketMakingEnv(config, rows)
     return checked(env, record)
 
 
 def train_job(job):
-    """One training run, in its own process on one thread."""
+    """One training run on the pooled training days, in its own process on one thread."""
     torch.set_num_threads(1)
     design, digests = load_design()
     set_random_seed(job["seed"])
-    days = days_of(design, "train")
-    envs = [build_env(job, job["data_dir"], design, digests, day, "train") for day in days]
-    cycle = DayCycle(envs, job["seed"])
+    pairs = [(regime, day) for regime in job["regimes"] for day in days_of(design, "train")]
+    envs = [build_env(job, digests, regime, day, "train") for regime, day in pairs]
+    penalty = job.get("penalty")
+    cycle = DayCycle(envs, job["seed"], None if penalty is None else float(penalty))
     model_class = MaskablePPO if job["algorithm"] == "maskable_ppo" else SAC
     start = time.perf_counter()
     model = model_class(
@@ -250,24 +281,29 @@ def train_job(job):
     seconds = time.perf_counter() - start
     path = pathlib.Path(job["path"])
     model.save(path)
-    first = envs[0]
+    configs = {}
+    for (regime, _), env in zip(pairs, envs, strict=True):
+        configs.setdefault(regime, env.config)
     metadata = {
         "algorithm": job["algorithm"],
-        "regime": job["regime"],
+        "arm": job["arm"],
         "variant": job["variant"],
+        "penalty": penalty,
+        "set": job["set"],
         "seed": job["seed"],
         "steps": job["steps"],
         "hyperparameters": job["hyperparameters"],
-        "spec": list(first.spec_id),
-        "kernel_fingerprint": first.bridge_info["kernel_fingerprint"],
-        "config": first.config,
-        "training_days": days,
+        "spec": list(envs[0].spec_id),
+        "kernel_fingerprint": envs[0].bridge_info["kernel_fingerprint"],
+        "configs": configs,
+        "training_days": [list(pair) for pair in pairs],
         "training_digests": [env.bridge_info["dataset_digest"] for env in envs],
         "commit": job["commit"],
         "design_sha256": sha256(HERE / "design.json"),
         "versions": versions(),
         "train_seconds": round(seconds, 2),
         "checkpoint_sha256": sha256(path.with_suffix(".zip")),
+        "path": str(path),
     }
     cycle.close()
     path.with_suffix(".json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
@@ -287,7 +323,7 @@ def same_but_session(a, b):
     return strip(a) == strip(b)
 
 
-def load_frozen(metadata, env):
+def load_frozen(metadata, env, regime):
     path = pathlib.Path(metadata["path"])
     if sha256(path.with_suffix(".zip")) != metadata["checkpoint_sha256"]:
         raise ValueError("a checkpoint changed after training")
@@ -295,7 +331,7 @@ def load_frozen(metadata, env):
         raise ValueError("a checkpoint of another specification")
     if metadata["kernel_fingerprint"] != env.bridge_info["kernel_fingerprint"]:
         raise ValueError("a checkpoint of other execution rules")
-    if not same_but_session(metadata["config"], env.config):
+    if not same_but_session(metadata["configs"][regime], env.config):
         raise ValueError("a checkpoint of another configuration")
     model_class = MaskablePPO if metadata["algorithm"] == "maskable_ppo" else SAC
     model = model_class.load(path.with_suffix(".zip"), device="cpu")
@@ -303,33 +339,92 @@ def load_frozen(metadata, env):
     return model
 
 
+def time_beyond(attribution, lots):
+    """The share of the window with an absolute position above `lots`."""
+    start, end = attribution["window_ms"]
+    if end <= start:
+        return 0.0
+    beyond, since, position = 0, start, Decimal(0)
+    for timestamp, _, after in attribution["positions"]:
+        until = min(max(timestamp, start), end)
+        if abs(position) > lots:
+            beyond += until - since
+        since, position = until, Decimal(after)
+    if abs(position) > lots:
+        beyond += end - since
+    return beyond / (end - start)
+
+
+def episode(policy, env, seed, design):
+    """One evaluated day: the exact net result, its attribution, and what the gate refused."""
+    observation, _ = env.reset(seed=seed)
+    refusals = fallbacks = clipped = steps = 0
+    masked = isinstance(env, MaskableMarketMakingEnv)
+    while True:
+        if masked:
+            action, _ = policy.predict(
+                observation, deterministic=True, action_masks=env.action_masks()
+            )
+        else:
+            action, _ = policy.predict(observation, deterministic=True)
+        observation, _, terminated, truncated, info = env.step(action)
+        steps += 1
+        refusals += info["refused_because"] is not None
+        residual = info.get("residual")
+        if residual is not None:
+            fallbacks += residual["fallback"] is not None
+            clipped += any(residual["clips"])
+        if terminated or truncated:
+            break
+    attribution = dict(env.attribution())
+    limits = design["execution"]["limits"]
+    peak_notional = max(
+        (abs(Decimal(after)) * Decimal(price) for _, price, after in attribution["positions"]),
+        default=Decimal(0),
+    )
+    return {
+        "seed": seed,
+        "steps": steps,
+        "net": info["net"],
+        "penalties": info["penalties"],
+        "attribution": {k: v for k, v in attribution.items() if k != "positions"},
+        "refusals": refusals,
+        "residual_fallbacks": fallbacks,
+        "residual_clipped": clipped,
+        "peak_notional": str(peak_notional),
+        "time_beyond_5_lots": time_beyond(attribution, 5),
+        "limit_breach": Decimal(attribution["max_abs_position"]) > Decimal(limits["max_position"])
+        or peak_notional > Decimal(limits["max_notional"]),
+    }
+
+
 def evaluate_job(job):
     """One arm on one day, over the evaluation seeds."""
     torch.set_num_threads(1)
     design, digests = load_design()
-    env = build_env(job, job["data_dir"], design, digests, job["day"], job["split"])
+    env = build_env(
+        job, digests, job["regime"], job["day"], job["split"], job["split"] == "holdout"
+    )
     try:
         if job["policy"]["kind"] == "constant":
             policy = Constant(job["policy"]["action"])
         elif job["policy"]["kind"] == "zero_residual":
             policy = ZeroResidual()
         else:
-            policy = load_frozen(job["policy"]["metadata"], env)
-        results = evaluate(policy, env, design["evaluation"]["evaluation_seeds"])
+            policy = load_frozen(job["policy"]["metadata"], env, job["regime"])
+        days = [episode(policy, env, seed, design) for seed in job["evaluation_seeds"]]
     finally:
         env.close()
-    nets = [r.net for r in results]
+    nets = [Decimal(d["net"]) for d in days]
     return {
         "arm": job["arm"],
         "candidate": job["candidate"],
+        "variant": job["variant"],
         "regime": job["regime"],
         "day": job["day"],
         "split": job["split"],
-        "nets": [str(n) for n in nets],
         "daily_value": str(sum(nets, Decimal(0)) / len(nets)),
-        "attribution": [r.attribution for r in results],
-        "penalties": [str(r.penalties) for r in results],
-        "steps": [r.steps for r in results],
+        "episodes": days,
     }
 
 
@@ -349,141 +444,257 @@ def mean_daily(rows):
     return sum(values, Decimal(0)) / len(values)
 
 
-def reduced(data_dir, out_dir, commit, dry_budget=None):
-    torch.set_num_threads(1)
-    design, digests = load_design()
-    step = dict(next(s for s in design["steps"] if s["name"] == "reduced"))
-    if dry_budget is not None:
-        # A check of the code only: its results are not the step's and are not reported.
-        step["budget_steps"] = dry_budget
-    parallel = design["compute"]["max_parallel_runs"]
-    out = pathlib.Path(out_dir)
-    (out / "checkpoints").mkdir(parents=True, exist_ok=True)
-    report = {
-        "step": "reduced",
-        "commit": commit,
-        "data": design["data"],
-        "bounds": design["bounds"],
-        "design_sha256": sha256(HERE / "design.json"),
-        "digests_sha256": sha256(HERE / "digests.json"),
-        "versions": versions(),
-        "regimes": step["regimes"],
-        "training_seeds": step["training_seeds"],
-        "budget_steps": step["budget_steps"],
-        "holdout": "not read",
-        "dry_run": dry_budget is not None,
-    }
-    clock = {}
-    arms = design["arms"]
-    ppo_grid = arms["maskable_ppo"]["grid"]
-    grid_config = base_config(design, "main", "mask", ppo_grid)
-    validation = days_of(design, "validation")
-    started = time.perf_counter()
+class Context:
+    """What every step shares: the design, the data, the output and the commit."""
 
-    sigmas = {r: volatility(data_dir, design, digests, r) for r in step["regimes"]}
-    report["volatility_from_training_days"] = sigmas
+    def __init__(self, data_dir, out_dir, commit):
+        torch.set_num_threads(1)
+        self.design, self.digests = load_design()
+        self.data_dir = data_dir
+        self.out = pathlib.Path(out_dir)
+        (self.out / "checkpoints").mkdir(parents=True, exist_ok=True)
+        self.commit = commit
+        self.parallel = self.design["compute"]["max_parallel_runs"]
+        self.seeds = self.design["evaluation"]["evaluation_seeds_from_step_2"]
+        self.regimes = regimes_of(self.design)
+        self.arms = self.design["arms"]
+        self.grid = self.arms["maskable_ppo"]["grid"]
+        self.sigmas = {r: volatility(data_dir, self.design, self.digests, r) for r in self.regimes}
 
-    # Baselines and classical arms, scored on validation, every grid point reported.
-    jobs = []
-    for regime in step["regimes"]:
-        for day in validation:
-            common = {"regime": regime, "day": day, "split": "validation", "data_dir": data_dir,
-                      "variant": "main"}
-            jobs.append({**common, "arm": "no_trade", "candidate": "hold",
-                         "encoding": "maskable", "config": grid_config,
-                         "policy": {"kind": "constant", "action": [0, 0, 0, 0, 0]}})
-            offsets = ppo_grid["bid_offsets"]
-            for point in grid_points(arms["fixed_spread"]["grid"]):
-                index = offsets.index(point["offset_ticks"])
-                jobs.append({**common, "arm": "fixed_spread",
-                             "candidate": json.dumps(point, sort_keys=True),
-                             "encoding": "maskable", "config": grid_config,
-                             "policy": {"kind": "constant", "action": [1, index, index, 0, 0]}})
-            for kind in ("avellaneda_stoikov", "glft"):
-                for point in grid_points(arms[kind]["grid"], sigmas[regime]):
-                    jobs.append({**common, "arm": kind,
-                                 "candidate": json.dumps(point, sort_keys=True),
-                                 "encoding": "residual", "baseline_kind": kind,
-                                 "baseline": point,
-                                 "bounds": arms["sac_residual_avellaneda_stoikov"]["bounds"],
-                                 "policy": {"kind": "zero_residual"}})
-    # The slow ones first, so that the pool ends together.
-    jobs.sort(key=lambda job: job["arm"] != "glft")
-    classical = pool(jobs, evaluate_job, parallel, "classical")
+    def header(self, step):
+        return {
+            "step": step,
+            "commit": self.commit,
+            "data": self.design["data"],
+            "bounds": self.design["bounds"],
+            "design_sha256": sha256(HERE / "design.json"),
+            "digests_sha256": sha256(HERE / "digests.json"),
+            "versions": versions(),
+            "evaluation_seeds": self.seeds,
+            "volatility_from_training_days": self.sigmas,
+        }
+
+    def grid_config(self, variant):
+        return base_config(self.design, variant, "mask", self.grid)
+
+    def common(self, variant, regime, day, split):
+        return {"regime": regime, "day": day, "split": split, "data_dir": self.data_dir,
+                "variant": variant, "evaluation_seeds": self.seeds}
+
+    def classical_jobs(self, variant, split, days, chosen=None):
+        """Baselines and classical arms; every grid point, or only the chosen ones."""
+        jobs = []
+        offsets = self.grid["bid_offsets"]
+        bounds = self.arms["sac_residual_avellaneda_stoikov"]["bounds"]
+        for regime in self.regimes:
+            for day in days:
+                common = self.common(variant, regime, day, split)
+                maskable = {**common, "encoding": "maskable", "config": self.grid_config(variant)}
+                jobs.append({**maskable, "arm": "no_trade", "candidate": "hold",
+                             "policy": {"kind": "constant", "action": [0, 0, 0, 0, 0]}})
+                for point in grid_points(self.arms["fixed_spread"]["grid"]):
+                    candidate = json.dumps(point, sort_keys=True)
+                    if chosen is not None and chosen[(regime, "fixed_spread")] != point:
+                        continue
+                    index = offsets.index(point["offset_ticks"])
+                    jobs.append({**maskable, "arm": "fixed_spread", "candidate": candidate,
+                                 "policy": {"kind": "constant",
+                                            "action": [1, index, index, 0, 0]}})
+                for kind in ("avellaneda_stoikov", "glft"):
+                    for point in grid_points(self.arms[kind]["grid"], self.sigmas[regime]):
+                        if chosen is not None and chosen[(regime, kind)] != point:
+                            continue
+                        jobs.append({**common, "arm": kind,
+                                     "candidate": json.dumps(point, sort_keys=True),
+                                     "encoding": "residual", "baseline_kind": kind,
+                                     "baselines": {regime: point}, "bounds": bounds,
+                                     "policy": {"kind": "zero_residual"}})
+        # The slow ones first, so that the pool ends together.
+        jobs.sort(key=lambda job: job["arm"] != "glft")
+        return jobs
+
+    def train_jobs(self, arm, sets, variant, baselines, penalty=None, tag="main"):
+        jobs = []
+        spec = self.arms[arm]
+        for index in sets:
+            for seed in self.design["training_seeds"]:
+                name = f"{arm}-{tag}-set{index}-seed{seed}"
+                job = {"arm": arm, "algorithm": LEARNED[arm]["algorithm"],
+                       "encoding": LEARNED[arm]["encoding"], "regimes": self.regimes,
+                       "seed": seed, "steps": spec["budget_steps"], "set": index,
+                       "hyperparameters": spec["hyperparameter_sets"][index],
+                       "data_dir": self.data_dir, "variant": variant, "penalty": penalty,
+                       "commit": self.commit, "path": str(self.out / "checkpoints" / name)}
+                if LEARNED[arm]["encoding"] == "maskable":
+                    job["config"] = self.grid_config(variant)
+                else:
+                    job.update({"baseline_kind": "avellaneda_stoikov", "baselines": baselines,
+                                "bounds": spec["bounds"]})
+                jobs.append(job)
+        return jobs
+
+    def learned_jobs(self, runs, variant, split, days):
+        jobs = []
+        for metadata in runs:
+            for regime in self.regimes:
+                for day in days:
+                    job = {**self.common(variant, regime, day, split), "arm": metadata["arm"],
+                           "candidate": f"set{metadata['set']}-seed{metadata['seed']}",
+                           "encoding": LEARNED[metadata["arm"]]["encoding"],
+                           "policy": {"kind": "frozen", "metadata": metadata}}
+                    if job["encoding"] == "maskable":
+                        job["config"] = self.grid_config(variant)
+                    else:
+                        baselines = {}
+                        for r, config in metadata["configs"].items():
+                            baselines[r] = {k: v for k, v in config["residual"]["baseline"].items()
+                                            if k not in ("kind", "session_start_ms")}
+                        job.update({"baseline_kind": "avellaneda_stoikov",
+                                    "baselines": baselines,
+                                    "bounds": self.arms[metadata["arm"]]["bounds"]})
+                    jobs.append(job)
+        return jobs
+
+    def write(self, name, report):
+        path = self.out / f"{name}.json"
+        path.write_text(json.dumps(report, indent=2, sort_keys=True))
+        return path
+
+
+def best(rows, key):
+    groups = {}
+    for row in rows:
+        groups.setdefault(key(row), []).append(row)
+    return groups
+
+
+def selection(ctx):
+    report = ctx.header("selection")
+    clock, started = {}, time.perf_counter()
+    validation = days_of(ctx.design, "validation")
+    classical = pool(ctx.classical_jobs("main", "validation", validation), evaluate_job,
+                     ctx.parallel, "classical")
     clock["classical_validation_seconds"] = round(time.perf_counter() - started, 1)
+    chosen = {}
+    for (regime, arm), rows in best(classical, lambda r: (r["regime"], r["arm"])).items():
+        if arm == "no_trade":
+            continue
+        scores = best(rows, lambda r: r["candidate"])
+        top = max(scores, key=lambda c: (mean_daily(scores[c]), c))
+        chosen[(regime, arm)] = json.loads(top)
     report["classical_validation"] = classical
+    report["classical_selected"] = {f"{r}/{a}": v for (r, a), v in sorted(chosen.items())}
 
-    selected = {}
-    for regime in step["regimes"]:
-        for kind in ("avellaneda_stoikov", "glft"):
-            scores = {}
-            for row in classical:
-                if row["arm"] == kind and row["regime"] == regime:
-                    scores.setdefault(row["candidate"], []).append(row)
-            best = max(scores, key=lambda c: (mean_daily(scores[c]), c))
-            selected[(regime, kind)] = json.loads(best)
-    report["classical_selected"] = {f"{r}/{k}": v for (r, k), v in selected.items()}
-
-    # Learned arms, trained on the training days with the first hyperparameter set.
+    baselines = {r: chosen[(r, "avellaneda_stoikov")] for r in ctx.regimes}
     started = time.perf_counter()
-    train = []
-    for regime in step["regimes"]:
-        for seed in step["training_seeds"]:
-            common = {"regime": regime, "seed": seed, "steps": step["budget_steps"],
-                      "data_dir": data_dir, "variant": "main", "commit": commit}
-            train.append({**common, "algorithm": "maskable_ppo", "encoding": "maskable",
-                          "config": grid_config,
-                          "hyperparameters": arms["maskable_ppo"]["hyperparameter_sets"][0],
-                          "path": str(out / "checkpoints" / f"ppo-{regime}-{seed}")})
-            residual = arms["sac_residual_avellaneda_stoikov"]
-            train.append({**common, "algorithm": "sac_residual", "encoding": "residual",
-                          "baseline_kind": "avellaneda_stoikov",
-                          "baseline": selected[(regime, "avellaneda_stoikov")],
-                          "bounds": residual["bounds"],
-                          "hyperparameters": residual["hyperparameter_sets"][0],
-                          "path": str(out / "checkpoints" / f"sac-as-{regime}-{seed}")})
-    trained = pool(train, train_job, parallel, "training")
+    sets = {arm: range(len(ctx.arms[arm]["hyperparameter_sets"])) for arm in LEARNED}
+    train = [job for arm in LEARNED for job in ctx.train_jobs(arm, sets[arm], "main", baselines)]
+    trained = pool(train, train_job, ctx.parallel, "training")
     clock["training_seconds"] = round(time.perf_counter() - started, 1)
-    for job, metadata in zip(train, trained, strict=True):
-        metadata["path"] = job["path"]
     report["training"] = trained
 
     started = time.perf_counter()
-    jobs = []
-    for job, metadata in zip(train, trained, strict=True):
-        for day in validation:
-            jobs.append({**{k: v for k, v in job.items() if k not in ("seed", "steps", "path")},
-                         "day": day, "split": "validation",
-                         "arm": "maskable_ppo" if job["algorithm"] == "maskable_ppo"
-                         else "sac_residual_avellaneda_stoikov",
-                         "candidate": f"seed-{job['seed']}",
-                         "policy": {"kind": "frozen", "metadata": metadata}})
-    learned = pool(jobs, evaluate_job, parallel, "learned")
+    learned = pool(ctx.learned_jobs(trained, "main", "validation", validation), evaluate_job,
+                   ctx.parallel, "learned")
     clock["learned_validation_seconds"] = round(time.perf_counter() - started, 1)
     report["learned_validation"] = learned
-
-    summary = {}
-    for row in classical + learned:
-        key = f"{row['regime']}/{row['arm']}/{row['candidate']}"
-        summary.setdefault(key, []).append(row)
-    report["mean_daily_net_on_validation"] = {
-        key: str(mean_daily(rows)) for key, rows in sorted(summary.items())
-    }
+    selected_sets = {}
+    for arm in LEARNED:
+        rows = [r for r in learned if r["arm"] == arm]
+        by_set = best(rows, lambda r: r["candidate"].split("-")[0])
+        selected_sets[arm] = max(by_set, key=lambda s: (mean_daily(by_set[s]), s))
+    report["learned_selected_sets"] = selected_sets
     report["seconds"] = clock
-    (out / "reduced.json").write_text(json.dumps(report, indent=2, sort_keys=True))
+    ctx.write("selection", report)
+    return report
+
+
+def ablations(ctx, selection_report):
+    """Each ablation retrains the selected set of each learned arm, and evaluates the
+    selected classical points, under its execution, on validation."""
+    report = ctx.header("ablations")
+    clock = {}
+    validation = days_of(ctx.design, "validation")
+    chosen = {tuple(k.split("/")): v for k, v in selection_report["classical_selected"].items()}
+    baselines = {r: chosen[(r, "avellaneda_stoikov")] for r in ctx.regimes}
+    sets = {arm: int(s.removeprefix("set"))
+            for arm, s in selection_report["learned_selected_sets"].items()}
+    for variant, spec in ctx.design["execution"]["ablations"].items():
+        started = time.perf_counter()
+        execution_variant = "main" if spec.get("training_only") else variant
+        penalty = spec.get("penalty_per_squared_lot_per_step") if spec.get("training_only") else None
+        train = [job for arm in LEARNED
+                 for job in ctx.train_jobs(arm, [sets[arm]], execution_variant, baselines,
+                                           penalty, tag=variant)]
+        trained = pool(train, train_job, ctx.parallel, f"{variant} training")
+        jobs = ctx.learned_jobs(trained, execution_variant, "validation", validation)
+        if not spec.get("training_only"):
+            jobs += ctx.classical_jobs(variant, "validation", validation, chosen)
+        rows = pool(jobs, evaluate_job, ctx.parallel, f"{variant} evaluation")
+        for row in rows:
+            row["ablation"] = variant
+        report[variant] = {"training": trained, "validation": rows}
+        clock[variant] = round(time.perf_counter() - started, 1)
+    report["seconds"] = clock
+    ctx.write("ablations", report)
+    return report
+
+
+def check_ppo_hold(ctx):
+    """Whether PPO's hold is an artefact of the mask or of the reward's scale, on training
+    days only: how often the mask offers a quote, and what a reward 100 times larger gives."""
+    report = ctx.header("check_ppo_hold")
+    job = {"encoding": "maskable", "config": ctx.grid_config("main"), "data_dir": ctx.data_dir,
+           "variant": "main"}
+    offered = decisions = 0
+    for regime in ctx.regimes:
+        env = build_env(job, ctx.digests, regime, 1, "train")
+        env.reset(seed=1)
+        while True:
+            mask = env.action_masks()
+            decisions += 1
+            offered += bool(mask[1])
+            _, _, terminated, truncated, _ = env.step(np.array([0, 0, 0, 0, 0]))
+            if terminated or truncated:
+                break
+        env.close()
+    report["mask_offers_a_quote"] = {"decisions": decisions, "offered": offered}
+    scaled = ctx.grid_config("main")
+    scaled["f32_unit"] = "0.01"
+    train = ctx.train_jobs("maskable_ppo", [0], "main", {}, tag="check-reward-x100")
+    for job in train[:2]:
+        job["config"] = scaled
+        job["steps"] = 50_000
+    trained = pool(train[:2], train_job, ctx.parallel, "check training")
+    rows = []
+    for metadata in trained:
+        jobs = []
+        for regime in ctx.regimes:
+            job = {**ctx.common("main", regime, 2, "train"), "arm": "maskable_ppo",
+                   "candidate": f"x100-seed{metadata['seed']}", "encoding": "maskable",
+                   "config": scaled, "policy": {"kind": "frozen", "metadata": metadata}}
+            jobs.append(job)
+        rows += pool(jobs, evaluate_job, ctx.parallel, "check evaluation")
+    report["reward_x100_on_training_day_2"] = rows
+    report["training"] = trained
+    ctx.write("check_ppo_hold", report)
     return report
 
 
 def main():
     step, data_dir, out_dir, commit = sys.argv[1:5]
-    dry_budget = int(sys.argv[6]) if sys.argv[5:6] == ["--dry-run"] else None
-    if step != "reduced":
-        raise SystemExit(f"step {step!r} is not implemented yet")
+    ctx = Context(data_dir, out_dir, commit)
     started = time.perf_counter()
-    report = reduced(data_dir, out_dir, commit, dry_budget)
-    print(json.dumps({"seconds": report["seconds"], "total": round(time.perf_counter() - started, 1),
-                      "mean_daily_net_on_validation": report["mean_daily_net_on_validation"]},
-                     indent=2))
+    if step == "check_ppo_hold":
+        report = check_ppo_hold(ctx)
+    elif step == "selection":
+        report = selection(ctx)
+    elif step == "ablations":
+        report = ablations(ctx, json.loads((ctx.out / "selection.json").read_text()))
+    else:
+        raise SystemExit(f"step {step!r} is not implemented yet")
+    print(json.dumps({"step": step, "seconds": report.get("seconds"),
+                      "total": round(time.perf_counter() - started, 1)}, indent=2))
 
 
 if __name__ == "__main__":

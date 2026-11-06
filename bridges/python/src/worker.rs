@@ -5,11 +5,14 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use market_maker_rs::Decimal;
-use market_maker_rs::backtest::evaluation::{Attribution, EvaluationInput, attribute};
+use market_maker_rs::backtest::evaluation::{
+    Attribution, EvaluationInput, InventoryStats, attribute, inventory_stats, max_drawdown,
+};
 use market_maker_rs::backtest::kernel::{
     ActionGrid, ActionMask, AvellanedaQuoter, GlftQuoter, KernelConfig, KernelDataset,
     KernelFillModel, KernelLatency, KernelTick, QuoteSource,
 };
+use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
     EpisodeRecorder, FeatureVector, InvalidActionPolicy, ObservationScales, ResidualBounds,
@@ -358,12 +361,31 @@ pub struct ResetReply {
 }
 
 /// The attribution of the episode so far, reconciled with the reward.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributionReply {
     /// The components, in the evaluation's definitions.
     pub attribution: Attribution,
     /// Fills, the terminal close included.
     pub fills: usize,
+    /// The position over the window, in the evaluation's definitions.
+    pub inventory: InventoryStats,
+    /// The largest fall of equity from a peak, valued at the marks.
+    pub max_drawdown: Decimal,
+    /// From the first mark to just after the last record, in milliseconds.
+    pub window_ms: (u64, u64),
+    /// The position after each fill, net of base fees, with the fill's time and price.
+    pub positions: Vec<PositionChange>,
+}
+
+/// The position after one fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionChange {
+    /// The fill's time, in milliseconds.
+    pub timestamp_ms: u64,
+    /// The fill's price.
+    pub price: Decimal,
+    /// The position after it, net of base fees.
+    pub position: Decimal,
 }
 
 /// The result of a step, with the running totals.
@@ -432,9 +454,33 @@ fn attribution_of<const K: usize, const M: usize>(
     let input = EvaluationInput::new(records.window, &records.marks, &records.fills, Decimal::ONE)
         .map_err(|e| e.to_string())?;
     let split = attribute(&input).map_err(|e| e.to_string())?;
+    let mut position = Decimal::ZERO;
+    let mut positions = Vec::with_capacity(records.fills.len());
+    for fill in &records.fills {
+        let signed = match fill.side {
+            Action::Buy => fill.quantity,
+            Action::Sell => -fill.quantity,
+            // `Action` is another crate's non exhaustive enum: a side added there is refused.
+            _ => return Err(format!("a fill with an unknown side {:?}", fill.side)),
+        };
+        let change = signed
+            .checked_sub(fill.base_fee)
+            .and_then(|delta| position.checked_add(delta))
+            .ok_or_else(|| "a position does not convert".to_string())?;
+        position = change;
+        positions.push(PositionChange {
+            timestamp_ms: fill.timestamp_ms,
+            price: fill.price,
+            position,
+        });
+    }
     Ok(AttributionReply {
         attribution: split.total,
         fills: records.fills.len(),
+        inventory: inventory_stats(&input).map_err(|e| e.to_string())?,
+        max_drawdown: max_drawdown(&input).map_err(|e| e.to_string())?,
+        window_ms: (records.window.start_ms, records.window.end_ms),
+        positions,
     })
 }
 

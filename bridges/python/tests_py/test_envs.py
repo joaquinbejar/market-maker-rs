@@ -63,6 +63,24 @@ def test_hand_computed_trajectory_through_gymnasium():
     env.close()
 
 
+def test_attribution_reports_the_position_and_drawdown_of_the_hand_trajectory():
+    env = MaskableMarketMakingEnv(config(), LONG_ROWS)
+    env.reset(seed=1)
+    env.step([1, 1, 2, 1, 0])
+    env.step([0, 0, 0, 0, 0])
+    env.step([0, 0, 0, 0, 0])
+    a = env.attribution()
+    # Two lots bought at 99.5 at 2 s, sold at 100 by the close at 3 s.
+    assert a["positions"] == [(2000, "99.5", "2"), (3000, "100", "0")]
+    assert (a["max_abs_position"], a["final_position"]) == ("2", "0")
+    # Two lots held for 1 s of the 2 s between the first and the last mark.
+    assert a["mean_abs_position"] == "1"
+    # Cash -199.199 after the buy and its fee, and 2 x 99 at the mark of 2 s.
+    assert a["max_drawdown"] == "1.199"
+    assert a["window_ms"] == [1000, 3001]
+    env.close()
+
+
 def test_truncation_is_not_termination():
     env = MaskableMarketMakingEnv(config(max_steps=2), LONG_ROWS)
     env.reset(seed=1)

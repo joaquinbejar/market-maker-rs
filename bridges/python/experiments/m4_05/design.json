@@ -1,6 +1,6 @@
 {
   "issue": 102,
-  "design_version": 3,
+  "design_version": 4,
   "data": "synthetic: a queue-reactive simulator with made-up parameters, no market data",
   "bounds": "One synthetic simulator, made-up parameters and 24 days per regime bound what this comparison can show.",
   "simulator": {
@@ -225,7 +225,11 @@
     "version 3, before any training: the version 2 classical grids could not trade. Avellaneda-Stoikov measures time in years and volatility in absolute price units per square root of a year, and its half spread is close to 1/k, so k = 1.5 quoted about 1.0, some 200 kernel ticks, away. Volatility now comes from the training days by the rule below, and k from a grid near the touch.",
     "version 3: GLFT with max_inventory_lots 20 cost about 146 s per 8640 step episode, and still about 68 s with 5. Its grid is cut to 3 points, and max_inventory_lots 5 is a model approximation under a position limit of 20 for every arm; the report says how often a GLFT position exceeds 5. The residual over GLFT is not run.",
     "What was seen on validation before version 3: a dry run of the runner with a budget of 6000 steps, a check of the code, evaluated the version 2 Avellaneda-Stoikov and GLFT points with a zero residual on the calm validation days, and was stopped before it wrote or showed any result. Timing probes on calm validation day 15 showed, for whole episodes with evaluation seed 101: Avellaneda-Stoikov risk aversion 0.01, volatility 0.05, k 1.5: net 0, 0 fills, 5.19 s; Avellaneda-Stoikov risk aversion 1, volatility 0.2, k 1.5: net 0, 0 fills, 1.35 s; GLFT risk aversion 0.1, k 1, volatility 0.2, max inventory 20: net 0, 0 fills, 146.61 s. Two more probes timed 2000 steps of the first of those and of a hold, and showed only their time per step (310 and 144 microseconds). No version 3 point, no learned arm and no other regime was evaluated on validation. The holdout was never read; the runner refuses it.",
-    "Version 3 probes ran on training day 1 of the calm regime only."
+    "Version 3 probes ran on training day 1 of the calm regime only.",
+    "Step 1, the reduced step, ran at commit da14f8f with design version 3: calm only, 2 seeds, 50000 steps, validation only. It took 525.6 s. Its three evaluation seeds never gave different nets, over 100 rows.",
+    "version 4, before step 2: with rows every 10 s, a latency of 50 ms with 10 ms jitter never changes the row an order lands in, so latency and its seeds have no effect at the main execution. The latency ablation is one row instead: orders and cancels arrive 10 s after they are sent. Evaluation uses one seed from step 2 on, since three gave identical results.",
+    "version 4: each learned arm trains one policy on the pooled training days of all three regimes, since a regime is not observed, and is evaluated per regime and pooled. The classical arms keep a volatility and a validation choice per regime, which makes them the stronger baseline. The residual over Avellaneda-Stoikov corrects each regime's selected point.",
+    "version 4: the bridge's attribution adds the position over the window (largest and mean absolute, final), the largest drawdown and the position after each fill, from which the runner reports peak notional, the share of time beyond 5 lots and limit breaches. Markout is not reported: the attribution has no markout horizon over these rows."
   ],
   "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
   "kernel": {
@@ -264,19 +268,19 @@
           "kind": "immediate"
         }
       },
-      "latency_zero": {
-        "latency": {
-          "quantum_ns": 1000000,
-          "observation_q": 0,
-          "submit_q": 0,
-          "cancel_q": 0,
-          "ack_q": 0,
-          "jitter_q": 0
-        }
-      },
       "reward_inventory_penalty": {
         "training_only": true,
         "penalty_per_squared_lot_per_step": "0.00001"
+      },
+      "latency_one_row": {
+        "latency": {
+          "quantum_ns": 1000000,
+          "observation_q": 0,
+          "submit_q": 10000,
+          "cancel_q": 10000,
+          "ack_q": 0,
+          "jitter_q": 0
+        }
       }
     },
     "not_run": {
@@ -303,14 +307,16 @@
     },
     "metrics": [
       "net_pnl and its attribution",
-      "markout",
-      "inventory",
+      "inventory: largest and mean absolute position, final position",
       "max_drawdown",
       "cvar_5_of_daily_net",
-      "rejections",
-      "peak_notional",
-      "peak_inventory",
+      "rejections: gate refusals, residual fallbacks and clips",
+      "peak_notional at fill prices",
+      "time_beyond_5_lots",
       "limit_breaches"
+    ],
+    "evaluation_seeds_from_step_2": [
+      101
     ]
   },
   "arms": {
@@ -475,7 +481,7 @@
     4,
     5
   ],
-  "training_days": "each reset draws a training day uniformly from the run's seed",
+  "training_days": "each learned run trains on the pooled training days of every regime; every reset draws one of those days from the run's seed",
   "steps": [
     {
       "name": "reduced",
@@ -491,15 +497,13 @@
     },
     {
       "name": "selection",
-      "estimate_minutes": 90
-    },
-    {
-      "name": "main",
-      "estimate_minutes": 30
+      "estimate_minutes": 100,
+      "note": "30 runs: 2 learned arms, 3 sets, 5 seeds; the main comparison uses the selected set's 5 runs, so it trains nothing"
     },
     {
       "name": "ablations",
-      "estimate_minutes": 120
+      "estimate_minutes": 100,
+      "note": "30 runs: 3 ablations, 2 learned arms, the selected set, 5 seeds"
     },
     {
       "name": "holdout",
