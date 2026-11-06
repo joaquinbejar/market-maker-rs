@@ -12,6 +12,9 @@
 //! - [`DerivativeMarginAccount::accountant`] reads position, realized PnL and fees back from
 //!   that ledger.
 //!
+//! It takes every mark as its own contract's, so it runs in `BacktestEngine::with_instrument`
+//! and `ContractEngine`, whose marks are of several contracts, refuses it.
+//!
 //! The service accepts or refuses an order, so a proposal beyond the margin is refused whole,
 //! never cut. A requirement that a mark move takes beyond the cash keeps the previous hold and
 //! is counted in [`DerivativeMarginAccount::hold_shortfalls`]. Nothing liquidates: funding,
@@ -433,7 +436,7 @@ impl<M: InitialMarginModel + Clone + fmt::Debug> PretradePolicy for DerivativeMa
         )
     }
 
-    fn in_contracts(&self) -> bool {
+    fn in_one_contract(&self) -> bool {
         true
     }
 }

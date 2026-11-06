@@ -19,7 +19,8 @@ project follows [Semantic Versioning](https://semver.org/).
   #230): `backtest::DerivativeMarginAccount` shares a `margin-rs` gate and its reservation
   service between a pretrade policy and an accountant, in contracts and on the contract's
   notional. An order beyond the margin is refused whole. `BacktestEngine::with_instrument` now
-  accepts a policy that declares `PretradePolicy::in_contracts`, and still refuses any other.
+  accepts a policy that declares the new `PretradePolicy::in_one_contract`, which defaults to
+  `in_contracts`, and still refuses any other.
 - Example `consistent_time_travel` (#109): chronological replay as the baseline against
   time travel as a separate labelled mode, on a small synthetic environment whose true
   values are exact, with no new public API. It reports discontinuities, reuse of the tape

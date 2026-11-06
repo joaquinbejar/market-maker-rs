@@ -20,7 +20,7 @@ use market_maker_rs::Decimal;
 use market_maker_rs::backtest::engine::{BacktestConfig, BacktestStrategy, FeeCurrency};
 use market_maker_rs::backtest::{
     BacktestEngine, BacktestResult, DerivativeMarginAccount, MarginLedgerAccountant, MarketTick,
-    SimulatedFill, VecDataSource,
+    SimLatencyConfig, SimulatedFill, VecDataSource,
 };
 use market_maker_rs::dec;
 use market_maker_rs::execution::Action;
@@ -494,7 +494,9 @@ fn test_an_other_instrument_and_a_side_that_is_not_one_are_refused() {
     other.instrument = Some("OTHER".to_string());
     assert!(policy.check(&other).is_rejected());
     assert_eq!(held(&account), dec!(0));
-    assert!(policy.in_contracts());
+    // One contract's marks only, so an engine of several contracts must not take it.
+    assert!(policy.in_one_contract());
+    assert!(!policy.in_contracts());
 }
 
 #[test]
@@ -672,4 +674,37 @@ fn test_an_inverse_perpetual_is_margined_on_its_contract_value() {
             .check(&request("3", Action::Buy, dec!(2500)))
             .is_rejected()
     );
+}
+
+#[test]
+fn test_in_the_engine_a_fill_before_the_cancel_takes_effect_stands_and_later_none_does() {
+    let spec = perpetual(dec!(0.01));
+    let run = |cross_at: u64| {
+        let account = account(&spec, dec!(1000));
+        // Quoted at 1000, silent from 1100, with the cancel taking effect at 1150.
+        let script = vec![Some((dec!(60000), dec!(5), FAR_HIGH, dec!(5))), None, None];
+        let mut ticks = vec![
+            tick(1000, dec!(60100)),
+            tick(1100, dec!(60100)),
+            tick(cross_at, dec!(59999)),
+        ];
+        ticks.push(tick(cross_at + 1, dec!(60100)));
+        let mut engine = BacktestEngine::new(
+            config(&spec, dec!(0)),
+            Scripted(script, 0),
+            VecDataSource::new(ticks),
+        )
+        .with_instrument(spec.clone(), account.accountant())
+        .unwrap()
+        .with_pretrade_policy(account.policy())
+        .with_latency(SimLatencyConfig::new().with_cancel_ms(50))
+        .unwrap();
+        let result = engine.run();
+        assert!(account.errors().is_empty(), "{:?}", account.errors());
+        (result.final_position, held(&account))
+    };
+    // The fill stands, and the position of 5 at 60100 still asks 300.5.
+    assert_eq!(run(1149), (dec!(5), dec!(300.5)));
+    // After the effect there is no order, and nothing is held.
+    assert_eq!(run(1150), (dec!(0), dec!(0)));
 }

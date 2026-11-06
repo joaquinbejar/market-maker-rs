@@ -253,6 +253,14 @@ pub trait PretradePolicy: fmt::Debug {
     fn in_contracts(&self) -> bool {
         false
     }
+
+    /// Whether it decides in contracts for the one contract of a run, reading each
+    /// [`PretradePolicy::on_market_data`] mark as that contract's. Less than
+    /// [`PretradePolicy::in_contracts`], which also copes with marks of other contracts.
+    /// `BacktestEngine::with_instrument` refuses a policy that declares neither.
+    fn in_one_contract(&self) -> bool {
+        self.in_contracts()
+    }
 }
 
 /// Outcome of [`limits_capacity`] for one order.

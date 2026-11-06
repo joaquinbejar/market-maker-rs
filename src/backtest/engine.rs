@@ -1777,7 +1777,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
     ///
     /// [`MMError::InvalidConfiguration`] for a contract that is not a future or a
     /// perpetual, a pretrade policy that does not decide in contracts (see
-    /// [`PretradePolicy::in_contracts`]: other limits read `price * quantity`, which is
+    /// [`PretradePolicy::in_one_contract`]: other limits read `price * quantity`, which is
     /// not a notional here), a [`BacktestConfig::lot_size`] other than the lot of
     /// `spec`, a [`BacktestConfig::tick_size`] other than its single price tick,
     /// or a fee currency other than [`FeeCurrency::Settlement`]; and the error of
@@ -1840,7 +1840,7 @@ impl<S: BacktestStrategy, D: HistoricalDataSource, F: FillModel> BacktestEngine<
         if !matches!(spec.kind(), ContractKind::Future | ContractKind::Perpetual) {
             return refuse(format!("{:?} is not a future or a perpetual", spec.kind()));
         }
-        if self.policy.as_ref().is_some_and(|p| !p.in_contracts()) {
+        if self.policy.as_ref().is_some_and(|p| !p.in_one_contract()) {
             return refuse(
                 "a pretrade policy reads price * quantity, which is not a notional here: \
                  only one that decides in contracts can run"
