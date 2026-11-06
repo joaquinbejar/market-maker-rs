@@ -16,7 +16,7 @@
 //! | linear perpetual | [`LinearPerpetual`](margin_rs::LinearPerpetual) | multiplier: the size amount |
 //! | inverse future | [`InverseFuture`](margin_rs::InverseFuture), settled in the settlement asset (the underlying) | contract value: the size amount |
 //! | inverse perpetual | [`InversePerpetual`](margin_rs::InversePerpetual) | contract value: the size amount |
-//! | option | none: [`AdapterError::Unsupported`] | |
+//! | option | [`OptionInstrument`](margin_rs::instrument::OptionInstrument), as `margin-rs` 0.2 maps it | multiplier: the size amount |
 //!
 //! The identifier and the asset codes go through the `margin-rs`
 //! constructors, and the expiry (milliseconds since the epoch) is passed
@@ -47,7 +47,7 @@
 //!   the underlying, and its prices and settlement are in the price asset;
 //! - the price asset of an inverse derivative: its contract value and
 //!   prices are in that currency, which is not a ledger asset;
-//! - option terms (options are not converted).
+//! - for an option, whatever `margin-rs` leaves out of its option terms.
 //!
 //! The lot is not a risk minimum either. When the risk limits of an
 //! instrument leave `min_quantity` unset, `margin-rs` uses one unit at
@@ -193,7 +193,7 @@ impl From<MarginError> for AdapterError {
 ///
 /// Checked in this order:
 ///
-/// - [`AdapterError::Unsupported`] for an option;
+/// - [`AdapterError::Unsupported`] for a specification `margin-rs` does not convert;
 /// - [`AdapterError::ScaleBelowGrid`] if `scales.price_scale` is below the
 ///   digits of a price tick, or `scales.contract_scale` below the digits of
 ///   the lot;
@@ -240,7 +240,8 @@ pub fn margin_instrument(
 ///
 /// - [`AdapterError::SymbolMismatch`] unless the fill's symbol is the identifier
 ///   of `spec`, compared exactly;
-/// - [`AdapterError::Unsupported`] for an option;
+/// - [`AdapterError::Unsupported`] for an option, whose fill needs its premium and its time
+///   checked against the expiry, which this conversion does not do;
 /// - [`AdapterError::UnsupportedSide`] for a side other than buy or sell;
 /// - [`AdapterError::EmptyTradeId`] for an empty `trade_id`;
 /// - [`AdapterError::NotPositive`] for a price or a quantity that is not
@@ -376,9 +377,21 @@ mod tests {
         )
         .unwrap();
         let binance = binance_usdm::btcusdt_perpetual().unwrap();
-        for (spec, (price_scale, contract_scale)) in
-            [(&option, (4, 1)), (&binance, (0, 3)), (&binance, (19, 3))]
-        {
+        // margin-rs 0.2 converts options, so an option is no longer an error here.
+        let converted = margin_instrument(
+            &option,
+            MarginScales {
+                price_scale: 4,
+                contract_scale: 1,
+            },
+        )
+        .unwrap();
+        assert!(converted.option_terms().is_some());
+        assert_eq!(
+            Ok(converted),
+            Instrument::from_spec(&option, scales(4, 1)).map_err(AdapterError::from)
+        );
+        for (spec, (price_scale, contract_scale)) in [(&binance, (0, 3)), (&binance, (19, 3))] {
             let direct = Instrument::from_spec(spec, scales(price_scale, contract_scale))
                 .map_err(AdapterError::from);
             let adapter = margin_instrument(

@@ -517,6 +517,8 @@ project follows [Semantic Versioning](https://semver.org/).
   `SettlementRecord` gains `outcome` and `realized_pnl`. A cash option out of the money settles
   in cash for zero, as the ledger has no lapse for one. The premium is booked by the ledger at
   each fill and stays in the option's realized PnL. Inverse options are refused.
+  `instruments::margin_instrument` now converts an option specification, as
+  `Instrument::from_spec` does in 0.2; `fill_execution` still refuses an option's fill.
 - `OptionQuoter` holds a short's capital at `margin-rs` 0.2's short option initial margin
   (#98), computed by `margin-rs`'s `rules::ShortOptionIm` and no longer from the declared
   scenarios. A sale reserves the rule's initial margin for one short contract at the round's
