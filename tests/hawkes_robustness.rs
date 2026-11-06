@@ -3,12 +3,20 @@
 //!
 //! Everything here is a simulation with the model's own parameters: it says how these
 //! policies behave in this model under these bounds, and nothing about a market. No
-//! learned policy exists yet, so only classical ones are compared, and no margin
-//! shortfall is measured, as this study has no margin account.
+//! learned policy exists yet, so only classical ones are compared.
+//!
+//! Margin is measured, not enforced: the position is read as a linear perpetual under
+//! `margin-rs`'s `linear-im/1` maintenance rule, with [`CAPITAL`], a made-up figure of no
+//! venue. Nothing closes the position when it falls short, and cash is taken as the whole
+//! collateral, as this study books no realized PnL apart. So the shortfall is how far the
+//! account would be below maintenance if it had kept running. It is sampled at market orders
+//! and at the end, and the adversary does not target it: it picks on the PnL's tail alone.
+//! The capital sits where the inventory limit binds, so this column largely reads the
+//! inventory, and `margin-rs` has no named stress scenarios to use here.
 //!
 //! The protocol is fixed in the constants below, before the holdout seeds run:
 //! the adversary picks one scenario per policy from [`GRID_MARKET`], [`GRID_BRANCHING`]
-//! and [`GRID_IMPACT`], maximising the expected shortfall of the PnL on [`SELECTION_SEEDS`]
+//! and [`GRID_IMPACT`], maximising the 5% tail loss of the PnL on [`SELECTION_SEEDS`]
 //! only. It sets parameters before an episode and sees nothing of its path, and it changes
 //! neither matching, accounting nor the limits. The fixed stress is [`FIXED_STRESS`].
 //! Every arm is reported on [`HOLDOUT_SEEDS`].
@@ -32,6 +40,10 @@
 
 use std::ops::Range;
 
+use margin_rs::initial_margin::{ExposurePosition, ExposureView, InitialMarginModel, ProductKind};
+use margin_rs::maintenance::{AccountState, CollateralView, assess};
+use margin_rs::rules::TieredLinearIm;
+use margin_rs::{AccountId, Asset, ContractSize, InstrumentId, VenueId};
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::hawkes::{HawkesEvent, HawkesParameters, HawkesSimulator};
 use market_maker_rs::backtest::queue_reactive::QrEventKind;
@@ -94,6 +106,9 @@ const OFF_GRID: [(&str, Scenario); 4] = [
         },
     ),
 ];
+/// Capital of the account in the margin measure. Synthetic, and the only margin parameter
+/// declared here; the rates are those of the rule.
+const CAPITAL: Decimal = dec!(40);
 const SELECTION_SEEDS: Range<u64> = 1..401;
 const HOLDOUT_SEEDS: Range<u64> = 1_001..1_401;
 const BOOTSTRAP_SEED: u64 = 77;
@@ -235,6 +250,52 @@ struct Episode {
     time_weighted_inventory: f64,
     max_drawdown: f64,
     terminal_inventory: Decimal,
+    /// Largest shortfall below maintenance, in the margin measure.
+    max_shortfall: f64,
+    /// Shortfall at the end.
+    terminal_shortfall: f64,
+    /// Whether the account ever left the healthy state.
+    left_healthy: bool,
+}
+
+/// The maintenance shortfall of `inventory` and `equity` at `mid`, and the account's state.
+fn margin_measure(
+    inventory: Decimal,
+    equity: Decimal,
+    mid: Decimal,
+    previous: AccountState,
+) -> (Decimal, AccountState) {
+    let usd = Asset::new("USD").unwrap();
+    let rule = TieredLinearIm::linear_v1(usd.clone(), 6).unwrap();
+    let view = ExposureView {
+        account: AccountId::new("study").unwrap(),
+        venue: VenueId::new("synthetic").unwrap(),
+        positions: if inventory.is_zero() {
+            vec![]
+        } else {
+            vec![ExposurePosition {
+                instrument: InstrumentId::new("PERP").unwrap(),
+                product: ProductKind::LinearPerpetual,
+                settlement: usd.clone(),
+                contracts: inventory,
+                size: ContractSize::Multiplier(Decimal::ONE),
+                mark: mid,
+            }]
+        },
+    };
+    let collateral = CAPITAL + equity;
+    let decision = assess(
+        previous,
+        &CollateralView {
+            currency: usd,
+            cash: collateral,
+            collateral: Some(collateral),
+            equity: Some(collateral),
+        },
+        &rule.requirement(&view).unwrap(),
+    )
+    .unwrap();
+    (decision.maintenance_shortfall.unwrap(), decision.state)
 }
 
 /// The accounts of an episode, in `Decimal`.
@@ -315,6 +376,7 @@ fn run_path(
             out.time_weighted_inventory += inventory.abs().to_f64().unwrap() * delta;
             *now = to;
         };
+    let mut state = AccountState::Healthy;
     for &(event, side) in events {
         // The quote rests from the last event, before the mid moves on to this one.
         let (bid, ask) = quotes(policy, mid, book.inventory, now);
@@ -358,6 +420,11 @@ fn run_path(
         let equity = book.equity(mid);
         peak = peak.max(equity);
         out.max_drawdown = out.max_drawdown.max(peak - equity);
+        let marked = book.cash + book.inventory * price(mid);
+        let (shortfall, next) = margin_measure(book.inventory, marked, price(mid), state);
+        state = next;
+        out.max_shortfall = out.max_shortfall.max(shortfall.to_f64().unwrap());
+        out.left_healthy = out.left_healthy || state != AccountState::Healthy;
     }
     advance(
         &mut mid,
@@ -366,6 +433,11 @@ fn run_path(
         book.inventory,
         &mut out,
     );
+    let marked = book.cash + book.inventory * price(mid);
+    let (shortfall, last) = margin_measure(book.inventory, marked, price(mid), state);
+    out.terminal_shortfall = shortfall.to_f64().unwrap();
+    out.max_shortfall = out.max_shortfall.max(out.terminal_shortfall);
+    out.left_healthy = out.left_healthy || last != AccountState::Healthy;
     let equity = book.equity(mid) - liquidation_cost(book.inventory, impact);
     peak = peak.max(equity);
     out.max_drawdown = out.max_drawdown.max(peak - equity);
@@ -508,6 +580,33 @@ fn test_off_grid_scenarios_are_stable_and_outside_the_grid() {
         assert!(queue_params(scenario.bid_market, scenario.branching).branching_ratio() < 1.0);
         assert!(queue_params(scenario.ask_market, scenario.branching).branching_ratio() < 1.0);
         assert!(run_episode(Policy::Fixed, scenario, 1).max_abs_inventory <= inventory_limit());
+    }
+}
+
+#[test]
+fn test_margin_measure_by_hand() {
+    // Long 10 at 100: maintenance 5% of 1000 is 50, against capital 40.
+    let (shortfall, state) = margin_measure(dec!(10), dec!(0), dec!(100), AccountState::Healthy);
+    assert_eq!(shortfall, dec!(10));
+    assert_eq!(state, AccountState::ReduceOnly);
+    // A short counts the same, and equity covers the gap.
+    let (shortfall, state) = margin_measure(dec!(-10), dec!(10), dec!(100), AccountState::Healthy);
+    assert_eq!(shortfall, dec!(0));
+    assert_eq!(state, AccountState::Healthy);
+    // No position needs nothing, and a capital wiped out is a default.
+    let (shortfall, state) = margin_measure(dec!(0), dec!(-41), dec!(100), AccountState::Healthy);
+    assert_eq!(shortfall, dec!(1));
+    assert_eq!(state, AccountState::Default);
+}
+
+#[test]
+fn test_the_margin_measure_reaches_an_episode() {
+    let episodes: Vec<Episode> = (1..40)
+        .map(|seed| run_episode(Policy::Fixed, FIXED_STRESS, seed))
+        .collect();
+    assert!(episodes.iter().any(|e| e.max_shortfall > 0.0));
+    for episode in &episodes {
+        assert!(episode.left_healthy || episode.max_shortfall == 0.0);
     }
 }
 
@@ -856,6 +955,10 @@ fn test_a_table_row_prints_each_figure_under_its_header() {
     // Twenty episodes, so the worst 5% is the one at -40.
     let mut episodes = vec![episode(2.0, 3, 5.0, 7.0, dec!(4)); 19];
     episodes.push(episode(-40.0, 3, 5.0, 7.0, inventory_limit()));
+    for one in &mut episodes {
+        one.max_shortfall = 9.0;
+    }
+    episodes[0].left_healthy = true;
     let row = table_row(Policy::Fixed, "base", BASE, &episodes);
     let cells: Vec<&str> = row.split('|').map(str::trim).collect();
     assert_eq!(cells[1], "Fixed");
@@ -868,6 +971,8 @@ fn test_a_table_row_prints_each_figure_under_its_header() {
     assert_eq!(cells[8], "10");
     assert_eq!(cells[9], "1");
     assert!(cells[10].starts_with("3.000 "), "{}", cells[10]);
+    assert!(cells[11].starts_with("9.000 "), "{}", cells[11]);
+    assert_eq!(cells[12], "1");
 }
 
 /// How many fills in the holdout were at a quote through the mid when it was set: the limit
@@ -917,7 +1022,7 @@ fn table_row(policy: Policy, arm: &str, scenario: Scenario, episodes: &[Episode]
         .filter(|e| e.max_abs_inventory == inventory_limit())
         .count();
     format!(
-        "| {policy:?} | {arm} | {}, {}, {}, {} | {} | {:.3} [{tail_low:.3}, {tail_high:.3}] | {} | {} | {peak} | {at_limit} | {} |",
+        "| {policy:?} | {arm} | {}, {}, {}, {} | {} | {:.3} [{tail_low:.3}, {tail_high:.3}] | {} | {} | {peak} | {at_limit} | {} | {} | {} |",
         scenario.bid_market,
         scenario.ask_market,
         scenario.branching,
@@ -927,10 +1032,12 @@ fn table_row(policy: Policy, arm: &str, scenario: Scenario, episodes: &[Episode]
         pick(|e| e.max_drawdown),
         pick(|e| e.time_weighted_inventory),
         pick(|e| f64::from(e.fills)),
+        pick(|e| e.max_shortfall),
+        episodes.iter().filter(|e| e.left_healthy).count(),
     )
 }
 
-/// The evidence table. `--ignored --nocapture`, in release.
+/// The evidence table. `--ignored --nocapture`, in release, with the `margin` feature.
 #[test]
 #[ignore = "the study itself: several minutes without --release"]
 fn test_robustness_evidence_table() {
@@ -940,9 +1047,9 @@ fn test_robustness_evidence_table() {
         SELECTION_SEEDS.count()
     );
     println!(
-        "| policy | arm | scenario (bid, ask, branching, impact) | mean pnl | cvar 5% | mean drawdown | mean abs inventory | peak abs inventory | at limit | fills |"
+        "| policy | arm | scenario (bid, ask, branching, impact) | mean pnl | cvar 5% | mean drawdown | mean abs inventory | peak abs inventory | at limit | fills | max shortfall | left healthy |"
     );
-    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     for policy in [Policy::Fixed, Policy::AvellanedaStoikov] {
         for (arm, scenario) in table_arms(policy, adversary) {
             let episodes: Vec<Episode> = HOLDOUT_SEEDS
@@ -951,4 +1058,61 @@ fn test_robustness_evidence_table() {
             println!("{}", table_row(policy, arm, scenario, &episodes));
         }
     }
+}
+
+/// Long 10 by hand: buys at 99.95 with a fee of 1 bp, so equity 0.40005 at a mid of 100.
+/// Maintenance 50 against 40.40005. Selling it all back leaves nothing to maintain.
+#[test]
+fn test_a_shortfall_gone_by_the_end_still_counts() {
+    let mut events: Vec<_> = (1..=10).map(|i| market(f64::from(i), Side::Bid)).collect();
+    events.extend((11..=20).map(|i| market(f64::from(i), Side::Ask)));
+    let e = scripted(Policy::Fixed, 0.0, &events, &[true; 20]);
+    assert_eq!(e.terminal_inventory, dec!(0));
+    close(e.max_shortfall, 9.59995);
+    assert_eq!(e.terminal_shortfall, 0.0);
+    assert!(e.left_healthy);
+}
+
+/// Long 8 by hand holds at 100: maintenance 40 against 40.32004. A fall to 99 over the last
+/// stretch gives maintenance 39.6 against 32.32004, seen only by the sample at the end.
+#[test]
+fn test_a_shortfall_at_the_last_mid_is_sampled_with_the_position_at_that_mid() {
+    let events: Vec<_> = (1..=8).map(|i| market(f64::from(i), Side::Bid)).collect();
+    let fall = -1.0 / (SIGMA * (HORIZON_SECONDS - 8.0).sqrt());
+    let mut steps = std::iter::repeat_n(0.0, 8).chain([fall]);
+    let mut draws = std::iter::repeat(0.0);
+    let e = run_path(
+        Policy::Fixed,
+        0.0,
+        &events,
+        || steps.next().unwrap(),
+        || draws.next().unwrap(),
+    );
+    close(e.max_shortfall, 7.27996);
+    close(e.terminal_shortfall, 7.27996);
+    assert!(e.left_healthy);
+    // Without the fall it never left.
+    let held = scripted(Policy::Fixed, 0.0, &events, &[true; 8]);
+    assert_eq!(held.max_shortfall, 0.0);
+    assert!(!held.left_healthy);
+}
+
+/// The same fall as above, inside the loop: the order at 9 s misses, with the mid at 99, and
+/// the mid comes back by the end. So the shortfall is read there, at that mid.
+#[test]
+fn test_a_shortfall_inside_the_loop_is_read_at_the_mid_of_that_moment() {
+    let events: Vec<_> = (1..=9).map(|i| market(f64::from(i), Side::Bid)).collect();
+    let back = 1.0 / (SIGMA * (HORIZON_SECONDS - 9.0).sqrt());
+    let mut steps = std::iter::repeat_n(0.0, 8).chain([-50.0, back]);
+    let mut draws = std::iter::repeat_n(0.0, 8).chain([1.0]);
+    let e = run_path(
+        Policy::Fixed,
+        0.0,
+        &events,
+        || steps.next().unwrap(),
+        || draws.next().unwrap(),
+    );
+    assert_eq!(e.fills, 8);
+    close(e.max_shortfall, 7.27996);
+    assert_eq!(e.terminal_shortfall, 0.0);
 }
