@@ -17,6 +17,10 @@
 //! stale before the next order, and that order fills at the quote. What is held at the end
 //! is charged half the impact of selling it all. Drawdown is sampled at market orders and at
 //! the end only.
+//!
+//! The fill rule takes a quote as it is. A skew can set a bid above the mid or an ask under
+//! it, and such a quote fills with probability 1 at a passive fee, where a venue would have
+//! crossed it. See [`Episode::through_when_set`] and `test_fills_through_the_mid_when_set`.
 
 #![allow(
     clippy::unwrap_used,
@@ -155,7 +159,7 @@ fn price(value: f64) -> Decimal {
     Decimal::from_f64(value).unwrap().round_dp(4)
 }
 
-/// Half spreads to the mid given what the policy can see: time, mid and inventory.
+/// Bid and ask prices given what the policy can see: time, mid and inventory.
 fn quotes(policy: Policy, mid: f64, inventory: Decimal, now: f64) -> (Decimal, Decimal) {
     let mid_price = price(mid);
     match policy {
@@ -182,8 +186,11 @@ fn quotes(policy: Policy, mid: f64, inventory: Decimal, now: f64) -> (Decimal, D
 struct Episode {
     pnl: f64,
     fills: u32,
-    /// Fills at a quote the mid had moved through since it was set.
+    /// Fills at a quote through the mid when the order came, however it got there.
     stale_fills: u32,
+    /// Those whose quote was already through the mid when it was set, which only a skew
+    /// can do: a venue would have crossed it, not rested it at a passive fee.
+    through_when_set: u32,
     max_abs_inventory: Decimal,
     time_weighted_inventory: f64,
     max_drawdown: f64,
@@ -240,21 +247,38 @@ fn liquidation_cost(inventory: Decimal, impact: f64) -> f64 {
 
 fn run_episode(policy: Policy, scenario: Scenario, seed: u64) -> Episode {
     let mut noise = Noise(seed.wrapping_mul(0x9E37_79B9).wrapping_add(1));
+    let mut draws = Noise(seed.wrapping_mul(0x5851_F42D).wrapping_add(3));
+    run_path(
+        policy,
+        BASE_IMPACT * scenario.impact,
+        &flow(scenario, seed),
+        || noise.normal(),
+        || draws.unit(),
+    )
+}
+
+/// An episode on given events, with `normal` driving the diffusion and `draw` the fills.
+fn run_path(
+    policy: Policy,
+    impact: f64,
+    events: &[(HawkesEvent, Side)],
+    mut normal: impl FnMut() -> f64,
+    mut draw: impl FnMut() -> f64,
+) -> Episode {
     let mut book = Book::default();
     let mut out = Episode::default();
     let (mut mid, mut now, mut peak) = (100.0f64, 0.0f64, 0.0f64);
-    let impact = BASE_IMPACT * scenario.impact;
     let mut advance =
         |mid: &mut f64, now: &mut f64, to: f64, inventory: Decimal, out: &mut Episode| {
             let delta = to - *now;
-            *mid += SIGMA * delta.sqrt() * noise.normal();
+            *mid += SIGMA * delta.sqrt() * normal();
             out.time_weighted_inventory += inventory.abs().to_f64().unwrap() * delta;
             *now = to;
         };
-    let mut draws = Noise(seed.wrapping_mul(0x5851_F42D).wrapping_add(3));
-    for (event, side) in flow(scenario, seed) {
+    for &(event, side) in events {
         // The quote rests from the last event, before the mid moves on to this one.
         let (bid, ask) = quotes(policy, mid, book.inventory, now);
+        let mid_when_set = mid;
         advance(
             &mut mid,
             &mut now,
@@ -279,10 +303,14 @@ fn run_episode(policy: Policy, scenario: Scenario, seed: u64) -> Episode {
                 book.inventory > -inventory_limit(),
             ),
         };
-        let draw = draws.unit();
-        if open && draw < fill_probability(distance) {
+        let drawn = draw();
+        if open && drawn < fill_probability(distance) {
             book.fill(side, at);
             out.stale_fills += u32::from(distance < 0.0);
+            out.through_when_set += u32::from(match side {
+                Side::Bid => at.to_f64().unwrap() > mid_when_set,
+                Side::Ask => at.to_f64().unwrap() < mid_when_set,
+            });
             out.fills += 1;
             out.max_abs_inventory = out.max_abs_inventory.max(book.inventory.abs());
         }
@@ -392,7 +420,7 @@ fn test_liquidation_charges_half_the_impact_of_the_position() {
     assert_eq!(liquidation_cost(dec!(0), 0.5), 0.0);
 }
 
-/// A larger impact costs a position more, and a quote left behind by the mid loses.
+/// A larger impact costs a position more on average.
 #[test]
 fn test_stale_quotes_and_impact_cost_a_fixed_policy_on_average() {
     let pnl = |s: Scenario| {
@@ -534,6 +562,302 @@ fn test_the_adversary_is_the_argmax_on_its_seeds() {
     }
 }
 
+fn market(time_seconds: f64, side: Side) -> (HawkesEvent, Side) {
+    (
+        HawkesEvent {
+            time_seconds,
+            kind: QrEventKind::Market,
+        },
+        side,
+    )
+}
+
+/// An episode with no diffusion, whose fills follow `fills` in order.
+fn scripted(
+    policy: Policy,
+    impact: f64,
+    events: &[(HawkesEvent, Side)],
+    fills: &[bool],
+) -> Episode {
+    let mut next = fills.iter();
+    run_path(
+        policy,
+        impact,
+        events,
+        || 0.0,
+        || if *next.next().unwrap() { 0.0 } else { 1.0 },
+    )
+}
+
+fn close(found: f64, expected: f64) {
+    assert!((found - expected).abs() < 1e-9, "{found} {expected}");
+}
+
+#[test]
+fn test_an_episode_by_hand_with_a_position_at_the_end() {
+    let events = [market(100.0, Side::Bid), market(200.0, Side::Bid)];
+    let e = scripted(Policy::Fixed, 0.01, &events, &[true, true]);
+    // Buys at 99.95 and 99.94, fee 1 bp: cash -199.909989. Mid 100, 99.99, then 99.98.
+    assert_eq!(e.fills, 2);
+    assert_eq!(e.terminal_inventory, dec!(2));
+    assert_eq!(e.max_abs_inventory, dec!(2));
+    // Equity 0.030005, then 0.050011, less 2 * 2 * 0.01 / 2 at the end.
+    close(e.pnl, 0.030011);
+    // The fall from the peak comes only from the charge at the end.
+    close(e.max_drawdown, 0.02);
+    // Held 0, 1, 2 for 100 s each, over 300 s.
+    close(e.time_weighted_inventory, 1.0);
+}
+
+#[test]
+fn test_drawdown_is_sampled_at_each_market_order() {
+    let events = [
+        market(10.0, Side::Bid),
+        market(20.0, Side::Bid),
+        market(30.0, Side::Ask),
+        market(40.0, Side::Ask),
+    ];
+    let e = scripted(Policy::Fixed, 0.01, &events, &[true, false, false, false]);
+    assert_eq!(e.fills, 1);
+    // Equity 0.030005, 0.020005, 0.030005, 0.040005, then 0.035005 after the charge. The
+    // deepest fall is the one in the loop, from an order that missed.
+    close(e.max_drawdown, 0.01);
+    close(e.pnl, 0.035005);
+}
+
+#[test]
+fn test_a_short_side_order_moves_the_books_and_the_mid_the_other_way() {
+    let events = [market(150.0, Side::Ask)];
+    let e = scripted(Policy::Fixed, 0.01, &events, &[true]);
+    // Sold at 100.05, fee 0.010005, bought back marked at 100.01, charge 0.005.
+    assert_eq!(e.terminal_inventory, dec!(-1));
+    close(e.pnl, 100.05 - 0.010005 - 100.01 - 0.005);
+    close(e.time_weighted_inventory, 0.5);
+}
+
+#[test]
+fn test_a_side_at_the_limit_takes_no_fill_but_its_order_still_moves_the_mid() {
+    let events: Vec<_> = (1..=12).map(|i| market(f64::from(i), Side::Bid)).collect();
+    let e = scripted(Policy::Fixed, 0.0, &events, &[true; 12]);
+    assert_eq!(e.fills, 10);
+    assert_eq!(e.terminal_inventory, inventory_limit());
+}
+
+#[test]
+fn test_avellaneda_stoikov_in_an_episode_sees_its_inventory_and_the_time_left() {
+    let events = [market(100.0, Side::Bid), market(200.0, Side::Bid)];
+    let impact = 0.01;
+    let e = scripted(Policy::AvellanedaStoikov, impact, &events, &[true, true]);
+    let (first, _) = quotes(Policy::AvellanedaStoikov, 100.0, dec!(0), 0.0);
+    // The second quote is set after the first fill, at the mid the order left, 100 s in.
+    let (second, _) = quotes(Policy::AvellanedaStoikov, 100.0 - impact, dec!(1), 100.0);
+    let mut book = Book::default();
+    book.fill(Side::Bid, first);
+    book.fill(Side::Bid, second);
+    let expected = book.equity(100.0 - 2.0 * impact) - liquidation_cost(dec!(2), impact);
+    close(e.pnl, expected);
+    // Both inputs change the quote, so an episode that ignored one would differ.
+    assert_ne!(
+        second,
+        quotes(Policy::AvellanedaStoikov, 100.0 - impact, dec!(0), 100.0).0
+    );
+    assert_ne!(
+        second,
+        quotes(Policy::AvellanedaStoikov, 100.0 - impact, dec!(1), 0.0).0
+    );
+}
+
+#[test]
+fn test_a_fill_through_the_mid_when_set_is_told_from_a_quote_left_behind() {
+    // Long one unit with 299 s left, the skew puts the ask under the mid; short, the bid over.
+    let (_, ask) = quotes(Policy::AvellanedaStoikov, 100.0, dec!(1), 1.0);
+    let (bid, _) = quotes(Policy::AvellanedaStoikov, 100.0, dec!(-1), 1.0);
+    assert!(ask < dec!(100), "{ask}");
+    assert!(bid > dec!(100), "{bid}");
+    for (open, close) in [(Side::Bid, Side::Ask), (Side::Ask, Side::Bid)] {
+        let events = [market(1.0, open), market(2.0, close)];
+        let e = scripted(Policy::AvellanedaStoikov, 0.0, &events, &[true, true]);
+        assert_eq!((e.fills, e.through_when_set, e.stale_fills), (2, 1, 1));
+    }
+    // A quote the mid moved through after it was set is stale and was not through then.
+    let left_behind = [market(1.0, Side::Bid), market(2.0, Side::Bid)];
+    let mut steps = [0.0, -1.0, 0.0].into_iter();
+    let mut fills = [0.0, 0.0].into_iter();
+    let e = run_path(
+        Policy::Fixed,
+        0.0,
+        &left_behind,
+        || steps.next().unwrap(),
+        || fills.next().unwrap(),
+    );
+    assert_eq!(e.through_when_set, 0);
+    assert_eq!(e.stale_fills, 0);
+    let mut steps = [0.0, -100.0, 0.0].into_iter();
+    let mut fills = [0.0, 0.0].into_iter();
+    let e = run_path(
+        Policy::Fixed,
+        0.0,
+        &left_behind,
+        || steps.next().unwrap(),
+        || fills.next().unwrap(),
+    );
+    assert_eq!(e.through_when_set, 0);
+    assert_eq!(e.stale_fills, 1);
+}
+
+#[test]
+fn test_branching_and_market_multipliers_reach_the_flow() {
+    let count = |scenario: Scenario| {
+        (1..30)
+            .map(|seed| {
+                flow(scenario, seed)
+                    .iter()
+                    .filter(|(e, _)| e.kind == QrEventKind::Market)
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    let more_branching = Scenario {
+        branching: 1.2,
+        ..BASE
+    };
+    let more_market = Scenario {
+        bid_market: 1.3,
+        ask_market: 1.3,
+        ..BASE
+    };
+    assert_ne!(flow(BASE, 3), flow(more_branching, 3));
+    assert!(count(more_branching) > count(BASE));
+    assert!(count(more_market) > count(BASE));
+}
+
+#[test]
+fn test_the_two_queues_do_not_share_a_seed() {
+    let events = flow(BASE, 3);
+    let times = |side| {
+        events
+            .iter()
+            .filter(|(_, s)| *s == side)
+            .map(|(e, _)| e.time_seconds)
+            .collect::<Vec<_>>()
+    };
+    assert!(!times(Side::Bid).is_empty());
+    assert_ne!(times(Side::Bid), times(Side::Ask));
+}
+
+#[test]
+fn test_selection_and_holdout_seeds_do_not_meet_as_flow_doubles_them() {
+    // `flow` uses 2 s and 2 s + 1.
+    const { assert!((SELECTION_SEEDS.end - 1) * 2 + 1 < HOLDOUT_SEEDS.start * 2) };
+}
+
+#[test]
+fn test_the_table_selects_on_the_selection_seeds_only() {
+    let seen = std::cell::RefCell::new(Vec::new());
+    let arms = table_arms(Policy::Fixed, |policy, seeds| {
+        seen.borrow_mut().push((policy, seeds));
+        FIXED_STRESS
+    });
+    assert_eq!(*seen.borrow(), [(Policy::Fixed, SELECTION_SEEDS)]);
+    assert!(arms.contains(&("adversary", FIXED_STRESS)));
+    assert!(arms.contains(&("base", BASE)));
+}
+
+#[test]
+fn test_interval_resamples_and_keeps_the_central_95_percent() {
+    // Half zeros and half ones: the mean of 100 has a standard error of 0.05.
+    let values: Vec<f64> = (0..100).map(|i| f64::from(i % 2)).collect();
+    let (low, high) = interval(&values, mean);
+    assert!((low - 0.40).abs() <= 0.011, "{low}");
+    assert!((high - 0.60).abs() <= 0.011, "{high}");
+    assert_eq!(interval(&[2.0; 10], mean), (2.0, 2.0));
+}
+
+#[test]
+fn test_a_table_row_prints_each_figure_under_its_header() {
+    let episode = |pnl: f64, fills, inventory: f64, drawdown: f64, peak: Decimal| Episode {
+        pnl,
+        fills,
+        time_weighted_inventory: inventory,
+        max_drawdown: drawdown,
+        max_abs_inventory: peak,
+        ..Episode::default()
+    };
+    // Twenty episodes, so the worst 5% is the one at -40.
+    let mut episodes = vec![episode(2.0, 3, 5.0, 7.0, dec!(4)); 19];
+    episodes.push(episode(-40.0, 3, 5.0, 7.0, inventory_limit()));
+    let row = table_row(Policy::Fixed, "base", BASE, &episodes);
+    let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+    assert_eq!(cells[1], "Fixed");
+    assert_eq!(cells[2], "base");
+    assert_eq!(cells[3], "1, 1, 1, 1");
+    assert!(cells[4].starts_with("-0.100 "), "{}", cells[4]);
+    assert!(cells[5].starts_with("40.000 "), "{}", cells[5]);
+    assert!(cells[6].starts_with("7.000 "), "{}", cells[6]);
+    assert!(cells[7].starts_with("5.000 "), "{}", cells[7]);
+    assert_eq!(cells[8], "10");
+    assert_eq!(cells[9], "1");
+    assert!(cells[10].starts_with("3.000 "), "{}", cells[10]);
+}
+
+/// How many fills in the holdout were at a quote through the mid when it was set: the limit
+/// stated with the table. `--ignored --nocapture`, in release.
+#[test]
+#[ignore = "runs the adversary's selection"]
+fn test_fills_through_the_mid_when_set() {
+    for policy in [Policy::Fixed, Policy::AvellanedaStoikov] {
+        for (arm, scenario) in table_arms(policy, adversary) {
+            let (mut through, mut fills) = (0, 0);
+            for seed in HOLDOUT_SEEDS {
+                let e = run_episode(policy, scenario, seed);
+                through += e.through_when_set;
+                fills += e.fills;
+            }
+            println!("{policy:?} {arm}: {through} of {fills}");
+        }
+    }
+}
+
+/// The arms of the table, the adversary picked on the selection seeds alone.
+fn table_arms(
+    policy: Policy,
+    pick: impl Fn(Policy, Range<u64>) -> Scenario,
+) -> Vec<(&'static str, Scenario)> {
+    vec![
+        ("base", BASE),
+        ("fixed stress", FIXED_STRESS),
+        ("adversary", pick(policy, SELECTION_SEEDS)),
+    ]
+}
+
+/// One row of the table.
+fn table_row(policy: Policy, arm: &str, scenario: Scenario, episodes: &[Episode]) -> String {
+    let pnls: Vec<f64> = episodes.iter().map(|e| e.pnl).collect();
+    let pick = |f: fn(&Episode) -> f64| {
+        let values: Vec<f64> = episodes.iter().map(f).collect();
+        let (low, high) = interval(&values, mean);
+        format!("{:.3} [{low:.3}, {high:.3}]", mean(&values))
+    };
+    let (tail_low, tail_high) = interval(&pnls, cvar);
+    let peak = episodes.iter().map(|e| e.max_abs_inventory).max().unwrap();
+    let at_limit = episodes
+        .iter()
+        .filter(|e| e.max_abs_inventory == inventory_limit())
+        .count();
+    format!(
+        "| {policy:?} | {arm} | {}, {}, {}, {} | {} | {:.3} [{tail_low:.3}, {tail_high:.3}] | {} | {} | {peak} | {at_limit} | {} |",
+        scenario.bid_market,
+        scenario.ask_market,
+        scenario.branching,
+        scenario.impact,
+        pick(|e| e.pnl),
+        cvar(&pnls),
+        pick(|e| e.max_drawdown),
+        pick(|e| e.time_weighted_inventory),
+        pick(|e| f64::from(e.fills)),
+    )
+}
+
 /// The evidence table. `--ignored --nocapture`, in release.
 #[test]
 #[ignore = "the study itself: several minutes without --release"]
@@ -548,39 +872,11 @@ fn test_robustness_evidence_table() {
     );
     println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     for policy in [Policy::Fixed, Policy::AvellanedaStoikov] {
-        let adversarial = adversary(policy, SELECTION_SEEDS);
-        for (arm, scenario) in [
-            ("base", BASE),
-            ("fixed stress", FIXED_STRESS),
-            ("adversary", adversarial),
-        ] {
+        for (arm, scenario) in table_arms(policy, adversary) {
             let episodes: Vec<Episode> = HOLDOUT_SEEDS
                 .map(|seed| run_episode(policy, scenario, seed))
                 .collect();
-            let pnls: Vec<f64> = episodes.iter().map(|e| e.pnl).collect();
-            let pick = |f: fn(&Episode) -> f64| {
-                let values: Vec<f64> = episodes.iter().map(f).collect();
-                let (low, high) = interval(&values, mean);
-                format!("{:.3} [{low:.3}, {high:.3}]", mean(&values))
-            };
-            let (tail_low, tail_high) = interval(&pnls, cvar);
-            let peak = episodes.iter().map(|e| e.max_abs_inventory).max().unwrap();
-            let at_limit = episodes
-                .iter()
-                .filter(|e| e.max_abs_inventory == inventory_limit())
-                .count();
-            println!(
-                "| {policy:?} | {arm} | {}, {}, {}, {} | {} | {:.3} [{tail_low:.3}, {tail_high:.3}] | {} | {} | {peak} | {at_limit} | {} |",
-                scenario.bid_market,
-                scenario.ask_market,
-                scenario.branching,
-                scenario.impact,
-                pick(|e| e.pnl),
-                cvar(&pnls),
-                pick(|e| e.max_drawdown),
-                pick(|e| e.time_weighted_inventory),
-                pick(|e| f64::from(e.fills)),
-            );
+            println!("{}", table_row(policy, arm, scenario, &episodes));
         }
     }
 }
