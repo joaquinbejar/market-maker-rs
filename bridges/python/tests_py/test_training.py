@@ -53,6 +53,7 @@ def test_smoke_training_gives_a_reusable_checkpoint(tmp_path, algorithm, make, h
     assert metadata["config"] == env.config
     assert metadata["train_rows"] == 400
     assert metadata["kernel_fingerprint"] == env.bridge_info["kernel_fingerprint"]
+    assert metadata["residual_version"] is None
     assert metadata["train_dataset_digest"] == env.bridge_info["dataset_digest"]
     assert metadata["commit"] == "abc123"
     assert metadata["seed"] == 11
@@ -278,7 +279,7 @@ def test_protocol_sends_the_best_mean_net_to_the_holdout(tmp_path, monkeypatch, 
     def known(model, env, seeds):
         evaluated.append(env.bridge_info["dataset_digest"])
         return [
-            EpisodeResult(seed, 1, Decimal(net), Decimal(0), True, False, ())
+            EpisodeResult(seed, 1, Decimal(net), Decimal(0), True, False, (), {})
             for seed, net in zip(seeds, nets[model["seed"]])
         ]
 

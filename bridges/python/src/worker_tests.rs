@@ -12,7 +12,7 @@ use std::sync::Arc;
 use market_maker_rs::backtest::kernel::KernelFillModel;
 use market_maker_rs::rl::{
     ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, OBSERVATION_SPACE_VERSION,
-    REWARD_VERSION, RlAction, RlEnv,
+    REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv,
 };
 
 use super::*;
@@ -397,4 +397,181 @@ fn test_worker_reports_the_running_penalties() {
     let again = worker.step(quote(0, 3, 0, 0)).unwrap();
     assert_eq!(again.penalties.to_string(), "0.50");
     assert_eq!(again.net.to_string(), "0");
+}
+
+fn residual_config(baseline: &str) -> BridgeConfig {
+    let mut bridge = config("close", "reject", 100);
+    let text = format!(
+        r#"{{"baseline": {baseline}, "price_ticks": 4, "size_lots": 1, "default_order_size": "1"}}"#
+    );
+    bridge.residual = Some(serde_json::from_str(&text).unwrap());
+    bridge
+}
+
+const AVELLANEDA: &str = r#"{"kind": "avellaneda_stoikov", "risk_aversion": "0.1",
+    "volatility": "0.2", "order_intensity": "1.5", "session_start_ms": 0,
+    "horizon_ms": 100000, "size": "1"}"#;
+const GLFT: &str = r#"{"kind": "glft", "risk_aversion": "0.01", "order_intensity_k": "0.3",
+    "intensity_scale_a": "0.9", "max_inventory_lots": 30, "terminal_time": 100000,
+    "min_spread": "0", "volatility": "5", "session_start_ms": 0}"#;
+
+#[test]
+fn test_worker_residual_logs_and_equals_a_direct_environment() {
+    for (baseline, source) in [(AVELLANEDA, true), (GLFT, false)] {
+        let bridge = residual_config(baseline);
+        let kernel = bridge.kernel().unwrap();
+        // Enough rows to hold inventory, which is where the volatility reaches a quote.
+        let rows: Vec<KernelTick> = (0..100_u64)
+            .map(|i| {
+                let bid = 190 + (i * 7) % 13;
+                KernelTick {
+                    ts_ns: (1000 + i * 25) * 1_000_000,
+                    bid,
+                    bid_lots: 4,
+                    ask: bid + 2,
+                    ask_lots: 3,
+                }
+            })
+            .collect();
+        let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+        let rl = bridge.rl().unwrap();
+        let bounds = ResidualBounds {
+            price_ticks: 4,
+            size_lots: 1,
+        };
+        let proposal = ResidualProposal {
+            bid_away: 0.5,
+            ask_away: -0.25,
+            bid_size: 1.0,
+            ask_size: 0.0,
+        };
+        let d = |text: &str| Decimal::from_str(text).unwrap();
+        let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+        worker.reset(1).unwrap();
+        let through: Vec<StepReply> = (0..100)
+            .map(|_| worker.step_residual(proposal).unwrap())
+            .collect();
+        macro_rules! compare {
+            ($source:expr) => {{
+                let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
+                    ResidualEnv::new(&kernel, &data, $source, d("1"), bounds, rl).unwrap();
+                let mut state = env.reset(1).unwrap();
+                let mut filled = false;
+                for reply in &through {
+                    let step = env.step(&mut state, proposal).unwrap();
+                    assert_eq!(reply.transition, step.transition);
+                    assert_eq!(reply.decision, Some(step.decision));
+                    assert_eq!(step.decision.delta.bid_away_ticks, 2);
+                    filled |= !state.kernel().venue_position().is_zero();
+                }
+                assert_eq!(through[99].net, state.net());
+                assert!(filled, "the fixture never holds inventory");
+            }};
+        }
+        if source {
+            compare!(AvellanedaQuoter {
+                risk_aversion: d("0.1"),
+                volatility: d("0.2"),
+                order_intensity: d("1.5"),
+                session_start_ms: 0,
+                horizon_ms: 100_000,
+                size: d("1"),
+            });
+        } else {
+            compare!(GlftQuoter {
+                config: GLFTConfig::new(d("0.01"), d("0.3"), d("0.9"), 30, d("1"), 100_000, d("0"))
+                    .unwrap(),
+                volatility: d("5"),
+                size: d("1"),
+                session_start_ms: 0,
+            });
+        }
+    }
+}
+
+#[test]
+fn test_worker_refuses_the_wrong_kind_of_action_and_ends() {
+    let mut residual = Worker::spawn(residual_config(AVELLANEDA), long_rows(), None).unwrap();
+    residual.reset(1).unwrap();
+    assert!(matches!(
+        residual.step(RlAction::Hold),
+        Err(BridgeError::Failed(_))
+    ));
+    assert_eq!(residual.reset(1).unwrap_err(), BridgeError::Closed);
+    let mut grid = Worker::spawn(config("mark", "mask", 100), long_rows(), None).unwrap();
+    grid.reset(1).unwrap();
+    assert!(matches!(
+        grid.step_residual(ResidualProposal::ZERO),
+        Err(BridgeError::Failed(_))
+    ));
+}
+
+#[test]
+fn test_worker_refuses_an_invalid_baseline() {
+    let bad = |json: &str, field: &str, value: &str| {
+        let text = json.replace(field, value);
+        let result = Worker::spawn(residual_config(&text), long_rows(), None);
+        assert!(matches!(result, Err(BridgeError::Refused(_))), "{value}");
+    };
+    bad(AVELLANEDA, r#""0.2""#, r#""not a number""#);
+    bad(
+        GLFT,
+        r#""max_inventory_lots": 30"#,
+        r#""max_inventory_lots": 0"#,
+    );
+    let mut size = residual_config(AVELLANEDA);
+    size.residual.as_mut().unwrap().default_order_size = "x".to_string();
+    assert!(matches!(
+        Worker::spawn(size, long_rows(), None),
+        Err(BridgeError::Refused(_))
+    ));
+}
+
+#[test]
+fn test_worker_attribution_splits_the_hand_computed_trajectory() {
+    let mut worker = Worker::spawn(config("close", "mask", 100), long_rows(), None).unwrap();
+    assert!(matches!(worker.attribution(), Err(BridgeError::Failed(_))));
+    let mut worker = Worker::spawn(config("close", "mask", 100), long_rows(), None).unwrap();
+    worker.reset(1).unwrap();
+    worker.step(quote(1, 2, 1, 0)).unwrap();
+    worker.step(RlAction::Hold).unwrap();
+    worker.step(RlAction::Hold).unwrap();
+    let reply = worker.attribution().unwrap();
+    assert_eq!(reply.fills, 2);
+    let a = reply.attribution;
+    assert_eq!(a.net_pnl.normalize().to_string(), "0.601");
+    assert_eq!(a.quote_fees.normalize().to_string(), "0.399");
+    // The same net of fees, split between the fills' edge and the position's moves.
+    let gross = a.spread_capture + a.inventory_pnl;
+    assert_eq!(gross.normalize().to_string(), "1");
+}
+
+#[test]
+fn test_baselines_parse_to_what_they_state() {
+    let d = |text: &str| Decimal::from_str(text).unwrap();
+    let parsed = |json: &str| {
+        let baseline: BaselineConfig = serde_json::from_str(json).unwrap();
+        parse_baseline(&baseline, "1").unwrap()
+    };
+    assert_eq!(
+        parsed(AVELLANEDA),
+        Baseline::Avellaneda(AvellanedaQuoter {
+            risk_aversion: d("0.1"),
+            volatility: d("0.2"),
+            order_intensity: d("1.5"),
+            session_start_ms: 0,
+            horizon_ms: 100_000,
+            size: d("1"),
+        })
+    );
+    assert_eq!(
+        parsed(GLFT),
+        Baseline::Glft(GlftQuoter {
+            config: GLFTConfig::new(d("0.01"), d("0.3"), d("0.9"), 30, d("1"), 100_000, d("0"))
+                .unwrap(),
+            volatility: d("5"),
+            size: d("1"),
+            session_start_ms: 0,
+        })
+    );
 }

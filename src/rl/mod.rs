@@ -97,6 +97,19 @@
 //! replica of an exchange, and it claims no queue priority of its own. A simulator that
 //! stops ends the rows early, with the reason in [`QrMarket::stopped`].
 //!
+//! # Residual policies
+//!
+//! [`ResidualEnv`] puts a bounded correction on top of a classical quote from a
+//! [`QuoteSource`](crate::backtest::kernel::QuoteSource). That residual policies help is an
+//! implementation hypothesis of this crate, not a result of the market making papers. The
+//! order is fixed: the classical quote is discretized by
+//! [`QuoteAdapter`](crate::backtest::kernel::QuoteAdapter), then [`compose`] applies the
+//! residual in ticks and lots and validates the result against the market grid, then the
+//! kernel's admission and its gate decide. See [`compose`] for the rules. A zero residual
+//! gives the classical action unchanged, and [`ResidualDecision`] logs each component
+//! of every decision. There is no mask here: what the correction cannot do is clipped or
+//! falls back to the classical action, with the reason logged.
+//!
 //! # Limits
 //!
 //! One linear spot instrument with fees in the quote asset, as the kernel. The reward
@@ -142,6 +155,7 @@ mod audit;
 mod env;
 mod features;
 mod queue_reactive;
+mod residual;
 mod spec;
 
 pub use audit::{EpisodeRecorder, EpisodeRecords};
@@ -150,6 +164,10 @@ pub use env::{
 };
 pub use features::FeatureVector;
 pub use queue_reactive::{MAX_QR_ROWS, QrEpisode, QrMarket, qr_market};
+pub use residual::{
+    RESIDUAL_VERSION, ResidualBounds, ResidualClips, ResidualDecision, ResidualDelta, ResidualEnv,
+    ResidualFallback, ResidualProposal, ResidualStep, compose,
+};
 pub use spec::{
     ACTION_SPACE_VERSION, ActionSpace, AsOf, EPISODE_VERSION, EpisodeSpec, FEATURE_COUNT,
     FeatureHorizon, FeatureId, FeatureSpec, FeatureUnit, HedgeActions, InvalidActionPolicy,
