@@ -317,7 +317,7 @@ fn hawkes_ticks(days: u64, seed: u64) -> MMResult<(Vec<MarketTick>, Option<f64>)
             reference - step
         };
     }
-    Ok((ticks, fill_rate(&segments, 10.0, 20.0)?))
+    Ok((ticks, fill_rate(&segments, CAP as u32, 10.0, 20.0)?))
 }
 
 fn print_row(row: &EvaluationRow) {
