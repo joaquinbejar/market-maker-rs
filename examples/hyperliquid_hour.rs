@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Vec::new(), 0usize, 0usize, 0usize, 0usize, 0usize);
     let keep_events = files.len() / 3 <= MAX_HOURS_KEPT;
     let (mut seen, mut inherited, mut cold) = (0usize, 0usize, 0usize);
+    let (mut repeated_statuses, mut repeated_diffs, mut repeated_trades) = (0u64, 0u64, 0u64);
     let (mut limit, mut cancel, mut fill, mut unknown) = (0usize, 0usize, 0usize, 0usize);
     println!("REAL DATA: the Hyperliquid capture, for {coin}. Times of book diffs are inferred.");
     for triple in files.chunks(3) {
@@ -110,7 +111,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(bytes);
         let diffs = read_book_diffs(BufReader::new(fs::File::open(diffs)?), coin)?;
         let trades = read_trades(BufReader::new(fs::File::open(trades)?), coin)?;
-        let output = replay.ingest(&statuses, &diffs, &trades)?;
+        repeated_statuses += statuses.repeated_lines;
+        repeated_diffs += diffs.repeated_lines;
+        repeated_trades += trades.repeated_lines;
+        let output = replay.ingest(&statuses.rows, &diffs.rows, &trades.rows)?;
         tops += output.tops.len();
         market += output.market_events.len();
         prices += output.prices.len();
@@ -174,6 +178,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Longest time between diffs: {:.3} s, between trades: {:.3} s.",
         coverage.longest_gap_ns as f64 / 1e9,
         coverage.longest_trade_gap_ns as f64 / 1e9,
+    );
+    println!(
+        "Re-emitted lines left out: {repeated_statuses} statuses, {repeated_diffs} diffs, \
+         {repeated_trades} trades. Trades out of order, skipped: {}.",
+        coverage.trades_out_of_order,
     );
     println!(
         "A silence over {} s resets the replay: {} on diffs, {} on trades, {} orders cut there.",
