@@ -98,6 +98,10 @@ name = "options_greeks"
 required-features = ["options"]
 
 [[example]]
+name = "hyperliquid_hour"
+required-features = ["serde"]
+
+[[example]]
 name = "l3_reconstruction"
 required-features = ["l3"]
 
@@ -161,6 +165,10 @@ required-features = ["kernel"]
 [[example]]
 name = "kernel_glft"
 required-features = ["kernel"]
+
+[[test]]
+name = "hyperliquid"
+required-features = ["serde"]
 
 [[test]]
 name = "hawkes_robustness"
