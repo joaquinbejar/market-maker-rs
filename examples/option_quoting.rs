@@ -16,7 +16,9 @@
 //!   spot with no cost, which flatters them.
 //!
 //! Net PnL is the change in cash, positions at the pricer's value and the hedge at the spot.
-//! Capital use is `OptionCapital::committed` over the budget. No arm is selected: all are printed.
+//! Capital use is `OptionCapital::committed` over the budget, where a short and a sale count at the
+//! initial margin of `margin-rs`'s rule `short-option-im/1`, that crate's own rates and not a
+//! venue's. No arm is selected: all are printed.
 //! Nothing here is a claim about which is better on real flow.
 //!
 //! `cargo run --release --features options,margin,multi-underlying --example option_quoting`
@@ -434,9 +436,11 @@ fn main() -> Result<(), Failure> {
         }
     }
     println!(
-        "\nWithout a hedge, capital use stays at or under 1: every side is scaled to what the \
-         budget leaves. A hedge is sized by the delta and sent outside the round, so it can pass \
-         the budget, as the hedged arms show, and the next rounds then have less left."
+        "\nEvery side is scaled to what the budget leaves, so without a hedge capital use passes 1 \
+         only when the positions held move past it between rounds: a long's value and a short's \
+         margin both follow the spot. A hedge is sized by the delta and sent outside the round, \
+         so it can pass the budget, as the hedged arms show, and the next rounds then have less \
+         left."
     );
     Ok(())
 }

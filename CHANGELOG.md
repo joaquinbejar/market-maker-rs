@@ -162,9 +162,10 @@ project follows [Semantic Versioning](https://semver.org/).
   declared factor covariance into the inputs of `MultiAssetModel`, so a hedged book is skewed less
   than a concentrated one. Greek and scenario limits hold on every way live orders can fill, one
   budget is shared across contracts, every quote holds a `margin-rs` ledger reservation, each change
-  to a side is logged with its cause, and a hedge is sized and reported. Capital for a sale is the
-  worst of declared scenarios, repriced by the pricer: an internal budget, not a venue's margin,
-  since `margin-rs` has no option instrument. Example `option_quoting`, on synthetic data.
+  to a side is logged with its cause, and a hedge is sized and reported. A buy holds its premium,
+  and a sale and a short the initial margin of `margin-rs`'s rule `short-option-im/1`, that
+  crate's own specification and not a venue's margin. Example `option_quoting`, on synthetic
+  data.
 - Metric definitions and attribution for comparing strategies (#92):
   `backtest::evaluation` measures one window from plain marks and fills, with no
   engine types in its arithmetic. Net result is split into spread capture, inventory
@@ -516,6 +517,23 @@ project follows [Semantic Versioning](https://semver.org/).
   `SettlementRecord` gains `outcome` and `realized_pnl`. A cash option out of the money settles
   in cash for zero, as the ledger has no lapse for one. The premium is booked by the ledger at
   each fill and stays in the option's realized PnL. Inverse options are refused.
+- `OptionQuoter` holds a short's capital at `margin-rs` 0.2's short option initial margin
+  (#98), computed by `margin-rs`'s `rules::ShortOptionIm` and no longer from the declared
+  scenarios. A sale reserves the rule's initial margin for one short contract at the round's
+  spot, per contract, instead of its worst scenario value less its price, and a short position
+  counts in `OptionCapital::deployed` at the rule's requirement instead of its worst scenario
+  loss. A buy still holds its premium, and the part of a sale that only unwinds a long still
+  holds nothing. The default rule is `short-option-im/1` in the cash asset at its ledger scale:
+  per short contract, `max(15 % of the spot less the amount out of the money, 10 % of the
+  spot)`, rounded up to the rule's scale. `OptionQuoter::with_short_margin` takes a rule with
+  other rates, built with `ShortOptionIm::new` under its own rule id, and refuses one in another
+  asset than the cash. The rule covers the initial margin of each short contract alone, at the
+  round's spot; it does not net between contracts or against the underlying or the hedge, adds
+  no stress beyond its formula, and leaves out the short's value, its cost to close, which
+  `margin-rs` leaves to collateral and this quoter does not count against the budget; its
+  maintenance margin is not used. Its rates are `margin-rs`'s own specification, not
+  a venue's rule. The scenarios now feed only the scenario loss limit, so a sale's reservation
+  and the budget's sizing change for every contract.
 - `ContractRunResult` and `ContractSummary` have new public fields for funding (#207):
   `realized_pnl`, `total_funding` and `fundings`; `funding` and `funding_missing`. A
   `ContractStrategy` is unchanged.
