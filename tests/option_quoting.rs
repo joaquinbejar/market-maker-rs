@@ -2500,3 +2500,52 @@ fn test_a_sale_that_only_unwinds_a_long_holds_no_margin() {
     assert_eq!(round.capital.deployed, dec!(10));
     assert_eq!(round.capital.committed, dec!(10) + bid);
 }
+
+/// A book of `size` contracts valued by `Scattered(seed)`, at the factor correlation given.
+fn scattered_quoter(size: usize, seed: u64, correlation: Decimal) -> OptionQuoter {
+    let contracts: Vec<ContractTerms> = (0..size)
+        .map(|i| contract(&format!("C{i}"), Decimal::from(50 + i as u64)))
+        .collect();
+    let mut settings = config(contracts);
+    settings.pricer = Arc::new(Scattered(seed));
+    settings.scenarios = vec![RiskScenario {
+        name: "up".to_string(),
+        spot_factor: dec!(1.1),
+        pricer: Arc::new(Scattered(seed)),
+    }];
+    settings.factors.correlation = correlation;
+    OptionQuoter::new(settings).unwrap()
+}
+
+#[test]
+fn test_a_derived_correlation_rounded_past_the_floor_is_clipped_and_reported() {
+    // At a factor correlation of -1 some contracts' delta and vega nearly offset, and the
+    // rounding of this book, positive semidefinite in exact arithmetic, leaves an eigenvalue of
+    // about -1.94e-11: past the floor of -1.7e-11 for 17 assets, so a supplied correlation like
+    // it is refused, and well within what that cancellation can reach.
+    let mut book = ledger(dec!(100000));
+    let round = scattered_quoter(16, 19317, dec!(-1))
+        .quote(&mut book, &market())
+        .unwrap();
+    assert!(!round.quotes.is_empty());
+    let clipped = round.clipped_eigenvalue.unwrap();
+    assert_eq!(clipped.floor, dec!(-0.000000000017));
+    assert!(clipped.eigenvalue < clipped.floor, "{clipped:?}");
+    assert!(clipped.eigenvalue > dec!(-0.00000000002), "{clipped:?}");
+    assert!(clipped.band < clipped.eigenvalue, "{clipped:?}");
+}
+
+#[test]
+fn test_a_correlation_with_no_eigenvalue_past_the_floor_reports_no_clip() {
+    let mut book = ledger(dec!(100000));
+    let round = quoter(vec![dec!(2), dec!(-3)])
+        .quote(&mut book, &market())
+        .unwrap();
+    assert_eq!(round.clipped_eigenvalue, None);
+    // The same contracts as the clipped book, at a correlation that cancels nothing.
+    let mut book = ledger(dec!(100000));
+    let round = scattered_quoter(16, 19317, dec!(-0.5))
+        .quote(&mut book, &market())
+        .unwrap();
+    assert_eq!(round.clipped_eigenvalue, None);
+}

@@ -30,9 +30,9 @@ pub use model::{
 };
 #[cfg(all(feature = "options", feature = "margin"))]
 pub use option_quoter::{
-    AdmittedOptionQuote, ContractTerms, FactorRisk, LimitedGreek, OptionCapital, OptionConstraint,
-    OptionConstraintKind, OptionFill, OptionMarket, OptionQuoteRound, OptionQuoter,
-    OptionQuoterConfig, RiskScenario, UnderlyingTerms,
+    AdmittedOptionQuote, ClippedEigenvalue, ContractTerms, FactorRisk, LimitedGreek, OptionCapital,
+    OptionConstraint, OptionConstraintKind, OptionFill, OptionMarket, OptionQuoteRound,
+    OptionQuoter, OptionQuoterConfig, RiskScenario, UnderlyingTerms,
 };
 #[cfg(feature = "margin")]
 pub use quoter::{

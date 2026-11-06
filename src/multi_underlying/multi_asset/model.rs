@@ -2,7 +2,7 @@
 
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
-use super::matrix::Matrix;
+use super::matrix::{Clipped, Matrix};
 use crate::Decimal;
 use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
@@ -11,7 +11,12 @@ use crate::types::error::{MMError, MMResult};
 /// matrices stored.
 pub const MAX_ASSETS: usize = 64;
 
-/// Relative size of a negative eigenvalue that counts as rounding noise.
+/// Relative size of a negative eigenvalue that counts as rounding noise, per row.
+///
+/// About 4500 times the machine epsilon. By Weyl's inequality it covers a few
+/// roundings per entry of a matrix whose entries come without cancellation, and
+/// the error of the eigendecomposition, about the size of the matrix times the
+/// epsilon and the largest entry per sweep, over up to 64 sweeps.
 const PSD_TOLERANCE: f64 = 1e-12;
 
 /// The objective of the market maker (section 2.2 of the paper).
@@ -203,8 +208,13 @@ fn to_decimal(value: f64, name: &str) -> MMResult<Decimal> {
         .ok_or_else(|| MMError::NumericalError(format!("{name} {value} is not a decimal")))
 }
 
-/// Checks a correlation matrix and returns it in floating point.
-fn checked_correlation(correlation: &[Vec<Decimal>], size: usize) -> MMResult<Matrix> {
+/// Checks a correlation matrix and returns it in floating point, with the
+/// eigenvalue clipped within `band` as [`Matrix::principal_sqrt`] reports it.
+fn checked_correlation(
+    correlation: &[Vec<Decimal>],
+    size: usize,
+    band: f64,
+) -> MMResult<(Matrix, Option<Clipped>)> {
     if correlation.len() != size || correlation.iter().any(|row| row.len() != size) {
         return Err(MMError::InvalidConfiguration(format!(
             "correlation matrix must be {size} by {size}"
@@ -230,8 +240,16 @@ fn checked_correlation(correlation: &[Vec<Decimal>], size: usize) -> MMResult<Ma
     // Not positive semidefinite is refused here, for either view: a diagonal
     // run must not be accepted on a correlation the correlated run refuses. With
     // a unit diagonal this also refuses any entry outside [-1, 1].
-    matrix.principal_sqrt(PSD_TOLERANCE)?;
-    Ok(matrix)
+    let (_, clipped) = matrix.principal_sqrt(PSD_TOLERANCE, band)?;
+    Ok((matrix, clipped))
+}
+
+/// The more negative of two clipped eigenvalues, each relative to its matrix.
+fn worse(left: Option<Clipped>, right: Option<Clipped>) -> Option<Clipped> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(if b.eigenvalue < a.eigenvalue { b } else { a }),
+        (a, b) => a.or(b),
+    }
 }
 
 impl MultiAssetModel {
@@ -253,6 +271,61 @@ impl MultiAssetModel {
         objective: QuotingObjective,
         risk_view: RiskView,
     ) -> MMResult<Self> {
+        Self::build(
+            assets,
+            correlation,
+            risk_aversion,
+            objective,
+            risk_view,
+            PSD_TOLERANCE,
+        )
+        .map(|(model, _)| model)
+    }
+
+    /// As [`MultiAssetModel::new`], for a correlation the crate derived, which is
+    /// positive semidefinite in exact arithmetic and whose entries off the
+    /// diagonal are each known to within `entry_error`. By Weyl's inequality that
+    /// moves an eigenvalue by at most `entry_error` per row, so a negative
+    /// eigenvalue above the floor of `PSD_TOLERANCE + entry_error` per row is
+    /// rounding and is set to zero. One below the floor of `PSD_TOLERANCE` alone,
+    /// which [`MultiAssetModel::new`] refuses, is returned.
+    ///
+    /// The check applies to the correlation and again to the scaled covariance
+    /// whose root is taken. That one is the correlation under a congruence by a
+    /// positive diagonal, which by Ostrowski's theorem keeps a negative eigenvalue
+    /// no more negative relative to its largest entry, and four roundings per
+    /// entry, well within `PSD_TOLERANCE`.
+    ///
+    /// # Errors
+    ///
+    /// As [`MultiAssetModel::new`], with that wider floor.
+    #[cfg(all(feature = "options", feature = "margin"))]
+    pub(super) fn derived(
+        assets: Vec<AssetQuotingParams>,
+        correlation: &[Vec<Decimal>],
+        risk_aversion: Decimal,
+        objective: QuotingObjective,
+        risk_view: RiskView,
+        entry_error: f64,
+    ) -> MMResult<(Self, Option<Clipped>)> {
+        Self::build(
+            assets,
+            correlation,
+            risk_aversion,
+            objective,
+            risk_view,
+            PSD_TOLERANCE + entry_error,
+        )
+    }
+
+    fn build(
+        assets: Vec<AssetQuotingParams>,
+        correlation: &[Vec<Decimal>],
+        risk_aversion: Decimal,
+        objective: QuotingObjective,
+        risk_view: RiskView,
+        band: f64,
+    ) -> MMResult<(Self, Option<Clipped>)> {
         let size = assets.len();
         if size == 0 || size > MAX_ASSETS {
             return Err(MMError::InvalidConfiguration(format!(
@@ -264,7 +337,7 @@ impl MultiAssetModel {
                 "risk aversion must be positive, got {risk_aversion}"
             )));
         }
-        let rho = checked_correlation(correlation, size)?;
+        let (rho, clipped) = checked_correlation(correlation, size, band)?;
         let gamma = to_f64(risk_aversion, "risk aversion")?;
         let gamma_root = gamma.sqrt();
 
@@ -306,7 +379,8 @@ impl MultiAssetModel {
                 scaled.set(i, j, depth_i.sqrt() * value * depth_j.sqrt());
             }
         }
-        let root = scaled.principal_sqrt(PSD_TOLERANCE)?;
+        let (root, scaled_clipped) = scaled.principal_sqrt(PSD_TOLERANCE, band)?;
+        let clipped = worse(clipped, scaled_clipped);
 
         let mut gamma_matrix = Matrix::zeros(size);
         for (i, depth_i) in depths.iter().enumerate() {
@@ -336,7 +410,7 @@ impl MultiAssetModel {
             half_spreads.push(to_decimal(half, "half spread")?);
         }
 
-        Ok(Self {
+        let model = Self {
             assets,
             objective,
             risk_view,
@@ -344,7 +418,8 @@ impl MultiAssetModel {
             skew_matrix,
             covariance: stored_covariance,
             half_spreads,
-        })
+        };
+        Ok((model, clipped))
     }
 
     /// Number of assets.
@@ -477,5 +552,26 @@ impl MultiAssetModel {
             }
         }
         Ok(variance)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_the_worse_clip_of_the_two_matrices_is_the_one_reported() {
+        let clip = |eigenvalue: f64| {
+            Some(Clipped {
+                eigenvalue,
+                floor: -2e-12,
+                band: -1e-9,
+            })
+        };
+        assert_eq!(worse(clip(-3e-12), clip(-5e-12)), clip(-5e-12));
+        assert_eq!(worse(clip(-5e-12), clip(-3e-12)), clip(-5e-12));
+        assert_eq!(worse(None, clip(-3e-12)), clip(-3e-12));
+        assert_eq!(worse(clip(-3e-12), None), clip(-3e-12));
+        assert_eq!(worse(None, None), None);
     }
 }

@@ -794,3 +794,28 @@ fn test_numerical_equation_correlated_model_tracks_cross_inventory_effect() {
         }
     }
 }
+
+#[test]
+fn test_a_supplied_correlation_is_held_to_the_floor_of_rounding_alone() {
+    // Two rows, so a floor of -2e-12 for the eigenvalue `1 - rho`. A correlation the crate
+    // derives may be clipped past it; one supplied is not.
+    let new = |rho: Decimal| {
+        MultiAssetModel::new(
+            paper_assets(),
+            &correlation(rho),
+            dec!(0.08),
+            QuotingObjective::RiskAdjustedExpectation,
+            RiskView::Correlated,
+        )
+    };
+    assert!(new(dec!(1.000000000001)).is_ok());
+    let error = new(dec!(1.000000000003)).unwrap_err();
+    let MMError::InvalidConfiguration(message) = &error else {
+        panic!("{error:?}");
+    };
+    assert!(
+        message.contains("eigenvalue -0.0000000000029")
+            && message.contains("floor -0.000000000002"),
+        "{message}"
+    );
+}
