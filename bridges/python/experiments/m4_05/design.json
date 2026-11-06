@@ -1,0 +1,133 @@
+{
+  "issue": 102,
+  "design_version": 1,
+  "data": "synthetic: a queue-reactive simulator with made-up parameters, no market data",
+  "bounds": "One synthetic simulator, made-up parameters and 24 days per regime bound what this comparison can show.",
+  "simulator": {
+    "kind": "queue_reactive",
+    "sample_ms": 10000,
+    "rows_per_day": 8640,
+    "reference_ticks": 10000,
+    "regimes": [
+      {
+        "name": "calm",
+        "tick_size": "0.01",
+        "theta": 0.6,
+        "theta_reinit": 0.2,
+        "event_sizes": ["1", "2"],
+        "rates": [
+          [[4.0, 0.0, 0.0], [4.0, 1.0, 1.0], [3.0, 2.0, 1.0], [2.0, 3.0, 1.0], [0.0, 4.0, 1.0]],
+          [[4.0, 0.0, 0.0], [4.0, 1.0, 1.0], [3.0, 2.0, 1.0], [2.0, 3.0, 1.0], [0.0, 4.0, 1.0]]
+        ],
+        "policy": "nearest_supported"
+      },
+      {
+        "name": "stressed",
+        "tick_size": "0.01",
+        "theta": 0.7,
+        "theta_reinit": 0.3,
+        "event_sizes": ["1", "2"],
+        "rates": [
+          [[6.0, 0.0, 0.0], [6.0, 2.0, 2.5], [5.0, 3.0, 2.5], [4.0, 4.0, 2.5], [0.0, 5.0, 2.5]],
+          [[6.0, 0.0, 0.0], [6.0, 2.0, 2.5], [5.0, 3.0, 2.5], [4.0, 4.0, 2.5], [0.0, 5.0, 2.5]]
+        ],
+        "policy": "nearest_supported"
+      },
+      {
+        "name": "thin",
+        "tick_size": "0.01",
+        "theta": 0.8,
+        "theta_reinit": 0.4,
+        "event_sizes": ["1", "2"],
+        "rates": [
+          [[2.0, 0.0, 0.0], [2.0, 1.0, 1.0], [1.0, 2.0, 1.0], [0.0, 2.0, 1.0]],
+          [[2.0, 0.0, 0.0], [2.0, 1.0, 1.0], [1.0, 2.0, 1.0], [0.0, 2.0, 1.0]]
+        ],
+        "policy": "nearest_supported"
+      }
+    ],
+    "regime_note": "The simulator's rates are the same on both sides, so a skewed flow is not available; the third regime is a thin book instead.",
+    "seed": "1000003 * regime_number + day, regime_number from 1 in the order above, day from 1",
+    "start_ms": "(day - 1) * 86400000, so each day is one UTC day"
+  },
+  "days": 24,
+  "splits": {"train": [1, 14], "validation": [15, 19], "holdout": [20, 24]},
+  "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
+  "kernel": {"tick_size": "0.005", "lot_size": "1", "max_price": "1000", "max_order_size": "10"},
+  "execution": {
+    "fee_rate": "0.0002",
+    "initial_capital": "0",
+    "terminal": "mark",
+    "limits": {"max_position": "20", "max_notional": "2500", "scaling_factor": "1"},
+    "main": {
+      "fill_model": {"kind": "queue_position", "rate": "0.0005", "min_queue_ms": 0},
+      "latency": {"quantum_ns": 1000000, "observation_q": 25, "submit_q": 25, "cancel_q": 25, "ack_q": 10, "jitter_q": 10}
+    },
+    "ablations": {
+      "fill_immediate": {"fill_model": {"kind": "immediate"}},
+      "latency_zero": {"latency": {"quantum_ns": 1000000, "observation_q": 0, "submit_q": 0, "cancel_q": 0, "ack_q": 0, "jitter_q": 0}},
+      "reward_inventory_penalty": {"training_only": true, "penalty_per_squared_lot_per_step": "0.00001"}
+    },
+    "not_run": {
+      "alpha": "no alpha signal exists in the crate",
+      "hedge": "HedgeActions::NotModelled, and hedge plans are not wired into the kernel",
+      "margin": "margin and liquidation stress are not connected to the kernel; capital is peak notional and peak inventory"
+    }
+  },
+  "evaluation": {
+    "episode": "one UTC day",
+    "evaluation_seeds": [101, 102, 103],
+    "daily_value": "the mean over the evaluation seeds of a day's exact net result",
+    "selection": "the best mean daily net over validation days, per arm, under the main execution",
+    "bootstrap": {"replicates": 2000, "mean_block_days": 2, "confidence_percent": 90, "seed": 102, "min_days": 4},
+    "metrics": ["net_pnl and its attribution", "markout", "inventory", "max_drawdown", "cvar_5_of_daily_net", "rejections", "peak_notional", "peak_inventory", "limit_breaches"]
+  },
+  "arms": {
+    "no_trade": {"kind": "baseline"},
+    "fixed_spread": {"kind": "baseline", "grid": {"offset_ticks": [1, 2, 4], "size_lots": [1]}},
+    "avellaneda_stoikov": {"kind": "classical", "grid": {"risk_aversion": ["0.01", "0.1", "1"], "volatility": ["0.05", "0.2"], "order_intensity": ["1.5"], "size": ["1"], "horizon_ms": [86400000]}},
+    "glft": {"kind": "classical", "grid": {"risk_aversion": ["0.01", "0.1"], "order_intensity_k": ["0.3", "1"], "intensity_scale_a": ["1.5"], "max_inventory_lots": [20], "min_spread": ["0.01"], "volatility": ["0.05", "0.2"], "terminal_time": [86400000]}},
+    "maskable_ppo": {
+      "kind": "pure_rl",
+      "grid": {"bid_offsets": [0, 1, 2, 4, 8], "ask_offsets": [0, 1, 2, 4, 8], "sizes": [1, 2]},
+      "invalid_action": "mask",
+      "hyperparameter_sets": [
+        {"learning_rate": 0.0003, "n_steps": 2048, "batch_size": 256, "n_epochs": 5, "ent_coef": 0.0},
+        {"learning_rate": 0.0001, "n_steps": 2048, "batch_size": 256, "n_epochs": 5, "ent_coef": 0.0},
+        {"learning_rate": 0.0003, "n_steps": 2048, "batch_size": 256, "n_epochs": 5, "ent_coef": 0.01}
+      ],
+      "budget_steps": 2000000
+    },
+    "sac_residual_avellaneda_stoikov": {
+      "kind": "residual_rl",
+      "baseline": "the avellaneda_stoikov parameters selected on validation",
+      "bounds": {"price_ticks": 4, "size_lots": 1},
+      "invalid_action": "reject",
+      "hyperparameter_sets": [
+        {"learning_rate": 0.0003, "batch_size": 256, "buffer_size": 200000, "learning_starts": 5000, "tau": 0.005},
+        {"learning_rate": 0.0001, "batch_size": 256, "buffer_size": 200000, "learning_starts": 5000, "tau": 0.005},
+        {"learning_rate": 0.0003, "batch_size": 256, "buffer_size": 200000, "learning_starts": 5000, "tau": 0.02}
+      ],
+      "budget_steps": 500000
+    },
+    "sac_residual_glft": {"kind": "residual_rl", "conditional": "only if the budget holds after the AS residual", "baseline": "the glft parameters selected on validation", "same_as": "sac_residual_avellaneda_stoikov"}
+  },
+  "training_seeds": [1, 2, 3, 4, 5],
+  "training_days": "each reset draws a training day uniformly from the run's seed",
+  "steps": [
+    {"name": "reduced", "regimes": ["calm"], "training_seeds": [1, 2], "budget_steps": 50000, "estimate_minutes": 15},
+    {"name": "selection", "estimate_minutes": 90},
+    {"name": "main", "estimate_minutes": 30},
+    {"name": "ablations", "estimate_minutes": 120},
+    {"name": "holdout", "estimate_minutes": 10}
+  ],
+  "compute": {"machine": "Apple M4 Max", "device": "cpu", "threads_per_run": 1, "max_parallel_runs": 6, "overrun_rule": "a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds"},
+  "decision_rule": {
+    "against": "the best classical arm on the holdout, avellaneda_stoikov or glft, by mean daily net",
+    "interval": "90 % block bootstrap over days, on the paired daily difference",
+    "continue": "the lower bound is above 0, there is no limit breach, and max drawdown is at most 1.2 times the classical arm's",
+    "revise": "the point estimate is above 0 but the interval includes 0, or the drawdown condition fails",
+    "discard": "otherwise",
+    "applied": "per regime and pooled"
+  }
+}
