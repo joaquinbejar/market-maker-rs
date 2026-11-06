@@ -37,6 +37,9 @@ use market_maker_rs::types::fee::FeeAsset;
 
 type Account = DerivativeMarginAccount<TieredLinearIm>;
 
+/// A quote per tick, bid price and size then ask price and size.
+type Script = Vec<Option<(Decimal, Decimal, Decimal, Decimal)>>;
+
 const FAR_LOW: Decimal = dec!(1);
 const FAR_HIGH: Decimal = dec!(10000000);
 
@@ -106,7 +109,7 @@ fn account(spec: &InstrumentSpec, deposit: Decimal) -> Account {
 
 /// Quotes from a script, one per tick; `None` is silent and cancels what rests.
 #[derive(Debug, Clone)]
-struct Scripted(Vec<Option<(Decimal, Decimal, Decimal, Decimal)>>, usize);
+struct Scripted(Script, usize);
 
 impl BacktestStrategy for Scripted {
     fn on_tick(&mut self, tick: &MarketTick, _position: &InventoryPosition) -> Option<Quote> {
@@ -156,12 +159,7 @@ fn tick(timestamp: u64, mid: Decimal) -> MarketTick {
 }
 
 /// A buy of `size` from tick 0, which tick 1's ask of 60000 reaches.
-fn buy_script(
-    size: Decimal,
-) -> (
-    Vec<Option<(Decimal, Decimal, Decimal, Decimal)>>,
-    Vec<MarketTick>,
-) {
+fn buy_script(size: Decimal) -> (Script, Vec<MarketTick>) {
     (
         vec![Some((dec!(60000), size, FAR_HIGH, size)), None, None],
         vec![
@@ -176,7 +174,7 @@ fn gated(
     spec: &InstrumentSpec,
     account: &Account,
     fee: Decimal,
-    script: Vec<Option<(Decimal, Decimal, Decimal, Decimal)>>,
+    script: Script,
     ticks: Vec<MarketTick>,
 ) -> BacktestResult {
     let mut engine = BacktestEngine::new(
@@ -193,7 +191,7 @@ fn gated(
 fn control(
     spec: &InstrumentSpec,
     fee: Decimal,
-    script: Vec<Option<(Decimal, Decimal, Decimal, Decimal)>>,
+    script: Script,
     ticks: Vec<MarketTick>,
 ) -> BacktestResult {
     let ledger = ledger_for(spec, dec!(1000));
@@ -556,5 +554,122 @@ fn test_an_accountant_of_other_terms_is_refused() {
         )
         .with_instrument(other.clone(), account.accountant())
         .is_err()
+    );
+}
+
+#[test]
+fn test_the_accountant_counts_fills_and_refuses_one_that_was_not_booked() {
+    use market_maker_rs::backtest::{AccountingFill, FeeAsset as PostedFee, FillAccountant};
+    let spec = perpetual(dec!(0.01));
+    let account = account(&spec, dec!(1000));
+    let mut policy = account.policy();
+    let mut accountant = account.accountant();
+    policy.on_market_data(dec!(60000), 0);
+    assert!(
+        !policy
+            .check(&request("1", Action::Buy, dec!(4)))
+            .is_rejected()
+    );
+    let posted = |execution_id| AccountingFill {
+        execution_id,
+        order_id: Default::default(),
+        side: Action::Buy,
+        price: dec!(60000),
+        quantity: dec!(2),
+        cumulative_quantity: dec!(2),
+        fee: dec!(0),
+        fee_asset: PostedFee::Settlement,
+        timestamp: 1,
+    };
+    assert!(accountant.post_fill(&posted(0)).is_err());
+    policy.on_order_event(&fill("1", "sim-0", dec!(2))).unwrap();
+    accountant.post_fill(&posted(0)).unwrap();
+    assert_eq!(accountant.snapshot().unwrap().fills_posted, 1);
+    // The same execution again changes nothing.
+    policy.on_order_event(&fill("1", "sim-0", dec!(2))).unwrap();
+    assert_eq!(accountant.snapshot().unwrap().fills_posted, 1);
+}
+
+#[test]
+fn test_a_fill_past_its_order_stands_and_is_recorded() {
+    let spec = perpetual(dec!(0.01));
+    let account = account(&spec, dec!(1000));
+    let mut policy = account.policy();
+    policy.on_market_data(dec!(60000), 0);
+    assert!(
+        !policy
+            .check(&request("1", Action::Buy, dec!(1)))
+            .is_rejected()
+    );
+    policy.on_order_event(&fill("1", "sim-0", dec!(3))).unwrap();
+    let position = account.with_gate(|gate| gate.ledger().position(&id()).unwrap().quantity);
+    assert_eq!(position, dec!(3));
+    assert_eq!(account.errors().len(), 1, "{:?}", account.errors());
+}
+
+#[test]
+fn test_a_fee_scale_above_the_settlement_asset_is_refused() {
+    let spec = perpetual(dec!(0.01));
+    let account = account(&spec, dec!(1000));
+    let (script, ticks) = buy_script(dec!(1));
+    let mut too_fine = config(&spec, dec!(0));
+    too_fine.fee_currency = FeeCurrency::Settlement { scale: 9 };
+    assert!(
+        BacktestEngine::new(too_fine, Scripted(script, 0), VecDataSource::new(ticks))
+            .with_instrument(spec.clone(), account.accountant())
+            .is_err()
+    );
+}
+
+#[test]
+fn test_an_inverse_perpetual_is_margined_on_its_contract_value() {
+    use market_maker_rs::instruments::reference::deribit;
+    let spec = deribit::btc_perpetual().unwrap();
+    let btc = Asset::new("BTC").unwrap();
+    let mut ledger = Ledger::new(LedgerConfig::default());
+    ledger.register_asset(btc.clone(), 8).unwrap();
+    ledger.register_asset(usdt(), 8).unwrap();
+    let scales = InstrumentScales {
+        price_scale: 2,
+        contract_scale: 0,
+    };
+    ledger
+        .register_instrument(Instrument::from_spec(&spec, scales).unwrap())
+        .unwrap();
+    ledger
+        .deposit(TransferId::new("seed").unwrap(), btc.clone(), dec!(0.1))
+        .unwrap();
+    let account = DerivativeMarginAccount::new(
+        margin_rs::rules::TieredInverseIm::inverse_v1(btc.clone(), 8).unwrap(),
+        RiskGate::new(ledger),
+        InstrumentId::new(spec.id().as_str()).unwrap(),
+        AccountId::new("a").unwrap(),
+        VenueId::new("v").unwrap(),
+        ReservationId::new("margin").unwrap(),
+    )
+    .unwrap();
+    let mut policy = account.policy();
+    policy.on_market_data(dec!(50000), 0);
+    // 2500 contracts of 10 USD at 50000 are 0.5 BTC of notional, 0.05 of 0.1 held.
+    assert!(
+        !policy
+            .check(&request("1", Action::Buy, dec!(2500)))
+            .is_rejected()
+    );
+    let held = account.with_gate(|gate| {
+        let balance = gate.ledger().balance(&btc).unwrap();
+        balance.total - balance.available
+    });
+    assert_eq!(held, dec!(0.05));
+    // 5001 in all would ask just over the 0.1.
+    assert!(
+        policy
+            .check(&request("2", Action::Buy, dec!(2501)))
+            .is_rejected()
+    );
+    assert!(
+        !policy
+            .check(&request("3", Action::Buy, dec!(2500)))
+            .is_rejected()
     );
 }
