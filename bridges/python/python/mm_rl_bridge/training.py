@@ -69,7 +69,8 @@ def _hash(path):
 def train(algorithm, env, seed, total_timesteps, path, commit, hyperparameters=None):
     """Trains on one thread of the CPU and saves a checkpoint with its metadata.
 
-    `commit` is declared by the caller, and not checked. Returns the metadata.
+    `commit` is declared by the caller, and not checked. Replaces what `path` held. Returns
+    the metadata.
     """
     _check_algorithm(algorithm, env)
     if stable_baselines3.__version__ != TRAINER_VERSION:
@@ -211,12 +212,20 @@ class Protocol:
         self._holdout_used = False
 
     def train(self, seed, total_timesteps, hyperparameters=None):
-        """Trains one candidate on the training window. Every candidate stays listed."""
+        """Trains one candidate on the training window. Every candidate stays listed.
+
+        A candidate's files are named by its place in the list, so that candidates with one
+        seed and other hyperparameters stay apart. Raises `FileExistsError` before training
+        if those files exist, so that a directory used before keeps its checkpoints.
+        """
         if self._selected is not None:
             raise RuntimeError("training after the selection")
+        path = self._directory / f"{self._algorithm}-{len(self._candidates)}-{seed}"
+        for existing in (path.with_suffix(".zip"), _metadata_path(path)):
+            if existing.exists():
+                raise FileExistsError(f"{existing} holds a candidate of an earlier run")
         env = self._env_class(self._config, self._train, seed=seed)
         try:
-            path = self._directory / f"{self._algorithm}-{seed}"
             metadata = train(
                 self._algorithm,
                 env,

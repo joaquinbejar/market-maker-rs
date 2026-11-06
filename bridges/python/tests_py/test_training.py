@@ -193,6 +193,66 @@ def test_protocol_orders_its_steps_and_uses_the_holdout_once(tmp_path):
         protocol.run_holdout([1])
 
 
+def protocol_in(directory):
+    ns = lambda ms: ms * 1_000_000  # noqa: E731
+    return Protocol(
+        config(max_steps=1000),
+        "maskable_ppo",
+        walk(600),
+        ns(1000 + 300 * 25),
+        ns(1000 + 450 * 25),
+        directory,
+        "abc",
+    )
+
+
+def files_in(directory):
+    return {path.name: path.read_bytes() for path in directory.iterdir()}
+
+
+def test_protocol_keeps_candidates_with_one_seed_apart(tmp_path):
+    protocol = protocol_in(tmp_path)
+    other = {**PPO_SMALL, "n_epochs": 2}
+    first = protocol.train(1, 32, PPO_SMALL)
+    before = files_in(tmp_path)
+    second = protocol.train(1, 32, other)
+    after = files_in(tmp_path)
+    assert len(before) == 2
+    assert len(after) == 4
+    assert {name: after[name] for name in before} == before
+    assert first["checkpoint_sha256"] != second["checkpoint_sha256"]
+    table = protocol.select([1])
+    assert len({row["path"] for row in table}) == 2
+    # Each row was evaluated on its own checkpoint, under its own metadata.
+    env = MaskableMarketMakingEnv(config(max_steps=1000), walk(600))
+    try:
+        loaded = [load_for_inference(row["path"], env)[1] for row in table]
+    finally:
+        env.close()
+    assert loaded == [first, second]
+    assert [m["hyperparameters"] for m in loaded] == [PPO_SMALL, other]
+
+
+@pytest.mark.parametrize("kept", [".zip", ".json"])
+def test_protocol_refuses_a_candidates_files_before_training(tmp_path, monkeypatch, kept):
+    protocol_in(tmp_path).train(1, 32, PPO_SMALL)
+    for path in list(tmp_path.iterdir()):
+        if path.suffix != kept:
+            path.unlink()
+    before = files_in(tmp_path)
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("trained over an existing candidate")
+
+    monkeypatch.setattr("mm_rl_bridge.training.train", never)
+    later = protocol_in(tmp_path)
+    with pytest.raises(FileExistsError, match="earlier run"):
+        later.train(1, 32, {**PPO_SMALL, "n_epochs": 2})
+    assert files_in(tmp_path) == before
+    with pytest.raises(RuntimeError, match="nothing to select"):
+        later.select([1])
+
+
 def test_report_separates_environment_determinism_from_training_variability(tmp_path):
     # Environment: the same actions give the same exact trace, which is asserted.
     # Training: two runs with one seed are compared and the result is only reported, as
