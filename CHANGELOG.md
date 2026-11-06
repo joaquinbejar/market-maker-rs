@@ -8,6 +8,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
+  calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
+  the chain take it unchanged; the interpolation, wings and short and long expiries are
+  upstream's. What upstream reports and does not refuse is refused by default under
+  `UpstreamPolicy`: a surface whose static arbitrage report did not pass, a read whose value or
+  slope spans an expiry with no slice, and fitted expiries closer than a second. A surface served
+  after its as-of time is rolled down at constant implied volatility per log moneyness.
+  `UpstreamStore` keeps every calibration attempt, failed ones included, with the time it became
+  available, and serves at an instant only what was available then, with its age from the data.
+  `SurfaceQuality` reports residuals by strike and expiry, rejected quotes and unfitted expiries
+  by reason, and the static arbitrage violations. Example `upstream_surface_replay` runs it over
+  synthetic daily snapshots, out of sample, against a flat volatility per expiry.
 - Example `regime_adaptation` (#112): fixed parameters against a simple causal adaptation over
   synthetic regime changes on queue-reactive and Hawkes flow, with detection delay, false alarms,
   a labelled oracle, transfer between the simulators and a go or no-go rule fixed before the
@@ -399,6 +411,7 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `optionstratlib` requirement 0.24.1, for the surface's derivatives (#96).
 - `optionstratlib` 0.24 and `option-chain-orderbook` 0.15 (breaking, as their types are in this
   crate's public API). `ExpirationDate`'s conversions from the wall clock now need the `clock`
   feature, which `options` turns on, so results are unchanged.
