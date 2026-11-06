@@ -261,7 +261,11 @@ pub struct ResidualStep {
 
 /// An environment whose policy corrects a classical quote. See [`compose`].
 ///
-/// It needs `&mut self` to step, as a [`QuoteSource`] may keep state.
+/// It needs `&mut self` to step, as a [`QuoteSource`] may keep state within an episode.
+/// Nothing resets the source: [`ResidualEnv::reset`] resets the market and the ledger
+/// only, so a source that keeps state across episodes carries it into the next one, and
+/// one seed may not repeat. Use a source with no state between episodes, or build a new
+/// environment for each episode.
 #[derive(Debug, Clone)]
 pub struct ResidualEnv<
     'd,
@@ -341,7 +345,8 @@ impl<'d, S: QuoteSource, const ORD: usize, const MSG: usize, const DLV: usize, c
         self.env.spec().id()
     }
 
-    /// The state at the first decision.
+    /// The state at the first decision. The [`QuoteSource`] is not reset: see
+    /// [`ResidualEnv`].
     ///
     /// # Errors
     ///
