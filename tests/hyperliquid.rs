@@ -11,6 +11,9 @@ use market_maker_rs::backtest::hyperliquid::{
     decode_order_status, decode_order_statuses, hawkes_segments, parse_book_diff, parse_time_ns,
     queue_observations, read_book_diffs, read_trades, sized_events,
 };
+use market_maker_rs::backtest::hyperliquid::{
+    RepeatFilter, decode_order_statuses_after, read_book_diffs_after, read_trades_after,
+};
 use market_maker_rs::backtest::queue_reactive::{QrEventKind, QrSide};
 use market_maker_rs::dec;
 use market_maker_rs::strategy::signal_quote::MarketEvent;
@@ -1906,4 +1909,141 @@ fn test_a_diff_with_no_status_does_not_end_a_silence_a_trade_saw() {
     assert_eq!(output.events[0].time.evidence, TimeEvidence::Inherited);
     assert_eq!(replay.coverage().resets_on_diffs, 1, "the same silence");
     assert_eq!(replay.coverage().orders_cut_by_reset, 2);
+}
+
+/// A diff line of BTC in the dataset's format.
+fn diff_line(oid: u64, side: &str, px: &str, change: &str) -> String {
+    format!(
+        r#"{{"user":"0x1","oid":{oid},"coin":"BTC","side":"{side}","px":"{px}","raw_book_diff":{change}}}"#
+    )
+}
+
+#[test]
+fn test_a_filter_leaves_out_the_tail_of_the_file_before_and_forgets_older_files() {
+    let [a, b, c, d] = [1, 2, 3, 4].map(|oid| diff_line(oid, "B", "100", r#"{"new":{"sz":"1"}}"#));
+    let mut filter = RepeatFilter::new();
+    let first = read_book_diffs_after(
+        [&a, &b, &c].map(String::as_str).join("\n").as_bytes(),
+        "BTC",
+        &mut filter,
+    )
+    .unwrap();
+    assert_eq!(
+        (first.rows.len(), first.repeated_from_previous_file),
+        (3, 0)
+    );
+    // The next file starts with the last one's tail, and repeats a line of its own.
+    let second = read_book_diffs_after(
+        [&b, &c, &d, &d].map(String::as_str).join("\n").as_bytes(),
+        "BTC",
+        &mut filter,
+    )
+    .unwrap();
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows[0].oid, 4);
+    assert_eq!(second.repeated_from_previous_file, 2);
+    assert_eq!(second.repeated_lines, 1);
+    // Only the file before is remembered: a line of two files back is kept.
+    let third = read_book_diffs_after(a.as_bytes(), "BTC", &mut filter).unwrap();
+    assert_eq!(
+        (third.rows.len(), third.repeated_from_previous_file),
+        (1, 0)
+    );
+    // Without the filter nothing carries over.
+    assert_eq!(
+        read_book_diffs([&b, &d].map(String::as_str).join("\n").as_bytes(), "BTC")
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn test_status_and_trade_files_leave_out_the_tail_of_the_file_before() {
+    let a = record(START, STATUS_OPEN, false, 10_000, 100, 1);
+    let b = record(START + SECOND, STATUS_OPEN, false, 10_000, 100, 2);
+    let c = record(START + 2 * SECOND, CANCELED, false, 10_000, 100, 1);
+    let mut filter = RepeatFilter::new();
+    let first = decode_order_statuses_after(&[a.clone(), b.clone()].concat(), &mut filter).unwrap();
+    assert_eq!(first.rows.len(), 2);
+    let second = decode_order_statuses_after(&[b, c].concat(), &mut filter).unwrap();
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows[0].status_id, CANCELED);
+    assert_eq!(second.repeated_from_previous_file, 1);
+
+    let line = |second: u32, hash: &str| {
+        format!(
+            r#"{{"coin":"BTC","side":"B","time":"2025-12-30T18:00:{second:02}","px":"101","sz":"1","hash":"{hash}"}}"#
+        )
+    };
+    let mut filter = RepeatFilter::new();
+    let first = [line(1, "a"), line(2, "b")].join("\n");
+    let second = [line(2, "b"), line(3, "c")].join("\n");
+    assert_eq!(
+        read_trades_after(first.as_bytes(), "BTC", &mut filter)
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+    let read = read_trades_after(second.as_bytes(), "BTC", &mut filter).unwrap();
+    assert_eq!(read.rows.len(), 1);
+    assert_eq!(read.repeated_from_previous_file, 1);
+}
+
+/// Two hour files of statuses and diffs, the second starting with the first's tail, through one
+/// replay; with filters or without.
+fn overlapping_hours(filtered: bool) -> Replay {
+    let open = |ts: u64, is_ask: bool, price: u32, oid: u64| {
+        record(ts, STATUS_OPEN, is_ask, price, 100, oid)
+    };
+    let statuses = [
+        [
+            open(START, false, 10_000, 1),
+            open(START + SECOND, true, 10_100, 2),
+        ]
+        .concat(),
+        [
+            open(START, false, 10_000, 1),
+            open(START + SECOND, true, 10_100, 2),
+            open(START + 2 * SECOND, false, 9_900, 3),
+        ]
+        .concat(),
+    ];
+    let one = diff_line(1, "B", "100", r#"{"new":{"sz":"1"}}"#);
+    let two = diff_line(2, "A", "101", r#"{"new":{"sz":"1"}}"#);
+    let three = diff_line(3, "B", "99", r#"{"new":{"sz":"1"}}"#);
+    let diffs = [
+        [&one, &two].map(String::as_str).join("\n"),
+        [&one, &two, &three].map(String::as_str).join("\n"),
+    ];
+    let mut replay = Replay::new(config(0));
+    let (mut status_filter, mut diff_filter) = (RepeatFilter::new(), RepeatFilter::new());
+    for (statuses, diffs) in statuses.iter().zip(&diffs) {
+        let (statuses, diffs) = if filtered {
+            (
+                decode_order_statuses_after(statuses, &mut status_filter).unwrap(),
+                read_book_diffs_after(diffs.as_bytes(), "BTC", &mut diff_filter).unwrap(),
+            )
+        } else {
+            (
+                decode_order_statuses(statuses).unwrap(),
+                read_book_diffs(diffs.as_bytes(), "BTC").unwrap(),
+            )
+        };
+        replay.ingest(&statuses.rows, &diffs.rows, &[]).unwrap();
+    }
+    replay
+}
+
+#[test]
+fn test_hours_that_overlap_step_back_unless_read_through_one_filter_per_stream() {
+    let unfiltered = overlapping_hours(false);
+    assert!(unfiltered.coverage().time_steps_back > 0);
+    assert!(unfiltered.coverage().duplicate_new > 0);
+    let filtered = overlapping_hours(true);
+    assert_eq!(filtered.coverage().time_steps_back, 0);
+    assert_eq!(filtered.coverage().duplicate_new, 0);
+    assert_eq!(filtered.coverage().diffs, 3);
 }

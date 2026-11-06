@@ -17,15 +17,18 @@
 //! A silence over [`RESET_GAP_NS`] empties the book and restarts the warm-up.
 //!
 //! Each hour gets a line of what it added: diffs, crossed events, resets, orders cut, re-emitted
-//! diffs, times stepping back and unknown orders after the warm-up, to see where they cluster.
+//! diffs, statuses and diffs repeating the file before, times stepping back and unknown orders
+//! after the warm-up, to see where they cluster. Consecutive files overlap by minutes, so each
+//! stream's files are read through one `RepeatFilter`.
 
 use std::fs;
 use std::io::BufReader;
 
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::hyperliquid::{
-    EventCause, Replay, ReplayConfig, TimeEvidence, TouchCheck, Warmth, decode_order_statuses,
-    hawkes_segments, queue_observations, read_book_diffs, read_trades, sized_events,
+    EventCause, RepeatFilter, Replay, ReplayConfig, TimeEvidence, TouchCheck, Warmth,
+    decode_order_statuses_after, hawkes_segments, queue_observations, read_book_diffs_after,
+    read_trades_after, sized_events,
 };
 use market_maker_rs::backtest::queue_reactive::{QrSide, estimate_event_sizes};
 use market_maker_rs::strategy::walk_forward::TimeWindow;
@@ -98,6 +101,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keep_events = files.len() / 3 <= MAX_HOURS_KEPT;
     let (mut seen, mut inherited, mut cold) = (0usize, 0usize, 0usize);
     let (mut repeated_statuses, mut repeated_diffs, mut repeated_trades) = (0u64, 0u64, 0u64);
+    // One filter per stream: consecutive files overlap, and each repeats the tail of the last.
+    let (mut status_filter, mut diff_filter, mut trade_filter) = (
+        RepeatFilter::new(),
+        RepeatFilter::new(),
+        RepeatFilter::new(),
+    );
+    let mut overlap = [0u64; 3];
     let (mut limit, mut cancel, mut fill, mut unknown) = (0usize, 0usize, 0usize, 0usize);
     println!("REAL DATA: the Hyperliquid capture, for {coin}. Times of book diffs are inferred.");
     for triple in files.chunks(3) {
@@ -112,10 +122,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bytes.len(),
             digest(&bytes)
         );
-        let statuses = decode_order_statuses(&bytes)?;
+        let statuses = decode_order_statuses_after(&bytes, &mut status_filter)?;
         drop(bytes);
-        let diffs = read_book_diffs(BufReader::new(fs::File::open(diffs)?), coin)?;
-        let trades = read_trades(BufReader::new(fs::File::open(trades)?), coin)?;
+        let diffs = read_book_diffs_after(
+            BufReader::new(fs::File::open(diffs)?),
+            coin,
+            &mut diff_filter,
+        )?;
+        let trades = read_trades_after(
+            BufReader::new(fs::File::open(trades)?),
+            coin,
+            &mut trade_filter,
+        )?;
+        overlap[0] += statuses.repeated_from_previous_file;
+        overlap[1] += diffs.repeated_from_previous_file;
+        overlap[2] += trades.repeated_from_previous_file;
         repeated_statuses += statuses.repeated_lines;
         repeated_diffs += diffs.repeated_lines;
         repeated_trades += trades.repeated_lines;
@@ -129,13 +150,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let after = replay.coverage();
         println!(
             "  {hour}: {} diffs, {} crossed events, resets {} on diffs and {} on trades, {} \
-             orders cut, {} diffs re-emitted, {} times stepping back, {} unknown orders warm",
+             orders cut, {} diffs re-emitted, {} statuses and {} diffs from the file before, {} \
+             times stepping back, {} unknown orders warm",
             after.diffs - before.diffs,
             after.crossed_events - before.crossed_events,
             after.resets_on_diffs - before.resets_on_diffs,
             after.resets_on_trades - before.resets_on_trades,
             after.orders_cut_by_reset - before.orders_cut_by_reset,
             diffs.repeated_lines,
+            statuses.repeated_from_previous_file,
+            diffs.repeated_from_previous_file,
             after.time_steps_back - before.time_steps_back,
             after.unknown_orders_warm - before.unknown_orders_warm,
         );
@@ -199,8 +223,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "Re-emitted lines left out: {repeated_statuses} statuses, {repeated_diffs} diffs, \
-         {repeated_trades} trades. Trades out of order, skipped: {}.",
-        coverage.trades_out_of_order,
+         {repeated_trades} trades; repeating the file before: {} statuses, {} diffs, {} trades. \
+         Trades out of order, skipped: {}.",
+        overlap[0], overlap[1], overlap[2], coverage.trades_out_of_order,
     );
     println!(
         "A silence over {} s resets the replay: {} on diffs, {} on trades, {} orders cut there.",
