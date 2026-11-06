@@ -1,12 +1,15 @@
-//! What a step costs in Rust, directly and through the worker's channels.
+//! What a step costs in Rust, directly and through the worker's channels, and what the
+//! worker's episode recorder holds at the end of an episode.
 //!
 //! `cargo run --release --example step_cost`. Synthetic rows. It measures one machine, once.
 
 use std::time::Instant;
 
 use market_maker_rs::Decimal;
-use market_maker_rs::backtest::kernel::{ActionGrid, KernelConfig, KernelDataset, KernelTick};
-use market_maker_rs::rl::{ObservationScales, RlAction, RlConfig, RlEnv};
+use market_maker_rs::backtest::kernel::{
+    ActionGrid, FillRec, KernelConfig, KernelDataset, KernelTick,
+};
+use market_maker_rs::rl::{EpisodeRecorder, ObservationScales, RlAction, RlConfig, RlEnv};
 use mm_rl_bridge::worker::{BridgeConfig, DLV, MSG, OBS, ORD, Worker};
 
 const ROWS: u64 = 200_000;
@@ -88,6 +91,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let direct = start.elapsed().as_nanos() / u128::from(steps);
 
+    // The worker records every episode, as `attribution` needs: one row index per completed
+    // row and one record per fill. A `Vec` may hold up to twice what it has grown to.
+    let mut recorder = EpisodeRecorder::default();
+    let mut state = env.reset_with(1, &mut recorder)?;
+    let start = Instant::now();
+    let mut recorded = 0_u64;
+    while !state.is_done() {
+        env.step_with(&mut state, action(recorded), &mut recorder)?;
+        recorded += 1;
+    }
+    let with_recorder = start.elapsed().as_nanos() / u128::from(recorded);
+    let records = env.records(&state, &recorder)?;
+    let rows_bytes = records.marks.len() * std::mem::size_of::<u64>();
+    let fills_bytes = records.fills.len() * std::mem::size_of::<FillRec>();
+    let held = rows_bytes + fills_bytes;
+
     let mut worker = Worker::spawn(config(), rows(), None)?;
     worker.reset(1)?;
     let start = Instant::now();
@@ -100,6 +119,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     worker.close()?;
     println!(
         "direct {direct} ns per step, through the worker {channels} ns per step, {steps} steps"
+    );
+    println!(
+        "with the recorder {with_recorder} ns per step; at the end it holds {} rows ({rows_bytes} \
+         bytes) and {} fills ({fills_bytes} bytes, {} each): {held} bytes, {:.1} per step, up to \
+         twice that allocated",
+        records.marks.len(),
+        records.fills.len(),
+        std::mem::size_of::<FillRec>(),
+        held as f64 / recorded as f64,
     );
     Ok(())
 }

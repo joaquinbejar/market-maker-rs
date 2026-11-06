@@ -262,10 +262,8 @@ pub struct ResidualStep {
 /// An environment whose policy corrects a classical quote. See [`compose`].
 ///
 /// It needs `&mut self` to step, as a [`QuoteSource`] may keep state within an episode.
-/// Nothing resets the source: [`ResidualEnv::reset`] resets the market and the ledger
-/// only, so a source that keeps state across episodes carries it into the next one, and
-/// one seed may not repeat. Use a source with no state between episodes, or build a new
-/// environment for each episode.
+/// Every reset starts the source again from the state it was built with, so what it learnt
+/// in one episode does not reach the next, and one seed repeats.
 #[derive(Debug, Clone)]
 pub struct ResidualEnv<
     'd,
@@ -277,13 +275,20 @@ pub struct ResidualEnv<
 > {
     env: RlEnv<'d, 1, 1, ORD, MSG, DLV, OBS>,
     adapter: QuoteAdapter<S>,
+    built: QuoteAdapter<S>,
     bounds: ResidualBounds,
     max_price_ticks: u64,
     max_lots: u64,
 }
 
-impl<'d, S: QuoteSource, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
-    ResidualEnv<'d, S, ORD, MSG, DLV, OBS>
+impl<
+    'd,
+    S: QuoteSource + Clone,
+    const ORD: usize,
+    const MSG: usize,
+    const DLV: usize,
+    const OBS: usize,
+> ResidualEnv<'d, S, ORD, MSG, DLV, OBS>
 {
     /// Builds the environment. `default_order_size` replaces a classical size that is not
     /// positive, as in [`QuoteAdapter::new`].
@@ -321,6 +326,7 @@ impl<'d, S: QuoteSource, const ORD: usize, const MSG: usize, const DLV: usize, c
                 "max_order_size",
             )?,
             env,
+            built: adapter.clone(),
             adapter,
             bounds,
         })
@@ -345,13 +351,14 @@ impl<'d, S: QuoteSource, const ORD: usize, const MSG: usize, const DLV: usize, c
         self.env.spec().id()
     }
 
-    /// The state at the first decision. The [`QuoteSource`] is not reset: see
-    /// [`ResidualEnv`].
+    /// The state at the first decision, with the [`QuoteSource`] as it was built.
     ///
     /// # Errors
     ///
     /// As [`RlEnv::reset`].
-    pub fn reset(&self, seed: u64) -> MMResult<RlState<ORD, MSG, DLV, OBS>> {
+    pub fn reset(&mut self, seed: u64) -> MMResult<RlState<ORD, MSG, DLV, OBS>> {
+        // A state is large, so it is returned straight from the inner environment.
+        self.adapter = self.built.clone();
         self.env.reset(seed)
     }
 
@@ -361,10 +368,11 @@ impl<'d, S: QuoteSource, const ORD: usize, const MSG: usize, const DLV: usize, c
     ///
     /// As [`RlEnv::reset`].
     pub fn reset_with<E: EventSink>(
-        &self,
+        &mut self,
         seed: u64,
         sink: &mut E,
     ) -> MMResult<RlState<ORD, MSG, DLV, OBS>> {
+        self.adapter = self.built.clone();
         self.env.reset_with(seed, sink)
     }
 

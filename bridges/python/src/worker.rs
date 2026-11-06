@@ -486,7 +486,7 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
     }
 }
 
-impl<S: QuoteSource> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
+impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
     fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String> {
         self.reset_with(seed, recorder).map_err(|e| e.to_string())
     }
@@ -578,7 +578,7 @@ fn answer<D: Driver>(
 }
 
 /// Builds a residual environment over `source` and answers requests.
-fn serve_residual<S: QuoteSource>(
+fn serve_residual<S: QuoteSource + Clone>(
     job: Job<'_>,
     source: S,
     default_order_size: Decimal,

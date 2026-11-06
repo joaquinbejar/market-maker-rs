@@ -12,7 +12,7 @@ use market_maker_rs::Decimal;
 use market_maker_rs::backtest::MarketTick;
 use market_maker_rs::backtest::kernel::{
     AvellanedaQuoter, ErrCode, FinancialKernel, GlftQuoter, KernelAction, KernelConfig,
-    KernelDataset, QuoteAdapter, QuoteSide, QuoteSource, encode,
+    KernelDataset, Observation, QuoteAdapter, QuoteSide, QuoteSource, SourceQuote, encode,
 };
 use market_maker_rs::dec;
 use market_maker_rs::risk::RiskLimits;
@@ -21,6 +21,7 @@ use market_maker_rs::rl::{
     ResidualFallback, ResidualProposal, RlConfig, compose,
 };
 use market_maker_rs::strategy::glft::GLFTConfig;
+use market_maker_rs::types::error::MMResult;
 
 const BOUNDS: ResidualBounds = ResidualBounds {
     price_ticks: 10,
@@ -350,6 +351,60 @@ fn zero_reproduces<S: QuoteSource + Clone>(source: S) {
     }
     assert!(quotes > 100, "only {quotes} quotes");
     assert!(state.kernel().counters().venue_fills > 0);
+}
+
+/// A source that remembers how often it quoted, and quotes further away each time.
+#[derive(Debug, Clone, Default)]
+struct Drifting {
+    calls: u32,
+}
+
+impl QuoteSource for Drifting {
+    fn quote(
+        &mut self,
+        _obs: &Observation,
+        mid: Decimal,
+        _inventory: Decimal,
+    ) -> MMResult<SourceQuote> {
+        self.calls += 1;
+        let away = Decimal::from(1 + self.calls % 40);
+        Ok(SourceQuote::Bid(mid - away, dec!(1)))
+    }
+}
+
+fn classical_actions(env: &mut ResidualEnv<'_, Drifting>, seed: u64) -> Vec<KernelAction> {
+    let mut state = env.reset(seed).unwrap();
+    let mut actions = Vec::new();
+    while !state.is_done() {
+        let step = env.step(&mut state, ResidualProposal::ZERO).unwrap();
+        actions.push(step.decision.classical);
+    }
+    actions
+}
+
+#[test]
+fn test_env_reset_starts_a_stateful_source_again_so_a_seed_repeats() {
+    let cfg = kernel_config();
+    let data = KernelDataset::from_ticks(&rows(60), &cfg).unwrap();
+    let mut env: ResidualEnv<'_, Drifting> = ResidualEnv::new(
+        &cfg,
+        &data,
+        Drifting::default(),
+        dec!(1),
+        BOUNDS,
+        RlConfig::new(scales(), dec!(1)),
+    )
+    .unwrap();
+    let first = classical_actions(&mut env, 1);
+    // The source does keep state within an episode.
+    assert!(first.len() > 2);
+    assert_ne!(first.first(), first.get(1));
+    let again = classical_actions(&mut env, 1);
+    assert_eq!(first, again);
+    // A reset in the middle of an episode starts it again too.
+    let mut state = env.reset(1).unwrap();
+    env.step(&mut state, ResidualProposal::ZERO).unwrap();
+    assert_eq!(classical_actions(&mut env, 1), first);
 }
 
 #[test]
