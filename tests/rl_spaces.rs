@@ -519,6 +519,45 @@ fn test_features_count_an_order_waiting_for_the_outcome_of_a_cancel() {
 }
 
 #[test]
+fn test_features_keep_the_sign_of_a_short_position() {
+    // The second trajectory: short 1.5 entered at 50.75, with the mid up from 50.5 to 51.5,
+    // which is 4 ticks of 0.25.
+    let cfg = short_config();
+    let data = KernelDataset::from_ticks(&short_ticks(), &cfg).unwrap();
+    let grid = ActionGrid::new([2, 8], [1, 8], [1, 3]).unwrap();
+    let env: RlEnv<'_, 2, 2> = RlEnv::new(&cfg, &data, grid, config()).unwrap();
+    let mut state = env.reset(1).unwrap();
+    let observed = env.step(&mut state, quote(1, 0, 0, 1)).unwrap().observation;
+    let at = |id: FeatureId| (observed.raw[id.index()], observed.values[id.index()]);
+    assert_eq!(at(FeatureId::Position), (Some(dec!(-1.5)), -0.375));
+    // The gap is the mid less the entry whichever way the position runs, and here that is
+    // a loss: the sign of the position and of the gap together say so.
+    assert_eq!(at(FeatureId::EntryGap), (Some(dec!(0.75)), 0.375));
+    assert_eq!(at(FeatureId::MidChange), (Some(dec!(4)), 1.0));
+}
+
+#[test]
+fn test_features_keep_the_sign_of_each_direction() {
+    // A mid that falls, an entry above the mid, and a book heavier on the ask.
+    let cfg = long_config();
+    let ticks = vec![
+        tick(1000, dec!(99.5), dec!(1), dec!(100.5), dec!(3)),
+        tick(2000, dec!(98.5), dec!(1), dec!(99.5), dec!(3)),
+    ];
+    let data = KernelDataset::from_ticks(&ticks, &cfg).unwrap();
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, long_grid(), config()).unwrap();
+    let mut state = env.reset(1).unwrap();
+    let first = env.observe(&state).unwrap();
+    assert_eq!(first.raw[FeatureId::Imbalance.index()], Some(dec!(-0.5)));
+    assert_eq!(first.values[FeatureId::Imbalance.index()], -0.5);
+    let second = env.step(&mut state, quote(1, 2, 1, 0)).unwrap().observation;
+    let at = |id: FeatureId| (second.raw[id.index()], second.values[id.index()]);
+    assert_eq!(at(FeatureId::Position), (Some(dec!(2)), 0.5));
+    assert_eq!(at(FeatureId::EntryGap), (Some(dec!(-0.5)), -0.25));
+    assert_eq!(at(FeatureId::MidChange), (Some(dec!(-2)), -0.5));
+}
+
+#[test]
 fn test_features_clip_the_normalized_value_and_keep_the_raw_one() {
     let cfg = long_config();
     let data = KernelDataset::from_ticks(&long_ticks(), &cfg).unwrap();
