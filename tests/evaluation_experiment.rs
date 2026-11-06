@@ -659,7 +659,7 @@ fn test_regimes_sum_to_the_run_with_a_new_labeller_per_run() {
         vec![immediate()],
     )
     .unwrap()
-    .with_regimes(move || {
+    .with_regimes("moves above 0.5", move || {
         *made.borrow_mut() += 1;
         let mut last: Option<Decimal> = None;
         Box::new(move |mark| {
@@ -935,4 +935,40 @@ fn test_data_hash_covers_the_last_trade_fields() {
     }
     // The same value at another scale is the same data here too.
     assert_eq!(price, with_last(Some(dec!(100.00)), None));
+}
+
+#[test]
+fn test_manifest_records_the_regime_labeller() {
+    let manifest = |description: Option<&str>, label: &'static str| {
+        let experiment = Experiment::new(
+            experiment_config(),
+            ticks(),
+            with(vec![quoter("a", dec!(0.25))]),
+            vec![immediate()],
+        )
+        .unwrap();
+        let experiment = match description {
+            Some(text) => experiment.with_regimes(text, move || {
+                Box::new(move |_: &market_maker_rs::backtest::evaluation::Mark| label.to_string())
+            }),
+            None => experiment,
+        };
+        let validated = experiment.evaluate_validation();
+        let regimes: Vec<String> = completed(row(&validated.report().rows, "a", "immediate"))
+            .regimes
+            .keys()
+            .cloned()
+            .collect();
+        (validated.report().manifest.clone(), regimes)
+    };
+    let (none, no_regimes) = manifest(None, "");
+    let (first, first_regimes) = manifest(Some("always x"), "x");
+    let (second, second_regimes) = manifest(Some("always y"), "y");
+    assert!(no_regimes.is_empty());
+    assert_eq!(none.regime_labeller, None);
+    // Different labels in the reports, so the manifests must differ too.
+    assert_ne!(first_regimes, second_regimes);
+    assert_eq!(first.regime_labeller.as_deref(), Some("always x"));
+    assert_ne!(first, second);
+    assert_ne!(first, none);
 }

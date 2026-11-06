@@ -664,6 +664,8 @@ pub struct Manifest {
     pub execution: String,
     /// The pretrade policy every run uses, if any.
     pub pretrade_policy: Option<String>,
+    /// The declared description of the regime labeller, if any.
+    pub regime_labeller: Option<String>,
     /// Horizons and the mark rule.
     pub metrics: MetricsSpec,
     /// Bootstrap.
@@ -766,7 +768,8 @@ pub struct Experiment {
     /// The scenarios after it, for sensitivity on validation.
     sensitivity: Vec<Scenario>,
     policy: Option<Box<PolicyFactory>>,
-    regimes: Option<Box<RegimeFactory>>,
+    /// The declared description of the labeller, and how to make one.
+    regimes: Option<(String, Box<RegimeFactory>)>,
 }
 
 impl fmt::Debug for Experiment {
@@ -872,10 +875,17 @@ impl Experiment {
         self
     }
 
-    /// Reports by regime, with a new labeller for each run.
+    /// Reports by regime, with a new labeller for each run. The manifest records
+    /// `description`, which must say everything that decides the labels, such as the
+    /// rule and its parameters: code cannot be hashed, so a labeller that changes under
+    /// the same description is not detected.
     #[must_use]
-    pub fn with_regimes(mut self, make: impl Fn() -> Box<RegimeLabeller> + 'static) -> Self {
-        self.regimes = Some(Box::new(make));
+    pub fn with_regimes(
+        mut self,
+        description: impl Into<String>,
+        make: impl Fn() -> Box<RegimeLabeller> + 'static,
+    ) -> Self {
+        self.regimes = Some((description.into(), Box::new(make)));
         self
     }
 
@@ -912,6 +922,10 @@ impl Experiment {
             ]),
             execution: format!("{:?}", self.config.execution),
             pretrade_policy: self.policy.as_ref().map(|make| make().description()),
+            regime_labeller: self
+                .regimes
+                .as_ref()
+                .map(|(description, _)| description.clone()),
             metrics: self.config.metrics.clone(),
             bootstrap: self.config.bootstrap,
             seed: self.config.seed,
@@ -1007,7 +1021,7 @@ impl Experiment {
         let metrics = evaluate_window(&input, &self.config.metrics).map_err(text)?;
         let values = metrics.values().map_err(text)?;
         let regimes = match &self.regimes {
-            Some(make) => {
+            Some((_, make)) => {
                 let mut label = make();
                 attribute_by(&input, |mark| label(mark))
                     .map_err(text)?

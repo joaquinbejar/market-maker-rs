@@ -27,6 +27,8 @@ project follows [Semantic Versioning](https://semver.org/).
   unchanged `margin-rs` gate cuts or refuses them, with a control that has no gate. Synthetic,
   with made-up budgets and no new public API. Nothing is learned, so constrained learning and a
   penalty are not compared.
+- `Experiment::with_regimes` takes a description, recorded in `Manifest::regime_labeller`
+  (#92), so a manifest covers its regime report as far as the caller declares it.
 - Example `consistent_time_travel` (#109): chronological replay as the baseline against
   time travel as a separate labelled mode, on a small synthetic environment whose true
   values are exact, with no new public API. It reports discontinuities, reuse of the tape
