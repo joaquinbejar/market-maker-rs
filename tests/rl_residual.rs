@@ -372,8 +372,19 @@ impl QuoteSource for Drifting {
     }
 }
 
-fn classical_actions(env: &mut ResidualEnv<'_, Drifting>, seed: u64) -> Vec<KernelAction> {
-    let mut state = env.reset(seed).unwrap();
+/// One episode's classical actions, reset with or without a sink, as the bridge's worker
+/// resets with one.
+fn classical_actions(
+    env: &mut ResidualEnv<'_, Drifting>,
+    seed: u64,
+    with_sink: bool,
+) -> Vec<KernelAction> {
+    let mut recorder = EpisodeRecorder::default();
+    let mut state = if with_sink {
+        env.reset_with(seed, &mut recorder).unwrap()
+    } else {
+        env.reset(seed).unwrap()
+    };
     let mut actions = Vec::new();
     while !state.is_done() {
         let step = env.step(&mut state, ResidualProposal::ZERO).unwrap();
@@ -395,16 +406,19 @@ fn test_env_reset_starts_a_stateful_source_again_so_a_seed_repeats() {
         RlConfig::new(scales(), dec!(1)),
     )
     .unwrap();
-    let first = classical_actions(&mut env, 1);
+    let first = classical_actions(&mut env, 1, false);
     // The source does keep state within an episode.
     assert!(first.len() > 2);
     assert_ne!(first.first(), first.get(1));
-    let again = classical_actions(&mut env, 1);
-    assert_eq!(first, again);
-    // A reset in the middle of an episode starts it again too.
-    let mut state = env.reset(1).unwrap();
-    env.step(&mut state, ResidualProposal::ZERO).unwrap();
-    assert_eq!(classical_actions(&mut env, 1), first);
+    for with_sink in [false, true, true, false] {
+        assert_eq!(classical_actions(&mut env, 1, with_sink), first);
+    }
+    // A reset in the middle of an episode starts it again too, either way.
+    for with_sink in [false, true] {
+        let mut state = env.reset(1).unwrap();
+        env.step(&mut state, ResidualProposal::ZERO).unwrap();
+        assert_eq!(classical_actions(&mut env, 1, with_sink), first);
+    }
 }
 
 #[test]

@@ -20,6 +20,8 @@ project follows [Semantic Versioning](https://semver.org/).
   `SurfaceQuality` reports residuals by strike and expiry, rejected quotes and unfitted expiries
   by reason, and the static arbitrage violations. Example `upstream_surface_replay` runs it over
   synthetic daily snapshots, out of sample, against a flat volatility per expiry.
+- `rl::LIBRARY_VERSION` (#100): the crate's version, which the Python bridge records in a
+  checkpoint's metadata next to its own.
 - Example `regime_adaptation` (#112): fixed parameters against a simple causal adaptation over
   synthetic regime changes on queue-reactive and Hawkes flow, with detection delay, false alarms,
   a labelled oracle, transfer between the simulators and a go or no-go rule fixed before the

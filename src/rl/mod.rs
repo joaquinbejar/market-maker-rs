@@ -158,6 +158,9 @@ mod queue_reactive;
 mod residual;
 mod spec;
 
+/// The version of this crate, for the record of what produced a run.
+pub const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use audit::{EpisodeRecorder, EpisodeRecords};
 pub use env::{
     ERR_ACTION_OFF_GRID, RlAction, RlConfig, RlEnv, RlState, StepReward, TerminalClose, Transition,
