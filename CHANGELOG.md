@@ -520,6 +520,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Example `hyperliquid_validation` (#262) samples the walk-forward's mid at each change of the
+  touch, from the replay's tops, instead of only when the mid changed. A touch that stays put
+  while its sizes change is a live book, so its mid is a sample; read as a silence, it failed the
+  calibration's gap check on the capture. `ReplayOutput::prices` now says that a stretch without
+  an entry is not a silence of the book.
 - `MarginLedgerAccountant` adds a replayed fill's base fee only once. A duplicate
   used to add it again, to `base_fees` and against the position; the engine never
   posts twice, so this reached direct callers only (#195).
