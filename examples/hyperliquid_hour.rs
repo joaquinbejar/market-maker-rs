@@ -14,6 +14,7 @@
 //!
 //! The tick is declared, and the report shows what the prices seen are multiples of. Fees and
 //! funding are in no file here. The book starts empty, so nothing below claims it is complete.
+//! A silence over [`RESET_GAP_NS`] empties the book and restarts the warm-up.
 
 use std::fs;
 use std::io::BufReader;
@@ -31,6 +32,8 @@ use rust_decimal::prelude::FromStr;
 const MAX_HOURS_KEPT: usize = 24;
 /// Limits a depth counts up to.
 const LIMITS: u8 = 3;
+/// The silence that resets the replay. Declared here: the capture's own gaps are of minutes.
+const RESET_GAP_NS: u64 = 60 * 1_000_000_000;
 /// Fewest events a limit's size is estimated from.
 const MIN_EVENTS: u64 = 30;
 /// FNV-1a 64 offset and prime, to tell inputs apart in a report.
@@ -84,12 +87,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Decimal::from_str(tick)?,
         LIMITS,
         minutes * 60 * 1_000_000_000,
+        RESET_GAP_NS,
     )?;
     let mut replay = Replay::new(config);
     let (mut events, mut tops, mut market, mut prices, mut references, mut exposures) =
         (Vec::new(), 0usize, 0usize, 0usize, 0usize, 0usize);
     let keep_events = files.len() / 3 <= MAX_HOURS_KEPT;
     let (mut seen, mut inherited, mut cold) = (0usize, 0usize, 0usize);
+    let (mut repeated_statuses, mut repeated_diffs, mut repeated_trades) = (0u64, 0u64, 0u64);
     let (mut limit, mut cancel, mut fill, mut unknown) = (0usize, 0usize, 0usize, 0usize);
     println!("REAL DATA: the Hyperliquid capture, for {coin}. Times of book diffs are inferred.");
     for triple in files.chunks(3) {
@@ -106,7 +111,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop(bytes);
         let diffs = read_book_diffs(BufReader::new(fs::File::open(diffs)?), coin)?;
         let trades = read_trades(BufReader::new(fs::File::open(trades)?), coin)?;
-        let output = replay.ingest(&statuses, &diffs, &trades)?;
+        repeated_statuses += statuses.repeated_lines;
+        repeated_diffs += diffs.repeated_lines;
+        repeated_trades += trades.repeated_lines;
+        let output = replay.ingest(&statuses.rows, &diffs.rows, &trades.rows)?;
         tops += output.tops.len();
         market += output.market_events.len();
         prices += output.prices.len();
@@ -167,8 +175,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         coverage.partial_last_status,
     );
     println!(
-        "Longest time between diffs: {:.3} s. The book carries over any gap.",
+        "Longest time between diffs: {:.3} s, between trades: {:.3} s.",
         coverage.longest_gap_ns as f64 / 1e9,
+        coverage.longest_trade_gap_ns as f64 / 1e9,
+    );
+    println!(
+        "Re-emitted lines left out: {repeated_statuses} statuses, {repeated_diffs} diffs, \
+         {repeated_trades} trades. Trades out of order, skipped: {}.",
+        coverage.trades_out_of_order,
+    );
+    println!(
+        "A silence over {} s resets the replay: {} on diffs, {} on trades, {} orders cut there.",
+        RESET_GAP_NS / 1_000_000_000,
+        coverage.resets_on_diffs,
+        coverage.resets_on_trades,
+        coverage.orders_cut_by_reset,
     );
     println!(
         "Tick: declared {tick}, {} prices off it. Prices seen are multiples of {:?}: observed, \

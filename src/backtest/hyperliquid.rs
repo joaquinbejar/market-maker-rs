@@ -21,6 +21,18 @@
 //!   whatever rested from November. So depth is unreliable at first, every event before
 //!   [`ReplayConfig::warmup_ns`] is [`Warmth::Cold`], and passing it proves nothing: the counts
 //!   in [`Coverage`] are what there is. No continuity is claimed, across hours or at the start.
+//! - **Gaps in the capture.** A replay carried over a gap goes wrong: it misses what the gap held,
+//!   and shows crossed touches and repeated adds afterwards. So a silence longer than
+//!   [`ReplayConfig::reset_gap_ns`], in the diffs or in the trades, empties the book and restarts
+//!   the warm-up, and what spans it is cut: see [`BookEvent::epoch`]. The threshold is declared,
+//!   and a quiet market can pass it too, which costs a warm-up and nothing else.
+//! - **Re-emitted stretches.** The capture can write a stretch of a stream twice, one right after
+//!   the other, which steps its times back and adds orders already on the book. The readers leave
+//!   out a line exactly equal to an earlier one of its file, and count it in
+//!   [`CaptureRead::repeated_lines`]. Nothing is removed for agreeing on some fields: the trade
+//!   hash can be null, and distinct records can agree on time, side, price, size and hash. A
+//!   stretch across two files is not removed; it shows in [`Coverage::duplicate_new`] and
+//!   [`Coverage::trades_out_of_order`]. Order status records follow the same rule.
 //! - **The tick and the lot.** [`Coverage::price_grid`] is what the prices seen are multiples of,
 //!   an observation that does not prove a rule. [`ReplayConfig::tick`] is declared by the caller.
 //! - **Fees and funding.** They are in no file here, so they stay inputs of whatever consumes
@@ -32,7 +44,9 @@
 //! A duration, as a waiting time or an order's life, comes from two times. It takes the weaker
 //! evidence of the two.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::BufRead;
 use std::str::FromStr;
 
@@ -151,12 +165,15 @@ pub fn decode_order_status(record: &[u8]) -> MMResult<OrderStatusRecord> {
     })
 }
 
-/// Decodes a decompressed order status file, in file order.
+/// Decodes a decompressed order status file, in file order, leaving out the records
+/// [`CaptureRead::repeated_lines`] counts. A status file holds one coin, so a real event could
+/// repeat all of its 54 bytes only if the source wrote it so, which nothing here can tell from a
+/// re-emitted stretch.
 ///
 /// # Errors
 ///
 /// Returns [`MMError::InvalidMarketState`] if its length is not a whole number of records.
-pub fn decode_order_statuses(bytes: &[u8]) -> MMResult<Vec<OrderStatusRecord>> {
+pub fn decode_order_statuses(bytes: &[u8]) -> MMResult<CaptureRead<OrderStatusRecord>> {
     let (records, rest) = bytes.as_chunks::<ORDER_STATUS_RECORD_BYTES>();
     if !rest.is_empty() {
         return Err(bad(format!(
@@ -164,10 +181,16 @@ pub fn decode_order_statuses(bytes: &[u8]) -> MMResult<Vec<OrderStatusRecord>> {
             bytes.len()
         )));
     }
-    records
-        .iter()
-        .map(|record| decode_order_status(record))
-        .collect()
+    let mut read = CaptureRead::default();
+    let mut seen = SeenLines::default();
+    for record in records {
+        if seen.is_repeat(record) {
+            read.repeated_lines = read.repeated_lines.saturating_add(1);
+        } else {
+            read.rows.push(decode_order_status(record)?);
+        }
+    }
+    Ok(read)
 }
 
 /// What a book diff changes.
@@ -274,23 +297,66 @@ pub fn parse_book_diff(line: &str) -> MMResult<(String, BookDiff)> {
     ))
 }
 
-/// Reads the diffs of one coin from a decompressed stream, in file order. The stream's order is
-/// the only sequence a diff has.
+/// What a reader kept of one file, and what it left out.
+///
+/// The check compares 64-bit hashes of the lines, without keeping them: with `n` lines in a file,
+/// a line wrongly left out has a chance of about `n^2 / 2^65`, some 1 in 10^7 at the 1.4 million
+/// records of a busy hour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CaptureRead<T> {
+    /// The rows, in file order.
+    pub rows: Vec<T>,
+    /// Lines or records of the coin left out for being exactly equal to an earlier one of the file.
+    /// The capture re-emits stretches of a stream, and a JSON line carries users and ids, so a real
+    /// event does not repeat one. Nothing is left out for agreeing on some of its fields.
+    pub repeated_lines: u64,
+}
+
+impl<T> Default for CaptureRead<T> {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            repeated_lines: 0,
+        }
+    }
+}
+
+/// The lines of one file seen so far, as hashes. A repeat across files is not seen here.
+#[derive(Debug, Default)]
+struct SeenLines(HashSet<u64>);
+
+impl SeenLines {
+    fn is_repeat(&mut self, line: &[u8]) -> bool {
+        let mut hasher = DefaultHasher::new();
+        line.hash(&mut hasher);
+        !self.0.insert(hasher.finish())
+    }
+}
+
+/// Reads the diffs of one coin from a decompressed stream, in file order, leaving out the lines
+/// [`CaptureRead::repeated_lines`] counts. The stream's order is the only sequence a diff has.
 ///
 /// # Errors
 ///
 /// Returns [`MMError::InvalidMarketState`] for an unreadable stream or a line of any coin that
 /// does not follow the schema.
-pub fn read_book_diffs(reader: impl BufRead, coin: &str) -> MMResult<Vec<BookDiff>> {
-    let mut diffs = Vec::new();
+pub fn read_book_diffs(reader: impl BufRead, coin: &str) -> MMResult<CaptureRead<BookDiff>> {
+    let mut read = CaptureRead::default();
+    let mut seen = SeenLines::default();
     for line in reader.lines() {
         let line = line.map_err(|error| bad(format!("reading book diffs: {error}")))?;
         let (found, diff) = parse_book_diff(&line)?;
-        if found == coin {
-            diffs.push(diff);
+        if found != coin {
+            continue;
+        }
+        if seen.is_repeat(line.as_bytes()) {
+            read.repeated_lines = read.repeated_lines.saturating_add(1);
+        } else {
+            read.rows.push(diff);
         }
     }
-    Ok(diffs)
+    Ok(read)
 }
 
 /// A trade of the capture.
@@ -404,8 +470,9 @@ pub fn parse_time_ns(text: &str) -> MMResult<u64> {
 ///
 /// Returns [`MMError::InvalidMarketState`] for an unreadable stream, a line that is not a trade,
 /// or a line of this coin whose fields do not follow the schema.
-pub fn read_trades(reader: impl BufRead, coin: &str) -> MMResult<Vec<CaptureTrade>> {
-    let mut trades = Vec::new();
+pub fn read_trades(reader: impl BufRead, coin: &str) -> MMResult<CaptureRead<CaptureTrade>> {
+    let mut read = CaptureRead::default();
+    let mut seen = SeenLines::default();
     for line in reader.lines() {
         let line = line.map_err(|error| bad(format!("reading trades: {error}")))?;
         let raw: RawTrade =
@@ -413,7 +480,11 @@ pub fn read_trades(reader: impl BufRead, coin: &str) -> MMResult<Vec<CaptureTrad
         if raw.coin != coin {
             continue;
         }
-        trades.push(CaptureTrade {
+        if seen.is_repeat(line.as_bytes()) {
+            read.repeated_lines = read.repeated_lines.saturating_add(1);
+            continue;
+        }
+        read.rows.push(CaptureTrade {
             timestamp_ns: parse_time_ns(&raw.time)?,
             price: decimal(&raw.px, "price")?,
             size: decimal(&raw.sz, "size")?,
@@ -424,7 +495,7 @@ pub fn read_trades(reader: impl BufRead, coin: &str) -> MMResult<Vec<CaptureTrad
             },
         });
     }
-    Ok(trades)
+    Ok(read)
 }
 
 /// Where a time comes from.
@@ -472,6 +543,9 @@ pub struct Inferred<T> {
     pub value: T,
     /// Its time's origin.
     pub time: InferredTime,
+    /// How many resets came before it. A difference across two epochs, such as a return between
+    /// two prices, spans a gap and means nothing.
+    pub epoch: u64,
 }
 
 /// Whether an event comes before the declared warm-up has passed.
@@ -522,6 +596,9 @@ pub struct BookEvent {
     pub level_before: Decimal,
     /// The mid before the event, if the touch was two sided.
     pub mid_before: Option<Decimal>,
+    /// How many resets came before it. Nothing spans two epochs: the book, the waiting times and
+    /// the segments all start again.
+    pub epoch: u64,
 }
 
 /// How a trade's price stood against the rebuilt touch just before its block.
@@ -599,9 +676,20 @@ pub struct Coverage {
     pub order_mismatches: u64,
     /// Fills whose last status was a partial one, left with an unknown cause.
     pub partial_last_status: u64,
-    /// The longest time between two consecutive diffs, in nanoseconds. A missing hour shows here;
-    /// the book carries over it regardless, with whatever it missed.
+    /// The longest time between two consecutive diffs, in nanoseconds. A missing hour shows here.
     pub longest_gap_ns: u64,
+    /// Trades stamped before the last one, skipped: they were not placed, sorted or checked. The
+    /// capture's known cause is a re-emitted stretch, which [`CaptureRead`] removes within a file.
+    pub trades_out_of_order: u64,
+    /// The longest time between two consecutive trades, in nanoseconds.
+    pub longest_trade_gap_ns: u64,
+    /// Silences in the diffs that reset the replay, once each, whether a trade or the next diff
+    /// showed it.
+    pub resets_on_diffs: u64,
+    /// Silences in the trades, which reset the replay unless a reset already fell within them.
+    pub resets_on_trades: u64,
+    /// Orders resting at a reset, whose lives were cut there and reached no exposure.
+    pub orders_cut_by_reset: u64,
 }
 
 /// Settings of a replay.
@@ -612,8 +700,12 @@ pub struct ReplayConfig {
     pub tick: Decimal,
     /// Limits a depth is counted up to.
     pub limits: u8,
-    /// How long after the first time events stay [`Warmth::Cold`], in nanoseconds.
+    /// How long after the first time, or after a reset, events stay [`Warmth::Cold`], in
+    /// nanoseconds.
     pub warmup_ns: u64,
+    /// The silence that resets the replay, in nanoseconds: more than this between two diffs or
+    /// two trades. `u64::MAX` never resets, and carries the book over any gap.
+    pub reset_gap_ns: u64,
 }
 
 impl ReplayConfig {
@@ -622,7 +714,7 @@ impl ReplayConfig {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a tick that is not positive or no limits.
-    pub fn new(tick: Decimal, limits: u8, warmup_ns: u64) -> MMResult<Self> {
+    pub fn new(tick: Decimal, limits: u8, warmup_ns: u64, reset_gap_ns: u64) -> MMResult<Self> {
         if tick <= Decimal::ZERO || limits == 0 {
             return Err(MMError::InvalidConfiguration(format!(
                 "invalid replay settings: tick {tick}, {limits} limits"
@@ -632,6 +724,7 @@ impl ReplayConfig {
             tick,
             limits,
             warmup_ns,
+            reset_gap_ns,
         })
     }
 }
@@ -720,6 +813,10 @@ pub struct Replay {
     orders: HashMap<u64, Resting>,
     first_time: Option<u64>,
     last_time: Option<u64>,
+    last_trade_time: Option<u64>,
+    silence_noted: bool,
+    last_reset: Option<u64>,
+    epoch: u64,
     last_mid: Option<Decimal>,
     last_top: Option<(Decimal, Decimal, Decimal, Decimal)>,
     inherited_in_block: bool,
@@ -747,6 +844,10 @@ impl Replay {
             orders: HashMap::new(),
             first_time: None,
             last_time: None,
+            last_trade_time: None,
+            silence_noted: false,
+            last_reset: None,
+            epoch: 0,
             last_mid: None,
             last_top: None,
             inherited_in_block: false,
@@ -872,13 +973,71 @@ impl Replay {
             },
             (None, None) => return None,
         };
-        if let Some(last) = self.last_time {
-            let gap = time.timestamp_ns.saturating_sub(last);
-            self.coverage.longest_gap_ns = self.coverage.longest_gap_ns.max(gap);
-        }
-        self.last_time = Some(time.timestamp_ns);
-        self.first_time.get_or_insert(time.timestamp_ns);
         Some(time)
+    }
+
+    /// Marks that a diff arrived at `time`, once the trades before it have been checked, and
+    /// resets if it ends a silence. The warm-up runs from here even if a trade already saw the
+    /// silence and reset: no book has been rebuilt until the diffs come back.
+    fn note_diff(&mut self, time: u64) {
+        if let Some(last) = self.last_time {
+            let gap = time.saturating_sub(last);
+            self.coverage.longest_gap_ns = self.coverage.longest_gap_ns.max(gap);
+            if gap > self.config.reset_gap_ns {
+                if self.silence_noted {
+                    self.first_time = Some(time);
+                } else {
+                    self.coverage.resets_on_diffs = self.coverage.resets_on_diffs.saturating_add(1);
+                    self.reset(time);
+                }
+            }
+        }
+        self.silence_noted = false;
+        self.last_time = Some(time);
+    }
+
+    /// Resets at a trade if it shows a silence in the trades, or one in the diffs: a trade checked
+    /// against a book that has stopped hearing would be read against what it missed.
+    fn note_trade(&mut self, time: u64) {
+        let limit = self.config.reset_gap_ns;
+        let mut silent = false;
+        if let Some(last) = self.last_trade_time {
+            let gap = time.saturating_sub(last);
+            self.coverage.longest_trade_gap_ns = self.coverage.longest_trade_gap_ns.max(gap);
+            if gap > limit {
+                self.coverage.resets_on_trades = self.coverage.resets_on_trades.saturating_add(1);
+                // A reset within this silence already forgot the book, which has been rebuilding
+                // from what came after it.
+                silent = self.last_reset.is_none_or(|reset| reset <= last);
+            }
+        }
+        if !self.silence_noted
+            && self
+                .last_time
+                .is_some_and(|last| time.saturating_sub(last) > limit)
+        {
+            self.coverage.resets_on_diffs = self.coverage.resets_on_diffs.saturating_add(1);
+            self.silence_noted = true;
+            silent = true;
+        }
+        if silent {
+            self.reset(time);
+        }
+        self.last_trade_time = Some(time);
+    }
+
+    /// Forgets the book and what follows from it, and starts the warm-up at `time`.
+    fn reset(&mut self, time: u64) {
+        let cut = u64::try_from(self.orders.len()).unwrap_or(u64::MAX);
+        self.coverage.orders_cut_by_reset = self.coverage.orders_cut_by_reset.saturating_add(cut);
+        self.bids.clear();
+        self.asks.clear();
+        self.orders.clear();
+        self.last_mid = None;
+        self.last_top = None;
+        self.first_time = Some(time);
+        self.last_reset = Some(time);
+        self.epoch = self.epoch.saturating_add(1);
     }
 
     fn warmth(&self, time: u64) -> Warmth {
@@ -902,6 +1061,15 @@ impl Replay {
                 break;
             }
             *next = next.saturating_add(1);
+            if self
+                .last_trade_time
+                .is_some_and(|last| trade.timestamp_ns < last)
+            {
+                self.coverage.trades_out_of_order =
+                    self.coverage.trades_out_of_order.saturating_add(1);
+                continue;
+            }
+            self.note_trade(trade.timestamp_ns);
             let warmth = self.warmth(trade.timestamp_ns);
             let touch = self.touch();
             let inherited = self.inherited_in_block;
@@ -943,6 +1111,7 @@ impl Replay {
                     timestamp_ns: trade.timestamp_ns,
                     evidence: TimeEvidence::Observed,
                 },
+                epoch: self.epoch,
             });
         }
     }
@@ -974,10 +1143,15 @@ impl Replay {
             bid_size: top.2,
             ask_size: top.3,
         };
-        output.tops.push(Inferred { value: quote, time });
+        output.tops.push(Inferred {
+            value: quote,
+            time,
+            epoch: self.epoch,
+        });
         output.market_events.push(Inferred {
             value: MarketEvent::Quote(quote),
             time,
+            epoch: self.epoch,
         });
         let mid = self.mid()?;
         if let Some(mid) = mid
@@ -991,6 +1165,7 @@ impl Replay {
                         reinitialized: false,
                     },
                     time,
+                    epoch: self.epoch,
                 });
             }
             self.last_mid = Some(mid);
@@ -1000,6 +1175,7 @@ impl Replay {
                     price: mid,
                 },
                 time,
+                epoch: self.epoch,
             });
         }
         Ok(())
@@ -1010,21 +1186,13 @@ impl Replay {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::NumericalError`] if a size or a price overflows, and
-    /// [`MMError::InvalidMarketState`] for trades out of time order, since their times are
-    /// observed.
+    /// Returns [`MMError::NumericalError`] if a size or a price overflows.
     pub fn ingest(
         &mut self,
         statuses: &[OrderStatusRecord],
         diffs: &[BookDiff],
         trades: &[CaptureTrade],
     ) -> MMResult<ReplayOutput> {
-        if trades
-            .windows(2)
-            .any(|pair| matches!(pair, [a, b] if b.timestamp_ns < a.timestamp_ns))
-        {
-            return Err(bad("trades out of time order".to_string()));
-        }
         let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
         self.coverage.statuses = self.coverage.statuses.saturating_add(count(statuses.len()));
         self.coverage.diffs = self.coverage.diffs.saturating_add(count(diffs.len()));
@@ -1040,12 +1208,14 @@ impl Replay {
                     self.coverage.diffs_without_time.saturating_add(1);
                 continue;
             };
+            self.first_time.get_or_insert(time.timestamp_ns);
             self.check_trades(
                 trades,
                 &mut next_trade,
                 Some(time.timestamp_ns),
                 &mut output,
             );
+            self.note_diff(time.timestamp_ns);
             self.inherited_in_block = time.evidence == TimeEvidence::Inherited;
             self.apply(diff, time, &index, &mut output)?;
             self.after_event(time, &mut output)?;
@@ -1211,6 +1381,7 @@ impl Replay {
             depth,
             level_before,
             mid_before,
+            epoch: self.epoch,
         });
         Ok(())
     }
@@ -1237,6 +1408,7 @@ impl Replay {
                 fills: order.fills.saturating_add(final_fill),
             },
             time: time.weakest(order.opened),
+            epoch: self.epoch,
         });
     }
 }
@@ -1260,6 +1432,7 @@ pub fn sized_events(events: &[BookEvent]) -> Vec<Inferred<SizedEvent>> {
                     size: event.size,
                 },
                 time: event.time,
+                epoch: event.epoch,
             })
         })
         .collect()
@@ -1306,7 +1479,8 @@ fn in_event_sizes(level: Decimal, event_size: Decimal) -> MMResult<u32> {
 
 /// Converts events into the queue reactive model's observations, with `event_sizes` per limit
 /// from `estimate_event_sizes` on the same window. A move of the mid restarts the waiting times,
-/// as the model's estimator does.
+/// as the model's estimator does. A reset leaves no two sided touch, so no observation waits from
+/// before it: the first one after it follows a move.
 ///
 /// # Errors
 ///
@@ -1368,6 +1542,7 @@ pub fn queue_observations(
                 waiting_seconds: to_seconds(now.saturating_sub(previous.timestamp_ns)),
             },
             time: event.time.weakest(previous),
+            epoch: event.epoch,
         });
     }
     Ok(conversion)
@@ -1398,6 +1573,8 @@ pub struct HawkesConversion {
     /// Periods left out because, in event sizes, a departure found the queue empty, which the
     /// model refuses. Real events have their own sizes, so this happens.
     pub inconsistent: u64,
+    /// Periods left out because a reset cut them: no move ended them.
+    pub cut_by_reset: u64,
 }
 
 /// Whether a path of unit events from `initial` ever departs from an empty queue.
@@ -1419,7 +1596,8 @@ fn departs_from_empty(segment: &HawkesSegment) -> bool {
 
 /// Converts events at the first limit of a side into one segment per period at a constant mid.
 /// A segment starts at the first event kept, with the queue before it counted in `event_size`,
-/// rounded, and ends at the move. The last period, with no move to end it, is left out.
+/// rounded, and ends at the move. The last period, with no move to end it, is left out, and so
+/// is one a reset cuts.
 ///
 /// # Errors
 ///
@@ -1438,8 +1616,15 @@ pub fn hawkes_segments(
     let mut mid = None;
     let mut before = 0u64;
     let mut open: Option<(u64, HawkesRecord)> = None;
+    let mut epoch = events.first().map_or(0, |event| event.epoch);
     for event in events {
         let now = event.time.timestamp_ns;
+        if event.epoch != epoch {
+            epoch = event.epoch;
+            if open.take().is_some() {
+                conversion.cut_by_reset = conversion.cut_by_reset.saturating_add(1);
+            }
+        }
         // The move happened on the event before the one that first sees it.
         if event.mid_before != mid {
             if let Some((start, mut record)) = open.take() {

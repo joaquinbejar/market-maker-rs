@@ -69,7 +69,7 @@ fn update(oid: u64, side: &str, price: &str, previous: &str, remaining: &str) ->
 }
 
 fn config(warmup: u64) -> ReplayConfig {
-    ReplayConfig::new(dec!(1), 3, warmup).unwrap()
+    ReplayConfig::new(dec!(1), 3, warmup, u64::MAX).unwrap()
 }
 
 /// Bid 100 of size 2 from oid 1, ask 101 of size 3 from oid 2, at `START` and a second on.
@@ -117,10 +117,10 @@ fn test_decode_order_status_reads_each_field_at_its_offset() {
 fn test_decoders_refuse_a_broken_length() {
     assert!(decode_order_status(&[0u8; 53]).is_err());
     assert!(decode_order_statuses(&[0u8; 55]).is_err());
-    assert!(decode_order_statuses(&[]).unwrap().is_empty());
+    assert!(decode_order_statuses(&[]).unwrap().rows.is_empty());
     let mut two = record(1, 1, false, 1, 1, 1);
     two.extend(record(2, 1, false, 1, 1, 2));
-    let decoded = decode_order_statuses(&two).unwrap();
+    let decoded = decode_order_statuses(&two).unwrap().rows;
     assert_eq!(decoded.len(), 2);
     assert_eq!(decoded[1].timestamp_ns, 2);
 }
@@ -168,7 +168,7 @@ fn test_readers_keep_only_their_coin() {
         r#"{"oid":2,"coin":"BTC","side":"A","px":"1","raw_book_diff":"remove"}"#,
         "\n",
     );
-    let read = read_book_diffs(diffs.as_bytes(), "BTC").unwrap();
+    let read = read_book_diffs(diffs.as_bytes(), "BTC").unwrap().rows;
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].oid, 2);
     let trades = concat!(
@@ -179,7 +179,7 @@ fn test_readers_keep_only_their_coin() {
         r#"{"coin":"BTC","side":"B","time":"2025-12-01T10:00:01","px":"8","sz":"3"}"#,
         "\n",
     );
-    let read = read_trades(trades.as_bytes(), "BTC").unwrap();
+    let read = read_trades(trades.as_bytes(), "BTC").unwrap().rows;
     assert_eq!(read.len(), 2);
     assert_eq!(read[0].price, dec!(7));
     assert_eq!(read[0].size, dec!(2));
@@ -465,7 +465,7 @@ fn trade(ts: u64, price: Decimal, aggressor: TradeSide) -> CaptureTrade {
         },
         format_args!("1970-01-01T00:{:02}:{:02}", time / 60, time % 60),
     );
-    read_trades(line.as_bytes(), "BTC").unwrap().remove(0)
+    read_trades(line.as_bytes(), "BTC").unwrap().rows.remove(0)
 }
 
 #[test]
@@ -527,7 +527,9 @@ fn test_trades_out_of_order_are_refused() {
         trade(2 * SECOND, dec!(1), TradeSide::Buy),
         trade(SECOND, dec!(1), TradeSide::Buy),
     ];
-    assert!(Replay::new(config(0)).ingest(&[], &[], &trades).is_err());
+    let mut replay = Replay::new(config(0));
+    replay.ingest(&[], &[], &trades).unwrap();
+    assert_eq!(replay.coverage().trades_out_of_order, 1);
 }
 
 #[test]
@@ -672,9 +674,9 @@ fn test_the_price_grid_and_the_declared_tick_are_reported_apart() {
 
 #[test]
 fn test_config_refuses_what_it_cannot_count_in() {
-    assert!(ReplayConfig::new(dec!(0), 3, 0).is_err());
-    assert!(ReplayConfig::new(dec!(-1), 3, 0).is_err());
-    assert!(ReplayConfig::new(dec!(1), 0, 0).is_err());
+    assert!(ReplayConfig::new(dec!(0), 3, 0, u64::MAX).is_err());
+    assert!(ReplayConfig::new(dec!(-1), 3, 0, u64::MAX).is_err());
+    assert!(ReplayConfig::new(dec!(1), 0, 0, u64::MAX).is_err());
 }
 
 #[test]
@@ -875,12 +877,22 @@ fn test_readers_read_the_coin_field_and_not_the_marker() {
         r#"{"meta":{"coin":"BTC"},"oid":3,"coin":"ETH","side":"A","px":"1","raw_book_diff":"remove"}"#,
         "\n",
     );
-    assert!(read_book_diffs(diffs.as_bytes(), "BTC").unwrap().is_empty());
+    assert!(
+        read_book_diffs(diffs.as_bytes(), "BTC")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
     let trades = concat!(
         r#"{"meta":{"coin":"BTC"},"coin":"ETH","side":"A","time":"2025-12-01T10:00:00","px":"1","sz":"1"}"#,
         "\n",
     );
-    assert!(read_trades(trades.as_bytes(), "BTC").unwrap().is_empty());
+    assert!(
+        read_trades(trades.as_bytes(), "BTC")
+            .unwrap()
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]
@@ -889,12 +901,15 @@ fn test_readers_take_a_valid_line_however_it_is_spaced() {
         r#"{"oid": 3, "coin": "BTC", "side": "A", "px": "1", "raw_book_diff": "remove"}"#,
         "\n",
     );
-    assert_eq!(read_book_diffs(diffs.as_bytes(), "BTC").unwrap().len(), 1);
+    assert_eq!(
+        read_book_diffs(diffs.as_bytes(), "BTC").unwrap().rows.len(),
+        1
+    );
     let trades = concat!(
         r#"{"coin": "BTC", "side": "A", "time": "2025-12-01T10:00:00", "px": "1", "sz": "1"}"#,
         "\n",
     );
-    assert_eq!(read_trades(trades.as_bytes(), "BTC").unwrap().len(), 1);
+    assert_eq!(read_trades(trades.as_bytes(), "BTC").unwrap().rows.len(), 1);
 }
 
 #[test]
@@ -1271,4 +1286,598 @@ fn test_decode_fixed_keeps_bit_28_as_part_of_the_value() {
         decode_fixed((1 << 29) | (1 << 28)).unwrap(),
         dec!(26843545.6)
     );
+}
+
+const GAP: u64 = 60 * SECOND;
+
+fn resetting(warmup: u64) -> Replay {
+    Replay::new(ReplayConfig::new(dec!(1), 3, warmup, GAP).unwrap())
+}
+
+#[test]
+fn test_a_silence_in_the_diffs_empties_the_book_and_restarts_the_warmup() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(10 * SECOND);
+    let first = replay.ingest(&statuses, &diffs, &[]).unwrap();
+    assert_eq!(first.events.last().unwrap().epoch, 0);
+
+    // Past the warm-up, and after the gap: the book it remembered is gone.
+    let later = START + SECOND + GAP + 1;
+    let more = [status(later, STATUS_OPEN, false, 9_900, 100, 3)];
+    let output = replay
+        .ingest(&more, &[new(3, QrSide::Bid, dec!(99), dec!(1))], &[])
+        .unwrap();
+    let event = output.events[0];
+    assert_eq!(event.epoch, 1);
+    assert_eq!(event.warmth, Warmth::Cold);
+    assert_eq!(event.level_before, dec!(0));
+    assert_eq!(event.mid_before, None);
+    assert!(output.tops.is_empty(), "one side left");
+    let coverage = replay.coverage();
+    assert_eq!(coverage.resets_on_diffs, 1);
+    assert_eq!(coverage.resets_on_trades, 0);
+    assert_eq!(coverage.orders_cut_by_reset, 2);
+
+    // An order from before the gap is now unknown, and reaches no exposure.
+    let after = later + SECOND;
+    let gone = [status(after, CANCELED, false, 10_000, 200, 1)];
+    let output = replay.ingest(&gone, &[remove(1, "B", "100")], &[]).unwrap();
+    assert!(output.exposures.is_empty());
+    assert_eq!(replay.coverage().unknown_orders, 1);
+
+    // The warm-up counts from the reset, not from the start.
+    let warm = later + 10 * SECOND;
+    let last = [status(warm, STATUS_OPEN, false, 9_900, 100, 4)];
+    let output = replay
+        .ingest(&last, &[new(4, QrSide::Bid, dec!(99), dec!(1))], &[])
+        .unwrap();
+    assert_eq!(output.events[0].warmth, Warmth::Warm);
+    assert_eq!(output.events[0].level_before, dec!(1));
+}
+
+#[test]
+fn test_a_silence_of_exactly_the_limit_does_not_reset() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    replay.ingest(&statuses, &diffs, &[]).unwrap();
+    let later = START + SECOND + GAP;
+    let more = [status(later, STATUS_OPEN, false, 10_000, 100, 3)];
+    let output = replay
+        .ingest(&more, &[new(3, QrSide::Bid, dec!(100), dec!(1))], &[])
+        .unwrap();
+    assert_eq!(output.events[0].epoch, 0);
+    assert_eq!(output.events[0].level_before, dec!(2));
+    assert_eq!(replay.coverage().resets_on_diffs, 0);
+    assert_eq!(replay.coverage().longest_gap_ns, GAP);
+}
+
+#[test]
+fn test_a_silence_in_the_trades_resets_across_files_with_the_diffs_flowing() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    let first = [trade(START, dec!(100), TradeSide::Sell)];
+    replay.ingest(&statuses, &diffs, &first).unwrap();
+    assert_eq!(replay.coverage().resets_on_trades, 0);
+
+    // The diffs never stop, so only the trades can show this one.
+    let mut opened = Vec::new();
+    let mut steps = Vec::new();
+    for step in 1..=3u64 {
+        let at = START + SECOND + step * 30 * SECOND;
+        opened.push(status(at, STATUS_OPEN, false, 9_900, 100, 10 + step));
+        steps.push(new(10 + step, QrSide::Bid, dec!(99), dec!(1)));
+    }
+    let late = START + SECOND + 90 * SECOND;
+    let output = replay
+        .ingest(&opened, &steps, &[trade(late, dec!(100), TradeSide::Sell)])
+        .unwrap();
+    let coverage = replay.coverage();
+    assert_eq!(coverage.resets_on_trades, 1);
+    assert_eq!(coverage.resets_on_diffs, 0);
+    assert_eq!(coverage.longest_trade_gap_ns, late - START);
+    assert_eq!(coverage.orders_cut_by_reset, 4);
+    assert_eq!(output.events[0].epoch, 0);
+    assert_eq!(output.events[2].epoch, 1);
+    assert_eq!(output.events[2].level_before, dec!(0));
+}
+
+#[test]
+fn test_silences_in_both_streams_keep_the_latest_reset() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(10 * SECOND);
+    let first = [trade(START, dec!(100), TradeSide::Sell)];
+    replay.ingest(&statuses, &diffs, &first).unwrap();
+
+    // The trade at 70 is older than the diff at 101: it comes first, and the diff restarts the
+    // warm-up, as no book has been rebuilt until then.
+    let at = START + 101 * SECOND;
+    let more = [status(at, STATUS_OPEN, false, 10_000, 100, 3)];
+    let trades = [trade(START + 70 * SECOND, dec!(100), TradeSide::Sell)];
+    let output = replay
+        .ingest(&more, &[new(3, QrSide::Bid, dec!(100), dec!(1))], &trades)
+        .unwrap();
+    assert_eq!(output.events[0].warmth, Warmth::Cold);
+    let coverage = replay.coverage();
+    assert_eq!(coverage.resets_on_trades, 1);
+    assert_eq!(coverage.resets_on_diffs, 1);
+    assert_eq!(coverage.orders_cut_by_reset, 2);
+    assert_eq!(
+        output.events[0].epoch, 1,
+        "one silence, one reset of the book"
+    );
+
+    let warm = at + 10 * SECOND;
+    let last = [status(warm, STATUS_OPEN, false, 10_000, 100, 4)];
+    let output = replay
+        .ingest(&last, &[new(4, QrSide::Bid, dec!(100), dec!(1))], &[])
+        .unwrap();
+    assert_eq!(output.events[0].warmth, Warmth::Warm);
+    assert_eq!(output.events[0].epoch, 1);
+}
+
+#[test]
+fn test_a_reset_does_not_reach_the_trades_before_it() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    replay.ingest(&statuses, &diffs, &[]).unwrap();
+    // Within the limit of the last diff, so the touch still stands for it.
+    let trades = [trade(START + 30 * SECOND, dec!(101), TradeSide::Buy)];
+    let at = START + 101 * SECOND;
+    let more = [status(at, STATUS_OPEN, false, 10_000, 100, 3)];
+    replay
+        .ingest(&more, &[new(3, QrSide::Bid, dec!(100), dec!(1))], &trades)
+        .unwrap();
+    let coverage = replay.coverage();
+    assert_eq!(coverage.touch_warm.at_touch, 1);
+    assert_eq!(coverage.resets_on_diffs, 1);
+    assert_eq!(coverage.resets_on_trades, 0);
+}
+
+#[test]
+fn test_a_trade_after_the_diffs_go_silent_is_not_read_against_the_stale_book() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    replay.ingest(&statuses, &diffs, &[]).unwrap();
+    // No gap between trades here, but the diffs stopped at 1 and a trade at 70 shows it.
+    let trades = [
+        trade(START + 30 * SECOND, dec!(101), TradeSide::Buy),
+        trade(START + 70 * SECOND, dec!(101), TradeSide::Buy),
+        trade(START + 80 * SECOND, dec!(101), TradeSide::Buy),
+    ];
+    let at = START + 101 * SECOND;
+    let more = [status(at, STATUS_OPEN, false, 10_000, 100, 3)];
+    let output = replay
+        .ingest(&more, &[new(3, QrSide::Bid, dec!(100), dec!(1))], &trades)
+        .unwrap();
+    let coverage = replay.coverage();
+    assert_eq!(coverage.touch_warm.at_touch, 1, "only the trade at 30");
+    assert_eq!(coverage.resets_on_diffs, 1, "one silence, shown three ways");
+    assert_eq!(coverage.resets_on_trades, 0);
+    assert_eq!(output.events[0].level_before, dec!(0));
+    assert_eq!(output.events[0].epoch, 1);
+}
+
+#[test]
+fn test_a_silence_of_exactly_the_limit_in_the_trades_does_not_reset() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    let trades = [
+        trade(START, dec!(100), TradeSide::Sell),
+        trade(START + GAP, dec!(100), TradeSide::Sell),
+    ];
+    replay.ingest(&statuses, &diffs, &trades).unwrap();
+    assert_eq!(replay.coverage().resets_on_trades, 0);
+    assert_eq!(replay.coverage().longest_trade_gap_ns, GAP);
+}
+
+#[test]
+fn test_no_move_of_the_mid_is_reported_across_a_reset() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    replay.ingest(&statuses, &diffs, &[]).unwrap();
+    let t = |seconds: u64| START + SECOND + GAP + seconds * SECOND;
+    let more = [
+        status(t(1), STATUS_OPEN, false, 20_000, 100, 3),
+        status(t(2), STATUS_OPEN, true, 20_100, 100, 4),
+    ];
+    let output = replay
+        .ingest(
+            &more,
+            &[
+                new(3, QrSide::Bid, dec!(200), dec!(1)),
+                new(4, QrSide::Ask, dec!(201), dec!(1)),
+            ],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(output.tops.len(), 1);
+    assert_eq!(output.prices.len(), 1);
+    assert!(output.references.is_empty(), "a new book, not a move");
+}
+
+/// Events on both sides of a gap, at the first limit of the bid, with a mid on either side.
+fn events_across_a_gap() -> Vec<market_maker_rs::backtest::hyperliquid::BookEvent> {
+    let (mut statuses, mut diffs) = opening();
+    let t = |seconds: u64| START + seconds * SECOND;
+    statuses.push(status(t(3), STATUS_OPEN, false, 10_000, 100, 3));
+    diffs.push(new(3, QrSide::Bid, dec!(100), dec!(1)));
+    let mut replay = resetting(0);
+    let mut events = replay.ingest(&statuses, &diffs, &[]).unwrap().events;
+    let l = |seconds: u64| t(1_000) + seconds * SECOND;
+    let more = [
+        status(l(0), STATUS_OPEN, false, 10_000, 100, 5),
+        status(l(1), STATUS_OPEN, true, 10_100, 100, 6),
+        status(l(4), STATUS_OPEN, false, 10_000, 100, 7),
+    ];
+    let later = [
+        new(5, QrSide::Bid, dec!(100), dec!(1)),
+        new(6, QrSide::Ask, dec!(101), dec!(1)),
+        new(7, QrSide::Bid, dec!(100), dec!(1)),
+    ];
+    events.extend(replay.ingest(&more, &later, &[]).unwrap().events);
+    events
+}
+
+#[test]
+fn test_no_waiting_time_spans_a_reset() {
+    let conversion = queue_observations(&events_across_a_gap(), &[dec!(1); 3]).unwrap();
+    for observation in &conversion.observations {
+        assert!(
+            observation.value.waiting_seconds < 100.0,
+            "{:?}",
+            observation.value
+        );
+    }
+}
+
+#[test]
+fn test_waiting_times_start_again_after_a_reset() {
+    let joined = queue_observations(&events_across_a_gap(), &[dec!(1); 3]).unwrap();
+    // The ask at 1 made the new book two sided, so 4 - 1, with nothing from before the gap.
+    let last = joined.observations.last().unwrap().value;
+    assert_eq!(last.waiting_seconds, 3.0);
+}
+
+#[test]
+fn test_the_same_touch_after_a_reset_is_a_new_top() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    assert_eq!(replay.ingest(&statuses, &diffs, &[]).unwrap().tops.len(), 1);
+    let t = |seconds: u64| START + SECOND + GAP + seconds * SECOND;
+    let more = [
+        status(t(1), STATUS_OPEN, false, 10_000, 200, 3),
+        status(t(2), STATUS_OPEN, true, 10_100, 300, 4),
+    ];
+    let output = replay
+        .ingest(
+            &more,
+            &[
+                new(3, QrSide::Bid, dec!(100), dec!(2)),
+                new(4, QrSide::Ask, dec!(101), dec!(3)),
+            ],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(output.tops.len(), 1);
+    assert_eq!(output.prices.len(), 1);
+}
+
+#[test]
+fn test_a_period_a_reset_cuts_is_left_out_of_the_segments() {
+    let conversion = hawkes_segments(&events_across_a_gap(), QrSide::Bid, dec!(1)).unwrap();
+    assert_eq!(conversion.cut_by_reset, 1);
+    assert!(
+        conversion.segments.is_empty(),
+        "no move ended either period"
+    );
+}
+
+#[test]
+fn test_a_reset_with_no_open_period_cuts_none() {
+    let events: Vec<_> = events_across_a_gap()
+        .into_iter()
+        .filter(|event| event.epoch == 1)
+        .collect();
+    let conversion = hawkes_segments(&events, QrSide::Bid, dec!(1)).unwrap();
+    assert_eq!(conversion.cut_by_reset, 0);
+}
+
+#[test]
+fn test_a_re_emitted_stretch_of_diffs_is_left_out_and_counted() {
+    let line = |oid: u64, change: &str| {
+        format!(
+            r#"{{"user":"0x1","oid":{oid},"coin":"BTC","side":"B","px":"100","raw_book_diff":{change}}}"#
+        )
+    };
+    let added = line(1, r#"{"new":{"sz":"2"}}"#);
+    let other = line(2, r#"{"new":{"sz":"3"}}"#);
+    let gone = line(1, r#""remove""#);
+    let eth = added.replace("BTC", "ETH");
+    let stream = [
+        added.as_str(),
+        other.as_str(),
+        eth.as_str(),
+        added.as_str(),
+        other.as_str(),
+        eth.as_str(),
+        gone.as_str(),
+    ]
+    .join("\n");
+    let read = read_book_diffs(stream.as_bytes(), "BTC").unwrap();
+    assert_eq!(read.rows.len(), 3);
+    assert_eq!(read.repeated_lines, 2);
+    assert_eq!(read.rows[2].oid, 1);
+    // A new reader for a new file starts again.
+    assert_eq!(
+        read_book_diffs(added.as_bytes(), "BTC")
+            .unwrap()
+            .repeated_lines,
+        0
+    );
+}
+
+#[test]
+fn test_lines_that_agree_on_fields_are_not_taken_for_a_repeat() {
+    let line = |hash: &str| {
+        format!(
+            r#"{{"coin":"BTC","side":"B","time":"2025-12-30T18:00:00.5","px":"100","sz":"1","hash":"{hash}"}}"#
+        )
+    };
+    let stream = [line("0x1"), line("0x2"), line("0x1")].join("\n");
+    let read = read_trades(stream.as_bytes(), "BTC").unwrap();
+    assert_eq!(read.rows.len(), 2);
+    assert_eq!(read.repeated_lines, 1);
+}
+
+#[test]
+fn test_a_re_emitted_stretch_steps_back_nothing_once_read() {
+    // A stretch written twice, with the times stepping back between, as the capture has it.
+    let line = |second: u32, hash: &str| {
+        format!(
+            r#"{{"coin":"BTC","side":"B","time":"2025-12-30T18:00:{second:02}","px":"101","sz":"1","hash":"{hash}"}}"#
+        )
+    };
+    let stream = [
+        line(1, "a"),
+        line(2, "b"),
+        line(3, "c"),
+        line(2, "b"),
+        line(3, "c"),
+        line(4, "d"),
+    ]
+    .join("\n");
+    let read = read_trades(stream.as_bytes(), "BTC").unwrap();
+    assert_eq!(read.repeated_lines, 2);
+    assert_eq!(read.rows.len(), 4);
+    let (statuses, diffs) = opening();
+    let mut replay = Replay::new(config(0));
+    replay.ingest(&statuses, &diffs, &read.rows).unwrap();
+    assert_eq!(replay.coverage().trades_out_of_order, 0);
+    assert_eq!(replay.coverage().trades, 4);
+}
+
+#[test]
+fn test_a_trade_before_the_last_is_skipped_and_counted_across_files() {
+    let (statuses, diffs) = opening();
+    let mut replay = Replay::new(config(0));
+    let t = |seconds: u64| START + seconds * SECOND;
+    let first = [
+        trade(t(1), dec!(101), TradeSide::Buy),
+        trade(t(5), dec!(101), TradeSide::Buy),
+        trade(t(3), dec!(101), TradeSide::Buy),
+        trade(t(5), dec!(101), TradeSide::Buy),
+    ];
+    replay.ingest(&statuses, &diffs, &first).unwrap();
+    let coverage = replay.coverage();
+    assert_eq!(coverage.trades_out_of_order, 1);
+    assert_eq!(
+        coverage.touch_warm.at_touch + coverage.touch_warm.no_touch,
+        3,
+        "a trade at the same time as the last is kept, and the late one reaches no check"
+    );
+    replay
+        .ingest(&[], &[], &[trade(t(4), dec!(101), TradeSide::Buy)])
+        .unwrap();
+    assert_eq!(replay.coverage().trades_out_of_order, 2);
+    assert_eq!(replay.coverage().longest_trade_gap_ns, 4 * SECOND);
+}
+
+#[test]
+fn test_every_output_says_which_side_of_a_reset_it_is_on() {
+    let t = |seconds: u64| START + SECOND + GAP + seconds * SECOND;
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    let first = [trade(START + SECOND, dec!(101), TradeSide::Buy)];
+    let before = replay.ingest(&statuses, &diffs, &first).unwrap();
+    assert!(before.tops.iter().all(|top| top.epoch == 0));
+    assert!(before.prices.iter().all(|price| price.epoch == 0));
+    assert!(before.market_events.iter().all(|event| event.epoch == 0));
+    assert!(!before.tops.is_empty() && !before.prices.is_empty());
+
+    let more = [
+        status(t(1), STATUS_OPEN, false, 10_000, 200, 3),
+        status(t(2), STATUS_OPEN, true, 10_100, 300, 4),
+        status(t(3), STATUS_OPEN, true, 10_050, 100, 5),
+        status(t(4), CANCELED, true, 10_050, 100, 5),
+    ];
+    let after = replay
+        .ingest(
+            &more,
+            &[
+                new(3, QrSide::Bid, dec!(100), dec!(2)),
+                new(4, QrSide::Ask, dec!(101), dec!(3)),
+                new(5, QrSide::Ask, dec!(100.5), dec!(1)),
+                remove(5, "A", "100.5"),
+            ],
+            &[trade(t(3), dec!(101), TradeSide::Buy)],
+        )
+        .unwrap();
+    assert_eq!(replay.coverage().resets_on_diffs, 1);
+    assert!(!after.tops.is_empty());
+    assert!(after.tops.iter().all(|top| top.epoch == 1));
+    assert!(after.prices.iter().all(|price| price.epoch == 1));
+    assert!(after.market_events.iter().all(|event| event.epoch == 1));
+    assert!(!after.references.is_empty());
+    assert!(after.references.iter().all(|moved| moved.epoch == 1));
+    assert!(!after.exposures.is_empty());
+    assert!(after.exposures.iter().all(|life| life.epoch == 1));
+    let sized = sized_events(&after.events);
+    assert!(!sized.is_empty());
+    assert!(sized.iter().all(|event| event.epoch == 1));
+    let queue = queue_observations(&after.events, &[dec!(1); 3]).unwrap();
+    assert!(!queue.observations.is_empty());
+    assert!(queue.observations.iter().all(|seen| seen.epoch == 1));
+}
+
+#[test]
+fn test_a_second_silence_after_a_trade_saw_the_first_is_seen_too() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    replay.ingest(&statuses, &diffs, &[]).unwrap();
+    let t = |seconds: u64| START + seconds * SECOND;
+    // A trade at 70 sees the first silence; the diff at 101 ends it.
+    let more = [status(t(101), STATUS_OPEN, false, 10_000, 100, 3)];
+    replay
+        .ingest(
+            &more,
+            &[new(3, QrSide::Bid, dec!(100), dec!(1))],
+            &[trade(t(70), dec!(101), TradeSide::Buy)],
+        )
+        .unwrap();
+    assert_eq!(replay.coverage().resets_on_diffs, 1);
+    // A trade at 170 sees a second one, and empties the order the diff at 101 added.
+    replay
+        .ingest(&[], &[], &[trade(t(170), dec!(101), TradeSide::Buy)])
+        .unwrap();
+    assert_eq!(replay.coverage().resets_on_diffs, 2);
+    assert_eq!(replay.coverage().orders_cut_by_reset, 3);
+}
+
+#[test]
+fn test_a_trade_exactly_the_limit_after_the_last_diff_does_not_reset() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    replay.ingest(&statuses, &diffs, &[]).unwrap();
+    replay
+        .ingest(
+            &[],
+            &[],
+            &[trade(START + SECOND + GAP, dec!(101), TradeSide::Buy)],
+        )
+        .unwrap();
+    assert_eq!(replay.coverage().resets_on_diffs, 0);
+    assert_eq!(replay.coverage().touch_warm.at_touch, 1);
+}
+
+#[test]
+fn test_a_diff_reset_after_a_later_trade_gap_does_not_move_the_warmup_back() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(60 * SECOND);
+    replay
+        .ingest(
+            &statuses,
+            &diffs,
+            &[trade(START, dec!(100), TradeSide::Sell)],
+        )
+        .unwrap();
+    let t = |seconds: u64| START + seconds * SECOND;
+    // The diff resets at 100, the trade before it at 70. At 131 the warm-up from 100 still runs.
+    let more = [
+        status(t(100), STATUS_OPEN, false, 10_000, 100, 3),
+        status(t(131), STATUS_OPEN, false, 10_000, 100, 4),
+    ];
+    let output = replay
+        .ingest(
+            &more,
+            &[
+                new(3, QrSide::Bid, dec!(100), dec!(1)),
+                new(4, QrSide::Bid, dec!(100), dec!(1)),
+            ],
+            &[trade(t(70), dec!(100), TradeSide::Sell)],
+        )
+        .unwrap();
+    assert_eq!(output.events[1].warmth, Warmth::Cold);
+}
+
+#[test]
+fn test_a_re_emitted_stretch_of_statuses_is_left_out_and_counted() {
+    let a = record(START, STATUS_OPEN, false, 10_000, 100, 1);
+    let b = record(START + SECOND, STATUS_OPEN, false, 10_000, 100, 2);
+    let c = record(START + 2 * SECOND, CANCELED, false, 10_000, 100, 1);
+    let stream = [a.clone(), b.clone(), a, b, c].concat();
+    let read = decode_order_statuses(&stream).unwrap();
+    assert_eq!(read.repeated_lines, 2);
+    assert_eq!(read.rows.len(), 3);
+    assert_eq!(read.rows[2].status_id, CANCELED);
+}
+
+#[test]
+fn test_a_trade_after_the_diffs_came_back_does_not_forget_the_book_again() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    let first = [trade(START + SECOND, dec!(101), TradeSide::Buy)];
+    replay.ingest(&statuses, &diffs, &first).unwrap();
+    let t = |seconds: u64| START + SECOND + GAP + seconds * SECOND;
+    let more = [
+        status(t(1), STATUS_OPEN, false, 10_000, 200, 3),
+        status(t(3), STATUS_OPEN, false, 10_000, 100, 4),
+    ];
+    let output = replay
+        .ingest(
+            &more,
+            &[
+                new(3, QrSide::Bid, dec!(100), dec!(2)),
+                new(4, QrSide::Bid, dec!(100), dec!(1)),
+            ],
+            &[trade(t(2), dec!(101), TradeSide::Buy)],
+        )
+        .unwrap();
+    let coverage = replay.coverage();
+    assert_eq!(coverage.resets_on_diffs, 1);
+    assert_eq!(coverage.resets_on_trades, 1, "both streams went silent");
+    assert_eq!(
+        output.events[1].level_before,
+        dec!(2),
+        "the book since the diff stands"
+    );
+    assert_eq!(output.events[1].epoch, 1);
+}
+
+#[test]
+fn test_a_later_silence_in_the_trades_resets_after_an_earlier_reset() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    let t = |seconds: u64| START + seconds * SECOND;
+    replay
+        .ingest(&statuses, &diffs, &[trade(t(1), dec!(101), TradeSide::Buy)])
+        .unwrap();
+    // An outage of both, then the trades go on.
+    let more = [status(t(100), STATUS_OPEN, false, 10_000, 200, 3)];
+    replay
+        .ingest(
+            &more,
+            &[new(3, QrSide::Bid, dec!(100), dec!(2))],
+            &[trade(t(100), dec!(101), TradeSide::Buy)],
+        )
+        .unwrap();
+    assert_eq!(replay.coverage().resets_on_trades, 1);
+    assert_eq!(replay.coverage().orders_cut_by_reset, 2);
+    // The diffs keep flowing, but the trades stop for over the limit.
+    let later = [
+        status(t(140), STATUS_OPEN, false, 10_000, 100, 4),
+        status(t(180), STATUS_OPEN, false, 10_000, 100, 5),
+    ];
+    let output = replay
+        .ingest(
+            &later,
+            &[
+                new(4, QrSide::Bid, dec!(100), dec!(1)),
+                new(5, QrSide::Bid, dec!(100), dec!(1)),
+            ],
+            &[trade(t(170), dec!(101), TradeSide::Buy)],
+        )
+        .unwrap();
+    assert_eq!(replay.coverage().resets_on_trades, 2);
+    assert_eq!(output.events[1].epoch, 2);
+    assert_eq!(output.events[1].level_before, dec!(0));
 }

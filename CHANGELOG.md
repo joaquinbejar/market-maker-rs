@@ -18,6 +18,12 @@ project follows [Semantic Versioning](https://semver.org/).
   `HawkesSegment` and `QuoteExposure`, with no new dependency. Book diffs have no timestamp, so
   their times are inferred and marked. Example `hyperliquid_hour` reports what could and could
   not be established. No data is in the repository, and the book starts empty.
+  A silence longer than a declared `ReplayConfig::reset_gap_ns`, in the diffs or the trades, empties
+  the book and restarts the warm-up, with `Coverage` counting the resets and the orders cut, and
+  `BookEvent::epoch` keeping events apart.
+  Readers leave out a line or record exactly equal to an earlier one of its file, as the capture
+  re-emits stretches of its streams, and count it. A trade stamped before the last is skipped and
+  counted.
 - `options::settlement` (#97), behind `options` and `margin`: `OptionBook` keeps option positions
   beside a `margin-rs` ledger, and books an expiry, exercise or assignment computed by
   OptionStratLib as one transaction: open orders' reservations released, cash as a settlement or
