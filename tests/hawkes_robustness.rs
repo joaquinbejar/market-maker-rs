@@ -830,6 +830,7 @@ fn test_the_table_selects_on_the_selection_seeds_only() {
     assert_eq!(*seen.borrow(), [(Policy::Fixed, SELECTION_SEEDS)]);
     assert!(arms.contains(&("adversary", FIXED_STRESS)));
     assert!(arms.contains(&("base", BASE)));
+    assert!(OFF_GRID.iter().all(|arm| arms.contains(arm)));
 }
 
 #[test]
