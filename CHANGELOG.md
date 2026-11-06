@@ -57,6 +57,8 @@ project follows [Semantic Versioning](https://semver.org/).
 - Seasonality for `backtest::hawkes` (#91): `SeasonalProfile`, a time change of the whole
   flow, `fit_seasonality` from training segments, and `score_flow_seasonal`, with at most
   `MAX_SEASONAL_BUCKETS` buckets and serde for the profile.
+- `backtest::evaluation::check_contract` (feature `instruments`, #92): refuses a contract
+  the attribution cannot value, such as an inverse one, since its records carry no contract.
 - Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`
   takes a new `instruments::perpetual::PerpetualTerms`, with the declared rate and mark of
   each instant on the funding grid. Each instant books through the `margin-rs` ledger,
@@ -89,6 +91,16 @@ project follows [Semantic Versioning](https://semver.org/).
   `margin-rs` `RiskGate`, shares one capital budget across instruments and reports the
   cause of each active constraint. Spot instruments only. There is no option logic and
   no hedging stage: a withheld side is reported and hedging is left to the caller.
+- Metric definitions and attribution for comparing strategies (#92):
+  `backtest::evaluation` measures one window from plain marks and fills, with no
+  engine types in its arithmetic. Net result is split into spread capture, inventory
+  and fees, exactly in `Decimal`: a sum that would round is an error, and
+  `BucketedAttribution::reconcile` compares the result with the books to the last digit.
+  Buckets by UTC day or by a caller's label sum exactly to the run. It reports signed
+  markout, realized and effective spread, price impact, fills, volume, time weighted
+  inventory and drawdown, each with a declared unit, sign, horizon and capital
+  denominator (`MetricId::definition`). It covers linear spot positions. Hedge costs
+  are reported as `HedgeCosts::NotModelled`, not as zero.
 - Several dated futures in one backtest run (features `margin` and `instruments`,
   #199): `backtest::contracts::ContractEngine` gives each contract its own data, fill
   model and orders, on one clock and one `margin-rs` ledger, with one sided orders and

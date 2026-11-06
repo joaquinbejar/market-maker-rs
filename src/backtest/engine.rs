@@ -80,6 +80,8 @@ use crate::risk::pretrade::{
 use crate::strategy::quote::Quote;
 use crate::types::action::Dir;
 use crate::types::decimal::OrOverflow;
+#[cfg(feature = "instruments")]
+use crate::types::decimal::exact_product;
 use crate::types::error::{MMError, MMResult};
 use rust_decimal_macros::dec;
 
@@ -2167,27 +2169,6 @@ pub(super) fn settlement_charge(
         asset: FeeAsset::Settlement,
         quote_value: settled.amount.amount,
     })
-}
-
-/// `a * b` if a `Decimal` holds it exactly, or `None`.
-///
-/// `Decimal::checked_mul` rounds a product with more than 28 decimal places,
-/// which would round a fee twice.
-#[cfg(feature = "instruments")]
-fn exact_product(a: Decimal, b: Decimal) -> Option<Decimal> {
-    let (a, b) = (a.normalize(), b.normalize());
-    let mut mantissa = a.mantissa().checked_mul(b.mantissa())?;
-    let mut scale = a.scale().checked_add(b.scale())?;
-    loop {
-        if let Ok(product) = Decimal::try_from_i128_with_scale(mantissa, scale) {
-            return Some(product);
-        }
-        if mantissa % 10 != 0 {
-            return None;
-        }
-        mantissa /= 10;
-        scale = scale.checked_sub(1)?;
-    }
 }
 
 /// Rounds `value` to a multiple of `step`, up or down; a non positive step
