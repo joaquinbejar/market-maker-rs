@@ -303,6 +303,12 @@ impl QrParameters {
         })
     }
 
+    /// Returns the size of a tick.
+    #[must_use]
+    pub fn tick_size(&self) -> Decimal {
+        self.tick_size
+    }
+
     /// Returns the number of limits per side, `K`.
     #[must_use]
     pub fn limits(&self) -> usize {

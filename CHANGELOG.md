@@ -83,6 +83,11 @@ project follows [Semantic Versioning](https://semver.org/).
   `MAX_SEASONAL_BUCKETS` buckets and serde for the profile.
 - `Scenario::with_fee_rate` (#92): one experiment can vary the fee rate, recorded in
   `ScenarioRecord::fee_rate`.
+- The queue-reactive simulator as the market of an RL episode (feature `rl`, #90):
+  `rl::qr_market` samples `QrSimulator` onto the kernel's grid, so `RlEnv` can run on it.
+  The market does not react to the agent, and fills come from the kernel's fill model. A
+  simulator that stops ends the rows early with its reason. New
+  `QrParameters::tick_size`. Checked on simulated data only.
 - Versioned observation, action and reward spaces (feature `rl`, #99): `rl::RlEnv` drives one
   kernel for an external RL trainer or engine, and `rl::RlSpec` describes its spaces, with a
   version per space and a fingerprint that `RlSpec::ensure` checks before any step.
