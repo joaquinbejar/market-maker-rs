@@ -1175,6 +1175,32 @@ mod tests {
     }
 
     #[test]
+    fn test_a_measure_reads_each_figure_of_its_row() {
+        let provenance = Provenance {
+            commit: "t".to_string(),
+            toolchain: "t".to_string(),
+        };
+        let (report, _) = run_path(Flow::Hawkes, 1, FillRule::Immediate, &provenance).unwrap();
+        let row = report
+            .holdout
+            .iter()
+            .find(|r| r.candidate == FIXED)
+            .unwrap();
+        let RowOutcome::Completed(metrics) = &row.outcome else {
+            panic!("not completed");
+        };
+        let measure = measure_of(row).unwrap();
+        let regime = |name: &str| number(metrics.regimes[name].attribution.net_pnl);
+        assert_eq!(measure.stress_net, regime("stress"));
+        assert_eq!(measure.calm_net, regime("calm"));
+        assert_ne!(measure.stress_net, measure.calm_net);
+        assert_eq!(measure.net, number(metrics.metrics.attribution.net_pnl));
+        assert_eq!(measure.drawdown, number(metrics.metrics.max_drawdown));
+        assert_ne!(measure.drawdown, measure.net);
+        assert_eq!(measure.fills, metrics.metrics.fills as f64);
+    }
+
+    #[test]
     fn test_interval_brackets_the_mean() {
         let values: Vec<f64> = (0..100).map(|i| f64::from(i % 2)).collect();
         let (m, low, high) = interval(&values);
