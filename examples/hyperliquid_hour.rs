@@ -15,6 +15,9 @@
 //! The tick is declared, and the report shows what the prices seen are multiples of. Fees and
 //! funding are in no file here. The book starts empty, so nothing below claims it is complete.
 //! A silence over [`RESET_GAP_NS`] empties the book and restarts the warm-up.
+//!
+//! Each hour gets a line of what it added: diffs, crossed events, resets, orders cut, re-emitted
+//! diffs, times stepping back and unknown orders after the warm-up, to see where they cluster.
 
 use std::fs;
 use std::io::BufReader;
@@ -101,6 +104,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let [statuses, diffs, trades] = triple else {
             continue;
         };
+        let hour = diffs.clone();
+        let before = replay.coverage().clone();
         let bytes = fs::read(statuses)?;
         println!(
             "{statuses}: {} bytes, fnv {:016x}",
@@ -121,6 +126,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         references += output.references.len();
         exposures += output.exposures.len();
         seen += output.events.len();
+        let after = replay.coverage();
+        println!(
+            "  {hour}: {} diffs, {} crossed events, resets {} on diffs and {} on trades, {} \
+             orders cut, {} diffs re-emitted, {} times stepping back, {} unknown orders warm",
+            after.diffs - before.diffs,
+            after.crossed_events - before.crossed_events,
+            after.resets_on_diffs - before.resets_on_diffs,
+            after.resets_on_trades - before.resets_on_trades,
+            after.orders_cut_by_reset - before.orders_cut_by_reset,
+            diffs.repeated_lines,
+            after.time_steps_back - before.time_steps_back,
+            after.unknown_orders_warm - before.unknown_orders_warm,
+        );
         for event in &output.events {
             inherited += usize::from(event.time.evidence == TimeEvidence::Inherited);
             cold += usize::from(event.warmth == Warmth::Cold);

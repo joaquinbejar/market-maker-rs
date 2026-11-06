@@ -1881,3 +1881,29 @@ fn test_a_later_silence_in_the_trades_resets_after_an_earlier_reset() {
     assert_eq!(output.events[1].epoch, 2);
     assert_eq!(output.events[1].level_before, dec!(0));
 }
+
+#[test]
+fn test_a_diff_with_no_status_does_not_end_a_silence_a_trade_saw() {
+    let (statuses, diffs) = opening();
+    let mut replay = resetting(0);
+    let t = |seconds: u64| START + seconds * SECOND;
+    replay
+        .ingest(
+            &statuses,
+            &diffs,
+            &[trade(t(70), dec!(101), TradeSide::Buy)],
+        )
+        .unwrap();
+    assert_eq!(replay.coverage().resets_on_diffs, 1);
+    // A diff with no status inherits the old time, so no time has passed for it.
+    let output = replay
+        .ingest(
+            &[],
+            &[new(3, QrSide::Bid, dec!(100), dec!(1))],
+            &[trade(t(80), dec!(101), TradeSide::Buy)],
+        )
+        .unwrap();
+    assert_eq!(output.events[0].time.evidence, TimeEvidence::Inherited);
+    assert_eq!(replay.coverage().resets_on_diffs, 1, "the same silence");
+    assert_eq!(replay.coverage().orders_cut_by_reset, 2);
+}
