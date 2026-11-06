@@ -11,7 +11,9 @@ use crate::types::error::{MMError, MMResult};
 /// supported size needs well under ten.
 const MAX_SWEEPS: usize = 64;
 
-/// Off diagonal mass, relative to the whole matrix, at which a sweep stops.
+/// Off diagonal mass, relative to the whole matrix and per row, at which a sweep stops. Rounding
+/// leaves mass of the order of the machine's epsilon on each row, so a tolerance that does not
+/// grow with the size cannot be met by a large matrix, however well it has converged.
 const OFF_DIAGONAL_TOLERANCE: f64 = 1e-15;
 
 /// A square matrix; indices out of range read as `NaN` and ignore writes, and
@@ -87,7 +89,7 @@ impl Matrix {
         for index in 0..self.size {
             vectors.set(index, index, 1.0);
         }
-        let threshold = (self.max_abs() * OFF_DIAGONAL_TOLERANCE).powi(2);
+        let threshold = (self.max_abs() * OFF_DIAGONAL_TOLERANCE * self.size.max(1) as f64).powi(2);
         for _ in 0..MAX_SWEEPS {
             if work.off_diagonal() <= threshold {
                 break;
@@ -170,6 +172,32 @@ impl Matrix {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_large_singular_matrix_converges_to_its_square_root() {
+        // Two factors and the largest size a model takes.
+        let size = 64;
+        let load = |i: usize| (1.0 + i as f64 * 0.37, (i as f64 * 0.91).sin());
+        let mut low_rank = Matrix::zeros(size);
+        for i in 0..size {
+            for j in 0..size {
+                let (a, b) = (load(i), load(j));
+                low_rank.set(i, j, a.0 * b.0 + a.1 * b.1);
+            }
+        }
+        let root = low_rank.principal_sqrt(1e-12).unwrap();
+        let scale = low_rank.max_abs();
+        for i in 0..size {
+            for j in 0..size {
+                let square: f64 = (0..size).map(|k| root.at(i, k) * root.at(k, j)).sum();
+                assert!(
+                    (square - low_rank.at(i, j)).abs() < 1e-11 * scale,
+                    "{i} {j}: {square} against {}",
+                    low_rank.at(i, j)
+                );
+            }
+        }
+    }
 
     fn matrix(rows: &[&[f64]]) -> Matrix {
         let mut out = Matrix::zeros(rows.len());

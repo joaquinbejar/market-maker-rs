@@ -1063,8 +1063,16 @@ fn test_a_partly_filled_sale_holds_what_the_position_now_leaves_it() {
     let bid = bid_ask(&round.quotes, 0).0;
     assert_eq!(reserved(&book), bid + (dec!(0.5) * unit).round_dp(8));
 
+    // A sale in parts holds its own remainder throughout: 0.25 left at a position of -0.35, so the
+    // short and the sale still add up to the 0.6 of new short the whole sale could make.
+    let fill = quoter
+        .on_fill(&mut book, &sell.order_id, dec!(0.25))
+        .unwrap();
+    assert_eq!(fill.position, dec!(-0.35));
+    assert_eq!(held(&quoter), Some((dec!(0.25) * unit).round_dp(8)));
+
     quoter
-        .on_fill(&mut book, &sell.order_id, dec!(0.5))
+        .on_fill(&mut book, &sell.order_id, dec!(0.25))
         .unwrap();
     assert_eq!(held(&quoter), None);
     assert_eq!(reserved(&book), bid);
@@ -2114,4 +2122,67 @@ fn test_the_inventory_limit_reads_the_worst_of_either_side_of_the_reach() {
     assert!(run(dec!(60), Action::Sell));
     // And the same from -60 with four buys.
     assert!(run(dec!(-60), Action::Buy));
+}
+
+#[test]
+fn test_a_large_book_on_the_validated_pricer_quotes_at_any_supported_size() {
+    let surface = FlatSurface::new(dec!(0.4)).unwrap();
+    let pricer = Arc::new(SurfacePricer::new(Arc::new(surface), Dynamics::StickyMoneyness).unwrap())
+        as Arc<dyn OptionPricer>;
+    let mut rounds = 0;
+    for size in [2usize, 4, 8, 12, 16, 24, 32, 48, 63] {
+        for spot in [dec!(60), dec!(100), dec!(150)] {
+            for days in [1u64, 30, 365] {
+                for (spot_volatility, correlation) in [
+                    (dec!(0.02), dec!(0)),
+                    (dec!(2), dec!(-0.5)),
+                    (dec!(2), dec!(1)),
+                    (dec!(200), dec!(0.9)),
+                ] {
+                    let contracts: Vec<ContractTerms> = (0..size)
+                        .map(|i| {
+                            let strike = dec!(60) + Decimal::from(i as u64) * dec!(1.5);
+                            let mut terms = contract(&format!("C{i}"), strike);
+                            terms.expiry_ms = NOW + days * 86_400_000;
+                            terms.price_scale = 4;
+                            terms.style = if i % 2 == 0 {
+                                OptionStyle::Call
+                            } else {
+                                OptionStyle::Put
+                            };
+                            terms
+                        })
+                        .collect();
+                    let mut settings = config(contracts);
+                    settings.pricer = pricer.clone();
+                    settings.factors.spot_volatility = spot_volatility;
+                    settings.factors.correlation = correlation;
+                    settings.scenarios = vec![RiskScenario {
+                        name: "up".to_string(),
+                        spot_factor: dec!(1.1),
+                        pricer: pricer.clone(),
+                    }];
+                    let mut book = ledger(dec!(100000));
+                    let mut at = market();
+                    at.spot = spot;
+                    let positions: Vec<Decimal> = (0..size)
+                        .map(|i| Decimal::from((i % 5) as i64 - 2))
+                        .collect();
+                    OptionQuoter::new(settings)
+                        .unwrap()
+                        .with_restored_state(positions, 0)
+                        .unwrap()
+                        .quote(&mut book, &at)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{size} contracts at {spot}, {days} days, {spot_volatility}, \
+                                 {correlation}: {error}"
+                            )
+                        });
+                    rounds += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(rounds, 324);
 }
