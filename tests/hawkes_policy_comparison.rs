@@ -9,6 +9,10 @@
 //! fill rule, fees and inventory limit are the same in every arm. The gap of an arm is its
 //! policy metric against the same metric on flow from the true model, on other seeds, which
 //! here plays the data. What is held at the end is charged half the impact of selling it.
+//!
+//! The fill rule takes a quote as it is. A skew can set a bid above the mid or an ask under
+//! it, and such a quote fills with probability 1 at a passive fee, where a venue would have
+//! crossed it. See `test_market_order_rates_and_fills_through_the_mid`.
 
 #![allow(
     clippy::unwrap_used,
@@ -73,9 +77,15 @@ enum Policy {
     AvellanedaStoikov,
 }
 
+/// What an episode draws: the diffusion's normals and the fills' uniforms.
+trait Draws {
+    fn unit(&mut self) -> f64;
+    fn normal(&mut self) -> f64;
+}
+
 struct Noise(u64);
 
-impl Noise {
+impl Draws for Noise {
     fn unit(&mut self) -> f64 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -121,6 +131,9 @@ struct Outcome {
     abs_inventory: f64,
     max_drawdown: f64,
     peak_inventory: Decimal,
+    /// Fills at a quote already through the mid when it was set, which only a skew can do. A
+    /// venue would have crossed it, not rested it at a passive fee.
+    through_when_set: f64,
 }
 
 /// One unit at `at`, with the fee on the notional: both legs move in one step.
@@ -142,6 +155,16 @@ fn mark(cash: Decimal, inventory: Decimal, mid: f64, peak: &mut f64, drawdown: &
 
 /// One episode over a bid queue's and an ask queue's flow. Only market orders trade.
 fn episode(policy: Policy, bid: &HawkesSegment, ask: &HawkesSegment, seed: u64) -> Outcome {
+    let mut noise = Noise(seed.wrapping_mul(0x9E37_79B9).wrapping_add(1));
+    episode_with(policy, bid, ask, &mut noise)
+}
+
+fn episode_with(
+    policy: Policy,
+    bid: &HawkesSegment,
+    ask: &HawkesSegment,
+    noise: &mut impl Draws,
+) -> Outcome {
     let mut events: Vec<(f64, bool, QrEventKind)> = bid
         .events
         .iter()
@@ -149,14 +172,15 @@ fn episode(policy: Policy, bid: &HawkesSegment, ask: &HawkesSegment, seed: u64) 
         .chain(ask.events.iter().map(|e| (e.time_seconds, false, e.kind)))
         .collect();
     events.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut noise = Noise(seed.wrapping_mul(0x9E37_79B9).wrapping_add(1));
     let (mut mid, mut now) = (100.0f64, 0.0f64);
     let (mut cash, mut inventory) = (Decimal::ZERO, Decimal::ZERO);
     let (mut peak, mut drawdown, mut fills, mut held) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let limit = dec!(10);
     let mut peak_inventory = Decimal::ZERO;
+    let mut through_when_set = 0.0f64;
     for (time, on_bid, kind) in events {
         let (quote_bid, quote_ask) = quotes(policy, mid, inventory, now);
+        let mid_when_set = mid;
         let delta = time - now;
         mid += SIGMA * delta.sqrt() * noise.normal();
         held += inventory.abs().to_f64().unwrap() * delta;
@@ -180,6 +204,12 @@ fn episode(policy: Policy, bid: &HawkesSegment, ask: &HawkesSegment, seed: u64) 
             let at = price(if on_bid { quote_bid } else { quote_ask });
             (cash, inventory) = fill(cash, inventory, on_bid, at);
             fills += 1.0;
+            let through = if on_bid {
+                quote_bid > mid_when_set
+            } else {
+                quote_ask < mid_when_set
+            };
+            through_when_set += f64::from(u8::from(through));
             peak_inventory = peak_inventory.max(inventory.abs());
         }
         mid += if on_bid { -IMPACT } else { IMPACT };
@@ -195,10 +225,12 @@ fn episode(policy: Policy, bid: &HawkesSegment, ask: &HawkesSegment, seed: u64) 
         abs_inventory: held / HORIZON,
         max_drawdown: drawdown.max(peak - pnl),
         peak_inventory,
+        through_when_set,
     }
 }
 
-fn outcomes(policy: Policy, params: &HawkesParameters, seeds: Range<u64>) -> Vec<Outcome> {
+/// The two queues of an episode, each on its own seed.
+fn queues(params: &HawkesParameters, seed: u64) -> (HawkesSegment, HawkesSegment) {
     let run = |seed: u64| {
         let mut sim = HawkesSimulator::new(params.clone(), seed, 10).unwrap();
         let (segment, stop) = sim.run(HORIZON).unwrap();
@@ -206,11 +238,18 @@ fn outcomes(policy: Policy, params: &HawkesParameters, seeds: Range<u64>) -> Vec
         assert!(stop.is_none(), "{stop:?}");
         segment
     };
+    (run(seed * 2), run(seed * 2 + 1))
+}
+
+fn outcomes(policy: Policy, params: &HawkesParameters, seeds: Range<u64>) -> Vec<Outcome> {
     // Each episode's generator starts from the same seed in every arm, by its position. The
     // arms draw from it at their own events, so their paths differ, yet are not independent.
     seeds
         .enumerate()
-        .map(|(i, seed)| episode(policy, &run(seed * 2), &run(seed * 2 + 1), i as u64 + 1))
+        .map(|(i, seed)| {
+            let (bid, ask) = queues(params, seed);
+            episode(policy, &bid, &ask, i as u64 + 1)
+        })
         .collect()
 }
 
@@ -232,9 +271,23 @@ fn paired_gap(arm: &[f64], base: &[f64]) -> (f64, f64) {
     (mean(&differences), standard_error(&differences))
 }
 
+/// The seeds of the fits, and of an arm's episodes.
+fn fit_seeds() -> (Range<u64>, Range<u64>) {
+    (TRAIN, VALIDATION)
+}
+
+fn arm_seeds(name: &str) -> Range<u64> {
+    if name == "data" {
+        DATA_HOLDOUT
+    } else {
+        SIM_SEEDS
+    }
+}
+
 fn fitted() -> (HawkesParameters, HawkesParameters, HawkesParameters, f64) {
-    let train = segments(&truth(), TRAIN);
-    let validation = segments(&truth(), VALIDATION);
+    let (train, validation) = fit_seeds();
+    let train = segments(&truth(), train);
+    let validation = segments(&truth(), validation);
     let config = HawkesFitConfig::new(CAP as u32, vec![]).with_iterations(100);
     let (_, best) = select_decay(&train, &validation, &DECAYS, &config).unwrap();
     let decay = DECAYS[best.unwrap()];
@@ -340,6 +393,7 @@ fn test_a_policy_on_no_market_orders_does_nothing() {
             abs_inventory: 0.0,
             max_drawdown: 0.0,
             peak_inventory: Decimal::ZERO,
+            through_when_set: 0.0,
         }
     );
 }
@@ -363,6 +417,212 @@ fn test_hawkes_flow_clusters_market_orders_more_than_its_poisson_fit() {
         counts.iter().map(|c| (c - m).powi(2)).sum::<f64>() / (counts.len() as f64 - 1.0) / m
     };
     assert!(dispersion(&train) > dispersion(&segments(&poisson, TRAIN)));
+}
+
+/// Given draws: normals that run out at zero, and fills that all reach the quote unless told.
+#[derive(Default)]
+struct Scripted {
+    normals: std::collections::VecDeque<f64>,
+    units: std::collections::VecDeque<f64>,
+}
+
+impl Draws for Scripted {
+    fn unit(&mut self) -> f64 {
+        self.units.pop_front().unwrap_or(0.0)
+    }
+
+    fn normal(&mut self) -> f64 {
+        self.normals.pop_front().unwrap_or(0.0)
+    }
+}
+
+fn at_times(times: &[f64]) -> HawkesSegment {
+    HawkesSegment {
+        initial_queue: 20,
+        duration_seconds: HORIZON,
+        events: times
+            .iter()
+            .map(|&time_seconds| HawkesEvent {
+                time_seconds,
+                kind: QrEventKind::Market,
+            })
+            .collect(),
+    }
+}
+
+fn close(found: f64, expected: f64) {
+    assert!((found - expected).abs() < 1e-9, "{found} {expected}");
+}
+
+#[test]
+fn test_an_episode_by_hand_with_a_position_at_the_end() {
+    let quiet = at_times(&[]);
+    let o = episode_with(
+        Policy::Fixed,
+        &at_times(&[100.0, 200.0]),
+        &quiet,
+        &mut Scripted::default(),
+    );
+    // Buys at 99.95, then at 99.945 after the first order's impact, with a fee of 1 bp: cash
+    // -199.9149895. The mid goes to 99.995, then 99.99, a position of 2 is worth 199.98, and
+    // the charge at the end is 2 * 2 * 0.005 / 2.
+    assert_eq!(o.fills, 2.0);
+    assert_eq!(o.peak_inventory, dec!(2));
+    close(o.pnl, 0.0550105);
+    // Equity 0.035005, then 0.0650105: the only fall is the charge.
+    close(o.max_drawdown, 0.01);
+    // Held 0, 1, 2 for 100 s each, over 300 s.
+    close(o.abs_inventory, 1.0);
+}
+
+#[test]
+fn test_drawdown_is_sampled_at_each_market_order_and_an_ask_moves_the_mid_up() {
+    // A buy, then two sells that miss: the first order's impact is undone twice.
+    let draws = Scripted {
+        units: [0.0, 1.0, 1.0, 1.0].into(),
+        ..Scripted::default()
+    };
+    let mut draws = draws;
+    let o = episode_with(
+        Policy::Fixed,
+        &at_times(&[10.0, 20.0]),
+        &at_times(&[30.0, 40.0]),
+        &mut draws,
+    );
+    assert_eq!(o.fills, 1.0);
+    // Equity 0.035005, 0.030005, 0.035005, 0.040005, then 0.037505 after the charge of 0.0025.
+    close(o.max_drawdown, 0.005);
+    close(o.pnl, 0.037505);
+}
+
+#[test]
+fn test_a_quote_rests_while_the_mid_moves_before_the_order() {
+    // SIGMA * sqrt(100) = 0.2, so the mid is 100.2 when the order comes, at the quote of 99.95.
+    let mut draws = Scripted {
+        normals: [1.0].into(),
+        ..Scripted::default()
+    };
+    let o = episode_with(
+        Policy::Fixed,
+        &at_times(&[100.0]),
+        &at_times(&[]),
+        &mut draws,
+    );
+    // Cash -99.959995, one unit at 100.195 after the impact, a charge of 0.0025.
+    close(o.pnl, 0.232505);
+}
+
+#[test]
+fn test_avellaneda_stoikov_in_an_episode_sees_its_inventory_and_the_time_left() {
+    let o = episode_with(
+        Policy::AvellanedaStoikov,
+        &at_times(&[100.0, 200.0]),
+        &at_times(&[]),
+        &mut Scripted::default(),
+    );
+    let first = quotes(Policy::AvellanedaStoikov, 100.0, dec!(0), 0.0).0;
+    let moved = 100.0 - IMPACT;
+    let second = quotes(Policy::AvellanedaStoikov, moved, dec!(1), 100.0).0;
+    let (cash, inventory) = fill(Decimal::ZERO, Decimal::ZERO, true, price(first));
+    let (cash, inventory) = fill(cash, inventory, true, price(second));
+    let end = (cash + inventory * price(moved - IMPACT)).to_f64().unwrap();
+    close(o.pnl, end - 2.0 * 2.0 * IMPACT / 2.0);
+    assert_ne!(
+        second,
+        quotes(Policy::AvellanedaStoikov, moved, dec!(0), 100.0).0
+    );
+    assert_ne!(
+        second,
+        quotes(Policy::AvellanedaStoikov, moved, dec!(1), 0.0).0
+    );
+}
+
+#[test]
+fn test_a_fill_through_the_mid_when_set_is_counted() {
+    let run = |policy| {
+        episode_with(
+            policy,
+            &at_times(&[1.0]),
+            &at_times(&[2.0]),
+            &mut Scripted::default(),
+        )
+    };
+    // Long one unit with 299 s left, the skew sets the ask under the mid.
+    assert!(quotes(Policy::AvellanedaStoikov, 100.0, dec!(1), 1.0).1 < 100.0);
+    let skewed = run(Policy::AvellanedaStoikov);
+    assert_eq!((skewed.fills, skewed.through_when_set), (2.0, 1.0));
+    assert_eq!(run(Policy::Fixed).through_when_set, 0.0);
+}
+
+#[test]
+fn test_each_queue_has_its_own_seed_and_the_seed_ranges_do_not_meet() {
+    let (bid, ask) = queues(&truth(), 3);
+    assert_ne!(bid.events, ask.events);
+    const {
+        // `queues` uses 2 s and 2 s + 1, and the fits use the seeds themselves.
+        assert!((TRAIN.end - 1) * 2 + 1 < DATA_HOLDOUT.start * 2);
+        assert!(VALIDATION.start >= TRAIN.end);
+        assert!(VALIDATION.end <= DATA_HOLDOUT.start);
+        assert!((DATA_HOLDOUT.end - 1) * 2 + 1 < SIM_SEEDS.start * 2);
+    };
+}
+
+#[test]
+fn test_the_arms_use_their_own_seeds_and_the_fits_stay_off_the_holdout() {
+    assert_eq!(arm_seeds("data"), DATA_HOLDOUT);
+    for name in ["poisson", "qr", "hawkes"] {
+        assert_eq!(arm_seeds(name), SIM_SEEDS);
+    }
+    assert_eq!(fit_seeds(), (TRAIN, VALIDATION));
+}
+
+#[test]
+fn test_each_arm_is_the_model_it_names() {
+    let (poisson, qr, hawkes, decay) = fitted();
+    assert!(DECAYS.contains(&decay));
+    assert_eq!(poisson.branching_ratio(), 0.0);
+    assert_eq!(qr.branching_ratio(), 0.0);
+    assert!(hawkes.branching_ratio() > 0.0);
+    // Fits, not the truth, and the queue-reactive one has its rates by size.
+    assert_ne!(qr, truth());
+    assert_ne!(hawkes, truth());
+    assert_ne!(poisson, qr);
+}
+
+/// Market orders per queue per episode in each arm, and the fills through the mid when set: the
+/// limits stated with the table. `--ignored --nocapture`, in release.
+#[test]
+#[ignore = "fits the models and runs every arm"]
+fn test_market_order_rates_and_fills_through_the_mid() {
+    let (poisson, qr, hawkes, _) = fitted();
+    for (name, params) in [
+        ("data", &truth()),
+        ("poisson", &poisson),
+        ("qr", &qr),
+        ("hawkes", &hawkes),
+    ] {
+        let counts: Vec<f64> = arm_seeds(name)
+            .flat_map(|seed| {
+                let (bid, ask) = queues(params, seed);
+                [bid, ask]
+            })
+            .map(|segment| {
+                segment
+                    .events
+                    .iter()
+                    .filter(|e| e.kind == QrEventKind::Market)
+                    .count() as f64
+            })
+            .collect();
+        let runs = outcomes(Policy::AvellanedaStoikov, params, arm_seeds(name));
+        let through: f64 = runs.iter().map(|o| o.through_when_set).sum();
+        let fills: f64 = runs.iter().map(|o| o.fills).sum();
+        println!(
+            "{name}: {:.2} [{:.2}] market orders per queue; AS {through} of {fills} through the mid",
+            mean(&counts),
+            standard_error(&counts)
+        );
+    }
 }
 
 /// The evidence table. `--ignored --nocapture`, in release.
@@ -397,7 +657,7 @@ fn test_policy_comparison_evidence_table() {
         |o| o.max_drawdown,
     ];
     for policy in [Policy::Fixed, Policy::AvellanedaStoikov] {
-        let data = outcomes(policy, &truth(), DATA_HOLDOUT);
+        let data = outcomes(policy, &truth(), arm_seeds("data"));
         for (name, params) in [
             ("data", &truth()),
             ("poisson", &poisson),
@@ -407,7 +667,7 @@ fn test_policy_comparison_evidence_table() {
             let runs = if name == "data" {
                 data.clone()
             } else {
-                outcomes(policy, params, SIM_SEEDS)
+                outcomes(policy, params, arm_seeds(name))
             };
             let mut row = String::new();
             for pick in picks {
