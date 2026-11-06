@@ -12,6 +12,12 @@ project follows [Semantic Versioning](https://semver.org/).
   synthetic regime changes on queue-reactive and Hawkes flow, with detection delay, false alarms,
   a labelled oracle, transfer between the simulators and a go or no-go rule fixed before the
   holdout, which says no-go here. No new public API, and nothing learned.
+- `backtest::hyperliquid` (#214), behind `serde`: decoders for the three streams of the
+  Hyperliquid "An Open Book" capture, a book replay, and conversions to `TopOfBook`,
+  `MarketEvent`, `PriceSample`, `SizedEvent`, `QueueObservation`, `ReferenceObservation`,
+  `HawkesSegment` and `QuoteExposure`, with no new dependency. Book diffs have no timestamp, so
+  their times are inferred and marked. Example `hyperliquid_hour` reports what could and could
+  not be established. No data is in the repository, and the book starts empty.
 - A true expiry in the example `quote_duration` (#110): `Hold::Expire` decides at the rate of
   `Hold::For` and cancels each quote after a shorter life through
   `BacktestStrategy::cancels_when_silent`, leaving the book empty until the next decision.

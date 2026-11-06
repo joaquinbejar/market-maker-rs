@@ -47,6 +47,9 @@ pub mod calibrated;
 #[cfg(all(feature = "margin", feature = "instruments"))]
 pub mod contracts;
 
+#[cfg(feature = "serde")]
+pub mod hyperliquid;
+
 /// `margin-rs` risk gate behind the pretrade and accounting ports.
 #[cfg(feature = "margin")]
 pub mod margin;
