@@ -51,6 +51,10 @@ pub mod contracts;
 #[cfg(feature = "margin")]
 pub mod margin;
 
+/// Initial margin for a future or a perpetual, behind the same ports.
+#[cfg(all(feature = "margin", feature = "instruments"))]
+pub mod derivative_margin;
+
 /// Data types for market data.
 pub mod data;
 
@@ -78,6 +82,10 @@ pub mod metrics;
 pub use accounting::MarginLedgerAccountant;
 pub use accounting::{AccountingFill, AccountingSnapshot, FeeAsset, FillAccountant};
 pub use data::{HistoricalDataSource, MarketTick, OHLCVBar, VecDataSource};
+#[cfg(all(feature = "margin", feature = "instruments"))]
+pub use derivative_margin::{
+    DerivativeMarginAccount, DerivativeMarginAccountant, DerivativeMarginPolicy,
+};
 pub use engine::{
     AccountingStatus, BacktestConfig, BacktestEngine, BacktestResult, BacktestStrategy,
     PretradeRecord, SimulatedFill, SlippageModel,

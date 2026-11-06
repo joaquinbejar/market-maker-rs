@@ -15,6 +15,11 @@ project follows [Semantic Versioning](https://semver.org/).
   late for a fill and an order still in flight. Synthetic, with no new public API and nothing
   learned. On this tape it gave fewer fills with a worse markout than the refresh at the same
   rate, on every seed and delay reported.
+- Initial margin before a derivative order in a backtest (features `margin` and `instruments`,
+  #230): `backtest::DerivativeMarginAccount` shares a `margin-rs` gate and its reservation
+  service between a pretrade policy and an accountant, in contracts and on the contract's
+  notional. An order beyond the margin is refused whole. `BacktestEngine::with_instrument` now
+  accepts a policy that declares `PretradePolicy::in_contracts`, and still refuses any other.
 - Example `consistent_time_travel` (#109): chronological replay as the baseline against
   time travel as a separate labelled mode, on a small synthetic environment whose true
   values are exact, with no new public API. It reports discontinuities, reuse of the tape
