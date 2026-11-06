@@ -1572,3 +1572,52 @@ fn test_event_sizes_the_hash_covers_the_size() {
     };
     assert_ne!(hash(dec!(1)), hash(dec!(2)));
 }
+
+#[test]
+fn test_event_sizes_the_hash_covers_the_time_and_the_limit() {
+    let hash = |timestamp_ms, depth| {
+        estimate_event_sizes(&[sized(timestamp_ms, depth, dec!(1))], &size_window(), 2, 1)
+            .unwrap()
+            .dataset_hash
+    };
+    assert_ne!(hash(100, 0), hash(101, 0));
+    assert_ne!(hash(100, 0), hash(100, 1));
+}
+
+#[test]
+fn test_event_sizes_name_the_first_of_two_thin_limits() {
+    let events = [sized(100, 0, dec!(1)), sized(101, 0, dec!(1))];
+    let record = estimate_event_sizes(&events, &size_window(), 3, 2).unwrap();
+    assert_eq!(
+        record.sizes,
+        Err(QrFailure::TooFewSizedEvents {
+            depth: 1,
+            have: 0,
+            need: 2,
+        })
+    );
+}
+
+#[test]
+fn test_event_sizes_reach_the_parameters_they_are_for() {
+    let t = generate(21, 300_000.0);
+    let end = t.events.last().unwrap().timestamp_ms + 1;
+    let sized_events: Vec<SizedEvent> = t
+        .events
+        .iter()
+        .map(|e| sized(e.timestamp_ms, e.depth, dec!(100) + Decimal::from(e.depth)))
+        .collect();
+    let record = estimate_event_sizes(&sized_events, &window(end), 2, 1).unwrap();
+    let sizes = record.sizes.unwrap();
+    assert_eq!(sizes, [dec!(100), dec!(101)]);
+    let fit = estimate_parameters(
+        &t.events,
+        &t.references,
+        &sizes,
+        &window(end),
+        &config(),
+        "d",
+    )
+    .unwrap();
+    assert_eq!(fit.parameters().expect("calibrated").event_sizes(), sizes);
+}
