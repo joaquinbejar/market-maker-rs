@@ -637,10 +637,22 @@ fn test_a_short_side_order_moves_the_books_and_the_mid_the_other_way() {
 
 #[test]
 fn test_a_side_at_the_limit_takes_no_fill_but_its_order_still_moves_the_mid() {
+    let impact = 0.01;
     let events: Vec<_> = (1..=12).map(|i| market(f64::from(i), Side::Bid)).collect();
-    let e = scripted(Policy::Fixed, 0.0, &events, &[true; 12]);
+    let e = scripted(Policy::Fixed, impact, &events, &[true; 12]);
     assert_eq!(e.fills, 10);
     assert_eq!(e.terminal_inventory, inventory_limit());
+    // Ten buys, each at the half spread under a mid that falls by the impact of each order.
+    let mut book = Book::default();
+    for k in 0..10 {
+        book.fill(
+            Side::Bid,
+            price(100.0 - impact * f64::from(k) - FIXED_HALF_SPREAD),
+        );
+    }
+    // All twelve orders moved it, the two at the limit too.
+    let expected = book.equity(100.0 - 12.0 * impact) - liquidation_cost(dec!(10), impact);
+    close(e.pnl, expected);
 }
 
 #[test]
