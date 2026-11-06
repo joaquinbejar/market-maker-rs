@@ -94,6 +94,12 @@ project follows [Semantic Versioning](https://semver.org/).
   The market does not react to the agent, and fills come from the kernel's fill model. A
   simulator that stops ends the rows early with its reason. New
   `QrParameters::tick_size`. Checked on simulated data only.
+- A Python bridge for an external RL trainer (`bridges/python`, #100): a nested crate outside
+  the root build and not published, with a worker thread per environment, thin Gymnasium
+  environments for `MaskablePPO` and `SAC`, checkpoints with metadata, inference only
+  loading and a protocol of training, selection and one holdout evaluation. The trainer is
+  pinned to `stable-baselines3` and `sb3-contrib` 2.9.2, on the CPU with one thread. Nothing in
+  the library or its features changes. Checked on synthetic data only.
 - Versioned observation, action and reward spaces (feature `rl`, #99): `rl::RlEnv` drives one
   kernel for an external RL trainer or engine, and `rl::RlSpec` describes its spaces, with a
   version per space and a fingerprint that `RlSpec::ensure` checks before any step.

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mm-rl-bridge"
+version = "0.1.0"
+description = "A Python bridge for an external RL trainer over the market-maker-rs RL spaces"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+dependencies = [
+    "gymnasium==1.4.0",
+    "numpy>=2,<3",
+    "sb3-contrib==2.9.2",
+    "stable-baselines3==2.9.2",
+    "torch==2.15.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.maturin]
+features = ["python"]
+module-name = "mm_rl_bridge._native"
+python-source = "python"
+
+[tool.pytest.ini_options]
+testpaths = ["tests_py"]

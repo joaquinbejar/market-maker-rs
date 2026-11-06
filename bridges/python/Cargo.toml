@@ -1,0 +1,26 @@
+[package]
+name = "mm-rl-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A Python bridge for an external RL trainer over the market-maker-rs RL spaces"
+license = "MIT"
+publish = false
+
+# Outside the root build: the trainer never reaches market-maker-rs itself.
+[workspace]
+
+[lib]
+name = "mm_rl_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+market-maker-rs = { path = "../..", features = ["rl"] }
+pyo3 = { version = "0.30", features = ["abi3-py312"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = []
+# The extension module. The worker builds and tests without Python.
+python = ["dep:pyo3", "pyo3/extension-module"]

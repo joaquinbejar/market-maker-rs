@@ -1,0 +1,53 @@
+name: Python Bridge
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bridge:
+    name: Bridge tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridges/python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Format and lint
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Worker tests
+        run: cargo test
+
+      - name: Python tests
+        env:
+          UV_TORCH_BACKEND: cpu
+        run: |
+          uv venv --python 3.12 .venv
+          source .venv/bin/activate
+          uv pip install "maturin>=1.16,<2"
+          maturin develop --uv --extras test
+          python -m pytest -s
