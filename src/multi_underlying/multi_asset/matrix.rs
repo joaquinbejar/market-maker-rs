@@ -139,8 +139,12 @@ impl Matrix {
 
     /// The principal square root of a symmetric positive semidefinite matrix.
     ///
-    /// Eigenvalues within `tolerance` below zero are rounding noise of a
-    /// singular matrix and count as zero.
+    /// An eigenvalue below zero by no more than `tolerance`, relative to the
+    /// largest entry and per row, is rounding noise of a singular matrix and
+    /// counts as zero. Each entry is known to `tolerance` of the largest at best,
+    /// and by Weyl's inequality errors of that size move an eigenvalue by at most
+    /// the size of the matrix times that, so a fixed floor would refuse large
+    /// singular matrices for their rounding alone.
     ///
     /// # Errors
     ///
@@ -148,7 +152,7 @@ impl Matrix {
     /// negative than that, and whatever [`Matrix::symmetric_eigen`] returns.
     pub(super) fn principal_sqrt(&self, tolerance: f64) -> MMResult<Self> {
         let (values, vectors) = self.symmetric_eigen()?;
-        let floor = -tolerance * self.max_abs();
+        let floor = -tolerance * self.size.max(1) as f64 * self.max_abs();
         let mut root = Self::zeros(self.size);
         for (index, value) in values.iter().enumerate() {
             if *value < floor {
@@ -172,6 +176,39 @@ impl Matrix {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_large_indefinite_matrix_is_still_refused() {
+        // Rank one, with a negative eigenvalue well past any rounding, on the same scale.
+        let size = 64;
+        let mut indefinite = Matrix::zeros(size);
+        for i in 0..size {
+            for j in 0..size {
+                indefinite.set(i, j, 1.0);
+            }
+        }
+        indefinite.set(0, 0, 1.0 - 1e-6);
+        indefinite.set(1, 1, 1.0 - 1e-6);
+        indefinite.set(0, 1, 1.0 + 1e-6);
+        indefinite.set(1, 0, 1.0 + 1e-6);
+        assert!(indefinite.principal_sqrt(1e-12).is_err());
+    }
+
+    #[test]
+    fn test_a_negative_eigenvalue_within_the_floor_counts_as_zero_and_past_it_does_not() {
+        let at = |eigenvalue: f64| {
+            let mut diagonal = Matrix::zeros(4);
+            diagonal.set(0, 0, 1.0);
+            diagonal.set(1, 1, 1.0);
+            diagonal.set(2, 2, 1.0);
+            diagonal.set(3, 3, eigenvalue);
+            diagonal.principal_sqrt(1e-12)
+        };
+        // Four rows, so a floor of 4e-12 of the largest entry.
+        let within = at(-3e-12).unwrap();
+        assert_eq!(within.at(3, 3), 0.0);
+        assert!(at(-5e-12).is_err());
+    }
 
     #[test]
     fn test_a_large_singular_matrix_converges_to_its_square_root() {

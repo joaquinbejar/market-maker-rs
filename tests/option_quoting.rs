@@ -22,7 +22,7 @@ use market_maker_rs::options::{FlatSurface, VolSurface};
 use market_maker_rs::types::action::Action;
 use market_maker_rs::types::error::{MMError, MMResult};
 use optionstratlib::OptionStyle;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 const NOW: u64 = 1_000_000;
 const EXPIRY: u64 = NOW + 30 * 86_400_000;
@@ -255,7 +255,7 @@ fn model_by_hand(view: RiskView) -> MultiAssetModel {
             } else {
                 let (p, q) = if i < j { (a, b) } else { (b, a) };
                 let value = cov(*p, *q) / (cov(*p, *p).sqrt() * cov(*q, *q).sqrt());
-                row.push(Decimal::try_from(value).unwrap().round_dp(14));
+                row.push(Decimal::from_f64(value.clamp(-1.0, 1.0)).unwrap());
             }
         }
         correlation.push(row);
@@ -2103,86 +2103,169 @@ fn test_an_overdrawn_ledger_leaves_a_sale_what_it_held() {
 }
 
 #[test]
-fn test_the_inventory_limit_reads_the_worst_of_either_side_of_the_reach() {
+fn test_a_reduction_stops_at_the_limit_on_the_other_side() {
     let mut terms = contract("C100", dec!(100));
     terms.trade_size = dec!(30);
-    let run = |position: Decimal, side: Action| {
-        let mut book = ledger(dec!(100000));
-        let mut quoter = OptionQuoter::new(config(vec![terms.clone()]))
-            .unwrap()
-            .with_restored_state(vec![position], 0)
-            .unwrap();
-        let mut last = None;
-        for _ in 0..4 {
-            last = Some(quoter.quote(&mut book, &market()).unwrap());
-        }
-        last.unwrap().quotes.iter().any(|quote| quote.side == side)
+    let mut book = ledger(dec!(1000000));
+    let mut quoter = OptionQuoter::new(config(vec![terms]))
+        .unwrap()
+        .with_restored_state(vec![dec!(60)], 0)
+        .unwrap();
+    let sale = |round: &market_maker_rs::multi_underlying::multi_asset::OptionQuoteRound| {
+        round
+            .quotes
+            .iter()
+            .find(|quote| quote.side == Action::Sell)
+            .map(|quote| quote.quantity)
     };
-    // From 60, four sales reach -60: as far as the position already is, so no further.
-    assert!(run(dec!(60), Action::Sell));
-    // And the same from -60 with four buys.
-    assert!(run(dec!(-60), Action::Buy));
+    // 60 to 30, to 0, to -30: all whole.
+    for _ in 0..3 {
+        assert_eq!(
+            sale(&quoter.quote(&mut book, &market()).unwrap()),
+            Some(dec!(30))
+        );
+    }
+    // Then only the 20 left to -50, and it says so.
+    let round = quoter.quote(&mut book, &market()).unwrap();
+    assert_eq!(sale(&round), Some(dec!(20)));
+    assert!(kinds(&round.constraints, 0, Action::Sell).contains(
+        &OptionConstraintKind::InventoryCapped {
+            requested: dec!(30),
+            allowed: dec!(20),
+            limit: dec!(50),
+        }
+    ));
+    // And nothing further.
+    let round = quoter.quote(&mut book, &market()).unwrap();
+    assert_eq!(sale(&round), None);
+    assert_eq!(
+        kinds(&round.constraints, 0, Action::Sell),
+        vec![OptionConstraintKind::InventoryLimit {
+            resulting: dec!(-80),
+            limit: dec!(50),
+        }]
+    );
+    let total: Decimal = quoter
+        .live_orders()
+        .iter()
+        .filter(|quote| quote.side == Action::Sell)
+        .map(|quote| quote.quantity)
+        .sum();
+    assert_eq!(total, dec!(110), "from 60 to -50");
 }
 
 #[test]
-fn test_a_large_book_on_the_validated_pricer_quotes_at_any_supported_size() {
-    let surface = FlatSurface::new(dec!(0.4)).unwrap();
-    let pricer = Arc::new(SurfacePricer::new(Arc::new(surface), Dynamics::StickyMoneyness).unwrap())
-        as Arc<dyn OptionPricer>;
-    let mut rounds = 0;
-    for size in [2usize, 4, 8, 12, 16, 24, 32, 48, 63] {
-        for spot in [dec!(60), dec!(100), dec!(150)] {
-            for days in [1u64, 30, 365] {
-                for (spot_volatility, correlation) in [
-                    (dec!(0.02), dec!(0)),
-                    (dec!(2), dec!(-0.5)),
-                    (dec!(2), dec!(1)),
-                    (dec!(200), dec!(0.9)),
-                ] {
-                    let contracts: Vec<ContractTerms> = (0..size)
-                        .map(|i| {
-                            let strike = dec!(60) + Decimal::from(i as u64) * dec!(1.5);
-                            let mut terms = contract(&format!("C{i}"), strike);
-                            terms.expiry_ms = NOW + days * 86_400_000;
-                            terms.price_scale = 4;
-                            terms.style = if i % 2 == 0 {
-                                OptionStyle::Call
-                            } else {
-                                OptionStyle::Put
-                            };
-                            terms
-                        })
-                        .collect();
-                    let mut settings = config(contracts);
-                    settings.pricer = pricer.clone();
-                    settings.factors.spot_volatility = spot_volatility;
-                    settings.factors.correlation = correlation;
-                    settings.scenarios = vec![RiskScenario {
-                        name: "up".to_string(),
-                        spot_factor: dec!(1.1),
-                        pricer: pricer.clone(),
-                    }];
-                    let mut book = ledger(dec!(100000));
-                    let mut at = market();
-                    at.spot = spot;
-                    let positions: Vec<Decimal> = (0..size)
-                        .map(|i| Decimal::from((i % 5) as i64 - 2))
-                        .collect();
-                    OptionQuoter::new(settings)
-                        .unwrap()
-                        .with_restored_state(positions, 0)
-                        .unwrap()
-                        .quote(&mut book, &at)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "{size} contracts at {spot}, {days} days, {spot_volatility}, \
-                                 {correlation}: {error}"
-                            )
-                        });
-                    rounds += 1;
-                }
+fn test_a_buy_stops_at_the_limit_too() {
+    let mut terms = contract("C100", dec!(100));
+    terms.trade_size = dec!(30);
+    let mut book = ledger(dec!(1000000));
+    let round = OptionQuoter::new(config(vec![terms]))
+        .unwrap()
+        .with_restored_state(vec![dec!(45)], 0)
+        .unwrap()
+        .quote(&mut book, &market())
+        .unwrap();
+    let buy = round
+        .quotes
+        .iter()
+        .find(|quote| quote.side == Action::Buy)
+        .unwrap();
+    assert_eq!(buy.quantity, dec!(5));
+}
+
+#[test]
+fn test_a_cap_that_rounds_to_no_lot_withholds_the_side() {
+    let mut terms = contract("C100", dec!(100));
+    terms.quantity_scale = 1;
+    let mut book = ledger(dec!(100000));
+    let round = OptionQuoter::new(config(vec![terms]))
+        .unwrap()
+        .with_restored_state(vec![dec!(49.96)], 0)
+        .unwrap()
+        .quote(&mut book, &market())
+        .unwrap();
+    assert!(matches!(
+        kinds(&round.constraints, 0, Action::Buy)[..],
+        [OptionConstraintKind::InventoryLimit { .. }]
+    ));
+}
+
+/// Seeded values for books of many contracts, of every delta and vega the review tried.
+struct Scattered(u64);
+
+impl OptionPricer for Scattered {
+    fn value(&self, inputs: &OptionInputs) -> MMResult<OptionValuation> {
+        let strike = inputs.strike.to_u64().unwrap();
+        let mix = |salt: u64| {
+            let mut x = self
+                .0
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(strike.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+                .wrapping_add(salt);
+            for _ in 0..3 {
+                x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                x ^= x >> 31;
+            }
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        };
+        Ok(valuation(
+            dec!(10),
+            Decimal::from_f64(0.05 + 0.9 * mix(1)).unwrap(),
+            Decimal::from_f64(1.0 + 29.0 * mix(2)).unwrap(),
+        ))
+    }
+}
+
+#[test]
+fn test_a_book_of_scattered_sensitivities_quotes_at_any_supported_size_and_correlation() {
+    for size in [16usize, 32, 63] {
+        for correlation in [dec!(-1), dec!(-0.5), dec!(0), dec!(1)] {
+            for seed in 0..10u64 {
+                let contracts: Vec<ContractTerms> = (0..size)
+                    .map(|i| contract(&format!("C{i}"), Decimal::from(50 + i as u64)))
+                    .collect();
+                let mut settings = config(contracts);
+                settings.pricer = Arc::new(Scattered(seed));
+                settings.scenarios = vec![RiskScenario {
+                    name: "up".to_string(),
+                    spot_factor: dec!(1.1),
+                    pricer: Arc::new(Scattered(seed)),
+                }];
+                settings.factors.correlation = correlation;
+                let mut book = ledger(dec!(100000));
+                OptionQuoter::new(settings)
+                    .unwrap()
+                    .quote(&mut book, &market())
+                    .unwrap_or_else(|error| {
+                        panic!("{size} contracts, {correlation}, seed {seed}: {error}")
+                    });
             }
         }
     }
-    assert_eq!(rounds, 324);
+}
+
+#[test]
+fn test_the_limits_read_what_the_cap_left_and_not_the_size_asked() {
+    let mut terms = contract("C100", dec!(100));
+    terms.trade_size = dec!(30);
+    // 45 long at a delta of 0.5 is 22.5, and the 5 the cap leaves take it to 25.
+    let limits = GreeksLimits {
+        max_delta: dec!(25),
+        ..loose()
+    };
+    let mut book = ledger(dec!(1000000));
+    let round = OptionQuoter::new(config(vec![terms]))
+        .unwrap()
+        .with_restored_state(vec![dec!(45)], 0)
+        .unwrap()
+        .with_greek_limits(limits)
+        .quote(&mut book, &market())
+        .unwrap();
+    let buy = round
+        .quotes
+        .iter()
+        .find(|quote| quote.side == Action::Buy)
+        .unwrap();
+    assert_eq!(buy.quantity, dec!(5));
 }

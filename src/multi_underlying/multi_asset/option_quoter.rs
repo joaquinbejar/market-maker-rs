@@ -56,10 +56,6 @@ use crate::types::error::{MMError, MMResult};
 /// Milliseconds in a day.
 const DAY_MS: Decimal = Decimal::from_parts(86_400_000, 0, 0, false, 0);
 
-/// Decimal places kept of a derived correlation: well inside what the model's check tolerates,
-/// so a book with fewer factors than contracts stays positive semidefinite after rounding.
-const CORRELATION_DP: u32 = 14;
-
 /// The terms of one contract and how it is quoted. A quantity is in units of the underlying, as
 /// [`OptionValuation`] is.
 #[derive(Debug, Clone, PartialEq)]
@@ -228,13 +224,23 @@ pub enum OptionConstraintKind {
         /// The pricer's value.
         value: Decimal,
     },
-    /// With the live orders of this side filled, a trade would pass the inventory limit, further
-    /// than without it; the side is withheld. A side that moves a position beyond the limit back
-    /// towards it is not.
+    /// With the live orders of this side filled, this side has no room before the limit in its
+    /// own direction; the side is withheld. A side that moves a position beyond the limit back
+    /// towards it has room, as its extreme is on the far side.
     InventoryLimit {
         /// The worst case position after the trade.
         resulting: Decimal,
         /// The limit on its absolute value.
+        limit: Decimal,
+    },
+    /// The inventory limit cut the quantity, so that this side stops at the limit in its own
+    /// direction.
+    InventoryCapped {
+        /// Quantity asked.
+        requested: Decimal,
+        /// Quantity it left.
+        allowed: Decimal,
+        /// The limit on the absolute position.
         limit: Decimal,
     },
     /// Some way for the live orders and this side to fill could pass a Greek limit, further than
@@ -830,11 +836,9 @@ impl OptionQuoter {
                 let (p, q) = if i < j { (a, b) } else { (b, a) };
                 let value =
                     covariance(*p, *q) / (covariance(*p, *p).sqrt() * covariance(*q, *q).sqrt());
-                let value = Decimal::from_f64(value.clamp(-1.0, 1.0))
-                    .ok_or_else(|| {
-                        MMError::NumericalError(format!("correlation {value} is not a decimal"))
-                    })?
-                    .round_dp(CORRELATION_DP);
+                let value = Decimal::from_f64(value.clamp(-1.0, 1.0)).ok_or_else(|| {
+                    MMError::NumericalError(format!("correlation {value} is not a decimal"))
+                })?;
                 row.push(value);
             }
             correlation.push(row);
@@ -1067,25 +1071,50 @@ impl OptionQuoter {
                     push(OptionConstraintKind::NonPositivePrice { price });
                     continue;
                 }
-                let widened = reach.with_side(contract, side, terms.trade_size)?;
-                let resulting = match side {
-                    Dir::Buy => widened.high.get(contract),
-                    Dir::Sell => widened.low.get(contract),
+                // What this side can add before its own extreme passes the limit. A sale from
+                // a long may go through flat, and stops at the limit on the short side.
+                let extreme = match side {
+                    Dir::Buy => reach.high.get(contract),
+                    Dir::Sell => reach.low.get(contract),
                 }
                 .copied()
                 .ok_or_else(|| out_of_range(contract))?;
-                let worst_before = reach
-                    .low
-                    .get(contract)
-                    .zip(reach.high.get(contract))
-                    .map_or(Decimal::ZERO, |(low, high)| low.abs().max(high.abs()));
-                if resulting.abs() > terms.inventory_limit && resulting.abs() > worst_before {
+                let (room, resulting) = match side {
+                    Dir::Buy => (
+                        terms
+                            .inventory_limit
+                            .checked_sub(extreme)
+                            .or_overflow("inventory room")?,
+                        extreme
+                            .checked_add(terms.trade_size)
+                            .or_overflow("worst case position")?,
+                    ),
+                    Dir::Sell => (
+                        terms
+                            .inventory_limit
+                            .checked_add(extreme)
+                            .or_overflow("inventory room")?,
+                        extreme
+                            .checked_sub(terms.trade_size)
+                            .or_overflow("worst case position")?,
+                    ),
+                };
+                let quantity = floor_to(terms.trade_size.min(room), terms.quantity_scale);
+                if quantity <= Decimal::ZERO {
                     push(OptionConstraintKind::InventoryLimit {
                         resulting,
                         limit: terms.inventory_limit,
                     });
                     continue;
                 }
+                if quantity < terms.trade_size {
+                    push(OptionConstraintKind::InventoryCapped {
+                        requested: terms.trade_size,
+                        allowed: quantity,
+                        limit: terms.inventory_limit,
+                    });
+                }
+                let widened = reach.with_side(contract, side, quantity)?;
                 if let Some(kind) = self.breach(&reach, &widened, valued, hedge, market)? {
                     push(kind);
                     continue;
@@ -1117,8 +1146,8 @@ impl OptionQuoter {
                     contract,
                     side,
                     price,
-                    quantity: terms.trade_size,
-                    covered: unwinds.min(terms.trade_size),
+                    quantity,
+                    covered: unwinds.min(quantity),
                     unit_capital,
                 });
                 reach = widened;
