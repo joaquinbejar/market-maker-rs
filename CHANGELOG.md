@@ -34,6 +34,10 @@ project follows [Semantic Versioning](https://semver.org/).
   and inventory, and with race fixtures showing that a fill before the effective cancel stands.
   Synthetic only, with no new public API. No teacher or predictor is learned, nothing here is a
   batch market, and its delays are inputs, not measurements of a venue.
+- `strategy::signal_quote::simulate_gated` replays a signal quote simulation with a
+  `PretradePolicy` as a gate after the raw limits, with its reductions, rejections and
+  faults on `SimulationReport` (#89). `simulate` and `simulate_detailed` give the same
+  results as before.
 - Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`
   takes a new `instruments::perpetual::PerpetualTerms`, with the declared rate and mark of
   each instant on the funding grid. Each instant books through the `margin-rs` ledger,

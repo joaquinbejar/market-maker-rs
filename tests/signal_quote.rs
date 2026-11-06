@@ -1131,3 +1131,539 @@ fn test_ablation_report_with_moves_inside_the_quotes() {
         }
     }
 }
+
+use market_maker_rs::risk::pretrade::{
+    LimitsPolicy, OrderEvent, PretradeDecision, PretradePolicy, PretradeRequest,
+};
+
+/// Decides from a script, and remembers the life of each order.
+#[derive(Debug, Default)]
+struct Scripted {
+    decide: Option<fn(&PretradeRequest) -> PretradeDecision>,
+    fail_on_fill: bool,
+    checks: Vec<String>,
+    requests: Vec<PretradeRequest>,
+    fills: Vec<OrderEvent>,
+    events: Vec<String>,
+    marks: u32,
+    resets: u32,
+    executions: Vec<String>,
+    cumulative: Vec<Decimal>,
+}
+
+impl PretradePolicy for Scripted {
+    fn check(&mut self, request: &PretradeRequest) -> PretradeDecision {
+        self.checks.push(request.order_id.clone());
+        self.requests.push(request.clone());
+        self.decide
+            .map_or(PretradeDecision::Accepted, |decide| decide(request))
+    }
+    fn on_market_data(&mut self, _mark: Decimal, _timestamp: u64) {
+        self.marks += 1;
+    }
+    fn on_order_event(
+        &mut self,
+        event: &OrderEvent,
+    ) -> market_maker_rs::types::error::MMResult<()> {
+        if matches!(event, OrderEvent::Fill { .. }) {
+            self.fills.push(event.clone());
+        }
+        let text = match event {
+            OrderEvent::Accepted { order_id } => format!("accepted {order_id}"),
+            OrderEvent::VenueRejected { order_id } => format!("rejected {order_id}"),
+            OrderEvent::Canceled { order_id } => format!("canceled {order_id}"),
+            OrderEvent::Fill {
+                order_id,
+                execution_id,
+                quantity,
+                cumulative_quantity,
+                fee,
+                ..
+            } => {
+                self.executions.push(execution_id.clone());
+                self.cumulative.push(*cumulative_quantity);
+                if self.fail_on_fill {
+                    return Err(
+                        market_maker_rs::types::error::MMError::InvalidPositionUpdate(
+                            "no".to_string(),
+                        ),
+                    );
+                }
+                format!("fill {order_id} {quantity} {cumulative_quantity} {fee}")
+            }
+            other => format!("{other:?}"),
+        };
+        self.events.push(text);
+        Ok(())
+    }
+    fn reset(&mut self) {
+        self.resets += 1;
+    }
+}
+
+fn gated_events() -> Vec<MarketEvent> {
+    vec![
+        top(0, dec!(100), dec!(1), dec!(1)),
+        trade(10, dec!(90), dec!(0.5), TradeSide::Sell),
+        top(20, dec!(100), dec!(1), dec!(1)),
+        trade(30, dec!(90), dec!(100), TradeSide::Sell),
+        top(40, dec!(100), dec!(1), dec!(1)),
+    ]
+}
+
+#[test]
+fn test_simulate_gated_with_a_permissive_policy_equals_simulate() {
+    {
+        let events = gated_events();
+        let plain = simulate_detailed(&events, &sim(), &caps(), None).unwrap();
+        let mut policy = Scripted::default();
+        let gated = simulate_gated(&events, &sim(), &caps(), None, &mut policy).unwrap();
+        assert_eq!(plain, gated);
+        assert!(plain.report.fills > 0);
+        assert_eq!(policy.resets, 1);
+        assert_eq!(policy.marks, 3);
+    }
+}
+
+#[test]
+fn test_simulate_gated_rejection_takes_the_side_off() {
+    let events = gated_events();
+    let plain = simulate(&events, &sim(), &caps(), None).unwrap();
+    let mut policy = Scripted {
+        decide: Some(|r| {
+            if matches!(r.side, Action::Buy) {
+                PretradeDecision::Rejected {
+                    reason: "no".to_string(),
+                }
+            } else {
+                PretradeDecision::Accepted
+            }
+        }),
+        ..Scripted::default()
+    };
+    let run = simulate_gated(&events, &sim(), &caps(), None, &mut policy).unwrap();
+    assert_eq!(run.report.fills, 0);
+    assert_ne!(run.report.total_pnl, plain.total_pnl);
+    assert_eq!(run.report.gate_rejections, run.report.decisions);
+    assert!(
+        run.decisions
+            .iter()
+            .all(|d| d.bid.is_none() && d.ask.is_some())
+    );
+}
+
+#[test]
+fn test_simulate_gated_reduction_changes_the_fill() {
+    let events = gated_events();
+    let plain = simulate(&events, &sim(), &caps(), None).unwrap();
+    let mut policy = Scripted {
+        decide: Some(|_| PretradeDecision::Reduced {
+            quantity: dec!(0.25),
+            reason: "smaller".to_string(),
+        }),
+        ..Scripted::default()
+    };
+    let run = simulate_gated(&events, &sim(), &caps(), None, &mut policy).unwrap();
+    assert!(run.report.volume < plain.volume, "{:?}", run.report);
+    assert!(run.fills.iter().all(|f| f.size <= dec!(0.25)));
+    assert_eq!(run.report.gate_reductions, 2 * run.report.decisions);
+    assert!(run.report.gate_rejections == 0);
+}
+
+#[test]
+fn test_simulate_gated_reduction_to_nothing_is_a_rejection() {
+    let mut policy = Scripted {
+        decide: Some(|_| PretradeDecision::Reduced {
+            quantity: dec!(0),
+            reason: "none".to_string(),
+        }),
+        ..Scripted::default()
+    };
+    let run = simulate_gated(&gated_events(), &sim(), &caps(), None, &mut policy).unwrap();
+    assert_eq!(run.report.fills, 0);
+    assert_eq!(run.report.gate_reductions, 0);
+    assert_eq!(run.report.gate_rejections, 2 * run.report.decisions);
+}
+
+#[test]
+fn test_simulate_gated_tells_the_policy_each_order_life() {
+    let events = vec![
+        top(0, dec!(100), dec!(1), dec!(1)),
+        trade(10, dec!(90), dec!(0.5), TradeSide::Sell),
+        top(20, dec!(100), dec!(1), dec!(1)),
+    ];
+    let mut policy = Scripted::default();
+    let run = simulate_gated(&events, &sim(), &caps(), None, &mut policy).unwrap();
+    assert_eq!(run.report.fills, 1);
+    assert_eq!(
+        policy.checks,
+        ["sq-0-bid", "sq-0-ask", "sq-1-bid", "sq-1-ask"]
+    );
+    let fee = run.report.fees;
+    assert_eq!(
+        policy.events,
+        vec![
+            "accepted sq-0-bid".to_string(),
+            "accepted sq-0-ask".to_string(),
+            format!("fill sq-0-bid 0.5 0.5 {fee}"),
+            "canceled sq-0-bid".to_string(),
+            "canceled sq-0-ask".to_string(),
+            "accepted sq-1-bid".to_string(),
+            "accepted sq-1-ask".to_string(),
+            "canceled sq-1-bid".to_string(),
+            "canceled sq-1-ask".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn test_simulate_gated_a_quote_replaced_before_it_arrives_is_cancelled() {
+    let events = vec![
+        top(0, dec!(100), dec!(1), dec!(1)),
+        top(10, dec!(100), dec!(1), dec!(1)),
+        top(200, dec!(100), dec!(1), dec!(1)),
+    ];
+    let mut policy = Scripted::default();
+    simulate_gated(
+        &events,
+        &sim().with_latency_ms(100),
+        &caps(),
+        None,
+        &mut policy,
+    )
+    .unwrap();
+    let position = |text: &str| policy.events.iter().position(|e| e == text).unwrap();
+    assert!(position("canceled sq-0-bid") < position("accepted sq-1-bid"));
+    assert!(!policy.events.iter().any(|e| e == "accepted sq-0-bid"));
+}
+
+#[test]
+fn test_simulate_gated_stops_sending_after_a_policy_fault() {
+    let mut policy = Scripted {
+        fail_on_fill: true,
+        ..Scripted::default()
+    };
+    let run = simulate_gated(&gated_events(), &sim(), &caps(), None, &mut policy).unwrap();
+    assert_eq!(run.report.gate_faults, 1);
+    assert_eq!(policy.checks.len(), 2);
+    assert_eq!(run.report.gate_rejections, 2 * (run.report.decisions - 1));
+    assert_eq!(run.report.fills, 1);
+    assert!(run.decisions[1].bid.is_none() && run.decisions[1].ask.is_none());
+}
+
+#[test]
+fn test_simulate_gated_limits_policy_holds_its_own_tighter_limit() {
+    let events = gated_events();
+    let mut policy = LimitsPolicy::new(RiskLimits::new(dec!(0.75), dec!(100000), dec!(1)).unwrap());
+    let run = simulate_gated(&events, &sim(), &caps(), None, &mut policy).unwrap();
+    assert!(
+        run.report.max_abs_inventory <= dec!(0.75),
+        "{:?}",
+        run.report
+    );
+    assert!(run.report.gate_reductions + run.report.gate_rejections > 0);
+    // Nothing is left live, whatever happened.
+    assert_eq!(policy.live_quantity(Action::Buy).unwrap(), dec!(0));
+    assert_eq!(policy.live_quantity(Action::Sell).unwrap(), dec!(0));
+    assert_eq!(policy.position(), run.report.final_inventory);
+}
+
+#[test]
+fn test_simulate_gated_partial_fills_accumulate_under_their_own_executions() {
+    let events = vec![
+        top(0, dec!(100), dec!(1), dec!(1)),
+        trade(10, dec!(90), dec!(0.25), TradeSide::Sell),
+        trade(11, dec!(90), dec!(0.25), TradeSide::Sell),
+    ];
+    let mut policy = Scripted::default();
+    simulate_gated(&events, &sim(), &caps(), None, &mut policy).unwrap();
+    assert_eq!(policy.cumulative, [dec!(0.25), dec!(0.5)]);
+    assert_eq!(policy.executions, ["sq-fill-0", "sq-fill-1"]);
+}
+
+#[test]
+fn test_simulate_gated_a_side_that_crosses_on_arrival_is_rejected_to_the_policy() {
+    let events = vec![
+        top(0, dec!(100), dec!(1), dec!(1)),
+        top(50, dec!(50), dec!(1), dec!(1)),
+        top(100, dec!(50), dec!(1), dec!(1)),
+    ];
+    let mut policy = Scripted::default();
+    let cfg = sim().with_latency_ms(100);
+    let run = simulate_gated(&events, &cfg, &caps(), None, &mut policy).unwrap();
+    assert!(run.report.crossing_sides > 0);
+    assert!(policy.events.iter().any(|e| e == "rejected sq-0-bid"));
+    assert!(policy.events.iter().any(|e| e == "accepted sq-0-ask"));
+    assert!(!policy.events.iter().any(|e| e == "accepted sq-0-bid"));
+}
+
+#[test]
+fn test_simulate_gated_the_terminal_time_cancels_what_rests() {
+    let events = vec![
+        top(0, dec!(100), dec!(1), dec!(1)),
+        top(TERMINAL, dec!(100), dec!(1), dec!(1)),
+    ];
+    let mut policy = Scripted::default();
+    simulate_gated(&events, &sim(), &caps(), None, &mut policy).unwrap();
+    assert_eq!(policy.checks.len(), 2);
+    assert_eq!(
+        policy.events,
+        [
+            "accepted sq-0-bid",
+            "accepted sq-0-ask",
+            "canceled sq-0-bid",
+            "canceled sq-0-ask",
+        ]
+    );
+}
+
+#[cfg(feature = "margin")]
+#[test]
+fn test_simulate_gated_margin_policy_books_fills_and_cancels_cleanly() {
+    use margin_rs::ledger::Ledger;
+    use margin_rs::risk::{InstrumentLimits, RiskGate};
+    use margin_rs::{Asset, InstrumentId, SpotInstrument, TransferId};
+    use market_maker_rs::backtest::MarginAccount;
+    let quote = Asset::new("USDC").unwrap();
+    let base = Asset::new("BTC").unwrap();
+    let pair = InstrumentId::new("BTC-USDC").unwrap();
+    let mut ledger = Ledger::default();
+    ledger.register_asset(quote.clone(), 8).unwrap();
+    ledger.register_asset(base.clone(), 8).unwrap();
+    ledger
+        .register_instrument(
+            SpotInstrument::new(pair.clone(), base.clone(), quote.clone(), 4, 4).unwrap(),
+        )
+        .unwrap();
+    let mut gate = RiskGate::new(ledger);
+    gate.deposit(TransferId::new("quote").unwrap(), quote, dec!(100000))
+        .unwrap();
+    gate.deposit(TransferId::new("base").unwrap(), base, dec!(100))
+        .unwrap();
+    gate.set_limits(
+        &pair,
+        InstrumentLimits {
+            max_fee_rate: dec!(0.001),
+            ..InstrumentLimits::default()
+        },
+    )
+    .unwrap();
+    let account = MarginAccount::new(gate, pair).unwrap();
+    let mut policy = account.policy();
+    let run = simulate_gated(&gated_events(), &sim(), &caps(), None, &mut policy).unwrap();
+    assert!(run.report.fills > 0, "{:?}", run.report);
+    assert_eq!(run.report.gate_faults, 0);
+    assert!(account.errors().is_empty(), "{:?}", account.errors());
+    assert!(account.fault().is_none());
+    assert_eq!(
+        account.with_gate(|g| g.ledger().journal().len()),
+        run.fills.len()
+    );
+}
+
+/// A bid and an ask filled, the ask twice, and the fee on each.
+fn two_sided_events() -> Vec<MarketEvent> {
+    vec![
+        top(0, dec!(100), dec!(1), dec!(1)),
+        trade(10, dec!(90), dec!(0.5), TradeSide::Sell),
+        trade(11, dec!(200), dec!(0.25), TradeSide::Buy),
+        trade(12, dec!(200), dec!(0.25), TradeSide::Buy),
+        top(20, dec!(100), dec!(1), dec!(1)),
+    ]
+}
+
+#[test]
+fn test_simulate_gated_tells_the_policy_each_whole_fill_on_both_sides() {
+    let cfg = sim().with_fee_rate(dec!(0.0005));
+    let mut policy = Scripted::default();
+    let run = simulate_gated(&two_sided_events(), &cfg, &caps(), None, &mut policy).unwrap();
+    assert_eq!(run.fills.len(), 3);
+    let at = |i: usize| run.fills[i].price;
+    let event = |i: usize, order_id: &str, side, quantity, cumulative_quantity, timestamp| {
+        OrderEvent::Fill {
+            order_id: order_id.to_string(),
+            execution_id: format!("sq-fill-{i}"),
+            side,
+            price: at(i),
+            quantity,
+            cumulative_quantity,
+            fee: at(i) * quantity * dec!(0.0005),
+            fee_asset: market_maker_rs::types::fee::FeeAsset::Quote,
+            timestamp,
+        }
+    };
+    assert!(at(0) < dec!(100.005) && at(1) > dec!(100.005));
+    assert_eq!(
+        policy.fills,
+        [
+            event(0, "sq-0-bid", Action::Buy, dec!(0.5), dec!(0.5), 10),
+            event(1, "sq-0-ask", Action::Sell, dec!(0.25), dec!(0.25), 11),
+            event(2, "sq-0-ask", Action::Sell, dec!(0.25), dec!(0.5), 12),
+        ]
+    );
+    let fees: Decimal = (0..3)
+        .map(|i| at(i) * run.fills[i].size * dec!(0.0005))
+        .sum();
+    assert_eq!(fees, run.report.fees);
+    assert!(fees > dec!(0));
+}
+
+#[test]
+fn test_simulate_gated_each_request_is_a_quote_at_its_decision() {
+    let mut policy = Scripted::default();
+    let run = simulate_gated(&two_sided_events(), &sim(), &caps(), None, &mut policy).unwrap();
+    let times: Vec<u64> = policy.requests.iter().map(|r| r.timestamp).collect();
+    assert_eq!(times, [0, 0, 20, 20]);
+    for request in &policy.requests {
+        assert_eq!(
+            request.purpose,
+            market_maker_rs::risk::pretrade::OrderPurpose::Quote
+        );
+        assert_eq!(request.quantity, dec!(1));
+    }
+    let (bid, _) = run.decisions[0].bid.unwrap();
+    let (ask, _) = run.decisions[0].ask.unwrap();
+    assert_eq!(policy.requests[0].price, Some(bid));
+    assert_eq!(policy.requests[1].price, Some(ask));
+    assert_eq!(policy.requests[0].side, Action::Buy);
+    assert_eq!(policy.requests[1].side, Action::Sell);
+}
+
+#[test]
+fn test_simulate_gated_a_reduction_above_the_size_keeps_the_size() {
+    let mut policy = Scripted {
+        decide: Some(|_| PretradeDecision::Reduced {
+            quantity: dec!(100),
+            reason: "more".to_string(),
+        }),
+        ..Scripted::default()
+    };
+    let run = simulate_gated(&two_sided_events(), &sim(), &caps(), None, &mut policy).unwrap();
+    assert_eq!(run.decisions[0].bid.unwrap().1, dec!(1));
+    assert_eq!(run.decisions[0].ask.unwrap().1, dec!(1));
+}
+
+#[test]
+fn test_simulate_gated_a_quote_in_flight_at_the_terminal_time_or_the_end_is_cancelled() {
+    let mut policy = Scripted::default();
+    let cfg = sim().with_latency_ms(100);
+    let events = [
+        top(0, dec!(100), dec!(1), dec!(1)),
+        top(TERMINAL, dec!(100), dec!(1), dec!(1)),
+    ];
+    simulate_gated(&events, &cfg, &caps(), None, &mut policy).unwrap();
+    assert_eq!(policy.events, ["canceled sq-0-bid", "canceled sq-0-ask"]);
+    let mut policy = Scripted::default();
+    simulate_gated(&events[..1], &cfg, &caps(), None, &mut policy).unwrap();
+    assert_eq!(policy.events, ["canceled sq-0-bid", "canceled sq-0-ask"]);
+}
+
+#[test]
+fn test_simulate_gated_after_a_fault_a_quote_already_out_can_still_fill() {
+    let mut policy = Scripted {
+        fail_on_fill: true,
+        ..Scripted::default()
+    };
+    let events = [
+        top(0, dec!(100), dec!(1), dec!(1)),
+        trade(10, dec!(90), dec!(0.25), TradeSide::Sell),
+        trade(11, dec!(90), dec!(0.25), TradeSide::Sell),
+        top(20, dec!(100), dec!(1), dec!(1)),
+        trade(21, dec!(90), dec!(0.25), TradeSide::Sell),
+    ];
+    let run = simulate_gated(&events, &sim(), &caps(), None, &mut policy).unwrap();
+    // Both before the next decision, and that decision replaced it with nothing.
+    assert_eq!(run.report.fills, 2);
+    assert_eq!(run.report.gate_faults, 2);
+    assert_eq!(policy.checks.len(), 2);
+}
+
+/// A quote replaced before it arrives, an ask filled, and one still in flight at the end.
+fn latency_events() -> Vec<MarketEvent> {
+    vec![
+        top(0, dec!(100), dec!(1), dec!(1)),
+        top(10, dec!(100), dec!(1), dec!(1)),
+        top(40, dec!(100), dec!(1), dec!(1)),
+        trade(45, dec!(200), dec!(0.5), TradeSide::Buy),
+        top(70, dec!(100), dec!(1), dec!(1)),
+        trade(75, dec!(90), dec!(0.25), TradeSide::Sell),
+        top(80, dec!(100), dec!(1), dec!(1)),
+    ]
+}
+
+#[test]
+fn test_simulate_gated_limits_policy_stays_clean_under_latency() {
+    let events = latency_events();
+    let cfg = sim().with_latency_ms(30).with_fee_rate(dec!(0.0005));
+    let plain = simulate_detailed(&events, &cfg, &caps(), None).unwrap();
+    let mut policy = LimitsPolicy::new(RiskLimits::new(dec!(10), dec!(100000), dec!(1)).unwrap());
+    let run = simulate_gated(&events, &cfg, &caps(), None, &mut policy).unwrap();
+    assert_eq!(run, plain);
+    assert!(run.fills.iter().any(|f| f.side == Action::Sell));
+    assert_eq!(run.report.gate_faults, 0);
+    assert_eq!(policy.live_quantity(Action::Buy).unwrap(), dec!(0));
+    assert_eq!(policy.live_quantity(Action::Sell).unwrap(), dec!(0));
+    assert_eq!(policy.position(), run.report.final_inventory);
+}
+
+#[cfg(feature = "margin")]
+#[test]
+fn test_simulate_gated_margin_policy_stays_clean_under_latency() {
+    use margin_rs::ledger::Ledger;
+    use margin_rs::risk::{InstrumentLimits, RiskGate};
+    use margin_rs::{Asset, InstrumentId, SpotInstrument, TransferId};
+    use market_maker_rs::backtest::MarginAccount;
+    let quote = Asset::new("USDC").unwrap();
+    let base = Asset::new("BTC").unwrap();
+    let pair = InstrumentId::new("BTC-USDC").unwrap();
+    let mut ledger = Ledger::default();
+    ledger.register_asset(quote.clone(), 8).unwrap();
+    ledger.register_asset(base.clone(), 8).unwrap();
+    ledger
+        .register_instrument(
+            SpotInstrument::new(pair.clone(), base.clone(), quote.clone(), 4, 4).unwrap(),
+        )
+        .unwrap();
+    let mut gate = RiskGate::new(ledger);
+    gate.deposit(TransferId::new("quote").unwrap(), quote, dec!(100000))
+        .unwrap();
+    gate.deposit(TransferId::new("base").unwrap(), base, dec!(100))
+        .unwrap();
+    gate.set_limits(
+        &pair,
+        InstrumentLimits {
+            max_fee_rate: dec!(0.001),
+            ..InstrumentLimits::default()
+        },
+    )
+    .unwrap();
+    let account = MarginAccount::new(gate, pair).unwrap();
+    let mut policy = account.policy();
+    let events = latency_events();
+    let cfg = sim().with_latency_ms(30).with_fee_rate(dec!(0.0005));
+    let run = simulate_gated(&events, &cfg, &caps(), None, &mut policy).unwrap();
+    assert_eq!(
+        run,
+        simulate_detailed(&events, &cfg, &caps(), None).unwrap()
+    );
+    assert!(run.fills.iter().any(|f| f.side == Action::Sell));
+    assert_eq!(run.report.gate_faults, 0);
+    assert!(account.errors().is_empty(), "{:?}", account.errors());
+    assert!(account.fault().is_none());
+    assert_eq!(
+        account.with_gate(|g| g.ledger().journal().len()),
+        run.fills.len()
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_a_report_from_before_the_gate_reads_with_zero_gate_counts() {
+    let report = simulate(&gated_events(), &sim(), &caps(), None).unwrap();
+    let mut older = serde_json::to_value(report).unwrap();
+    for field in ["gate_reductions", "gate_rejections", "gate_faults"] {
+        older.as_object_mut().unwrap().remove(field).unwrap();
+    }
+    let read: SimulationReport = serde_json::from_value(older).unwrap();
+    assert_eq!(read, report);
+}
