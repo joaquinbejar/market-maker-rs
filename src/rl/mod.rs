@@ -87,6 +87,16 @@
 //! an assumption, not a fill the venue made: [`TerminalClose::beyond_touch`] reports
 //! the size above what the touch displayed, and no impact is charged for it.
 //!
+//! # Queue-reactive markets
+//!
+//! [`qr_market`] simulates the rows of an episode with
+//! [`QrSimulator`](crate::backtest::queue_reactive::QrSimulator), so that [`RlEnv`] can
+//! run on them. The market comes first and does not react: the agent's orders change
+//! neither the queues nor the reference price, and its fills come from the kernel's fill
+//! model against the sampled touch, not from the simulated market orders. This is no
+//! replica of an exchange, and it claims no queue priority of its own. A simulator that
+//! stops ends the rows early, with the reason in [`QrMarket::stopped`].
+//!
 //! # Limits
 //!
 //! One linear spot instrument with fees in the quote asset, as the kernel. The reward
@@ -131,6 +141,7 @@
 mod audit;
 mod env;
 mod features;
+mod queue_reactive;
 mod spec;
 
 pub use audit::{EpisodeRecorder, EpisodeRecords};
@@ -138,6 +149,7 @@ pub use env::{
     ERR_ACTION_OFF_GRID, RlAction, RlConfig, RlEnv, RlState, StepReward, TerminalClose, Transition,
 };
 pub use features::FeatureVector;
+pub use queue_reactive::{MAX_QR_ROWS, QrEpisode, QrMarket, qr_market};
 pub use spec::{
     ACTION_SPACE_VERSION, ActionSpace, AsOf, EPISODE_VERSION, EpisodeSpec, FEATURE_COUNT,
     FeatureHorizon, FeatureId, FeatureSpec, FeatureUnit, HedgeActions, InvalidActionPolicy,
