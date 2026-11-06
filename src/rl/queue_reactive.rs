@@ -34,7 +34,8 @@ pub struct QrMarket {
     /// Why the simulator stopped before the last row asked for, if it did. The rows
     /// end there and are not padded.
     pub stopped: Option<QrStep>,
-    /// The simulator's state after the last row, which can be stored and continued.
+    /// The simulator's state at the end: at the last row's time or, when it stopped early,
+    /// where it stopped, which holds the events after that row. It can be stored and continued.
     pub end: QrState,
 }
 

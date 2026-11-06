@@ -230,6 +230,16 @@ fn test_market_stops_with_the_reason_and_pads_nothing() {
     let last = rows.last().unwrap();
     let ms = e.start_ms + (rows.len() as u64 - 1) * u64::from(e.sample_ms);
     assert_eq!(last.ts_ns, ms * 1_000_000);
+    // The end holds the state where it stopped, past the last row.
+    let mut simulator = QrSimulator::new(limited.clone(), e.seed, e.reference_ticks).unwrap();
+    let seconds = f64::from(e.sample_ms) / 1000.0;
+    for _ in 1..rows.len() {
+        simulator.run(seconds, seconds).unwrap();
+    }
+    let at_last_row = simulator.state();
+    assert!(simulator.run(seconds, seconds).unwrap().stopped.is_some());
+    assert_eq!(market.end, simulator.state());
+    assert_ne!(market.end, at_last_row);
 }
 
 fn scales() -> ObservationScales {
