@@ -8,6 +8,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A true expiry in the example `quote_duration` (#110): `Hold::Expire` decides at the rate of
+  `Hold::For` and cancels each quote after a shorter life through
+  `BacktestStrategy::cancels_when_silent`, leaving the book empty until the next decision.
+  Fixtures cover the book left empty, a fill before the cancel takes effect, a cancel too
+  late for a fill and an order still in flight. Synthetic, with no new public API and nothing
+  learned. On this tape it gave fewer fills with a worse markout than the refresh at the same
+  rate, on every seed and delay reported.
 - Example `consistent_time_travel` (#109): chronological replay as the baseline against
   time travel as a separate labelled mode, on a small synthetic environment whose true
   values are exact, with no new public API. It reports discontinuities, reuse of the tape

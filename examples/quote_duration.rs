@@ -14,10 +14,28 @@
 //! then requotes. A requote goes through the engine like any other, so the old
 //! quote's cancel takes the simulated delay, and a fill before that stands.
 //!
-//! So this tests how often a quote is refreshed, not a true expiry. The book is
-//! not left empty when a duration ends, as a new quote replaces the old one, and
+//! So [`Hold::For`] tests how often a quote is refreshed, not an expiry. The book
+//! is not left empty when a duration ends, as a new quote replaces the old one, and
 //! the replacement loses its place in time. A pricer with no price keeps the old
 //! quote live.
+//!
+//! # Expiry
+//!
+//! [`Hold::Expire`] is a true expiry: a decision every `every_ms`, as under
+//! `Hold::For(every_ms)`, whose quote lives for `live_ms` only. At the first tick
+//! seen at or after that, the quoter stays silent and asks for its orders to be
+//! cancelled, through [`BacktestStrategy::cancels_when_silent`], and nothing replaces
+//! them until the next decision. So the two arms decide at the same rate, and differ
+//! in how long the book holds a quote. The cancel takes the simulated delay like any
+//! other, so a fill before it takes effect stands, and an order still in flight is
+//! cancelled before it rests. Expiry is a request from the quoter, seen on ticks: it
+//! is not an instruction held by the venue, which would need no cancel message.
+//!
+//! A quote rests for its life plus the cancel delay less the submit delay, so for
+//! `live_ms` when these are equal, as in the reported runs. From a delay of `live_ms`
+//! the cancel is requested by the time the quote is active, so every fill comes with
+//! a cancel already on its way: late cancels then equal fills by construction, and
+//! say nothing more.
 //!
 //! # Tape
 //!
@@ -102,6 +120,17 @@ const HOLDS: [Hold; 4] = [
     Hold::For(250),
     Hold::For(1_000),
 ];
+/// Arms with a true expiry, each at the decision rate of an arm of [`HOLDS`].
+const EXPIRIES: [Hold; 2] = [
+    Hold::Expire {
+        live_ms: 50,
+        every_ms: 250,
+    },
+    Hold::Expire {
+        live_ms: 250,
+        every_ms: 1_000,
+    },
+];
 /// Bootstrap replicates.
 const REPLICATES: usize = 200;
 /// Buckets per bootstrap block.
@@ -170,6 +199,9 @@ enum Hold {
     EveryTick,
     /// Keep a quote this long, in milliseconds of the ticks' time, then requote.
     For(u64),
+    /// Decide every `every_ms`, and ask to cancel each quote after `live_ms` of the
+    /// ticks' time, leaving the book empty from then until the next decision.
+    Expire { live_ms: u64, every_ms: u64 },
 }
 
 /// Prices a quote from the mid and the delivered position.
@@ -187,6 +219,8 @@ struct DurationQuoter {
     pricer: Pricer,
     /// Time of the tick of the last quote.
     last_quote: Option<u64>,
+    /// Time of the last tick seen.
+    seen: u64,
     quotes: usize,
     reports: Vec<ExecutionKind>,
 }
@@ -197,6 +231,7 @@ impl DurationQuoter {
             hold,
             pricer,
             last_quote: None,
+            seen: 0,
             quotes: 0,
             reports: Vec::new(),
         }
@@ -210,12 +245,24 @@ impl DurationQuoter {
         match (self.hold, self.last_quote) {
             (Hold::EveryTick, _) | (_, None) => true,
             (Hold::For(hold_ms), Some(last)) => timestamp.saturating_sub(last) >= hold_ms,
+            (Hold::Expire { every_ms, .. }, Some(last)) => {
+                timestamp.saturating_sub(last) >= every_ms
+            }
+        }
+    }
+
+    /// Whether the last quote's life is over at this time.
+    fn expired(&self, timestamp: u64) -> bool {
+        match (self.hold, self.last_quote) {
+            (Hold::Expire { live_ms, .. }, Some(last)) => timestamp.saturating_sub(last) >= live_ms,
+            (Hold::EveryTick | Hold::For(_) | Hold::Expire { .. }, _) => false,
         }
     }
 }
 
 impl BacktestStrategy for DurationQuoter {
     fn on_tick(&mut self, tick: &MarketTick, position: &InventoryPosition) -> Option<Quote> {
+        self.seen = tick.timestamp;
         if !self.due(tick.timestamp) {
             return None;
         }
@@ -237,8 +284,13 @@ impl BacktestStrategy for DurationQuoter {
         self.reports.push(report.kind);
     }
 
+    fn cancels_when_silent(&self) -> bool {
+        self.expired(self.seen)
+    }
+
     fn reset(&mut self) {
         self.last_quote = None;
+        self.seen = 0;
         self.quotes = 0;
         self.reports.clear();
     }
@@ -437,7 +489,7 @@ fn main() {
     );
     for delay_ms in DELAYS_MS {
         println!("\n== every message delayed {delay_ms} ms ==");
-        for hold in HOLDS {
+        for hold in HOLDS.into_iter().chain(EXPIRIES) {
             println!("{hold:?}");
             for seed in SEEDS {
                 let ticks = generate_tape(seed, TAPE_TICKS);
@@ -612,6 +664,226 @@ mod tests {
         assert_eq!(every.quotes, 3);
     }
 
+    const EXPIRE: Hold = Hold::Expire {
+        live_ms: 100,
+        every_ms: 1_000,
+    };
+
+    #[test]
+    fn test_an_expired_quote_leaves_the_book_empty_until_the_next_decision() {
+        // Quotes 99 and 101 at 0, cancelled from 100, and 90 would cross the old bid.
+        let ticks = vec![
+            tick_at(0, dec!(100)),
+            tick_at(100, dec!(100)),
+            tick_at(300, dec!(90)),
+            tick_at(999, dec!(90)),
+        ];
+        let (result, strategy) = run(ticks.clone(), EXPIRE, one_away, cancel_after(10));
+        assert!(result.trades.is_empty(), "{:?}", result.trades);
+        assert_eq!(strategy.quotes, 1);
+        assert_eq!(strategy.count(ExecutionKind::Canceled), 2);
+        // A refresh at the same rate has its first quote live on the same ticks.
+        let (refresh, _) = run(ticks, Hold::For(1_000), one_away, cancel_after(10));
+        assert_eq!(refresh.trades.len(), 1);
+    }
+
+    #[test]
+    fn test_an_expiring_quote_is_live_until_its_life_runs_out() {
+        let ticks = vec![tick_at(0, dec!(100)), tick_at(99, dec!(98.9))];
+        let (result, strategy) = run(ticks, EXPIRE, one_away, SimLatencyConfig::new());
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(strategy.count(ExecutionKind::Canceled), 0);
+    }
+
+    #[test]
+    fn test_a_fill_before_the_cancel_of_an_expiry_takes_effect_stands() {
+        for cross_at in [120, 149] {
+            let (result, strategy) = run(race_tape(cross_at), EXPIRE, one_away, cancel_after(50));
+            assert_eq!(result.trades.len(), 1, "{cross_at}");
+            assert_eq!(result.trades[0].side, Action::Buy);
+            assert_eq!(result.trades[0].price, dec!(99));
+            assert_eq!(result.trades[0].timestamp, cross_at);
+            assert_eq!(result.final_position, ORDER_SIZE);
+            // Nothing replaced it.
+            assert_eq!(strategy.quotes, 1);
+        }
+        for (cross_at, cancel_ms) in [(150, 50), (151, 50), (120, 10), (110, 10)] {
+            let (result, _) = run(
+                race_tape(cross_at),
+                EXPIRE,
+                one_away,
+                cancel_after(cancel_ms),
+            );
+            assert!(result.trades.is_empty(), "{cross_at} {cancel_ms}");
+        }
+    }
+
+    #[test]
+    fn test_a_cancel_of_an_expiry_too_late_for_a_fill_is_rejected_and_the_fill_stays() {
+        let mut ticks = race_tape(120);
+        ticks.push(tick_at(200, dec!(99.5)));
+        let (result, strategy) = run(ticks, EXPIRE, one_away, cancel_after(50));
+        assert_eq!(result.trades.len(), 1);
+        assert_eq!(result.trades[0].timestamp, 120);
+        assert_eq!(result.final_position, ORDER_SIZE);
+        assert_eq!(strategy.count(ExecutionKind::CancelRejected), 1);
+        // The other side of the quote was still live, and goes.
+        assert_eq!(strategy.count(ExecutionKind::Canceled), 1);
+    }
+
+    #[test]
+    fn test_an_expiry_cancels_an_order_still_in_flight_before_it_rests() {
+        // The quote is active at 200, and its cancel at 110 comes before that.
+        let latency = SimLatencyConfig::new()
+            .with_submit_ms(200)
+            .with_cancel_ms(10);
+        let ticks = vec![
+            tick_at(0, dec!(100)),
+            tick_at(100, dec!(100)),
+            tick_at(250, dec!(90)),
+        ];
+        let (result, strategy) = run(ticks.clone(), EXPIRE, one_away, latency);
+        assert!(result.trades.is_empty(), "{:?}", result.trades);
+        assert_eq!(strategy.quotes, 1);
+        // With a cancel too slow to arrive before that tick, the same quote does fill.
+        let slow = latency.with_cancel_ms(200);
+        let (filled, _) = run(ticks, EXPIRE, one_away, slow);
+        assert_eq!(filled.trades.len(), 1);
+    }
+
+    #[test]
+    fn test_expiry_and_the_next_decision_come_exactly_when_due() {
+        let mut quoter = DurationQuoter::new(EXPIRE, one_away);
+        let position = InventoryPosition::new();
+        let at = |quoter: &mut DurationQuoter, time| {
+            let quote = quoter.on_tick(&tick_at(time, dec!(100)), &position);
+            (quote.is_some(), quoter.cancels_when_silent())
+        };
+        assert!(!quoter.cancels_when_silent());
+        assert_eq!(at(&mut quoter, 1_000), (true, false));
+        assert_eq!(at(&mut quoter, 1_099), (false, false));
+        assert_eq!(at(&mut quoter, 1_100), (false, true));
+        assert_eq!(at(&mut quoter, 1_999), (false, true));
+        assert_eq!(at(&mut quoter, 2_000), (true, false));
+        assert_eq!(at(&mut quoter, 2_099), (false, false));
+        assert_eq!(quoter.quotes, 2);
+        quoter.reset();
+        assert_eq!(quoter.seen, 0);
+        assert!(!quoter.cancels_when_silent());
+    }
+
+    #[test]
+    fn test_only_an_expiring_arm_cancels_when_silent() {
+        let position = InventoryPosition::new();
+        // A price never comes after the first, so the later ticks are silent, past any hold.
+        for hold in [Hold::EveryTick, Hold::For(100)] {
+            let mut quoter = DurationQuoter::new(hold, one_away);
+            let _ = quoter.on_tick(&tick_at(0, dec!(100)), &position);
+            quoter.pricer = never;
+            for time in [99, 100, 5_000] {
+                assert!(
+                    quoter
+                        .on_tick(&tick_at(time, dec!(100)), &position)
+                        .is_none()
+                );
+                assert!(!quoter.cancels_when_silent(), "{hold:?} {time}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_quote_rests_for_its_life_plus_the_cancel_less_the_submit() {
+        // Active after 30, with the cancel asked at 50 taking effect at 60: 30 ms of rest.
+        let hold = Hold::Expire {
+            live_ms: 50,
+            every_ms: 1_000,
+        };
+        let latency = SimLatencyConfig::new()
+            .with_submit_ms(30)
+            .with_cancel_ms(10);
+        let fills = |ticks: Vec<MarketTick>| run(ticks, hold, one_away, latency).0.trades;
+        let (start, seen) = (tick_at(0, dec!(100)), tick_at(50, dec!(100)));
+        let cross = |at| tick_at(at, dec!(98.9));
+        assert!(fills(vec![start.clone(), cross(30), seen.clone()]).is_empty());
+        assert_eq!(fills(vec![start.clone(), cross(31), seen.clone()]).len(), 1);
+        assert_eq!(fills(vec![start.clone(), seen.clone(), cross(59)]).len(), 1);
+        assert!(fills(vec![start, seen, cross(60)]).is_empty());
+    }
+
+    #[test]
+    fn test_from_a_delay_of_its_life_every_fill_of_an_expiry_has_a_late_cancel() {
+        let ticks = short_tape(SEEDS[0]);
+        for delay_ms in [50, 200] {
+            let expiring = measure(&ticks, EXPIRIES[0], delay_ms, SEEDS[0]);
+            assert!(expiring.fills > 0);
+            assert_eq!(expiring.late_cancels, expiring.fills, "{delay_ms}");
+        }
+        // Under its life they part: most fills come before the cancel is asked.
+        let expiring = measure(&ticks, EXPIRIES[0], 10, SEEDS[0]);
+        assert!(expiring.late_cancels * 2 < expiring.fills, "{expiring:?}");
+    }
+
+    #[test]
+    fn test_no_price_at_a_decision_leaves_an_expired_quote_cancelled() {
+        let mut quoter = DurationQuoter::new(EXPIRE, one_away);
+        let position = InventoryPosition::new();
+        assert!(quoter.on_tick(&tick_at(0, dec!(100)), &position).is_some());
+        quoter.pricer = never;
+        assert!(
+            quoter
+                .on_tick(&tick_at(1_000, dec!(100)), &position)
+                .is_none()
+        );
+        assert!(quoter.cancels_when_silent());
+        assert_eq!(quoter.quotes, 1);
+    }
+
+    #[test]
+    fn test_a_life_as_long_as_the_decision_interval_is_the_refresh() {
+        // The control of the expiry's decisions. With a price always there, a quote is
+        // always replaced at its end, so this does not reach the silent cancel.
+        let ticks = short_tape(SEEDS[0]);
+        for delay_ms in DELAYS_MS {
+            let measure_of = |hold| measure(&ticks, hold, delay_ms, SEEDS[0]);
+            let expiring = measure_of(Hold::Expire {
+                live_ms: 250,
+                every_ms: 250,
+            });
+            assert_eq!(expiring, measure_of(Hold::For(250)), "{delay_ms}");
+        }
+    }
+
+    #[test]
+    fn test_an_expiry_decides_at_the_rate_of_its_refresh_and_fills_less() {
+        for seed in SEEDS {
+            let ticks = short_tape(seed);
+            for delay_ms in DELAYS_MS {
+                for (expiring, every_ms) in [(EXPIRIES[0], 250), (EXPIRIES[1], 1_000)] {
+                    let expiring = measure(&ticks, expiring, delay_ms, seed);
+                    let refresh = measure(&ticks, Hold::For(every_ms), delay_ms, seed);
+                    assert_eq!(expiring.quotes, refresh.quotes, "{seed} {delay_ms}");
+                    assert!(expiring.fills < refresh.fills, "{seed} {delay_ms}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_on_the_reported_tapes_an_expiry_has_the_worse_markout() {
+        // The negative result of the report, on its own tapes: a shorter life does not
+        // give cleaner fills here, on any seed or delay. Shorter tapes need not agree.
+        for seed in SEEDS {
+            let ticks = generate_tape(seed, TAPE_TICKS);
+            for delay_ms in DELAYS_MS {
+                for (expiring, every_ms) in [(EXPIRIES[0], 250), (EXPIRIES[1], 1_000)] {
+                    let expiring = measure(&ticks, expiring, delay_ms, seed);
+                    let refresh = measure(&ticks, Hold::For(every_ms), delay_ms, seed);
+                    assert!(expiring.markout < refresh.markout, "{seed} {delay_ms}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_the_pricer_gets_the_mid_and_the_delivered_position() {
         fn shifted(mid: Decimal, position: Decimal) -> Option<(Decimal, Decimal)> {
@@ -685,7 +957,7 @@ mod tests {
     fn test_every_fill_reported_is_in_the_result_and_the_position_adds_up() {
         let ticks = short_tape(SEEDS[0]);
         for delay_ms in DELAYS_MS {
-            for hold in HOLDS {
+            for hold in HOLDS.into_iter().chain(EXPIRIES) {
                 let (result, strategy) =
                     run(ticks.clone(), hold, classical_prices, delays(delay_ms));
                 assert_eq!(
@@ -785,7 +1057,7 @@ mod tests {
     fn test_every_arm_reads_the_same_tape_at_the_same_delay() {
         // What differs between two arms is the hold: the ticks seen are the same.
         let ticks = short_tape(SEEDS[0]);
-        for hold in HOLDS {
+        for hold in HOLDS.into_iter().chain(EXPIRIES) {
             let (result, _) = run(ticks.clone(), hold, classical_prices, delays(50));
             assert_eq!(result.num_ticks, ticks.len() as u64);
             assert_eq!(result.start_time, ticks[0].timestamp);
