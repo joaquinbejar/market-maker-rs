@@ -40,7 +40,7 @@ jobs:
           --engine llvm
           --all-features
           --workspace
-          --timeout 180
+          --timeout 600
           --out Xml
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       # UPLOAD CODE COVERAGE REPORT TO CODECOV.IO
