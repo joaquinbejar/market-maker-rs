@@ -50,7 +50,7 @@ hyper = { version = "1.11", features = ["server", "http1"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "macros", "sync", "time"], optional = true }
-optionstratlib = { version = "0.24", default-features = false, features = ["pricing", "clock"], optional = true }
+optionstratlib = { version = "0.24.1", default-features = false, features = ["pricing", "clock"], optional = true }
 chrono = { version = "0.4", optional = true }
 option-chain-orderbook = { version = "0.15", optional = true }
 axum = { version = "0.8", optional = true }
@@ -110,6 +110,11 @@ required-features = ["l3"]
 [[example]]
 name = "vol_surface_validation"
 required-features = ["options"]
+
+[[example]]
+name = "upstream_surface_replay"
+required-features = ["options"]
+test = true
 
 [[example]]
 name = "counterpart"
@@ -175,6 +180,10 @@ required-features = ["kernel"]
 [[test]]
 name = "option_quoting"
 required-features = ["options", "margin", "multi-underlying"]
+
+[[test]]
+name = "upstream_surface"
+required-features = ["options"]
 
 [[test]]
 name = "hyperliquid"

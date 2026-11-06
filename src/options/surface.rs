@@ -62,6 +62,7 @@ pub mod shocks;
 pub mod store;
 /// Raw SVI slices and surfaces of slices.
 pub mod svi;
+pub mod upstream;
 /// Out of sample validation of the SVI fit against a baseline.
 pub mod validation;
 
