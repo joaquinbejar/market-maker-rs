@@ -83,6 +83,17 @@ project follows [Semantic Versioning](https://semver.org/).
   `MAX_SEASONAL_BUCKETS` buckets and serde for the profile.
 - `Scenario::with_fee_rate` (#92): one experiment can vary the fee rate, recorded in
   `ScenarioRecord::fee_rate`.
+- Versioned observation, action and reward spaces (feature `rl`, #99): `rl::RlEnv` drives one
+  kernel for an external RL trainer or engine, and `rl::RlSpec` describes its spaces, with a
+  version per space and a fingerprint that `RlSpec::ensure` checks before any step.
+  Features hold only what a real agent could know at its decision, normalized by constants
+  from the configuration. An action outside the mask is an error or a charged hold, as
+  declared, and the mask reads no hard limit. The reward is `Decimal`, and the `f32` is
+  derived from it: its ledger part is the change of `MetricId::NetPnl` at every decision,
+  which `RlEnv::reconcile` checks against `backtest::evaluation`. The end of the data marks
+  the inventory or closes it at the touch, as declared, and `max_steps` closes nothing. No
+  hedge actions, since the kernel holds one instrument. Checked on synthetic data only;
+  agreement with an external RL engine's adapter is not checked here.
 - `backtest::evaluation::check_contract` (feature `instruments`, #92): refuses a contract
   the attribution cannot value, such as an inverse one, since its records carry no contract.
 - Perpetual funding in `backtest::contracts` (#207): `ContractEngine::with_perpetual`

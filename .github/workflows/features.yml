@@ -67,6 +67,7 @@ jobs:
           - margin
           - instruments
           - kernel
+          - rl
 
     steps:
       - uses: actions/checkout@v4

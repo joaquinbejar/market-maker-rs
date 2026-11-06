@@ -229,6 +229,10 @@ crate's own serialization support.
   exactly equivalent to the engine inside its documented subset. Meant to
   be stepped by an external RL trainer through a bridge crate. No extra
   dependencies.
+- `rl`: Versioned observation, action and reward spaces over the kernel (`rl`),
+  for an external RL trainer or engine: features a real agent could know, masks
+  apart from the hard limits, and a `Decimal` reward that reconciles with
+  `backtest::evaluation`, with the `f32` derived from it. Implies `kernel`.
 
 ### Examples
 

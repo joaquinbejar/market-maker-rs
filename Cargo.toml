@@ -92,6 +92,8 @@ instruments = ["financial_types/instruments", "margin-rs?/instruments"]
 arbitrage = ["instruments", "dep:arbitrage-rs"]
 # Deterministic financial kernel for external RL trainers; no dependencies.
 kernel = []
+# Versioned observation, action and reward spaces over the kernel.
+rl = ["kernel"]
 
 [[example]]
 name = "options_greeks"
