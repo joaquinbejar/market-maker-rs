@@ -21,6 +21,12 @@ project follows [Semantic Versioning](https://semver.org/).
   notional. An order beyond the margin is refused whole. `BacktestEngine::with_instrument` now
   accepts a policy that declares the new `PretradePolicy::in_one_contract`, which defaults to
   `in_contracts`, and still refuses any other.
+- Test `constraint_costs` (#105), behind `margin`: inventory, margin and drawdown costs with
+  sign and scale checked by hand, reported apart from the violations per episode and from the
+  decisions of the hard gate. Scripted proposers ask for more than the account holds, and the
+  unchanged `margin-rs` gate cuts or refuses them, with a control that has no gate. Synthetic,
+  with made-up budgets and no new public API. Nothing is learned, so constrained learning and a
+  penalty are not compared.
 - Example `consistent_time_travel` (#109): chronological replay as the baseline against
   time travel as a separate labelled mode, on a small synthetic environment whose true
   values are exact, with no new public API. It reports discontinuities, reuse of the tape
