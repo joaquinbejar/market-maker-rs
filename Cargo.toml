@@ -135,6 +135,11 @@ name = "chain_market_making"
 required-features = ["chain"]
 
 [[example]]
+name = "chain_pricing_evaluation"
+required-features = ["chain"]
+test = true
+
+[[example]]
 name = "multi_underlying"
 required-features = ["multi-underlying"]
 
