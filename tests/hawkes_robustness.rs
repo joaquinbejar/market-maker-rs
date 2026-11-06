@@ -955,6 +955,10 @@ fn test_a_table_row_prints_each_figure_under_its_header() {
     // Twenty episodes, so the worst 5% is the one at -40.
     let mut episodes = vec![episode(2.0, 3, 5.0, 7.0, dec!(4)); 19];
     episodes.push(episode(-40.0, 3, 5.0, 7.0, inventory_limit()));
+    for one in &mut episodes {
+        one.max_shortfall = 9.0;
+    }
+    episodes[0].left_healthy = true;
     let row = table_row(Policy::Fixed, "base", BASE, &episodes);
     let cells: Vec<&str> = row.split('|').map(str::trim).collect();
     assert_eq!(cells[1], "Fixed");
@@ -967,6 +971,8 @@ fn test_a_table_row_prints_each_figure_under_its_header() {
     assert_eq!(cells[8], "10");
     assert_eq!(cells[9], "1");
     assert!(cells[10].starts_with("3.000 "), "{}", cells[10]);
+    assert!(cells[11].starts_with("9.000 "), "{}", cells[11]);
+    assert_eq!(cells[12], "1");
 }
 
 /// How many fills in the holdout were at a quote through the mid when it was set: the limit
@@ -1031,7 +1037,6 @@ fn table_row(policy: Policy, arm: &str, scenario: Scenario, episodes: &[Episode]
     )
 }
 
-/// The evidence table. `--ignored --nocapture`, in release.
 /// The evidence table. `--ignored --nocapture`, in release, with the `margin` feature.
 #[test]
 #[ignore = "the study itself: several minutes without --release"]
@@ -1090,4 +1095,24 @@ fn test_a_shortfall_at_the_last_mid_is_sampled_with_the_position_at_that_mid() {
     let held = scripted(Policy::Fixed, 0.0, &events, &[true; 8]);
     assert_eq!(held.max_shortfall, 0.0);
     assert!(!held.left_healthy);
+}
+
+/// The same fall as above, inside the loop: the order at 9 s misses, with the mid at 99, and
+/// the mid comes back by the end. So the shortfall is read there, at that mid.
+#[test]
+fn test_a_shortfall_inside_the_loop_is_read_at_the_mid_of_that_moment() {
+    let events: Vec<_> = (1..=9).map(|i| market(f64::from(i), Side::Bid)).collect();
+    let back = 1.0 / (SIGMA * (HORIZON_SECONDS - 9.0).sqrt());
+    let mut steps = std::iter::repeat_n(0.0, 8).chain([-50.0, back]);
+    let mut draws = std::iter::repeat_n(0.0, 8).chain([1.0]);
+    let e = run_path(
+        Policy::Fixed,
+        0.0,
+        &events,
+        || steps.next().unwrap(),
+        || draws.next().unwrap(),
+    );
+    assert_eq!(e.fills, 8);
+    close(e.max_shortfall, 7.27996);
+    assert_eq!(e.terminal_shortfall, 0.0);
 }
