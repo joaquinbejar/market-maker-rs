@@ -63,6 +63,8 @@ pub const MAX_THINNING: u32 = 1_000_000;
 pub const MAX_RUN_EVENTS: usize = 50_000_000;
 /// The most intervals or probes one segment is measured over.
 pub const MAX_INTERVALS: f64 = 100_000_000.0;
+/// Most buckets in a [`SeasonalProfile`].
+pub const MAX_SEASONAL_BUCKETS: usize = 1_000_000;
 const EVENT_TYPES: usize = 3;
 const KINDS: [QrEventKind; EVENT_TYPES] =
     [QrEventKind::Limit, QrEventKind::Cancel, QrEventKind::Market];
@@ -1246,9 +1248,65 @@ pub fn fit_poisson(segments: &[HawkesSegment], max_queue: u32) -> MMResult<Hawke
 /// and simulate in model time, and score with [`score_flow_seasonal`]. A segment's time 0 is
 /// the start of the period, so segments must be aligned to it.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(into = "RawProfile", try_from = "RawProfile"))]
 pub struct SeasonalProfile {
     bucket_seconds: f64,
     multipliers: Vec<f64>,
+}
+
+/// The stored form of a [`SeasonalProfile`], checked when read back.
+#[cfg(feature = "serde")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProfile {
+    bucket_seconds: f64,
+    multipliers: Vec<f64>,
+}
+
+#[cfg(feature = "serde")]
+impl From<SeasonalProfile> for RawProfile {
+    fn from(profile: SeasonalProfile) -> Self {
+        Self {
+            bucket_seconds: profile.bucket_seconds,
+            multipliers: profile.multipliers,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawProfile> for SeasonalProfile {
+    type Error = MMError;
+
+    /// Keeps the stored multipliers as they are, so that a profile reads back equal: a
+    /// second normalization could move them by a rounding.
+    fn try_from(raw: RawProfile) -> MMResult<Self> {
+        check_profile(raw.bucket_seconds, &raw.multipliers)?;
+        let mean = raw.multipliers.iter().sum::<f64>() / as_float(raw.multipliers.len());
+        if (mean - 1.0).abs() > 1e-9 {
+            return invalid(format!("stored profile of mean {mean}"));
+        }
+        Ok(Self {
+            bucket_seconds: raw.bucket_seconds,
+            multipliers: raw.multipliers,
+        })
+    }
+}
+
+/// Bounded, so that each bucket keeps a span in model time and the change inverts.
+fn check_profile(bucket_seconds: f64, multipliers: &[f64]) -> MMResult<()> {
+    let bounded = 1.0 / MAX_RATE..=MAX_RATE;
+    if !bounded.contains(&bucket_seconds)
+        || multipliers.is_empty()
+        || multipliers.len() > MAX_SEASONAL_BUCKETS
+        || multipliers.iter().any(|m| !bounded.contains(m))
+    {
+        return invalid(format!(
+            "profile of {} buckets of {bucket_seconds}",
+            multipliers.len()
+        ));
+    }
+    Ok(())
 }
 
 impl SeasonalProfile {
@@ -1257,28 +1315,22 @@ impl SeasonalProfile {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a bucket out of
-    /// `[1 / MAX_RATE, MAX_RATE]`, no multipliers, or one that is not finite and positive,
-    /// or out of `[1 / MAX_RATE, MAX_RATE]` after the normalization.
+    /// `[1 / MAX_RATE, MAX_RATE]`, no multipliers or more than [`MAX_SEASONAL_BUCKETS`], or
+    /// one that is not finite and positive, or out of `[1 / MAX_RATE, MAX_RATE]` after the
+    /// normalization.
     pub fn new(bucket_seconds: f64, multipliers: Vec<f64>) -> MMResult<Self> {
-        if !bucket_seconds.is_finite()
-            || !(1.0 / MAX_RATE..=MAX_RATE).contains(&bucket_seconds)
-            || multipliers.is_empty()
-            || multipliers.iter().any(|m| !m.is_finite() || *m <= 0.0)
-        {
-            return invalid(format!("profile {bucket_seconds} {multipliers:?}"));
+        if multipliers.is_empty() || multipliers.iter().any(|m| !m.is_finite() || *m <= 0.0) {
+            return invalid(format!(
+                "profile of {} buckets of {bucket_seconds}",
+                multipliers.len()
+            ));
         }
         let mean = multipliers.iter().sum::<f64>() / as_float(multipliers.len());
         if !mean.is_finite() || mean <= 0.0 {
             return invalid(format!("profile mean {mean}"));
         }
         let multipliers: Vec<f64> = multipliers.iter().map(|m| m / mean).collect();
-        // Bounded, so that each bucket keeps a span in model time and the change inverts.
-        if multipliers
-            .iter()
-            .any(|m| !(1.0 / MAX_RATE..=MAX_RATE).contains(m))
-        {
-            return invalid(format!("profile out of range: {multipliers:?}"));
-        }
+        check_profile(bucket_seconds, &multipliers)?;
         Ok(Self {
             bucket_seconds,
             multipliers,
@@ -1322,6 +1374,9 @@ impl SeasonalProfile {
     }
 
     /// `τ(t)`, of clock time `t`.
+    ///
+    /// Monotonic only within rounding at a bucket's edge, where two close times can swap by
+    /// about `1e-16` of the time. [`Self::segment_to_model_time`] keeps a segment in order.
     #[must_use]
     pub fn to_model_time(&self, t: f64) -> f64 {
         let (whole, index) = self.bucket_of(t);
@@ -1350,30 +1405,36 @@ impl SeasonalProfile {
         clock
     }
 
-    /// A segment in model time, to fit or to score.
+    /// A segment in model time, to fit or to score. Its order survives the rounding of the
+    /// map: an event that would step back takes the time of the one before it.
     #[must_use]
     pub fn segment_to_model_time(&self, segment: &HawkesSegment) -> HawkesSegment {
         self.map_segment(segment, |t| self.to_model_time(t))
     }
 
-    /// A segment simulated in model time, in clock time.
+    /// A segment simulated in model time, in clock time, its order kept in the same way.
     #[must_use]
     pub fn segment_to_clock_time(&self, segment: &HawkesSegment) -> HawkesSegment {
         self.map_segment(segment, |t| self.to_clock_time(t))
     }
 
     fn map_segment(&self, segment: &HawkesSegment, map: impl Fn(f64) -> f64) -> HawkesSegment {
+        let mut last = 0.0f64;
+        let events: Vec<HawkesEvent> = segment
+            .events
+            .iter()
+            .map(|event| {
+                last = last.max(map(event.time_seconds));
+                HawkesEvent {
+                    time_seconds: last,
+                    kind: event.kind,
+                }
+            })
+            .collect();
         HawkesSegment {
             initial_queue: segment.initial_queue,
-            duration_seconds: map(segment.duration_seconds),
-            events: segment
-                .events
-                .iter()
-                .map(|event| HawkesEvent {
-                    time_seconds: map(event.time_seconds),
-                    kind: event.kind,
-                })
-                .collect(),
+            duration_seconds: map(segment.duration_seconds).max(last),
+            events,
         }
     }
 }
@@ -1385,8 +1446,9 @@ impl SeasonalProfile {
 ///
 /// # Errors
 ///
-/// Returns [`MMError::InvalidConfiguration`] for an invalid bucket, no buckets or a segment
-/// of more than [`MAX_INTERVALS`] buckets, and
+/// Returns [`MMError::InvalidConfiguration`] for an invalid bucket, no buckets or more than
+/// [`MAX_SEASONAL_BUCKETS`], refused before allocating, a segment of more than
+/// [`MAX_INTERVALS`] buckets, and
 /// [`MMError::InvalidMarketState`] for a segment out of order, or a bucket with no time
 /// observed or too few events, which is refused rather than filled in.
 pub fn fit_seasonality(
@@ -1396,7 +1458,8 @@ pub fn fit_seasonality(
     buckets: usize,
     min_events: u64,
 ) -> MMResult<SeasonalProfile> {
-    if max_queue == 0 || max_queue > MAX_QUEUE || min_events == 0 {
+    if buckets > MAX_SEASONAL_BUCKETS || max_queue == 0 || max_queue > MAX_QUEUE || min_events == 0
+    {
         return invalid(format!(
             "{buckets} buckets, cap {max_queue}, {min_events} events"
         ));

@@ -1160,3 +1160,121 @@ fn test_profile_keeps_each_bucket_a_span_in_model_time() {
     let back = p.to_clock_time(p.to_model_time(inside));
     assert!((back - inside).abs() < 1e-15, "{back}");
 }
+
+#[test]
+fn test_fit_seasonality_refuses_too_many_buckets_before_allocating() {
+    for buckets in [MAX_SEASONAL_BUCKETS + 1, usize::MAX] {
+        assert!(matches!(
+            fit_seasonality(&[], 1, 1.0, buckets, 1),
+            Err(MMError::InvalidConfiguration(_))
+        ));
+    }
+    // At the bound it gets as far as the data, which has seen no bucket.
+    assert!(matches!(
+        fit_seasonality(&[], 1, 1.0, MAX_SEASONAL_BUCKETS, 1),
+        Err(MMError::InvalidMarketState(_))
+    ));
+    assert!(matches!(
+        SeasonalProfile::new(1.0, vec![1.0; MAX_SEASONAL_BUCKETS + 1]),
+        Err(MMError::InvalidConfiguration(_))
+    ));
+    assert!(SeasonalProfile::new(1.0, vec![1.0; MAX_SEASONAL_BUCKETS]).is_ok());
+}
+
+#[test]
+fn test_fit_seasonality_refuses_a_segment_out_of_order() {
+    let at = |time_seconds| HawkesEvent {
+        time_seconds,
+        kind: QrEventKind::Limit,
+    };
+    let segment = HawkesSegment {
+        initial_queue: 0,
+        duration_seconds: 10.0,
+        events: vec![at(5.0), at(4.0)],
+    };
+    assert!(matches!(
+        fit_seasonality(&[segment], 8, 10.0, 1, 1),
+        Err(MMError::InvalidMarketState(_))
+    ));
+}
+
+#[test]
+fn test_profile_bucket_and_multipliers_have_a_range() {
+    let one = || vec![1.0];
+    assert!(SeasonalProfile::new(MAX_RATE, one()).is_ok());
+    assert!(SeasonalProfile::new(1.0 / MAX_RATE, one()).is_ok());
+    assert!(SeasonalProfile::new(MAX_RATE * 2.0, one()).is_err());
+    assert!(SeasonalProfile::new(0.5 / MAX_RATE, one()).is_err());
+    // Positive, and still out of range after the normalization.
+    assert!(SeasonalProfile::new(1.0, vec![1.0, 1e-12]).is_err());
+}
+
+#[test]
+fn test_segment_ending_mid_period_maps_its_duration_both_ways() {
+    let p = SeasonalProfile::new(10.0, vec![0.5, 1.5]).unwrap();
+    let at = |time_seconds| HawkesEvent {
+        time_seconds,
+        kind: QrEventKind::Limit,
+    };
+    let clock = HawkesSegment {
+        initial_queue: 0,
+        duration_seconds: 14.0,
+        events: vec![at(4.0), at(12.0)],
+    };
+    // 5 + 1.5 * 4 = 11, 0.5 * 4 = 2, 5 + 1.5 * 2 = 8.
+    let model = p.segment_to_model_time(&clock);
+    assert_eq!(model.duration_seconds, 11.0);
+    assert_eq!(model.events[0].time_seconds, 2.0);
+    assert_eq!(model.events[1].time_seconds, 8.0);
+    assert_eq!(p.segment_to_clock_time(&model), clock);
+}
+
+#[test]
+fn test_a_mapped_segment_stays_in_order_across_bucket_edges() {
+    // Pairs of times as close as a float allows, either side of many edges.
+    for (bucket, multipliers) in [(0.3, vec![0.7, 1.3, 1.1]), (33.3, vec![0.9, 1.7, 0.4])] {
+        let p = SeasonalProfile::new(bucket, multipliers).unwrap();
+        let mut events = Vec::new();
+        for edge in 1..200_000u32 {
+            let t = f64::from(edge) * bucket;
+            for time_seconds in [t.next_down(), t, t.next_up()] {
+                events.push(HawkesEvent {
+                    time_seconds,
+                    kind: QrEventKind::Limit,
+                });
+            }
+        }
+        let duration_seconds = 200_000.0 * bucket;
+        let model = p.segment_to_model_time(&HawkesSegment {
+            initial_queue: 0,
+            duration_seconds,
+            events,
+        });
+        assert!(model.duration_seconds >= model.events.last().unwrap().time_seconds);
+        assert!(
+            model
+                .events
+                .windows(2)
+                .all(|w| w[0].time_seconds <= w[1].time_seconds)
+        );
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_profile_serde_reads_back_equal_and_refuses_what_new_refuses() {
+    let p = busy_profile();
+    let json = serde_json::to_string(&p).unwrap();
+    assert_eq!(serde_json::from_str::<SeasonalProfile>(&json).unwrap(), p);
+    for bad in [
+        r#"{"bucket_seconds":0.0,"multipliers":[1.0]}"#,
+        r#"{"bucket_seconds":1.0,"multipliers":[]}"#,
+        r#"{"bucket_seconds":1.0,"multipliers":[2.0,2.0]}"#,
+        r#"{"bucket_seconds":1.0,"multipliers":[1.0],"x":1}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<SeasonalProfile>(bad).is_err(),
+            "{bad}"
+        );
+    }
+}
