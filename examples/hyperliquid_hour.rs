@@ -14,6 +14,7 @@
 //!
 //! The tick is declared, and the report shows what the prices seen are multiples of. Fees and
 //! funding are in no file here. The book starts empty, so nothing below claims it is complete.
+//! A silence over [`RESET_GAP_NS`] empties the book and restarts the warm-up.
 
 use std::fs;
 use std::io::BufReader;
@@ -31,6 +32,8 @@ use rust_decimal::prelude::FromStr;
 const MAX_HOURS_KEPT: usize = 24;
 /// Limits a depth counts up to.
 const LIMITS: u8 = 3;
+/// The silence that resets the replay. Declared here: the capture's own gaps are of minutes.
+const RESET_GAP_NS: u64 = 60 * 1_000_000_000;
 /// Fewest events a limit's size is estimated from.
 const MIN_EVENTS: u64 = 30;
 /// FNV-1a 64 offset and prime, to tell inputs apart in a report.
@@ -84,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Decimal::from_str(tick)?,
         LIMITS,
         minutes * 60 * 1_000_000_000,
+        RESET_GAP_NS,
     )?;
     let mut replay = Replay::new(config);
     let (mut events, mut tops, mut market, mut prices, mut references, mut exposures) =
@@ -167,8 +171,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         coverage.partial_last_status,
     );
     println!(
-        "Longest time between diffs: {:.3} s. The book carries over any gap.",
+        "Longest time between diffs: {:.3} s, between trades: {:.3} s.",
         coverage.longest_gap_ns as f64 / 1e9,
+        coverage.longest_trade_gap_ns as f64 / 1e9,
+    );
+    println!(
+        "A silence over {} s resets the replay: {} on diffs, {} on trades, {} orders cut there.",
+        RESET_GAP_NS / 1_000_000_000,
+        coverage.resets_on_diffs,
+        coverage.resets_on_trades,
+        coverage.orders_cut_by_reset,
     );
     println!(
         "Tick: declared {tick}, {} prices off it. Prices seen are multiples of {:?}: observed, \

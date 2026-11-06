@@ -21,6 +21,13 @@
 //!   whatever rested from November. So depth is unreliable at first, every event before
 //!   [`ReplayConfig::warmup_ns`] is [`Warmth::Cold`], and passing it proves nothing: the counts
 //!   in [`Coverage`] are what there is. No continuity is claimed, across hours or at the start.
+//! - **Gaps in the capture.** A replay carried over a gap goes wrong: it misses what the gap held,
+//!   and shows crossed touches and repeated adds afterwards. So a silence longer than
+//!   [`ReplayConfig::reset_gap_ns`], in the diffs or in the trades, empties the book and restarts
+//!   the warm-up, and what spans it is cut: see [`BookEvent::epoch`]. The threshold is declared,
+//!   and a quiet market can pass it too, which costs a warm-up and nothing else.
+//! - **Repeated trades.** Nothing here removes any. The dataset's trade hash can be null, and
+//!   distinct records can agree on time, side, price, size and hash, so no field is a key.
 //! - **The tick and the lot.** [`Coverage::price_grid`] is what the prices seen are multiples of,
 //!   an observation that does not prove a rule. [`ReplayConfig::tick`] is declared by the caller.
 //! - **Fees and funding.** They are in no file here, so they stay inputs of whatever consumes
@@ -522,6 +529,9 @@ pub struct BookEvent {
     pub level_before: Decimal,
     /// The mid before the event, if the touch was two sided.
     pub mid_before: Option<Decimal>,
+    /// How many resets came before it. Nothing spans two epochs: the book, the waiting times and
+    /// the segments all start again.
+    pub epoch: u64,
 }
 
 /// How a trade's price stood against the rebuilt touch just before its block.
@@ -599,9 +609,16 @@ pub struct Coverage {
     pub order_mismatches: u64,
     /// Fills whose last status was a partial one, left with an unknown cause.
     pub partial_last_status: u64,
-    /// The longest time between two consecutive diffs, in nanoseconds. A missing hour shows here;
-    /// the book carries over it regardless, with whatever it missed.
+    /// The longest time between two consecutive diffs, in nanoseconds. A missing hour shows here.
     pub longest_gap_ns: u64,
+    /// The longest time between two consecutive trades, in nanoseconds.
+    pub longest_trade_gap_ns: u64,
+    /// Times a silence in the diffs reset the replay.
+    pub resets_on_diffs: u64,
+    /// Times a silence in the trades reset the replay.
+    pub resets_on_trades: u64,
+    /// Orders resting at a reset, whose lives were cut there and reached no exposure.
+    pub orders_cut_by_reset: u64,
 }
 
 /// Settings of a replay.
@@ -612,8 +629,12 @@ pub struct ReplayConfig {
     pub tick: Decimal,
     /// Limits a depth is counted up to.
     pub limits: u8,
-    /// How long after the first time events stay [`Warmth::Cold`], in nanoseconds.
+    /// How long after the first time, or after a reset, events stay [`Warmth::Cold`], in
+    /// nanoseconds.
     pub warmup_ns: u64,
+    /// The silence that resets the replay, in nanoseconds: more than this between two diffs or
+    /// two trades. `u64::MAX` never resets, and carries the book over any gap.
+    pub reset_gap_ns: u64,
 }
 
 impl ReplayConfig {
@@ -622,7 +643,7 @@ impl ReplayConfig {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a tick that is not positive or no limits.
-    pub fn new(tick: Decimal, limits: u8, warmup_ns: u64) -> MMResult<Self> {
+    pub fn new(tick: Decimal, limits: u8, warmup_ns: u64, reset_gap_ns: u64) -> MMResult<Self> {
         if tick <= Decimal::ZERO || limits == 0 {
             return Err(MMError::InvalidConfiguration(format!(
                 "invalid replay settings: tick {tick}, {limits} limits"
@@ -632,6 +653,7 @@ impl ReplayConfig {
             tick,
             limits,
             warmup_ns,
+            reset_gap_ns,
         })
     }
 }
@@ -720,6 +742,8 @@ pub struct Replay {
     orders: HashMap<u64, Resting>,
     first_time: Option<u64>,
     last_time: Option<u64>,
+    last_trade_time: Option<u64>,
+    epoch: u64,
     last_mid: Option<Decimal>,
     last_top: Option<(Decimal, Decimal, Decimal, Decimal)>,
     inherited_in_block: bool,
@@ -747,6 +771,8 @@ impl Replay {
             orders: HashMap::new(),
             first_time: None,
             last_time: None,
+            last_trade_time: None,
+            epoch: 0,
             last_mid: None,
             last_top: None,
             inherited_in_block: false,
@@ -875,10 +901,27 @@ impl Replay {
         if let Some(last) = self.last_time {
             let gap = time.timestamp_ns.saturating_sub(last);
             self.coverage.longest_gap_ns = self.coverage.longest_gap_ns.max(gap);
+            if gap > self.config.reset_gap_ns {
+                self.coverage.resets_on_diffs = self.coverage.resets_on_diffs.saturating_add(1);
+                self.reset(time.timestamp_ns);
+            }
         }
         self.last_time = Some(time.timestamp_ns);
         self.first_time.get_or_insert(time.timestamp_ns);
         Some(time)
+    }
+
+    /// Forgets the book and what follows from it, and starts the warm-up at `time`.
+    fn reset(&mut self, time: u64) {
+        let cut = u64::try_from(self.orders.len()).unwrap_or(u64::MAX);
+        self.coverage.orders_cut_by_reset = self.coverage.orders_cut_by_reset.saturating_add(cut);
+        self.bids.clear();
+        self.asks.clear();
+        self.orders.clear();
+        self.last_mid = None;
+        self.last_top = None;
+        self.first_time = Some(time);
+        self.epoch = self.epoch.saturating_add(1);
     }
 
     fn warmth(&self, time: u64) -> Warmth {
@@ -902,6 +945,16 @@ impl Replay {
                 break;
             }
             *next = next.saturating_add(1);
+            if let Some(last) = self.last_trade_time {
+                let gap = trade.timestamp_ns.saturating_sub(last);
+                self.coverage.longest_trade_gap_ns = self.coverage.longest_trade_gap_ns.max(gap);
+                if gap > self.config.reset_gap_ns {
+                    self.coverage.resets_on_trades =
+                        self.coverage.resets_on_trades.saturating_add(1);
+                    self.reset(trade.timestamp_ns);
+                }
+            }
+            self.last_trade_time = Some(trade.timestamp_ns);
             let warmth = self.warmth(trade.timestamp_ns);
             let touch = self.touch();
             let inherited = self.inherited_in_block;
@@ -1211,6 +1264,7 @@ impl Replay {
             depth,
             level_before,
             mid_before,
+            epoch: self.epoch,
         });
         Ok(())
     }
@@ -1306,7 +1360,8 @@ fn in_event_sizes(level: Decimal, event_size: Decimal) -> MMResult<u32> {
 
 /// Converts events into the queue reactive model's observations, with `event_sizes` per limit
 /// from `estimate_event_sizes` on the same window. A move of the mid restarts the waiting times,
-/// as the model's estimator does.
+/// as the model's estimator does. A reset leaves no two sided touch, so no observation waits from
+/// before it: the first one after it follows a move.
 ///
 /// # Errors
 ///
@@ -1398,6 +1453,8 @@ pub struct HawkesConversion {
     /// Periods left out because, in event sizes, a departure found the queue empty, which the
     /// model refuses. Real events have their own sizes, so this happens.
     pub inconsistent: u64,
+    /// Periods left out because a reset cut them: no move ended them.
+    pub cut_by_reset: u64,
 }
 
 /// Whether a path of unit events from `initial` ever departs from an empty queue.
@@ -1419,7 +1476,8 @@ fn departs_from_empty(segment: &HawkesSegment) -> bool {
 
 /// Converts events at the first limit of a side into one segment per period at a constant mid.
 /// A segment starts at the first event kept, with the queue before it counted in `event_size`,
-/// rounded, and ends at the move. The last period, with no move to end it, is left out.
+/// rounded, and ends at the move. The last period, with no move to end it, is left out, and so
+/// is one a reset cuts.
 ///
 /// # Errors
 ///
@@ -1438,8 +1496,15 @@ pub fn hawkes_segments(
     let mut mid = None;
     let mut before = 0u64;
     let mut open: Option<(u64, HawkesRecord)> = None;
+    let mut epoch = events.first().map_or(0, |event| event.epoch);
     for event in events {
         let now = event.time.timestamp_ns;
+        if event.epoch != epoch {
+            epoch = event.epoch;
+            if open.take().is_some() {
+                conversion.cut_by_reset = conversion.cut_by_reset.saturating_add(1);
+            }
+        }
         // The move happened on the event before the one that first sees it.
         if event.mid_before != mid {
             if let Some((start, mut record)) = open.take() {
