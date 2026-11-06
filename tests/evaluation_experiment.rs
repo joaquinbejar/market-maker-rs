@@ -972,3 +972,126 @@ fn test_manifest_records_the_regime_labeller() {
     assert_ne!(first, second);
     assert_ne!(first, none);
 }
+
+/// Quotes on its first tick and is silent afterwards. The fixture moves at most 1 a
+/// tick, so 1.5 from the mid cannot fill on the next tick, before the first silence.
+struct QuoteOnce {
+    cancels: bool,
+    quoted: bool,
+}
+
+impl BacktestStrategy for QuoteOnce {
+    fn on_tick(&mut self, tick: &MarketTick, _position: &InventoryPosition) -> Option<Quote> {
+        if std::mem::replace(&mut self.quoted, true) {
+            return None;
+        }
+        Some(Quote {
+            bid_price: tick.mid_price() - dec!(1.5),
+            bid_size: dec!(0.5),
+            ask_price: tick.mid_price() + dec!(1.5),
+            ask_size: dec!(0.5),
+            timestamp: tick.timestamp,
+        })
+    }
+    fn on_fill(&mut self, _fill: &SimulatedFill) {}
+    fn cancels_when_silent(&self) -> bool {
+        self.cancels
+    }
+    fn reset(&mut self) {
+        self.quoted = false;
+    }
+}
+
+#[test]
+fn test_experiment_runs_a_strategy_as_the_engine_does_when_it_goes_silent() {
+    let window: Vec<MarketTick> = ticks()
+        .into_iter()
+        .filter(|t| (4 * DAY..8 * DAY).contains(&t.timestamp))
+        .collect();
+    for (cancels, name) in [(true, "cancels"), (false, "rests")] {
+        let direct = market_maker_rs::backtest::BacktestEngine::new(
+            experiment_config().execution.with_record_trades(true),
+            QuoteOnce {
+                cancels,
+                quoted: false,
+            },
+            market_maker_rs::backtest::VecDataSource::new(window.clone()),
+        )
+        .run();
+        let candidate = Candidate::model(name, BTreeMap::new(), move |_| {
+            Ok(Box::new(QuoteOnce {
+                cancels,
+                quoted: false,
+            }) as Box<dyn BacktestStrategy>)
+        });
+        let validated = Experiment::new(
+            experiment_config(),
+            ticks(),
+            with(vec![candidate]),
+            vec![immediate()],
+        )
+        .unwrap()
+        .evaluate_validation();
+        let metrics = completed(row(&validated.report().rows, name, "immediate"));
+        assert_eq!(metrics.metrics.fills, direct.num_trades, "{name}");
+        assert_eq!(
+            metrics.metrics.attribution.net_pnl, direct.net_pnl,
+            "{name}"
+        );
+        assert_eq!(
+            direct.num_trades > 0,
+            !cancels,
+            "the fixture must tell them apart"
+        );
+    }
+}
+
+fn validation_interval(config: ExperimentConfig) -> (f64, f64, f64, u32) {
+    let validated = Experiment::new(
+        config,
+        ticks(),
+        with(vec![quoter("a", dec!(0.25))]),
+        vec![immediate()],
+    )
+    .unwrap()
+    .evaluate_validation();
+    interval(completed(row(&validated.report().rows, "a", "immediate")).mean_daily_net)
+}
+
+#[test]
+fn test_the_bootstrap_seed_drives_the_resampling_and_the_experiment_seed_does_not() {
+    let base = validation_interval(experiment_config());
+    let mut other = experiment_config();
+    other.bootstrap.seed += 1;
+    let moved = validation_interval(other);
+    assert_eq!(base.0, moved.0, "the point estimate does not resample");
+    assert!((base.1, base.2) != (moved.1, moved.2));
+    // The immediate model ignores its seed, so this seed changes nothing here.
+    let mut other = experiment_config();
+    other.seed += 1;
+    assert_eq!(base, validation_interval(other));
+}
+
+#[test]
+fn test_validation_digest_moves_with_the_rows() {
+    let digest = |half_spread: Decimal| {
+        Experiment::new(
+            experiment_config(),
+            ticks(),
+            with(vec![quoter("a", half_spread)]),
+            vec![immediate()],
+        )
+        .unwrap()
+        .evaluate_validation()
+        .select(&["a"])
+        .unwrap()
+        .run_holdout()
+        .manifest
+        .validation_digest
+        .unwrap()
+    };
+    let base = digest(dec!(0.25));
+    assert!(!base.is_empty());
+    assert_eq!(base, digest(dec!(0.25)));
+    assert_ne!(base, digest(dec!(0.75)));
+}

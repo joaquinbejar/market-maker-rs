@@ -405,6 +405,9 @@ impl BacktestStrategy for BoxedStrategy {
     fn on_execution_report(&mut self, report: &crate::backtest::lifecycle::ExecutionReport) {
         self.0.on_execution_report(report);
     }
+    fn cancels_when_silent(&self) -> bool {
+        self.0.cancels_when_silent()
+    }
     fn reset(&mut self) {
         self.0.reset();
     }
@@ -1411,5 +1414,114 @@ mod tests {
 
     fn dec(value: i64) -> Decimal {
         Decimal::from(value)
+    }
+
+    #[test]
+    fn test_interval_bounds_are_the_declared_order_statistics() {
+        // 90 % of 500 replicates leaves (100 - 90) * 500 / 200 = 25 on each side.
+        let series: Vec<Decimal> = (0..20).map(|i| Decimal::from(i * i % 13)).collect();
+        let values: Vec<f64> = series.iter().map(|v| v.to_f64().unwrap()).collect();
+        let mut means = resampled_means(&values, &config(2), 5);
+        means.sort_by(f64::total_cmp);
+        let BootstrapOutcome::Interval { lower, upper, .. } =
+            bootstrap(&series, &config(2), 5).unwrap()
+        else {
+            panic!("no interval");
+        };
+        assert_eq!(lower, means[25]);
+        assert_eq!(upper, means[474]);
+        assert!(
+            means[25] < means[50],
+            "the fixture must tell the ranks apart"
+        );
+    }
+
+    fn tampered_rows(tamper: fn(&mut BacktestResult)) -> Vec<EvaluationRow> {
+        let real = Scenario::new("tampered", SimLatencyConfig::new(), BTreeMap::new(), |_| {
+            crate::backtest::ImmediateFillModel::new()
+        });
+        let run = real.run;
+        let scenario = Scenario {
+            run: Box::new(move |request| {
+                let mut raw = run(request)?;
+                tamper(&mut raw.result);
+                Ok(raw)
+            }),
+            name: real.name,
+            latency: real.latency,
+            fee_rate: real.fee_rate,
+            parameters: real.parameters,
+            fill_model_description: real.fill_model_description,
+        };
+        let day = 86_400_000_u64;
+        let ticks: Vec<MarketTick> = (0..72_u64)
+            .map(|i| {
+                let mid = Decimal::from(100 + (i % 5) * 2);
+                MarketTick::new(
+                    i * 3_600_000,
+                    mid - Decimal::ONE,
+                    Decimal::ONE,
+                    mid + Decimal::ONE,
+                    Decimal::ONE,
+                )
+            })
+            .collect();
+        let config = ExperimentConfig {
+            name: "tampered".to_string(),
+            execution: BacktestConfig::new()
+                .with_tick_size(Decimal::ONE)
+                .with_lot_size(Decimal::ONE),
+            splits: Splits::new(0, day, 2 * day, 3 * day).unwrap(),
+            metrics: MetricsSpec {
+                horizons_ms: vec![3_600_000],
+                max_mark_delay_ms: 0,
+            },
+            bootstrap: config(1),
+            seed: 1,
+            provenance: Provenance {
+                commit: "c".to_string(),
+                toolchain: "t".to_string(),
+            },
+        };
+        let candidates = vec![Candidate::fixed_spread(Decimal::ONE, Decimal::ONE)];
+        Experiment::new(config, ticks, candidates, vec![scenario])
+            .unwrap()
+            .evaluate_validation()
+            .report()
+            .rows
+            .clone()
+    }
+
+    fn failure(tamper: fn(&mut BacktestResult)) -> String {
+        match &tampered_rows(tamper)[0].outcome {
+            RowOutcome::Failed { reason } => reason.clone(),
+            other => panic!("a bad run was reported as a result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_an_untampered_run_completes() {
+        let rows = tampered_rows(|_| {});
+        assert!(matches!(rows[0].outcome, RowOutcome::Completed(_)));
+    }
+
+    #[test]
+    fn test_an_inconsistent_run_is_a_failed_row() {
+        let reason = failure(|r| r.accounting.dropped_fills = 1);
+        assert!(reason.starts_with("accounting"), "{reason}");
+    }
+
+    #[test]
+    fn test_a_run_that_stops_early_is_a_failed_row() {
+        let reason = failure(|r| r.num_ticks -= 1);
+        assert!(reason.contains("the run stopped"), "{reason}");
+    }
+
+    #[test]
+    fn test_a_run_that_does_not_reconcile_is_a_failed_row() {
+        let reason = failure(|r| r.net_pnl += Decimal::new(1, 8));
+        assert!(reason.contains("does not reconcile"), "{reason}");
+        let reason = failure(|r| r.final_position += Decimal::ONE);
+        assert!(reason.contains("does not reconcile"), "{reason}");
     }
 }
