@@ -347,6 +347,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `optionstratlib` 0.24 and `option-chain-orderbook` 0.15 (breaking, as their types are in this
+  crate's public API). `ExpirationDate`'s conversions from the wall clock now need the `clock`
+  feature, which `options` turns on, so results are unchanged.
 - `MarginLedgerAccountant::snapshot` keeps running sums instead of walking the
   journal, so a run costs linear rather than quadratic time in its fills. The
   values and the errors are the same: a sum that overflows stays an error until
