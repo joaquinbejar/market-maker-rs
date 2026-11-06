@@ -992,7 +992,10 @@ impl Replay {
                 }
             }
         }
-        self.silence_noted = false;
+        // A diff that inherited its time says nothing of when the diffs came back.
+        if self.last_time.is_none_or(|last| time > last) {
+            self.silence_noted = false;
+        }
         self.last_time = Some(time);
     }
 
