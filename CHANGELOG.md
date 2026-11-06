@@ -29,6 +29,12 @@ project follows [Semantic Versioning](https://semver.org/).
   penalty are not compared.
 - `Experiment::with_regimes` takes a description, recorded in `Manifest::regime_labeller`
   (#92), so a manifest covers its regime report as far as the caller declares it.
+- Example `chain_pricing_evaluation` (#95): measures the chain's replaced pricing with the
+  evaluation harness, through the real `ChainMarketMaker`, with no new public API. On synthetic
+  paths the surface quotes nearer the market than the previous formula when the surface is the
+  market. Net PnL shows no such gain when a crossing quote takes the touch, only when fills are
+  booked at the quote's own price, and positions are unhedged. It reports three fill rules,
+  volatility off by a quarter each way, and a market with a premium and a skew.
 - Example `consistent_time_travel` (#109): chronological replay as the baseline against
   time travel as a separate labelled mode, on a small synthetic environment whose true
   values are exact, with no new public API. It reports discontinuities, reuse of the tape

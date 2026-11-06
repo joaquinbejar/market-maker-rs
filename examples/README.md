@@ -22,6 +22,7 @@ cargo run --example display_example --features serde
 cargo run --example offline_rl_support
 cargo run --example consistent_time_travel
 cargo run --release --example quote_duration
+cargo run --release --features chain --example chain_pricing_evaluation -- <commit> <toolchain>
 ```
 
 ## Examples Overview
