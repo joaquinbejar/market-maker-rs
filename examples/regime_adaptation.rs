@@ -11,11 +11,13 @@
 //!
 //! The signals are causal: a [`Detector`] reads only mids and trades at or before the tick, through
 //! `VolatilityEstimator` and `VPINCalculator`, and the adaptive arm prices through
-//! `AdaptiveSpreadCalculator`. Only the arm named [`ORACLE`] reads the latent regime, as an upper
-//! reference that no policy could realize. The report's regime split reads it too, after the run.
+//! `AdaptiveSpreadCalculator`. Only the arm named [`ORACLE`] reads the latent regime, as a reference
+//! that no policy could realize, and not a bound: it scales its spread by a declared factor. The report's regime split reads it too, after the run.
 //!
-//! The [`GoNoGo`] rule is fixed here, before the holdout runs, and is applied per simulator:
-//! adaptation goes only if it holds on every one.
+//! The [`GoNoGo`] rule is fixed here, before the holdout runs, and is applied per simulator and
+//! fill rule: adaptation goes only if it holds on every group. The arm prices from the ratio and
+//! the flow, not from the alarm, so delay and false alarms measure a signal beside its decisions.
+//! A volatility that fails to compute leaves the last ratio in place.
 //!
 //! Run with `cargo run --release --example regime_adaptation -- <commit> <toolchain>`.
 
@@ -724,12 +726,50 @@ fn verdict(
     paired: (f64, f64, f64),
     drawdown: (f64, f64, f64),
     delay: f64,
+    missed: u32,
     false_alarms: f64,
 ) -> bool {
-    paired.1 > 0.0
+    missed == 0
+        && paired.1 > 0.0
         && drawdown.2 <= 0.0
         && delay <= RULE.max_delay_minutes
         && false_alarms <= RULE.max_false_alarms_per_day
+}
+
+fn arm_row(flow: Flow, rule: FillRule, name: &str, measures: &[Measure]) -> String {
+    let of = |f: fn(&Measure) -> f64| shown(interval(&measures.iter().map(f).collect::<Vec<_>>()));
+    format!(
+        "| {flow:?} | {rule:?} | {name} | {} | {} | {} | {} | {} |",
+        of(|m| m.net),
+        of(|m| m.stress_net),
+        of(|m| m.calm_net),
+        of(|m| m.drawdown),
+        of(|m| m.fills)
+    )
+}
+
+/// `gaps` holds the adaptive net, the adaptive drawdown, the oracle's net and the transfer's.
+fn summary_row(
+    flow: Flow,
+    rule: FillRule,
+    gaps: [(f64, f64, f64); 4],
+    delay: f64,
+    missed: u32,
+    alarms_rate: f64,
+) -> (String, bool) {
+    let [net, drawdown, oracle, transfer] = gaps;
+    let go = verdict(net, drawdown, delay, missed, alarms_rate);
+    (
+        format!(
+            "| {flow:?} | {rule:?} | {} | {} | {} | {} | {delay:.1} | {missed} | {alarms_rate:.2} | {} |",
+            shown(net),
+            shown(drawdown),
+            shown(oracle),
+            shown(transfer),
+            if go { "go" } else { "no-go" },
+        ),
+        go,
+    )
 }
 
 fn main() -> MMResult<()> {
@@ -753,7 +793,7 @@ fn main() -> MMResult<()> {
     for flow in FLOWS {
         for rule in RULES {
             let mut rows: BTreeMap<String, Vec<Measure>> = BTreeMap::new();
-            let (mut delays, mut missed, mut false_alarms) = (Vec::new(), 0, Vec::new());
+            let (mut delays, mut missed, mut false_alarms) = (Vec::new(), 0_u32, Vec::new());
             for seed in PATHS {
                 let (report, alarms) = run_path(flow, seed, rule, &provenance)?;
                 for row in &report.holdout {
@@ -768,17 +808,7 @@ fn main() -> MMResult<()> {
                 false_alarms.push(false_alarms_per_day(&alarms));
             }
             for (name, measures) in &rows {
-                let of = |f: fn(&Measure) -> f64| {
-                    shown(interval(&measures.iter().map(f).collect::<Vec<_>>()))
-                };
-                println!(
-                    "| {flow:?} | {rule:?} | {name} | {} | {} | {} | {} | {} |",
-                    of(|m| m.net),
-                    of(|m| m.stress_net),
-                    of(|m| m.calm_net),
-                    of(|m| m.drawdown),
-                    of(|m| m.fills)
-                );
+                println!("{}", arm_row(flow, rule, name, measures));
             }
             let gap =
                 |arm: &str, f: fn(&Measure) -> f64| interval(&paired(&rows[arm], &rows[FIXED], f));
@@ -789,16 +819,21 @@ fn main() -> MMResult<()> {
                 mean(&delays)
             };
             let alarms_rate = mean(&false_alarms);
-            let go = missed == 0 && verdict(net, drawdown, delay, alarms_rate);
+            let (line, go) = summary_row(
+                flow,
+                rule,
+                [
+                    net,
+                    drawdown,
+                    gap(ORACLE, |m| m.net),
+                    gap(TRANSFER, |m| m.net),
+                ],
+                delay,
+                missed,
+                alarms_rate,
+            );
             go_all &= go;
-            summaries.push(format!(
-                "| {flow:?} | {rule:?} | {} | {} | {} | {} | {delay:.1} | {missed} | {alarms_rate:.2} | {} |",
-                shown(net),
-                shown(drawdown),
-                shown(gap(ORACLE, |m| m.net)),
-                shown(gap(TRANSFER, |m| m.net)),
-                if go { "go" } else { "no-go" },
-            ));
+            summaries.push(line);
         }
     }
     println!(
@@ -931,6 +966,8 @@ mod tests {
         assert_eq!(delay_minutes(&[start + 5 * MINUTE]), Some(5.0));
         // One before the change is no detection, nor is one after it ended.
         assert_eq!(delay_minutes(&[start - MINUTE]), None);
+        let end = (STRESSES[1].1 * DAY as f64) as u64;
+        assert_eq!(delay_minutes(&[end]), None);
         // 2 days, 0.75 of stress: 1.25 calm days.
         let calm = HOLDOUT_DAY * DAY + MINUTE;
         assert_eq!(false_alarms_per_day(&[calm]), 1.0 / 1.25);
@@ -942,11 +979,12 @@ mod tests {
     fn test_the_rule_needs_all_of_its_terms() {
         let good = (1.0, 0.5, 2.0);
         let ok_drawdown = (-1.0, -2.0, -0.1);
-        assert!(verdict(good, ok_drawdown, 10.0, 1.0));
-        assert!(!verdict((1.0, -0.1, 2.0), ok_drawdown, 10.0, 1.0));
-        assert!(!verdict(good, (0.0, -1.0, 0.5), 10.0, 1.0));
-        assert!(!verdict(good, ok_drawdown, 61.0, 1.0));
-        assert!(!verdict(good, ok_drawdown, 10.0, 2.5));
+        assert!(verdict(good, ok_drawdown, 10.0, 0, 1.0));
+        assert!(!verdict(good, ok_drawdown, 10.0, 1, 1.0));
+        assert!(!verdict((1.0, -0.1, 2.0), ok_drawdown, 10.0, 0, 1.0));
+        assert!(!verdict(good, (0.0, -1.0, 0.5), 10.0, 0, 1.0));
+        assert!(!verdict(good, ok_drawdown, 61.0, 0, 1.0));
+        assert!(!verdict(good, ok_drawdown, 10.0, 0, 2.5));
     }
 
     #[test]
@@ -1029,6 +1067,111 @@ mod tests {
         };
         let day = DAY_MINUTES;
         assert!(moves(5 * day, 5 * day + 500) > 2.0 * moves(4 * day, 4 * day + 500));
+    }
+
+    #[test]
+    fn test_an_alarm_comes_from_a_toxic_flow_and_stays_while_it_lasts() {
+        // Only buyers, in full buckets, on a mid that does not move.
+        let trades: Vec<Trade> = (0..1_200)
+            .map(|i| Trade::new(dec!(100), dec!(1), TradeSide::Buy, i / 10 * MINUTE))
+            .collect();
+        let mut d = detector(trades);
+        for minute in 0..120 {
+            d.observe(&at(minute, dec!(100)));
+        }
+        assert!(d.vpin.is_toxic());
+        assert!(d.ratio < ALARM_OFF, "{}", d.ratio);
+        assert_eq!(d.alarms.len(), 1);
+        assert!(d.alarm);
+    }
+
+    #[test]
+    fn test_the_adaptive_arm_prices_from_the_flow() {
+        let buyers = vec![Trade::new(dec!(100), dec!(50), TradeSide::Buy, 0)];
+        let mid_of = |trades: Vec<Trade>| {
+            let mut q = Quoter {
+                pricing: Pricing::Adaptive,
+                half: dec!(0.03),
+                detector: detector(trades),
+                calculator: AdaptiveSpreadCalculator::new(
+                    AdaptiveSpreadConfig::new(dec!(0.01), dec!(2), dec!(0), dec!(0.5)).unwrap(),
+                ),
+                log: Rc::new(RefCell::new(vec![])),
+            };
+            let quote = q
+                .on_tick(&at(0, dec!(100)), &InventoryPosition::new())
+                .unwrap();
+            quote.bid_price + quote.ask_price
+        };
+        assert_ne!(mid_of(buyers), mid_of(vec![]));
+    }
+
+    fn quick_measures(flow: Flow, rule: FillRule, seed: u64) -> BTreeMap<String, Measure> {
+        let provenance = Provenance {
+            commit: "t".to_string(),
+            toolchain: "t".to_string(),
+        };
+        run_path(flow, seed, rule, &provenance)
+            .unwrap()
+            .0
+            .holdout
+            .iter()
+            .map(|row| (row.candidate.clone(), measure_of(row).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn test_the_transfer_arm_is_not_the_adaptive_arm() {
+        for flow in FLOWS {
+            let rows = quick_measures(flow, FillRule::Immediate, 1);
+            assert_ne!(rows[TRANSFER], rows[ADAPTIVE], "{flow:?}");
+        }
+    }
+
+    #[test]
+    fn test_the_half_chance_rule_fills_about_half() {
+        let of = |rule| quick_measures(Flow::Hawkes, rule, 1)[FIXED].fills;
+        let share = of(FillRule::HalfChance) / of(FillRule::Immediate);
+        assert!((share - 0.5).abs() < 0.1, "{share}");
+    }
+
+    #[test]
+    fn test_an_arm_row_prints_each_figure_under_its_header() {
+        let measure = Measure {
+            net: 1.0,
+            stress_net: 2.0,
+            calm_net: 3.0,
+            drawdown: 4.0,
+            fills: 5.0,
+        };
+        let row = arm_row(Flow::Hawkes, FillRule::Immediate, "x", &[measure; 3]);
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        assert_eq!(&cells[1..4], ["Hawkes", "Immediate", "x"]);
+        for (cell, figure) in cells[4..9]
+            .iter()
+            .zip(["1.00", "2.00", "3.00", "4.00", "5.00"])
+        {
+            assert!(cell.starts_with(figure), "{cell}");
+        }
+    }
+
+    #[test]
+    fn test_a_summary_row_prints_each_gap_and_its_verdict() {
+        let at = |m: f64| (m, m - 0.5, m + 0.5);
+        let drawdown = (-3.0, -4.0, -2.0);
+        let gaps = [at(1.0), drawdown, at(5.0), at(6.0)];
+        let (row, go) = summary_row(Flow::Hawkes, FillRule::Immediate, gaps, 7.0, 0, 0.5);
+        assert!(go);
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        assert!(cells[3].starts_with("1.00"), "{}", cells[3]);
+        assert!(cells[4].starts_with("-3.00"), "{}", cells[4]);
+        assert!(cells[5].starts_with("5.00"), "{}", cells[5]);
+        assert!(cells[6].starts_with("6.00"), "{}", cells[6]);
+        assert_eq!(&cells[7..11], ["7.0", "0", "0.50", "go"]);
+        // A missed stress fails the rule whatever else holds.
+        let (row, go) = summary_row(Flow::Hawkes, FillRule::Immediate, gaps, 7.0, 1, 0.5);
+        assert!(!go);
+        assert!(row.contains("no-go"));
     }
 
     #[test]
