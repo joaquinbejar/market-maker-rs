@@ -1321,6 +1321,24 @@ fn test_a_mapped_segment_stays_out_of_order_if_it_was() {
 }
 
 #[test]
+fn test_a_step_back_larger_than_a_rounding_is_not_absorbed() {
+    let p = SeasonalProfile::new(1e6, vec![1.0]).unwrap();
+    let later = 1000.0;
+    let earlier = later * (1.0 - 64.0 * f64::EPSILON);
+    let mapped = p.segment_to_model_time(&HawkesSegment {
+        initial_queue: 0,
+        duration_seconds: 2000.0,
+        events: [later, earlier]
+            .map(|time_seconds| HawkesEvent {
+                time_seconds,
+                kind: QrEventKind::Limit,
+            })
+            .to_vec(),
+    });
+    assert!(mapped.events[1].time_seconds < mapped.events[0].time_seconds);
+}
+
+#[test]
 fn test_a_mapped_duration_stays_above_an_event_that_rounded_past_it() {
     let p = SeasonalProfile::new(0.3, vec![0.7, 1.3, 1.1]).unwrap();
     let mut seen = 0;
@@ -1376,6 +1394,18 @@ mod seasonal_serde {
         }
         // So a tolerance of zero on the mean would refuse real profiles.
         assert!(moved_by_rounding > 0);
+    }
+
+    #[test]
+    fn test_a_large_skewed_profile_from_new_reads_back_equal() {
+        // The sum rounds further here than the tolerance for a small profile.
+        let mut multipliers = vec![1.0; MAX_SEASONAL_BUCKETS];
+        multipliers[0] = 1e8;
+        let p = SeasonalProfile::new(1.0, multipliers).unwrap();
+        let mean = p.multipliers().iter().sum::<f64>() / MAX_SEASONAL_BUCKETS as f64;
+        assert!((mean - 1.0).abs() > 1e-12, "{mean}");
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<SeasonalProfile>(&json).unwrap(), p);
     }
 
     #[test]

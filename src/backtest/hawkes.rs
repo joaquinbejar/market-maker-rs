@@ -1274,9 +1274,12 @@ impl From<SeasonalProfile> for RawProfile {
     }
 }
 
-/// How far from 1 the mean of stored multipliers may be: the rounding of a normalization.
+/// How far from 1 the mean of `count` stored multipliers may be: the rounding of a
+/// normalization, which grows with the sum.
 #[cfg(feature = "serde")]
-const STORED_MEAN_TOLERANCE: f64 = 1e-12;
+fn stored_mean_tolerance(count: usize) -> f64 {
+    (as_float(count) * f64::EPSILON).max(1e-12)
+}
 
 #[cfg(feature = "serde")]
 impl TryFrom<RawProfile> for SeasonalProfile {
@@ -1293,7 +1296,7 @@ impl TryFrom<RawProfile> for SeasonalProfile {
             .collect::<MMResult<Vec<f64>>>()?;
         check_profile(bucket_seconds, &multipliers)?;
         let mean = multipliers.iter().sum::<f64>() / as_float(multipliers.len());
-        if (mean - 1.0).abs() > STORED_MEAN_TOLERANCE {
+        if (mean - 1.0).abs() > stored_mean_tolerance(multipliers.len()) {
             return invalid(format!("stored profile of mean {mean}"));
         }
         Ok(Self {
