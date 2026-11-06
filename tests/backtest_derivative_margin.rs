@@ -765,3 +765,26 @@ fn test_no_unit_of_cash_is_held_by_margin_and_a_spot_reservation() {
             .is_rejected()
     );
 }
+
+#[test]
+fn test_a_hold_error_that_is_not_about_the_cash_stops_new_orders() {
+    let spec = perpetual(dec!(0.01));
+    let account = account(&spec, dec!(1000));
+    let mut policy = account.policy();
+    policy.on_market_data(dec!(60000), 0);
+    assert!(
+        !policy
+            .check(&request("0", Action::Buy, dec!(1)))
+            .is_rejected()
+    );
+    // With an order open, a mark the service refuses: no shortfall, and a fault.
+    policy.on_market_data(dec!(0), 1);
+    assert_eq!(account.hold_shortfalls(), 0);
+    assert!(account.fault().is_some());
+    assert_eq!(account.errors().len(), 1);
+    let PretradeDecision::Rejected { reason } = policy.check(&request("1", Action::Buy, dec!(1)))
+    else {
+        panic!("not refused");
+    };
+    assert!(reason.contains("policy fault"), "{reason}");
+}
