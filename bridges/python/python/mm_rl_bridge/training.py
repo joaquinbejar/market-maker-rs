@@ -28,7 +28,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from .envs import BoxMarketMakingEnv, MaskableMarketMakingEnv
+from .envs import BoxMarketMakingEnv, MaskableMarketMakingEnv, ResidualMarketMakingEnv
 
 TRAINER_VERSION = "2.9.2"
 METADATA_VERSION = 1
@@ -36,6 +36,7 @@ METADATA_VERSION = 1
 _ALGORITHMS = {
     "maskable_ppo": (MaskablePPO, MaskableMarketMakingEnv),
     "sac": (SAC, BoxMarketMakingEnv),
+    "sac_residual": (SAC, ResidualMarketMakingEnv),
 }
 
 
@@ -168,6 +169,15 @@ class EpisodeResult:
     terminated: bool
     truncated: bool
     trace: tuple
+    attribution: dict
+
+
+class ZeroResidual:
+    """The classical baseline as a policy: no correction at any decision."""
+
+    @staticmethod
+    def predict(observation, deterministic=True):
+        return np.zeros(4, dtype=np.float32), None
 
 
 def evaluate(model, env, seeds):
@@ -196,6 +206,7 @@ def evaluate(model, env, seeds):
                 terminated=terminated,
                 truncated=truncated,
                 trace=tuple(trace),
+                attribution=dict(env.attribution()),
             )
         )
     return results

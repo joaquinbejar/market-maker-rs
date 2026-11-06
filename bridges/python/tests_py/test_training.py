@@ -278,7 +278,7 @@ def test_protocol_sends_the_best_mean_net_to_the_holdout(tmp_path, monkeypatch, 
     def known(model, env, seeds):
         evaluated.append(env.bridge_info["dataset_digest"])
         return [
-            EpisodeResult(seed, 1, Decimal(net), Decimal(0), True, False, ())
+            EpisodeResult(seed, 1, Decimal(net), Decimal(0), True, False, (), {})
             for seed, net in zip(seeds, nets[model["seed"]])
         ]
 

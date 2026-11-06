@@ -3,8 +3,10 @@
 use std::sync::{Mutex, PoisonError};
 
 use market_maker_rs::Decimal;
-use market_maker_rs::backtest::kernel::{ActionMask, ActionStatus, KernelTick, QuoteSide};
-use market_maker_rs::rl::{FeatureVector, RlAction, SpecId};
+use market_maker_rs::backtest::kernel::{
+    ActionMask, ActionStatus, KernelAction, KernelTick, QuoteSide,
+};
+use market_maker_rs::rl::{FeatureVector, ResidualProposal, RlAction, SpecId};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
@@ -61,6 +63,41 @@ fn reset_dict<'py>(py: Python<'py>, reply: &ResetReply) -> PyResult<Bound<'py, P
     Ok(out)
 }
 
+fn action_dict<'py>(py: Python<'py>, action: &KernelAction) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    match action {
+        KernelAction::Hold => out.set_item("kind", "hold")?,
+        KernelAction::Quote {
+            bid,
+            ask,
+            bid_lots,
+            ask_lots,
+        } => {
+            out.set_item("kind", "quote")?;
+            out.set_item("bid", bid)?;
+            out.set_item("ask", ask)?;
+            out.set_item("bid_lots", bid_lots)?;
+            out.set_item("ask_lots", ask_lots)?;
+        }
+        KernelAction::QuoteError(code) => {
+            out.set_item("kind", "strategy_error")?;
+            out.set_item("code", code.0)?;
+        }
+        KernelAction::OneSided { side, price, lots } => {
+            out.set_item(
+                "kind",
+                match side {
+                    QuoteSide::Bid => "bid",
+                    QuoteSide::Ask => "ask",
+                },
+            )?;
+            out.set_item("price", price)?;
+            out.set_item("lots", lots)?;
+        }
+    }
+    Ok(out)
+}
+
 fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyDict>> {
     let t = &reply.transition;
     let out = PyDict::new(py);
@@ -93,6 +130,23 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
             out.set_item("close", closed)?;
         }
         None => out.set_item("close", py.None())?,
+    }
+    if let Some(decision) = &reply.decision {
+        let log = PyDict::new(py);
+        log.set_item("classical", action_dict(py, &decision.classical)?)?;
+        log.set_item("composed", action_dict(py, &decision.composed)?)?;
+        let d = decision.delta;
+        log.set_item(
+            "delta",
+            (d.bid_away_ticks, d.ask_away_ticks, d.bid_lots, d.ask_lots),
+        )?;
+        let c = decision.clips;
+        log.set_item("clips", (c.proposal, c.price, c.size))?;
+        log.set_item(
+            "fallback",
+            decision.fallback.map(|reason| format!("{reason:?}")),
+        )?;
+        out.set_item("residual", log)?;
     }
     Ok(out)
 }
@@ -231,6 +285,39 @@ impl NativeEnv {
     ) -> PyResult<Py<PyDict>> {
         let side = if bid { QuoteSide::Bid } else { QuoteSide::Ask };
         self.take_step(py, RlAction::OneSided { side, offset, size })
+    }
+
+    /// Takes one decision of a residual policy.
+    fn step_residual(
+        &self,
+        py: Python<'_>,
+        bid_away: f64,
+        ask_away: f64,
+        bid_size: f64,
+        ask_size: f64,
+    ) -> PyResult<Py<PyDict>> {
+        let proposal = ResidualProposal {
+            bid_away,
+            ask_away,
+            bid_size,
+            ask_size,
+        };
+        let reply = self.with_worker(py, |worker| worker.step_residual(proposal))?;
+        Ok(step_dict(py, &reply)?.unbind())
+    }
+
+    /// The attribution of the episode so far, reconciled with the reward.
+    fn attribution<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let reply = self.with_worker(py, Worker::attribution)?;
+        let a = reply.attribution;
+        let out = PyDict::new(py);
+        out.set_item("spread_capture", exact(a.spread_capture))?;
+        out.set_item("inventory_pnl", exact(a.inventory_pnl))?;
+        out.set_item("quote_fees", exact(a.quote_fees))?;
+        out.set_item("base_fees", exact(a.base_fees))?;
+        out.set_item("net_pnl", exact(a.net_pnl))?;
+        out.set_item("fills", reply.fills)?;
+        Ok(out)
     }
 
     /// Ends the thread and frees the dataset.

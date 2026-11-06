@@ -57,6 +57,12 @@ project follows [Semantic Versioning](https://semver.org/).
   market. Net PnL shows no such gain when a crossing quote takes the touch, only when fills are
   booked at the quote's own price, and positions are unhedged. It reports three fill rules,
   volatility off by a quarter each way, and a market with a premium and a skew.
+- Residual corrections to a classical quote (feature `rl`, #101): `rl::ResidualEnv` puts a
+  bounded correction in ticks and lots on an Avellaneda-Stoikov or GLFT quote, discretized,
+  validated against the grid and then given to the kernel's gate. A zero residual gives the
+  classical action unchanged, and `rl::ResidualDecision` logs each component, what was clipped
+  and why a proposal fell back. That this helps is a hypothesis of this crate: no comparison
+  here says so. The Python bridge trains it with `SAC`. Checked on synthetic data only.
 - Example `consistent_time_travel` (#109): chronological replay as the baseline against
   time travel as a separate labelled mode, on a small synthetic environment whose true
   values are exact, with no new public API. It reports discontinuities, reuse of the tape

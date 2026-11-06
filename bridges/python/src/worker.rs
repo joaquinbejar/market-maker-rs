@@ -5,14 +5,18 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use market_maker_rs::Decimal;
+use market_maker_rs::backtest::evaluation::{Attribution, EvaluationInput, attribute};
 use market_maker_rs::backtest::kernel::{
-    ActionGrid, ActionMask, KernelConfig, KernelDataset, KernelFillModel, KernelLatency, KernelTick,
+    ActionGrid, ActionMask, AvellanedaQuoter, GlftQuoter, KernelConfig, KernelDataset,
+    KernelFillModel, KernelLatency, KernelTick, QuoteSource,
 };
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    FeatureVector, InvalidActionPolicy, ObservationScales, RlAction, RlConfig, RlEnv, SpecId,
+    EpisodeRecorder, FeatureVector, InvalidActionPolicy, ObservationScales, ResidualBounds,
+    ResidualDecision, ResidualEnv, ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId,
     TerminalValuation, Transition,
 };
+use market_maker_rs::strategy::glft::GLFTConfig;
 use serde::Deserialize;
 
 /// Capacities of the kernel in the bridge. [`Worker::spawn`] refuses a dataset and a
@@ -146,6 +150,60 @@ pub enum TerminalConfig {
     Close,
 }
 
+/// The classical strategy a residual corrects, with numbers as decimal strings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BaselineConfig {
+    /// Avellaneda-Stoikov.
+    AvellanedaStoikov {
+        /// Risk aversion.
+        risk_aversion: String,
+        /// Volatility.
+        volatility: String,
+        /// Order intensity.
+        order_intensity: String,
+        /// Session start, in milliseconds of the rows' clock.
+        session_start_ms: u64,
+        /// Horizon from the session start, in milliseconds.
+        horizon_ms: u64,
+        /// Size of both sides.
+        size: String,
+    },
+    /// GLFT.
+    Glft {
+        /// Risk aversion.
+        risk_aversion: String,
+        /// Decay of the fill intensity.
+        order_intensity_k: String,
+        /// Scale of the fill intensity.
+        intensity_scale_a: String,
+        /// Inventory bound, in lots.
+        max_inventory_lots: u32,
+        /// Terminal time from the session start, in milliseconds.
+        terminal_time: u64,
+        /// Smallest spread.
+        min_spread: String,
+        /// Volatility.
+        volatility: String,
+        /// Session start, in milliseconds of the rows' clock.
+        session_start_ms: u64,
+    },
+}
+
+/// A residual policy over a classical strategy, in place of the action grid.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidualConfig {
+    /// The classical strategy.
+    pub baseline: BaselineConfig,
+    /// Largest move of a price, in ticks.
+    pub price_ticks: u32,
+    /// Largest change of a size, in lots.
+    pub size_lots: u32,
+    /// What replaces a classical size that is not positive.
+    pub default_order_size: String,
+}
+
 /// Everything an environment is built from. Money is in decimal strings, so no float
 /// crosses the boundary on its way to the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -187,6 +245,9 @@ pub struct BridgeConfig {
     pub invalid_action_penalty: String,
     /// What values the last inventory.
     pub terminal: TerminalConfig,
+    /// A residual policy, which then takes no action on the grid.
+    #[serde(default)]
+    pub residual: Option<ResidualConfig>,
 }
 
 fn decimal(what: &str, text: &str) -> Result<Decimal, BridgeError> {
@@ -296,6 +357,15 @@ pub struct ResetReply {
     pub done: bool,
 }
 
+/// The attribution of the episode so far, reconciled with the reward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttributionReply {
+    /// The components, in the evaluation's definitions.
+    pub attribution: Attribution,
+    /// Fills, the terminal close included.
+    pub fills: usize,
+}
+
 /// The result of a step, with the running totals.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepReply {
@@ -305,18 +375,345 @@ pub struct StepReply {
     pub net: Decimal,
     /// [`market_maker_rs::rl::RlState::penalties`] after the step.
     pub penalties: Decimal,
+    /// How the action came to be, under a residual policy.
+    pub decision: Option<ResidualDecision>,
 }
 
 enum Request {
     Reset(u64),
     Step(RlAction),
+    StepResidual(ResidualProposal),
+    Attribution,
     #[cfg(test)]
     Panic,
 }
 
+// Sent by value on every step: a box would allocate for each one.
+#[allow(clippy::large_enum_variant)]
 enum Reply {
     Reset(Result<ResetReply, String>),
     Step(Result<StepReply, String>),
+    Attribution(Result<AttributionReply, String>),
+}
+
+type State = RlState<ORD, MSG, DLV, OBS>;
+
+/// What the request loop needs from an environment.
+trait Driver {
+    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String>;
+    fn observe(&self, state: &State) -> Result<FeatureVector, String>;
+    fn mask(&self, state: &State) -> ActionMask;
+    fn step(
+        &mut self,
+        state: &mut State,
+        action: RlAction,
+        recorder: &mut EpisodeRecorder,
+    ) -> Result<StepReply, String>;
+    fn step_residual(
+        &mut self,
+        state: &mut State,
+        proposal: ResidualProposal,
+        recorder: &mut EpisodeRecorder,
+    ) -> Result<StepReply, String>;
+    fn inner_attribution(
+        &self,
+        state: &State,
+        recorder: &EpisodeRecorder,
+    ) -> Result<AttributionReply, String>;
+}
+
+fn attribution_of<const K: usize, const M: usize>(
+    env: &RlEnv<'_, K, M, ORD, MSG, DLV, OBS>,
+    state: &State,
+    recorder: &EpisodeRecorder,
+) -> Result<AttributionReply, String> {
+    env.reconcile(state, recorder).map_err(|e| e.to_string())?;
+    let records = env.records(state, recorder).map_err(|e| e.to_string())?;
+    let input = EvaluationInput::new(records.window, &records.marks, &records.fills, Decimal::ONE)
+        .map_err(|e| e.to_string())?;
+    let split = attribute(&input).map_err(|e| e.to_string())?;
+    Ok(AttributionReply {
+        attribution: split.total,
+        fills: records.fills.len(),
+    })
+}
+
+impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, OBS> {
+    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String> {
+        self.reset_with(seed, recorder).map_err(|e| e.to_string())
+    }
+
+    fn observe(&self, state: &State) -> Result<FeatureVector, String> {
+        RlEnv::observe(self, state).map_err(|e| e.to_string())
+    }
+
+    fn mask(&self, state: &State) -> ActionMask {
+        RlEnv::mask(self, state)
+    }
+
+    fn step(
+        &mut self,
+        state: &mut State,
+        action: RlAction,
+        recorder: &mut EpisodeRecorder,
+    ) -> Result<StepReply, String> {
+        let transition = self
+            .step_with(state, action, recorder)
+            .map_err(|e| e.to_string())?;
+        Ok(StepReply {
+            transition,
+            net: state.net(),
+            penalties: state.penalties(),
+            decision: None,
+        })
+    }
+
+    fn step_residual(
+        &mut self,
+        _state: &mut State,
+        _proposal: ResidualProposal,
+        _recorder: &mut EpisodeRecorder,
+    ) -> Result<StepReply, String> {
+        Err("a residual step on an environment with a grid".to_string())
+    }
+
+    fn inner_attribution(
+        &self,
+        state: &State,
+        recorder: &EpisodeRecorder,
+    ) -> Result<AttributionReply, String> {
+        attribution_of(self, state, recorder)
+    }
+}
+
+impl<S: QuoteSource> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
+    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String> {
+        self.reset_with(seed, recorder).map_err(|e| e.to_string())
+    }
+
+    fn observe(&self, state: &State) -> Result<FeatureVector, String> {
+        ResidualEnv::observe(self, state).map_err(|e| e.to_string())
+    }
+
+    fn mask(&self, state: &State) -> ActionMask {
+        self.env().mask(state)
+    }
+
+    fn step(
+        &mut self,
+        _state: &mut State,
+        _action: RlAction,
+        _recorder: &mut EpisodeRecorder,
+    ) -> Result<StepReply, String> {
+        Err("a grid action on a residual environment".to_string())
+    }
+
+    fn step_residual(
+        &mut self,
+        state: &mut State,
+        proposal: ResidualProposal,
+        recorder: &mut EpisodeRecorder,
+    ) -> Result<StepReply, String> {
+        let step = self
+            .step_with(state, proposal, recorder)
+            .map_err(|e| e.to_string())?;
+        Ok(StepReply {
+            transition: step.transition,
+            net: state.net(),
+            penalties: state.penalties(),
+            decision: Some(step.decision),
+        })
+    }
+
+    fn inner_attribution(
+        &self,
+        state: &State,
+        recorder: &EpisodeRecorder,
+    ) -> Result<AttributionReply, String> {
+        attribution_of(self.env(), state, recorder)
+    }
+}
+
+/// Answers requests until the sender goes.
+fn answer<D: Driver>(
+    mut env: D,
+    requests: &mpsc::Receiver<Request>,
+    replies: &mpsc::Sender<Reply>,
+) {
+    let mut episode: Option<(State, EpisodeRecorder)> = None;
+    let none = || "a step before any reset".to_string();
+    for request in requests {
+        let reply = match request {
+            #[cfg(test)]
+            Request::Panic => panic!("a panic asked for by a test"),
+            Request::Reset(seed) => {
+                let mut recorder = EpisodeRecorder::default();
+                Reply::Reset(env.reset(seed, &mut recorder).and_then(|fresh| {
+                    let reply = ResetReply {
+                        observation: env.observe(&fresh)?,
+                        mask: env.mask(&fresh),
+                        done: fresh.is_done(),
+                    };
+                    episode = Some((fresh, recorder));
+                    Ok(reply)
+                }))
+            }
+            Request::Step(action) => Reply::Step(match episode.as_mut() {
+                None => Err(none()),
+                Some((state, recorder)) => env.step(state, action, recorder),
+            }),
+            Request::StepResidual(proposal) => Reply::Step(match episode.as_mut() {
+                None => Err(none()),
+                Some((state, recorder)) => env.step_residual(state, proposal, recorder),
+            }),
+            Request::Attribution => Reply::Attribution(match episode.as_ref() {
+                None => Err(none()),
+                Some((state, recorder)) => env.inner_attribution(state, recorder),
+            }),
+        };
+        if replies.send(reply).is_err() {
+            return;
+        }
+    }
+}
+
+/// Builds a residual environment over `source` and answers requests.
+fn serve_residual<S: QuoteSource>(
+    job: Job<'_>,
+    source: S,
+    default_order_size: Decimal,
+    bounds: ResidualBounds,
+) {
+    let Job {
+        kernel,
+        data,
+        config,
+        expected,
+        ready,
+        requests,
+        replies,
+    } = job;
+    let refuse =
+        |error: market_maker_rs::types::error::MMError| BridgeError::Refused(error.to_string());
+    let built = config.rl().and_then(|rl| {
+        let env: ResidualEnv<'_, S, ORD, MSG, DLV, OBS> =
+            ResidualEnv::new(kernel, data, source, default_order_size, bounds, rl)
+                .map_err(refuse)?;
+        let spec = env.env().spec();
+        let id = spec.id();
+        check_spec(spec, id, expected)?;
+        let shape = spec.shape();
+        let info = EnvInfo {
+            spec: id,
+            features: shape.features,
+            offsets: shape.bid_offsets,
+            sizes: shape.sizes,
+            kernel_fingerprint: env.env().kernel().config_fingerprint(),
+            dataset_digest: data.id().digest,
+            rows: data.id().len,
+        };
+        Ok((env, info))
+    });
+    match built {
+        Ok((env, info)) => {
+            if ready.send(Ok(info)).is_ok() {
+                answer(env, &requests, &replies);
+            }
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+        }
+    }
+}
+
+fn check_spec(
+    spec: &market_maker_rs::rl::RlSpec,
+    id: SpecId,
+    expected: Option<SpecId>,
+) -> Result<(), BridgeError> {
+    if !known_versions(&id) {
+        return Err(BridgeError::Refused(format!("unknown versions in {id:?}")));
+    }
+    if let Some(expected) = expected {
+        spec.ensure(expected)
+            .map_err(|error| BridgeError::Refused(error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Parses the baseline and serves it.
+fn start_residual(job: Job<'_>, residual: &ResidualConfig) {
+    let bounds = ResidualBounds {
+        price_ticks: residual.price_ticks,
+        size_lots: residual.size_lots,
+    };
+    let parsed = decimal("default_order_size", &residual.default_order_size).and_then(|size| {
+        Ok((
+            size,
+            parse_baseline(&residual.baseline, &job.config.lot_size)?,
+        ))
+    });
+    match parsed {
+        Ok((size, Baseline::Avellaneda(source))) => serve_residual(job, source, size, bounds),
+        Ok((size, Baseline::Glft(source))) => serve_residual(job, source, size, bounds),
+        Err(error) => {
+            let _ = job.ready.send(Err(error));
+        }
+    }
+}
+
+fn parse_baseline(baseline: &BaselineConfig, lot_size: &str) -> Result<Baseline, BridgeError> {
+    match baseline {
+        BaselineConfig::AvellanedaStoikov {
+            risk_aversion,
+            volatility,
+            order_intensity,
+            session_start_ms,
+            horizon_ms,
+            size,
+        } => Ok(Baseline::Avellaneda(AvellanedaQuoter {
+            risk_aversion: decimal("risk_aversion", risk_aversion)?,
+            volatility: decimal("volatility", volatility)?,
+            order_intensity: decimal("order_intensity", order_intensity)?,
+            session_start_ms: *session_start_ms,
+            horizon_ms: *horizon_ms,
+            size: decimal("size", size)?,
+        })),
+        BaselineConfig::Glft {
+            risk_aversion,
+            order_intensity_k,
+            intensity_scale_a,
+            max_inventory_lots,
+            terminal_time,
+            min_spread,
+            volatility,
+            session_start_ms,
+        } => {
+            let lot = decimal("lot_size", lot_size)?;
+            let model = GLFTConfig::new(
+                decimal("risk_aversion", risk_aversion)?,
+                decimal("order_intensity_k", order_intensity_k)?,
+                decimal("intensity_scale_a", intensity_scale_a)?,
+                *max_inventory_lots,
+                lot,
+                *terminal_time,
+                decimal("min_spread", min_spread)?,
+            )
+            .map_err(|error| BridgeError::Refused(error.to_string()))?;
+            Ok(Baseline::Glft(GlftQuoter {
+                config: model,
+                volatility: decimal("volatility", volatility)?,
+                size: lot,
+                session_start_ms: *session_start_ms,
+            }))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Baseline {
+    Avellaneda(AvellanedaQuoter),
+    Glft(GlftQuoter),
 }
 
 /// What a worker thread serves.
@@ -368,12 +765,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
             RlEnv::new(kernel_config, data, grid, config.rl()?).map_err(refuse)?;
         let spec = env.spec();
         let id = spec.id();
-        if !known_versions(&id) {
-            return Err(BridgeError::Refused(format!("unknown versions in {id:?}")));
-        }
-        if let Some(expected) = expected {
-            spec.ensure(expected).map_err(refuse)?;
-        }
+        check_spec(spec, id, expected)?;
         let shape = spec.shape();
         let info = EnvInfo {
             spec: id,
@@ -398,41 +790,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
             return;
         }
     };
-    let mut state = None;
-    for request in requests {
-        let reply = match request {
-            #[cfg(test)]
-            Request::Panic => panic!("a panic asked for by a test"),
-            Request::Reset(seed) => Reply::Reset(
-                env.reset(seed)
-                    .map_err(|e| e.to_string())
-                    .and_then(|fresh| {
-                        let observation = env.observe(&fresh).map_err(|e| e.to_string())?;
-                        let reply = ResetReply {
-                            observation,
-                            mask: env.mask(&fresh),
-                            done: fresh.is_done(),
-                        };
-                        state = Some(fresh);
-                        Ok(reply)
-                    }),
-            ),
-            Request::Step(action) => Reply::Step(match state.as_mut() {
-                None => Err("a step before any reset".to_string()),
-                Some(current) => env
-                    .step(current, action)
-                    .map(|transition| StepReply {
-                        transition,
-                        net: current.net(),
-                        penalties: current.penalties(),
-                    })
-                    .map_err(|e| e.to_string()),
-            }),
-        };
-        if replies.send(reply).is_err() {
-            return;
-        }
-    }
+    answer(env, &requests, &replies);
 }
 
 macro_rules! dispatch {
@@ -521,6 +879,10 @@ impl Worker {
                     requests: request_rx,
                     replies: reply_tx,
                 };
+                if let Some(residual) = &config.residual {
+                    start_residual(job, residual);
+                    return;
+                }
                 dispatch!(
                     job;
                     (1, 1, 2, 3, 4),
@@ -565,8 +927,12 @@ impl Worker {
     pub fn reset(&mut self, seed: u64) -> Result<ResetReply, BridgeError> {
         match self.call(Request::Reset(seed))? {
             Reply::Reset(Ok(reply)) => Ok(reply),
-            Reply::Reset(Err(reason)) | Reply::Step(Err(reason)) => Err(self.fail(reason)),
-            Reply::Step(Ok(_)) => Err(self.fail("a step's reply to a reset".to_string())),
+            Reply::Reset(Err(reason))
+            | Reply::Step(Err(reason))
+            | Reply::Attribution(Err(reason)) => Err(self.fail(reason)),
+            Reply::Step(Ok(_)) | Reply::Attribution(Ok(_)) => {
+                Err(self.fail("the wrong reply to a reset".to_string()))
+            }
         }
     }
 
@@ -578,10 +944,46 @@ impl Worker {
     /// the mask under the mask policy included, [`BridgeError::Panicked`] after a panic and
     /// [`BridgeError::Closed`] afterwards, as nothing continues after an error.
     pub fn step(&mut self, action: RlAction) -> Result<StepReply, BridgeError> {
-        match self.call(Request::Step(action))? {
+        self.step_request(Request::Step(action))
+    }
+
+    /// Takes one decision of a residual policy.
+    ///
+    /// # Errors
+    ///
+    /// As [`Worker::step`]. A proposal is never an error by itself, and calling this on an
+    /// environment with a grid is.
+    pub fn step_residual(&mut self, proposal: ResidualProposal) -> Result<StepReply, BridgeError> {
+        self.step_request(Request::StepResidual(proposal))
+    }
+
+    /// The attribution of the episode so far. It fails if it does not reconcile with the
+    /// reward, which also ends the environment.
+    ///
+    /// # Errors
+    ///
+    /// As [`Worker::step`].
+    pub fn attribution(&mut self) -> Result<AttributionReply, BridgeError> {
+        match self.call(Request::Attribution)? {
+            Reply::Attribution(Ok(reply)) => Ok(reply),
+            Reply::Reset(Err(reason))
+            | Reply::Step(Err(reason))
+            | Reply::Attribution(Err(reason)) => Err(self.fail(reason)),
+            Reply::Reset(Ok(_)) | Reply::Step(Ok(_)) => {
+                Err(self.fail("the wrong reply to an attribution".to_string()))
+            }
+        }
+    }
+
+    fn step_request(&mut self, request: Request) -> Result<StepReply, BridgeError> {
+        match self.call(request)? {
             Reply::Step(Ok(reply)) => Ok(reply),
-            Reply::Reset(Err(reason)) | Reply::Step(Err(reason)) => Err(self.fail(reason)),
-            Reply::Reset(Ok(_)) => Err(self.fail("a reset's reply to a step".to_string())),
+            Reply::Reset(Err(reason))
+            | Reply::Step(Err(reason))
+            | Reply::Attribution(Err(reason)) => Err(self.fail(reason)),
+            Reply::Reset(Ok(_)) | Reply::Attribution(Ok(_)) => {
+                Err(self.fail("the wrong reply to a step".to_string()))
+            }
         }
     }
 

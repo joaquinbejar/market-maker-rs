@@ -12,7 +12,8 @@ It is not published.
   panic.
 - `src/python.rs`: the extension module, behind the feature `python`.
 - `python/mm_rl_bridge/envs.py`: thin `gymnasium.Env` classes. `MaskableMarketMakingEnv` is
-  discrete, for `MaskablePPO`, and `BoxMarketMakingEnv` is continuous, for `SAC`.
+  discrete, for `MaskablePPO`, `BoxMarketMakingEnv` is continuous, for `SAC`, and
+  `ResidualMarketMakingEnv` is a bounded correction to a classical quote, for `SAC`.
 - `python/mm_rl_bridge/training.py`: training, checkpoints with their metadata, inference
   only loading and a protocol of train, select and one holdout evaluation.
 

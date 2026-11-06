@@ -526,6 +526,44 @@ impl<
         }
         let decision = self.kernel.observe(&state.kernel);
         let kernel_action = self.resolve(&decision, state, action);
+        let penalty = if inside {
+            Decimal::ZERO
+        } else {
+            self.config.invalid_action_penalty
+        };
+        self.apply(state, &decision, kernel_action, penalty, sink)
+    }
+
+    /// Steps the kernel with a quote composed outside the grid. Its admission and its gate
+    /// decide as for any other action, and nothing is charged.
+    ///
+    /// # Errors
+    ///
+    /// As [`RlEnv::step_with`], with no mask to leave.
+    pub(super) fn step_composed_with<E: EventSink>(
+        &self,
+        state: &mut RlState<ORD, MSG, DLV, OBS>,
+        action: KernelAction,
+        sink: &mut E,
+    ) -> MMResult<Transition> {
+        self.check_owned(state)?;
+        if state.is_done() {
+            return Err(MMError::InvalidMarketState(
+                "the episode has ended".to_string(),
+            ));
+        }
+        let decision = self.kernel.observe(&state.kernel);
+        self.apply(state, &decision, action, Decimal::ZERO, sink)
+    }
+
+    fn apply<E: EventSink>(
+        &self,
+        state: &mut RlState<ORD, MSG, DLV, OBS>,
+        decision: &Observation,
+        kernel_action: KernelAction,
+        penalty: Decimal,
+        sink: &mut E,
+    ) -> MMResult<Transition> {
         let mut tap = Tap {
             inner: sink,
             row: None,
@@ -544,11 +582,6 @@ impl<
                 ts_ns: decision.ts_ns,
             });
         }
-        let penalty = if inside {
-            Decimal::ZERO
-        } else {
-            self.config.invalid_action_penalty
-        };
         let settled = self.settle(state, penalty, outcome);
         if settled.is_err() {
             state.fault = true;

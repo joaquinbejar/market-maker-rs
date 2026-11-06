@@ -86,16 +86,21 @@ class MarketMakingEnv(gym.Env):
             reply = self._native.step_quote(*indices)
         else:
             raise ValueError(f"unknown action kind {kind!r}")
-        self._mask = reply["mask"]
-        observed = reply["observation"]
-        info = {
-            "proposed_action": _plain(action),
+        extra = {
             "decoded_action": {"kind": kind, "indices": list(indices)},
             "applied_action": (
                 {"kind": kind, "indices": list(indices)}
                 if reply["applied"]
                 else {"kind": "hold", "indices": []}
             ),
+        }
+        return self._transition(reply, action, extra)
+
+    def _transition(self, reply, action, extra):
+        self._mask = reply["mask"]
+        observed = reply["observation"]
+        info = {
+            "proposed_action": _plain(action),
             "refused_because": reply["refused_because"],
             "reward_exact": reply["reward"],
             "ledger_change": reply["ledger_change"],
@@ -106,6 +111,7 @@ class MarketMakingEnv(gym.Env):
             "close": reply["close"],
             "row": observed["row"],
             "raw_observation": observed["raw"],
+            **extra,
         }
         return (
             self._observation(observed),
@@ -114,6 +120,10 @@ class MarketMakingEnv(gym.Env):
             bool(reply["truncated"]),
             info,
         )
+
+    def attribution(self):
+        """The episode's components in the evaluation's definitions, reconciled with the reward."""
+        return self._native.attribution()
 
     def close(self):
         self._native.close()
@@ -206,3 +216,26 @@ class BoxMarketMakingEnv(MarketMakingEnv):
             self._bin(values[3], self._sizes),
             self._bin(values[4], self._sizes),
         )
+
+
+class ResidualMarketMakingEnv(MarketMakingEnv):
+    """A correction to a classical quote, for SAC: `(bid away, ask away, bid size, ask size)`.
+
+    Each value is a fraction of its bound in `[-1, 1]`, and zero leaves the classical action
+    as it is. A value that is not finite refuses the proposal and the classical action
+    stands, as the log in `info["residual"]` says: a policy's output is never an error here,
+    and the limits apply in the kernel to whatever comes out.
+    """
+
+    def __init__(self, config, rows, expected_spec=None, seed=0):
+        if config.get("residual") is None:
+            raise ValueError("a residual environment needs a residual configuration")
+        super().__init__(config, rows, expected_spec, seed)
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+
+    def step(self, action):
+        values = [float(value) for value in np.asarray(action).ravel()]
+        if len(values) != 4:
+            raise ValueError(f"a proposal has 4 values, not {len(values)}")
+        reply = self._native.step_residual(*values)
+        return self._transition(reply, action, {"residual": reply["residual"]})
