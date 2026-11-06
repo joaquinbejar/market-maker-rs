@@ -377,6 +377,17 @@ fn test_inventory_mean_is_weighted_by_time_not_per_tick() {
 }
 
 #[test]
+fn test_inventory_mean_counts_a_position_held_to_the_last_mark() {
+    // Flat to 500, then long 2 up to the last mark at 1000: 2 * 500 / 1000 = 1.
+    let marks = [mark(0, dec!(100)), mark(1000, dec!(100))];
+    let fills = [fill(500, Action::Buy, dec!(100), dec!(2))];
+    let stats = inventory_stats(&input(2000, &marks, &fills)).unwrap();
+    assert_eq!(stats.mean_abs, Some(dec!(1)));
+    assert_eq!(stats.max_abs, dec!(2));
+    assert_eq!(stats.final_position, dec!(2));
+}
+
+#[test]
 fn test_inventory_mean_is_undefined_at_a_single_instant() {
     let marks = [mark(5, dec!(100))];
     let stats = inventory_stats(&input(10, &marks, &[])).unwrap();
