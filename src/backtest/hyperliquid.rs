@@ -30,9 +30,12 @@
 //!   the other, which steps its times back and adds orders already on the book. The readers leave
 //!   out a line exactly equal to an earlier one of its file, and count it in
 //!   [`CaptureRead::repeated_lines`]. Nothing is removed for agreeing on some fields: the trade
-//!   hash can be null, and distinct records can agree on time, side, price, size and hash. A
-//!   stretch across two files is not removed; it shows in [`Coverage::duplicate_new`] and
-//!   [`Coverage::trades_out_of_order`]. Order status records follow the same rule.
+//!   hash can be null, and distinct records can agree on time, side, price, size and hash.
+//!   Consecutive files of a stream overlap by minutes, the later one writing the earlier one's
+//!   tail again, and are not aligned to the clock hour: a [`RepeatFilter`] passed to the readers
+//!   of one stream's files in order leaves out a line of the file before too, counted in
+//!   [`CaptureRead::repeated_from_previous_file`]. Without it, such a stretch steps the inferred
+//!   times back and crosses the book. Order status records follow the same rule.
 //! - **The tick and the lot.** [`Coverage::price_grid`] is what the prices seen are multiples of,
 //!   an observation that does not prove a rule. [`ReplayConfig::tick`] is declared by the caller.
 //! - **Fees and funding.** They are in no file here, so they stay inputs of whatever consumes
@@ -174,6 +177,18 @@ pub fn decode_order_status(record: &[u8]) -> MMResult<OrderStatusRecord> {
 ///
 /// Returns [`MMError::InvalidMarketState`] if its length is not a whole number of records.
 pub fn decode_order_statuses(bytes: &[u8]) -> MMResult<CaptureRead<OrderStatusRecord>> {
+    decode_order_statuses_after(bytes, &mut RepeatFilter::new())
+}
+
+/// [`decode_order_statuses`], leaving out too the records of the file before that `filter` saw.
+///
+/// # Errors
+///
+/// As [`decode_order_statuses`].
+pub fn decode_order_statuses_after(
+    bytes: &[u8],
+    filter: &mut RepeatFilter,
+) -> MMResult<CaptureRead<OrderStatusRecord>> {
     let (records, rest) = bytes.as_chunks::<ORDER_STATUS_RECORD_BYTES>();
     if !rest.is_empty() {
         return Err(bad(format!(
@@ -182,13 +197,9 @@ pub fn decode_order_statuses(bytes: &[u8]) -> MMResult<CaptureRead<OrderStatusRe
         )));
     }
     let mut read = CaptureRead::default();
-    let mut seen = SeenLines::default();
+    filter.start_file();
     for record in records {
-        if seen.is_repeat(record) {
-            read.repeated_lines = read.repeated_lines.saturating_add(1);
-        } else {
-            read.rows.push(decode_order_status(record)?);
-        }
+        read.keep(filter, record, || decode_order_status(record))?;
     }
     Ok(read)
 }
@@ -311,6 +322,10 @@ pub struct CaptureRead<T> {
     /// The capture re-emits stretches of a stream, and a JSON line carries users and ids, so a real
     /// event does not repeat one. Nothing is left out for agreeing on some of its fields.
     pub repeated_lines: u64,
+    /// Lines or records left out for being exactly equal to one of the file before, when the
+    /// reader was given the [`RepeatFilter`] of that file: consecutive files of a stream overlap
+    /// by minutes, and the later one writes the earlier one's tail again.
+    pub repeated_from_previous_file: u64,
 }
 
 impl<T> Default for CaptureRead<T> {
@@ -318,19 +333,71 @@ impl<T> Default for CaptureRead<T> {
         Self {
             rows: Vec::new(),
             repeated_lines: 0,
+            repeated_from_previous_file: 0,
         }
     }
 }
 
-/// The lines of one file seen so far, as hashes. A repeat across files is not seen here.
-#[derive(Debug, Default)]
-struct SeenLines(HashSet<u64>);
+impl<T> CaptureRead<T> {
+    /// Keeps `row` unless the filter has seen its line, and counts what it leaves out.
+    fn keep(
+        &mut self,
+        filter: &mut RepeatFilter,
+        line: &[u8],
+        row: impl FnOnce() -> MMResult<T>,
+    ) -> MMResult<()> {
+        match filter.check(line) {
+            Seen::New => self.rows.push(row()?),
+            Seen::InFile => self.repeated_lines = self.repeated_lines.saturating_add(1),
+            Seen::InPreviousFile => {
+                self.repeated_from_previous_file =
+                    self.repeated_from_previous_file.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+}
 
-impl SeenLines {
-    fn is_repeat(&mut self, line: &[u8]) -> bool {
+/// Where a line was seen before.
+enum Seen {
+    New,
+    InFile,
+    InPreviousFile,
+}
+
+/// The lines of one stream's current file and of the file before it, as hashes, so that a reader
+/// leaves out a line written again: within its file, or from the tail of the file before, which
+/// the next file of the capture repeats. Pass one filter per stream to the readers of its files in
+/// order; each read starts a file, and what the file before held is forgotten then.
+#[derive(Debug, Clone, Default)]
+pub struct RepeatFilter {
+    previous: HashSet<u64>,
+    current: HashSet<u64>,
+}
+
+impl RepeatFilter {
+    /// A filter that has seen no file.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The next file starts: the current one becomes the one before.
+    fn start_file(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+    }
+
+    fn check(&mut self, line: &[u8]) -> Seen {
         let mut hasher = DefaultHasher::new();
         line.hash(&mut hasher);
-        !self.0.insert(hasher.finish())
+        let hash = hasher.finish();
+        if !self.current.insert(hash) {
+            Seen::InFile
+        } else if self.previous.contains(&hash) {
+            Seen::InPreviousFile
+        } else {
+            Seen::New
+        }
     }
 }
 
@@ -342,19 +409,28 @@ impl SeenLines {
 /// Returns [`MMError::InvalidMarketState`] for an unreadable stream or a line of any coin that
 /// does not follow the schema.
 pub fn read_book_diffs(reader: impl BufRead, coin: &str) -> MMResult<CaptureRead<BookDiff>> {
+    read_book_diffs_after(reader, coin, &mut RepeatFilter::new())
+}
+
+/// [`read_book_diffs`], leaving out too the lines of the file before that `filter` saw.
+///
+/// # Errors
+///
+/// As [`read_book_diffs`].
+pub fn read_book_diffs_after(
+    reader: impl BufRead,
+    coin: &str,
+    filter: &mut RepeatFilter,
+) -> MMResult<CaptureRead<BookDiff>> {
     let mut read = CaptureRead::default();
-    let mut seen = SeenLines::default();
+    filter.start_file();
     for line in reader.lines() {
         let line = line.map_err(|error| bad(format!("reading book diffs: {error}")))?;
         let (found, diff) = parse_book_diff(&line)?;
         if found != coin {
             continue;
         }
-        if seen.is_repeat(line.as_bytes()) {
-            read.repeated_lines = read.repeated_lines.saturating_add(1);
-        } else {
-            read.rows.push(diff);
-        }
+        read.keep(filter, line.as_bytes(), || Ok(diff))?;
     }
     Ok(read)
 }
@@ -471,8 +547,21 @@ pub fn parse_time_ns(text: &str) -> MMResult<u64> {
 /// Returns [`MMError::InvalidMarketState`] for an unreadable stream, a line that is not a trade,
 /// or a line of this coin whose fields do not follow the schema.
 pub fn read_trades(reader: impl BufRead, coin: &str) -> MMResult<CaptureRead<CaptureTrade>> {
+    read_trades_after(reader, coin, &mut RepeatFilter::new())
+}
+
+/// [`read_trades`], leaving out too the lines of the file before that `filter` saw.
+///
+/// # Errors
+///
+/// As [`read_trades`].
+pub fn read_trades_after(
+    reader: impl BufRead,
+    coin: &str,
+    filter: &mut RepeatFilter,
+) -> MMResult<CaptureRead<CaptureTrade>> {
     let mut read = CaptureRead::default();
-    let mut seen = SeenLines::default();
+    filter.start_file();
     for line in reader.lines() {
         let line = line.map_err(|error| bad(format!("reading trades: {error}")))?;
         let raw: RawTrade =
@@ -480,20 +569,18 @@ pub fn read_trades(reader: impl BufRead, coin: &str) -> MMResult<CaptureRead<Cap
         if raw.coin != coin {
             continue;
         }
-        if seen.is_repeat(line.as_bytes()) {
-            read.repeated_lines = read.repeated_lines.saturating_add(1);
-            continue;
-        }
-        read.rows.push(CaptureTrade {
-            timestamp_ns: parse_time_ns(&raw.time)?,
-            price: decimal(&raw.px, "price")?,
-            size: decimal(&raw.sz, "size")?,
-            aggressor: match raw.side.as_str() {
-                "B" => TradeSide::Buy,
-                "A" => TradeSide::Sell,
-                other => return Err(bad(format!("aggressor {other}"))),
-            },
-        });
+        read.keep(filter, line.as_bytes(), || {
+            Ok(CaptureTrade {
+                timestamp_ns: parse_time_ns(&raw.time)?,
+                price: decimal(&raw.px, "price")?,
+                size: decimal(&raw.sz, "size")?,
+                aggressor: match raw.side.as_str() {
+                    "B" => TradeSide::Buy,
+                    "A" => TradeSide::Sell,
+                    other => return Err(bad(format!("aggressor {other}"))),
+                },
+            })
+        })?;
     }
     Ok(read)
 }

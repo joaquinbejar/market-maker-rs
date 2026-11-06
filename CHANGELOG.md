@@ -30,6 +30,10 @@ project follows [Semantic Versioning](https://semver.org/).
   `HawkesSegment` and `QuoteExposure`, with no new dependency. Book diffs have no timestamp, so
   their times are inferred and marked. Example `hyperliquid_hour` reports what could and could
   not be established. No data is in the repository, and the book starts empty.
+  Consecutive files of a stream overlap by minutes, the later one writing the earlier one's
+  tail again: `RepeatFilter` and the readers `decode_order_statuses_after`,
+  `read_book_diffs_after` and `read_trades_after` leave out a line of the file before too, and
+  count it.
   A silence longer than a declared `ReplayConfig::reset_gap_ns`, in the diffs or the trades, empties
   the book and restarts the warm-up, with `Coverage` counting the resets and the orders cut, and
   `BookEvent::epoch` keeping events apart.
