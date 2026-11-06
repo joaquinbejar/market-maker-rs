@@ -155,10 +155,11 @@ fn episode_costs(trades: &[SimulatedFill], ticks: &[MarketTick]) -> Costs {
                     position += trade.quantity;
                     cash -= notional + trade.fee;
                 }
-                _ => {
+                Action::Sell => {
                     position -= trade.quantity;
                     cash += notional - trade.fee;
                 }
+                other => panic!("a fill is a buy or a sell, not {other:?}"),
             }
             next += 1;
         }
@@ -335,6 +336,42 @@ fn ungated(ticks: Vec<MarketTick>, size: Decimal) -> BacktestResult {
     BacktestEngine::new(config(), Proposer::new(size), VecDataSource::new(ticks)).run()
 }
 
+/// The balances of an account with these deposits after each fill, from the fills alone: the
+/// final quote and base, and the lowest each reached.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Balances {
+    quote: Decimal,
+    base: Decimal,
+    lowest_quote: Decimal,
+    lowest_base: Decimal,
+}
+
+fn balances_after(trades: &[SimulatedFill], quote: Decimal, base: Decimal) -> Balances {
+    let mut balances = Balances {
+        quote,
+        base,
+        lowest_quote: quote,
+        lowest_base: base,
+    };
+    for trade in trades {
+        let notional = trade.price * trade.quantity;
+        match trade.side {
+            Action::Buy => {
+                balances.quote -= notional + trade.fee;
+                balances.base += trade.quantity;
+            }
+            Action::Sell => {
+                balances.quote += notional - trade.fee;
+                balances.base -= trade.quantity;
+            }
+            other => panic!("a fill is a buy or a sell, not {other:?}"),
+        }
+        balances.lowest_quote = balances.lowest_quote.min(balances.quote);
+        balances.lowest_base = balances.lowest_base.min(balances.base);
+    }
+    balances
+}
+
 /// Whether the gate refused this for what the balance could pay.
 fn refused_for_the_balance(record: &PretradeRecord) -> bool {
     match &record.decision {
@@ -498,9 +535,44 @@ fn test_with_nothing_free_a_proposal_gets_no_order_executed() {
 }
 
 #[test]
-fn test_over_the_planned_episodes_the_gate_ends_each_with_a_solvent_account() {
+fn test_the_ledger_books_each_fill_by_hand() {
+    // Bought 1 at 99 for a fee of 0.0099, and sold 1 at 101 for a fee of 0.0101.
+    let ticks = vec![
+        tick_at(0, dec!(100)),
+        tick_at(100, dec!(98.9)),
+        tick_at(200, dec!(100)),
+        tick_at(300, dec!(101.1)),
+    ];
+    let account = account(QUOTE_DEPOSIT, BASE_DEPOSIT);
+    let before = account.with_gate(|gate| gate.ledger().journal().len());
+    let (result, _, _) = gated(ticks, MODEST, &account);
+    assert_eq!(result.trades.len(), 2);
+    // The policy books each fill, and the engine's figures read that same ledger back.
+    assert_eq!(
+        result.accounting.accountant.as_deref(),
+        Some("margin-rs gate ledger for BTC-USDC")
+    );
+    account.with_gate(|gate| {
+        let ledger = gate.ledger();
+        assert_eq!(ledger.journal().len(), before + 2);
+        let total = |asset| ledger.balance(&Asset::new(asset).unwrap()).unwrap().total;
+        assert_eq!(total("USDC"), dec!(1001.98));
+        assert_eq!(total("BTC"), BASE_DEPOSIT);
+    });
+    let hand = balances_after(&result.trades, QUOTE_DEPOSIT, BASE_DEPOSIT);
+    assert_eq!(hand.quote, dec!(1001.98));
+    assert_eq!(hand.base, BASE_DEPOSIT);
+    // The first fill spent 99.0099 of quote and the second gave back the base.
+    assert_eq!(hand.lowest_quote, dec!(900.9901));
+    assert_eq!(hand.lowest_base, BASE_DEPOSIT);
+}
+
+#[test]
+fn test_over_the_planned_episodes_the_gate_keeps_each_balance_from_going_under_zero() {
+    let mut control_overdrawn = 0;
     for seed in SEEDS {
         let account = account(QUOTE_DEPOSIT, BASE_DEPOSIT);
+        let before = account.with_gate(|gate| gate.ledger().journal().len());
         let (result, counts, records) = gated(tape(seed), OVERSIZED, &account);
         assert!(!result.trades.is_empty(), "{seed}");
         assert!(counts.reduced > 0, "{seed}");
@@ -514,17 +586,29 @@ fn test_over_the_planned_episodes_the_gate_ends_each_with_a_solvent_account() {
             account.errors()
         );
         assert_eq!(account.fault().map(|e| e.to_string()), None, "{seed}");
+        // The balances over the whole path, from the fills, and the ledger agrees at the end.
+        let path = balances_after(&result.trades, QUOTE_DEPOSIT, BASE_DEPOSIT);
+        assert!(path.lowest_quote >= Decimal::ZERO, "{seed}");
+        assert!(path.lowest_base >= Decimal::ZERO, "{seed}");
         account.with_gate(|gate| {
             let ledger = gate.ledger();
             assert!(ledger.reconcile().unwrap().is_clean(), "{seed}");
-            for asset in ["USDC", "BTC"] {
-                let balance = ledger.balance(&Asset::new(asset).unwrap()).unwrap();
-                assert!(balance.total >= Decimal::ZERO, "{seed} {asset}");
-            }
+            assert_eq!(
+                ledger.journal().len(),
+                before + result.trades.len(),
+                "{seed}"
+            );
+            let total = |asset| ledger.balance(&Asset::new(asset).unwrap()).unwrap().total;
+            assert_eq!(total("USDC"), path.quote, "{seed}");
+            assert_eq!(total("BTC"), path.base, "{seed}");
         });
-        // It cannot sell more than it holds, however much it proposes.
-        assert!(result.final_position >= -BASE_DEPOSIT, "{seed}");
+        // So the check can fail: the same proposer with no gate goes under on the same tape.
+        let control = ungated(tape(seed), OVERSIZED);
+        let path = balances_after(&control.trades, QUOTE_DEPOSIT, BASE_DEPOSIT);
+        control_overdrawn +=
+            usize::from(path.lowest_quote < Decimal::ZERO || path.lowest_base < Decimal::ZERO);
     }
+    assert_eq!(control_overdrawn, SEEDS.count());
 }
 
 #[test]
@@ -694,12 +778,130 @@ fn test_a_tape_reproduces_by_seed() {
     assert_eq!(tape(1).len(), TICKS);
 }
 
-/// The mean of a figure over the episodes, and its range.
+/// One line of the table: the mean of a figure over the episodes, and its range.
 fn line(name: &str, values: &[f64]) -> String {
     let mean = values.iter().sum::<f64>() / values.len() as f64;
     let low = values.iter().copied().fold(f64::INFINITY, f64::min);
     let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     format!("{name} {mean:.3} [{low:.3}, {high:.3}]")
+}
+
+/// An arm of the table.
+#[derive(Debug, Clone, Copy)]
+struct Arm {
+    name: &'static str,
+    size: Decimal,
+    gate: bool,
+}
+
+const ARMS: [Arm; 3] = [
+    Arm {
+        name: "modest, gated",
+        size: MODEST,
+        gate: true,
+    },
+    Arm {
+        name: "oversized, gated",
+        size: OVERSIZED,
+        gate: true,
+    },
+    Arm {
+        name: "oversized, no gate (control)",
+        size: OVERSIZED,
+        gate: false,
+    },
+];
+
+/// The costs and the gate's decisions of an arm on a tape. A control has no gate, so it has
+/// no decisions at all.
+fn run_arm(arm: Arm, ticks: &[MarketTick]) -> (Costs, GateCounts) {
+    let (result, counts) = if arm.gate {
+        let account = account(QUOTE_DEPOSIT, BASE_DEPOSIT);
+        let (result, counts, _) = gated(ticks.to_vec(), arm.size, &account);
+        (result, counts)
+    } else {
+        (ungated(ticks.to_vec(), arm.size), GateCounts::default())
+    };
+    (episode_costs(&result.trades, ticks), counts)
+}
+
+/// The table's text for an arm, from each episode's costs and decisions, kept apart.
+fn report(name: &str, episodes: &[(Costs, GateCounts)]) -> String {
+    let cost = |pick: fn(&Costs) -> Decimal| -> Vec<f64> {
+        episodes
+            .iter()
+            .map(|(c, _)| (pick(c) / Decimal::from(c.ticks)).to_f64().unwrap())
+            .collect()
+    };
+    let ticks = |pick: fn(&Costs) -> usize| -> Vec<f64> {
+        episodes.iter().map(|(c, _)| pick(c) as f64).collect()
+    };
+    let gate = |pick: fn(&GateCounts) -> usize| -> Vec<f64> {
+        episodes.iter().map(|(_, g)| pick(g) as f64).collect()
+    };
+    format!(
+        "{name}\n  expected cost: {}, {}, {}\n  violations: {}, {}, {}\n  gate: {}, {}, {}",
+        line("inventory", &cost(|c| c.inventory)),
+        line("margin", &cost(|c| c.margin)),
+        line("drawdown", &cost(|c| c.drawdown)),
+        line("inventory", &ticks(|c| c.inventory_violations)),
+        line("margin", &ticks(|c| c.margin_violations)),
+        line("drawdown", &ticks(|c| c.drawdown_violations)),
+        line("rejected", &gate(|g| g.rejected)),
+        line("reduced", &gate(|g| g.reduced)),
+        line("proposals", &gate(|g| g.proposals)),
+    )
+}
+
+#[test]
+fn test_a_report_prints_each_figure_under_its_name() {
+    let costs = Costs {
+        inventory: dec!(10),
+        margin: dec!(20),
+        drawdown: dec!(30),
+        inventory_violations: 1,
+        margin_violations: 2,
+        drawdown_violations: 3,
+        ticks: 10,
+        pnl: dec!(0),
+    };
+    let counts = GateCounts {
+        proposals: 6,
+        rejected: 4,
+        reduced: 5,
+    };
+    let double = Costs {
+        inventory: dec!(30),
+        inventory_violations: 3,
+        ..costs
+    };
+    assert_eq!(
+        report("arm", &[(costs, counts), (double, counts)]),
+        "arm\n  \
+         expected cost: inventory 2.000 [1.000, 3.000], margin 2.000 [2.000, 2.000], drawdown \
+         3.000 [3.000, 3.000]\n  \
+         violations: inventory 2.000 [1.000, 3.000], margin 2.000 [2.000, 2.000], drawdown 3.000 \
+         [3.000, 3.000]\n  \
+         gate: rejected 4.000 [4.000, 4.000], reduced 5.000 [5.000, 5.000], proposals 6.000 \
+         [6.000, 6.000]"
+    );
+}
+
+#[test]
+fn test_the_arms_are_as_named_and_only_the_control_has_no_gate() {
+    let ticks = tape(1);
+    let run = |index: usize| run_arm(ARMS[index], &ticks);
+    assert_eq!(ARMS[0].size, MODEST);
+    let (modest, modest_counts) = run(0);
+    let (oversized, oversized_counts) = run(1);
+    let (control, control_counts) = run(2);
+    assert!(modest_counts.proposals > 0);
+    assert!(oversized_counts.reduced > modest_counts.reduced);
+    assert!(oversized.inventory > modest.inventory);
+    assert_eq!(control_counts, GateCounts::default());
+    // Same size, and only the gate is between them.
+    assert_eq!(ARMS[1].size, ARMS[2].size);
+    assert!(control.inventory > oversized.inventory);
 }
 
 /// The evidence table. `--ignored --nocapture`, in release, with the `margin` feature.
@@ -712,55 +914,9 @@ fn evidence() {
          {QUOTE_DEPOSIT} quote and {BASE_DEPOSIT} base, fee {FEE}, {TICKS} ticks, episodes {SEEDS:?}."
     );
     println!("Mean per episode [lowest, highest]. Costs are per tick; violations are ticks.");
-    let per_tick = |sum: Decimal, ticks: usize| (sum / Decimal::from(ticks)).to_f64().unwrap();
-    for (name, size, gate) in [
-        ("modest, gated", MODEST, true),
-        ("oversized, gated", OVERSIZED, true),
-        ("oversized, no gate (control)", OVERSIZED, false),
-    ] {
-        let mut rows: Vec<[f64; 9]> = Vec::new();
-        for seed in SEEDS {
-            let ticks = tape(seed);
-            let (result, counts) = if gate {
-                let account = account(QUOTE_DEPOSIT, BASE_DEPOSIT);
-                let (result, counts, _) = gated(ticks.clone(), size, &account);
-                assert!(account.errors().is_empty(), "{:?}", account.errors());
-                (result, counts)
-            } else {
-                (ungated(ticks.clone(), size), GateCounts::default())
-            };
-            let costs = episode_costs(&result.trades, &ticks);
-            rows.push([
-                per_tick(costs.inventory, costs.ticks),
-                per_tick(costs.margin, costs.ticks),
-                per_tick(costs.drawdown, costs.ticks),
-                costs.inventory_violations as f64,
-                costs.margin_violations as f64,
-                costs.drawdown_violations as f64,
-                counts.rejected as f64,
-                counts.reduced as f64,
-                counts.proposals as f64,
-            ]);
-        }
-        let column = |index: usize| rows.iter().map(|row| row[index]).collect::<Vec<f64>>();
-        println!("\n{name}");
-        println!(
-            "  expected cost: {}, {}, {}",
-            line("inventory", &column(0)),
-            line("margin", &column(1)),
-            line("drawdown", &column(2))
-        );
-        println!(
-            "  violations: {}, {}, {}",
-            line("inventory", &column(3)),
-            line("margin", &column(4)),
-            line("drawdown", &column(5))
-        );
-        println!(
-            "  gate: {}, {}, {}",
-            line("rejected", &column(6)),
-            line("reduced", &column(7)),
-            line("proposals", &column(8))
-        );
+    for arm in ARMS {
+        let episodes: Vec<(Costs, GateCounts)> =
+            SEEDS.map(|seed| run_arm(arm, &tape(seed))).collect();
+        println!("\n{}", report(arm.name, &episodes));
     }
 }
