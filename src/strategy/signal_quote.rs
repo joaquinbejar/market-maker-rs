@@ -478,8 +478,8 @@ impl FeatureCoverage {
 pub struct SimulationReport {
     /// Quotes decided.
     pub decisions: u64,
-    /// Decisions with no quote: a stop policy, the limits on both sides or
-    /// inventory quotes that could not be formed.
+    /// Decisions with no quote: a stop policy, the limits on both sides, inventory quotes
+    /// that could not be formed, or a gate that took both sides off.
     pub halted_decisions: u64,
     /// Quotes skipped as crossed or empty.
     pub invalid_quotes: u64,
@@ -732,7 +732,9 @@ pub fn simulate(
 /// events. A quote is sent while the last one still rests until its replacement arrives,
 /// so a policy counting live orders counts both. A reduced side rests for the smaller size,
 /// and a rejected one does not rest. If the policy fails on an event, no new side is sent,
-/// and the events still reach it. See [`SimulationReport::gate_rejections`].
+/// and the events still reach it. That is not a stop: what is already out or in flight can
+/// still rest and fill until a later decision replaces it. See
+/// [`SimulationReport::gate_rejections`].
 ///
 /// # Errors
 ///
