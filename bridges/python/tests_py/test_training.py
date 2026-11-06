@@ -1,17 +1,20 @@
 """A pinned trainer over the environments: smoke runs, checkpoints and the protocol."""
 
 import json
+import pathlib
 from decimal import Decimal
 
 import numpy as np
 import pytest
 import sb3_contrib
 import stable_baselines3
+import torch
 from conftest import config, walk
 
 from mm_rl_bridge import BoxMarketMakingEnv, MaskableMarketMakingEnv
 from mm_rl_bridge.training import (
     TRAINER_VERSION,
+    EpisodeResult,
     Protocol,
     chronological_split,
     evaluate,
@@ -251,6 +254,113 @@ def test_protocol_refuses_a_candidates_files_before_training(tmp_path, monkeypat
     assert files_in(tmp_path) == before
     with pytest.raises(RuntimeError, match="nothing to select"):
         later.select([1])
+
+
+SELECTIONS = {
+    "best in the middle": ({1: ["1", "1"], 2: ["3", "5"], 3: ["2", "2"]}, 2),
+    "by the mean, not one episode": ({1: ["9", "-9"], 2: ["1", "1"], 3: ["0", "0"]}, 2),
+    "all negative": ({1: ["-5", "-5"], 2: ["-1", "-1"], 3: ["-9", "-9"]}, 2),
+    "a tie goes to the earlier": ({1: ["2", "2"], 2: ["2", "2"], 3: ["1", "1"]}, 1),
+}
+
+
+@pytest.mark.parametrize("nets, expected", SELECTIONS.values(), ids=SELECTIONS.keys())
+def test_protocol_sends_the_best_mean_net_to_the_holdout(tmp_path, monkeypatch, nets, expected):
+    protocol = protocol_in(tmp_path)
+    for seed in nets:
+        protocol.train(seed, 32, PPO_SMALL)
+    evaluated = []
+
+    def load(path, env):
+        metadata = json.loads(pathlib.Path(path).with_suffix(".json").read_text())
+        return metadata, metadata
+
+    def known(model, env, seeds):
+        evaluated.append(env.bridge_info["dataset_digest"])
+        return [
+            EpisodeResult(seed, 1, Decimal(net), Decimal(0), True, False, ())
+            for seed, net in zip(seeds, nets[model["seed"]])
+        ]
+
+    monkeypatch.setattr("mm_rl_bridge.training.load_for_inference", load)
+    monkeypatch.setattr("mm_rl_bridge.training.evaluate", known)
+    table = protocol.select([7, 8])
+    assert [row["seed"] for row in table] == list(nets)
+    assert [row["mean_net"] for row in table] == [
+        sum(map(Decimal, values)) / 2 for values in nets.values()
+    ]
+    metadata, _ = protocol.run_holdout([7, 8])
+    assert metadata["seed"] == expected
+    # The selection read validation alone, and only the holdout's evaluation read the holdout.
+    _, validation, holdout = chronological_split(
+        walk(600), (1000 + 300 * 25) * 1_000_000, (1000 + 450 * 25) * 1_000_000
+    )
+    digests = []
+    for window in (validation, holdout):
+        env = MaskableMarketMakingEnv(config(max_steps=1000), window)
+        digests.append(env.bridge_info["dataset_digest"])
+        env.close()
+    assert digests[0] != digests[1]
+    assert evaluated == [digests[0]] * 3 + [digests[1]]
+
+
+BAD_INPUTS = {
+    "a suffix": ({"name": "v1.5"}, "ends in"),
+    "two suffixes": ({"name": "model.tar.gz"}, "ends in"),
+    "hyperparameters": (
+        {"hyperparameters": {**PPO_SMALL, "policy_kwargs": {"activation_fn": torch.nn.Tanh}}},
+        "must be JSON",
+    ),
+    "a commit": ({"commit": object()}, "must be JSON"),
+    "a seed": ({"seed": np.int64(1)}, "must be JSON"),
+    "a budget": ({"total_timesteps": np.int64(8)}, "must be JSON"),
+}
+
+
+@pytest.mark.parametrize("changed, message", BAD_INPUTS.values(), ids=BAD_INPUTS.keys())
+def test_train_refuses_what_it_could_not_save_before_training(
+    tmp_path, monkeypatch, changed, message
+):
+    def never(*_args, **_kwargs):
+        raise AssertionError("trained on inputs it could not save")
+
+    monkeypatch.setattr(sb3_contrib.MaskablePPO, "learn", never)
+    inputs = {
+        "name": "model",
+        "seed": 1,
+        "total_timesteps": 8,
+        "commit": "abc",
+        "hyperparameters": PPO_SMALL,
+        **changed,
+    }
+    env = maskable()
+    with pytest.raises(ValueError, match=message):
+        train(
+            "maskable_ppo",
+            env,
+            inputs["seed"],
+            inputs["total_timesteps"],
+            tmp_path / inputs["name"],
+            inputs["commit"],
+            inputs["hyperparameters"],
+        )
+    env.close()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_train_takes_a_path_with_or_without_the_zip_suffix(tmp_path):
+    env = maskable()
+    for name in ("plain", "named.zip"):
+        metadata = train("maskable_ppo", env, 3, 32, tmp_path / name, "abc", PPO_SMALL)
+        _, loaded = load_for_inference(tmp_path / name, env)
+        assert loaded == metadata
+    env.close()
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "named.json",
+        "named.zip",
+        "plain.json",
+        "plain.zip",
+    ]
 
 
 def test_report_separates_environment_determinism_from_training_variability(tmp_path):

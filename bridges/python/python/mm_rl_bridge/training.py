@@ -66,24 +66,42 @@ def _hash(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 
 
+def _check_inputs(path, seed, total_timesteps, commit, hyperparameters):
+    """Refuses, before a run, what could only fail when the run is saved."""
+    if path.suffix not in ("", ".zip"):
+        raise ValueError(f"a checkpoint's path ends in .zip or nothing, not {path.suffix!r}")
+    inputs = {
+        "seed": seed,
+        "total_timesteps": total_timesteps,
+        "commit": commit,
+        "hyperparameters": hyperparameters,
+    }
+    try:
+        json.dumps(inputs)
+    except TypeError as error:
+        raise ValueError(f"a checkpoint's metadata must be JSON: {error}") from error
+
+
 def train(algorithm, env, seed, total_timesteps, path, commit, hyperparameters=None):
     """Trains on one thread of the CPU and saves a checkpoint with its metadata.
 
-    `commit` is declared by the caller, and not checked. Replaces what `path` held. Returns
-    the metadata.
+    `commit` is declared by the caller, and not checked. Replaces what `path` held. Raises
+    `ValueError` before training for a path with another suffix, or for inputs the metadata
+    cannot hold as JSON. Returns the metadata.
     """
     _check_algorithm(algorithm, env)
     if stable_baselines3.__version__ != TRAINER_VERSION:
         raise RuntimeError(f"the trainer is pinned to {TRAINER_VERSION}")
+    path = pathlib.Path(path)
+    hyperparameters = dict(hyperparameters or {})
+    _check_inputs(path, seed, total_timesteps, commit, hyperparameters)
     torch.set_num_threads(1)
     set_random_seed(seed)
-    hyperparameters = dict(hyperparameters or {})
     model_class, _ = _ALGORITHMS[algorithm]
     env.reset(seed=seed)
     wrapped = DummyVecEnv([lambda: Monitor(env)])
     model = model_class("MlpPolicy", wrapped, seed=seed, device="cpu", **hyperparameters)
     model.learn(total_timesteps=total_timesteps, progress_bar=False)
-    path = pathlib.Path(path)
     model.save(path)
     zip_path = path.with_suffix(".zip")
     metadata = {
@@ -243,7 +261,8 @@ class Protocol:
     def select(self, evaluation_seeds):
         """Evaluates every candidate on validation and keeps the best mean net result.
 
-        Returns one row per candidate, the unselected ones included.
+        The earlier candidate wins a tie. Returns one row per candidate, the unselected ones
+        included.
         """
         if not self._candidates:
             raise RuntimeError("there is nothing to select from")
