@@ -903,3 +903,36 @@ fn test_difference_to_an_identical_trading_baseline_is_exactly_zero() {
     let (_, lower, upper, _) = interval(metrics.against_baselines["fixed-spread"]);
     assert_eq!((lower, upper), (0.0, 0.0));
 }
+
+#[test]
+fn test_data_hash_covers_the_last_trade_fields() {
+    let hashes = |data| {
+        Experiment::new(experiment_config(), data, baselines(), vec![immediate()])
+            .unwrap()
+            .evaluate_validation()
+            .report()
+            .manifest
+            .data_hashes
+            .clone()
+    };
+    // Tick 10 is in the training window, and each field alone must move its hash.
+    let with_last = |price: Option<Decimal>, size: Option<Decimal>| {
+        let mut data = ticks();
+        data[10].last_price = price;
+        data[10].last_size = size;
+        hashes(data)["train"].clone()
+    };
+    let none = with_last(None, None);
+    let price = with_last(Some(dec!(100)), None);
+    let size = with_last(None, Some(dec!(100)));
+    let other_price = with_last(Some(dec!(101)), None);
+    let other_size = with_last(None, Some(dec!(101)));
+    let all = [&none, &price, &size, &other_price, &other_size];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    // The same value at another scale is the same data here too.
+    assert_eq!(price, with_last(Some(dec!(100.00)), None));
+}

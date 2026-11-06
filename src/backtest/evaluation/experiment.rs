@@ -724,6 +724,13 @@ fn hash_ticks(ticks: &[MarketTick]) -> String {
         for value in [tick.bid_price, tick.ask_price, tick.bid_size, tick.ask_size] {
             hash = fnv(hash, &value.normalize().serialize());
         }
+        // A strategy or fill model can read these. The tag tells absent from any value.
+        for value in [tick.last_price, tick.last_size] {
+            hash = match value {
+                Some(value) => fnv(fnv(hash, &[1]), &value.normalize().serialize()),
+                None => fnv(hash, &[0]),
+            };
+        }
     }
     format!("{hash:032x}")
 }
