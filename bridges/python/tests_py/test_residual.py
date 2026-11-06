@@ -1,13 +1,16 @@
 """A residual policy through the bridge. All data here is synthetic."""
 
+import json
 from decimal import Decimal
 
 import numpy as np
 import pytest
 from conftest import config, walk
+from stable_baselines3 import SAC
 from stable_baselines3.common.env_checker import check_env as sb3_check_env
 
 from mm_rl_bridge import BridgeFailure, ResidualMarketMakingEnv
+from mm_rl_bridge._native import RESIDUAL_VERSION
 from mm_rl_bridge.training import (
     Protocol,
     ZeroResidual,
@@ -173,6 +176,88 @@ def test_checkpoint_reproduces_inference_on_saved_observations(tmp_path):
     for observation, action in zip(saved, proposed, strict=True):
         replayed, _ = again.predict(observation, deterministic=True)
         assert np.array_equal(replayed, action)
+
+
+GLFT = {
+    "kind": "glft",
+    "risk_aversion": "0.01",
+    "order_intensity_k": "0.3",
+    "intensity_scale_a": "1.5",
+    "max_inventory_lots": 10,
+    "terminal_time": 100_000_000,
+    "min_spread": "0.5",
+    "volatility": "0.2",
+    "session_start_ms": 0,
+}
+OTHER_RESIDUALS = {
+    "price bound": lambda r: {**r, "price_ticks": 40},
+    "size bound": lambda r: {**r, "size_lots": 2},
+    "default size": lambda r: {**r, "default_order_size": "2"},
+    "baseline parameter": lambda r: {**r, "baseline": {**r["baseline"], "risk_aversion": "0.2"}},
+    "baseline kind": lambda r: {**r, "baseline": GLFT},
+    "one number written two ways": lambda r: {
+        **r,
+        "baseline": {**r["baseline"], "volatility": "0.20"},
+    },
+}
+
+
+@pytest.fixture(scope="module")
+def residual_checkpoint(tmp_path_factory):
+    path = tmp_path_factory.mktemp("residual") / "model"
+    env = env_on()
+    train("sac_residual", env, 2, 32, path, "abc", SAC_SMALL)
+    env.close()
+    return path
+
+
+@pytest.mark.parametrize("change", OTHER_RESIDUALS.values(), ids=OTHER_RESIDUALS.keys())
+def test_loading_refuses_another_residual_configuration(residual_checkpoint, monkeypatch, change):
+    settings = residual_config()
+    settings["residual"] = change(settings["residual"])
+    other = env_on(settings=settings)
+    try:
+        # The specification and the execution rules alone cannot tell them apart.
+        _, metadata = load_for_inference(residual_checkpoint, env_on())
+        assert tuple(metadata["spec"]) == other.spec_id
+        assert metadata["kernel_fingerprint"] == other.bridge_info["kernel_fingerprint"]
+
+        def never(*_args, **_kwargs):
+            raise AssertionError("loaded the zip, which runs code, before refusing it")
+
+        # The refusal comes before the zip is opened.
+        monkeypatch.setattr(SAC, "load", never)
+        with pytest.raises(ValueError, match="another residual configuration"):
+            load_for_inference(residual_checkpoint, other)
+    finally:
+        other.close()
+
+
+def never_load(*_args, **_kwargs):
+    raise AssertionError("loaded the zip, which runs code, before refusing it")
+
+
+def test_loading_refuses_another_composition_version(residual_checkpoint, tmp_path, monkeypatch):
+    path = tmp_path / "model"
+    for suffix in (".zip", ".json"):
+        path.with_suffix(suffix).write_bytes(residual_checkpoint.with_suffix(suffix).read_bytes())
+    metadata = json.loads(path.with_suffix(".json").read_text())
+    assert metadata["residual_version"] == RESIDUAL_VERSION
+    env = env_on()
+    try:
+        for version in (RESIDUAL_VERSION + 1, None):
+            metadata["residual_version"] = version
+            path.with_suffix(".json").write_text(json.dumps(metadata))
+            with monkeypatch.context() as patch:
+                patch.setattr(SAC, "load", never_load)
+                with pytest.raises(ValueError, match="another version"):
+                    load_for_inference(path, env)
+        metadata["residual_version"] = RESIDUAL_VERSION
+        path.with_suffix(".json").write_text(json.dumps(metadata))
+        _, loaded = load_for_inference(path, env)
+        assert loaded == metadata
+    finally:
+        env.close()
 
 
 def test_protocol_compares_the_policy_with_its_zero_baseline_on_the_same_window(tmp_path):

@@ -28,6 +28,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+from ._native import RESIDUAL_VERSION
 from .envs import BoxMarketMakingEnv, MaskableMarketMakingEnv, ResidualMarketMakingEnv
 
 TRAINER_VERSION = "2.9.2"
@@ -111,6 +112,7 @@ def train(algorithm, env, seed, total_timesteps, path, commit, hyperparameters=N
         "spec": list(env.spec_id),
         "config": env.config,
         "kernel_fingerprint": env.bridge_info["kernel_fingerprint"],
+        "residual_version": _residual_version(env.config),
         "train_dataset_digest": env.bridge_info["dataset_digest"],
         "train_rows": env.bridge_info["rows"],
         "seed": seed,
@@ -123,6 +125,10 @@ def train(algorithm, env, seed, total_timesteps, path, commit, hyperparameters=N
     }
     _metadata_path(path).write_text(json.dumps(metadata, indent=2, sort_keys=True))
     return metadata
+
+
+def _residual_version(config):
+    return None if config.get("residual") is None else RESIDUAL_VERSION
 
 
 def _optimizer(model):
@@ -140,7 +146,9 @@ def load_for_inference(path, env):
     """Loads a checkpoint to act only, after checking it belongs to this environment.
 
     Raises `ValueError` for another specification, other execution rules (fees, latency,
-    fills or limits) or a zip that changed.
+    fills or limits), another residual (its baseline, its bounds or the version of its
+    composition, none of which the specification covers) or a zip that changed. Residual
+    configurations are compared as written, so one number written two ways is refused too.
     """
     path = pathlib.Path(path)
     metadata = json.loads(_metadata_path(path).read_text())
@@ -149,6 +157,10 @@ def load_for_inference(path, env):
         raise ValueError(f"the checkpoint is for {metadata['spec']}, this is {env.spec_id}")
     if metadata["kernel_fingerprint"] != env.bridge_info["kernel_fingerprint"]:
         raise ValueError("the checkpoint was trained under other execution rules")
+    if metadata.get("residual_version") != _residual_version(env.config):
+        raise ValueError("the checkpoint composes its residual under another version")
+    if metadata["config"].get("residual") != env.config.get("residual"):
+        raise ValueError("the checkpoint was trained over another residual configuration")
     zip_path = path.with_suffix(".zip")
     if _hash(zip_path) != metadata["checkpoint_sha256"]:
         raise ValueError("the checkpoint's zip is not the one that was saved")
