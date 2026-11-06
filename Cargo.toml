@@ -148,6 +148,10 @@ name = "event_system"
 required-features = ["events"]
 
 [[example]]
+name = "regime_adaptation"
+test = true
+
+[[example]]
 name = "baseline_evaluation"
 
 [[example]]
