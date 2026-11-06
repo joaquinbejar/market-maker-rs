@@ -23,7 +23,7 @@ use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
     ACTION_SPACE_VERSION, AsOf, EPISODE_VERSION, ERR_ACTION_OFF_GRID, EpisodeRecorder,
-    FEATURE_COUNT, FeatureHorizon, FeatureId, FeatureUnit, InvalidActionPolicy,
+    FEATURE_COUNT, FeatureHorizon, FeatureId, FeatureUnit, HedgeActions, InvalidActionPolicy,
     OBSERVATION_SPACE_VERSION, ObservationScales, REWARD_VERSION, RlAction, RlConfig, RlEnv,
     RlSpec, StateMemory, TerminalValuation,
 };
@@ -1293,11 +1293,25 @@ fn test_spec_states_the_table_of_features() {
 fn test_spec_fingerprint_is_pinned_so_a_change_needs_a_new_version() {
     let spec = spec_of(&long_config(), long_grid(), config());
     let id = spec.id();
-    assert_eq!(id.fingerprint, 281796423096009772465355244436229638458);
+    assert_eq!(id.action, 2);
+    assert_eq!(id.fingerprint, 165280442375121912034794721707712240181);
     assert_eq!(
         market_maker_rs::backtest::kernel::fnv1a128(&spec.to_bytes()),
         id.fingerprint
     );
+    // What a checkpoint trained under action space 1 recorded for the same choices.
+    let version_one = market_maker_rs::rl::SpecId {
+        action: 1,
+        fingerprint: 281796423096009772465355244436229638458,
+        ..id
+    };
+    assert!(matches!(
+        spec.ensure(version_one),
+        Err(MMError::InvalidConfiguration(_))
+    ));
+    let hedged = spec_of(&long_config(), long_grid(), config().with_hedge_actions());
+    assert!(hedged.ensure(version_one).is_err());
+    assert!(hedged.ensure(id).is_err());
 }
 
 #[test]
@@ -1418,7 +1432,7 @@ fn test_spec_fingerprint_covers_every_public_field() {
     let base = spec_of(&long_config(), long_grid(), config());
     let id = base.id();
     type Change = fn(&mut RlSpec);
-    let changes: [(&str, Change); 27] = [
+    let changes: [(&str, Change); 28] = [
         ("observation version", |s| s.observation.version += 1),
         ("feature id", |s| s.observation.features.swap(0, 1)),
         ("feature unit", |s| {
@@ -1446,6 +1460,9 @@ fn test_spec_fingerprint_covers_every_public_field() {
         ("sizes", |s| s.action.sizes_lots[0] = 9),
         ("invalid action", |s| {
             s.action.invalid_action = InvalidActionPolicy::Reject;
+        }),
+        ("hedge", |s| {
+            s.action.hedge = HedgeActions::MarketableAtTouch
         }),
         ("reward version", |s| s.reward.version += 1),
         ("metric", |s| s.reward.metric = MetricId::SpreadCapture),

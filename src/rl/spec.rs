@@ -8,7 +8,7 @@ use crate::types::error::{MMError, MMResult};
 /// Version of the observation space. Raised when a feature, its order or its meaning changes.
 pub const OBSERVATION_SPACE_VERSION: u16 = 1;
 /// Version of the action space. Raised when an action or its meaning changes.
-pub const ACTION_SPACE_VERSION: u16 = 1;
+pub const ACTION_SPACE_VERSION: u16 = 2;
 /// Version of the reward. Raised when its definition changes.
 pub const REWARD_VERSION: u16 = 1;
 /// Version of the episode rules. Raised when an end of episode changes meaning.
@@ -392,6 +392,13 @@ pub enum HedgeActions {
         /// Why.
         reason: HedgeNotModelledReason,
     },
+    /// A hedge in the quoted instrument: a marketable limit order at the observed touch
+    /// on the side that reduces the delivered position, of a size from the order size
+    /// grid, never larger than that position. It replaces the resting orders, as a
+    /// quote does, and fills under the kernel's fill model at its own price, with the
+    /// kernel's fee rate: when a later row's touch reaches it, after the latencies, and
+    /// otherwise it rests. A hedge in another instrument is not modelled.
+    MarketableAtTouch,
 }
 
 impl HedgeActions {
@@ -400,6 +407,7 @@ impl HedgeActions {
             Self::NotModelled {
                 reason: HedgeNotModelledReason::SingleInstrument,
             } => 1,
+            Self::MarketableAtTouch => 2,
         }
     }
 }

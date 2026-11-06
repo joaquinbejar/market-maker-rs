@@ -29,8 +29,16 @@
 //!
 //! An [`RlAction`] holds indices into the [`ActionGrid`](crate::backtest::kernel::ActionGrid):
 //! offsets in ticks around the observed mid and sizes in lots. [`ActionSpace`] states
-//! the tick, the lot and the bounds. There is no cancel without a new quote, and no
-//! hedge action: the kernel holds one instrument, which [`HedgeActions`] says.
+//! the tick, the lot and the bounds. There is no cancel without a new quote.
+//!
+//! With [`RlConfig::with_hedge_actions`], [`RlAction::Hedge`] reduces the delivered
+//! position with a marketable limit order at the observed touch, in the one instrument the
+//! kernel holds, as [`HedgeActions::MarketableAtTouch`] states. Its size comes from the
+//! order size grid and is never larger than that position, as [`RlEnv::hedge_mask`]
+//! shows. It is an order like any other: the kernel's admission, its gate and its risk
+//! limits decide on it whatever the mask said, it fills under the kernel's fill model at
+//! its own price with the kernel's fee rate, and its cost reaches the reward only through
+//! the kernel's ledger. A hedge in another instrument is not modelled.
 //!
 //! An action outside the mask follows the declared [`InvalidActionPolicy`]:
 //!
@@ -163,7 +171,8 @@ pub const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use audit::{EpisodeRecorder, EpisodeRecords};
 pub use env::{
-    ERR_ACTION_OFF_GRID, RlAction, RlConfig, RlEnv, RlState, StepReward, TerminalClose, Transition,
+    ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED, RlAction, RlConfig, RlEnv, RlState, StepReward,
+    TerminalClose, Transition,
 };
 pub use features::FeatureVector;
 pub use queue_reactive::{MAX_QR_ROWS, QrEpisode, QrMarket, qr_market};
