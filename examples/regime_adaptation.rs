@@ -1004,8 +1004,19 @@ mod tests {
     fn test_a_trade_is_known_only_after_its_minute() {
         let path = simulate(Flow::Hawkes, 1).unwrap();
         assert!(path.trades.iter().all(|t| t.timestamp % MINUTE == 0));
-        let first = path.trades.first().unwrap();
-        assert!(first.timestamp >= MINUTE);
+        // An order in the first minute is known at the second tick, not the first.
+        let mut any_early = false;
+        for seed in 1..10 {
+            for flow in FLOWS {
+                let seen = simulate(flow, seed).unwrap();
+                assert!(seen.trades.iter().all(|t| t.timestamp >= MINUTE));
+                any_early |= seen.trades.iter().any(|t| t.timestamp == MINUTE);
+            }
+        }
+        assert!(
+            any_early,
+            "no order came in a first minute: this tested nothing"
+        );
         // Stress changes the diffusion: the path's minute moves are larger inside it.
         let moves = |from: u64, to: u64| {
             let changes: Vec<f64> = path.ticks[from as usize..to as usize]
