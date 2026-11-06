@@ -228,8 +228,9 @@ pub enum OptionConstraintKind {
         /// The pricer's value.
         value: Decimal,
     },
-    /// With the live orders of this side filled, a trade would pass the inventory limit; the
-    /// side is withheld.
+    /// With the live orders of this side filled, a trade would pass the inventory limit, further
+    /// than without it; the side is withheld. A side that moves a position beyond the limit back
+    /// towards it is not.
     InventoryLimit {
         /// The worst case position after the trade.
         resulting: Decimal,
@@ -345,8 +346,12 @@ pub struct OptionFill {
     pub premium: Decimal,
     /// The contract's position after the fill.
     pub position: Decimal,
-    /// What the ledger could not cover, if anything.
+    /// What the ledger could not cover of the premium, if anything.
     pub shortfall: Option<Decimal>,
+    /// What the contract's live sales should hold and the ledger had no free cash for. A fill can
+    /// use up the long that exempted another sale, and it happened, so this is reported and not
+    /// refused. The order is still live: the caller decides whether to cancel it.
+    pub unreserved: Decimal,
 }
 
 /// A live order and its reservation.
@@ -357,8 +362,6 @@ struct LiveOption {
     side: Dir,
     price: Decimal,
     remaining: Decimal,
-    /// The part that holds nothing per unit: a sale's unwinding part. Zero for a buy.
-    uncharged: Decimal,
     /// Cash held per charged unit.
     unit: Decimal,
     reserved: Decimal,
@@ -1071,7 +1074,12 @@ impl OptionQuoter {
                 }
                 .copied()
                 .ok_or_else(|| out_of_range(contract))?;
-                if resulting.abs() > terms.inventory_limit {
+                let worst_before = reach
+                    .low
+                    .get(contract)
+                    .zip(reach.high.get(contract))
+                    .map_or(Decimal::ZERO, |(low, high)| low.abs().max(high.abs()));
+                if resulting.abs() > terms.inventory_limit && resulting.abs() > worst_before {
                     push(OptionConstraintKind::InventoryLimit {
                         resulting,
                         limit: terms.inventory_limit,
@@ -1323,7 +1331,6 @@ impl OptionQuoter {
                 side: candidate.side,
                 price: candidate.price,
                 remaining: candidate.quantity,
-                uncharged,
                 unit: candidate.unit_capital,
                 reserved: required,
             });
@@ -1394,9 +1401,65 @@ impl OptionQuoter {
         ))
     }
 
-    /// Books a fill: the reservation shrinks with the order, the premium is booked under the
-    /// contract's name, and the position moves. Replaying a fill at the same point of an order is
-    /// refused by the ledger. On error nothing changes.
+    /// What each live sale of a contract should hold at this position, setting the ledger to it:
+    /// a long exempts the oldest sales first, and what no sale can hold is returned. Shrinks come
+    /// first, so what they free can pay for the rises.
+    fn sync_sales(
+        &self,
+        ledger: &mut Ledger,
+        live: &mut [LiveOption],
+        contract: usize,
+        position: Decimal,
+    ) -> MMResult<Decimal> {
+        let scale = self.cash_scale(ledger)?;
+        let asset = &self.config.cash_asset;
+        let mut long = position.max(Decimal::ZERO);
+        let mut targets = Vec::new();
+        for (index, order) in live.iter().enumerate() {
+            if order.contract != contract || order.side != Dir::Sell {
+                continue;
+            }
+            let exempt = order.remaining.min(long);
+            long = long.checked_sub(exempt).or_overflow("long left")?;
+            let target = reservation_amount(order.remaining, exempt, order.unit, scale)?;
+            targets.push((index, target));
+        }
+        let mut unreserved = Decimal::ZERO;
+        for rises in [false, true] {
+            for (index, target) in &targets {
+                let Some(order) = live.get_mut(*index) else {
+                    continue;
+                };
+                if (*target > order.reserved) != rises {
+                    continue;
+                }
+                let mut held = *target;
+                if rises {
+                    let balance = ledger
+                        .balance(asset)
+                        .ok_or_else(|| config(format!("cash asset {asset} is not registered")))?;
+                    let free = balance
+                        .total
+                        .checked_sub(balance.reserved)
+                        .or_overflow("free cash")?
+                        .max(Decimal::ZERO);
+                    let most = order.reserved.checked_add(free).or_overflow("most held")?;
+                    held = held.min(most);
+                    let short = target.checked_sub(held).or_overflow("unreserved")?;
+                    unreserved = unreserved.checked_add(short).or_overflow("unreserved")?;
+                }
+                ledger
+                    .set_reservation(&reservation_id(&order.order_id)?, asset.clone(), held)
+                    .map_err(|error| ledger_error("reservation", &error))?;
+                order.reserved = held;
+            }
+        }
+        Ok(unreserved)
+    }
+
+    /// Books a fill: the premium is booked under the contract's name, the position moves, and the
+    /// contract's live sales hold what the new position leaves them to hold. Replaying a fill at the
+    /// same point of an order is refused by the ledger. On error nothing changes.
     ///
     /// # Errors
     ///
@@ -1410,43 +1473,59 @@ impl OptionQuoter {
         quantity: Decimal,
     ) -> MMResult<OptionFill> {
         let index = self.live_index(order)?;
-        let live = self
+        let filled = self
             .live
             .get(index)
             .cloned()
             .ok_or_else(|| unknown(order))?;
-        if quantity <= Decimal::ZERO || quantity > live.remaining {
+        if quantity <= Decimal::ZERO || quantity > filled.remaining {
             return Err(MMError::InvalidPositionUpdate(format!(
                 "fill of {quantity} on order {order} with {} live",
-                live.remaining
+                filled.remaining
             )));
         }
         let terms = self
             .config
             .contracts
-            .get(live.contract)
-            .ok_or_else(|| out_of_range(live.contract))?;
-        let remaining = live
+            .get(filled.contract)
+            .ok_or_else(|| out_of_range(filled.contract))?;
+        let remaining = filled
             .remaining
             .checked_sub(quantity)
             .or_overflow("remaining")?;
         let cash_scale = self.cash_scale(ledger)?;
-        let held = reservation_amount(remaining, live.uncharged, live.unit, cash_scale)?;
-        let premium = quantity.checked_mul(live.price).or_overflow("premium")?;
-        let premium = match live.side {
-            Dir::Buy => Decimal::ZERO.checked_sub(premium).or_overflow("premium")?,
-            Dir::Sell => premium,
+        let premium = quantity.checked_mul(filled.price).or_overflow("premium")?;
+        let (premium, change) = match filled.side {
+            Dir::Buy => (
+                Decimal::ZERO.checked_sub(premium).or_overflow("premium")?,
+                quantity,
+            ),
+            Dir::Sell => (
+                premium,
+                Decimal::ZERO.checked_sub(quantity).or_overflow("sold")?,
+            ),
         };
+        let position = self
+            .positions
+            .get(filled.contract)
+            .copied()
+            .ok_or_else(|| out_of_range(filled.contract))?
+            .checked_add(change)
+            .or_overflow("position")?;
 
         let mut trial = ledger.clone();
-        if !live.reserved.is_zero() {
+        let mut live = self.live.clone();
+        let own = match filled.side {
+            Dir::Buy => reservation_amount(remaining, Decimal::ZERO, filled.unit, cash_scale)?,
+            Dir::Sell => Decimal::ZERO,
+        };
+        if filled.side == Dir::Buy || remaining.is_zero() {
             trial
-                .set_reservation(
-                    &reservation_id(order)?,
-                    self.config.cash_asset.clone(),
-                    held,
-                )
+                .set_reservation(&reservation_id(order)?, self.config.cash_asset.clone(), own)
                 .map_err(|error| ledger_error("reservation", &error))?;
+            if let Some(slot) = live.get_mut(index) {
+                slot.reserved = own;
+            }
         }
         let booking = trial
             .book_settlement(&DerivativeSettlement {
@@ -1464,37 +1543,29 @@ impl OptionQuoter {
                 "this fill of order {order} was already booked"
             )));
         }
-        let change = match live.side {
-            Dir::Buy => quantity,
-            Dir::Sell => Decimal::ZERO.checked_sub(quantity).or_overflow("sold")?,
-        };
-        let position = self
-            .positions
-            .get(live.contract)
-            .copied()
-            .ok_or_else(|| out_of_range(live.contract))?
-            .checked_add(change)
-            .or_overflow("position")?;
+        if remaining.is_zero() {
+            live.remove(index);
+        } else if let Some(slot) = live.get_mut(index) {
+            slot.remaining = remaining;
+        }
+        let unreserved = self.sync_sales(&mut trial, &mut live, filled.contract, position)?;
 
         *ledger = trial;
-        if let Some(slot) = self.positions.get_mut(live.contract) {
+        self.live = live;
+        if let Some(slot) = self.positions.get_mut(filled.contract) {
             *slot = position;
         }
-        if remaining.is_zero() {
-            self.live.remove(index);
-        } else if let Some(slot) = self.live.get_mut(index) {
-            slot.remaining = remaining;
-            slot.reserved = held;
-        }
         Ok(OptionFill {
-            contract: live.contract,
+            contract: filled.contract,
             premium,
             position,
             shortfall: booking.shortfall,
+            unreserved,
         })
     }
 
-    /// Releases what a cancelled order holds.
+    /// Releases what a cancelled order holds, and what its going leaves the contract's other sales
+    /// no longer needing.
     ///
     /// # Errors
     ///
@@ -1502,16 +1573,27 @@ impl OptionQuoter {
     /// no longer has.
     pub fn on_cancel(&mut self, ledger: &mut Ledger, order: &OrderId) -> MMResult<()> {
         let index = self.live_index(order)?;
-        let held = self
+        let cancelled = self
             .live
             .get(index)
-            .is_some_and(|live| !live.reserved.is_zero());
-        if held {
-            ledger
+            .cloned()
+            .ok_or_else(|| unknown(order))?;
+        let position = self
+            .positions
+            .get(cancelled.contract)
+            .copied()
+            .ok_or_else(|| out_of_range(cancelled.contract))?;
+        let mut trial = ledger.clone();
+        if !cancelled.reserved.is_zero() {
+            trial
                 .release(&reservation_id(order)?)
                 .map_err(|error| ledger_error("release", &error))?;
         }
-        self.live.remove(index);
+        let mut live = self.live.clone();
+        live.remove(index);
+        self.sync_sales(&mut trial, &mut live, cancelled.contract, position)?;
+        *ledger = trial;
+        self.live = live;
         Ok(())
     }
 

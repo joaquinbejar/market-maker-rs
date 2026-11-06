@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use margin_rs::ledger::{Execution, Ledger};
+use margin_rs::ledger::{DerivativeSettlement, Execution, Ledger};
 use margin_rs::{
     Asset, ExecutionId, InstrumentId, OrderId, ReservationId, SpotInstrument, TransferId,
 };
@@ -987,18 +987,21 @@ fn test_a_buy_fill_pays_its_premium_and_moves_the_position_and_the_reservation()
     assert_eq!(quoter.positions(), &[dec!(0.25)]);
     assert_eq!(cash(&book), dec!(100000) - bid * dec!(0.25));
     assert_eq!(book.settled_pnl(&usd()), -(bid * dec!(0.25)));
-    assert_eq!(reserved(&book), bid * dec!(0.75) + dec!(14) - ask);
+    // The long it bought now covers a quarter of the live sale.
+    let unit = dec!(14) - ask;
+    assert_eq!(reserved(&book), bid * dec!(0.75) + unit * dec!(0.75));
     let live = quoter.live_orders();
     assert_eq!(live.len(), 2);
     assert_eq!(live[0].quantity, dec!(0.75));
     assert_eq!(live[0].reserved, bid * dec!(0.75));
+    assert_eq!(live[1].reserved, unit * dec!(0.75));
     assert_eq!(book.settlement_journal()[0].instrument.as_str(), "C100");
 
     quoter
         .on_fill(&mut book, &buy.order_id, dec!(0.75))
         .unwrap();
     assert_eq!(quoter.live_orders().len(), 1);
-    assert_eq!(reserved(&book), dec!(14) - ask);
+    assert_eq!(reserved(&book), dec!(0));
     assert!(quoter.on_cancel(&mut book, &buy.order_id).is_err());
 }
 
@@ -1021,7 +1024,7 @@ fn test_a_sell_fill_receives_its_premium() {
 }
 
 #[test]
-fn test_a_partly_unwinding_sale_releases_its_charged_part_last() {
+fn test_a_partly_filled_sale_holds_what_the_position_now_leaves_it() {
     let mut book = ledger(dec!(100000));
     let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
         .unwrap()
@@ -1036,9 +1039,6 @@ fn test_a_partly_unwinding_sale_releases_its_charged_part_last() {
         .unwrap();
     let unit = dec!(14) - ask;
     assert_eq!(sell.reserved, (dec!(0.6) * unit).round_dp(8));
-    quoter
-        .on_fill(&mut book, &sell.order_id, dec!(0.5))
-        .unwrap();
     let held = |quoter: &OptionQuoter| {
         quoter
             .live_orders()
@@ -1046,15 +1046,163 @@ fn test_a_partly_unwinding_sale_releases_its_charged_part_last() {
             .find(|quote| quote.side == Action::Sell)
             .map(|quote| quote.reserved)
     };
-    assert_eq!(held(&quoter), Some((dec!(0.1) * unit).round_dp(8)));
+
+    // Still long after this one, so the 0.6 left is 0.3 of cover and 0.3 of new short.
     quoter
-        .on_fill(&mut book, &sell.order_id, dec!(0.25))
+        .on_fill(&mut book, &sell.order_id, dec!(0.1))
         .unwrap();
-    assert_eq!(held(&quoter), Some(dec!(0)));
+    assert_eq!(held(&quoter), Some((dec!(0.6) * unit).round_dp(8)));
+
+    // Past zero: the 0.5 left is all new short, at the position's -0.2.
+    let fill = quoter
+        .on_fill(&mut book, &sell.order_id, dec!(0.4))
+        .unwrap();
+    assert_eq!(fill.position, dec!(-0.1));
+    assert_eq!(fill.unreserved, dec!(0));
+    assert_eq!(held(&quoter), Some((dec!(0.5) * unit).round_dp(8)));
+    let bid = bid_ask(&round.quotes, 0).0;
+    assert_eq!(reserved(&book), bid + (dec!(0.5) * unit).round_dp(8));
+
     quoter
-        .on_fill(&mut book, &sell.order_id, dec!(0.25))
+        .on_fill(&mut book, &sell.order_id, dec!(0.5))
         .unwrap();
     assert_eq!(held(&quoter), None);
+    assert_eq!(reserved(&book), bid);
+}
+
+#[test]
+fn test_filling_one_sale_can_take_the_cover_of_another() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(1)], 0)
+        .unwrap();
+    let first = quoter.quote(&mut book, &market()).unwrap();
+    let second = quoter.quote(&mut book, &market()).unwrap();
+    let side = |round: &market_maker_rs::multi_underlying::multi_asset::OptionQuoteRound| {
+        round
+            .quotes
+            .iter()
+            .find(|quote| quote.side == Action::Sell)
+            .unwrap()
+            .clone()
+    };
+    let (older, newer) = (side(&first), side(&second));
+    assert_eq!(older.reserved, dec!(0));
+    let unit = dec!(14) - older.price;
+    assert!(newer.reserved > dec!(0));
+
+    // The newer sale fills and the long is gone, so the older one is new short now.
+    quoter.on_fill(&mut book, &newer.order_id, dec!(1)).unwrap();
+    let live = quoter.live_orders();
+    let left = live
+        .iter()
+        .find(|quote| quote.order_id == older.order_id)
+        .unwrap();
+    assert_eq!(left.reserved, unit);
+    assert!(
+        book.reservation(&ReservationId::new(older.order_id.as_str()).unwrap())
+            .is_some()
+    );
+}
+
+#[test]
+fn test_a_buy_fill_gives_a_live_sale_its_cover() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))])).unwrap();
+    let round = quoter.quote(&mut book, &market()).unwrap();
+    let id = |side| {
+        round
+            .quotes
+            .iter()
+            .find(|quote| quote.side == side)
+            .unwrap()
+            .order_id
+            .clone()
+    };
+    quoter
+        .on_fill(&mut book, &id(Action::Buy), dec!(0.5))
+        .unwrap();
+    let unit = dec!(14) - bid_ask(&round.quotes, 0).1;
+    let sell = quoter
+        .live_orders()
+        .into_iter()
+        .find(|quote| quote.side == Action::Sell)
+        .unwrap();
+    assert_eq!(sell.reserved, (dec!(0.5) * unit).round_dp(8));
+}
+
+#[test]
+fn test_cancelling_a_sale_passes_its_cover_to_the_next() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(1)], 0)
+        .unwrap();
+    let first = quoter.quote(&mut book, &market()).unwrap();
+    let second = quoter.quote(&mut book, &market()).unwrap();
+    let sell = |round: &market_maker_rs::multi_underlying::multi_asset::OptionQuoteRound| {
+        round
+            .quotes
+            .iter()
+            .find(|quote| quote.side == Action::Sell)
+            .unwrap()
+            .clone()
+    };
+    let (older, newer) = (sell(&first), sell(&second));
+    assert!(newer.reserved > dec!(0));
+    quoter.on_cancel(&mut book, &older.order_id).unwrap();
+    let left = quoter
+        .live_orders()
+        .into_iter()
+        .find(|quote| quote.order_id == newer.order_id)
+        .unwrap();
+    assert_eq!(left.reserved, dec!(0));
+}
+
+#[test]
+fn test_a_cover_lost_with_too_little_free_cash_is_reported_and_the_fill_stands() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(1)], 0)
+        .unwrap();
+    let first = quoter.quote(&mut book, &market()).unwrap();
+    let second = quoter.quote(&mut book, &market()).unwrap();
+    let sell = |round: &market_maker_rs::multi_underlying::multi_asset::OptionQuoteRound| {
+        round
+            .quotes
+            .iter()
+            .find(|quote| quote.side == Action::Sell)
+            .unwrap()
+            .clone()
+    };
+    let (older, newer) = (sell(&first), sell(&second));
+    let unit = dec!(14) - older.price;
+
+    // Something else takes the cash, so after the fill frees what it frees, 1 is left over.
+    let held = reserved(&book);
+    let wanted = held - newer.reserved - newer.price + dec!(1);
+    book.book_settlement(&DerivativeSettlement {
+        id: ExecutionId::new("elsewhere").unwrap(),
+        instrument: InstrumentId::new("OTHER").unwrap(),
+        asset: usd(),
+        realized_pnl: wanted - dec!(100000),
+        fee: dec!(0),
+    })
+    .unwrap();
+
+    let fill = quoter.on_fill(&mut book, &newer.order_id, dec!(1)).unwrap();
+    assert_eq!(fill.position, dec!(0));
+    let left = quoter
+        .live_orders()
+        .into_iter()
+        .find(|quote| quote.order_id == older.order_id)
+        .unwrap();
+    assert_eq!(left.reserved, dec!(1));
+    assert_eq!(fill.unreserved, unit - dec!(1));
+    assert_eq!(left.quantity, dec!(1));
+    assert_eq!(quoter.positions(), &[dec!(0)]);
 }
 
 #[test]
@@ -1343,6 +1491,49 @@ fn test_a_price_below_the_grid_is_withheld_and_a_quote_through_the_value_is_repo
             value: dec!(10),
         }]
     );
+}
+
+#[test]
+fn test_a_position_beyond_the_inventory_limit_can_still_reduce() {
+    let mut book = ledger(dec!(100000));
+    let round = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(52)], 0)
+        .unwrap()
+        .quote(&mut book, &market())
+        .unwrap();
+    assert_eq!(round.quotes.len(), 1);
+    assert_eq!(round.quotes[0].side, Action::Sell);
+    assert_eq!(
+        kinds(&round.constraints, 0, Action::Buy),
+        vec![OptionConstraintKind::InventoryLimit {
+            resulting: dec!(53),
+            limit: dec!(50),
+        }]
+    );
+
+    let mut book = ledger(dec!(100000));
+    let round = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(-52)], 0)
+        .unwrap()
+        .quote(&mut book, &market())
+        .unwrap();
+    assert_eq!(round.quotes.len(), 1);
+    assert_eq!(round.quotes[0].side, Action::Buy);
+}
+
+#[test]
+fn test_a_position_exactly_at_the_inventory_limit_only_quotes_back() {
+    let mut book = ledger(dec!(100000));
+    let round = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(50)], 0)
+        .unwrap()
+        .quote(&mut book, &market())
+        .unwrap();
+    assert_eq!(round.quotes.len(), 1);
+    assert_eq!(round.quotes[0].side, Action::Sell);
 }
 
 #[test]
@@ -1741,4 +1932,186 @@ fn test_a_sale_with_a_negative_delta_raises_the_delta_it_is_limited_on() {
             limit: dec!(0.4),
         }]
     );
+}
+
+fn sale_of(
+    round: &market_maker_rs::multi_underlying::multi_asset::OptionQuoteRound,
+) -> market_maker_rs::multi_underlying::multi_asset::AdmittedOptionQuote {
+    round
+        .quotes
+        .iter()
+        .find(|quote| quote.side == Action::Sell)
+        .unwrap()
+        .clone()
+}
+
+fn live_sale(
+    quoter: &OptionQuoter,
+    id: &OrderId,
+) -> market_maker_rs::multi_underlying::multi_asset::AdmittedOptionQuote {
+    quoter
+        .live_orders()
+        .into_iter()
+        .find(|quote| quote.order_id == *id)
+        .unwrap()
+}
+
+/// Takes cash out of the ledger until `free` would be left once the fill adds `gained`.
+fn leave_free(book: &mut Ledger, gained: Decimal, free: Decimal) {
+    let total = cash(book);
+    let target = reserved(book) - gained + free;
+    book.book_settlement(&DerivativeSettlement {
+        id: ExecutionId::new("elsewhere").unwrap(),
+        instrument: InstrumentId::new("OTHER").unwrap(),
+        asset: usd(),
+        realized_pnl: target - total,
+        fee: dec!(0),
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_a_long_covers_the_oldest_sales_in_turn() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(3)], 0)
+        .unwrap();
+    let rounds: Vec<_> = (0..4)
+        .map(|_| quoter.quote(&mut book, &market()).unwrap())
+        .collect();
+    let sales: Vec<_> = rounds.iter().map(sale_of).collect();
+    // The fourth is the one with no cover, and cancelling it changes none of the others.
+    assert!(sales[3].reserved > dec!(0));
+    quoter.on_cancel(&mut book, &sales[3].order_id).unwrap();
+    for sale in &sales[..3] {
+        assert_eq!(live_sale(&quoter, &sale.order_id).reserved, dec!(0));
+    }
+}
+
+#[test]
+fn test_a_long_does_not_cover_a_sale_beyond_it() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(1)], 0)
+        .unwrap();
+    let rounds: Vec<_> = (0..3)
+        .map(|_| quoter.quote(&mut book, &market()).unwrap())
+        .collect();
+    let sales: Vec<_> = rounds.iter().map(sale_of).collect();
+    quoter.on_cancel(&mut book, &sales[2].order_id).unwrap();
+    assert_eq!(live_sale(&quoter, &sales[0].order_id).reserved, dec!(0));
+    assert_eq!(
+        live_sale(&quoter, &sales[1].order_id).reserved,
+        dec!(14) - sales[1].price
+    );
+}
+
+#[test]
+fn test_a_fill_on_one_contract_leaves_the_sales_of_another() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = quoter(vec![dec!(0), dec!(0)]);
+    let round = quoter.quote(&mut book, &market()).unwrap();
+    let on = |contract, side| {
+        round
+            .quotes
+            .iter()
+            .find(|quote| quote.contract == contract && quote.side == side)
+            .unwrap()
+            .clone()
+    };
+    let other = on(1, Action::Sell);
+    // With the first contract's own sale gone, the long the buy brings has no sale of its own.
+    quoter
+        .on_cancel(&mut book, &on(0, Action::Sell).order_id)
+        .unwrap();
+    quoter
+        .on_fill(&mut book, &on(0, Action::Buy).order_id, dec!(1))
+        .unwrap();
+    assert_eq!(live_sale(&quoter, &other.order_id).reserved, other.reserved);
+}
+
+#[test]
+fn test_what_a_fill_shrinks_pays_for_what_it_raises() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(1)], 0)
+        .unwrap();
+    let older = sale_of(&quoter.quote(&mut book, &market()).unwrap());
+    let newer = sale_of(&quoter.quote(&mut book, &market()).unwrap());
+    let unit = dec!(14) - older.price;
+    // Half of the newer fills: half its capital frees, and half the older one's cover goes. Only
+    // the premium is free otherwise, and it is taken here.
+    leave_free(&mut book, newer.price * dec!(0.5), dec!(0));
+    let fill = quoter
+        .on_fill(&mut book, &newer.order_id, dec!(0.5))
+        .unwrap();
+    assert_eq!(fill.unreserved, dec!(0));
+    assert_eq!(
+        live_sale(&quoter, &older.order_id).reserved,
+        unit * dec!(0.5)
+    );
+    assert_eq!(
+        live_sale(&quoter, &newer.order_id).reserved,
+        unit * dec!(0.5)
+    );
+}
+
+#[test]
+fn test_a_sale_that_rises_keeps_what_it_held_and_adds_what_is_free() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(0.5)], 0)
+        .unwrap();
+    let older = sale_of(&quoter.quote(&mut book, &market()).unwrap());
+    let newer = sale_of(&quoter.quote(&mut book, &market()).unwrap());
+    let unit = dec!(14) - older.price;
+    assert_eq!(older.reserved, unit * dec!(0.5));
+    // The newer fills in full, so what it frees and its premium are both free.
+    leave_free(&mut book, newer.reserved + newer.price, dec!(0.1));
+    let fill = quoter.on_fill(&mut book, &newer.order_id, dec!(1)).unwrap();
+    let left = live_sale(&quoter, &older.order_id);
+    assert_eq!(left.reserved, unit * dec!(0.5) + dec!(0.1));
+    assert_eq!(fill.unreserved, unit * dec!(0.5) - dec!(0.1));
+}
+
+#[test]
+fn test_an_overdrawn_ledger_leaves_a_sale_what_it_held() {
+    let mut book = ledger(dec!(100000));
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(1)], 0)
+        .unwrap();
+    let older = sale_of(&quoter.quote(&mut book, &market()).unwrap());
+    let newer = sale_of(&quoter.quote(&mut book, &market()).unwrap());
+    let unit = dec!(14) - older.price;
+    leave_free(&mut book, newer.reserved + newer.price, dec!(-5));
+    let fill = quoter.on_fill(&mut book, &newer.order_id, dec!(1)).unwrap();
+    assert_eq!(live_sale(&quoter, &older.order_id).reserved, dec!(0));
+    assert_eq!(fill.unreserved, unit);
+}
+
+#[test]
+fn test_the_inventory_limit_reads_the_worst_of_either_side_of_the_reach() {
+    let mut terms = contract("C100", dec!(100));
+    terms.trade_size = dec!(30);
+    let run = |position: Decimal, side: Action| {
+        let mut book = ledger(dec!(100000));
+        let mut quoter = OptionQuoter::new(config(vec![terms.clone()]))
+            .unwrap()
+            .with_restored_state(vec![position], 0)
+            .unwrap();
+        let mut last = None;
+        for _ in 0..4 {
+            last = Some(quoter.quote(&mut book, &market()).unwrap());
+        }
+        last.unwrap().quotes.iter().any(|quote| quote.side == side)
+    };
+    // From 60, four sales reach -60: as far as the position already is, so no further.
+    assert!(run(dec!(60), Action::Sell));
+    // And the same from -60 with four buys.
+    assert!(run(dec!(-60), Action::Buy));
 }
