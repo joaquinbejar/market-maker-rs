@@ -8,6 +8,19 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Example `hyperliquid_validation` (Refs #214), behind `serde`: evaluates on the Hyperliquid
+  capture the criteria of #87, #88, #89, #90 and #91 that the existing interfaces can evaluate,
+  with no new library code. It reports walk-forward errors per day against constant parameters
+  and their sensitivity to the training window; out-of-sample errors and markouts of the mid,
+  weighted mid and micro-price at fixed horizons, overall and by spread and imbalance; quoting
+  markout, inventory and attributed PnL over a grid of declared fees and latencies; queue-reactive
+  intensities per state, event sizes and estimates per day; and Poisson, queue-reactive and Hawkes
+  flow on the holdout, the Hawkes decay chosen on validation. The protocol is fixed in the code
+  before any data is read: the longest stretch with no reset, split by time into training,
+  validation and holdout, the holdout used for no choice, no randomness, fees declared and
+  funding not applied. It streams the files, keeps only thinned inputs and says what it keeps.
+  Not evaluated: #90 (b) and (c), which need a data trajectory the replay does not expose; #77,
+  #180 and #91 (b) do not apply to this capture. No data is in the repository.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are
