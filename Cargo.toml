@@ -141,6 +141,10 @@ name = "chain_market_making"
 required-features = ["chain"]
 
 [[example]]
+name = "option_quoting"
+required-features = ["options", "margin", "multi-underlying"]
+
+[[example]]
 name = "chain_pricing_evaluation"
 required-features = ["chain"]
 test = true
@@ -167,6 +171,10 @@ required-features = ["kernel"]
 [[example]]
 name = "kernel_glft"
 required-features = ["kernel"]
+
+[[test]]
+name = "option_quoting"
+required-features = ["options", "margin", "multi-underlying"]
 
 [[test]]
 name = "hyperliquid"

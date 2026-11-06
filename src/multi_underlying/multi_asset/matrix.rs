@@ -11,7 +11,9 @@ use crate::types::error::{MMError, MMResult};
 /// supported size needs well under ten.
 const MAX_SWEEPS: usize = 64;
 
-/// Off diagonal mass, relative to the whole matrix, at which a sweep stops.
+/// Off diagonal mass, relative to the whole matrix and per row, at which a sweep stops. Rounding
+/// leaves mass of the order of the machine's epsilon on each row, so a tolerance that does not
+/// grow with the size cannot be met by a large matrix, however well it has converged.
 const OFF_DIAGONAL_TOLERANCE: f64 = 1e-15;
 
 /// A square matrix; indices out of range read as `NaN` and ignore writes, and
@@ -87,7 +89,7 @@ impl Matrix {
         for index in 0..self.size {
             vectors.set(index, index, 1.0);
         }
-        let threshold = (self.max_abs() * OFF_DIAGONAL_TOLERANCE).powi(2);
+        let threshold = (self.max_abs() * OFF_DIAGONAL_TOLERANCE * self.size.max(1) as f64).powi(2);
         for _ in 0..MAX_SWEEPS {
             if work.off_diagonal() <= threshold {
                 break;
@@ -137,8 +139,12 @@ impl Matrix {
 
     /// The principal square root of a symmetric positive semidefinite matrix.
     ///
-    /// Eigenvalues within `tolerance` below zero are rounding noise of a
-    /// singular matrix and count as zero.
+    /// An eigenvalue below zero by no more than `tolerance`, relative to the
+    /// largest entry and per row, is rounding noise of a singular matrix and
+    /// counts as zero. Each entry is known to `tolerance` of the largest at best,
+    /// and by Weyl's inequality errors of that size move an eigenvalue by at most
+    /// the size of the matrix times that, so a fixed floor would refuse large
+    /// singular matrices for their rounding alone.
     ///
     /// # Errors
     ///
@@ -146,7 +152,7 @@ impl Matrix {
     /// negative than that, and whatever [`Matrix::symmetric_eigen`] returns.
     pub(super) fn principal_sqrt(&self, tolerance: f64) -> MMResult<Self> {
         let (values, vectors) = self.symmetric_eigen()?;
-        let floor = -tolerance * self.max_abs();
+        let floor = -tolerance * self.size.max(1) as f64 * self.max_abs();
         let mut root = Self::zeros(self.size);
         for (index, value) in values.iter().enumerate() {
             if *value < floor {
@@ -170,6 +176,65 @@ impl Matrix {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_large_indefinite_matrix_is_still_refused() {
+        // Rank one, with a negative eigenvalue well past any rounding, on the same scale.
+        let size = 64;
+        let mut indefinite = Matrix::zeros(size);
+        for i in 0..size {
+            for j in 0..size {
+                indefinite.set(i, j, 1.0);
+            }
+        }
+        indefinite.set(0, 0, 1.0 - 1e-6);
+        indefinite.set(1, 1, 1.0 - 1e-6);
+        indefinite.set(0, 1, 1.0 + 1e-6);
+        indefinite.set(1, 0, 1.0 + 1e-6);
+        assert!(indefinite.principal_sqrt(1e-12).is_err());
+    }
+
+    #[test]
+    fn test_a_negative_eigenvalue_within_the_floor_counts_as_zero_and_past_it_does_not() {
+        let at = |eigenvalue: f64| {
+            let mut diagonal = Matrix::zeros(4);
+            diagonal.set(0, 0, 1.0);
+            diagonal.set(1, 1, 1.0);
+            diagonal.set(2, 2, 1.0);
+            diagonal.set(3, 3, eigenvalue);
+            diagonal.principal_sqrt(1e-12)
+        };
+        // Four rows, so a floor of 4e-12 of the largest entry.
+        let within = at(-3e-12).unwrap();
+        assert_eq!(within.at(3, 3), 0.0);
+        assert!(at(-5e-12).is_err());
+    }
+
+    #[test]
+    fn test_a_large_singular_matrix_converges_to_its_square_root() {
+        // Two factors and the largest size a model takes.
+        let size = 64;
+        let load = |i: usize| (1.0 + i as f64 * 0.37, (i as f64 * 0.91).sin());
+        let mut low_rank = Matrix::zeros(size);
+        for i in 0..size {
+            for j in 0..size {
+                let (a, b) = (load(i), load(j));
+                low_rank.set(i, j, a.0 * b.0 + a.1 * b.1);
+            }
+        }
+        let root = low_rank.principal_sqrt(1e-12).unwrap();
+        let scale = low_rank.max_abs();
+        for i in 0..size {
+            for j in 0..size {
+                let square: f64 = (0..size).map(|k| root.at(i, k) * root.at(k, j)).sum();
+                assert!(
+                    (square - low_rank.at(i, j)).abs() < 1e-11 * scale,
+                    "{i} {j}: {square} against {}",
+                    low_rank.at(i, j)
+                );
+            }
+        }
+    }
 
     fn matrix(rows: &[&[f64]]) -> Matrix {
         let mut out = Matrix::zeros(rows.len());
