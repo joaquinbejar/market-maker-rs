@@ -20,6 +20,7 @@ cargo run --example display_example --features serde
 
 # Research, on synthetic data only
 cargo run --example offline_rl_support
+cargo run --example consistent_time_travel
 ```
 
 ## Examples Overview

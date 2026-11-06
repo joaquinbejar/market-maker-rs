@@ -115,6 +115,10 @@ name = "offline_rl_support"
 test = true
 
 [[example]]
+name = "consistent_time_travel"
+test = true
+
+[[example]]
 name = "options_market_making"
 required-features = ["options"]
 
