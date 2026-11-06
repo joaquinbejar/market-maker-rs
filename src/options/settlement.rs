@@ -9,7 +9,8 @@
 //! the ledger, under the contract's name, so it counts as settled PnL and not as a transfer. A
 //! physical settlement is an execution of the spot instrument at the strike, so the underlying
 //! has the strike as its cost. The position then leaves the book, so nothing holds both an
-//! extinguished option and its value.
+//! extinguished option and its value. A lapse is booked too, as a settlement of zero, so the
+//! ledger keeps the end of every contract and a rebuilt book cannot settle one again.
 //!
 //! # Causal order
 //!
@@ -343,7 +344,8 @@ impl OptionBook {
         let mut shortfalls = BTreeMap::new();
         if !obligation.underlying.is_zero() {
             book_physical(&mut trial, contract, position, &obligation, &mut shortfalls)?;
-        } else if !obligation.cash.is_zero() {
+        } else {
+            // A lapse too, for zero: the ledger is what remembers that the contract ended.
             book_cash(
                 &mut trial,
                 contract,

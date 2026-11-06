@@ -657,3 +657,94 @@ fn test_a_delivery_rounded_away_from_what_the_ledger_books_is_refused() {
     assert_eq!(held(&ledger, &btc()).0, dec!(0));
     assert!(book.position("C1").is_some());
 }
+
+#[test]
+fn test_a_lapse_stays_in_the_ledger_with_nothing_moved() {
+    let mut ledger = ledger(dec!(5000), dec!(0));
+    book_of(european(Side::Long, OptionStyle::Call))
+        .settle(&mut ledger, "C1", &expiry(SettlementType::Cash, 90.0))
+        .unwrap();
+    assert_eq!(held(&ledger, &usdc()).0, dec!(5000));
+    assert_eq!(ledger.settled_pnl(&usdc()), dec!(0));
+    let journal = ledger.settlement_journal();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].realized_pnl, dec!(0));
+    assert_eq!(journal[0].instrument.as_str(), "C1");
+}
+
+#[test]
+fn test_a_lapsed_contract_cannot_pay_after_the_book_is_rebuilt() {
+    let mut ledger = ledger(dec!(5000), dec!(0));
+    book_of(european(Side::Long, OptionStyle::Call))
+        .settle(&mut ledger, "C1", &expiry(SettlementType::Cash, 90.0))
+        .unwrap();
+    let mut rebuilt = book_of(european(Side::Long, OptionStyle::Call));
+    assert!(
+        rebuilt
+            .settle(&mut ledger, "C1", &expiry(SettlementType::Cash, 110.0))
+            .is_err()
+    );
+    assert_eq!(held(&ledger, &usdc()).0, dec!(5000));
+    assert!(rebuilt.position("C1").is_some());
+}
+
+#[test]
+fn test_a_lapsed_contract_cannot_deliver_after_the_book_is_rebuilt() {
+    let mut ledger = ledger(dec!(5000), dec!(0));
+    book_of(european(Side::Long, OptionStyle::Call))
+        .settle(&mut ledger, "C1", &expiry(SettlementType::Physical, 90.0))
+        .unwrap();
+    let mut rebuilt = book_of(european(Side::Long, OptionStyle::Call));
+    assert!(
+        rebuilt
+            .settle(&mut ledger, "C1", &expiry(SettlementType::Physical, 110.0))
+            .is_err()
+    );
+    assert_eq!(held(&ledger, &usdc()).0, dec!(5000));
+    assert_eq!(held(&ledger, &btc()).0, dec!(0));
+}
+
+#[test]
+fn test_a_paid_contract_cannot_lapse_after_the_book_is_rebuilt() {
+    let mut ledger = ledger(dec!(5000), dec!(0));
+    book_of(european(Side::Long, OptionStyle::Call))
+        .settle(&mut ledger, "C1", &expiry(SettlementType::Cash, 110.0))
+        .unwrap();
+    let after = held(&ledger, &usdc()).0;
+    let mut rebuilt = book_of(european(Side::Long, OptionStyle::Call));
+    assert!(
+        rebuilt
+            .settle(&mut ledger, "C1", &expiry(SettlementType::Cash, 90.0))
+            .is_err()
+    );
+    assert_eq!(held(&ledger, &usdc()).0, after);
+    assert!(rebuilt.position("C1").is_some());
+}
+
+#[test]
+fn test_a_delivered_contract_cannot_lapse_after_the_book_is_rebuilt() {
+    let mut ledger = ledger(dec!(5000), dec!(0));
+    book_of(european(Side::Long, OptionStyle::Call))
+        .settle(&mut ledger, "C1", &expiry(SettlementType::Physical, 110.0))
+        .unwrap();
+    let mut rebuilt = book_of(european(Side::Long, OptionStyle::Call));
+    assert!(
+        rebuilt
+            .settle(&mut ledger, "C1", &expiry(SettlementType::Cash, 90.0))
+            .is_err()
+    );
+    assert_eq!(held(&ledger, &btc()).0, dec!(20));
+}
+
+#[test]
+fn test_a_second_lapse_after_the_book_is_rebuilt_is_refused() {
+    let mut ledger = ledger(dec!(5000), dec!(0));
+    let terms = expiry(SettlementType::Cash, 90.0);
+    book_of(european(Side::Long, OptionStyle::Call))
+        .settle(&mut ledger, "C1", &terms)
+        .unwrap();
+    let mut rebuilt = book_of(european(Side::Long, OptionStyle::Call));
+    let refused = rebuilt.settle(&mut ledger, "C1", &terms).unwrap_err();
+    assert!(refused.to_string().contains("already booked"), "{refused}");
+    assert_eq!(ledger.settlement_journal().len(), 1);
+}
