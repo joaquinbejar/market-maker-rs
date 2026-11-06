@@ -252,6 +252,8 @@ struct Episode {
     terminal_inventory: Decimal,
     /// Largest shortfall below maintenance, in the margin measure.
     max_shortfall: f64,
+    /// Shortfall at the end.
+    terminal_shortfall: f64,
     /// Whether the account ever left the healthy state.
     left_healthy: bool,
 }
@@ -433,7 +435,8 @@ fn run_path(
     );
     let marked = book.cash + book.inventory * price(mid);
     let (shortfall, last) = margin_measure(book.inventory, marked, price(mid), state);
-    out.max_shortfall = out.max_shortfall.max(shortfall.to_f64().unwrap());
+    out.terminal_shortfall = shortfall.to_f64().unwrap();
+    out.max_shortfall = out.max_shortfall.max(out.terminal_shortfall);
     out.left_healthy = out.left_healthy || last != AccountState::Healthy;
     let equity = book.equity(mid) - liquidation_cost(book.inventory, impact);
     peak = peak.max(equity);
@@ -1052,12 +1055,39 @@ fn test_robustness_evidence_table() {
     }
 }
 
-/// A shortfall met on the way and gone by the end still counts: the measure is a maximum.
+/// Long 10 by hand: buys at 99.95 with a fee of 1 bp, so equity 0.40005 at a mid of 100.
+/// Maintenance 50 against 40.40005. Selling it all back leaves nothing to maintain.
 #[test]
 fn test_a_shortfall_gone_by_the_end_still_counts() {
-    let episode = (1..400)
-        .map(|seed| run_episode(Policy::Fixed, BASE, seed))
-        .find(|e| e.terminal_inventory.abs() < dec!(4) && e.max_shortfall > 0.0)
-        .expect("an episode that fell short and came back");
-    assert!(episode.left_healthy);
+    let mut events: Vec<_> = (1..=10).map(|i| market(f64::from(i), Side::Bid)).collect();
+    events.extend((11..=20).map(|i| market(f64::from(i), Side::Ask)));
+    let e = scripted(Policy::Fixed, 0.0, &events, &[true; 20]);
+    assert_eq!(e.terminal_inventory, dec!(0));
+    close(e.max_shortfall, 9.59995);
+    assert_eq!(e.terminal_shortfall, 0.0);
+    assert!(e.left_healthy);
+}
+
+/// Long 8 by hand holds at 100: maintenance 40 against 40.32004. A fall to 99 over the last
+/// stretch gives maintenance 39.6 against 32.32004, seen only by the sample at the end.
+#[test]
+fn test_a_shortfall_at_the_last_mid_is_sampled_with_the_position_at_that_mid() {
+    let events: Vec<_> = (1..=8).map(|i| market(f64::from(i), Side::Bid)).collect();
+    let fall = -1.0 / (SIGMA * (HORIZON_SECONDS - 8.0).sqrt());
+    let mut steps = std::iter::repeat_n(0.0, 8).chain([fall]);
+    let mut draws = std::iter::repeat(0.0);
+    let e = run_path(
+        Policy::Fixed,
+        0.0,
+        &events,
+        || steps.next().unwrap(),
+        || draws.next().unwrap(),
+    );
+    close(e.max_shortfall, 7.27996);
+    close(e.terminal_shortfall, 7.27996);
+    assert!(e.left_healthy);
+    // Without the fall it never left.
+    let held = scripted(Policy::Fixed, 0.0, &events, &[true; 8]);
+    assert_eq!(held.max_shortfall, 0.0);
+    assert!(!held.left_healthy);
 }
