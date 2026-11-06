@@ -635,6 +635,161 @@ fn test_metric_definitions_pin_units_and_signs() {
     );
 }
 
+#[test]
+fn test_every_metric_declares_the_literal_definition() {
+    use MetricId as M;
+    use market_maker_rs::backtest::evaluation::{
+        Aggregation as A, CapitalDenominator as C, Direction as D, MetricDefinition,
+        MetricHorizon as H, MetricUnit as U,
+    };
+    let table = [
+        (
+            M::NetPnl,
+            U::Quote,
+            D::PositiveIsGain,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::SpreadCapture,
+            U::Quote,
+            D::PositiveIsGain,
+            H::AtFill,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::InventoryPnl,
+            U::Quote,
+            D::PositiveIsGain,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::QuoteFees,
+            U::Quote,
+            D::PositiveIsCost,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::BaseFees,
+            U::Quote,
+            D::PositiveIsCost,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::HedgeCosts,
+            U::Quote,
+            D::PositiveIsCost,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::SignedMarkout,
+            U::QuotePerBase,
+            D::PositiveIsGain,
+            H::AfterFill,
+            C::None,
+            A::VolumeWeightedMean,
+        ),
+        (
+            M::RealizedSpread,
+            U::QuotePerBase,
+            D::PositiveIsGain,
+            H::AfterFill,
+            C::None,
+            A::VolumeWeightedMean,
+        ),
+        (
+            M::EffectiveSpread,
+            U::QuotePerBase,
+            D::PositiveIsGain,
+            H::AtFill,
+            C::None,
+            A::VolumeWeightedMean,
+        ),
+        (
+            M::PriceImpact,
+            U::QuotePerBase,
+            D::PositiveIsCost,
+            H::AfterFill,
+            C::None,
+            A::VolumeWeightedMean,
+        ),
+        (
+            M::Fills,
+            U::Count,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::Count,
+        ),
+        (M::Volume, U::Base, D::Magnitude, H::Window, C::None, A::Sum),
+        (
+            M::MeanAbsInventory,
+            U::Base,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::TimeWeightedMean,
+        ),
+        (
+            M::MaxAbsInventory,
+            U::Base,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::Maximum,
+        ),
+        (
+            M::MaxDrawdown,
+            U::Quote,
+            D::MagnitudeIsCost,
+            H::Window,
+            C::None,
+            A::Maximum,
+        ),
+        (
+            M::NetReturnOnCapital,
+            U::Ratio,
+            D::PositiveIsGain,
+            H::Window,
+            C::DeclaredCapital,
+            A::Quotient,
+        ),
+        (
+            M::MaxDrawdownOnCapital,
+            U::Ratio,
+            D::MagnitudeIsCost,
+            H::Window,
+            C::DeclaredCapital,
+            A::Quotient,
+        ),
+    ];
+    assert_eq!(table.len(), M::ALL.len());
+    for (row, id) in table.iter().zip(M::ALL) {
+        assert_eq!(row.0, id, "the table follows MetricId::ALL");
+        assert_eq!(
+            id.definition(),
+            MetricDefinition {
+                unit: row.1,
+                direction: row.2,
+                horizon: row.3,
+                capital_denominator: row.4,
+                aggregation: row.5,
+            },
+            "{id:?}"
+        );
+    }
+}
+
 // ------------------------------------------------------------ the engine's books
 
 /// Quotes one tick either side of the mid, always.
