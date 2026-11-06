@@ -38,7 +38,7 @@ rust_decimal_macros = "1.40"
 # (owner-approved exception, as in arbitrage-rs). The floor is 0.3.1, the
 # first release with the `instruments` module.
 financial_types = "0.3.1"
-margin-rs = { version = "0.1", optional = true }
+margin-rs = { version = "0.2", optional = true }
 arbitrage-rs = { version = "0.3", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
@@ -83,9 +83,7 @@ events = ["dep:tokio", "serde"]
 margin = ["dep:margin-rs"]
 # Contract specifications from financial_types (`instruments` module); with
 # `margin` too, the conversion into margin-rs instruments, delegated to
-# margin-rs. Asking for `margin-rs/instruments` is what excludes 0.1.0, which
-# has no such feature, while `margin-rs = "0.1"` keeps it valid for `margin`
-# alone. The `?` keeps `instruments` alone from pulling margin-rs.
+# margin-rs. The `?` keeps `instruments` alone from pulling margin-rs.
 instruments = ["financial_types/instruments", "margin-rs?/instruments"]
 # The net edge of a spot and a dated future (`instruments::basis`), through
 # arbitrage-rs, whose types stay out of this crate's public API.

@@ -508,6 +508,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `margin-rs` 0.2, whose types are in this crate's public API (#97, #98). `options::settlement`
+  now settles an option held in the ledger as a registered `OptionInstrument`, through
+  `Ledger::settle_option`: `OptionPosition::new` takes the option's `InstrumentId` instead of a
+  cash asset, `OptionBook::open` takes the ledger and checks the instrument's strike, right,
+  exercise style and multiplier and the ledger's position against the option, and
+  `SettlementRecord` gains `outcome` and `realized_pnl`. A cash option out of the money settles
+  in cash for zero, as the ledger has no lapse for one. The premium is booked by the ledger at
+  each fill and stays in the option's realized PnL. Inverse options are refused.
 - `ContractRunResult` and `ContractSummary` have new public fields for funding (#207):
   `realized_pnl`, `total_funding` and `fundings`; `funding` and `funding_missing`. A
   `ContractStrategy` is unchanged.

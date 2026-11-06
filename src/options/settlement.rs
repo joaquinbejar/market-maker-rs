@@ -1,66 +1,87 @@
 //! Booking an option's expiry, exercise or assignment.
 //!
 //! What a position must pay, receive or deliver is computed by OptionStratLib, through
-//! `settlement_obligation`. This module owns what happens around it: the open orders on the
-//! contract, the ledger, and the option's own record.
+//! `settlement_obligation`. The `margin-rs` ledger holds the option itself: a registered
+//! [`OptionInstrument`], its position, the premium booked at each fill, and its settlement,
+//! through [`Ledger::settle_option`]. This module joins the two: it maps the obligation to the
+//! ledger's [`OptionOutcome`], releases the contract's open orders first, and refuses unless the
+//! ledger moved exactly what OptionStratLib computed.
 //!
-//! The `margin-rs` ledger has no option instrument, so [`OptionBook`] holds option positions
-//! beside it, and the ledger never values one. A cash settlement is a derivative settlement in
-//! the ledger, under the contract's name, so it counts as settled PnL and not as a transfer. A
-//! physical settlement is an execution of the spot instrument at the strike, so the underlying
-//! has the strike as its cost. The position then leaves the book, so nothing holds both an
-//! extinguished option and its value. A lapse is booked too, as a settlement of zero, so the
-//! ledger keeps the end of every contract and a rebuilt book cannot settle one again.
+//! # Outcomes
+//!
+//! - **Cash.** `OptionOutcome::Cash` at the terms' settlement price. Out of the money it pays
+//!   zero: the ledger has no lapse for a cash option, so a payoff is never dropped by leaving its
+//!   price out. The value is settled PnL of the option, not a transfer.
+//! - **Physical, exercised or assigned.** `OptionOutcome::Delivery`: a spot execution at the
+//!   strike, booked with the close of the option in one step, so the underlying has the strike
+//!   as its cost and the premium stays in the option's PnL.
+//! - **Physical, not exercised.** `OptionOutcome::Lapsed`.
+//!
+//! Either way the settlement stays in the ledger under its identifier, and the position is
+//! flat, so a rebuilt book cannot settle the contract again.
 //!
 //! # Causal order
 //!
-//! 1. The obligation is computed. A missing price, a price after the cutoff, an event of the
-//!    wrong side and an unsupported option type are errors here, before anything changes.
+//! 1. The obligation is computed, and the instrument's terms are checked against the option. A
+//!    missing price, a price after the cutoff, an event of the wrong side, an unsupported option
+//!    type, terms that disagree, or a position other than the option's are errors here, before
+//!    anything changes.
 //! 2. The reservations of the contract's open orders are released, so a settlement can use them.
 //!    One no longer in the ledger, such as a filled order's, is noted and skipped.
-//! 3. The obligation is booked. It is mandatory: a position that cannot pay or deliver is booked
+//! 3. The settlement is booked. It is mandatory: a position that cannot pay or deliver is booked
 //!    all the same, and the amount short is in [`SettlementRecord::shortfalls`]. What follows,
 //!    such as a default or a liquidation, is not modelled.
 //! 4. The position leaves the book.
 //!
-//! All of it is one transaction: on an error, such as an amount finer than the asset's scale, the
-//! ledger and the book are as they were, and the position stays open.
+//! All of it is one transaction: on an error, such as an amount finer than an asset's scale, or
+//! a ledger that rounds otherwise than the terms, the ledger and the book are as they were.
 //!
 //! # What is the caller's
 //!
+//! - **The instrument and the position.** Register the option in the ledger and book its fills
+//!   there, with their premium. The ledger values an open option at the marks it is given.
 //! - **Open orders.** Releasing a reservation does not cancel its order: cancel those in
 //!   [`SettlementRecord::released`] with whatever manages them. Nothing checks who owns a
 //!   reservation, so register only the contract's own.
 //! - **The event.** Which short position an assignment falls on and whether an American option
-//!   should be exercised early are not decided here, and a settlement ends the whole position. No
-//!   clock is read: the terms state the price, its source and the cutoff.
-//! - **The contract size**, taken from the `Options` as it is, where 1 is also what a position
-//!   deserialized without one gets.
+//!   should be exercised early are not decided here, and a settlement closes the whole position.
+//!   No clock is read: the terms state the price, its source and the cutoff, which is the time
+//!   the settlement applies.
 //! - **Margin held in a `RiskGate`**, which is not touched here.
+//! - **The underlying and the expiry** of the instrument, which are not compared with the
+//!   option's: the obligation depends on neither, and the ledger applies its own expiry rules.
+//! - **A position reopened after its settlement**, by a fill executed before the expiry and
+//!   booked after it. The book settles a contract once, under one identifier, so such a position
+//!   is the caller's to settle in the ledger.
 
 use std::collections::BTreeMap;
 
-use margin_rs::ledger::{Booking, DerivativeSettlement, Execution, Ledger};
+use margin_rs::instrument::{
+    ExerciseStyle, OptionDelivery, OptionInstrument, OptionMargining, OptionRight,
+};
+use margin_rs::ledger::{Ledger, OptionOutcome, OptionSettlement};
 use margin_rs::{Asset, ExecutionId, Instrument, InstrumentId, MarginError, ReservationId};
 use optionstratlib::Options;
+use optionstratlib::model::types::{OptionStyle, OptionType, Side};
 use optionstratlib::model::{
     SettlementEvent, SettlementObligation, SettlementTerms, SettlementType, settlement_obligation,
 };
 
 use crate::Decimal;
-use crate::execution::Action;
+use crate::types::decimal::OrOverflow;
 use crate::types::error::{MMError, MMResult};
 
-/// An open option position, and what its settlement moves in the ledger.
+/// An open option position: the contract as OptionStratLib sees it, and the ledger's instrument
+/// that holds it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct OptionPosition {
-    /// The contract, with its side, quantity and contract size.
+    /// The contract, with its side, quantity in contracts and contract size.
     pub option: Options,
-    /// The asset cash settles in.
-    pub cash_asset: Asset,
-    /// The spot instrument a physical settlement trades, with the underlying as its base and
-    /// `cash_asset` as its quote.
+    /// The option instrument in the ledger.
+    pub instrument: InstrumentId,
+    /// The spot instrument a physical settlement trades, with the underlying as its base and the
+    /// option's settlement asset as its quote.
     pub spot: Option<InstrumentId>,
     reservations: Vec<ReservationId>,
 }
@@ -68,10 +89,10 @@ pub struct OptionPosition {
 impl OptionPosition {
     /// A position with no open orders, which can settle in cash only.
     #[must_use]
-    pub fn new(option: Options, cash_asset: Asset) -> Self {
+    pub fn new(option: Options, instrument: InstrumentId) -> Self {
         Self {
             option,
-            cash_asset,
+            instrument,
             spot: None,
             reservations: Vec::new(),
         }
@@ -95,7 +116,7 @@ impl OptionPosition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SettlementRecord {
-    /// The contract settled.
+    /// The contract settled: its instrument in the ledger.
     pub contract: String,
     /// What ended it.
     pub event: SettlementEvent,
@@ -103,6 +124,10 @@ pub struct SettlementRecord {
     pub settlement_type: SettlementType,
     /// What it obliged, seen from the position.
     pub obligation: SettlementObligation,
+    /// The outcome booked in the ledger.
+    pub outcome: OptionOutcome,
+    /// Realized PnL of the option's close, in its settlement asset: the value less the premium.
+    pub realized_pnl: Decimal,
     /// Who published the price, if the event needed one.
     pub price_source: Option<String>,
     /// The reservations released, with their assets and amounts. Their orders are the caller's
@@ -115,7 +140,7 @@ pub struct SettlementRecord {
     pub shortfalls: BTreeMap<Asset, Decimal>,
 }
 
-/// Open option positions, kept beside a ledger.
+/// Open option positions, kept with the ledger that holds their instruments.
 #[derive(Debug, Clone, Default)]
 pub struct OptionBook {
     open: BTreeMap<String, OptionPosition>,
@@ -126,117 +151,85 @@ fn ledger_error(what: &str, error: &MarginError) -> MMError {
     MMError::InvalidPositionUpdate(format!("settlement {what}: {error}"))
 }
 
-fn settlement_id(contract: &str) -> Result<ExecutionId, MarginError> {
-    ExecutionId::new(format!("settlement:{contract}"))
-}
-
 fn config_error(what: String) -> MMError {
     MMError::InvalidConfiguration(what)
 }
 
-fn checked_total(ledger: &Ledger, asset: &Asset) -> MMResult<Decimal> {
+fn execution_id(kind: &str, contract: &str) -> MMResult<ExecutionId> {
+    ExecutionId::new(format!("{kind}:{contract}")).map_err(|error| ledger_error("id", &error))
+}
+
+fn total(ledger: &Ledger, asset: &Asset) -> Decimal {
     ledger
         .balance(asset)
-        .map(|balance| balance.total)
-        .ok_or_else(|| config_error(format!("settlement asset {asset} is not in the ledger")))
+        .map_or(Decimal::ZERO, |balance| balance.total)
 }
 
-/// Books a cash obligation as a derivative settlement of the contract.
-fn book_cash(
-    ledger: &mut Ledger,
-    contract: &str,
-    position: &OptionPosition,
-    cash: Decimal,
-    shortfalls: &mut BTreeMap<Asset, Decimal>,
-) -> MMResult<()> {
-    let id = settlement_id(contract).map_err(|error| ledger_error("id", &error))?;
-    let instrument = InstrumentId::new(contract).map_err(|error| ledger_error("id", &error))?;
-    let booking = ledger
-        .book_settlement(&DerivativeSettlement {
-            id,
-            instrument,
-            asset: position.cash_asset.clone(),
-            realized_pnl: cash,
-            fee: Decimal::ZERO,
-        })
-        .map_err(|error| ledger_error("cash", &error))?;
-    if !booking.is_new {
-        return Err(MMError::InvalidPositionUpdate(format!(
-            "settlement of {contract} was already booked"
+/// The ledger's option for `position`, checked against the option's own terms.
+fn checked_instrument(ledger: &Ledger, position: &OptionPosition) -> MMResult<OptionInstrument> {
+    let id = &position.instrument;
+    let instrument = ledger
+        .instrument(id)
+        .and_then(Instrument::option_terms)
+        .ok_or_else(|| config_error(format!("{id} is not an option in the ledger")))?;
+    let option = &position.option;
+    let contract = instrument.contract();
+    if contract.margining != OptionMargining::Linear {
+        // OptionStratLib's obligation is in the price asset, and an inverse option pays the
+        // underlying.
+        return Err(config_error(format!(
+            "{id}: inverse options are not settled here"
         )));
     }
-    if let Some(short) = booking.shortfall {
-        shortfalls.insert(position.cash_asset.clone(), short);
+    let right = match option.option_style {
+        OptionStyle::Call => OptionRight::Call,
+        OptionStyle::Put => OptionRight::Put,
+    };
+    let exercise = match option.option_type {
+        OptionType::European => ExerciseStyle::European,
+        OptionType::American => ExerciseStyle::American,
+        _ => {
+            return Err(config_error(format!(
+                "{id}: the ledger holds European and American options only"
+            )));
+        }
+    };
+    let disagree =
+        |what: &str| config_error(format!("{id}: the ledger's {what} is not the option's"));
+    if contract.strike != option.strike_price.to_dec() {
+        return Err(disagree("strike"));
     }
-    Ok(())
+    if contract.right != right {
+        return Err(disagree("right"));
+    }
+    if contract.exercise != exercise {
+        return Err(disagree("exercise style"));
+    }
+    if instrument.terms().multiplier() != option.contract_size.to_dec() {
+        return Err(disagree("multiplier"));
+    }
+    Ok(instrument.clone())
 }
 
-/// Books a physical obligation as an execution of the spot instrument at the strike, and checks
-/// it moved what the obligation says.
-fn book_physical(
-    ledger: &mut Ledger,
-    contract: &str,
-    position: &OptionPosition,
-    obligation: &SettlementObligation,
-    shortfalls: &mut BTreeMap<Asset, Decimal>,
-) -> MMResult<()> {
-    let spot = position.spot.as_ref().ok_or_else(|| {
-        config_error(format!(
-            "{contract} settles physically with no spot instrument"
-        ))
-    })?;
-    let Some(Instrument::Spot(instrument)) = ledger.instrument(spot) else {
+/// The ledger's position in `position`'s instrument must be the option's, side and quantity.
+fn check_position(ledger: &Ledger, position: &OptionPosition) -> MMResult<Decimal> {
+    let id = &position.instrument;
+    let held = ledger
+        .position(id)
+        .map_or(Decimal::ZERO, |snapshot| snapshot.quantity);
+    let quantity = position.option.quantity.to_dec();
+    let expected = match position.option.side {
+        Side::Long => quantity,
+        Side::Short => Decimal::ZERO
+            .checked_sub(quantity)
+            .or_overflow("short quantity")?,
+    };
+    if held != expected {
         return Err(config_error(format!(
-            "{spot} is not a spot instrument in the ledger"
-        )));
-    };
-    let (base, quote) = (instrument.base().clone(), instrument.quote().clone());
-    if quote != position.cash_asset {
-        return Err(config_error(format!(
-            "{spot} is quoted in {quote}, and {contract} settles in {}",
-            position.cash_asset
+            "{id}: the ledger holds {held} contracts, and the option is {expected}"
         )));
     }
-    let (cash_before, base_before) = (
-        checked_total(ledger, &quote)?,
-        checked_total(ledger, &base)?,
-    );
-    let side = if obligation.underlying > Decimal::ZERO {
-        Action::Buy
-    } else {
-        Action::Sell
-    };
-    let id = settlement_id(contract).map_err(|error| ledger_error("id", &error))?;
-    let execution = Execution::new(
-        id,
-        spot.clone(),
-        side,
-        position.option.strike_price.to_dec(),
-        obligation.underlying.abs(),
-    );
-    let booked = ledger
-        .book_execution_allowing_overdraft(&execution, None)
-        .map_err(|error| ledger_error("delivery", &error))?;
-    if matches!(booked.booking, Booking::Duplicate(_)) {
-        return Err(MMError::InvalidPositionUpdate(format!(
-            "settlement of {contract} was already booked"
-        )));
-    }
-    shortfalls.extend(booked.shortfalls);
-    let moved = |after: Decimal, before: Decimal| {
-        after
-            .checked_sub(before)
-            .ok_or_else(|| MMError::NumericalError(format!("settlement of {contract}")))
-    };
-    let cash_moved = moved(checked_total(ledger, &quote)?, cash_before)?;
-    let base_moved = moved(checked_total(ledger, &base)?, base_before)?;
-    if cash_moved != obligation.cash || base_moved != obligation.underlying {
-        return Err(MMError::InvalidPositionUpdate(format!(
-            "settlement of {contract} moved {cash_moved} and {base_moved}, and owes {} and {}",
-            obligation.cash, obligation.underlying
-        )));
-    }
-    Ok(())
+    Ok(quantity)
 }
 
 impl OptionBook {
@@ -246,15 +239,17 @@ impl OptionBook {
         Self::default()
     }
 
-    /// Opens a position under `contract`, a name the ledger's identifiers can hold.
+    /// Opens `position`, under its instrument's identifier.
     ///
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] if the contract is open or was settled, as a
-    /// settlement ends a contract once, if its quantity is zero, or if the name cannot be an
-    /// identifier in the ledger.
-    pub fn open(&mut self, contract: impl Into<String>, position: OptionPosition) -> MMResult<()> {
-        let contract = contract.into();
+    /// settlement ends a contract once, if its quantity is zero, if its identifier is too long to
+    /// name its settlement in the ledger, if the instrument is not an
+    /// option in `ledger` whose strike, right, exercise style and multiplier are the option's,
+    /// or if the ledger's position in it is not the option's side and quantity.
+    pub fn open(&mut self, ledger: &Ledger, position: OptionPosition) -> MMResult<()> {
+        let contract = position.instrument.to_string();
         if self.open.contains_key(&contract) || self.settled.contains_key(&contract) {
             return Err(config_error(format!(
                 "option contract {contract} is already in the book"
@@ -265,9 +260,12 @@ impl OptionBook {
                 "option contract {contract} has no quantity"
             )));
         }
-        settlement_id(&contract)
-            .and_then(|_| InstrumentId::new(contract.as_str()))
+        // The identifiers its settlement will need, so that what opens can settle.
+        execution_id("settlement", &contract)
+            .and_then(|_| execution_id("delivery", &contract))
             .map_err(|error| config_error(format!("option contract {contract}: {error}")))?;
+        checked_instrument(ledger, &position)?;
+        check_position(ledger, &position)?;
         self.open.insert(contract, position);
         Ok(())
     }
@@ -313,10 +311,12 @@ impl OptionBook {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a contract that is not open, terms
-    /// OptionStratLib refuses, such as a missing price or an unsupported option type, or a
-    /// physical settlement with no usable spot instrument, and
-    /// [`MMError::InvalidPositionUpdate`] if the ledger refuses a step, such as an amount finer
-    /// than an asset's scale. The ledger and the book are then unchanged.
+    /// OptionStratLib refuses, such as a missing price or an unsupported option type, an
+    /// instrument or a position that is no longer the option's, a settlement type other than the
+    /// instrument's delivery, or a physical settlement with no spot instrument, and
+    /// [`MMError::InvalidPositionUpdate`] if the ledger refuses a step, has booked the
+    /// settlement already, or moves other than the obligation. The ledger and the book are then
+    /// unchanged.
     pub fn settle(
         &mut self,
         ledger: &mut Ledger,
@@ -329,6 +329,44 @@ impl OptionBook {
             .ok_or_else(|| config_error(format!("option contract {contract} is not open")))?;
         let obligation = settlement_obligation(&position.option, terms)
             .map_err(|error| config_error(format!("settling {contract}: {error}")))?;
+        let instrument = checked_instrument(ledger, position)?;
+        let contracts = check_position(ledger, position)?;
+        let delivery = match terms.settlement_type {
+            SettlementType::Cash => OptionDelivery::Cash,
+            SettlementType::Physical => OptionDelivery::Physical,
+        };
+        if instrument.contract().delivery != delivery {
+            return Err(config_error(format!(
+                "{contract} settles {:?} in the ledger, and the terms say {:?}",
+                instrument.contract().delivery,
+                terms.settlement_type
+            )));
+        }
+        let outcome = match delivery {
+            OptionDelivery::Cash => OptionOutcome::Cash {
+                price: terms
+                    .price
+                    .as_ref()
+                    .map(|price| price.price.to_dec())
+                    .ok_or_else(|| {
+                        config_error(format!("{contract} settles in cash with no price"))
+                    })?,
+            },
+            OptionDelivery::Physical if obligation.underlying.is_zero() => OptionOutcome::Lapsed,
+            OptionDelivery::Physical => OptionOutcome::Delivery {
+                spot: position.spot.clone().ok_or_else(|| {
+                    config_error(format!(
+                        "{contract} settles physically with no spot instrument"
+                    ))
+                })?,
+                delivery_id: execution_id("delivery", contract)?,
+            },
+        };
+        let as_of_ms = u64::try_from(terms.cutoff.timestamp_millis())
+            .map_err(|_| config_error(format!("{contract}: a cutoff before the epoch")))?;
+        let cash_asset = instrument.terms().settlement().clone();
+        let underlying = instrument.contract().underlying.clone();
+
         let mut trial = ledger.clone();
         let (mut released, mut already_gone) = (Vec::new(), Vec::new());
         for reservation in &position.reservations {
@@ -341,28 +379,45 @@ impl OptionBook {
                 .map_err(|error| ledger_error("release", &error))?;
             released.push((reservation.clone(), asset, amount));
         }
-        let mut shortfalls = BTreeMap::new();
-        if !obligation.underlying.is_zero() {
-            book_physical(&mut trial, contract, position, &obligation, &mut shortfalls)?;
-        } else {
-            // A lapse too, for zero: the ledger is what remembers that the contract ended.
-            book_cash(
-                &mut trial,
-                contract,
-                position,
-                obligation.cash,
-                &mut shortfalls,
-            )?;
+        let (cash_before, base_before) = (total(&trial, &cash_asset), total(&trial, &underlying));
+        let booking = trial
+            .settle_option(&OptionSettlement {
+                id: execution_id("settlement", contract)?,
+                instrument: position.instrument.clone(),
+                contracts,
+                outcome: outcome.clone(),
+                as_of_ms,
+            })
+            .map_err(|error| ledger_error("booking", &error))?;
+        if !booking.is_new {
+            return Err(MMError::InvalidPositionUpdate(format!(
+                "settlement of {contract} was already booked"
+            )));
+        }
+        let moved = |after: Decimal, before: Decimal| {
+            after
+                .checked_sub(before)
+                .ok_or_else(|| MMError::NumericalError(format!("settlement of {contract}")))
+        };
+        let cash_moved = moved(total(&trial, &cash_asset), cash_before)?;
+        let base_moved = moved(total(&trial, &underlying), base_before)?;
+        if cash_moved != obligation.cash || base_moved != obligation.underlying {
+            return Err(MMError::InvalidPositionUpdate(format!(
+                "settlement of {contract} moved {cash_moved} and {base_moved}, and owes {} and {}",
+                obligation.cash, obligation.underlying
+            )));
         }
         let record = SettlementRecord {
             contract: contract.to_string(),
             event: terms.event,
             settlement_type: terms.settlement_type,
             obligation,
+            outcome,
+            realized_pnl: booking.cashflow.realized_pnl,
             price_source: terms.price.as_ref().map(|price| price.source.clone()),
             released,
             already_gone,
-            shortfalls,
+            shortfalls: booking.shortfalls,
         };
         *ledger = trial;
         self.open.remove(contract);
