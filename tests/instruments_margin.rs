@@ -192,10 +192,10 @@ fn deribit_btc_future_maps_exactly() {
     assert_eq!(instrument.kind(), PositionKind::InverseFuture);
 }
 
-/// Deribit BTC option: `margin-rs` has no option instrument, whatever the
-/// scales.
+/// Deribit BTC option: `margin-rs` 0.2 converts it, as an inverse option, and its scales are
+/// checked as for any other instrument.
 #[test]
-fn options_are_unsupported() {
+fn options_convert_through_margin_rs() {
     let spec = deribit::btc_option(
         id("BTC-27NOV26-100000-C"),
         EXPIRY_MS,
@@ -203,19 +203,18 @@ fn options_are_unsupported() {
         OptionStyle::Call,
     )
     .unwrap();
-    let unsupported = AdapterError::Unsupported {
-        kind: ContractKind::Option,
-        margining: Margining::Inverse,
-    };
+    let converted = margin_instrument(&spec, scales(4, 1)).unwrap();
+    let option = converted.option_terms().unwrap();
+    assert_eq!(option.contract().strike, dec!(100000));
+    assert_eq!(option.contract().expiry_ms, EXPIRY_MS);
     assert_eq!(
-        margin_instrument(&spec, scales(4, 1)).unwrap_err(),
-        unsupported
+        option.contract().margining,
+        margin_rs::instrument::OptionMargining::Inverse
     );
-    // Reported before the scales are checked.
-    assert_eq!(
-        margin_instrument(&spec, scales(0, 0)).unwrap_err(),
-        unsupported
-    );
+    assert!(matches!(
+        margin_instrument(&spec, scales(0, 0)),
+        Err(AdapterError::ScaleBelowGrid { .. })
+    ));
 }
 
 // ------------------------------------------------------ other forms
@@ -462,7 +461,7 @@ fn ledger_registration_checks() {
 // ------------------------------------------------------------ fixtures
 
 /// Canary: the shared fixtures still pass against the published formulas,
-/// and every specification they use either converts or is an option.
+/// and every specification they use converts, options included since `margin-rs` 0.2.
 #[test]
 fn shared_fixtures_canary() {
     let cases = fixtures::cases().unwrap();
@@ -470,10 +469,6 @@ fn shared_fixtures_canary() {
     for case in &cases {
         fixtures::check(case).unwrap();
         let result = margin_instrument(&case.spec, scales(18, 18));
-        if case.spec.kind() == ContractKind::Option {
-            assert!(matches!(result, Err(AdapterError::Unsupported { .. })));
-        } else {
-            assert!(result.is_ok(), "{}: {result:?}", case.name);
-        }
+        assert!(result.is_ok(), "{}: {result:?}", case.name);
     }
 }

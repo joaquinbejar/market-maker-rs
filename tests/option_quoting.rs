@@ -2,9 +2,15 @@
 
 use std::sync::Arc;
 
+use margin_rs::initial_margin::RuleId;
+use margin_rs::instrument::{
+    ExerciseStyle, OptionContract, OptionDelivery, OptionInstrument, OptionMargining, OptionRight,
+};
 use margin_rs::ledger::{DerivativeSettlement, Execution, Ledger};
+use margin_rs::rules::{OptionExposure, OptionExposureView, ShortOptionIm, ShortOptionParameters};
 use margin_rs::{
-    Asset, ExecutionId, InstrumentId, OrderId, ReservationId, SpotInstrument, TransferId,
+    AccountId, Asset, ExecutionId, InstrumentId, LinearTerms, OrderId, ReservationId,
+    SpotInstrument, TransferId, VenueId,
 };
 use market_maker_rs::Decimal;
 use market_maker_rs::dec;
@@ -224,6 +230,69 @@ fn cash(ledger: &Ledger) -> Decimal {
     ledger.balance(&usd()).unwrap().total
 }
 
+// The capital of a short is the initial margin of margin-rs's `short-option-im/1` at the spot of
+// 100: `q * max(0.15 * 100 - OTM, 0.10 * 100)`, `OTM = max(0, K - 100)` for a call. So one short
+// of the call at 100 holds max(15 - 0, 10) = 15 and one of the call at 110 max(15 - 10, 10) = 10.
+
+/// What margin-rs's `rule` requires of `contracts` of the contract `terms` at `spot`, asked of
+/// margin-rs directly: the figure the quoter must hold.
+fn rule_margin(
+    rule: &ShortOptionIm,
+    terms: &ContractTerms,
+    contracts: Decimal,
+    spot: Decimal,
+) -> Decimal {
+    let option = OptionInstrument::new(
+        LinearTerms::new(
+            InstrumentId::new(&terms.name).unwrap(),
+            usd(),
+            dec!(1),
+            terms.price_scale,
+            terms.quantity_scale,
+        )
+        .unwrap(),
+        OptionContract {
+            underlying: base(),
+            strike: terms.strike,
+            expiry_ms: terms.expiry_ms,
+            right: match terms.style {
+                OptionStyle::Call => OptionRight::Call,
+                OptionStyle::Put => OptionRight::Put,
+            },
+            exercise: ExerciseStyle::European,
+            delivery: OptionDelivery::Cash,
+            margining: OptionMargining::Linear,
+        },
+    )
+    .unwrap();
+    rule.requirement(&OptionExposureView {
+        account: AccountId::new("test").unwrap(),
+        venue: VenueId::new("test").unwrap(),
+        positions: vec![OptionExposure {
+            option,
+            contracts,
+            underlying_price: spot,
+        }],
+    })
+    .unwrap()
+    .initial
+}
+
+fn default_rule() -> ShortOptionIm {
+    ShortOptionIm::short_option_v1(usd(), 8).unwrap()
+}
+
+/// One call at a strike of 101.000000001, so that its margin is finer than the cash asset under a
+/// rule at 18 places: max(0.15 * 100 - 1.000000001, 0.10 * 100) = 13.999999999.
+fn fine_strike() -> (OptionQuoterConfig, ShortOptionIm) {
+    let strike = dec!(101.000000001);
+    let pricer = Values(vec![(strike, valuation(dec!(9.5), dec!(0.5), dec!(20)))]);
+    let mut settings = config(vec![contract("C101", strike)]);
+    settings.pricer = Arc::new(pricer.clone());
+    settings.scenarios = vec![scenario("same", dec!(1), pricer)];
+    (settings, ShortOptionIm::short_option_v1(usd(), 18).unwrap())
+}
+
 /// The model the quoter should build, by hand from the fixture's sensitivities.
 fn model_by_hand(view: RiskView) -> MultiAssetModel {
     let (s, v, rho) = (2.0_f64, 0.05_f64, -0.5_f64);
@@ -339,7 +408,7 @@ fn test_an_offsetting_contract_reduces_the_skew_only_under_the_correlated_view()
 }
 
 #[test]
-fn test_a_buy_reserves_its_premium_and_a_sell_its_worst_scenario_from_its_price() {
+fn test_a_buy_reserves_its_premium_and_a_sell_its_initial_margin() {
     let mut book = ledger(dec!(100000));
     let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))])).unwrap();
     let round = quoter.quote(&mut book, &market()).unwrap();
@@ -353,8 +422,10 @@ fn test_a_buy_reserves_its_premium_and_a_sell_its_worst_scenario_from_its_price(
             .clone()
     };
     assert_eq!(held(Action::Buy).reserved, bid);
-    assert_eq!(held(Action::Sell).reserved, dec!(14) - ask);
-    assert_eq!(reserved(&book), bid + dec!(14) - ask);
+    // One short of the call at 100: max(0.15 * 100 - 0, 0.10 * 100) = 15, whatever the ask.
+    assert!(ask > dec!(0));
+    assert_eq!(held(Action::Sell).reserved, dec!(15));
+    assert_eq!(reserved(&book), bid + dec!(15));
     assert_eq!(
         book.reservation(&ReservationId::new(held(Action::Buy).order_id.as_str()).unwrap())
             .map(|(_, amount)| amount),
@@ -364,7 +435,7 @@ fn test_a_buy_reserves_its_premium_and_a_sell_its_worst_scenario_from_its_price(
 }
 
 #[test]
-fn test_a_sale_prices_its_capital_from_the_worst_of_every_scenario() {
+fn test_a_sale_holds_the_same_margin_whatever_the_scenarios() {
     let mut settings = config(vec![contract("C100", dec!(100))]);
     settings.scenarios = vec![
         scenario("small", dec!(1), raised(dec!(2))),
@@ -376,22 +447,24 @@ fn test_a_sale_prices_its_capital_from_the_worst_of_every_scenario() {
         .unwrap()
         .quote(&mut book, &market())
         .unwrap();
-    let (_, ask) = bid_ask(&round.quotes, 0);
     let sell = round
         .quotes
         .iter()
         .find(|quote| quote.side == Action::Sell)
         .unwrap();
-    // A 20% higher spot at a delta of 0.5 is worth 10 more, the worst of the three.
-    assert_eq!(sell.reserved, dec!(20) - ask);
+    // A 20% higher spot would raise the value by 10, but the margin reads only the round's spot:
+    // max(0.15 * 100 - 0, 0.10 * 100) = 15, as under the single scenario of the fixture.
+    assert_eq!(sell.reserved, dec!(15));
 }
 
 #[test]
-fn test_a_sale_above_every_scenario_holds_nothing() {
-    let mut settings = config(vec![contract("C100", dec!(100))]);
-    settings.scenarios = vec![scenario("down", dec!(0.5), values())];
+fn test_a_sale_that_holds_nothing_still_fills_and_cancels() {
     let mut book = ledger(dec!(100000));
-    let mut quoter = OptionQuoter::new(settings).unwrap();
+    // A long of 1 covers the whole sale of 1, so it holds nothing.
+    let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(1)], 0)
+        .unwrap();
     let round = quoter.quote(&mut book, &market()).unwrap();
     let sell = round
         .quotes
@@ -414,27 +487,21 @@ fn test_a_sale_above_every_scenario_holds_nothing() {
 
 #[test]
 fn test_a_reservation_rounds_up_to_the_cash_asset() {
-    let mut settings = config(vec![contract("C100", dec!(100))]);
-    settings.scenarios = vec![scenario(
-        "third",
-        dec!(1),
-        Values(vec![(
-            dec!(100),
-            valuation(dec!(13.3333333333333), dec!(0.5), dec!(20)),
-        )]),
-    )];
+    let (settings, rule) = fine_strike();
     let mut book = ledger(dec!(100000));
     let round = OptionQuoter::new(settings)
         .unwrap()
+        .with_short_margin(rule)
+        .unwrap()
         .quote(&mut book, &market())
         .unwrap();
-    let (_, ask) = bid_ask(&round.quotes, 0);
     let sell = round
         .quotes
         .iter()
         .find(|quote| quote.side == Action::Sell)
         .unwrap();
-    assert_eq!(sell.reserved, dec!(13.33333334) - ask);
+    // 13.999999999 at the rule's 18 places, up to the cash asset's 8: 14.00000000.
+    assert_eq!(sell.reserved, dec!(14.00000000));
 }
 
 #[test]
@@ -454,13 +521,15 @@ fn test_a_sale_that_unwinds_a_long_charges_only_what_it_adds() {
             .find(|quote| quote.side == Action::Sell)
             .unwrap()
             .reserved;
-        (sell, dec!(14) - ask)
+        assert!(ask > dec!(0));
+        sell
     };
-    assert_eq!(held_by(dec!(3)).0, dec!(0));
-    let (part, unit) = held_by(dec!(0.4));
-    assert_eq!(part, (dec!(0.6) * unit).round_dp(8));
-    let (whole, unit) = held_by(dec!(0));
-    assert_eq!(whole, unit);
+    // A long of 3 covers the whole sale of 1.
+    assert_eq!(held_by(dec!(3)), dec!(0));
+    // A long of 0.4 covers 0.4: the 0.6 left holds 0.6 * 15 = 9.
+    assert_eq!(held_by(dec!(0.4)), dec!(9));
+    // Flat, the whole sale holds 1 * 15 = 15.
+    assert_eq!(held_by(dec!(0)), dec!(15));
 }
 
 #[test]
@@ -492,11 +561,12 @@ fn test_a_buy_that_covers_a_short_only_counts_once_in_the_capital() {
         .with_restored_state(vec![dec!(-1)], 0)
         .unwrap();
     let round = quoter.quote(&mut book, &market()).unwrap();
-    let (bid, ask) = bid_ask(&round.quotes, 0);
-    // The short at its scenario loss of 4, the bid and the ask's capital held, less the bid.
-    assert_eq!(round.capital.deployed, dec!(4));
-    assert_eq!(round.capital.reserved, bid + dec!(14) - ask);
-    assert_eq!(round.capital.committed, dec!(4) + dec!(14) - ask);
+    let (bid, _) = bid_ask(&round.quotes, 0);
+    // The short of 1 at its margin of 1 * max(15 - 0, 10) = 15, the bid and the sale's 15 held,
+    // less the bid that covers the short: 15 + bid + 15 - bid = 30.
+    assert_eq!(round.capital.deployed, dec!(15));
+    assert_eq!(round.capital.reserved, bid + dec!(15));
+    assert_eq!(round.capital.committed, dec!(30));
 }
 
 #[test]
@@ -515,23 +585,25 @@ fn test_a_second_buy_covers_only_what_the_first_leaves_short() {
         .map(|quote| quote.reserved)
         .sum();
     assert_eq!(round.capital.reserved, held);
-    assert_eq!(round.capital.committed, dec!(4) + held - bid);
+    // The short of 1 at its margin of 15.
+    assert_eq!(round.capital.committed, dec!(15) + held - bid);
 }
 
 #[test]
-fn test_capital_counts_longs_at_value_shorts_at_scenario_loss_and_the_hedge_at_spot() {
+fn test_capital_counts_longs_at_value_shorts_at_initial_margin_and_the_hedge_at_spot() {
     let mut book = ledger(dec!(100000));
     hold_spot(&mut book, dec!(-2));
     let round = quoter(vec![dec!(3), dec!(-2)])
         .quote(&mut book, &market())
         .unwrap();
-    assert_eq!(round.capital.deployed, dec!(30) + dec!(8) + dec!(200));
+    // 3 long of the call at 100 at its value of 10; 2 short of the call at 110 at
+    // 2 * max(0.15 * 100 - 10, 0.10 * 100) = 2 * 10 = 20; 2 short of the spot at 100.
+    assert_eq!(round.capital.deployed, dec!(30) + dec!(20) + dec!(200));
 }
 
 #[test]
 fn test_the_budget_scales_every_side_by_one_factor_and_logs_it() {
     let mut settings = config(two_contracts());
-    settings.scenarios = vec![scenario("up", dec!(1), raised(dec!(20)))];
     let mut unbudgeted = ledger(dec!(100000));
     let free = OptionQuoter::new(settings.clone())
         .unwrap()
@@ -604,12 +676,15 @@ fn test_a_spent_budget_withholds_new_risk_but_lets_a_position_unwind() {
 }
 
 #[test]
-fn test_a_side_whose_scenario_gives_no_capital_is_not_cut_by_the_budget() {
+fn test_the_part_of_a_sale_that_unwinds_a_long_is_not_cut_by_the_budget() {
     let mut settings = config(vec![contract("C100", dec!(100))]);
-    settings.scenarios = vec![scenario("down", dec!(0.5), values())];
     settings.capital_budget = dec!(1);
     let mut book = ledger(dec!(100000));
+    // The long of 0.4 at its value of 10 deploys 4, past the budget of 1: nothing is left for
+    // new risk, but the 0.4 of the sale that unwinds the long commits nothing.
     let round = OptionQuoter::new(settings)
+        .unwrap()
+        .with_restored_state(vec![dec!(0.4)], 0)
         .unwrap()
         .quote(&mut book, &market())
         .unwrap();
@@ -618,8 +693,16 @@ fn test_a_side_whose_scenario_gives_no_capital_is_not_cut_by_the_budget() {
         .iter()
         .find(|quote| quote.side == Action::Sell)
         .unwrap();
-    assert_eq!(sell.quantity, dec!(1));
-    assert_eq!(kinds(&round.constraints, 0, Action::Sell), vec![]);
+    assert_eq!(sell.quantity, dec!(0.4));
+    assert_eq!(sell.reserved, dec!(0));
+    assert_eq!(
+        kinds(&round.constraints, 0, Action::Sell),
+        vec![OptionConstraintKind::CapitalBudget {
+            requested: dec!(1),
+            allowed: dec!(0.4),
+            budget: dec!(1),
+        }]
+    );
 }
 
 #[test]
@@ -972,7 +1055,7 @@ fn test_a_buy_fill_pays_its_premium_and_moves_the_position_and_the_reservation()
     let mut book = ledger(dec!(100000));
     let mut quoter = OptionQuoter::new(config(vec![contract("C100", dec!(100))])).unwrap();
     let round = quoter.quote(&mut book, &market()).unwrap();
-    let (bid, ask) = bid_ask(&round.quotes, 0);
+    let (bid, _) = bid_ask(&round.quotes, 0);
     let buy = round
         .quotes
         .iter()
@@ -987,14 +1070,13 @@ fn test_a_buy_fill_pays_its_premium_and_moves_the_position_and_the_reservation()
     assert_eq!(quoter.positions(), &[dec!(0.25)]);
     assert_eq!(cash(&book), dec!(100000) - bid * dec!(0.25));
     assert_eq!(book.settled_pnl(&usd()), -(bid * dec!(0.25)));
-    // The long it bought now covers a quarter of the live sale.
-    let unit = dec!(14) - ask;
-    assert_eq!(reserved(&book), bid * dec!(0.75) + unit * dec!(0.75));
+    // The long it bought now covers a quarter of the live sale: 0.75 * 15 = 11.25 is left.
+    assert_eq!(reserved(&book), bid * dec!(0.75) + dec!(11.25));
     let live = quoter.live_orders();
     assert_eq!(live.len(), 2);
     assert_eq!(live[0].quantity, dec!(0.75));
     assert_eq!(live[0].reserved, bid * dec!(0.75));
-    assert_eq!(live[1].reserved, unit * dec!(0.75));
+    assert_eq!(live[1].reserved, dec!(11.25));
     assert_eq!(book.settlement_journal()[0].instrument.as_str(), "C100");
 
     quoter
@@ -1031,14 +1113,13 @@ fn test_a_partly_filled_sale_holds_what_the_position_now_leaves_it() {
         .with_restored_state(vec![dec!(0.4)], 0)
         .unwrap();
     let round = quoter.quote(&mut book, &market()).unwrap();
-    let (_, ask) = bid_ask(&round.quotes, 0);
     let sell = round
         .quotes
         .iter()
         .find(|quote| quote.side == Action::Sell)
         .unwrap();
-    let unit = dec!(14) - ask;
-    assert_eq!(sell.reserved, (dec!(0.6) * unit).round_dp(8));
+    // 15 per contract of new short: the 0.6 beyond the long of 0.4 holds 0.6 * 15 = 9.
+    assert_eq!(sell.reserved, dec!(9));
     let held = |quoter: &OptionQuoter| {
         quoter
             .live_orders()
@@ -1051,7 +1132,7 @@ fn test_a_partly_filled_sale_holds_what_the_position_now_leaves_it() {
     quoter
         .on_fill(&mut book, &sell.order_id, dec!(0.1))
         .unwrap();
-    assert_eq!(held(&quoter), Some((dec!(0.6) * unit).round_dp(8)));
+    assert_eq!(held(&quoter), Some(dec!(9)));
 
     // Past zero: the 0.5 left is all new short, at the position's -0.2.
     let fill = quoter
@@ -1059,9 +1140,10 @@ fn test_a_partly_filled_sale_holds_what_the_position_now_leaves_it() {
         .unwrap();
     assert_eq!(fill.position, dec!(-0.1));
     assert_eq!(fill.unreserved, dec!(0));
-    assert_eq!(held(&quoter), Some((dec!(0.5) * unit).round_dp(8)));
+    // 0.5 * 15 = 7.5.
+    assert_eq!(held(&quoter), Some(dec!(7.5)));
     let bid = bid_ask(&round.quotes, 0).0;
-    assert_eq!(reserved(&book), bid + (dec!(0.5) * unit).round_dp(8));
+    assert_eq!(reserved(&book), bid + dec!(7.5));
 
     // A sale in parts holds its own remainder throughout: 0.25 left at a position of -0.35, so the
     // short and the sale still add up to the 0.6 of new short the whole sale could make.
@@ -1069,7 +1151,8 @@ fn test_a_partly_filled_sale_holds_what_the_position_now_leaves_it() {
         .on_fill(&mut book, &sell.order_id, dec!(0.25))
         .unwrap();
     assert_eq!(fill.position, dec!(-0.35));
-    assert_eq!(held(&quoter), Some((dec!(0.25) * unit).round_dp(8)));
+    // 0.25 * 15 = 3.75.
+    assert_eq!(held(&quoter), Some(dec!(3.75)));
 
     quoter
         .on_fill(&mut book, &sell.order_id, dec!(0.25))
@@ -1097,7 +1180,6 @@ fn test_filling_one_sale_can_take_the_cover_of_another() {
     };
     let (older, newer) = (side(&first), side(&second));
     assert_eq!(older.reserved, dec!(0));
-    let unit = dec!(14) - older.price;
     assert!(newer.reserved > dec!(0));
 
     // The newer sale fills and the long is gone, so the older one is new short now.
@@ -1107,7 +1189,8 @@ fn test_filling_one_sale_can_take_the_cover_of_another() {
         .iter()
         .find(|quote| quote.order_id == older.order_id)
         .unwrap();
-    assert_eq!(left.reserved, unit);
+    // One contract of new short: 15.
+    assert_eq!(left.reserved, dec!(15));
     assert!(
         book.reservation(&ReservationId::new(older.order_id.as_str()).unwrap())
             .is_some()
@@ -1131,13 +1214,13 @@ fn test_a_buy_fill_gives_a_live_sale_its_cover() {
     quoter
         .on_fill(&mut book, &id(Action::Buy), dec!(0.5))
         .unwrap();
-    let unit = dec!(14) - bid_ask(&round.quotes, 0).1;
     let sell = quoter
         .live_orders()
         .into_iter()
         .find(|quote| quote.side == Action::Sell)
         .unwrap();
-    assert_eq!(sell.reserved, (dec!(0.5) * unit).round_dp(8));
+    // The long of 0.5 covers half: 0.5 * 15 = 7.5.
+    assert_eq!(sell.reserved, dec!(7.5));
 }
 
 #[test]
@@ -1186,7 +1269,6 @@ fn test_a_cover_lost_with_too_little_free_cash_is_reported_and_the_fill_stands()
             .clone()
     };
     let (older, newer) = (sell(&first), sell(&second));
-    let unit = dec!(14) - older.price;
 
     // Something else takes the cash, so after the fill frees what it frees, 1 is left over.
     let held = reserved(&book);
@@ -1208,7 +1290,8 @@ fn test_a_cover_lost_with_too_little_free_cash_is_reported_and_the_fill_stands()
         .find(|quote| quote.order_id == older.order_id)
         .unwrap();
     assert_eq!(left.reserved, dec!(1));
-    assert_eq!(fill.unreserved, unit - dec!(1));
+    // The older sale is new short of 1 now, 15 to hold, and 1 is free: 15 - 1 = 14 unreserved.
+    assert_eq!(fill.unreserved, dec!(14));
     assert_eq!(left.quantity, dec!(1));
     assert_eq!(quoter.positions(), &[dec!(0)]);
 }
@@ -1729,18 +1812,18 @@ fn test_on_the_validated_pricer_and_shocked_surfaces_a_book_of_many_contracts_qu
         let (bid, ask) = bid_ask(&round.quotes, contract);
         assert!(bid < ask);
     }
-    // The higher spot and volatility cost a short more than its premium.
+    // The call at 100, flat: max(0.15 * 100 - 0, 0.10 * 100) = 15, whatever the surface.
     let sale = round
         .quotes
         .iter()
         .find(|quote| quote.contract == 2 && quote.side == Action::Sell)
         .unwrap();
-    assert!(sale.reserved.to_f64().unwrap() > 1.0);
+    assert_eq!(sale.reserved, dec!(15));
     assert_eq!(round.capital.reserved, reserved(&book));
 }
 
 #[test]
-fn test_a_short_with_every_scenario_below_its_value_deploys_nothing() {
+fn test_a_short_deploys_its_margin_even_with_every_scenario_below_its_value() {
     let mut settings = config(vec![contract("C100", dec!(100))]);
     settings.scenarios = vec![scenario("down", dec!(0.5), values())];
     let mut book = ledger(dec!(100000));
@@ -1750,7 +1833,8 @@ fn test_a_short_with_every_scenario_below_its_value_deploys_nothing() {
         .unwrap()
         .quote(&mut book, &market())
         .unwrap();
-    assert_eq!(round.capital.deployed, dec!(0));
+    // The scenario only lowers the value, but the margin reads the spot: 3 * 15 = 45.
+    assert_eq!(round.capital.deployed, dec!(45));
 }
 
 #[test]
@@ -1762,10 +1846,12 @@ fn test_a_live_sale_does_not_count_as_covering_a_short() {
         .unwrap()
         .quote(&mut book, &market())
         .unwrap();
-    let (bid, ask) = bid_ask(&round.quotes, 0);
-    assert_eq!(round.capital.deployed, dec!(8));
-    assert_eq!(round.capital.reserved, bid + dec!(14) - ask);
-    assert_eq!(round.capital.committed, dec!(8) + dec!(14) - ask);
+    let (bid, _) = bid_ask(&round.quotes, 0);
+    // The short of 2 at 2 * 15 = 30, the sale's 15 held in full, and the bid less the bid that
+    // covers the short: 30 + bid + 15 - bid = 45.
+    assert_eq!(round.capital.deployed, dec!(30));
+    assert_eq!(round.capital.reserved, bid + dec!(15));
+    assert_eq!(round.capital.committed, dec!(45));
 }
 
 #[test]
@@ -1847,36 +1933,22 @@ fn test_a_price_of_exactly_zero_is_withheld() {
 
 #[test]
 fn test_a_reservation_rounded_past_the_budget_is_released_and_logged() {
-    let settings_with = |budget: Decimal| {
-        let mut settings = config(vec![contract("C100", dec!(100))]);
-        settings.capital_budget = budget;
-        settings.scenarios = vec![scenario(
-            "third",
-            dec!(1),
-            Values(vec![(
-                dec!(100),
-                valuation(dec!(13.3333333333333), dec!(0.5), dec!(20)),
-            )]),
-        )];
-        settings
-    };
+    // The sale's margin is 13.999999999 at the rule's 18 places (see `fine_strike`), finer than
+    // the cash asset, so its reservation rounds up to 14.00000000.
+    let unit = dec!(13.999999999);
+    let (mut settings, rule) = fine_strike();
+    settings.capital_budget = unit;
     // Only the sale stands: the theta limit holds a long back.
     let limits = GreeksLimits {
         max_theta: dec!(-0.05),
         ..loose()
     };
-    let mut wide = ledger(dec!(100000));
-    let free = OptionQuoter::new(settings_with(dec!(1000)))
-        .unwrap()
-        .with_greek_limits(limits.clone())
-        .quote(&mut wide, &market())
-        .unwrap();
-    assert_eq!(free.quotes.len(), 1);
-    let unit = dec!(13.3333333333333) - free.quotes[0].price;
 
     // Exactly what the sale needs, which is finer than the cash asset, so it rounds past it.
     let mut book = ledger(dec!(100000));
-    let mut quoter = OptionQuoter::new(settings_with(unit))
+    let mut quoter = OptionQuoter::new(settings)
+        .unwrap()
+        .with_short_margin(rule)
         .unwrap()
         .with_greek_limits(limits);
     let round = quoter.quote(&mut book, &market()).unwrap();
@@ -2010,10 +2082,8 @@ fn test_a_long_does_not_cover_a_sale_beyond_it() {
     let sales: Vec<_> = rounds.iter().map(sale_of).collect();
     quoter.on_cancel(&mut book, &sales[2].order_id).unwrap();
     assert_eq!(live_sale(&quoter, &sales[0].order_id).reserved, dec!(0));
-    assert_eq!(
-        live_sale(&quoter, &sales[1].order_id).reserved,
-        dec!(14) - sales[1].price
-    );
+    // One contract of new short: 15.
+    assert_eq!(live_sale(&quoter, &sales[1].order_id).reserved, dec!(15));
 }
 
 #[test]
@@ -2049,7 +2119,6 @@ fn test_what_a_fill_shrinks_pays_for_what_it_raises() {
         .unwrap();
     let older = sale_of(&quoter.quote(&mut book, &market()).unwrap());
     let newer = sale_of(&quoter.quote(&mut book, &market()).unwrap());
-    let unit = dec!(14) - older.price;
     // Half of the newer fills: half its capital frees, and half the older one's cover goes. Only
     // the premium is free otherwise, and it is taken here.
     leave_free(&mut book, newer.price * dec!(0.5), dec!(0));
@@ -2057,14 +2126,9 @@ fn test_what_a_fill_shrinks_pays_for_what_it_raises() {
         .on_fill(&mut book, &newer.order_id, dec!(0.5))
         .unwrap();
     assert_eq!(fill.unreserved, dec!(0));
-    assert_eq!(
-        live_sale(&quoter, &older.order_id).reserved,
-        unit * dec!(0.5)
-    );
-    assert_eq!(
-        live_sale(&quoter, &newer.order_id).reserved,
-        unit * dec!(0.5)
-    );
+    // Each now has 0.5 of new short: 0.5 * 15 = 7.5.
+    assert_eq!(live_sale(&quoter, &older.order_id).reserved, dec!(7.5));
+    assert_eq!(live_sale(&quoter, &newer.order_id).reserved, dec!(7.5));
 }
 
 #[test]
@@ -2076,14 +2140,15 @@ fn test_a_sale_that_rises_keeps_what_it_held_and_adds_what_is_free() {
         .unwrap();
     let older = sale_of(&quoter.quote(&mut book, &market()).unwrap());
     let newer = sale_of(&quoter.quote(&mut book, &market()).unwrap());
-    let unit = dec!(14) - older.price;
-    assert_eq!(older.reserved, unit * dec!(0.5));
+    // The long of 0.5 covers half of the older: 0.5 * 15 = 7.5.
+    assert_eq!(older.reserved, dec!(7.5));
     // The newer fills in full, so what it frees and its premium are both free.
     leave_free(&mut book, newer.reserved + newer.price, dec!(0.1));
     let fill = quoter.on_fill(&mut book, &newer.order_id, dec!(1)).unwrap();
     let left = live_sale(&quoter, &older.order_id);
-    assert_eq!(left.reserved, unit * dec!(0.5) + dec!(0.1));
-    assert_eq!(fill.unreserved, unit * dec!(0.5) - dec!(0.1));
+    // It should hold 15, keeps its 7.5 and adds the 0.1 free: 7.6, and 15 - 7.6 = 7.4 is unreserved.
+    assert_eq!(left.reserved, dec!(7.6));
+    assert_eq!(fill.unreserved, dec!(7.4));
 }
 
 #[test]
@@ -2095,11 +2160,11 @@ fn test_an_overdrawn_ledger_leaves_a_sale_what_it_held() {
         .unwrap();
     let older = sale_of(&quoter.quote(&mut book, &market()).unwrap());
     let newer = sale_of(&quoter.quote(&mut book, &market()).unwrap());
-    let unit = dec!(14) - older.price;
     leave_free(&mut book, newer.reserved + newer.price, dec!(-5));
     let fill = quoter.on_fill(&mut book, &newer.order_id, dec!(1)).unwrap();
     assert_eq!(live_sale(&quoter, &older.order_id).reserved, dec!(0));
-    assert_eq!(fill.unreserved, unit);
+    // The older sale should hold one contract of new short, 15, and none of it is free.
+    assert_eq!(fill.unreserved, dec!(15));
 }
 
 #[test]
@@ -2268,4 +2333,170 @@ fn test_the_limits_read_what_the_cap_left_and_not_the_size_asked() {
         .find(|quote| quote.side == Action::Buy)
         .unwrap();
     assert_eq!(buy.quantity, dec!(5));
+}
+
+/// A single contract of `style` at `strike`, with a value the pricer and the scenario both give.
+fn single(style: OptionStyle, strike: Decimal) -> (OptionQuoterConfig, ContractTerms) {
+    let delta = match style {
+        OptionStyle::Call => dec!(0.5),
+        OptionStyle::Put => dec!(-0.4),
+    };
+    let pricer = Values(vec![(strike, valuation(dec!(6), delta, dec!(20)))]);
+    let mut terms = contract("OPT", strike);
+    terms.style = style;
+    let mut settings = config(vec![terms.clone()]);
+    settings.pricer = Arc::new(pricer.clone());
+    settings.scenarios = vec![scenario("same", dec!(1), pricer)];
+    (settings, terms)
+}
+
+#[test]
+fn test_a_sale_holds_the_rules_margin_for_one_contract_in_and_out_of_the_money() {
+    // At a spot of 100, a = 15 % and b = 10 %: max(15 - OTM, 10).
+    let cases = [
+        // Call in the money, OTM = max(0, 90 - 100) = 0: max(15, 10) = 15.
+        (OptionStyle::Call, dec!(90), dec!(15)),
+        // Call a little out, OTM = 104 - 100 = 4: max(11, 10) = 11.
+        (OptionStyle::Call, dec!(104), dec!(11)),
+        // Call far out, OTM = 110 - 100 = 10: max(5, 10) = 10, the floor.
+        (OptionStyle::Call, dec!(110), dec!(10)),
+        // Put in the money, OTM = max(0, 100 - 110) = 0: max(15, 10) = 15.
+        (OptionStyle::Put, dec!(110), dec!(15)),
+        // Put a little out, OTM = 100 - 97 = 3: max(12, 10) = 12.
+        (OptionStyle::Put, dec!(97), dec!(12)),
+        // Put far out, OTM = 100 - 90 = 10: max(5, 10) = 10, the floor.
+        (OptionStyle::Put, dec!(90), dec!(10)),
+    ];
+    for (style, strike, expected) in cases {
+        let (settings, terms) = single(style, strike);
+        let mut book = ledger(dec!(100000));
+        let round = OptionQuoter::new(settings)
+            .unwrap()
+            .quote(&mut book, &market())
+            .unwrap();
+        let sale = sale_of(&round);
+        assert_eq!(sale.quantity, dec!(1), "{style:?} {strike}");
+        assert_eq!(sale.reserved, expected, "{style:?} {strike}");
+        assert_eq!(
+            sale.reserved,
+            rule_margin(&default_rule(), &terms, dec!(-1), dec!(100)),
+            "{style:?} {strike}"
+        );
+    }
+}
+
+#[test]
+fn test_a_held_short_deploys_the_rules_margin() {
+    for (style, strike, position, expected) in [
+        // 2.5 short of the put at 97: 2.5 * max(15 - 3, 10) = 30.
+        (OptionStyle::Put, dec!(97), dec!(-2.5), dec!(30)),
+        // 0.5 short of the call at 110: 0.5 * max(15 - 10, 10) = 5.
+        (OptionStyle::Call, dec!(110), dec!(-0.5), dec!(5)),
+        // 3 short of the call at 90: 3 * max(15 - 0, 10) = 45.
+        (OptionStyle::Call, dec!(90), dec!(-3), dec!(45)),
+    ] {
+        let (settings, terms) = single(style, strike);
+        let mut book = ledger(dec!(100000));
+        let round = OptionQuoter::new(settings)
+            .unwrap()
+            .with_restored_state(vec![position], 0)
+            .unwrap()
+            .quote(&mut book, &market())
+            .unwrap();
+        assert_eq!(round.capital.deployed, expected, "{style:?} {strike}");
+        assert_eq!(
+            round.capital.deployed,
+            rule_margin(&default_rule(), &terms, position, dec!(100)),
+            "{style:?} {strike}"
+        );
+    }
+    // Two shorts, margined each alone and summed: 30 + 5 = 35 at a spot of 100.
+    let put = {
+        let mut terms = contract("P97", dec!(97));
+        terms.style = OptionStyle::Put;
+        terms
+    };
+    let mut settings = config(vec![put, contract("C110", dec!(110))]);
+    let pricer = Values(vec![
+        (dec!(97), valuation(dec!(6), dec!(-0.4), dec!(20))),
+        (dec!(110), valuation(dec!(5), dec!(0.3), dec!(15))),
+    ]);
+    settings.pricer = Arc::new(pricer.clone());
+    settings.scenarios = vec![scenario("same", dec!(1), pricer)];
+    let mut book = ledger(dec!(100000));
+    let round = OptionQuoter::new(settings)
+        .unwrap()
+        .with_restored_state(vec![dec!(-2.5), dec!(-0.5)], 0)
+        .unwrap()
+        .quote(&mut book, &market())
+        .unwrap();
+    assert_eq!(round.capital.deployed, dec!(35));
+}
+
+#[test]
+fn test_a_custom_rule_changes_the_capital_accordingly() {
+    // a = 20 %, b = 12 %, m = 10 %, at a spot of 100: the call at 100 max(20 - 0, 12) = 20 and
+    // the call at 110 max(20 - 10, 12) = 12, against 15 and 10 under `short-option-im/1`.
+    let rule = ShortOptionIm::new(
+        RuleId::new("desk-short-option", 1),
+        usd(),
+        8,
+        ShortOptionParameters {
+            initial_rate: dec!(0.20),
+            floor_rate: dec!(0.12),
+            maintenance_rate: dec!(0.10),
+        },
+    )
+    .unwrap();
+    let run = |rule: Option<ShortOptionIm>| {
+        let mut quoter = quoter(vec![dec!(0), dec!(-1)]);
+        if let Some(rule) = rule {
+            quoter = quoter.with_short_margin(rule).unwrap();
+        }
+        let mut book = ledger(dec!(100000));
+        let round = quoter.quote(&mut book, &market()).unwrap();
+        let sale = |contract| {
+            round
+                .quotes
+                .iter()
+                .find(|quote| quote.contract == contract && quote.side == Action::Sell)
+                .unwrap()
+                .reserved
+        };
+        (sale(0), sale(1), round.capital.deployed)
+    };
+    // Sales of 1 of each, and the short of 1 of the call at 110.
+    assert_eq!(run(None), (dec!(15), dec!(10), dec!(10)));
+    assert_eq!(run(Some(rule.clone())), (dec!(20), dec!(12), dec!(12)));
+    let terms = contract("C100", dec!(100));
+    assert_eq!(rule_margin(&rule, &terms, dec!(-1), dec!(100)), dec!(20));
+}
+
+#[test]
+fn test_a_rule_in_another_asset_than_the_cash_is_refused() {
+    let quoter = OptionQuoter::new(config(two_contracts())).unwrap();
+    let in_base = ShortOptionIm::short_option_v1(base(), 8).unwrap();
+    assert!(matches!(
+        quoter.with_short_margin(in_base),
+        Err(MMError::InvalidConfiguration(_))
+    ));
+}
+
+#[test]
+fn test_a_sale_that_only_unwinds_a_long_holds_no_margin() {
+    let mut book = ledger(dec!(100000));
+    let round = OptionQuoter::new(config(vec![contract("C100", dec!(100))]))
+        .unwrap()
+        .with_restored_state(vec![dec!(1)], 0)
+        .unwrap()
+        .quote(&mut book, &market())
+        .unwrap();
+    let (bid, _) = bid_ask(&round.quotes, 0);
+    let sale = sale_of(&round);
+    assert_eq!(sale.quantity, dec!(1));
+    assert_eq!(sale.reserved, dec!(0));
+    // Only the bid is held, and the long counts at its value of 10.
+    assert_eq!(reserved(&book), bid);
+    assert_eq!(round.capital.deployed, dec!(10));
+    assert_eq!(round.capital.committed, dec!(10) + bid);
 }

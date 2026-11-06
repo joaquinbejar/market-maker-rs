@@ -13,18 +13,41 @@
 //! limits and the scenarios, but not the skew. Results are model outputs, not a claim about an
 //! option market.
 //!
-//! # Capital is a budget, not a venue's margin
+//! # Capital: premiums and the short option rule, not a venue's margin
 //!
-//! `margin-rs` has no option instrument, so these quotes cannot pass a `RiskGate`. Each one
-//! holds a reservation in the ledger instead, and a quote exists only if the ledger accepted it:
+//! A `RiskGate` takes orders for spot only, so these quotes do not pass one. Each holds a
+//! reservation in the ledger instead, and a quote exists only if the ledger accepted it:
 //!
 //! - A buy reserves its premium.
-//! - A sell reserves the worst scenario value of the contract less its price, over the declared
-//!   scenarios, except for the part that only unwinds a long.
+//! - A sale reserves the initial margin of one short contract, per contract, except for the
+//!   part that only unwinds a long, which reserves nothing.
 //!
-//! The scenario figure is an internal budget. It says nothing about what a venue would demand,
-//! it does not reach beyond the declared scenarios, and contracts are summed without netting, so
-//! a spread holds more than its real worst case.
+//! In [`OptionCapital::deployed`], a long counts at its value and a short at its initial margin.
+//!
+//! The initial margin is `margin-rs`'s rule `short-option-im/1`
+//! ([`ShortOptionIm::short_option_v1`]), computed by `margin-rs` and not by this crate. For a
+//! contract of the quoter, linear, settled in the cash asset, with one unit of the underlying per
+//! contract, a short of `q` at the round's spot `U` and strike `K` requires
+//! `q * max(a * U - OTM, b * U)`, with `OTM = max(0, K - U)` for a call and `max(0, U - K)` for a
+//! put, `a` 15 % and `b` 10 %, rounded up to the rule's scale. By default the rule is built in the
+//! cash asset at its scale in the ledger; [`OptionQuoter::with_short_margin`] takes a rule with
+//! other rates.
+//!
+//! What this covers: the initial margin of each short contract on its own, at the round's spot,
+//! at `margin-rs`'s own rates. Those rates are `margin-rs`'s own specification, not a venue's
+//! rule, so the figure says nothing about what a venue would demand. What it does not cover:
+//!
+//! - No netting, between contracts or against the underlying or the hedge: a spread holds the
+//!   margin of its short leg in full, and a covered call the margin of the call.
+//! - No stress beyond the rule: the requirement reads only the round's spot, not the declared
+//!   scenarios or the volatility.
+//! - The short's value, its cost to close, is not in the requirement: `margin-rs` leaves it to
+//!   collateral, which deducts it. This quoter does not count it against the budget either; the
+//!   premium a sale receives is booked as cash.
+//! - The rule's maintenance margin is not used.
+//!
+//! The scenarios do not enter capital. They feed only the scenario loss limit
+//! ([`OptionQuoter::with_max_scenario_loss`]), which is a separate check.
 //!
 //! # Limits
 //!
@@ -35,9 +58,14 @@
 use std::fmt;
 use std::sync::Arc;
 
+use margin_rs::instrument::{
+    ExerciseStyle, OptionContract, OptionDelivery, OptionInstrument, OptionMargining, OptionRight,
+};
 use margin_rs::ledger::{DerivativeSettlement, Ledger};
+use margin_rs::rules::{OptionExposure, OptionExposureView, ShortOptionIm};
 use margin_rs::{
-    Asset, ExecutionId, Instrument, InstrumentId, MarginError, OrderId, ReservationId,
+    AccountId, Asset, ExecutionId, Instrument, InstrumentId, LinearTerms, MarginError, OrderId,
+    ReservationId, VenueId,
 };
 use optionstratlib::OptionStyle;
 use rust_decimal::RoundingStrategy;
@@ -151,7 +179,7 @@ pub struct OptionQuoterConfig {
     pub risk_view: RiskView,
     /// The budget on [`OptionCapital::committed`].
     pub capital_budget: Decimal,
-    /// The scenarios behind a sale's capital and the loss limit. At least one.
+    /// The scenarios behind the loss limit. At least one. They do not enter capital.
     pub scenarios: Vec<RiskScenario>,
 }
 
@@ -315,8 +343,8 @@ pub struct AdmittedOptionQuote {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OptionCapital {
-    /// Positions at the round's values: a long at its value, a short at its worst scenario loss
-    /// from that value, and the hedge at the spot.
+    /// Positions at the round's values: a long at its value, a short at its initial margin under
+    /// the short option rule, and the hedge at the spot.
     pub deployed: Decimal,
     /// What the live orders hold.
     pub reserved: Decimal,
@@ -379,16 +407,84 @@ struct Valued {
     base: OptionValuation,
     /// `V_s - V`, per scenario.
     moves: Vec<Decimal>,
-    /// The highest of the value and the scenario values.
-    top: Decimal,
+    /// Initial margin of one short contract at the round's spot: what a sale holds per unit.
+    sale_margin: Decimal,
+    /// Initial margin of the position held, zero unless it is short.
+    held_margin: Decimal,
 }
 
-impl Valued {
-    /// What holding one short costs from the value: never negative.
-    fn short_capital(&self) -> MMResult<Decimal> {
-        self.top
-            .checked_sub(self.base.price)
-            .or_overflow("short capital")
+/// The short option rule of a round, and what it needs to see a contract as `margin-rs` does.
+#[derive(Debug)]
+struct ShortMargin<'a> {
+    rule: &'a ShortOptionIm,
+    /// The asset of the underlying's spot instrument.
+    underlying: &'a Asset,
+    account: AccountId,
+    venue: VenueId,
+}
+
+impl<'a> ShortMargin<'a> {
+    fn new(rule: &'a ShortOptionIm, underlying: &'a Asset) -> MMResult<Self> {
+        let id = |error: MarginError| margin_error("id", &error);
+        Ok(Self {
+            rule,
+            underlying,
+            account: AccountId::new("option-quoter").map_err(id)?,
+            venue: VenueId::new("option-quoter").map_err(id)?,
+        })
+    }
+
+    /// The contract as an option of `margin-rs`: linear, settled in the rule's asset, one unit of
+    /// the underlying per contract.
+    fn option(&self, terms: &ContractTerms) -> MMResult<OptionInstrument> {
+        let error = |error: MarginError| margin_error(&terms.name, &error);
+        let linear = LinearTerms::new(
+            InstrumentId::new(terms.name.as_str()).map_err(error)?,
+            self.rule.currency().clone(),
+            Decimal::ONE,
+            terms.price_scale,
+            terms.quantity_scale,
+        )
+        .map_err(error)?;
+        OptionInstrument::new(
+            linear,
+            OptionContract {
+                underlying: self.underlying.clone(),
+                strike: terms.strike,
+                expiry_ms: terms.expiry_ms,
+                right: match terms.style {
+                    OptionStyle::Call => OptionRight::Call,
+                    OptionStyle::Put => OptionRight::Put,
+                },
+                exercise: ExerciseStyle::European,
+                delivery: OptionDelivery::Cash,
+                margining: OptionMargining::Linear,
+            },
+        )
+        .map_err(error)
+    }
+
+    /// The rule's initial margin for `contracts`, signed, of `option` at `spot`.
+    fn initial(
+        &self,
+        option: &OptionInstrument,
+        contracts: Decimal,
+        spot: Decimal,
+    ) -> MMResult<Decimal> {
+        let view = OptionExposureView {
+            account: self.account.clone(),
+            venue: self.venue.clone(),
+            positions: vec![OptionExposure {
+                option: option.clone(),
+                contracts,
+                underlying_price: spot,
+            }],
+        };
+        let requirement = self
+            .rule
+            .requirement(&view)
+            .map_err(|error| margin_error(option.terms().id().as_str(), &error))?;
+        Ok(requirement.initial)
     }
 }
 
@@ -479,6 +575,22 @@ fn ledger_error(what: &str, error: &MarginError) -> MMError {
     MMError::InvalidPositionUpdate(format!("option quoter {what}: {error}"))
 }
 
+fn margin_error(what: &str, error: &MarginError) -> MMError {
+    let message = format!("short option margin of {what}: {error}");
+    match error {
+        MarginError::Arithmetic { .. } => MMError::NumericalError(message),
+        MarginError::InvalidInput {
+            field: "underlying_price",
+            ..
+        }
+        | MarginError::PrecisionExceeded {
+            field: "underlying_price",
+            ..
+        } => MMError::InvalidMarketState(message),
+        _ => MMError::InvalidConfiguration(message),
+    }
+}
+
 fn positive(name: &str, value: Decimal) -> MMResult<()> {
     if value <= Decimal::ZERO {
         return Err(config(format!("{name} must be positive, got {value}")));
@@ -509,6 +621,15 @@ fn floor_to(value: Decimal, scale: u32) -> Decimal {
 /// 5. **Hedge.** A delta beyond the threshold yields a sized [`HedgeOrder`], which is reported
 ///    and not sent. Withholding a side does not trigger one.
 ///
+/// A buy holds its premium. A sale holds the initial margin of one short contract under
+/// `margin-rs`'s rule `short-option-im/1` at the round's spot, `max(15 % of the spot less the
+/// amount out of the money, 10 % of the spot)` per contract, or under the rule given to
+/// [`OptionQuoter::with_short_margin`], except for the part that only unwinds a long, which holds
+/// nothing. A short position counts at the same rule's margin. The rates are `margin-rs`'s own
+/// specification, not a venue's rule. Each contract is margined alone: no netting between
+/// contracts or against the hedge, no stress beyond the rule, and the declared scenarios feed
+/// only the loss limit, not capital.
+///
 /// A round never raises the committed capital above the budget, except for what only unwinds a
 /// position. A hedge the caller sends is held at the spot in [`OptionCapital::deployed`], so it is
 /// sized by the delta and can pass the budget, and the next rounds then have less left. Values can
@@ -519,13 +640,15 @@ fn floor_to(value: Decimal, scale: u32) -> Decimal {
 /// before the next if it wants the quotes replaced, since live orders keep their capital and
 /// their limits. The hedge position is what the ledger holds of the underlying's instrument.
 ///
-/// The positions are this quoter's, as the ledger has no option instrument. A new quoter starts
+/// The positions are this quoter's, not the ledger's. A new quoter starts
 /// flat unless told otherwise with [`OptionQuoter::with_restored_state`].
 #[derive(Debug, Clone)]
 pub struct OptionQuoter {
     config: OptionQuoterConfig,
     greek_limits: Option<GreeksLimits>,
     max_scenario_loss: Option<Decimal>,
+    /// The short option rule, or `short-option-im/1` in the cash asset at its ledger scale.
+    short_margin: Option<ShortOptionIm>,
     positions: Vec<Decimal>,
     live: Vec<LiveOption>,
     next_round: u64,
@@ -592,6 +715,7 @@ impl OptionQuoter {
             config,
             greek_limits: None,
             max_scenario_loss: None,
+            short_margin: None,
             positions,
             live: Vec::new(),
             next_round: 0,
@@ -613,6 +737,28 @@ impl OptionQuoter {
     pub fn with_max_scenario_loss(mut self, limit: Decimal) -> MMResult<Self> {
         positive("scenario loss limit", limit)?;
         self.max_scenario_loss = Some(limit);
+        Ok(self)
+    }
+
+    /// Holds a short's capital, and a sale's, at `rule`'s initial margin instead of the default
+    /// `short-option-im/1` in the cash asset at its scale in the ledger. A rule with other rates
+    /// comes from [`ShortOptionIm::new`], under its own rule id. Each contract is margined as a
+    /// linear option settled in the cash asset, with one unit of the underlying per contract, at
+    /// the round's spot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] if `rule` is not in the cash asset.
+    pub fn with_short_margin(mut self, rule: ShortOptionIm) -> MMResult<Self> {
+        if *rule.currency() != self.config.cash_asset {
+            return Err(config(format!(
+                "short option rule {} is in {}, not in the cash asset {}",
+                rule.rule(),
+                rule.currency(),
+                self.config.cash_asset
+            )));
+        }
+        self.short_margin = Some(rule);
         Ok(self)
     }
 
@@ -670,8 +816,8 @@ impl OptionQuoter {
             .collect()
     }
 
-    /// The hedge position and the lot of the underlying's instrument.
-    fn hedge_position(&self, ledger: &Ledger) -> MMResult<(Decimal, u32)> {
+    /// The hedge position, the lot of the underlying's instrument and its base asset.
+    fn hedge_position(&self, ledger: &Ledger) -> MMResult<(Decimal, u32, Asset)> {
         let id = &self.config.underlying.instrument;
         let Some(Instrument::Spot(spot)) = ledger.instrument(id) else {
             return Err(config(format!(
@@ -688,7 +834,7 @@ impl OptionQuoter {
         let held = ledger
             .position(id)
             .map_or(Decimal::ZERO, |position| position.quantity);
-        Ok((held, spot.quantity_scale()))
+        Ok((held, spot.quantity_scale(), spot.base().clone()))
     }
 
     fn cash_scale(&self, ledger: &Ledger) -> MMResult<u32> {
@@ -715,6 +861,7 @@ impl OptionQuoter {
         contract: usize,
         terms: &ContractTerms,
         market: &OptionMarket,
+        margin: &ShortMargin<'_>,
     ) -> MMResult<Result<Valued, OptionConstraintKind>> {
         if market.now_ms >= terms.expiry_ms {
             if self.exposed(contract) {
@@ -738,28 +885,43 @@ impl OptionQuoter {
                 terms.style,
             ))
         };
-        let attempt = || -> MMResult<Valued> {
+        let attempt = || -> MMResult<(OptionValuation, Vec<Decimal>)> {
             let base = self.config.pricer.value(&inputs(market.spot)?)?;
             let mut moves = Vec::with_capacity(self.config.scenarios.len());
-            let mut top = base.price;
             for scenario in &self.config.scenarios {
                 let spot = market
                     .spot
                     .checked_mul(scenario.spot_factor)
                     .or_overflow("scenario spot")?;
                 let value = scenario.pricer.value(&inputs(spot)?)?.price;
-                top = top.max(value);
                 moves.push(value.checked_sub(base.price).or_overflow("scenario move")?);
             }
-            Ok(Valued { base, moves, top })
+            Ok((base, moves))
         };
-        match attempt() {
-            Ok(valued) => Ok(Ok(valued)),
-            Err(error) if self.exposed(contract) => Err(error),
-            Err(error) => Ok(Err(OptionConstraintKind::NotValued {
-                reason: error.to_string(),
-            })),
-        }
+        let (base, moves) = match attempt() {
+            Ok(values) => values,
+            Err(error) if self.exposed(contract) => return Err(error),
+            Err(error) => {
+                return Ok(Err(OptionConstraintKind::NotValued {
+                    reason: error.to_string(),
+                }));
+            }
+        };
+        let option = margin.option(terms)?;
+        let sale_margin = margin.initial(&option, Decimal::NEGATIVE_ONE, market.spot)?;
+        let position = self
+            .positions
+            .get(contract)
+            .copied()
+            .ok_or_else(|| out_of_range(contract))?;
+        // The rule requires nothing of a long.
+        let held_margin = margin.initial(&option, position, market.spot)?;
+        Ok(Ok(Valued {
+            base,
+            moves,
+            sale_margin,
+            held_margin,
+        }))
     }
 
     /// The joint model of the round, with the underlying as asset 0, and each contract's asset
@@ -968,15 +1130,13 @@ impl OptionQuoter {
             .or_overflow("deployed hedge")?;
         for (position, entry) in self.positions.iter().zip(valued) {
             let Some(entry) = entry else { continue };
-            let unit = if position.is_sign_negative() {
-                entry.short_capital()?
+            let value = if position.is_sign_negative() {
+                entry.held_margin
             } else {
-                entry.base.price
+                position
+                    .checked_mul(entry.base.price)
+                    .or_overflow("deployed capital")?
             };
-            let value = position
-                .abs()
-                .checked_mul(unit)
-                .or_overflow("deployed capital")?;
             deployed = deployed
                 .checked_add(value)
                 .or_overflow("deployed capital")?;
@@ -1136,11 +1296,7 @@ impl OptionQuoter {
                 .max(Decimal::ZERO);
                 let unit_capital = match side {
                     Dir::Buy => price,
-                    Dir::Sell => entry
-                        .top
-                        .checked_sub(price)
-                        .or_overflow("sale capital")?
-                        .max(Decimal::ZERO),
+                    Dir::Sell => entry.sale_margin,
                 };
                 candidates.push(OptionCandidate {
                     contract,
@@ -1253,8 +1409,10 @@ impl OptionQuoter {
     /// ledger quoted in a registered cash asset, or a contract's premium would be finer than that
     /// asset. Returns [`MMError::InvalidMarketState`] if the
     /// spot is not positive, or a contract with exposure has expired. Returns the pricer's error
-    /// for a contract with exposure it cannot value, the model's errors, and
-    /// [`MMError::NumericalError`] on overflow.
+    /// for a contract with exposure it cannot value, the model's errors, what the short option rule
+    /// refuses (a contract it cannot margin, as [`MMError::InvalidConfiguration`], or a spot finer
+    /// than it takes, as [`MMError::InvalidMarketState`]), and [`MMError::NumericalError`] on
+    /// overflow.
     pub fn quote(
         &mut self,
         ledger: &mut Ledger,
@@ -1266,8 +1424,19 @@ impl OptionQuoter {
                 market.spot
             )));
         }
-        let (hedge, spot_scale) = self.hedge_position(ledger)?;
+        let (hedge, spot_scale, underlying) = self.hedge_position(ledger)?;
         let cash_scale = self.cash_scale(ledger)?;
+        let default_rule;
+        let rule = match &self.short_margin {
+            Some(rule) => rule,
+            None => {
+                default_rule =
+                    ShortOptionIm::short_option_v1(self.config.cash_asset.clone(), cash_scale)
+                        .map_err(|error| margin_error("the cash asset", &error))?;
+                &default_rule
+            }
+        };
+        let margin = ShortMargin::new(rule, &underlying)?;
         for terms in &self.config.contracts {
             if terms.price_scale.saturating_add(terms.quantity_scale) > cash_scale {
                 return Err(config(format!(
@@ -1279,7 +1448,7 @@ impl OptionQuoter {
         let mut constraints = Vec::new();
         let mut valued = Vec::with_capacity(self.config.contracts.len());
         for (contract, terms) in self.config.contracts.iter().enumerate() {
-            match self.value_contract(contract, terms, market)? {
+            match self.value_contract(contract, terms, market, &margin)? {
                 Ok(entry) => valued.push(Some(entry)),
                 Err(kind) => {
                     for side in [Action::Buy, Action::Sell] {
