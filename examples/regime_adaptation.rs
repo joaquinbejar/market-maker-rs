@@ -56,7 +56,9 @@ const HOLDOUT_DAY: u64 = 4;
 const END_DAY: u64 = 6;
 /// Stress in validation, then in the holdout, in days: differently placed on purpose.
 const STRESSES: [(f64, f64); 2] = [(2.5, 3.0), (5.0, 5.75)];
-const PATHS: std::ops::Range<u64> = 1..11;
+/// The reported paths, fixed in the commit before their one run. Paths 1 to 10 were seen while
+/// this example was developed, and are not evidence.
+const PATHS: std::ops::Range<u64> = 101..111;
 const CAP: usize = 20;
 const IMPACT: f64 = 0.01;
 const DIFFUSION: f64 = 0.02;
