@@ -335,3 +335,38 @@ fn test_hedge_mask_leaves_out_a_size_the_kernel_would_not_admit() {
     assert_eq!(env.mask(&state).size, 0b01);
     assert_eq!(env.hedge_mask(&state), 0b01);
 }
+
+#[test]
+fn test_the_kernel_refuses_a_hedge_it_would_not_admit_even_under_reject() {
+    // The mask's check is the agent's; the kernel's admission decides on its own. With the
+    // policy rejecting rather than erroring, a size above the largest order reaches the
+    // kernel and is refused there.
+    let ticks: Vec<MarketTick> = (0..8_u64)
+        .map(|i| {
+            if i % 2 == 0 {
+                tick(1000 + i, dec!(100), dec!(101))
+            } else {
+                tick(1000 + i, dec!(99), dec!(100))
+            }
+        })
+        .collect();
+    let cfg = kernel_config();
+    let data = KernelDataset::from_ticks(&ticks, &cfg).unwrap();
+    let grid = ActionGrid::new([1, 2, 10], [10, 11, 12], [10, 11]).unwrap();
+    let rl = hedging().with_invalid_action(InvalidActionPolicy::Reject, dec!(0.25));
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, grid, rl).unwrap();
+    let mut state = env.reset(1).unwrap();
+    for _ in 0..2 {
+        env.step(&mut state, quote(0, 2, 0, 0)).unwrap();
+        env.step(&mut state, RlAction::Hold).unwrap();
+    }
+    let held = state.kernel().venue_position();
+    assert_eq!(env.hedge_mask(&state), 0b01);
+    let t = env.step(&mut state, RlAction::Hedge { size: 1 }).unwrap();
+    assert_eq!(
+        t.action_status,
+        ActionStatus::Rejected(market_maker_rs::backtest::kernel::RejectReason::SizeRange)
+    );
+    assert_eq!(t.reward.penalty, dec!(0.25));
+    assert_eq!(state.kernel().venue_position(), held);
+}
