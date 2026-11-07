@@ -1151,14 +1151,19 @@ fn test_worker_residual_hold_keeps_the_orders_and_equals_the_inner_hold() {
     };
     let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
         ResidualEnv::new(&kernel, &data, source, d("1"), bounds, bridge.rl().unwrap()).unwrap();
-    let mut state = env.reset(1).unwrap();
+    let mut tally = Tally::default();
+    let mut state = env.reset_with(1, &mut tally).unwrap();
     let mut worker = Worker::spawn(bridge, rows, None).unwrap();
     worker.reset(1).unwrap();
-    let mut held_while_resting = 0;
+    let (mut held_while_resting, mut residual_orders) = (0, 0);
     for step in 0..39 {
-        let (through, direct) = if step % 3 == 0 {
-            let step = env.step(&mut state, zero).unwrap();
-            (worker.step_residual(zero).unwrap(), step.transition)
+        tally = Tally::default();
+        // Two decisions in a row, so that a decision follows one that placed orders.
+        let (through, direct) = if step % 3 != 2 {
+            let step = env.step_with(&mut state, zero, &mut tally).unwrap();
+            let reply = worker.step_residual(zero).unwrap();
+            residual_orders += reply.orders.accepted;
+            (reply, step.transition)
         } else {
             let resting = state.kernel().queue_lengths().orders > 0;
             let reply = worker.step(RlAction::Hold).unwrap();
@@ -1166,11 +1171,118 @@ fn test_worker_residual_hold_keeps_the_orders_and_equals_the_inner_hold() {
             assert_eq!((reply.orders.accepted, reply.orders.canceled), (0, 0));
             assert!(reply.decision.is_none());
             held_while_resting += u32::from(resting);
-            let direct = env.env().step(&mut state, RlAction::Hold).unwrap();
+            let direct = env
+                .env()
+                .step_with(&mut state, RlAction::Hold, &mut tally)
+                .unwrap();
             (reply, direct)
         };
         assert_eq!(through.transition, direct, "step {step}");
         assert_eq!(through.net, state.net());
+        // Each step's own reports, a residual decision's as a hold's.
+        assert_eq!(through.orders, tally.counts(), "step {step}");
     }
+    assert!(residual_orders > 0, "no residual decision placed an order");
     assert!(held_while_resting > 0, "no hold with orders resting");
+}
+
+/// The order reports of a step, by the name of their kind, from the kernel's own events.
+#[derive(Default)]
+struct Tally(std::collections::BTreeMap<String, u64>);
+
+impl EventSink for Tally {
+    fn event(&mut self, event: KernelEvent) {
+        if let KernelEvent::Report(report) = event {
+            *self.0.entry(format!("{:?}", report.kind)).or_default() += 1;
+        }
+    }
+}
+
+impl Tally {
+    fn counts(&self) -> OrderCounts {
+        let of = |kind: &str| self.0.get(kind).copied().unwrap_or(0);
+        OrderCounts {
+            accepted: of("Accepted"),
+            rejected: of("Rejected"),
+            canceled: of("Canceled"),
+            cancel_rejected: of("CancelRejected"),
+            fills: of("PartialFill") + of("Fill"),
+        }
+    }
+}
+
+#[test]
+fn test_worker_counts_every_kind_of_report_as_the_kernel_reports_it() {
+    // Queue fills in parts, a cancel that a fill outruns, and a position limit that rejects.
+    let rows: Vec<KernelTick> = (0..200_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect();
+    let mut bridge = config("close", "reject", 1000);
+    bridge.latency = LatencyConfig {
+        quantum_ns: 1_000_000,
+        observation_q: 1,
+        submit_q: 1,
+        cancel_q: 40,
+        ack_q: 2,
+        jitter_q: 2,
+    };
+    // A lot about every row: a crossed order of 2 lots fills over two rows.
+    bridge.fill_model = FillConfig::QueuePositionRational {
+        lots: 1,
+        per_ms: 20,
+        min_queue_ms: 0,
+    };
+    bridge.limits = Some(LimitsConfig {
+        max_position: "3".to_string(),
+        max_notional: "100000".to_string(),
+        scaling_factor: "1".to_string(),
+    });
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let mut tally = Tally::default();
+    let mut state = env.reset_with(9, &mut tally).unwrap();
+    worker.reset(9).unwrap();
+    let action = |step: usize| match step % 3 {
+        0 => quote(0, 0, 1, 1),
+        1 => quote(1, 0, 0, 1),
+        _ => RlAction::Hold,
+    };
+    let (mut step, mut total) = (0, OrderCounts::default());
+    let mut partial_fills = 0;
+    while !state.is_done() {
+        tally = Tally::default();
+        env.step_with(&mut state, action(step), &mut tally).unwrap();
+        partial_fills += tally.0.get("PartialFill").copied().unwrap_or(0);
+        let through = worker.step(action(step)).unwrap();
+        assert_eq!(through.orders, tally.counts(), "step {step}");
+        total.accepted += through.orders.accepted;
+        total.rejected += through.orders.rejected;
+        total.canceled += through.orders.canceled;
+        total.cancel_rejected += through.orders.cancel_rejected;
+        total.fills += through.orders.fills;
+        step += 1;
+    }
+    // Every kind is reached, a partial fill among the fills.
+    assert!(
+        total.accepted > 0
+            && total.rejected > 0
+            && total.canceled > 0
+            && total.cancel_rejected > 0
+            && partial_fills > 0
+            && total.fills > partial_fills,
+        "{total:?}, {partial_fills} partial fills"
+    );
 }
