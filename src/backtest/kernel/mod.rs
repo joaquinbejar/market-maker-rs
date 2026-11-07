@@ -737,16 +737,22 @@ pub fn capacity_need(cfg: &KernelConfig, data: &KernelDataset) -> MMResult<Capac
 /// never overflows or rounds, so its overflow branch cannot be reached.
 fn check_fill_model(cfg: &ValidatedConfig, data: &KernelDataset) -> MMResult<()> {
     const LIMIT: u128 = 1 << 96;
-    let ValidFill::QueuePosition { rate_lots, .. } = cfg.fill else {
+    let ValidFill::QueuePosition {
+        rate_lots, per_ms, ..
+    } = cfg.fill
+    else {
         return Ok(());
     };
     let unit = u128::from(cfg.lot.mantissa);
     let fits = |lots: u128| lots.checked_mul(unit).is_some_and(|m| m < LIMIT);
     let last_ms = data.id.last_ts.checked_div(data::NS_PER_MS).unwrap_or(0);
-    let cleared = u128::from(rate_lots).checked_mul(u128::from(last_ms));
+    let cleared = u128::from(rate_lots)
+        .checked_mul(u128::from(last_ms))
+        .and_then(|v| v.checked_div(u128::from(per_ms)));
     if !cleared.is_some_and(fits) {
         return Err(MMError::InvalidConfiguration(format!(
-            "fill rate {rate_lots} lots per ms up to {last_ms} ms is not exact in a Decimal"
+            "fill rate {rate_lots} lots per {per_ms} ms up to {last_ms} ms is not exact in a \
+             Decimal"
         )));
     }
     let largest = data
