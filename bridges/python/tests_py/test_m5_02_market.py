@@ -220,7 +220,8 @@ def test_every_arm_builds_steps_and_evaluates_a_day(synthetic_day, arm):
                      "horizon_ms": 86400000, "size": "1"}}
     env = run_market.build_env(job, synthetic_day, "calm", 15, "validation")
     try:
-        assert env.unwrapped.config["fill_model"] == base["execution"]["fill_model"]
+        assert env.unwrapped.config["fill_model"] == design["execution"]["fill_model"]
+        assert env.unwrapped.config["fill_model"]["min_queue_ms"] == 0
         if arm in run_market.WINDOWED:
             assert env.observation_space.shape == (run_market.layout(design).size,)
             model = run_market.model_of(design, base, arm, env, seed=1)
