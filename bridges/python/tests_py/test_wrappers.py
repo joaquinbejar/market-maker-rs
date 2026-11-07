@@ -133,3 +133,21 @@ def test_an_interval_is_the_decision_then_direct_holds_on_a_walk():
     assert held_fills > 0
     direct.close()
     wrapped.close()
+
+
+def test_an_interval_holds_a_residual_policys_orders_between_its_decisions():
+    from mm_rl_bridge import ResidualMarketMakingEnv
+    from test_residual import residual_config
+
+    env = DecisionInterval(ResidualMarketMakingEnv(residual_config(), walk()), 4)
+    env.reset(seed=2)
+    zero = np.zeros(4, dtype=np.float32)
+    placed = 0
+    for _ in range(30):
+        _, _, terminated, truncated, info = env.step(zero)
+        placed += info["orders"]["accepted"]
+        assert info["rows"] == 4 or terminated or truncated
+        if terminated or truncated:
+            break
+    assert placed > 0
+    env.close()

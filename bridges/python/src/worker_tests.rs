@@ -494,7 +494,7 @@ fn test_worker_refuses_the_wrong_kind_of_action_and_ends() {
     let mut residual = Worker::spawn(residual_config(AVELLANEDA), long_rows(), None).unwrap();
     residual.reset(1).unwrap();
     assert!(matches!(
-        residual.step(RlAction::Hold),
+        residual.step(quote(0, 0, 1, 0)),
         Err(BridgeError::Failed(_))
     ));
     assert_eq!(residual.reset(1).unwrap_err(), BridgeError::Closed);
@@ -618,4 +618,66 @@ fn test_worker_counts_the_order_reports_of_each_step() {
     );
     // A hold sends nothing; the close at the end is not an order.
     assert_eq!(worker.step(RlAction::Hold).unwrap().orders, counts(0, 0, 0));
+}
+
+#[test]
+fn test_worker_residual_hold_keeps_the_orders_and_equals_the_inner_hold() {
+    let bridge = residual_config(AVELLANEDA);
+    let kernel = bridge.kernel().unwrap();
+    let rows: Vec<KernelTick> = (0..40_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let d = |text: &str| Decimal::from_str(text).unwrap();
+    let source = AvellanedaQuoter {
+        risk_aversion: d("0.1"),
+        volatility: d("0.2"),
+        order_intensity: d("1.5"),
+        session_start_ms: 0,
+        horizon_ms: 100_000,
+        size: d("1"),
+    };
+    let bounds = ResidualBounds {
+        price_ticks: 4,
+        size_lots: 1,
+    };
+    let zero = ResidualProposal {
+        bid_away: 0.0,
+        ask_away: 0.0,
+        bid_size: 0.0,
+        ask_size: 0.0,
+    };
+    let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
+        ResidualEnv::new(&kernel, &data, source, d("1"), bounds, bridge.rl().unwrap()).unwrap();
+    let mut state = env.reset(1).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    worker.reset(1).unwrap();
+    let mut held_while_resting = 0;
+    for step in 0..39 {
+        let (through, direct) = if step % 3 == 0 {
+            let step = env.step(&mut state, zero).unwrap();
+            (worker.step_residual(zero).unwrap(), step.transition)
+        } else {
+            let resting = state.kernel().queue_lengths().orders > 0;
+            let reply = worker.step(RlAction::Hold).unwrap();
+            // A hold sends nothing: no order placed or canceled.
+            assert_eq!((reply.orders.accepted, reply.orders.canceled), (0, 0));
+            assert!(reply.decision.is_none());
+            held_while_resting += u32::from(resting);
+            let direct = env.env().step(&mut state, RlAction::Hold).unwrap();
+            (reply, direct)
+        };
+        assert_eq!(through.transition, direct, "step {step}");
+        assert_eq!(through.net, state.net());
+    }
+    assert!(held_while_resting > 0, "no hold with orders resting");
 }

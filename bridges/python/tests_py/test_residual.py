@@ -123,8 +123,9 @@ def test_a_grid_action_is_not_a_residual_and_ends_the_environment():
     env.reset(seed=1)
     with pytest.raises(ValueError, match="4 values"):
         env.step(np.zeros(5))
+    # A hold is allowed (a decision interval holds between decisions); a quote is not.
     with pytest.raises(BridgeFailure, match="grid action"):
-        env._native.step_hold()
+        env._native.step_quote(0, 0, 1, 0)
     with pytest.raises(BridgeFailure, match="closed"):
         env.step(np.zeros(4))
 
