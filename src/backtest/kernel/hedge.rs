@@ -2,7 +2,7 @@
 
 use crate::Decimal;
 use crate::risk::RiskLimits;
-use crate::types::action::Dir;
+use crate::types::action::{Action, Dir};
 use crate::types::error::{MMError, MMResult};
 
 use super::FinancialKernel;
@@ -317,6 +317,48 @@ fn funding_scales(fs: u32, rate_s: u32) -> (u32, u32) {
         Some(up) => (up, 0),
         None => (0, rate_s.saturating_sub(fs)),
     }
+}
+
+/// A money event of the hedge lane, as [`EventSink::hedge`] receives it
+/// (#266), in the lane's order: at one time, funding, then the row, then an
+/// order's execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HedgeEvent {
+    /// A hedge row ran: the lane's mark is now its mid.
+    Row {
+        /// Row index in the hedge data.
+        row: u64,
+        /// Row time, in nanoseconds.
+        ts_ns: u64,
+        /// `bid + ask` in ticks, the mid in half ticks; `None` when not
+        /// positive, which leaves the lane without a mark.
+        mid2: Option<u64>,
+    },
+    /// A fill booked in the lane's venue ledger.
+    Fill {
+        /// Execution time, in nanoseconds.
+        ts_ns: u64,
+        /// Our side: [`Action::Buy`] or [`Action::Sell`].
+        side: Action,
+        /// Fill price, in ticks.
+        price: u64,
+        /// Size, in lots.
+        lots: u64,
+        /// Fee, in money units of [`HedgedKernel::lane_money_scale`];
+        /// negative for a rebate.
+        fee_u: i128,
+    },
+    /// A funding payment booked at the lane's mark.
+    Funding {
+        /// Payment time, in nanoseconds.
+        at_ns: u64,
+        /// Received, in money units of [`HedgedKernel::lane_money_scale`];
+        /// negative when paid.
+        received_u: i128,
+        /// The mark it was valued at, in half ticks.
+        mid2: u64,
+    },
 }
 
 /// How a hedge order ended at the venue.
@@ -917,7 +959,8 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         self.reset_with(seed, &mut NoSink)
     }
 
-    /// As [`HedgedKernel::reset`], sending the quoted lane's events to `sink`.
+    /// As [`HedgedKernel::reset`], sending the quoted lane's events to `sink`, and the
+    /// hedge lane's money events to [`EventSink::hedge`].
     pub fn reset_with<E: EventSink>(
         &self,
         seed: u64,
@@ -964,7 +1007,8 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         self.step_with(s, action, &mut NoSink)
     }
 
-    /// As [`HedgedKernel::step`], sending the quoted lane's events to `sink`.
+    /// As [`HedgedKernel::step`], sending the quoted lane's events to `sink`, and the
+    /// hedge lane's money events to [`EventSink::hedge`].
     pub fn step_with<E: EventSink>(
         &self,
         s: &mut HedgedState<ORD, MSG, DLV, OBS>,
@@ -1244,7 +1288,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         }
         let now = k.now_ns();
         let running = k.status().is_running();
-        if let Err(reason) = self.run_lane(l, now, !running) {
+        if let Err(reason) = self.run_lane(l, now, !running, em) {
             if k.status().is_running() {
                 step::halt(k, reason, em);
             }
@@ -1286,17 +1330,28 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
             .filter(|(t, _)| if inclusive { *t <= until } else { *t < until })
     }
 
-    fn run_lane(&self, lane: &mut HedgeLane, until: u64, inclusive: bool) -> Result<(), Halt> {
+    fn run_lane<E: EventSink>(
+        &self,
+        lane: &mut HedgeLane,
+        until: u64,
+        inclusive: bool,
+        sink: &mut E,
+    ) -> Result<(), Halt> {
         while let Some((at, event)) = self.next_event(lane, until, inclusive) {
             match event {
-                LaneEvent::Funding => self.fund(lane, at)?,
+                LaneEvent::Funding => self.fund(lane, at, sink)?,
                 LaneEvent::Row => {
                     let tick = self.hedge.row(lane.row).ok_or(Halt::CounterOverflow)?;
                     lane.gate.mark2 = tick.mid2().filter(|m| *m > 0);
                     lane.last_row = Some(lane.row);
+                    sink.hedge(HedgeEvent::Row {
+                        row: lane.row,
+                        ts_ns: tick.ts_ns,
+                        mid2: lane.gate.mark2,
+                    });
                     lane.row = lane.row.checked_add(1).ok_or(Halt::CounterOverflow)?;
                 }
-                LaneEvent::Execute => self.execute(lane, at)?,
+                LaneEvent::Execute => self.execute(lane, at, sink)?,
                 LaneEvent::Deliver => self.deliver(lane)?,
             }
         }
@@ -1307,7 +1362,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         lane.last_row.and_then(|r| self.hedge.row(r)).copied()
     }
 
-    fn fund(&self, lane: &mut HedgeLane, at: u64) -> Result<(), Halt> {
+    fn fund<E: EventSink>(&self, lane: &mut HedgeLane, at: u64, sink: &mut E) -> Result<(), Halt> {
         let index = usize::try_from(lane.funding).map_err(|_| Halt::CounterOverflow)?;
         let funding = *self.lane.funding.get(index).ok_or(Halt::CounterOverflow)?;
         lane.funding = lane.funding.checked_add(1).ok_or(Halt::CounterOverflow)?;
@@ -1362,10 +1417,21 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
             .checked_sub(shadow)
             .ok_or(Halt::LedgerOverflow)?;
         lane.counters.funding_paid = lane.counters.funding_paid.saturating_add(1);
-        self.check_ledger(lane)
+        self.check_ledger(lane)?;
+        sink.hedge(HedgeEvent::Funding {
+            at_ns: at,
+            received_u: paid.checked_neg().ok_or(Halt::LedgerOverflow)?,
+            mid2,
+        });
+        Ok(())
     }
 
-    fn execute(&self, lane: &mut HedgeLane, at: u64) -> Result<(), Halt> {
+    fn execute<E: EventSink>(
+        &self,
+        lane: &mut HedgeLane,
+        at: u64,
+        sink: &mut E,
+    ) -> Result<(), Halt> {
         let order = lane.order.take().ok_or(Halt::CounterOverflow)?;
         let latency = self.lane.inst.latency;
         let jitter = lane.rng.draw(latency.jitter_q);
@@ -1413,7 +1479,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
             HedgeFill::NoLots => c.no_lots = c.no_lots.saturating_add(1),
         }
         if filled > 0 {
-            self.book_fill(lane, order.dir, price, filled, at)?;
+            self.book_fill(lane, order.dir, price, filled, at, sink)?;
         }
         lane.report = Some(HedgeReport {
             id: order.id,
@@ -1426,13 +1492,14 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         Ok(())
     }
 
-    fn book_fill(
+    fn book_fill<E: EventSink>(
         &self,
         lane: &mut HedgeLane,
         dir: Dir,
         price: u64,
         lots: u64,
         at: u64,
+        sink: &mut E,
     ) -> Result<(), Halt> {
         let inst = &self.lane.inst;
         let notional = inst.notional_u(price, lots).ok_or(Halt::LedgerOverflow)?;
@@ -1461,7 +1528,15 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         lane.venue
             .update_fill(lots_d, price_d, at / NS_PER_MS)
             .ok_or(Halt::LedgerOverflow)?;
-        self.check_ledger(lane)
+        self.check_ledger(lane)?;
+        sink.hedge(HedgeEvent::Fill {
+            ts_ns: at,
+            side: Action::from(dir),
+            price,
+            lots,
+            fee_u: fee,
+        });
+        Ok(())
     }
 
     fn deliver(&self, lane: &mut HedgeLane) -> Result<(), Halt> {

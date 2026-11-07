@@ -15,7 +15,8 @@ include = [
     "benches/**/*",
     "src/**/*",
     "Cargo.toml",
-    "README.md",
+    "/README.md",
+    "examples/README.md",
     "LICENSE",
     "examples/**/*.rs",
     "tests/**/*.rs",
@@ -130,6 +131,11 @@ test = true
 
 [[example]]
 name = "consistent_time_travel"
+test = true
+
+[[example]]
+name = "time_travel_queues"
+required-features = ["serde"]
 test = true
 
 [[example]]
