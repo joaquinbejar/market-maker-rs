@@ -39,6 +39,19 @@ project follows [Semantic Versioning](https://semver.org/).
   hedge, binned over the sizes, a hedge outside the mask being a charged hold. A hedge replaces
   the resting orders, so the other values are then not read. A residual environment refuses the
   flag, and a checkpoint loads only into an environment with the same one.
+- A hedge lane in a second instrument for the kernel (feature `kernel`, #256): `HedgedKernel`
+  runs a `FinancialKernel` on the quoted instrument with a hedge lane on a spot or linear
+  perpetual on the same underlying, with its own grid, fees, limits and data
+  (`HedgeLaneConfig`). `HedgedAction::Hedge` sends an immediate-or-cancel order at the observed
+  hedge touch, one at a time; after the submission delay it fills at the touch standing then, up
+  to its lots, and is cancelled if the touch moved through its limit or the lane went stale. A
+  perpetual pays a declared funding schedule on the venue position at the last mid before each
+  payment, rounded half to even. `CombinedLimits` bound the net exposure and the gross notional
+  of both lanes, live orders filled at worst, for every order of either lane, apart from the
+  policy and its masks. The lanes meet only at decisions, so the hedge lane runs to each decision
+  time in order; at equal times the quoted lane comes first. The lane's integers are checked
+  against a `Decimal` shadow; no engine runs two instruments, so it is checked by hand-computed
+  fixtures, and the quoted lane alone is unchanged. Synthetic data only.
 - Hedge actions in the RL action space (feature `rl`, #247): with
   `RlConfig::with_hedge_actions`, `rl::RlAction::Hedge` reduces the delivered position with a
   marketable limit order at the observed touch, of a size from the order size grid and never
