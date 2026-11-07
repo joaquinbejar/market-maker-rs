@@ -9,11 +9,12 @@
 
 use std::sync::Arc;
 
-use market_maker_rs::backtest::kernel::KernelFillModel;
+use market_maker_rs::backtest::kernel::{KernelFillModel, quote_error_code};
 use market_maker_rs::rl::{
     ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, OBSERVATION_SPACE_VERSION,
     REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv,
 };
+use market_maker_rs::types::error::MMError;
 
 use super::*;
 
@@ -574,4 +575,67 @@ fn test_baselines_parse_to_what_they_state() {
             session_start_ms: 0,
         })
     );
+}
+
+#[test]
+fn test_a_strategy_error_is_reported_as_what_it_is() {
+    // GLFT over a day, with a large inventory bound: the exact quote needs more steps of the
+    // matrix exponential than it allows, so the strategy fails with a NumericalError.
+    let baseline = r#"{"kind": "glft", "risk_aversion": "0.001", "order_intensity_k": "50",
+        "intensity_scale_a": "1.5", "max_inventory_lots": 5, "terminal_time": 86400000,
+        "min_spread": "0", "volatility": "50", "session_start_ms": 0}"#;
+    let mut worker = Worker::spawn(residual_config(baseline), long_rows(), None).unwrap();
+    worker.reset(1).unwrap();
+    let proposal = ResidualProposal {
+        bid_away: 0.0,
+        ask_away: 0.0,
+        bid_size: 0.0,
+        ask_size: 0.0,
+    };
+    let reply = worker.step_residual(proposal).unwrap();
+    let code = quote_error_code(&MMError::NumericalError(String::new()));
+    assert_eq!(
+        reply.transition.action_status,
+        ActionStatus::QuoteError(code)
+    );
+    assert_eq!(
+        refused_because(reply.transition.action_status).as_deref(),
+        Some("strategy error: NumericalError (code 3)")
+    );
+}
+
+#[test]
+fn test_refusals_and_quote_errors_name_their_cause() {
+    use market_maker_rs::backtest::kernel::{
+        ERR_KERNEL_MISMATCH, ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, ErrCode, RejectReason,
+    };
+    use market_maker_rs::rl::ERR_ACTION_OFF_GRID;
+    assert_eq!(refused_because(ActionStatus::Applied), None);
+    assert_eq!(
+        refused_because(ActionStatus::Rejected(RejectReason::SizeRange)).as_deref(),
+        Some("SizeRange")
+    );
+    let quote = |code: ErrCode| refused_because(ActionStatus::QuoteError(code)).unwrap();
+    assert_eq!(quote(ERR_ACTION_OFF_GRID), "off grid (code 200)");
+    assert_eq!(
+        quote(ERR_PRICE_OUT_OF_RANGE),
+        "strategy quote price out of range (code 100)"
+    );
+    assert_eq!(
+        quote(ERR_SIZE_OUT_OF_RANGE),
+        "strategy quote size out of range (code 101)"
+    );
+    assert_eq!(
+        quote(ERR_KERNEL_MISMATCH),
+        "strategy quote for another kernel (code 102)"
+    );
+    assert_eq!(
+        quote(ErrCode(5)),
+        "strategy error: InvalidQuoteGeneration (code 5)"
+    );
+    assert_eq!(quote(ErrCode(999)), "quote error (code 999)");
+    // No strategy error reads as off grid.
+    for code in 1..=15 {
+        assert!(quote(ErrCode(code)).starts_with("strategy error: "));
+    }
 }
