@@ -50,6 +50,9 @@ def test_a_quote_is_projected_from_the_observed_mid_onto_the_nearest_offsets():
     # An even mid: both sides measure from it.
     assert offsets_of(run.teacher_target(quote(199, 201), (0, 199, 5, 201, 5), GRID, None)) \
         == (1, 1, 1, 1)
+    # The teacher's own duration, when given.
+    assert run.teacher_target(quote(198, 205), ODD, GRID, DURATIONS, duration=10)[5] == \
+        run.bin_centre(DURATIONS.index(10), len(DURATIONS))
     # Without a duration the target has the Box's five values.
     assert len(run.teacher_target(quote(198, 205), ODD, GRID, None)) == 5
 
@@ -247,9 +250,9 @@ def test_teacher_samples_are_the_classical_decisions_until_the_budget(one_day, m
         volatilities.append(point["volatility"])
         return baseline(kind, point, day)
 
-    def teacher_target(classical, row, grid, durations, notes=None):
+    def teacher_target(classical, row, grid, durations, notes=None, duration=None):
         projected.append((classical, row))
-        return project(classical, row, grid, durations, notes)
+        return project(classical, row, grid, durations, notes, duration)
 
     monkeypatch.setattr(run, "baseline_config", baseline_config)
     monkeypatch.setattr(run, "teacher_target", teacher_target)
@@ -264,6 +267,10 @@ def test_teacher_samples_are_the_classical_decisions_until_the_budget(one_day, m
     assert len(reads) >= 3 and all(split == "train" for *_, split in reads)
     assert all(len(o) == 23 and o[-1] == 0.25 for o in observations)
     assert all(len(t) == 6 for t in targets) and any(t[0] > 0 for t in targets)
+    every = DESIGN["runner_choices"]["teacher"]["every_rows"]
+    assert every == 10 and all(t[5] == run.bin_centre(DURATIONS.index(every), len(DURATIONS))
+                               for t in targets)
+    assert notes["fills"] >= 0 and set(notes) == {*run.PROJECTION_NOTES, "fills"}
     # The same seed draws the same days and decisions.
     assert notes["quotes"] + notes["holds"] == 130 and notes["quotes"] > 0
     # Each day's point has its regime's volatility.
@@ -276,17 +283,21 @@ def test_teacher_samples_are_the_classical_decisions_until_the_budget(one_day, m
     cfg["residual"] = {"baseline": baseline("avellaneda_stoikov",
                                             point | {"volatility": sigmas[regime]}, day),
                        "price_ticks": 4, "size_lots": 1, "default_order_size": "1"}
-    direct = run.ResidualMarketMakingEnv(cfg, walk_on(day))
+    inner = run.ResidualMarketMakingEnv(cfg, walk_on(day))
+    direct = run.DecisionInterval(inner, every)
     _, info = direct.reset(seed=int(rng.integers(2**31)))
-    for k in range(20):
+    for k in range(4):
         observed = walk_on(day)[info["row"]]
         *_, info = direct.step([0.0, 0.0, 0.0, 0.0])
         assert projected[k] == (info["residual"]["classical"], observed)
+        assert info["rows"] == every
     direct.close()
     projected.clear()
     assert run.teacher_samples(job) == (observations, targets, notes)
     loud = run.teacher_samples(job | {"predictor": {"coefficients": [0.0] * 22 + [3.0]}})
     assert all(o[-1] == 1.0 for o in loud[0])
+    flat = run.teacher_samples(job | {"arm": "no_duration"})
+    assert all(len(t) == 5 for t in flat[1]) and [t[:5] for t in targets] == flat[1]
     plain = run.teacher_samples(job | {"arm": "no_predictor"})
     assert all(len(o) == 22 for o in plain[0])
     assert plain[1] == targets and [o[:22] for o in observations] == plain[0]
@@ -327,7 +338,8 @@ def stubbed(monkeypatch):
 
     def pool(jobs, worker, parallel, label):
         holder["pools"].append((worker.__name__, len(jobs)))
-        return [job | {"daily_value": str(holder["ctx"].values(job))} for job in jobs]
+        return [job | {"daily_value": str(holder["ctx"].values(job)),
+                       "episodes": [{"attribution": {"fills": 1}}]} for job in jobs]
 
     monkeypatch.setattr(run, "pool", pool)
     return holder
@@ -352,7 +364,9 @@ def test_the_fee_rule_compares_points_over_every_regime_and_at_the_shortest_late
     assert report["fee"] == "0" and report["profitable"]
     assert report["teacher_point"] == {"horizon_ms": 7200000, "order_intensity": "100",
                                        "risk_aversion": "0.001", "size": "1"}
-    assert {(r["latency"], r["every"], r["split"]) for r in report["rows"]} == {("25", 1, "train")}
+    assert {(r["latency"], r["every"], r["split"]) for r in report["rows"]} == {("25", 10, "train")}
+    # One fill per stubbed day: the chosen point's days at the chosen fee, every regime.
+    assert report["teacher_point_fills"] == len(ctx.regimes) * len(run.days_of(DESIGN, "train"))
     assert {r["day"] for r in report["rows"]} == set(run.days_of(DESIGN, "train"))
     ctx = Ctx(tmp_path, lambda job: 0)
     stubbed["ctx"] = ctx
@@ -385,12 +399,13 @@ def test_the_teacher_and_training_cover_their_arms_latencies_and_seeds(tmp_path,
     def pool(jobs, worker, parallel, label):
         seen[label] = jobs
         if label == "teacher":
-            return [{k: j[k] for k in ("arm", "latency", "seed")} | {"path": j["path"]}
-                    for j in jobs]
+            return [{k: j[k] for k in ("arm", "latency", "seed")}
+                    | {"path": j["path"], "projection": {"fills": 3}} for j in jobs]
         return [{"arm": j["arm"]} for j in jobs]
 
     monkeypatch.setattr(run, "pool", pool)
-    fee_report = {"fee": "0", "teacher_point": {"order_intensity": "100"}}
+    fee_report = {"fee": "0", "teacher_point": {"order_intensity": "100"},
+                  "teacher_point_fills": 5}
     predictor = {"coefficients": [0.0] * 23}
     taught = run.teacher(ctx, fee_report, predictor)
     seeds = DESIGN["training_seeds"]
@@ -401,6 +416,12 @@ def test_the_teacher_and_training_cover_their_arms_latencies_and_seeds(tmp_path,
     assert all(j["point"] == {"order_intensity": "100"} and j["sigmas"] == ctx.sigmas
                and j["decisions"] == DESIGN["runner_choices"]["teacher"]["decisions"]
                for j in seen["teacher"])
+    with pytest.raises(ValueError, match="does not fill"):
+        run.teacher(ctx, fee_report | {"teacher_point_fills": 0}, predictor)
+    starved = dict(taught, samples=[s | {"projection": {"fills": 0}} if i == 1 else s
+                                    for i, s in enumerate(taught["samples"])])
+    with pytest.raises(ValueError, match="never filled"):
+        run.training(ctx, "0", predictor, starved)
     run.training(ctx, "0", predictor, taught)
     jobs = seen["training"]
     assert len(jobs) == len(run.LEARNED) * len(ctx.latencies) * len(seeds)
@@ -419,6 +440,8 @@ def test_the_teacher_and_training_cover_their_arms_latencies_and_seeds(tmp_path,
 def frozen_run(tmp_path):
     zipped = tmp_path / "full-25-seed1.zip"
     zipped.write_bytes(b"weights")
+    flat = tmp_path / "no_duration-25-seed1.zip"
+    flat.write_bytes(b"other weights")
     samples = tmp_path / "teacher" / "full-25-seed1.json"
     samples.parent.mkdir(exist_ok=True)
     samples.write_text("{}")
@@ -434,7 +457,9 @@ def frozen_run(tmp_path):
         {"path": str(samples), "sha256": run.sha256(samples)}]}))
     (tmp_path / "training.json").write_text(json.dumps({"runs": [
         {"arm": "full", "latency": "25", "seed": 1, "predictor": {"coefficients": [0.5]},
-         "path": str(zipped.with_suffix("")), "checkpoint_sha256": run.sha256(zipped)}]}))
+         "path": str(zipped.with_suffix("")), "checkpoint_sha256": run.sha256(zipped)},
+        {"arm": "no_duration", "latency": "25", "seed": 1, "predictor": {"coefficients": [0.5]},
+         "path": str(flat.with_suffix("")), "checkpoint_sha256": run.sha256(flat)}]}))
     return zipped, samples
 
 
@@ -442,7 +467,7 @@ def test_the_freeze_refuses_a_changed_checkpoint_or_teacher_sample(tmp_path):
     zipped, samples = frozen_run(tmp_path)
     ctx = Ctx(tmp_path, None)
     manifest = run.freeze(ctx)
-    assert manifest["runs"] == 1
+    assert manifest["runs"] == 2
     frozen = json.loads((tmp_path / "frozen.json").read_text())
     assert frozen["code_sha256"] == run.sha256(run.HERE / "run.py")
     assert frozen["base_code_sha256"] == run.sha256(run.HERE.parent / "m4_06" / "run.py")
@@ -482,8 +507,12 @@ def test_the_holdout_runs_once_from_its_manifest_at_both_fees(tmp_path, stubbed)
     rows = report["rows"]
     assert {r["split"] for r in rows} == {"holdout"}
     for fee in report["fees"]:
-        assert {r["arm"] for r in rows if r["fee"] == fee} == {"no_trade", "avellaneda_stoikov",
-                                                               "full"}
+        assert {r["arm"] for r in rows if r["fee"] == fee and r.get("fill", "queue") == "queue"} == {
+            "no_trade", "avellaneda_stoikov", "full", "no_duration"}
+    # Descriptive: the arm without a duration under immediate fill, at the chosen fee only.
+    immediate = [r for r in rows if r.get("fill") == "immediate"]
+    assert {(r["arm"], r["fee"]) for r in immediate} == {("no_duration", "0")}
+    assert len(immediate) == len(ctx.regimes) * len(run.days_of(DESIGN, "holdout"))
     # Only the chosen point, at each regime, latency and interval.
     classical = [r for r in rows if r["arm"] == "avellaneda_stoikov"]
     assert len(classical) == 2 * 2 * 2 * 2 * len(run.days_of(DESIGN, "holdout"))
@@ -524,6 +553,7 @@ def test_an_evaluated_day_counts_its_durations_rows_and_orders_per_hour():
     day = run.episode(Policy(), env, 1, DESIGN, rows)
     env.close()
     assert day["durations"]["5"] == 1 and day["durations"]["1"] == day["decisions"] - 1
+    assert day["holds_per_decision"] == (day["decisions"] - 1) / day["decisions"]
     assert day["rows"] == day["decisions"] + 4
     hours = day["rows"] * DESIGN["simulator"]["sample_ms"] / 3_600_000
     assert float(day["per_hour"]["accepted"]) == pytest.approx(day["orders"]["accepted"] / hours,
@@ -539,6 +569,7 @@ def test_an_evaluated_day_counts_its_durations_rows_and_orders_per_hour():
     day = run.episode(run.Constant(run.HOLD), plain, 1, DESIGN, rows)
     plain.close()
     assert day["rows"] == day["decisions"] and day["durations"] == {"1": day["decisions"]}
+    assert day["holds_per_decision"] == 1.0
 
 
 def test_each_latency_has_its_own_delays():
@@ -562,7 +593,7 @@ def test_a_day_is_evaluated_on_its_own_rows_and_only_the_holdout_step_reads_the_
            "day": 20, "split": "holdout", "candidate": "hold", "policy": {"kind": "hold"},
            "point": None, "data_dir": "x"}
     row = run.evaluate_job(job)
-    assert set(allowed) == {("holdout", True)}
+    assert set(allowed) == {("holdout", True)} and row["fill"] == "queue"
     assert row["daily_value"] == "0" and row["latency"] == "25" and row["every"] == 10
     day = row["episodes"][0]
     assert day["durations"]["10"] >= 1 and sum(day["durations"].values()) == day["decisions"]
@@ -598,6 +629,13 @@ def test_a_frozen_checkpoint_loads_only_where_it_was_trained(tmp_path):
     wider.close()
     with pytest.raises(ValueError, match="changed after training"):
         run.load_frozen(metadata | {"checkpoint_sha256": "0" * 64}, env)
+    # Under immediate fill only when the caller allows that one difference.
+    instant = BoxMarketMakingEnv(run.config(DESIGN, "0", "25") | {"fill_model": run.IMMEDIATE},
+                                 walk(40, spacing_ms=100))
+    with pytest.raises(ValueError, match="another configuration"):
+        run.load_frozen(metadata, instant)
+    assert run.load_frozen(metadata, instant, ("fill_model",)) is not None
+    instant.close()
     for e in (env, other_fee, later):
         e.close()
 
@@ -613,5 +651,34 @@ def test_a_learned_arm_decides_through_its_own_wrappers(one_day):
                                          "size": "1", "horizon_ms": 7200000,
                                          "volatility": "0.5"}}, {}, "calm", 1, "train")
     assert isinstance(env, run.DecisionInterval) and env.every == 10
+    assert env.unwrapped.config["fill_model"] == DESIGN["execution"]["fill_model"]
+    env.close()
+    env = run.build_env(job | {"fill": "immediate"}, {}, "calm", 1, "train")
+    assert env.unwrapped.config["fill_model"] == run.IMMEDIATE
     env.close()
 
+
+
+def test_the_teacher_log_counts_its_rollouts_fills(monkeypatch):
+    # Rows 100 ms apart, as the experiment's: a quote resting 10 rows clears a lot.
+    def rows_on(day):
+        shift = (day - 1) * 86_400_000 * 1_000_000
+        return [(ts + shift, *rest) for ts, *rest in walk(300, spacing_ms=100)]
+
+    digests = {}
+
+    def read_rows(data_dir, digests_, regime, day, split, holdout_allowed=False):
+        if day not in digests:
+            probe = BoxMarketMakingEnv(run.config(DESIGN, "0", "25"), rows_on(day))
+            digests[day] = {"dataset_digest": probe.bridge_info["dataset_digest"]}
+            probe.close()
+        return rows_on(day), digests[day]
+
+    monkeypatch.setattr(run, "read_rows", read_rows)
+    sigmas = dict.fromkeys(run.regimes_of(DESIGN), "0.5")
+    point = {"risk_aversion": "0.01", "order_intensity": "50", "size": "1",
+             "horizon_ms": 7200000}
+    job = {"arm": "no_predictor", "latency": "25", "seed": 2, "fee": "0", "point": point,
+           "sigmas": sigmas, "decisions": 60, "data_dir": "x", "predictor": None}
+    _, _, notes = run.teacher_samples(job)
+    assert notes["fills"] > 0

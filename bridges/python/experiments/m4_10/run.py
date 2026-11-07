@@ -60,6 +60,7 @@ HOLD = [-1.0, 0.0, 0.0, 0.0, 0.0]
 CLASSICAL_INTERVALS = (1, 10)
 MARKOUT_MS = (1000, 5000, 30000)
 FORECAST_ROWS = 5
+IMMEDIATE = {"kind": "immediate"}
 
 
 def load_design():
@@ -133,6 +134,8 @@ def build_env(job, digests, regime, day, split, holdout_allowed=False):
     design, _ = load_design()
     rows, record = read_rows(job["data_dir"], digests, regime, day, split, holdout_allowed)
     cfg = config(design, job["fee"], job["latency"])
+    if job.get("fill") == "immediate":
+        cfg["fill_model"] = IMMEDIATE
     if job["arm"] in CLASSICAL:
         cfg["residual"] = {"baseline": baseline_config(job["arm"], job["point"], day),
                            "price_ticks": 4, "size_lots": 1, "default_order_size": "1"}
@@ -166,10 +169,10 @@ PROJECTION_NOTES = ("quotes", "holds", "one_sided", "inside_mid", "beyond_grid",
                     "error_ticks")
 
 
-def teacher_target(classical, row, grid, durations, notes=None):
+def teacher_target(classical, row, grid, durations, notes=None, duration=None):
     """The Box action, at its bins' centres, nearest the classical action on the grid: offsets
     from the observed row's mid clamped to the grid, sizes to the nearest, a missing side at
-    the farthest offset and the smallest size, and the shortest duration.
+    the farthest offset and the smallest size, and `duration` (the shortest when None).
 
     `notes`, when given, counts what the projection did: quotes and holds, one-sided quotes
     whose missing side it made live, sides inside the mid clamped to 0, sides beyond the
@@ -209,7 +212,8 @@ def teacher_target(classical, row, grid, durations, notes=None):
         target = [0.5, bin_centre(bid, len(offsets)), bin_centre(ask, len(offsets)),
                   bin_centre(bid_size, len(sizes)), bin_centre(ask_size, len(sizes))]
     if durations is not None:
-        target.append(bin_centre(0, len(durations)))
+        chosen = durations.index(duration) if duration is not None else 0
+        target.append(bin_centre(chosen, len(durations)))
     return target
 
 
@@ -268,10 +272,11 @@ def teacher_samples(job):
         else None
     coefficients = (np.asarray(job["predictor"]["coefficients"])
                     if arm_shape(design, job["arm"])["predictor"] else None)
+    every = design["runner_choices"]["teacher"]["every_rows"]
     rng = np.random.default_rng(job["seed"])
     days = [(regime, day) for regime in regimes_of(design) for day in days_of(design, "train")]
     observations, targets = [], []
-    notes = dict.fromkeys(PROJECTION_NOTES, 0)
+    notes = dict.fromkeys(PROJECTION_NOTES, 0) | {"fills": 0}
     while len(targets) < job["decisions"]:
         regime, day = days[int(rng.integers(len(days)))]
         rows, record = read_rows(job["data_dir"], digests, regime, day, "train")
@@ -279,9 +284,10 @@ def teacher_samples(job):
         point = job["point"] | {"volatility": job["sigmas"][regime]}
         cfg["residual"] = {"baseline": baseline_config("avellaneda_stoikov", point, day),
                            "price_ticks": 4, "size_lots": 1, "default_order_size": "1"}
-        env = ResidualMarketMakingEnv(cfg, rows)
+        inner = ResidualMarketMakingEnv(cfg, rows)
+        env = DecisionInterval(inner, every)
         try:
-            if env.bridge_info["dataset_digest"] != record["dataset_digest"]:
+            if inner.bridge_info["dataset_digest"] != record["dataset_digest"]:
                 raise ValueError("other rows than digests.json")
             observation, info = env.reset(seed=int(rng.integers(2**31)))
             while len(targets) < job["decisions"]:
@@ -293,10 +299,12 @@ def teacher_samples(job):
                     forecast = float(np.dot(coefficients[:-1], value) + coefficients[-1])
                     value = np.append(value, min(max(forecast, -1.0), 1.0))
                 observations.append(value.tolist())
-                targets.append(teacher_target(classical, observed, grid, durations, notes))
+                targets.append(teacher_target(classical, observed, grid, durations, notes,
+                                              every if durations is not None else None))
                 observation, info = step[0], step[4]
                 if step[2] or step[3]:
                     break
+            notes["fills"] += inner.attribution()["fills"]
         finally:
             env.close()
     return observations, targets, notes
@@ -373,16 +381,17 @@ def train_job(job):
     return metadata
 
 
-def load_frozen(metadata, env):
+def load_frozen(metadata, env, also=()):
     """A trained policy, after checking that it is the one trained and that the environment
-    is the one it was trained for, but for its fee and its day."""
+    is the one it was trained for, but for its fee, its day and the keys in `also`."""
     path = pathlib.Path(metadata["path"])
     if sha256(path.with_suffix(".zip")) != metadata["checkpoint_sha256"]:
         raise ValueError("a checkpoint changed after training")
     if tuple(metadata["spec"]) != env.unwrapped.spec_id:
         raise ValueError("a checkpoint of another specification")
-    same = {k: v for k, v in metadata["config"].items() if k != "fee_rate"}
-    if same != {k: v for k, v in env.unwrapped.config.items() if k != "fee_rate"}:
+    free = {"fee_rate", *also}
+    same = {k: v for k, v in metadata["config"].items() if k not in free}
+    if same != {k: v for k, v in env.unwrapped.config.items() if k not in free}:
         raise ValueError("a checkpoint of another configuration")
     model = PPO.load(path.with_suffix(".zip"), device="cpu")
     model.policy.set_training_mode(False)
@@ -395,7 +404,9 @@ def policy_of(job, env):
         return Constant(HOLD)
     if kind == "zero_residual":
         return ZeroResidual()
-    return load_frozen(job["policy"]["metadata"], env)
+    # The descriptive rows under immediate fill load the checkpoints trained under the queue.
+    also = ("fill_model",) if job.get("fill") == "immediate" else ()
+    return load_frozen(job["policy"]["metadata"], env, also)
 
 
 def markouts(positions, rows, horizons=MARKOUT_MS):
@@ -426,7 +437,7 @@ def episode(policy, env, seed, design, rows):
     """One evaluated day."""
     observation, _ = env.reset(seed=seed)
     orders = dict.fromkeys(ORDER_KINDS, 0)
-    decisions = quotes = refusals = covered = 0
+    decisions = quotes = refusals = covered = holds = 0
     durations = {}
     decide_seconds = 0.0
     while True:
@@ -437,7 +448,9 @@ def episode(policy, env, seed, design, rows):
         decisions += 1
         # A plain Box decides every row.
         covered += info.get("rows", 1)
-        quotes += applied_kind(info) != "hold"
+        kind = applied_kind(info)
+        quotes += kind != "hold"
+        holds += kind == "hold"
         refusals += info["refused_because"] is not None
         duration = info.get("duration", info.get("rows", 1))
         durations[str(duration)] = durations.get(str(duration), 0) + 1
@@ -455,6 +468,7 @@ def episode(policy, env, seed, design, rows):
     return {
         "seed": seed, "decisions": decisions, "rows": covered, "quote_transactions": quotes,
         "refusals": refusals, "orders": orders, "net": info["net"], "durations": durations,
+        "holds_per_decision": holds / decisions,
         "per_hour": {kind: str((Decimal(orders[kind]) / hours).quantize(Decimal("0.0001")))
                      for kind in ORDER_KINDS},
         "markouts_ticks": markouts(in_ticks, rows),
@@ -482,7 +496,7 @@ def evaluate_job(job):
         env.close()
     nets = [Decimal(d["net"]) for d in days]
     keys = ("arm", "candidate", "latency", "every", "fee", "regime", "day", "split")
-    return {key: job[key] for key in keys} | {
+    return {key: job[key] for key in keys} | {"fill": job.get("fill", "queue")} | {
         "daily_value": str(sum(nets, Decimal(0)) / len(nets)), "episodes": days}
 
 
@@ -569,7 +583,7 @@ def fee_rule(ctx):
     rows = []
     for fee in rule["candidates"]:
         rows += pool(ctx.classical_jobs(fee, "train", days_of(ctx.design, "train"),
-                                        [rule["latency"]], [1]),
+                                        [rule["latency"]], [rule["every_rows"]]),
                      evaluate_job, ctx.parallel, f"fee {fee}")
     best = {}
     for fee, by_fee in group([r for r in rows if r["arm"] == "avellaneda_stoikov"],
@@ -579,8 +593,13 @@ def fee_rule(ctx):
     positive = [fee for fee in rule["candidates"] if Decimal(best[fee]["mean_daily_net"]) > 0]
     chosen = max(positive, key=Decimal) if positive else \
         ctx.design["execution"]["secondary_fee_rate"]
+    point = json.dumps(best[chosen]["point"], sort_keys=True)
+    point_fills = sum(r["episodes"][0]["attribution"]["fills"] for r in rows
+                      if r["arm"] == "avellaneda_stoikov" and r["fee"] == chosen
+                      and without_volatility(r) == point)
     report.update({"rows": rows, "best_per_fee": best, "fee": chosen,
-                   "teacher_point": best[chosen]["point"], "profitable": bool(positive),
+                   "teacher_point": best[chosen]["point"], "teacher_point_fills": point_fills,
+                   "profitable": bool(positive),
                    "seconds": round(time.perf_counter() - started, 1)})
     ctx.write("fee_rule", report)
     return report
@@ -635,6 +654,8 @@ def teacher_job(job):
 
 def teacher(ctx, fee_report, predictor):
     """The classical point's decisions, per teacher arm, latency and seed."""
+    if fee_report["teacher_point_fills"] == 0:
+        raise ValueError("the fee rule's point does not fill on the training days: no teacher")
     report = ctx.header("teacher")
     started = time.perf_counter()
     jobs = [{"arm": arm, "latency": latency, "seed": seed, "fee": fee_report["fee"],
@@ -655,6 +676,9 @@ def teacher(ctx, fee_report, predictor):
 def training(ctx, fee, predictor, teacher_report):
     report = ctx.header("training")
     started = time.perf_counter()
+    empty = [s["path"] for s in teacher_report["samples"] if s["projection"]["fills"] == 0]
+    if empty:
+        raise ValueError(f"a teacher's own rollout never filled: {empty}")
     samples = {(s["arm"], s["latency"], s["seed"]): s for s in teacher_report["samples"]}
     hyperparameters = {k: v for k, v in ctx.design["hyperparameters"].items() if k != "note"}
     jobs = []
@@ -729,6 +753,10 @@ def holdout(ctx, frozen_sha256):
         jobs += ctx.classical_jobs(fee, "holdout", days, ctx.latencies, CLASSICAL_INTERVALS,
                                    frozen["classical_selected"])
         jobs += ctx.learned_jobs(frozen["runs"], fee, "holdout", days)
+    # Descriptive, with no decision attached: the arm without a duration under immediate fill.
+    without = [m for m in frozen["runs"] if not ctx.design["arms"][m["arm"]]["duration"]]
+    jobs += [job | {"fill": "immediate"}
+             for job in ctx.learned_jobs(without, frozen["fee"], "holdout", days)]
     report.update({"fees": fees, "rows": pool(jobs, evaluate_job, ctx.parallel, "holdout"),
                    "seconds": round(time.perf_counter() - started, 1)})
     ctx.write("holdout", report)
