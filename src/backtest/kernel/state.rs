@@ -252,6 +252,13 @@ pub enum KernelAction {
         /// Size, in lots.
         lots: u64,
     },
+    /// Cancel every resting or pending order and submit nothing. Each cancel
+    /// takes effect after the cancel latency, as a quote's cancels do: a fill
+    /// before it stands, and a cancel that reaches an order already filled is
+    /// rejected (`CancelRejected`). Admitted whenever a `Hold` is, since an
+    /// open order already holds the venue message its cancel needs. Outside
+    /// the engine-equivalence subset: the engine cancels only to replace.
+    Cancel,
 }
 
 /// What happened to the action.
