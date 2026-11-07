@@ -2,7 +2,8 @@
 //! state, as `../criteria.json` fixes them before any run.
 //!
 //! `cargo run --release -- <criteria.json>` prints one JSON report: each check, its numbers and
-//! whether it passes. Everything is synthetic: Monte Carlo paths of the model at the papers'
+//! whether it passes. With `../criteria_1b.json` it runs step 1b instead, the checks fixed after
+//! step 1 failed. Everything is synthetic: Monte Carlo paths of the model at the papers'
 //! SPX parameters, calibrated to nothing here.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -256,6 +257,10 @@ fn main() {
     let criteria: Value =
         serde_json::from_str(&std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap())
             .unwrap();
+    if criteria["step"].as_str() == Some("1b") {
+        step_1b(&criteria);
+        return;
+    }
     let model = &criteria["model"];
     let alpha = dec(model["alpha"].as_str().unwrap());
     let factors = model["factors"].as_u64().unwrap() as usize;
@@ -374,6 +379,227 @@ fn main() {
         "pass": parity_ok && bounds_ok && shape_ok && skew_ok && convergence_ok
             && (0.4..=0.6).contains(&se_ratio) && path_ok}));
     let pass = report.values().all(|v| v["pass"].as_bool() == Some(true));
+    report.insert("pass".into(), json!(pass));
+    println!("{}", serde_json::to_string_pretty(&Value::Object(report)).unwrap());
+}
+
+fn norm_pdf(x: f64) -> f64 {
+    (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+/// The Black-Scholes vega of a call (no rates).
+fn bs_vega(s: f64, k: f64, t: f64, vol: f64) -> f64 {
+    let d1 = ((s / k).ln() + 0.5 * vol * vol * t) / (vol * t.sqrt());
+    s * norm_pdf(d1) * t.sqrt()
+}
+
+/// V0 = a (Z0 - b)^2 + c for Z0 = sum w_i z_i.
+fn variance_of(w: &[f64], z: &[f64], a: f64, b: f64, c: f64) -> (f64, f64) {
+    let z0: f64 = w.iter().zip(z).map(|(w, z)| w * z).sum();
+    (z0, a * (z0 - b).powi(2) + c)
+}
+
+/// The noise-free path (dW = 0) of the variance over [0, T] at step `dt`: the factors decayed by
+/// the scheme's implicit step, or by their exact exponential decay. Returns (V_T, the mean of the
+/// left-point V_k over the steps, which is what the spot step integrates).
+fn noise_free(
+    kernel: &[(f64, f64)],
+    z0: &[f64],
+    (a, b, c, lambda): (f64, f64, f64, f64),
+    t: f64,
+    dt: f64,
+    exact: bool,
+) -> (f64, f64) {
+    let weights: Vec<f64> = kernel.iter().map(|(w, _)| *w).collect();
+    let steps = (t / dt).round() as usize;
+    let mut z = z0.to_vec();
+    let mut integral = 0.0;
+    for _ in 0..steps {
+        let (zz, v) = variance_of(&weights, &z, a, b, c);
+        integral += v * dt;
+        for (zi, (_, g)) in z.iter_mut().zip(kernel) {
+            *zi = if exact {
+                let decay = (-g * dt).exp();
+                *zi * decay - lambda * zz * (1.0 - decay) / g
+            } else {
+                (*zi - lambda * zz * dt) / (1.0 + g * dt)
+            };
+        }
+    }
+    (variance_of(&weights, &z, a, b, c).1, integral / (steps as f64 * dt))
+}
+
+fn step_1b(criteria: &Value) {
+    let base: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(&std::env::args().nth(1).unwrap())
+                .with_file_name("criteria.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let model = &base["model"];
+    let (alpha, factors, ratio) = (
+        dec(model["alpha"].as_str().unwrap()),
+        model["factors"].as_u64().unwrap() as usize,
+        dec(model["ratio_x_n"].as_str().unwrap()),
+    );
+    let kernel = QuadraticRoughHestonKernel::try_new(alpha, factors, ratio).unwrap();
+    let p = params(&base, kernel.clone());
+    let raw = &model["parameters_2212_10164"];
+    let num = |k: &str| -> f64 { raw[k].as_str().unwrap().parse().unwrap() };
+    let (a, b, c, lambda) = (num("a"), num("b"), num("c"), num("lambda"));
+    let z0: Vec<f64> = raw["z0"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().parse().unwrap())
+        .collect();
+    let checks = &criteria["checks"];
+    let mut report = serde_json::Map::new();
+
+    // 1. Initial variance: every reading, none chosen by its value.
+    let closed = closed_form(f(alpha), factors, f(ratio));
+    let weights: Vec<f64> = closed.iter().map(|(w, _)| *w).collect();
+    let ga = gamma(f(alpha));
+    let unscaled: Vec<f64> = weights.iter().map(|w| w * ga).collect();
+    let reversed: Vec<f64> = z0.iter().rev().copied().collect();
+    let ones = vec![1.0; factors];
+    let (r1_z, r1_v) = variance_of(&weights, &z0, a, b, c);
+    let (r2_z, r2_v) = variance_of(&unscaled, &z0, a, b, c);
+    let (r3_z, r3_v) = variance_of(&weights, &reversed, a, b, c);
+    let (r4_z, r4_v) = variance_of(&ones, &z0, a, b, c);
+    // R1 over the rounding of the printed values: Z0 moves by at most 0.0005 sum c_i; V0 is
+    // a (Z0 - b)^2 + c, so its extremes are at the corners of (a, b, c, Z0), or at Z0 = b.
+    let spread = 0.0005 * weights.iter().sum::<f64>();
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for aa in [a - 0.0005, a + 0.0005] {
+        for bb in [b - 0.0005, b + 0.0005] {
+            for cc in [c - 0.00005, c + 0.00005] {
+                let (zl, zh) = (r1_z - spread, r1_z + spread);
+                for zz in [zl, zh] {
+                    let v = aa * (zz - bb).powi(2) + cc;
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+                if (zl..=zh).contains(&bb) {
+                    lo = lo.min(cc);
+                }
+            }
+        }
+    }
+    let printed: f64 = 0.18;
+    let r1_rounds = (r1_v * 100.0).round() / 100.0 == printed;
+    let interval_meets = lo < 0.185 && hi >= 0.175;
+    let shifted = ((printed - c) / a).sqrt();
+    report.insert("initial_variance".into(), json!({
+        "readings": {
+            "R1": {"z0": r1_z, "v0": r1_v, "optionstratlib_v0": p.initial_variance(),
+                   "supported_by_the_text": true},
+            "R1_rounding": {"z0_spread": spread, "v0_low": lo, "v0_high": hi,
+                            "supported_by_the_text": true},
+            "R2": {"z0": r2_z, "v0": r2_v, "supported_by_the_text": false},
+            "R3": {"z0": r3_z, "v0": r3_v, "supported_by_the_text": false},
+            "R4": {"z0": r4_z, "v0": r4_v, "supported_by_the_text": false}},
+        "printed": printed,
+        "z0_giving_printed_v0": [b - shifted, b + shifted],
+        "r1_rounds_to_printed": r1_rounds, "r1_rounding_interval_meets_printed": interval_meets,
+        "pass": r1_rounds || interval_meets}));
+
+    // 2. The time step sweep, and the noise-free diagnosis.
+    let grid = &criteria["grid"];
+    let floats = |key: &str| -> Vec<f64> {
+        grid[key].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()
+    };
+    let (maturities, moneyness) = (floats("maturities"), floats("log_moneyness"));
+    let (paths, seed) = (grid["paths"].as_u64().unwrap() as usize, grid["seed"].as_u64().unwrap());
+    let dts: Vec<f64> = checks["dt_convergence"]["dts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    let finest = *dts.last().unwrap();
+    let spot = f(p.spot().to_dec());
+    let mut rows = vec![];
+    let (mut converged, mut parity_ok, mut bounds_ok, mut skew_ok) = (true, true, true, true);
+    let mut skews = vec![];
+    let mut atm = vec![];
+    for &t in &maturities {
+        let mut vols = vec![];
+        for &k in &moneyness {
+            let strike = spot * f64::exp(k);
+            let sweep: Vec<(f64, f64)> = dts
+                .iter()
+                .map(|dt| price(&p, t, (t / dt).round() as usize, OptionStyle::Call, strike, paths, seed))
+                .collect();
+            let n = sweep.len();
+            let ((c3, s3), (c4, s4)) = (sweep[n - 2], sweep[n - 1]);
+            let row_converged = (c4 - c3).abs() < 2.0 * s3.max(s4);
+            converged &= row_converged;
+            let (call, call_se) = (c4, s4);
+            let steps = (t / finest).round() as usize;
+            let (put, put_se) = price(&p, t, steps, OptionStyle::Put, strike, paths, seed);
+            let parity = call - put - (spot - strike);
+            let parity_se = (call_se * call_se + put_se * put_se).sqrt();
+            parity_ok &= parity.abs() <= 3.0 * parity_se;
+            let intrinsic = (spot - strike).max(0.0);
+            bounds_ok &= call >= intrinsic - 3.0 * call_se && call <= spot + 3.0 * call_se;
+            let vol = implied_vol(call, spot, strike, t);
+            let vol_se = vol.map(|v| call_se / bs_vega(spot, strike, t, v));
+            vols.push((k, vol, vol_se));
+            if k == 0.0 {
+                atm.push(vol);
+            }
+            rows.push(json!({"maturity": t, "log_moneyness": k, "strike": strike,
+                "calls_by_dt": sweep.iter().zip(&dts).map(|((c, s), dt)|
+                    json!({"dt": dt, "call": c, "se": s})).collect::<Vec<_>>(),
+                "last_two_differ_by": c4 - c3, "tolerance_2se": 2.0 * s3.max(s4),
+                "converged": row_converged, "put": put, "put_se": put_se,
+                "parity_residual": parity, "parity_se": parity_se, "intrinsic": intrinsic,
+                "implied_vol": vol, "implied_vol_se": vol_se}));
+        }
+        let at = |m: f64| vols.iter().find(|(k, _, _)| (*k - m).abs() < 1e-12).unwrap();
+        let ((_, low, low_se), (_, mid, mid_se)) = (at(-0.1), at(0.0));
+        let skew = match (low, low_se, mid, mid_se) {
+            (Some(l), Some(ls), Some(m), Some(ms)) => {
+                let combined = (ls * ls + ms * ms).sqrt();
+                json!({"maturity": t, "iv_minus_010": l, "iv_atm": m, "difference": l - m,
+                       "combined_se": combined, "pass": l - m > 3.0 * combined})
+            }
+            _ => json!({"maturity": t, "pass": false, "why": "no implied volatility"}),
+        };
+        skew_ok &= skew["pass"].as_bool() == Some(true);
+        skews.push(skew);
+    }
+    let noise: Vec<Value> = maturities
+        .iter()
+        .flat_map(|&t| {
+            let closed = &closed;
+            let z0 = &z0;
+            dts.iter().map(move |&dt| {
+                let (vi, mi) = noise_free(closed, z0, (a, b, c, lambda), t, dt, false);
+                let (ve, me) = noise_free(closed, z0, (a, b, c, lambda), t, dt, true);
+                json!({"maturity": t, "dt": dt, "implicit": {"v_t": vi, "mean_left_point_v": mi},
+                       "exact_decay": {"v_t": ve, "mean_left_point_v": me}})
+            })
+        })
+        .collect();
+    report.insert("dt_convergence".into(), json!({
+        "paths": paths, "seed": seed, "dts": dts, "rows": rows,
+        "noise_free_diagnosis": {"max_gamma_dt_at_coarsest":
+            closed.last().unwrap().1 * dts[0], "paths": noise},
+        "pass": converged}));
+    report.insert("no_arbitrage_bounds".into(), json!({"dt": finest, "pass": bounds_ok}));
+    report.insert("negative_skew".into(), json!({"dt": finest, "by_maturity": skews,
+        "pass": skew_ok}));
+    report.insert("put_call_parity".into(), json!({"dt": finest, "pass": parity_ok}));
+    report.insert("reported_only".into(), json!({
+        "atm_implied_vols_at_finest_dt": atm, "sqrt_v0_r1": r1_v.sqrt()}));
+    let pass = report
+        .iter()
+        .filter(|(k, _)| k.as_str() != "reported_only")
+        .all(|(_, v)| v["pass"].as_bool() == Some(true));
     report.insert("pass".into(), json!(pass));
     println!("{}", serde_json::to_string_pretty(&Value::Object(report)).unwrap());
 }
