@@ -788,6 +788,57 @@ fn report(split: &str, separation: usize, results: &Results) {
     }
 }
 
+/// Post-hoc, added after the holdout was read: the noise floor of the measures. From a
+/// sampled position of each holdout day, the market is continued twice without any action,
+/// once from the tape's own generator state and once from an independent one, and the two
+/// continuations are compared as a mode is compared with its truth. It says how much of a
+/// measured error two equally true paths already show; it is not a mode.
+fn noise_floor(params: &[QrParameters], days: &[Day], every: usize) -> Result<(), Failure> {
+    let (_, first, last) = SPLITS[2];
+    let mut move_by_day = Vec::new();
+    let mut state_by_day = Vec::new();
+    for (regime, p) in params.iter().enumerate() {
+        let limits = p.limits();
+        for day in days
+            .iter()
+            .filter(|d| d.regime == regime && (first..=last).contains(&d.day))
+        {
+            let mut moved = 0.0;
+            let mut wrong = 0usize;
+            let mut count = 0usize;
+            let end = day.samples.len().saturating_sub(HORIZON_STEPS + 2);
+            for k in (0..end).step_by(every) {
+                let mut other = day.states[k];
+                let mut mixer = Rng(other.rng_state ^ 0xD1B5_4A32_D192_ED03);
+                other.rng_state = mixer.next() | 1;
+                let start = k as f64 * GRID_MS as f64 / 1000.0;
+                let mut sim = QrSimulator::from_state(p.clone(), other)?;
+                let states = grid(&mut sim, HORIZON_STEPS + 1, start)?;
+                let independent_move = states[HORIZON_STEPS].reference_ticks - day.samples[k].mid;
+                let tape_move = day.samples[k + HORIZON_STEPS].mid - day.samples[k].mid;
+                moved += (tape_move - independent_move).abs() as f64;
+                wrong += usize::from(
+                    sample_of(&states[1], limits).state() != day.samples[k + 1].state(),
+                );
+                count += 1;
+            }
+            move_by_day.push(moved / count.max(1) as f64);
+            state_by_day.push(share(wrong, count));
+        }
+    }
+    let m = interval(&move_by_day, BOOTSTRAP_SEED);
+    let w = interval(&state_by_day, BOOTSTRAP_SEED);
+    println!(
+        "\n== POST-HOC, added after the holdout was read: noise floor on the holdout ==\n\
+         Two continuations without any action, from the same state and independent generators, \
+         one position every {every} s: |10 s move difference| {:.3} [{:.3}, {:.3}] ticks; next state \
+         differs {:.4} [{:.4}, {:.4}]. A mode's error against its truth is read against this, and \
+         no conclusion beyond it is drawn.",
+        m.0, m.1, m.2, w.0, w.1, w.2
+    );
+    Ok(())
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, Failure> {
     value
         .get(key)
@@ -897,6 +948,7 @@ fn synthetic(design_path: &str) -> Result<(), Failure> {
     report("validation", separation, &validation);
     let holdout = run_split(&params, &days, "holdout", separation)?;
     report("holdout", separation, &holdout);
+    noise_floor(&params, &days, 60)?;
     Ok(())
 }
 
