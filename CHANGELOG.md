@@ -66,6 +66,13 @@ project follows [Semantic Versioning](https://semver.org/).
   synthetic regime changes on queue-reactive and Hawkes flow, with detection delay, false alarms,
   a labelled oracle, transfer between the simulators and a go or no-go rule fixed before the
   holdout, which says no-go here. No new public API, and nothing learned.
+- `KernelFillModel::QueuePositionRational { lots, per_ms, min_queue_ms }` (#267): the kernel's
+  queue position model at `lots` lots every `per_ms` milliseconds, so it can clear less than one
+  lot per millisecond. The cleared volume is the floor of `lots * t / per_ms` lots from the
+  order's entry to the queue, so no remainder is lost between rows; it equals the engine's
+  `QueuePositionFillModel` whenever that volume is a whole number of lots. `QueuePosition`, whose
+  floor is one lot per millisecond, now documents that it fills as `Immediate` when the rate
+  times the row interval exceeds every touch. Additive: the enum is `#[non_exhaustive]`.
 - `backtest::hyperliquid` (#214), behind `serde`: decoders for the three streams of the
   Hyperliquid "An Open Book" capture, a book replay, and conversions to `TopOfBook`,
   `MarketEvent`, `PriceSample`, `SizedEvent`, `QueueObservation`, `ReferenceObservation`,

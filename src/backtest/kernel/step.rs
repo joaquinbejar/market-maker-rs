@@ -457,11 +457,13 @@ fn run_events<
 
 /// Lots of `order` the queue position model fills on `row` it crosses, as
 /// `QueuePositionFillModel::fill_for`: the model's cumulative quantity less
-/// what is already filled, which can leave nothing when the touch grew.
+/// what is already filled, which can leave nothing when the touch grew. The
+/// cleared volume is `floor(rate_lots * ms in queue / per_ms)`, from the
+/// order's entry to the queue.
 fn queue_fill_lots(
     order: &VenueOrder,
     row: &KernelTick,
-    rate_lots: u64,
+    (rate_lots, per_ms): (u64, u64),
     min_queue_ms: u64,
 ) -> Option<u64> {
     let in_queue_ns = row.ts_ns.saturating_sub(order.active_after_ns);
@@ -475,7 +477,9 @@ fn queue_fill_lots(
         Dir::Sell => (row.bid > order.price, row.bid_lots),
     };
     let ahead = if through { 0 } else { touch_lots };
-    let cleared = u128::from(rate_lots).checked_mul(u128::from(in_queue_ms))?;
+    let cleared = u128::from(rate_lots)
+        .checked_mul(u128::from(in_queue_ms))?
+        .checked_div(u128::from(per_ms))?;
     let Some(cumulative) = cleared.checked_sub(u128::from(ahead)).filter(|v| *v > 0) else {
         return Some(0);
     };
@@ -522,8 +526,9 @@ fn match_row<
             ValidFill::Immediate => remaining,
             ValidFill::QueuePosition {
                 rate_lots,
+                per_ms,
                 min_queue_ms,
-            } => queue_fill_lots(&order, row, rate_lots, min_queue_ms)
+            } => queue_fill_lots(&order, row, (rate_lots, per_ms), min_queue_ms)
                 .ok_or(Halt::CounterOverflow)?,
         };
         if qty == 0 {

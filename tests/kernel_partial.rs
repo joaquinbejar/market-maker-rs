@@ -102,6 +102,59 @@ fn test_partial_equivalence_seeded_runs_match_engine_exactly_body() {
     assert!(distinct_sizes.len() > 1, "partial fills of different sizes");
 }
 
+/// A seeded scenario under the rational rate, with zero latency and its rows
+/// moved onto multiples of `per_ms`, so every order enters the queue on one
+/// and the cleared volume is always a whole number of lots.
+fn rational_scenario(seed: u64, index: u64) -> Option<Scenario> {
+    let mut sc = scenario(seed, index);
+    let mix = seed.wrapping_mul(31).wrapping_add(index);
+    let per_ms = [2u64, 4, 5][usize::try_from(mix % 3).unwrap()];
+    let lots = [1u64, 2, 3][usize::try_from((mix / 3) % 3).unwrap()];
+    let min_queue_ms = [0u64, 0, per_ms][usize::try_from((mix / 9) % 3).unwrap()];
+    sc.cfg.latency = KernelLatency::zero(MS);
+    for t in &mut sc.ticks {
+        t.timestamp = 1000 + (t.timestamp - 1000) * per_ms;
+    }
+    sc.cfg.fill_model = KernelFillModel::QueuePositionRational {
+        lots,
+        per_ms,
+        min_queue_ms,
+    };
+    fits(&sc).then_some(sc)
+}
+
+#[test]
+fn test_partial_rational_rate_matches_engine_when_cleared_volume_is_whole_lots() {
+    on_large_stack(
+        test_partial_rational_rate_matches_engine_when_cleared_volume_is_whole_lots_body,
+    );
+}
+
+fn test_partial_rational_rate_matches_engine_when_cleared_volume_is_whole_lots_body() {
+    let (mut runs, mut partials, mut below_one_lot_per_ms) = (0u64, 0u64, 0u64);
+    for seed in 0..seeds() {
+        for index in 0..DATASETS {
+            let ctx = format!("seed {seed} dataset {index}");
+            let Some(sc) = rational_scenario(seed, index) else {
+                continue;
+            };
+            let data = sc.data();
+            let k = kernel(&sc, &data);
+            let kr = run_kernel(&k, &sc, false);
+            let er = run_engine(&sc);
+            assert_equivalent(&k, &sc, &kr, &er, &ctx);
+            partials += u64::try_from(count_partials(&kr.events)).unwrap();
+            if let KernelFillModel::QueuePositionRational { lots, per_ms, .. } = sc.cfg.fill_model {
+                below_one_lot_per_ms += u64::from(lots < per_ms);
+            }
+            runs += 1;
+        }
+    }
+    assert!(runs > 0, "no rational scenario ran");
+    assert!(partials > 0, "partial fills under the rational rate");
+    assert!(below_one_lot_per_ms > 0, "rates below one lot per ms");
+}
+
 /// A golden configuration of the partial gate.
 #[derive(Clone, Copy)]
 enum Config {
