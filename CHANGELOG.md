@@ -551,7 +551,7 @@ project follows [Semantic Versioning](https://semver.org/).
   call, and an order re-mapped by a concurrent modify is cancelled through
   its current book id (#146).
 - `OptionQuoter` no longer fails a round for the rounding of the correlation it derives
-  between contracts (Refs #98). That correlation is positive semidefinite in exact arithmetic,
+  between contracts (#250). That correlation is positive semidefinite in exact arithmetic,
   but where a contract's delta and vega nearly offset under a factor correlation near -1, its
   rounding could leave an eigenvalue past the floor of `1e-12` per row, in about one random
   book of 16 contracts in two thousand. A negative eigenvalue down to `1e-12 + min(5.3e-15 k,
