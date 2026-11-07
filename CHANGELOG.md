@@ -36,8 +36,9 @@ project follows [Semantic Versioning](https://semver.org/).
 - `backtest::kernel::quote_error_name` (feature `kernel`, #265): the name of the `MMError`
   variant a strategy error's code stands for, the inverse of `quote_error_code`. The Python
   bridge's `info["refused_because"]` now names a quote error by what it is (a strategy's error
-  by its variant, a strategy quote out of range, or an action off the grid) instead of reporting
-  every one as off grid, a changed string for a caller who matched on it.
+  by its variant, a strategy quote out of range, an action off the grid, or a hedge not available
+  at this decision) instead of reporting every one as off grid, a changed string for a caller
+  who matched on it.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are

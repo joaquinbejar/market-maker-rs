@@ -609,7 +609,7 @@ fn test_refusals_and_quote_errors_name_their_cause() {
     use market_maker_rs::backtest::kernel::{
         ERR_KERNEL_MISMATCH, ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, ErrCode, RejectReason,
     };
-    use market_maker_rs::rl::ERR_ACTION_OFF_GRID;
+    use market_maker_rs::rl::{ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED};
     assert_eq!(refused_because(ActionStatus::Applied), None);
     assert_eq!(
         refused_because(ActionStatus::Rejected(RejectReason::SizeRange)).as_deref(),
@@ -617,6 +617,7 @@ fn test_refusals_and_quote_errors_name_their_cause() {
     );
     let quote = |code: ErrCode| refused_because(ActionStatus::QuoteError(code)).unwrap();
     assert_eq!(quote(ERR_ACTION_OFF_GRID), "off grid (code 200)");
+    assert_eq!(quote(ERR_HEDGE_REFUSED), "hedge not available (code 201)");
     assert_eq!(
         quote(ERR_PRICE_OUT_OF_RANGE),
         "strategy quote price out of range (code 100)"

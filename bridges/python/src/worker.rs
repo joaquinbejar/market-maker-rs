@@ -13,9 +13,9 @@ use market_maker_rs::backtest::kernel::{
 };
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    ERR_ACTION_OFF_GRID, EpisodeRecorder, FeatureVector, InvalidActionPolicy, ObservationScales,
-    ResidualBounds, ResidualDecision, ResidualEnv, ResidualProposal, RlAction, RlConfig, RlEnv,
-    RlState, SpecId, TerminalValuation, Transition,
+    ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED, EpisodeRecorder, FeatureVector, InvalidActionPolicy,
+    ObservationScales, ResidualBounds, ResidualDecision, ResidualEnv, ResidualProposal, RlAction,
+    RlConfig, RlEnv, RlState, SpecId, TerminalValuation, Transition,
 };
 use market_maker_rs::strategy::glft::GLFTConfig;
 use serde::Deserialize;
@@ -45,13 +45,15 @@ fn known_versions(id: &SpecId) -> bool {
 /// Why an action was not applied, as `info["refused_because"]` reports it; `None` when it
 /// was. A kernel refusal is named by its reason. A quote error says what its code stands
 /// for: a strategy's error by its `MMError` variant, a strategy quote the kernel cannot
-/// take, or an action off the grid; none of them reads as another.
+/// take, an action off the grid, or a hedge not available at this decision; none of them
+/// reads as another.
 pub fn refused_because(status: ActionStatus) -> Option<String> {
     match status {
         ActionStatus::Applied => None,
         ActionStatus::Rejected(reason) => Some(format!("{reason:?}")),
         ActionStatus::QuoteError(code) => Some(match code {
             ERR_ACTION_OFF_GRID => format!("off grid (code {})", code.0),
+            ERR_HEDGE_REFUSED => format!("hedge not available (code {})", code.0),
             ERR_PRICE_OUT_OF_RANGE => {
                 format!("strategy quote price out of range (code {})", code.0)
             }
