@@ -2,9 +2,10 @@
 //! agent's own actions and the kernel's events, through the replay, snapshot
 //! and batch gate.
 //!
-//! The kernel gate itself keeps using `RiskLimits`: the `kernel` feature has no
-//! dependencies and its state is `Copy`, so these reservations do not admit or
-//! refuse orders. A reservation the deposits cannot cover fails the test.
+//! These reservations shadow the kernel and do not admit or refuse orders; a
+//! reservation the deposits cannot cover fails the test. The kernel's own
+//! balance gate, which does refuse them (`KernelMargin`), is compared with the
+//! engine's `MarginAccount` in `kernel_margin_gate.rs`.
 //!
 //! An order reserves when it is submitted and the delivered reports consume the
 //! reservation, so it stays pending across every latency. A buy reserves

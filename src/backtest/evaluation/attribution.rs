@@ -104,6 +104,25 @@ impl ExecutedFill {
     }
 }
 
+/// A funding payment of a hedge instrument (#266).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct FundingPayment {
+    /// Payment time, in milliseconds.
+    pub timestamp_ms: u64,
+    /// Received; negative when paid.
+    pub amount: Decimal,
+}
+
+/// The records of a hedge in a second instrument, checked: its own marks, fills
+/// and funding payments. Their being here is what tags them with the instrument.
+#[derive(Debug, Clone, Copy)]
+struct HedgeRecords<'a> {
+    marks: &'a [Mark],
+    fills: &'a [ExecutedFill],
+    funding: &'a [FundingPayment],
+}
+
 /// The records of one window, checked.
 #[derive(Debug, Clone, Copy)]
 pub struct EvaluationInput<'a> {
@@ -111,6 +130,48 @@ pub struct EvaluationInput<'a> {
     marks: &'a [Mark],
     fills: &'a [ExecutedFill],
     capital: Decimal,
+    hedge: Option<HedgeRecords<'a>>,
+}
+
+/// Checks the marks and fills of one instrument against a window.
+fn check_lane(window: TimeWindow, marks: &[Mark], fills: &[ExecutedFill]) -> EvalResult<()> {
+    let inside = |t: u64| window.start_ms <= t && t < window.end_ms;
+    let mut previous = marks.first().map_or(0, |m| m.timestamp_ms);
+    for mark in marks {
+        if !inside(mark.timestamp_ms) {
+            return invalid(format!(
+                "mark at {} is outside the window",
+                mark.timestamp_ms
+            ));
+        }
+        if mark.timestamp_ms < previous {
+            return invalid(format!("mark at {} is out of order", mark.timestamp_ms));
+        }
+        if mark.mid <= Decimal::ZERO {
+            return invalid(format!("mark at {} is not positive", mark.timestamp_ms));
+        }
+        previous = mark.timestamp_ms;
+    }
+    let first = marks.first().map(|m| m.timestamp_ms);
+    let mut previous = first.unwrap_or(0);
+    for fill in fills {
+        let t = fill.timestamp_ms;
+        if first.is_none_or(|first| t < first) {
+            return Err(EvaluationError::FillBeforeFirstMark { timestamp_ms: t });
+        }
+        if !inside(t) {
+            return invalid(format!("fill at {t} is outside the window"));
+        }
+        if t < previous {
+            return invalid(format!("fill at {t} is out of order"));
+        }
+        if fill.price <= Decimal::ZERO || fill.quantity <= Decimal::ZERO {
+            return invalid(format!("fill at {t} needs a positive price and size"));
+        }
+        fill.signed_quantity()?;
+        previous = t;
+    }
+    Ok(())
 }
 
 impl<'a> EvaluationInput<'a> {
@@ -131,50 +192,63 @@ impl<'a> EvaluationInput<'a> {
         if capital <= Decimal::ZERO {
             return invalid(format!("capital {capital} must be positive"));
         }
-        let inside = |t: u64| window.start_ms <= t && t < window.end_ms;
-        let Some(first) = marks.first() else {
+        if marks.is_empty() {
             return invalid("a window needs at least one mark".to_string());
-        };
-        let mut previous = first.timestamp_ms;
-        for mark in marks {
-            if !inside(mark.timestamp_ms) {
-                return invalid(format!(
-                    "mark at {} is outside the window",
-                    mark.timestamp_ms
-                ));
-            }
-            if mark.timestamp_ms < previous {
-                return invalid(format!("mark at {} is out of order", mark.timestamp_ms));
-            }
-            if mark.mid <= Decimal::ZERO {
-                return invalid(format!("mark at {} is not positive", mark.timestamp_ms));
-            }
-            previous = mark.timestamp_ms;
         }
-        let mut previous = first.timestamp_ms;
-        for fill in fills {
-            let t = fill.timestamp_ms;
-            if t < first.timestamp_ms {
-                return Err(EvaluationError::FillBeforeFirstMark { timestamp_ms: t });
-            }
-            if !inside(t) {
-                return invalid(format!("fill at {t} is outside the window"));
-            }
-            if t < previous {
-                return invalid(format!("fill at {t} is out of order"));
-            }
-            if fill.price <= Decimal::ZERO || fill.quantity <= Decimal::ZERO {
-                return invalid(format!("fill at {t} needs a positive price and size"));
-            }
-            fill.signed_quantity()?;
-            previous = t;
-        }
+        check_lane(window, marks, fills)?;
         Ok(Self {
             window,
             marks,
             fills,
             capital,
+            hedge: None,
         })
+    }
+
+    /// Adds the records of a hedge in a second instrument (#266): its marks, its
+    /// fills and its funding payments, in the same window. The attribution then
+    /// reports the hedge apart, in [`Attribution::hedge_costs`].
+    ///
+    /// The hedge may have no record at all, a lane that has not traded yet. Its
+    /// fees are in the quote asset only.
+    ///
+    /// # Errors
+    ///
+    /// As [`EvaluationInput::new`] for the hedge's marks and fills, with
+    /// [`EvaluationError::FillBeforeFirstMark`] for a fill before the hedge's first
+    /// mark; [`EvaluationError::InvalidInput`] for a hedge fill with a base fee,
+    /// or a funding payment outside the window or out of order.
+    pub fn with_hedge(
+        mut self,
+        marks: &'a [Mark],
+        fills: &'a [ExecutedFill],
+        funding: &'a [FundingPayment],
+    ) -> EvalResult<Self> {
+        check_lane(self.window, marks, fills)?;
+        if let Some(fill) = fills.iter().find(|f| !f.base_fee.is_zero()) {
+            return invalid(format!(
+                "hedge fill at {} has a base fee",
+                fill.timestamp_ms
+            ));
+        }
+        let inside = |t: u64| self.window.start_ms <= t && t < self.window.end_ms;
+        let mut previous = funding.first().map_or(0, |f| f.timestamp_ms);
+        for payment in funding {
+            let t = payment.timestamp_ms;
+            if !inside(t) {
+                return invalid(format!("funding at {t} is outside the window"));
+            }
+            if t < previous {
+                return invalid(format!("funding at {t} is out of order"));
+            }
+            previous = t;
+        }
+        self.hedge = Some(HedgeRecords {
+            marks,
+            fills,
+            funding,
+        });
+        Ok(self)
     }
 
     /// The window.
@@ -200,14 +274,23 @@ enum Step<'a> {
     Settled { mark: &'a Mark },
 }
 
-/// Walks marks and fills in time order.
+/// Walks the quoted instrument's marks and fills in time order.
 fn sweep<'a>(
     input: &EvaluationInput<'a>,
+    on_step: impl FnMut(Step<'a>) -> EvalResult<()>,
+) -> EvalResult<()> {
+    sweep_lane(input.marks, input.fills, on_step)
+}
+
+/// Walks one instrument's marks and fills in time order.
+fn sweep_lane<'a>(
+    marks: &'a [Mark],
+    fills: &'a [ExecutedFill],
     mut on_step: impl FnMut(Step<'a>) -> EvalResult<()>,
 ) -> EvalResult<()> {
-    let mut fills = input.fills.iter().peekable();
+    let mut fills = fills.iter().peekable();
     let mut in_force: Option<&'a Mark> = None;
-    let mut marks = input.marks.iter().peekable();
+    let mut marks = marks.iter().peekable();
     while let Some(mark) = marks.next() {
         while let (Some(fill), Some(current)) = (
             fills.next_if(|fill| fill.timestamp_ms < mark.timestamp_ms),
@@ -260,6 +343,79 @@ pub enum HedgeCosts {
         /// Why.
         reason: HedgeNotModelledReason,
     },
+    /// The hedge lane's own attribution, from the records of
+    /// [`EvaluationInput::with_hedge`] (#266).
+    Attributed(HedgeAttribution),
+}
+
+/// The attribution of a hedge in a second instrument, against its own marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub struct HedgeAttribution {
+    /// Earned against the hedge's mark in force at each of its fills; negative
+    /// when the hedge pays the spread.
+    pub spread_capture: Decimal,
+    /// The hedge position times later moves of the hedge's mark.
+    pub inventory_pnl: Decimal,
+    /// Fees in the quote asset; negative for rebates.
+    pub fees: Decimal,
+    /// Funding received; negative when paid.
+    pub funding: Decimal,
+    /// `spread_capture + inventory_pnl - fees + funding`.
+    pub net_pnl: Decimal,
+}
+
+impl HedgeAttribution {
+    const ZERO: Self = Self {
+        spread_capture: Decimal::ZERO,
+        inventory_pnl: Decimal::ZERO,
+        fees: Decimal::ZERO,
+        funding: Decimal::ZERO,
+        net_pnl: Decimal::ZERO,
+    };
+
+    /// What the hedge cost to run, apart from its inventory result: `fees -
+    /// spread_capture - funding`, positive for a cost, as [`MetricId::HedgeCosts`]
+    /// reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationError::Inexact`] if the difference would round.
+    pub fn costs(&self) -> EvalResult<Decimal> {
+        const WHAT: &str = "hedge costs";
+        sub(
+            sub(self.fees, self.spread_capture, WHAT)?,
+            self.funding,
+            WHAT,
+        )
+    }
+
+    fn with_net(mut self) -> EvalResult<Self> {
+        const WHAT: &str = "hedge net pnl";
+        let gross = add(self.spread_capture, self.inventory_pnl, WHAT)?;
+        self.net_pnl = add(sub(gross, self.fees, WHAT)?, self.funding, WHAT)?;
+        Ok(self)
+    }
+
+    fn plus(mut self, other: &Self) -> EvalResult<Self> {
+        self.spread_capture = add(self.spread_capture, other.spread_capture, "hedge spread")?;
+        self.inventory_pnl = add(self.inventory_pnl, other.inventory_pnl, "hedge inventory")?;
+        self.fees = add(self.fees, other.fees, "hedge fees")?;
+        self.funding = add(self.funding, other.funding, "hedge funding")?;
+        self.with_net()
+    }
+}
+
+impl HedgeCosts {
+    fn plus(self, other: Self) -> EvalResult<Self> {
+        Ok(match (self, other) {
+            (Self::Attributed(a), Self::Attributed(b)) => Self::Attributed(a.plus(&b)?),
+            (Self::Attributed(a), Self::NotModelled { .. })
+            | (Self::NotModelled { .. }, Self::Attributed(a)) => Self::Attributed(a),
+            (not_modelled @ Self::NotModelled { .. }, Self::NotModelled { .. }) => not_modelled,
+        })
+    }
 }
 
 /// Where a result came from. See the [module documentation](super).
@@ -275,7 +431,8 @@ pub struct Attribution {
     pub quote_fees: Decimal,
     /// Fees in the base asset, valued at the mark in force at each fill.
     pub base_fees: Decimal,
-    /// Not part of [`Attribution::net_pnl`].
+    /// The hedge lane's, when the records hold one; not part of
+    /// [`Attribution::net_pnl`].
     pub hedge_costs: HedgeCosts,
     /// `spread_capture + inventory_pnl - quote_fees - base_fees`.
     pub net_pnl: Decimal,
@@ -303,12 +460,30 @@ impl Attribution {
         Ok(self)
     }
 
+    /// [`Attribution::zero`], with a hedge of zero when the records hold one.
+    fn zero_for(input: &EvaluationInput<'_>) -> Self {
+        let mut zero = Self::zero();
+        if input.hedge.is_some() {
+            zero.hedge_costs = HedgeCosts::Attributed(HedgeAttribution::ZERO);
+        }
+        zero
+    }
+
     fn plus(mut self, other: &Self) -> EvalResult<Self> {
         self.spread_capture = add(self.spread_capture, other.spread_capture, "spread capture")?;
         self.inventory_pnl = add(self.inventory_pnl, other.inventory_pnl, "inventory pnl")?;
         self.quote_fees = add(self.quote_fees, other.quote_fees, "quote fees")?;
         self.base_fees = add(self.base_fees, other.base_fees, "base fees")?;
+        self.hedge_costs = self.hedge_costs.plus(other.hedge_costs)?;
         self.with_net()
+    }
+
+    /// The hedge's attribution, when there is one.
+    fn hedge_mut(&mut self) -> Option<&mut HedgeAttribution> {
+        match &mut self.hedge_costs {
+            HedgeCosts::Attributed(hedge) => Some(hedge),
+            HedgeCosts::NotModelled { .. } => None,
+        }
     }
 }
 
@@ -343,6 +518,8 @@ pub struct BucketedAttribution<K: Ord> {
     pub total: Attribution,
     /// Final position, net of base fees.
     pub final_position: Decimal,
+    /// The hedge's final position, when the records hold a hedge (#266).
+    pub hedge_final_position: Option<Decimal>,
     /// The buckets.
     pub buckets: BTreeMap<K, BucketAttribution>,
 }
@@ -371,6 +548,39 @@ impl<K: Ord> BucketedAttribution<K> {
         }
         Ok(())
     }
+
+    /// Compares both lanes with their books (#266): the quoted lane as
+    /// [`BucketedAttribution::reconcile`], and the hedge's net result and final
+    /// position with `hedge`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationError::NotReconciled`] when a net result or a final
+    /// position differ by any amount, and [`EvaluationError::InvalidInput`] when the
+    /// records hold no hedge.
+    pub fn reconcile_lanes(&self, quoted: LedgerTotals, hedge: LedgerTotals) -> EvalResult<()> {
+        self.reconcile(quoted)?;
+        let (HedgeCosts::Attributed(attributed), Some(position)) =
+            (self.total.hedge_costs, self.hedge_final_position)
+        else {
+            return invalid("the records hold no hedge".to_string());
+        };
+        if attributed.net_pnl != hedge.net_pnl {
+            return Err(EvaluationError::NotReconciled {
+                what: "hedge net pnl",
+                attributed: attributed.net_pnl,
+                booked: hedge.net_pnl,
+            });
+        }
+        if position != hedge.position {
+            return Err(EvaluationError::NotReconciled {
+                what: "hedge final position",
+                attributed: position,
+                booked: hedge.position,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Attributes a window, each mark's label naming its bucket. See the
@@ -390,15 +600,21 @@ pub fn attribute_by<K: Ord + Clone>(
 ) -> EvalResult<BucketedAttribution<K>> {
     let mut buckets: BTreeMap<K, BucketAttribution> = BTreeMap::new();
     let mut key: Option<K> = None;
+    // The bucket of each quoted mark, in time order, for the hedge's records.
+    let mut timeline: Vec<(u64, K)> = Vec::with_capacity(input.marks.len());
     let mut position = Decimal::ZERO;
     let mut cash = Decimal::ZERO;
     let mut last_mid = Decimal::ZERO;
+    let empty = Attribution::zero_for(input);
     sweep(input, |step| {
         match step {
             Step::Move { mark, previous } => {
                 let this = label(mark);
+                if input.hedge.is_some() {
+                    timeline.push((mark.timestamp_ms, this.clone()));
+                }
                 let bucket = buckets.entry(this.clone()).or_insert(BucketAttribution {
-                    attribution: Attribution::zero(),
+                    attribution: empty,
                     marks: 0,
                     fills: 0,
                 });
@@ -436,8 +652,15 @@ pub fn attribute_by<K: Ord + Clone>(
         }
         Ok(())
     })?;
+    let hedge_position = match input.hedge {
+        Some(hedge) => Some(attribute_hedge(&hedge, &timeline, &mut buckets)?),
+        None => None,
+    };
     let mut total = Attribution::zero();
     for bucket in buckets.values_mut() {
+        if let Some(hedge) = bucket.attribution.hedge_mut() {
+            *hedge = hedge.with_net()?;
+        }
         bucket.attribution = bucket.attribution.with_net()?;
         total = total.plus(&bucket.attribution)?;
     }
@@ -454,11 +677,95 @@ pub fn attribute_by<K: Ord + Clone>(
             booked: direct,
         });
     }
+    if let (Some(hedge), Some((h_cash, h_position, h_mid))) = (input.hedge, hedge_position) {
+        const WHAT: &str = "hedge direct net";
+        let HedgeCosts::Attributed(attributed) = total.hedge_costs else {
+            return invalid("a hedge without its attribution".to_string());
+        };
+        let funding = hedge
+            .funding
+            .iter()
+            .try_fold(Decimal::ZERO, |sum, p| add(sum, p.amount, WHAT))?;
+        let value = mul(h_position, h_mid, WHAT)?;
+        let direct = add(
+            sub(add(h_cash, value, WHAT)?, attributed.fees, WHAT)?,
+            funding,
+            WHAT,
+        )?;
+        if direct != attributed.net_pnl {
+            return Err(EvaluationError::NotReconciled {
+                what: "hedge components and cash",
+                attributed: attributed.net_pnl,
+                booked: direct,
+            });
+        }
+    }
     Ok(BucketedAttribution {
         total,
         final_position: position,
+        hedge_final_position: hedge_position.map(|(_, position, _)| position),
         buckets,
     })
+}
+
+/// The bucket in force at `timestamp_ms`: that of the last quoted mark at or
+/// before it, or the first bucket for a record before the first quoted mark.
+fn bucket_at<'b, K: Ord>(
+    timeline: &[(u64, K)],
+    buckets: &'b mut BTreeMap<K, BucketAttribution>,
+    timestamp_ms: u64,
+) -> EvalResult<&'b mut HedgeAttribution> {
+    let index = timeline
+        .partition_point(|(t, _)| *t <= timestamp_ms)
+        .saturating_sub(1);
+    timeline
+        .get(index)
+        .and_then(|(_, key)| buckets.get_mut(key))
+        .and_then(|bucket| bucket.attribution.hedge_mut())
+        .ok_or(EvaluationError::InvalidInput {
+            reason: "a hedge record without a quoted bucket".to_string(),
+        })
+}
+
+/// Sweeps the hedge's marks and fills in their own order, each term into the
+/// quoted bucket in force at its time, and its funding likewise. Returns the
+/// hedge's cash, final position and last mark.
+fn attribute_hedge<K: Ord>(
+    hedge: &HedgeRecords<'_>,
+    timeline: &[(u64, K)],
+    buckets: &mut BTreeMap<K, BucketAttribution>,
+) -> EvalResult<(Decimal, Decimal, Decimal)> {
+    let (mut cash, mut position, mut last_mid) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+    sweep_lane(hedge.marks, hedge.fills, |step| {
+        match step {
+            Step::Move { mark, previous } => {
+                if let Some(previous) = previous {
+                    let moved = sub(mark.mid, previous.mid, "hedge price move")?;
+                    let earned = mul(position, moved, "hedge inventory")?;
+                    let row = bucket_at(timeline, buckets, mark.timestamp_ms)?;
+                    row.inventory_pnl = add(row.inventory_pnl, earned, "hedge inventory")?;
+                }
+                last_mid = mark.mid;
+            }
+            Step::Fill { fill, mark } => {
+                let signed = fill.signed_quantity()?;
+                let edge = sub(mark.mid, fill.price, "hedge spread")?;
+                let captured = mul(signed, edge, "hedge spread")?;
+                let row = bucket_at(timeline, buckets, fill.timestamp_ms)?;
+                row.spread_capture = add(row.spread_capture, captured, "hedge spread")?;
+                row.fees = add(row.fees, fill.quote_fee, "hedge fees")?;
+                cash = sub(cash, mul(signed, fill.price, "hedge cash")?, "hedge cash")?;
+                position = add(position, signed, "hedge position")?;
+            }
+            Step::Settled { .. } => {}
+        }
+        Ok(())
+    })?;
+    for payment in hedge.funding {
+        let row = bucket_at(timeline, buckets, payment.timestamp_ms)?;
+        row.funding = add(row.funding, payment.amount, "hedge funding")?;
+    }
+    Ok((cash, position, last_mid))
 }
 
 /// Attributes a whole window, as one bucket.
@@ -506,7 +813,7 @@ pub fn attribute_daily(
                 .get(&day)
                 .copied()
                 .unwrap_or(BucketAttribution {
-                    attribution: Attribution::zero(),
+                    attribution: Attribution::zero_for(input),
                     marks: 0,
                     fills: 0,
                 }),
@@ -883,14 +1190,17 @@ impl WindowMetrics {
                 })
         };
         let of = |id, value| MetricValue::new(id, None, Reading::Value(value));
-        let HedgeCosts::NotModelled { reason } = self.attribution.hedge_costs;
+        let hedge = match self.attribution.hedge_costs {
+            HedgeCosts::NotModelled { reason } => Reading::NotModelled(reason),
+            HedgeCosts::Attributed(hedge) => Reading::Value(hedge.costs()?),
+        };
         let mut values = vec![
             of(MetricId::NetPnl, self.attribution.net_pnl),
             of(MetricId::SpreadCapture, self.attribution.spread_capture),
             of(MetricId::InventoryPnl, self.attribution.inventory_pnl),
             of(MetricId::QuoteFees, self.attribution.quote_fees),
             of(MetricId::BaseFees, self.attribution.base_fees),
-            MetricValue::new(MetricId::HedgeCosts, None, Reading::NotModelled(reason)),
+            MetricValue::new(MetricId::HedgeCosts, None, hedge),
         ];
         let optional = |value: Option<Decimal>| value.map_or(Reading::Undefined, Reading::Value);
         for (id, read) in [

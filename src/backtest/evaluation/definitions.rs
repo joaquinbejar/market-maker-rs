@@ -115,7 +115,10 @@ pub enum MetricId {
     QuoteFees,
     /// Fees in the base asset, valued at `M_f`.
     BaseFees,
-    /// Costs of a hedge. Reported, today, only as not modelled.
+    /// Costs of a hedge in a second instrument, [`HedgeAttribution::costs`]: not
+    /// modelled with one instrument.
+    ///
+    /// [`HedgeAttribution::costs`]: super::HedgeAttribution::costs
     HedgeCosts,
     /// `s (M_H - P)` per unit, our result on the fill after the horizon.
     SignedMarkout,

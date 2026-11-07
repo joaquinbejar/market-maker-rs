@@ -366,6 +366,8 @@ pub struct EngineRun {
     pub pretrade: Vec<(u64, PretradeDecision, Decimal)>,
     pub state: (InventoryPosition, Decimal, Decimal),
     pub log: EngineLog,
+    /// The margin account's balances, with a balance gate.
+    pub margin: Option<MarginEnd>,
 }
 
 pub fn run_engine(sc: &Scenario) -> EngineRun {
@@ -421,10 +423,28 @@ fn finish_engine<F: FillModel>(
     log: Rc<RefCell<EngineLog>>,
 ) -> EngineRun {
     let engine = engine.with_latency(sc.engine_latency()).unwrap();
+    // The engine takes one pretrade policy: the kernel's limits or its
+    // balance gate, never both.
+    assert!(
+        sc.cfg.limits.is_none() || sc.cfg.margin.is_none(),
+        "limits and a balance gate in one engine scenario"
+    );
     let mut engine = match &sc.cfg.limits {
         Some(limits) => engine.with_pretrade_policy(LimitsPolicy::new(limits.clone())),
         None => engine,
     };
+    #[cfg(feature = "margin")]
+    let mut account = None;
+    if sc.cfg.margin.is_some() {
+        #[cfg(feature = "margin")]
+        {
+            let built = margin_account(&sc.cfg);
+            engine = engine.with_pretrade_policy(built.policy());
+            account = Some(built);
+        }
+        #[cfg(not(feature = "margin"))]
+        panic!("a balance gate scenario needs the margin feature");
+    }
     let result = engine.run();
     let reports = engine.execution_reports().to_vec();
     let pretrade = engine
@@ -436,13 +456,100 @@ fn finish_engine<F: FillModel>(
     let state = (position.clone(), pnl.realized, pnl.total);
     drop(engine);
     let log = Rc::try_unwrap(log).unwrap().into_inner();
+    #[cfg(feature = "margin")]
+    let margin = account.map(|account| {
+        assert_eq!(
+            account.errors(),
+            Vec::<String>::new(),
+            "margin account errors"
+        );
+        account.with_gate(|gate| {
+            let ledger = gate.ledger();
+            let balance = |name: &str| {
+                ledger
+                    .balance(&margin_rs::Asset::new(name).unwrap())
+                    .map(|b| (b.total, b.reserved))
+                    .unwrap_or_default()
+            };
+            MarginEnd {
+                quote: balance("QUOTE"),
+                base: balance("BASE"),
+            }
+        })
+    });
+    #[cfg(not(feature = "margin"))]
+    let margin = None;
     EngineRun {
         result,
         reports,
         pretrade,
         state,
         log,
+        margin,
     }
+}
+
+/// The margin account's balances at the end of an engine run: `(total,
+/// reserved)` of the quote and the base asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarginEnd {
+    pub quote: (Decimal, Decimal),
+    pub base: (Decimal, Decimal),
+}
+
+/// The margin-rs account a kernel's balance gate decides as: spot `BASE-QUOTE`
+/// at the tick's and the lot's scales, the quote asset at the kernel's money
+/// scale, `initial_capital` and `base_deposit` deposited, fees in quote up to
+/// `max(fee_rate, 0)`, no other limit.
+#[cfg(feature = "margin")]
+pub fn margin_account(cfg: &KernelConfig) -> market_maker_rs::backtest::MarginAccount {
+    use margin_rs::ledger::{Ledger, LedgerConfig};
+    use margin_rs::risk::{InstrumentLimits, RiskGate};
+    use margin_rs::{Asset, InstrumentId, SpotInstrument, TransferId};
+    let scale = |d: Decimal| d.normalize().scale();
+    let (tick_scale, lot_scale) = (scale(cfg.tick_size), scale(cfg.lot_size));
+    let money_scale = tick_scale + lot_scale + scale(cfg.fee_rate);
+    let base = Asset::new("BASE").unwrap();
+    let quote = Asset::new("QUOTE").unwrap();
+    let pair = InstrumentId::new("BASE-QUOTE").unwrap();
+    let mut ledger = Ledger::new(LedgerConfig::default());
+    ledger.register_asset(base.clone(), lot_scale).unwrap();
+    ledger.register_asset(quote.clone(), money_scale).unwrap();
+    ledger
+        .register_instrument(
+            SpotInstrument::new(
+                pair.clone(),
+                base.clone(),
+                quote.clone(),
+                tick_scale,
+                lot_scale,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut gate = RiskGate::new(ledger);
+    if cfg.initial_capital > Decimal::ZERO {
+        gate.deposit(
+            TransferId::new("quote").unwrap(),
+            quote,
+            cfg.initial_capital,
+        )
+        .unwrap();
+    }
+    let base_deposit = cfg.margin.unwrap().base_deposit;
+    if base_deposit > Decimal::ZERO {
+        gate.deposit(TransferId::new("base").unwrap(), base, base_deposit)
+            .unwrap();
+    }
+    gate.set_limits(
+        &pair,
+        InstrumentLimits {
+            max_fee_rate: cfg.fee_rate.max(Decimal::ZERO),
+            ..InstrumentLimits::default()
+        },
+    )
+    .unwrap();
+    market_maker_rs::backtest::MarginAccount::new(gate, pair).unwrap()
 }
 
 /// A kernel run: events, per decision observations, actions and states.
