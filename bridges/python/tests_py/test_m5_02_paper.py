@@ -232,7 +232,7 @@ def test_welch_matches_a_known_value():
 
 
 def test_design_widths_follow_the_parameter_rule():
-    design = json.loads((EXPERIMENT / "design.json").read_text())
+    design, _ = run_paper.load_design()
     found = run_paper.check_widths(design)
     for name, (width, count) in found.items():
         assert abs(count - design["paper"]["parameters"]["target"]) <= 0.1 * 2600

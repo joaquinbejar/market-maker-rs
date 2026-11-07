@@ -8,7 +8,7 @@ From `bridges/python`:
     python experiments/m5_02/run_paper.py evaluate <out dir> <frozen sha256>
     python experiments/m5_02/run_paper.py report <out dir>
 
-`widths` checks that the head widths in `design.json` are the ones its parameter target
+`widths` checks that the head widths in `design_paper.json` are the ones its parameter target
 gives. `train` refuses to run unless they are. `evaluate` reads only checkpoints whose
 hashes `freeze` recorded, refuses a different design, and runs once.
 
@@ -43,8 +43,8 @@ def sha256(path):
 
 
 def load_design():
-    path = HERE / "design.json"
-    return json.loads(path.read_text()), sha256(path)
+    path = HERE / "design_paper.json"
+    return {"paper": json.loads(path.read_text())}, sha256(path)
 
 
 def layout_of(part):
