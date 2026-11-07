@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The offline evaluation support study of #104 in `bridges/python/experiments/m4_07`: a design
+  and a go or no-go rule fixed before any log (`design.json`, `decide.py`, with the change log of
+  every amendment and what was seen when), epsilon-greedy behaviours with recorded propensities
+  on #102's synthetic days, per-decision importance sampling, a direct method and a doubly robust
+  estimator with their diagnostics (`estimate.py`), a runner with a consistency check against
+  #102, a freeze and a single holdout (`run.py`), a coverage diagnostic of the Hyperliquid
+  capture's states, and a report (`report.py`). The rule reads diagnostics only. Synthetic data,
+  apart from the capture's states in the coverage diagnostic; the results are on the issue.
 - The Python bridge builds against Python's stable ABI for 3.11 and loads on 3.11 and 3.12 (#284),
   both tested; nothing else in it changes.
 - The out-of-sample comparison of #102 in `bridges/python/experiments/m4_05`: a design fixed
