@@ -1,6 +1,6 @@
 {
   "issue": 104,
-  "design_version": 2,
+  "design_version": 3,
   "data": "synthetic: #102's queue-reactive days (a simulator with made-up parameters), no market data. The Hyperliquid capture enters only through a state coverage diagnostic: it holds no orders of our own, so no action, behaviour policy or propensity",
   "bounds": "One synthetic simulator whose rows do not react to orders, made-up parameters and 24 days per regime bound what this study can show. Every value is labelled [observed] (read from a log), [estimated] (an off-policy estimate under its stated assumption) or [simulated] (an interactive run of the target in the same simulator).",
   "disclosure": "#102 has already evaluated its arms on these holdout days (days 20 to 24). No estimator, threshold or choice of this study reads a holdout log before this study's freeze.",
@@ -104,7 +104,7 @@
       1.0,
       10.0
     ],
-    "choice_rule": "on validation logs, per behaviour: the window with the largest effective sample size among those whose effective sample size is at least the threshold, and otherwise the shortest; the ridge alpha with the lowest squared error of the per-decision reward on validation logs. Neither reads a target's truth"
+    "choice_rule": "on validation logs, per behaviour and target: the window with the largest effective sample among those whose effective sample is at least the threshold, and otherwise the shortest (a tie to the shorter); per logged behaviour, the ridge alpha with the lowest squared error of the per-decision reward on validation logs. Neither reads a target's truth"
   },
   "diagnostics": {
     "effective_sample": "per target: at each decision, (sum of weights)^2 / sum of squared weights across the trajectories present, as a share of them (0 where every weight is zero), averaged over decisions",
@@ -161,6 +161,18 @@
         "the consistency stop rule also compares each frozen PPO seed with #102's validation values",
         "as_grid's time elapsed is (rows per day - steps left) x the sample interval, and its year has 365 days, as #102's volatility rule",
         "#102's frozen runs were trained at action space version 1, before hedge actions (#247) made it 2 with hedges off unchanged; they are loaded across that one difference, with the kernel fingerprint and the configuration still checked equal, and the consistency step must reproduce #102's validation values"
+      ]
+    },
+    {
+      "version": 3,
+      "seen": "training and validation logs and interactive runs were being written; no log, estimate or interactive value had been read by any analysis",
+      "what": [
+        "the window is chosen per behaviour and target, by the same rule, since the effective sample is a target's",
+        "the direct method's features: an intercept, the observation as the policy sees it, the action (quote, bid and ask offset over 8 ticks, bid and ask size over 2 lots), and the quote, the offset difference and the quote times the position, and the quote times the spread",
+        "the ridge alpha is chosen per logged behaviour; the counted control uses the epsilon 0.3 logs and their direct method",
+        "a counted propensity is the share of the training logs' decisions in the state's bin that took the action; a bin or action never seen counts 0",
+        "the intervals of the direct method are reported too, as a third estimator that the decision does not read",
+        "coverage: the capture's states are read as the policy would see them at each declared tick (0.1 and 1), with #102's scales, so the coverage is reported per declared tick"
       ]
     }
   ]

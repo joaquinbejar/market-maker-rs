@@ -168,3 +168,124 @@ def interval(estimator, units, mean_block, replicates, seed, confidence=0.90):
 def overlap(a, b):
     """Whether two intervals `(point, low, high)` overlap."""
     return a[1] <= b[2] and b[1] <= a[2]
+
+
+def choose_window(ess_by_window, minimum):
+    """The design's rule: the window with the largest effective sample among those at or above
+    `minimum`, and otherwise the shortest. `ess_by_window` maps a window to its effective sample
+    share; ties go to the shorter window."""
+    windows = sorted(ess_by_window)
+    passing = [w for w in windows if ess_by_window[w] is not None and ess_by_window[w] >= minimum]
+    if not passing:
+        return windows[0]
+    return max(passing, key=lambda w: (ess_by_window[w], -w))
+
+
+def decode(code, offsets, sizes):
+    """A joint action code as (quote, bid offset, ask offset, bid size, ask size) in ticks and
+    lots; a hold is all zeros."""
+    if code == 0:
+        return (0, 0, 0, 0, 0)
+    index = code - 1
+    k, m = len(offsets), len(sizes)
+    ask_size = index % m
+    index //= m
+    bid_size = index % m
+    index //= m
+    ask = index % k
+    bid = index // k
+    return (1, offsets[bid], offsets[ask], sizes[bid_size], sizes[ask_size])
+
+
+def action_features(codes, offsets, sizes):
+    """Per action: quote, bid and ask offset over the largest offset, bid and ask size over the
+    largest size. A hold is all zeros."""
+    top_offset, top_size = max(offsets), max(sizes)
+    table = np.zeros((1 + len(offsets) ** 2 * len(sizes) ** 2, 5))
+    for code in range(1, len(table)):
+        quote, bid, ask, bid_size, ask_size = decode(code, offsets, sizes)
+        table[code] = (quote, bid / top_offset, ask / top_offset, bid_size / top_size,
+                       ask_size / top_size)
+    return table[np.asarray(codes, dtype=int)]
+
+
+def features(observations, codes, offsets, sizes, position=6, spread=0):
+    """The direct method's features of (observation, action): an intercept, the observation as
+    the policy sees it, the action's features, and the action's interactions with the position
+    and the spread."""
+    obs = np.asarray(observations, dtype=float)
+    act = action_features(codes, offsets, sizes)
+    quote, bid, ask = act[:, 0], act[:, 1], act[:, 2]
+    pos, spr = obs[:, position], obs[:, spread]
+    return np.column_stack(
+        [np.ones(len(obs)), obs, act, quote * pos, (bid - ask) * pos, quote * spr]
+    )
+
+
+def bin_states(observations, edges_imbalance, spread=0, mid_change=1, imbalance=5,
+               spread_scale=10.0, mid_scale=10.0, present_offset=11):
+    """The design's coverage and counting bins, from the observation as the policy sees it: the
+    spread in ticks (1, 2, 3-4, 5-8, more), the absolute mid change in ticks (0, 1, 2-4, more, or
+    none), and the imbalance by the given quintile edges (or none)."""
+    obs = np.asarray(observations, dtype=float)
+    ticks = np.rint(obs[:, spread] * spread_scale)
+    spread_bin = np.digitize(ticks, [1.5, 2.5, 4.5, 8.5])
+    change = np.abs(np.rint(obs[:, mid_change] * mid_scale))
+    change_bin = np.where(obs[:, present_offset + mid_change] > 0,
+                          np.digitize(change, [0.5, 1.5, 4.5]), 4)
+    imb_bin = np.where(obs[:, present_offset + imbalance] > 0,
+                       np.digitize(obs[:, imbalance], edges_imbalance), len(edges_imbalance) + 1)
+    return (spread_bin * 5 + change_bin) * (len(edges_imbalance) + 2) + imb_bin
+
+
+def counted_propensity(train_bins, train_codes, bins, codes):
+    """The behaviour's probability of `codes` at `bins`, counted from training logs; 0 for a bin
+    or an action the training logs never hold."""
+    pairs = {}
+    totals = {}
+    for b, c in zip(np.asarray(train_bins).tolist(), np.asarray(train_codes).tolist(), strict=True):
+        pairs[(b, c)] = pairs.get((b, c), 0) + 1
+        totals[b] = totals.get(b, 0) + 1
+    return np.asarray([pairs.get((b, c), 0) / totals[b] if b in totals else 0.0
+                       for b, c in zip(np.asarray(bins).tolist(), np.asarray(codes).tolist(),
+                                       strict=True)])
+
+
+def stacked(arrays, fill=0.0):
+    """Trajectories as one matrix, padded with `fill`, for estimators on row subsets."""
+    return _stack(arrays, fill)
+
+
+def _normalized(log_w):
+    top = log_w.max(axis=0)
+    finite = np.isfinite(top)
+    return np.exp(np.where(finite, log_w - np.where(finite, top, 0.0), -np.inf))
+
+
+def pdwis_rows(r, log_w):
+    """`pdwis` on stacked matrices (rows are trajectories)."""
+    return float(_mean_by(_normalized(log_w), r).sum())
+
+
+def doubly_robust_rows(r, log_w, log_w_prev, q_logged, q_target, present):
+    """`doubly_robust` on stacked matrices; `log_w_prev` is the log weight before each
+    decision's own ratio (0 at the first decision), `present` marks the real decisions."""
+    w = _normalized(log_w)
+    w_prev = _normalized(log_w_prev) * present
+    return float((_mean_by(w, r - q_logged) + _mean_by(w_prev, q_target)).sum())
+
+
+def direct_rows(q_target):
+    """`direct` on a stacked matrix padded with zeros."""
+    return float(q_target.sum(axis=1).mean())
+
+
+def interval_rows(estimator, units, mean_block, replicates, seed, confidence=0.90):
+    """The estimate on every row, and the percentile interval over the stationary bootstrap of
+    the ordered `units`, each a list of row indices (one day's trajectories)."""
+    point = estimator(np.concatenate([np.asarray(u) for u in units]))
+    draws = [estimator(np.concatenate([np.asarray(units[i]) for i in index]))
+             for index in stationary_bootstrap_indices(len(units), mean_block, replicates, seed)]
+    tail = (1.0 - confidence) / 2.0
+    low, high = np.quantile(draws, [tail, 1.0 - tail])
+    return point, float(low), float(high)

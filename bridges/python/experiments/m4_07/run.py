@@ -469,6 +469,259 @@ def rate(study):
     return report
 
 
+# The analysis.
+
+COUNTED = "as_grid_eps30_counted"
+
+
+def log_paths(study, split):
+    report = json.loads((study.out / f"logs-{split}.json").read_text())
+    for row in report["logs"]:
+        if sha256(row["path"]) != row["sha256"]:
+            raise ValueError(f"{row['path']} changed after it was written")
+    return report["logs"]
+
+
+def read_log(row):
+    with np.load(row["path"]) as data:
+        return {key: data[key] for key in data.files}
+
+
+def fit_direct(study, rows, alphas):
+    """The direct method's moments over the training logs of one behaviour, streamed."""
+    offsets, sizes = study.grid_spec["bid_offsets"], study.grid_spec["sizes"]
+    xtx = xty = None
+    yty = 0.0
+    for row in rows:
+        log = read_log(row)
+        x = est.features(log["observation"], log["action"], offsets, sizes)
+        y = log["reward"]
+        xtx = x.T @ x if xtx is None else xtx + x.T @ x
+        xty = x.T @ y if xty is None else xty + x.T @ y
+        yty += float(y @ y)
+    return {alpha: est.ridge_from_moments(xtx, xty, alpha) for alpha in alphas}
+
+
+def squared_errors(study, rows, betas):
+    offsets, sizes = study.grid_spec["bid_offsets"], study.grid_spec["sizes"]
+    errors = dict.fromkeys(betas, 0.0)
+    for row in rows:
+        log = read_log(row)
+        x = est.features(log["observation"], log["action"], offsets, sizes)
+        for alpha, beta in betas.items():
+            errors[alpha] += float(np.sum((log["reward"] - x @ beta) ** 2))
+    return errors
+
+
+def imbalance_edges(study, rows):
+    values = []
+    for row in rows:
+        obs = read_log(row)["observation"]
+        present = obs[:, 11 + IMBALANCE] > 0
+        values.append(obs[present, IMBALANCE])
+    return np.quantile(np.concatenate(values), [0.2, 0.4, 0.6, 0.8]).tolist()
+
+
+def counting_table(study, rows, edges):
+    bins, codes = [], []
+    for row in rows:
+        log = read_log(row)
+        bins.append(est.bin_states(log["observation"], edges))
+        codes.append(log["action"])
+    return np.concatenate(bins), np.concatenate(codes)
+
+
+def trajectories(study, split, behaviour, beta, counting=None, edges=None):
+    """Per target, the stacked matrices of one behaviour's logs on a split, and the day units."""
+    logged_behaviour = "as_grid_eps30" if behaviour == COUNTED else behaviour
+    rows = [r for r in log_paths(study, split) if r["behaviour"] == logged_behaviour]
+    rows.sort(key=lambda r: (study.regimes.index(r["regime"]), r["day"], r["seed"]))
+    offsets, sizes = study.grid_spec["bid_offsets"], study.grid_spec["sizes"]
+    names = None
+    per_target = {}
+    rewards, q_logged, units, unit_of = [], [], [], {}
+    for index, row in enumerate(rows):
+        log = read_log(row)
+        names = [str(n) for n in log["target_names"]]
+        rewards.append(log["reward"])
+        q_logged.append(est.features(log["observation"], log["action"], offsets, sizes) @ beta)
+        if behaviour == COUNTED:
+            bins = est.bin_states(log["observation"], edges)
+            mu_logged = est.counted_propensity(*counting, bins, log["action"])
+        else:
+            mu_logged = log["propensity"]
+        key = (row["regime"], row["day"])
+        if key not in unit_of:
+            unit_of[key] = len(units)
+            units.append([])
+        units[unit_of[key]].append(index)
+        for t, name in enumerate(names):
+            codes = log["target_code"][t]
+            if behaviour == COUNTED:
+                mu_target = est.counted_propensity(*counting, bins, codes)
+            else:
+                mu_target = log["target_mu"][t]
+            entry = per_target.setdefault(name, {"rho": [], "mu_target": [], "q_target": []})
+            entry["rho"].append(est.ratios(codes == log["action"], mu_logged))
+            entry["mu_target"].append(mu_target)
+            entry["q_target"].append(est.features(log["observation"], codes, offsets, sizes) @ beta)
+    return names, per_target, rewards, q_logged, units
+
+
+def assess(study, split, behaviour, target, data, rewards, q_logged, units, window=None):
+    """The estimates, intervals and diagnostics of one target on one behaviour's logs."""
+    settings = study.design["estimator_settings"]
+    boot = study.design["intervals"]
+    ess = {w: est.effective_sample_share([est.log_window_weights(r, w) for r in data["rho"]])
+           for w in settings["window_choices"]}
+    if window is None:
+        window = est.choose_window(ess, rule.MIN_EFFECTIVE_SAMPLE)
+    log_w = [est.log_window_weights(r, window) for r in data["rho"]]
+    log_prev = [np.concatenate(([0.0], lw[:-1])) for lw in log_w]
+    r = est.stacked(rewards)
+    lw = est.stacked(log_w, fill=-np.inf)
+    lp = est.stacked(log_prev, fill=-np.inf)
+    ql = est.stacked(q_logged)
+    qt = est.stacked(data["q_target"])
+    present = est.stacked([np.ones(len(x)) for x in rewards])
+    args = (boot["mean_block_days"], boot["replicates"], boot["seed"])
+    importance = est.interval_rows(lambda rows: est.pdwis_rows(r[rows], lw[rows]), units, *args)
+    robust = est.interval_rows(
+        lambda rows: est.doubly_robust_rows(r[rows], lw[rows], lp[rows], ql[rows], qt[rows],
+                                            present[rows]), units, *args)
+    model = est.interval_rows(lambda rows: est.direct_rows(qt[rows]), units, *args)
+    mu = np.concatenate(data["mu_target"])
+    effective = est.effective_sample_share(log_w)
+    diagnostics = {
+        "propensity_recorded": behaviour != COUNTED,
+        "out_of_support_by_construction": False,
+        "zero_propensity": int(np.sum(mu == 0)),
+        "effective_sample": effective,
+        "max_weight": est.max_normalized_weight(log_w),
+        "cross_check": est.overlap(importance, robust),
+    }
+    decision, reasons = rule.decide(diagnostics)
+    return {
+        "split": split, "behaviour": behaviour, "target": target, "window": window,
+        "effective_sample_by_window": ess, "low_propensity": float(np.mean(mu < rule.LOW_PROPENSITY)),
+        "estimates": {"pdwis_window": importance, "dr": robust, "dm": model,
+                      "label": "[estimated]"},
+        "diagnostics": diagnostics, "decision": decision, "reasons": reasons,
+    }
+
+
+def truth_by_target(study, split):
+    path = study.out / f"truth-{split}.json"
+    rows = json.loads(path.read_text())["rows"]
+    out = {}
+    for row in rows:
+        out.setdefault(row["target"], []).append(Decimal(row["net"]))
+    return {t: {"mean_daily_net": str(sum(v, Decimal(0)) / len(v)), "days": len(v),
+                "label": "[simulated]"} for t, v in out.items()}
+
+
+def behaviours(study):
+    return [name for name in study.design["behaviours"]]
+
+
+def validation(study):
+    """The estimator settings, the validation diagnostics and the stop rule. The truth is
+    attached to each row for the report and read by nothing here."""
+    settings = study.design["estimator_settings"]
+    train = log_paths(study, "train")
+    valid = log_paths(study, "validation")
+    report = study.header("validation")
+    fitted, edges, counting = {}, None, None
+    for name in behaviours(study):
+        logged = "as_grid_eps30" if name == COUNTED else name
+        if logged in fitted:
+            continue
+        train_rows = [r for r in train if r["behaviour"] == logged]
+        betas = fit_direct(study, train_rows, settings["ridge_alpha_choices"])
+        errors = squared_errors(study, [r for r in valid if r["behaviour"] == logged], betas)
+        alpha = min(errors, key=lambda a: (errors[a], a))
+        fitted[logged] = {"alpha": alpha, "beta": betas[alpha].tolist(),
+                          "validation_squared_error": errors}
+    eps30_train = [r for r in train if r["behaviour"] == "as_grid_eps30"]
+    edges = imbalance_edges(study, eps30_train)
+    counting = counting_table(study, eps30_train, edges)
+    report["direct_method"] = fitted
+    report["imbalance_edges"] = edges
+    rows = []
+    for name in behaviours(study):
+        logged = "as_grid_eps30" if name == COUNTED else name
+        beta = np.asarray(fitted[logged]["beta"])
+        names, per_target, rewards, q_logged, units = trajectories(
+            study, "validation", name, beta, counting, edges)
+        for target in names:
+            rows.append(assess(study, "validation", name, target, per_target[target], rewards,
+                               q_logged, units))
+    report["rows"] = rows
+    report["settings"] = {f"{r['behaviour']}/{r['target']}": r["window"] for r in rows}
+    eps30 = {r["target"]: r["diagnostics"]["effective_sample"] for r in rows
+             if r["behaviour"] == "as_grid_eps30"}
+    report["stop"] = rule.stop_on_validation(eps30)
+    report["truth"] = truth_by_target(study, "validation")
+    report["out_of_support_by_construction"] = study.design["out_of_support_by_construction"]
+    study.write("validation", report)
+    return report
+
+
+def freeze(study):
+    """The hashes of the design, the code, the validation report and every log written so far,
+    before any holdout log exists."""
+    validation_report = json.loads((study.out / "validation.json").read_text())
+    if validation_report["stop"]:
+        raise ValueError("the validation stop rule holds: the holdout stays closed")
+    manifest = study.header("freeze")
+    manifest["validation_sha256"] = sha256(study.out / "validation.json")
+    manifest["logs"] = {split: sha256(study.out / f"logs-{split}.json")
+                        for split in ("train", "validation")}
+    manifest["truth"] = {split: sha256(study.out / f"truth-{split}.json")
+                         for split in ("train", "validation")}
+    path = study.write("frozen", manifest)
+    return {"frozen_sha256": sha256(path)}
+
+
+def holdout(study, frozen_sha256):
+    """The holdout's logs, truth, estimates and decisions, once, with the frozen settings."""
+    path = study.out / "frozen.json"
+    if sha256(path) != frozen_sha256:
+        raise ValueError("the frozen manifest is not the one given")
+    if (study.out / "holdout.json").exists():
+        raise ValueError("the holdout was evaluated already")
+    frozen = json.loads(path.read_text())
+    here = study.header("holdout")
+    for key in ("design_sha256", "code_sha256"):
+        if frozen[key] != here[key]:
+            raise ValueError(f"{key} changed after the freeze")
+    if frozen["validation_sha256"] != sha256(study.out / "validation.json"):
+        raise ValueError("validation.json changed after the freeze")
+    validation_report = json.loads((study.out / "validation.json").read_text())
+    run_logs(study, "holdout")
+    run_truth(study, "holdout")
+    edges = validation_report["imbalance_edges"]
+    train = [r for r in log_paths(study, "train") if r["behaviour"] == "as_grid_eps30"]
+    counting = counting_table(study, train, edges)
+    rows = []
+    for name in behaviours(study):
+        logged = "as_grid_eps30" if name == COUNTED else name
+        beta = np.asarray(validation_report["direct_method"][logged]["beta"])
+        names, per_target, rewards, q_logged, units = trajectories(
+            study, "holdout", name, beta, counting, edges)
+        for target in names:
+            window = validation_report["settings"][f"{name}/{target}"]
+            rows.append(assess(study, "holdout", name, target, per_target[target], rewards,
+                               q_logged, units, window))
+    here["frozen_sha256"] = frozen_sha256
+    here["rows"] = rows
+    here["truth"] = truth_by_target(study, "holdout")
+    here["out_of_support_by_construction"] = study.design["out_of_support_by_construction"]
+    here["real_data"] = study.design["decision_rule"]["real_data"]
+    study.write("holdout", here)
+    return here
+
+
 def main():
     step, data_dir, run_dir, out_dir, commit = sys.argv[1:6]
     study = Study(data_dir, run_dir, out_dir, commit)
@@ -481,6 +734,12 @@ def main():
         report = run_logs(study, sys.argv[6])
     elif step == "truth":
         report = run_truth(study, sys.argv[6])
+    elif step == "validation":
+        report = validation(study)
+    elif step == "freeze":
+        report = freeze(study)
+    elif step == "holdout":
+        report = holdout(study, sys.argv[6])
     else:
         raise SystemExit(f"step {step!r} is not implemented yet")
     summary = {k: v for k, v in report.items() if not isinstance(v, list)}

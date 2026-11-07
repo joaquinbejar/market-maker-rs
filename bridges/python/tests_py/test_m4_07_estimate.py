@@ -133,3 +133,76 @@ def test_an_interval_of_a_constant_is_that_constant_and_intervals_overlap_by_bou
     assert (point, low, high) == (3.0, 3.0, 3.0)
     assert est.overlap((0, 1.0, 2.0), (0, 2.0, 3.0))
     assert not est.overlap((0, 1.0, 2.0), (0, 2.1, 3.0))
+
+
+def test_the_window_is_the_largest_effective_sample_that_passes_or_the_shortest():
+    assert est.choose_window({1: 0.4, 10: 0.2, 100: 0.01}, 0.05) == 1
+    assert est.choose_window({1: 0.1, 10: 0.3, 100: 0.01}, 0.05) == 10
+    assert est.choose_window({1: 0.01, 10: 0.02, 100: None}, 0.05) == 1
+    # A tie goes to the shorter window.
+    assert est.choose_window({1: 0.3, 10: 0.3}, 0.05) == 1
+
+
+OFFSETS = [0, 1, 2, 4, 8]
+SIZES = [1, 2]
+
+
+def test_codes_decode_to_the_grid():
+    assert est.decode(0, OFFSETS, SIZES) == (0, 0, 0, 0, 0)
+    # code = 1 + ((bid * 5 + ask) * 2 + bid size) * 2 + ask size
+    assert est.decode(1 + ((3 * 5 + 3) * 2 + 0) * 2 + 0, OFFSETS, SIZES) == (1, 4, 4, 1, 1)
+    assert est.decode(1 + ((4 * 5 + 0) * 2 + 1) * 2 + 1, OFFSETS, SIZES) == (1, 8, 0, 2, 2)
+    assert est.decode(100, OFFSETS, SIZES) == (1, 8, 8, 2, 2)
+
+
+def test_the_direct_methods_features():
+    obs = np.zeros((2, 22))
+    obs[:, 6] = [0.5, -0.25]
+    obs[:, 0] = [0.2, 0.4]
+    codes = [0, 1 + ((4 * 5 + 0) * 2 + 1) * 2 + 1]
+    x = est.features(obs, codes, OFFSETS, SIZES)
+    assert x.shape == (2, 1 + 22 + 5 + 3)
+    assert x[0, 23:].tolist() == [0, 0, 0, 0, 0, 0, 0, 0]
+    # quote, bid 8/8, ask 0/8, sizes 2/2; quote*pos, (bid-ask)*pos, quote*spread.
+    assert x[1, 23:].tolist() == pytest.approx([1, 1, 0, 1, 1, -0.25, -0.25, 0.4])
+
+
+def test_bins_and_counted_propensities():
+    obs = np.zeros((4, 22))
+    obs[:, 0] = [0.1, 0.2, 0.4, 0.9]  # 1, 2, 4 and 9 ticks
+    obs[:, 1] = [0.0, 0.1, 0.3, 0.6]
+    obs[:, 12] = [0, 1, 1, 1]  # the first has no mid change
+    obs[:, 5] = [-0.9, 0.0, 0.5, 0.9]
+    obs[:, 16] = [1, 1, 1, 0]  # the last has no imbalance
+    edges = [-0.5, 0.0, 0.5, 0.75]
+    bins = est.bin_states(obs, edges)
+    # (spread bin * 5 + change bin) * 6 + imbalance bin
+    assert bins.tolist() == [(0 * 5 + 4) * 6 + 0, (1 * 5 + 1) * 6 + 2,
+                             (2 * 5 + 2) * 6 + 3, (4 * 5 + 3) * 6 + 5]
+    train_bins = [7, 7, 7, 9]
+    train_codes = [0, 0, 5, 3]
+    mu = est.counted_propensity(train_bins, train_codes, [7, 7, 9, 11, 9], [0, 5, 3, 0, 4])
+    assert mu.tolist() == pytest.approx([2 / 3, 1 / 3, 1.0, 0.0, 0.0])
+
+
+def test_the_row_estimators_equal_the_list_ones():
+    rng = np.random.default_rng(11)
+    lengths = [5, 5, 4]
+    rewards = [rng.normal(size=n) for n in lengths]
+    log_w = [np.log(rng.uniform(0.1, 3.0, size=n)) for n in lengths]
+    logged = [rng.normal(size=n) for n in lengths]
+    target = [rng.normal(size=n) for n in lengths]
+    r = est.stacked(rewards)
+    lw = est.stacked(log_w, fill=-np.inf)
+    prev = est.stacked([np.concatenate(([0.0], x[:-1])) for x in log_w], fill=-np.inf)
+    present = est.stacked([np.ones(n) for n in lengths])
+    assert est.pdwis_rows(r, lw) == pytest.approx(est.pdwis(rewards, log_w))
+    assert est.doubly_robust_rows(
+        r, lw, prev, est.stacked(logged), est.stacked(target), present
+    ) == pytest.approx(est.doubly_robust(rewards, log_w, logged, target))
+    assert est.direct_rows(est.stacked(target)) == pytest.approx(est.direct(target))
+    units = [[0], [1, 2]]
+    point, low, high = est.interval_rows(lambda rows: est.pdwis_rows(r[rows], lw[rows]),
+                                         units, 2.0, 50, 104)
+    assert point == pytest.approx(est.pdwis(rewards, log_w))
+    assert low <= high
