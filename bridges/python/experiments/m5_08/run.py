@@ -7,7 +7,7 @@ From `bridges/python`, after `regime_days` wrote the days and `regime_alarm` the
     python experiments/m5_08/run.py train <data dir> <out dir> <commit> <parallel> <arm> <#103 validation sha256>
     python experiments/m5_08/run.py freeze <data dir> <out dir>
     python experiments/m5_08/run.py holdout <data dir> <out dir> <commit> <frozen sha256> <parallel>
-    python experiments/m5_08/run.py report <data dir> <out dir> <intervals binary>
+    python experiments/m5_08/run.py report <data dir> <out dir> <intervals binary> [<name>]
 
 Everything #103 fixes comes from its runner (`experiments/m4_06/run.py`): the configuration, the
 Box encoding with the reject policy, the classical baselines as zero residuals, the learned arms
@@ -390,7 +390,10 @@ class Context:
         return out
 
     def alarm_files(self):
-        return sorted(pathlib.Path(self.data_dir).glob("*/*/day-*.alarm-*.json"))
+        """The frozen detector's files only, one per simulator fitted on: not the tagged files of
+        a post hoc sensitivity run."""
+        root = pathlib.Path(self.data_dir)
+        return sorted(p for fit in SIMULATORS for p in root.glob(f"*/*/day-*.alarm-{fit}.json"))
 
 
 def check(ctx):
@@ -563,11 +566,12 @@ def detector_metrics(ctx, fitted, sim):
             calm_days += 1
             out["calm_onsets"] += len(onsets)
         for name, start, end in segments:
+            # Design change (h): the first onset at or after the start; an alarm already on at
+            # the start (latched from a false alarm) is not a detection.
             inside = [r for r in onsets if start <= r < end]
-            on_at_start = bool(alarm[start])
-            delay = 0 if on_at_start else (inside[0] - start if inside else None)
+            delay = inside[0] - start if inside else None
             out["changes"].append({"day": day, "regime": name, "start": start, "delay_s": delay,
-                                   "missed": delay is None})
+                                   "missed": delay is None, "on_at_start": bool(alarm[start])})
     out["false_alarms_per_calm_day"] = out["calm_onsets"] / calm_days
     return out
 
@@ -612,7 +616,7 @@ def summary(rows, arm, fitted, sim, execution, fee, days):
     }
 
 
-def report(ctx, binary):
+def report(ctx, binary, name="report"):
     design, rule = ctx.design, ctx.design["decision_rule"]
     rows = json.loads((ctx.out / "holdout.json").read_text())["rows"]
     days = days_of(design, "holdout")
@@ -677,7 +681,7 @@ def report(ctx, binary):
     result = {**ctx.header("report"), "rule": rule, "groups": groups, "detectors": detectors,
               "decisions": decisions, "go": verdict,
               "not_run": {"S3": "#106 had not adopted its neural simulator at the freeze"}}
-    print(json.dumps(verdict), ctx.write("report", result))
+    print(json.dumps(verdict), ctx.write(name, result))
 
 
 def main():
@@ -694,7 +698,7 @@ def main():
     elif step == "holdout":
         holdout(Context(sys.argv[2], sys.argv[3], sys.argv[4]), sys.argv[5], int(sys.argv[6]))
     elif step == "report":
-        report(Context(sys.argv[2], sys.argv[3], None), sys.argv[4])
+        report(Context(sys.argv[2], sys.argv[3], None), sys.argv[4], *sys.argv[5:6])
     else:
         raise SystemExit(f"unknown step {step}")
 

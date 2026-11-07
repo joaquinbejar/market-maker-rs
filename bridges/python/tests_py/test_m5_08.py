@@ -182,6 +182,8 @@ def test_the_detector_metrics_count_delays_misses_and_false_alarms(monkeypatch):
             alarm[5000:5001] = [1]
         if day == 22:  # stress from 54000: on at 54120
             alarm[54_120:60_000] = [1] * (60_000 - 54_120)
+        if day == 23:  # thin from 21600: latched on from before it, never a new onset inside
+            alarm[21_000:30_000] = [1] * 9_000
         alarms[day] = [(a, 1.0) for a in alarm]
     monkeypatch.setattr(run, "read_alarm", lambda d, f, s, day, *a: alarms[day])
 
@@ -194,12 +196,26 @@ def test_the_detector_metrics_count_delays_misses_and_false_alarms(monkeypatch):
     stress = [c for c in out["changes"] if c["regime"] == "stressed"]
     thin = [c for c in out["changes"] if c["regime"] == "thin"]
     assert stress == [{"day": 22, "regime": "stressed", "start": 54_000, "delay_s": 120,
-                       "missed": False}]
-    assert thin[0]["missed"] and thin[0]["delay_s"] is None
+                       "missed": False, "on_at_start": False}]
+    # An alarm already on at the change is not a detection: no onset inside, so missed.
+    assert thin[0]["missed"] and thin[0]["delay_s"] is None and thin[0]["on_at_start"]
     # Two onsets over the calm days 20, 21 and 24.
     assert out["false_alarms_per_calm_day"] == pytest.approx(2 / 3)
     assert out["seconds"]["stressed/on"] == 60_000 - 54_120
     assert out["seconds"]["stressed/off"] == 14_400 - (60_000 - 54_120)
+
+
+def test_the_frozen_alarm_files_leave_out_tagged_sensitivity_files(tmp_path):
+    for name in ("day-20.alarm-s1.json", "day-20.alarm-s2.json", "day-20.alarm-s1-wallclock.json"):
+        path = tmp_path / "holdout" / "s1" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]")
+
+    class Ctx:
+        data_dir = str(tmp_path)
+
+    found = [p.name for p in run.Context.alarm_files(Ctx())]
+    assert found == ["day-20.alarm-s1.json", "day-20.alarm-s2.json"]
 
 
 def test_the_holdout_is_refused_outside_its_step(tmp_path):
