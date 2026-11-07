@@ -1,0 +1,86 @@
+{
+  "issue": 111,
+  "step": "1b",
+  "version": 1,
+  "what": "a second, bounded check after step 1 failed: the time step, the reading of the initial variance in the papers' text, and the two step 1 checks whose criteria had no Monte Carlo tolerance; fixed before anything runs",
+  "follows": "step 1 (criteria.json, version 1), reported as FAIL on the issue",
+  "papers": {
+    "market_making": "Rosenbaum and Zhang, Multi-asset market making under the quadratic rough Heston, arXiv:2212.10164v1",
+    "calibration": "Rosenbaum and Zhang, Deep calibration of the quadratic rough Heston model, arXiv:2107.01611 (reference [28] of the first)"
+  },
+  "declared": [
+    "the same synthetic setting as step 1: Monte Carlo paths of the model at the papers' SPX parameters, calibrated to nothing here and never standing for BTC or any other market",
+    "only the SPX part is in scope, as in step 1",
+    "the optimal ratio check of step 1 is not run again; its step 1 fail stands and is reported with step 1b",
+    "the at-the-money level check of step 1 is not judged again; it follows from the initial variance and is reported only"
+  ],
+  "grid": {
+    "spot": "3000",
+    "maturities": [0.03, 0.05, 0.07, 0.09],
+    "log_moneyness": [-0.15, -0.1, -0.05, 0.0, 0.05],
+    "paths": 20000,
+    "seed": 7,
+    "source": "the step 1 grid, unchanged"
+  },
+  "checks": {
+    "dt_convergence": {
+      "what": "the call price at every maturity and strike of the grid, at dt 0.0005, 0.00025, 0.000125 and 0.0000625 years, with the same paths and seed",
+      "dts": [0.0005, 0.00025, 0.000125, 0.0000625],
+      "pass": "converged at every maturity and strike: the prices at the last two dts (0.000125 and 0.0000625) differ by less than 2 standard errors, the standard error being the larger of the two prices' Monte Carlo standard errors",
+      "reported": "the whole sweep; and, descriptive only, the noise-free path of the variance (dW = 0) at each dt, with the factors decayed by the scheme's implicit step and by their exact exponential decay, to show where the time step error comes from"
+    },
+    "initial_variance": {
+      "what": "V0 = a (Z0 - b)^2 + c at 2212.10164v1 Section 4.2.1 (a 0.265, b 0.246, c 0.0001, the printed z0), against the printed V0 = 0.18 per year",
+      "readings": {
+        "R1": {
+          "reading": "Z0 = sum c_i z0_i, with (c_i, gamma_i) the geometric partition of 2107.01611 Appendix A for K(t) = t^(alpha - 1) / Gamma(alpha), alpha 0.51, n 10, x 3.92, and z0_i paired with c_i in the order of the partition (i = 1 the slowest factor)",
+          "text": [
+            "2212.10164v1 equation (2.1) and footnote 6: the same multi-factor approximation as [28], the same (c_i, gamma_i), Z_t = sum c_i Z^i_t, Z^i_0 = z0_i",
+            "2107.01611 equations (2.3) to (2.5), Appendix A (c_i, gamma_i in closed form, eta_i = x^(i - n/2)), and the caption of Figure C.6: Z0 := sum c_i z0_i",
+            "2107.01611 Appendix C.2: the same z0 and (a, b, c), with lambda 1.717, as the calibration of 10 September 2019; 2212.10164 prints lambda 1.7, which does not enter V0",
+            "2107.01611 Figure A.3: log c_i and log gamma_i increase with i, the order used here"
+          ],
+          "supported_by_the_text": true
+        },
+        "R1_rounding": {
+          "reading": "R1 over every value the printed numbers round from: each z0_i within 0.0005 of its printed value, a within 0.0005, b within 0.0005, c within 0.00005; the interval of V0 that gives",
+          "text": ["the printed values have three or four decimals"],
+          "supported_by_the_text": true
+        },
+        "R2": {
+          "reading": "R1 with the c_i of the kernel t^(alpha - 1) without 1 / Gamma(alpha)",
+          "text": ["none: 2107.01611 Appendix A has mu(dx) = x^(-alpha) / (Gamma(alpha) Gamma(1 - alpha)) dx, which is the kernel with 1 / Gamma(alpha)"],
+          "supported_by_the_text": false
+        },
+        "R3": {
+          "reading": "R1 with z0 paired with the c_i in the reverse order (z0_1 with the fastest factor)",
+          "text": ["none: Figure A.3 of 2107.01611 orders the factors from the slowest to the fastest"],
+          "supported_by_the_text": false
+        },
+        "R4": {
+          "reading": "Z0 = sum z0_i, without the weights",
+          "text": ["none: both papers define Z0 with the weights c_i"],
+          "supported_by_the_text": false
+        }
+      },
+      "pass": "the printed 0.18 is reproduced by a reading the text supports: the R1 value rounds to 0.18 at two decimals, or the R1_rounding interval meets [0.175, 0.185]",
+      "rule_for_readings": "every reading is computed and reported; a reading the text does not support is never adopted, whatever V0 it gives, and no reading is chosen because it gives 0.18",
+      "reported": "the Z0 that would give V0 = 0.18 at the printed (a, b, c), descriptive only"
+    },
+    "no_arbitrage_bounds": {
+      "what": "replaces the step 1 bounds check, which had no Monte Carlo tolerance",
+      "pass": "at the finest dt, every call is at least max(S - K, 0) - 3 standard errors and at most S + 3 standard errors"
+    },
+    "negative_skew": {
+      "what": "replaces the step 1 skew check, which required a strictly decreasing smile over every strike with no Monte Carlo tolerance",
+      "pass": "at the finest dt and at every maturity, the implied volatility at log-moneyness -0.10 is above the one at 0 by more than 3 combined standard errors, an implied volatility's standard error being its price's standard error divided by the Black-Scholes vega at that volatility"
+    },
+    "put_call_parity": {
+      "what": "the step 1 parity check, run again at the finest dt",
+      "pass": "within 3 Monte Carlo standard errors at every strike and maturity"
+    }
+  },
+  "rule": "step 1b passes when every check passes. If initial_variance fails, #111 stops: it is closed out with Refs and the statement that the papers' parameters cannot be reproduced from their text, and step 2 does not start. If another check fails, step 1b stops and is reported.",
+  "compute": "one core; minutes",
+  "data": "synthetic: Monte Carlo paths of the model at the papers' parameters; no market data"
+}

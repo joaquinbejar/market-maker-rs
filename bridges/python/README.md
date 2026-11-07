@@ -14,6 +14,7 @@ It is not published.
 - `python/mm_rl_bridge/envs.py`: thin `gymnasium.Env` classes. `MaskableMarketMakingEnv` is
   discrete, for `MaskablePPO`, `BoxMarketMakingEnv` is continuous, for `SAC`, and
   `ResidualMarketMakingEnv` is a bounded correction to a classical quote, for `SAC`.
+- `python/mm_rl_bridge/expiry.py`: `ExpiringQuote`, a quote that expires by itself.
 - `python/mm_rl_bridge/training.py`: training, checkpoints with their metadata, inference
   only loading and a protocol of train, select and one holdout evaluation.
 
@@ -31,6 +32,29 @@ continuous one adds a sixth value, above zero for a hedge of the size at bin `(2
 hedge outside the mask is a charged hold. Either way a hedge replaces the resting orders, so the
 other values are not read. A residual environment takes no hedge actions and refuses the flag. A
 checkpoint loads only into an environment with the same flag.
+
+A residual's baseline is `avellaneda_stoikov`, `glft`, or `scheduled`: `{"kind": "scheduled",
+"points": [...], "changes": [[row, index], ...]}` quotes with `points[0]` from the start and,
+from each change on, with the point it names. A change at row `r` applies from the first decision
+whose observation holds row `r` or a later one, so it never acts on a row the agent has not
+observed. The points are Avellaneda-Stoikov or GLFT configurations. Change rows must increase
+strictly, and each change must name a point other than the one in force.
+
+With `"cancel_action": true` (off by default, with the same guarantee), the action space has
+the library's cancel-only action, `CancelActions::CancelOnly`, of action space version 4: every
+resting or pending order is cancelled and nothing is sent. The maskable encoding gives the first
+value a third choice, 2, always allowed; the continuous one adds a last value, above zero for a
+cancel, read after a hedge and before a quote. The bridge drives version 4 only with the flag,
+so a checkpoint of one space is refused by the other, and a residual environment refuses it.
+
+`ExpiringQuote(env, rows=d)` wraps such an environment so that a quote expires by itself: after
+a quote the environment applied it holds for `d - 1` decisions and cancels at the decision `d`
+rows after the quote, with no decision of the policy, which decides again on the next row. In
+venue time the quote rests `d` rows plus the cancel latency less the submission latency, so
+exactly `d` rows when the two are equal: with no latency it can fill on rows `t + 1` to `t + d`
+and not after. A fill before the cancel arrives stands, and a cancel that reaches an order
+already filled is rejected. A cancel scheduled in the kernel, exact in venue time whatever the
+latencies, is not modelled (#297).
 
 Money crosses the boundary only as decimal strings and rows as integer ticks and lots. The
 `f32` reward is the kernel's derived value, and `info` holds the exact reward and net result,

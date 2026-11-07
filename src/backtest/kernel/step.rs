@@ -17,7 +17,7 @@ use super::book::{
 use super::config::{ValidFill, ValidatedConfig};
 use super::data::{KernelDataset, KernelTick, NS_PER_MS};
 use super::encode::insert_by_id;
-use super::gate::{self, GateVerdict};
+use super::gate::{self, Balances, GateCheck, GateVerdict, MarginTerms};
 use super::grid::{half_units_decimal, scaled_decimal};
 use super::state::{
     ActionStatus, EventSink, GateRecord, HaltReason, KernelEvent, KernelState, Phase, QueueLengths,
@@ -25,6 +25,10 @@ use super::state::{
 };
 
 type Halt = HaltReason;
+
+/// The combined limits of a hedged kernel, with the counter of the orders
+/// they refuse; `None` for a kernel alone.
+pub(super) type Combined<'a> = Option<(&'a super::hedge::CombinedCheck, &'a mut u64)>;
 
 /// Counts the agent-facing events forwarded to the caller's sink.
 ///
@@ -57,6 +61,10 @@ impl<E: EventSink> EventSink for Em<'_, E> {
             }
         }
         self.sink.event(event);
+    }
+
+    fn hedge(&mut self, event: super::hedge::HedgeEvent) {
+        self.sink.hedge(event);
     }
 
     fn queues(&mut self, lengths: QueueLengths) {
@@ -986,11 +994,12 @@ pub(super) fn apply_quote<
     cfg: &ValidatedConfig,
     s: &mut St<ORD, MSG, DLV, OBS>,
     legs: Legs,
+    combined: Combined<'_>,
     em: &mut E,
 ) -> Result<(), Halt> {
     let undo = Undo::save(s);
     let mut buf = Buf::new();
-    let mut result = quote_transaction(cfg, s, legs, &mut buf);
+    let mut result = quote_transaction(cfg, s, legs, combined, &mut buf);
     if result.is_ok() && buf.full {
         result = Err(Halt::CounterOverflow);
     }
@@ -1054,6 +1063,7 @@ pub(super) fn quote_transaction<
     cfg: &ValidatedConfig,
     t: &mut St<ORD, MSG, DLV, OBS>,
     legs: Legs,
+    mut combined: Combined<'_>,
     em: &mut E,
 ) -> Result<(), Halt> {
     let now = t.now_ns;
@@ -1074,20 +1084,76 @@ pub(super) fn quote_transaction<
         account::open(&mut t.account, id).map_err(|_| Halt::CounterOverflow)?;
         let mut refused = crossed;
         let mut size = lots;
+        let mut record = None;
         if !refused && let Some(limits) = &cfg.limits {
             let decision = gate::check(limits, &t.gate, &cfg.tick, &cfg.lot, dir, price, lots)
                 .map_err(|_| Halt::GateNumeric)?;
-            em.event(KernelEvent::Gate(GateRecord {
+            record = Some(GateRecord {
                 order_id: id,
                 side: dir.into(),
                 requested: lots,
                 verdict: decision.verdict,
                 submitted: decision.submitted,
-            }));
+                check: GateCheck::Limits,
+            });
             match decision.verdict {
                 GateVerdict::Accepted | GateVerdict::Reduced => size = decision.submitted,
-                GateVerdict::ReducedOffLot | GateVerdict::Rejected => refused = true,
+                GateVerdict::ReducedOffLot | GateVerdict::Rejected => {
+                    refused = true;
+                }
             }
+        }
+        // The balance gate binds after the limits, on what they approved:
+        // their record is emitted first, then its own.
+        if !refused && let Some(margin) = &cfg.margin {
+            if let Some(record) = record.take() {
+                em.event(KernelEvent::Gate(record));
+            }
+            let terms = MarginTerms {
+                tick: &cfg.tick,
+                lot: &cfg.lot,
+                fee_scale: cfg.fee_scale().ok_or(Halt::GateNumeric)?,
+                fee_num: margin.fee_num,
+            };
+            let balances = balances(cfg, t, &terms).ok_or(Halt::GateNumeric)?;
+            let decision =
+                gate::margin_check(&terms, &balances, dir, price, size).ok_or(Halt::GateNumeric)?;
+            record = Some(GateRecord {
+                order_id: id,
+                side: dir.into(),
+                requested: size,
+                verdict: decision.verdict,
+                submitted: decision.submitted,
+                check: GateCheck::Margin,
+            });
+            match decision.verdict {
+                GateVerdict::Accepted | GateVerdict::Reduced => size = decision.submitted,
+                GateVerdict::ReducedOffLot | GateVerdict::Rejected => {
+                    refused = true;
+                }
+            }
+        }
+        // The combined limits of a hedged kernel bind after the instrument's
+        // own, on what it would submit; without them nothing here changes.
+        if !refused && let Some((check, rejects)) = combined.as_mut() {
+            let admitted = check
+                .admits_quoted(&t.gate, &cfg.tick, &cfg.lot, dir, price, size)
+                .ok_or(Halt::GateNumeric)?;
+            if !admitted {
+                refused = true;
+                bump(rejects)?;
+                record = Some(GateRecord {
+                    order_id: id,
+                    side: dir.into(),
+                    requested: lots,
+                    verdict: GateVerdict::Rejected,
+                    submitted: 0,
+                    check: GateCheck::Combined,
+                });
+            }
+        }
+        if let Some(record) = record {
+            em.event(KernelEvent::Gate(record));
         }
         let order = VenueOrder {
             id,
@@ -1118,6 +1184,43 @@ pub(super) fn quote_transaction<
         )?;
     }
     Ok(())
+}
+
+/// The balances of the balance gate: the quote balance (initial capital,
+/// fill cash flows and fees) less the reservations of the live buys (resting
+/// or in flight to the venue, as the gate's live lots), and the base deposit
+/// plus the venue position less the live sells.
+fn balances<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+    cfg: &ValidatedConfig,
+    t: &St<ORD, MSG, DLV, OBS>,
+    terms: &MarginTerms<'_>,
+) -> Option<Balances> {
+    let margin = cfg.margin.as_ref()?;
+    let activations = t.msgs.as_slice().iter().filter_map(|m| match &m.kind {
+        MsgKind::Activate(order) => Some(order),
+        MsgKind::Cancel { .. } => None,
+    });
+    let reserved = t
+        .orders
+        .as_slice()
+        .iter()
+        .chain(activations)
+        .filter(|o| o.side == Dir::Buy)
+        .try_fold(0i128, |sum, o| {
+            sum.checked_add(terms.buy_reservation_u(o.price, o.remaining())?)
+        })?;
+    let quote_free_u = cfg
+        .c0_u
+        .checked_add(t.venue.cash_u)?
+        .checked_sub(t.venue.fixed_fees_u)?
+        .checked_sub(reserved)?;
+    let base_free_lots = i128::from(margin.base_lots)
+        .checked_add(i128::from(t.gate.venue_pos_lots))?
+        .checked_sub(i128::from(t.gate.live_sell_lots))?;
+    Some(Balances {
+        quote_free_u,
+        base_free_lots,
+    })
 }
 
 /// Records the outcome of an action in the counters.

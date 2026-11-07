@@ -11,8 +11,10 @@ use std::sync::Arc;
 
 use market_maker_rs::backtest::kernel::{KernelFillModel, quote_error_code};
 use market_maker_rs::rl::{
-    ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, OBSERVATION_SPACE_VERSION,
-    REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv,
+    ACTION_SPACE_VERSION, CancelActions, EPISODE_VERSION, EpisodeRecorder,
+    HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION,
+    OBSERVATION_SPACE_VERSION, REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal,
+    RlAction, RlEnv, SpecId,
 };
 use market_maker_rs::types::error::MMError;
 
@@ -379,7 +381,7 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
         .unwrap()
         .info()
         .spec;
-    assert!(known_versions(&id));
+    assert!(known_versions(&id, false));
     for change in 0..4 {
         let mut later = id;
         match change {
@@ -388,8 +390,16 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
             2 => later.reward += 1,
             _ => later.episode += 1,
         }
-        assert!(!known_versions(&later));
+        assert!(!known_versions(&later, false));
     }
+    // An environment with a hedge lane in a second instrument is not one this bridge drives.
+    let hedged = SpecId {
+        observation: HEDGED_OBSERVATION_SPACE_VERSION,
+        action: HEDGED_ACTION_SPACE_VERSION,
+        reward: HEDGED_REWARD_VERSION,
+        ..id
+    };
+    assert!(!known_versions(&hedged, false));
 }
 
 #[test]
@@ -762,7 +772,7 @@ fn test_hedge_actions_are_off_by_default_and_change_the_specification() {
     let hedged = Worker::spawn(bridge, long_rows(), None).unwrap();
     let (p, h) = (plain.info().spec, hedged.info().spec);
     // The same versions, so the bridge drives both; another identity.
-    assert!(known_versions(&p) && known_versions(&h));
+    assert!(known_versions(&p, false) && known_versions(&h, false));
     assert_ne!(p.fingerprint, h.fingerprint);
     // The flag in the configuration.
     let mut json: serde_json::Value =
@@ -907,6 +917,178 @@ fn test_a_rational_queue_rate_is_configured_refused_at_zero_and_in_the_fingerpri
     );
 }
 
+/// Two Avellaneda-Stoikov points that quote different sizes, so the classical action says which
+/// one quoted.
+fn scheduled(changes: &str) -> String {
+    let two = AVELLANEDA.replace(r#""size": "1""#, r#""size": "2""#);
+    format!(r#"{{"kind": "scheduled", "points": [{AVELLANEDA}, {two}], "changes": {changes}}}"#)
+}
+
+fn scheduled_rows() -> Vec<KernelTick> {
+    (0..100_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect()
+}
+
+fn classical_size(decision: &ResidualDecision) -> Option<u64> {
+    match decision.classical {
+        market_maker_rs::backtest::kernel::KernelAction::Quote { bid_lots, .. } => Some(bid_lots),
+        _ => None,
+    }
+}
+
+#[test]
+fn test_a_scheduled_change_applies_from_the_first_decision_that_has_observed_its_row() {
+    const CHANGE: u64 = 40;
+    let mut bridge = residual_config(&scheduled(&format!("[[{CHANGE}, 1]]")));
+    // Under an observation delay longer than the gap between rows.
+    bridge.latency.observation_q = 60;
+    let kernel = bridge.kernel().unwrap();
+    let rows = scheduled_rows();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let rl = bridge.rl().unwrap();
+    let Baseline::Scheduled(source) = parse_baseline(
+        &bridge.residual.as_ref().unwrap().baseline,
+        &bridge.lot_size,
+    )
+    .unwrap() else {
+        panic!("a scheduled baseline");
+    };
+    let bounds = ResidualBounds {
+        price_ticks: 4,
+        size_lots: 1,
+    };
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    worker.reset(3).unwrap();
+    let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
+        ResidualEnv::new(&kernel, &data, source, Decimal::ONE, bounds, rl).unwrap();
+    let mut state = env.reset(3).unwrap();
+    let (mut before, mut after) = (0, 0);
+    let mut first_after = None;
+    for step in 0_u64.. {
+        let seen = env.env().kernel().observe(state.kernel()).row;
+        let direct = env.step(&mut state, ResidualProposal::ZERO).unwrap();
+        let reply = worker.step_residual(ResidualProposal::ZERO).unwrap();
+        assert_eq!(reply.decision, Some(direct.decision));
+        assert_eq!(reply.transition, direct.transition);
+        if let Some(size) = classical_size(&direct.decision) {
+            if seen.is_some_and(|row| row >= CHANGE) {
+                assert_eq!(size, 2, "step {step} saw row {seen:?}");
+                after += 1;
+                first_after = first_after.or(seen);
+            } else {
+                assert_eq!(size, 1, "step {step} saw row {seen:?}");
+                before += 1;
+            }
+        }
+        if direct.transition.terminated || direct.transition.truncated {
+            break;
+        }
+    }
+    assert!(before > 0 && after > 0, "{before} {after}");
+    // The first decision on the new point is the one that observed the change's row.
+    assert_eq!(first_after, Some(CHANGE));
+}
+
+#[test]
+fn test_a_schedule_without_changes_is_its_first_point() {
+    let rows = scheduled_rows();
+    let mut plain = Worker::spawn(residual_config(AVELLANEDA), rows.clone(), None).unwrap();
+    let mut one = Worker::spawn(residual_config(&scheduled("[]")), rows, None).unwrap();
+    plain.reset(5).unwrap();
+    one.reset(5).unwrap();
+    loop {
+        let a = plain.step_residual(ResidualProposal::ZERO).unwrap();
+        let b = one.step_residual(ResidualProposal::ZERO).unwrap();
+        assert_eq!(a, b);
+        if a.transition.terminated || a.transition.truncated {
+            break;
+        }
+    }
+    assert_eq!(plain.attribution().unwrap(), one.attribution().unwrap());
+}
+
+#[test]
+fn test_the_point_in_force_is_that_of_the_last_change_at_or_before_the_row() {
+    let baseline: BaselineConfig =
+        serde_json::from_str(&scheduled("[[10, 1], [20, 0], [30, 1]]")).unwrap();
+    let Baseline::Scheduled(quoter) = parse_baseline(&baseline, "1").unwrap() else {
+        panic!("a scheduled baseline");
+    };
+    let bridge = residual_config(AVELLANEDA);
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(long_rows(), &kernel).unwrap();
+    let env: RlEnv<'_, 1, 1, ORD, MSG, DLV, OBS> = RlEnv::new(
+        &kernel,
+        &data,
+        ActionGrid::new([0], [0], [1]).unwrap(),
+        bridge.rl().unwrap(),
+    )
+    .unwrap();
+    let state = env.reset(1).unwrap();
+    let observed = env.kernel().observe(state.kernel());
+    let at = |row: Option<u64>| {
+        let mut obs = observed;
+        obs.row = row;
+        quoter.in_force(&obs)
+    };
+    let seen: Vec<usize> = [
+        None,
+        Some(0),
+        Some(9),
+        Some(10),
+        Some(19),
+        Some(20),
+        Some(29),
+        Some(30),
+        Some(99),
+    ]
+    .into_iter()
+    .map(at)
+    .collect();
+    assert_eq!(seen, [0, 0, 0, 1, 1, 0, 0, 1, 1]);
+}
+
+#[test]
+fn test_a_malformed_schedule_is_refused() {
+    let refused = |baseline: &str| {
+        let result = Worker::spawn(residual_config(baseline), long_rows(), None);
+        assert!(matches!(result, Err(BridgeError::Refused(_))), "{baseline}");
+    };
+    refused(r#"{"kind": "scheduled", "points": [], "changes": []}"#);
+    refused(&scheduled("[[5, 2]]"));
+    refused(&scheduled("[[5, 0]]"));
+    refused(&scheduled("[[5, 1], [5, 0]]"));
+    refused(&scheduled("[[5, 1], [4, 0]]"));
+    refused(&scheduled("[[5, 1], [6, 1]]"));
+    let nested = format!(
+        r#"{{"kind": "scheduled", "points": [{}], "changes": []}}"#,
+        scheduled("[]")
+    );
+    refused(&nested);
+    refused(&scheduled("[[5, 1]]").replace(r#""0.2""#, r#""not a number""#));
+    // Unknown fields are refused as in every baseline.
+    let extra = scheduled("[]").replace(r#""changes""#, r#""extra": 1, "changes""#);
+    assert!(serde_json::from_str::<BaselineConfig>(&extra).is_err());
+    assert!(
+        Worker::spawn(
+            residual_config(&scheduled("[[5, 1], [9, 0]]")),
+            long_rows(),
+            None
+        )
+        .is_ok()
+    );
+}
+
 #[test]
 fn test_worker_counts_the_order_reports_of_each_step() {
     let mut worker = Worker::spawn(config("close", "mask", 100), long_rows(), None).unwrap();
@@ -970,14 +1152,19 @@ fn test_worker_residual_hold_keeps_the_orders_and_equals_the_inner_hold() {
     };
     let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
         ResidualEnv::new(&kernel, &data, source, d("1"), bounds, bridge.rl().unwrap()).unwrap();
-    let mut state = env.reset(1).unwrap();
+    let mut tally = Tally::default();
+    let mut state = env.reset_with(1, &mut tally).unwrap();
     let mut worker = Worker::spawn(bridge, rows, None).unwrap();
     worker.reset(1).unwrap();
-    let mut held_while_resting = 0;
+    let (mut held_while_resting, mut residual_orders) = (0, 0);
     for step in 0..39 {
-        let (through, direct) = if step % 3 == 0 {
-            let step = env.step(&mut state, zero).unwrap();
-            (worker.step_residual(zero).unwrap(), step.transition)
+        tally = Tally::default();
+        // Two decisions in a row, so that a decision follows one that placed orders.
+        let (through, direct) = if step % 3 != 2 {
+            let step = env.step_with(&mut state, zero, &mut tally).unwrap();
+            let reply = worker.step_residual(zero).unwrap();
+            residual_orders += reply.orders.accepted;
+            (reply, step.transition)
         } else {
             let resting = state.kernel().queue_lengths().orders > 0;
             let reply = worker.step(RlAction::Hold).unwrap();
@@ -985,11 +1172,226 @@ fn test_worker_residual_hold_keeps_the_orders_and_equals_the_inner_hold() {
             assert_eq!((reply.orders.accepted, reply.orders.canceled), (0, 0));
             assert!(reply.decision.is_none());
             held_while_resting += u32::from(resting);
-            let direct = env.env().step(&mut state, RlAction::Hold).unwrap();
+            let direct = env
+                .env()
+                .step_with(&mut state, RlAction::Hold, &mut tally)
+                .unwrap();
             (reply, direct)
         };
         assert_eq!(through.transition, direct, "step {step}");
         assert_eq!(through.net, state.net());
+        // Each step's own reports, a residual decision's as a hold's.
+        assert_eq!(through.orders, tally.counts(), "step {step}");
     }
+    assert!(residual_orders > 0, "no residual decision placed an order");
     assert!(held_while_resting > 0, "no hold with orders resting");
+}
+
+/// The order reports of a step, by the name of their kind, from the kernel's own events.
+#[derive(Default)]
+struct Tally(std::collections::BTreeMap<String, u64>);
+
+impl EventSink for Tally {
+    fn event(&mut self, event: KernelEvent) {
+        if let KernelEvent::Report(report) = event {
+            *self.0.entry(format!("{:?}", report.kind)).or_default() += 1;
+        }
+    }
+}
+
+impl Tally {
+    fn counts(&self) -> OrderCounts {
+        let of = |kind: &str| self.0.get(kind).copied().unwrap_or(0);
+        OrderCounts {
+            accepted: of("Accepted"),
+            rejected: of("Rejected"),
+            canceled: of("Canceled"),
+            cancel_rejected: of("CancelRejected"),
+            fills: of("PartialFill") + of("Fill"),
+        }
+    }
+}
+
+#[test]
+fn test_worker_counts_every_kind_of_report_as_the_kernel_reports_it() {
+    // Queue fills in parts, a cancel that a fill outruns, and a position limit that rejects.
+    let rows: Vec<KernelTick> = (0..200_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect();
+    let mut bridge = config("close", "reject", 1000);
+    bridge.latency = LatencyConfig {
+        quantum_ns: 1_000_000,
+        observation_q: 1,
+        submit_q: 1,
+        cancel_q: 40,
+        ack_q: 2,
+        jitter_q: 2,
+    };
+    // A lot about every row: a crossed order of 2 lots fills over two rows.
+    bridge.fill_model = FillConfig::QueuePositionRational {
+        lots: 1,
+        per_ms: 20,
+        min_queue_ms: 0,
+    };
+    bridge.limits = Some(LimitsConfig {
+        max_position: "3".to_string(),
+        max_notional: "100000".to_string(),
+        scaling_factor: "1".to_string(),
+    });
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let mut tally = Tally::default();
+    let mut state = env.reset_with(9, &mut tally).unwrap();
+    worker.reset(9).unwrap();
+    let action = |step: usize| match step % 3 {
+        0 => quote(0, 0, 1, 1),
+        1 => quote(1, 0, 0, 1),
+        _ => RlAction::Hold,
+    };
+    let (mut step, mut total) = (0, OrderCounts::default());
+    let mut partial_fills = 0;
+    while !state.is_done() {
+        tally = Tally::default();
+        env.step_with(&mut state, action(step), &mut tally).unwrap();
+        partial_fills += tally.0.get("PartialFill").copied().unwrap_or(0);
+        let through = worker.step(action(step)).unwrap();
+        assert_eq!(through.orders, tally.counts(), "step {step}");
+        total.accepted += through.orders.accepted;
+        total.rejected += through.orders.rejected;
+        total.canceled += through.orders.canceled;
+        total.cancel_rejected += through.orders.cancel_rejected;
+        total.fills += through.orders.fills;
+        step += 1;
+    }
+    // Every kind is reached, a partial fill among the fills.
+    assert!(
+        total.accepted > 0
+            && total.rejected > 0
+            && total.canceled > 0
+            && total.cancel_rejected > 0
+            && partial_fills > 0
+            && total.fills > partial_fills,
+        "{total:?}, {partial_fills} partial fills"
+    );
+}
+
+#[test]
+fn test_worker_with_the_cancel_action_is_equal_to_a_direct_environment_and_cancels() {
+    let rows: Vec<KernelTick> = (0..200_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect();
+    let mut bridge = config("close", "reject", 1000);
+    bridge.cancel_action = true;
+    bridge.latency.cancel_q = 1;
+    bridge.latency.submit_q = 1;
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    assert_eq!(env.spec().action.cancel, CancelActions::CancelOnly);
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let info = worker.info();
+    assert!(info.cancel_action);
+    assert_eq!(info.spec, env.spec().id());
+    assert_eq!(info.spec.action, BUILT_FOR_CANCEL_ACTION);
+    let mut events: Vec<market_maker_rs::backtest::kernel::KernelEvent> = Vec::new();
+    let mut state = env.reset_with(9, &mut events).unwrap();
+    worker.reset(9).unwrap();
+    let mut step = 0;
+    while !state.is_done() {
+        let action = if step % 3 == 2 {
+            RlAction::Cancel
+        } else {
+            actions(step)
+        };
+        let direct = env.step_with(&mut state, action, &mut events).unwrap();
+        let through = worker.step(action).unwrap();
+        assert_eq!(through.transition, direct, "step {step}");
+        assert_eq!(through.net, state.net());
+        step += 1;
+    }
+    let cancelled = events
+        .iter()
+        .filter(|e| {
+            matches!(e, market_maker_rs::backtest::kernel::KernelEvent::Report(r)
+                if r.kind == market_maker_rs::backtest::kernel::ExecKind::Canceled)
+        })
+        .count();
+    assert!(cancelled > 0, "no cancel took effect");
+}
+
+#[test]
+fn test_the_cancel_action_is_off_by_default_and_its_space_is_refused_without_it() {
+    let plain = Worker::spawn(config("close", "reject", 100), long_rows(), None).unwrap();
+    assert!(!plain.info().cancel_action);
+    assert_eq!(plain.info().spec.action, ACTION_SPACE_VERSION);
+    let mut bridge = config("close", "reject", 100);
+    assert!(!bridge.cancel_action);
+    bridge.cancel_action = true;
+    let cancel = Worker::spawn(bridge.clone(), long_rows(), None).unwrap();
+    let (p, c) = (plain.info().spec, cancel.info().spec);
+    assert_eq!(c.action, BUILT_FOR_CANCEL_ACTION);
+    assert_ne!(p.fingerprint, c.fingerprint);
+    // Each space is known only with the configuration that asks for it.
+    assert!(known_versions(&p, false) && !known_versions(&p, true));
+    assert!(known_versions(&c, true) && !known_versions(&c, false));
+    // A checkpoint of one is refused by the other, before any step.
+    assert!(matches!(
+        Worker::spawn(config("close", "reject", 100), long_rows(), Some(c)),
+        Err(BridgeError::Refused(_))
+    ));
+    assert!(matches!(
+        Worker::spawn(bridge, long_rows(), Some(p)),
+        Err(BridgeError::Refused(_))
+    ));
+    // Without it a cancel is a refused action, named as such.
+    let mut plain = plain;
+    plain.reset(1).unwrap();
+    let reply = plain.step(RlAction::Cancel).unwrap();
+    assert_eq!(
+        refused_because(reply.transition.action_status).as_deref(),
+        Some("cancel not available (code 203)")
+    );
+    // The flag in the configuration.
+    let mut json: serde_json::Value =
+        serde_json::from_str(&config_text("close", "mask", 100)).unwrap();
+    json["cancel_action"] = serde_json::Value::Bool(true);
+    assert!(
+        BridgeConfig::from_json(&json.to_string())
+            .unwrap()
+            .cancel_action
+    );
+}
+
+#[test]
+fn test_the_cancel_action_with_a_residual_policy_is_refused() {
+    let mut bridge = residual_config(AVELLANEDA);
+    bridge.cancel_action = true;
+    assert!(matches!(
+        Worker::spawn(bridge, long_rows(), None),
+        Err(BridgeError::Refused(reason)) if reason.contains("cancel_action")
+    ));
 }

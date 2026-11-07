@@ -5,7 +5,8 @@ use crate::Decimal;
 use super::account::AgentAccount;
 use super::book::{Arr, Delivery, FillRec, ObsEntry, ReportRec, VenueMsg, VenueOrder};
 use super::data::DatasetId;
-use super::gate::{GateState, GateVerdict};
+use super::gate::{GateCheck, GateState, GateVerdict};
+use super::hedge::HedgeEvent;
 use super::ledger::{AgentView, VenueLedger};
 use super::rng::KernelRng;
 use crate::execution::Action;
@@ -251,6 +252,13 @@ pub enum KernelAction {
         /// Size, in lots.
         lots: u64,
     },
+    /// Cancel every resting or pending order and submit nothing. Each cancel
+    /// takes effect after the cancel latency, as a quote's cancels do: a fill
+    /// before it stands, and a cancel that reaches an order already filled is
+    /// rejected (`CancelRejected`). Admitted whenever a `Hold` is, since an
+    /// open order already holds the venue message its cancel needs. Outside
+    /// the engine-equivalence subset: the engine cancels only to replace.
+    Cancel,
 }
 
 /// What happened to the action.
@@ -327,6 +335,8 @@ pub struct GateRecord {
     pub verdict: GateVerdict,
     /// Submitted lots (0 when refused).
     pub submitted: u64,
+    /// The check that decided.
+    pub check: GateCheck,
 }
 
 /// An event of the run, in event order.
@@ -390,6 +400,11 @@ pub trait EventSink {
     /// fill, observation push, action, end of data). A diagnostic for
     /// checking the queue bounds; ignored by default.
     fn queues(&mut self, _lengths: QueueLengths) {}
+
+    /// The hedge lane's money events (#266): its rows, fills and funding
+    /// payments, in the lane's own order. Ignored by default, so a sink of the
+    /// quoted lane alone is unchanged; a wrapping sink must forward it.
+    fn hedge(&mut self, _event: HedgeEvent) {}
 }
 
 /// A sink that ignores every event.

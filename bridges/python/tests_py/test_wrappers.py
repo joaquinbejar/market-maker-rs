@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 
+import gymnasium as gym
 import numpy as np
 import pytest
 from conftest import LONG_ROWS, config, walk
@@ -72,6 +73,64 @@ def test_an_interval_must_be_a_positive_whole_number_of_rows():
         with pytest.raises(ValueError):
             DecisionInterval(env, every)
     env.close()
+
+
+def test_an_interval_ends_where_the_episode_is_cut():
+    # Four steps in all: a decision of 3 rows, then one of the single row left.
+    env = DecisionInterval(MaskableMarketMakingEnv(config(max_steps=4), walk()), 3)
+    env.reset(seed=1)
+    *_, terminated, truncated, info = env.step(QUOTE)
+    assert info["rows"] == 3 and not (terminated or truncated)
+    *_, terminated, truncated, info = env.step(QUOTE)
+    assert truncated and not terminated and info["rows"] == 1
+    env.close()
+
+
+def test_a_hold_between_decisions_is_recorded_as_a_hold():
+    env = MaskableMarketMakingEnv(config(), LONG_ROWS)
+    env.reset(seed=1)
+    env.step(QUOTE)
+    *_, info = env.step_hold()
+    hold = {"kind": "hold", "indices": []}
+    assert info["applied_action"] == hold and info["decoded_action"] == hold
+    # The quote rests: nothing was canceled.
+    assert info["orders"]["canceled"] == 0
+    env.close()
+
+
+class Steady(gym.Env):
+    """Every observation is `value`, beyond the range the features keep to."""
+
+    def __init__(self, value):
+        self.value = value
+        self.observation_space = gym.spaces.Box(-5.0, 5.0, (6,), dtype=np.float32)
+        self.action_space = gym.spaces.Discrete(1)
+
+    def reset(self, *, seed=None, options=None):
+        return np.full(6, self.value, dtype=np.float32), {}
+
+    def step(self, action):
+        return np.full(6, self.value, dtype=np.float32), 0.0, False, False, {}
+
+
+def test_ema_features_stay_in_their_bounds_and_need_positive_half_lives():
+    env = EmaFeatures(Steady(3.0), (1,))
+    env.reset()
+    for _ in range(5):
+        observation, *_ = env.step(0)
+    assert np.array_equal(observation[6:], [1.0, 1.0])
+    env = EmaFeatures(Steady(-3.0), (1,))
+    observation, _ = env.reset()
+    assert np.array_equal(observation[6:], [-1.0, -1.0])
+    for half_lives in ((), (0,), (2, -1)):
+        with pytest.raises(ValueError, match="half-lives"):
+            EmaFeatures(Steady(0.0), half_lives)
+
+
+def test_a_history_is_a_positive_whole_number_of_decisions():
+    for length in (0, -2, 1.5):
+        with pytest.raises(ValueError, match="whole number"):
+            history(Steady(0.0), length)
 
 
 def test_ema_features_start_at_zero_each_episode_and_follow_the_decisions():

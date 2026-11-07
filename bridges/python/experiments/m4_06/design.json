@@ -1,6 +1,6 @@
 {
   "issue": 103,
-  "design_version": 1,
+  "design_version": 2,
   "data": "synthetic: a queue-reactive simulator with made-up parameters, no market data",
   "bounds": "One synthetic simulator, made-up parameters and 24 days per regime bound what this comparison can show.",
   "origin": "The regimes, days, seeds rule and splits of #102 (experiments/m4_05), sampled every second instead of every ten seconds; new data, with its own digests.",
@@ -223,7 +223,9 @@
   },
   "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
   "changes": [
-    "version 1, after the timing pilot and before any other run: observation scales stated (row gap 2000 ms for 1 s rows, the rest as #102); classical arms evaluated as #102 did; estimates set from the pilot (fee rule 60, training 240, holdout 120 minutes). Nothing but the pilot's timing was seen."
+    "version 1, after the timing pilot and before any other run: observation scales stated (row gap 2000 ms for 1 s rows, the rest as #102); classical arms evaluated as #102 did; estimates set from the pilot (fee rule 60, training 240, holdout 120 minutes). Nothing but the pilot's timing was seen.",
+    "version 2, after the fee rule and the classical selection of version 1 were run and seen, and before any learned run was evaluated: min_queue_ms 0 instead of 5000, and a rate of 1 lot per 500 ms instead of per 1000 ms. With 5000, an order that the next decision replaces never stays 5 s in queue at decision intervals of 1 or 5 rows, so it never fills: on training days Avellaneda-Stoikov had 0 fills and a net of exactly 0 at every candidate fee (172798 orders accepted and 172796 canceled per day), and the fee rule fell back to 0.0002; on validation Avellaneda-Stoikov and GLFT had 0 fills at intervals 1 and 5, and at interval 10 a mean daily net of -185.3 (5058 fills) and -212.0 (5861 fills). Training had started and was stopped after about 3 minutes, before any checkpoint. The version 1 outputs are kept apart: fee_rule.json sha256 cf1576602a46cabc50a63236f9a187bed3fa99ca1863179b27e49eaba725278a, classical_selection.json sha256 2f5b4f210ad521709960a33a6e5724aba2e32da5d0046f39dfe5ab6c00aa2fdb. Everything else is unchanged; every step runs again from the start. Before training, a check that Avellaneda-Stoikov fills on one validation day at interval 1.",
+    "version 2, the rate: at 1 lot per 1000 ms with min_queue_ms 0, an order replaced every row is 975 ms in queue at the next row and clears floor(975 / 1000) = 0 lots, so it never fills, not even through a trade-through. Avellaneda-Stoikov (risk aversion 0.01, intensity 50) on calm validation day 15 at fee 0.0002, fills per day and net: 1 lot / 1000 ms: every 1 row 0 and 0, every 5 rows 665 and -18.51, every 10 rows 1387 and -38.97; 1 lot / 500 ms: 22 and -0.02, 736 and -19.10; 1 lot / 250 ms: 56 and -0.37, 738 and -19.10; 1 lot / 100 ms: 64 and -0.31, 738 and -19.10. The coordinator's standard for 1 s rows is 1 lot per 500 ms, the smallest change that fills. The check before training, same day and point: queue at 1 lot / 500 ms against immediate fill, every 1 row 22 fills, net -0.020169 against 64 fills, -0.31108; every 5 rows 736, -19.103243 against 738, -19.102291; every 10 rows 1399, -38.680769 against 1399, -38.650775. The queue binds at the fastest interval and barely at the slower ones, which the report states."
   ],
   "kernel": {
     "tick_size": "0.005",
@@ -254,10 +256,10 @@
     "fill_model": {
       "kind": "queue_position_rational",
       "lots": 1,
-      "per_ms": 1000,
-      "min_queue_ms": 5000
+      "per_ms": 500,
+      "min_queue_ms": 0
     },
-    "fill_note": "one lot cleared per second in queue after five seconds, so the queue binds on 1 s rows with touches of 1 to 8 lots (#267); this needs the bridge's rational rate (#269)",
+    "fill_note": "one lot cleared per 500 ms in queue, from the order's entry, with the touch ahead of it (1 to 8 lots on training days): a requote loses its place; an order replaced every row is 975 ms in queue at the next row, which clears one lot (#267)",
     "latency": {
       "quantum_ns": 1000000,
       "observation_q": 25,
