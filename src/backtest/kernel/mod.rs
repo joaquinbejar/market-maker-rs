@@ -28,8 +28,8 @@
 //! - datasets with non-decreasing timestamps (the kernel rejects others at
 //!   load; the engine clamps them);
 //! - actions `Hold`, `Quote` and `QuoteError` (an engine `None`); the
-//!   one-sided `OneSided` action has no engine counterpart and is outside
-//!   the subset.
+//!   one-sided `OneSided` and the cancel-only `Cancel` actions have no
+//!   engine counterpart and are outside the subset.
 //!
 //! # Ordering
 //!
@@ -510,6 +510,18 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                     &mut em,
                 )
             }
+            KernelAction::Cancel => self.admit_apply(
+                s,
+                Ok(()),
+                step::Legs {
+                    legs: [None, None],
+                    crossed: false,
+                },
+                combined
+                    .as_mut()
+                    .map(|(check, rejects)| (*check, &mut **rejects)),
+                &mut em,
+            ),
         };
         if !s.status.is_running() {
             return StepOutcome {

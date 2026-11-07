@@ -7,10 +7,12 @@ from .envs import (
     MaskableMarketMakingEnv,
     ResidualMarketMakingEnv,
 )
+from .expiry import ExpiringQuote
 
 __all__ = [
     "BoxMarketMakingEnv",
     "BridgeFailure",
+    "ExpiringQuote",
     "MarketMakingEnv",
     "MaskableMarketMakingEnv",
     "NativeEnv",

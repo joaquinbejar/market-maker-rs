@@ -538,3 +538,19 @@ fn test_a_perpetual_hedge_attributes_its_funding() {
     assert_eq!(at(3000), dec!(0.01));
     assert_eq!(state.net(), dec!(2.801) + dec!(-1.5495) + dec!(0.01));
 }
+
+#[test]
+fn test_a_hedge_lane_refuses_the_cancel_action() {
+    let d = data();
+    let refused = RlEnv::<'_, 3, 2>::new_hedged(
+        &d.cfg,
+        &d.quoted,
+        &d.lane,
+        &d.hedge,
+        grid(),
+        vec![1, 2],
+        hedge_scales(),
+        RlConfig::new(scales(), dec!(1)).with_cancel_action(),
+    );
+    assert!(matches!(refused, Err(e) if e.to_string().contains("cancel action")));
+}

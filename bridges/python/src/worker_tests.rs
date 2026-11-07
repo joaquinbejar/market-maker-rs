@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use market_maker_rs::backtest::kernel::{KernelFillModel, quote_error_code};
 use market_maker_rs::rl::{
-    ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, HEDGED_ACTION_SPACE_VERSION,
+    ACTION_SPACE_VERSION, CancelActions, EPISODE_VERSION, EpisodeRecorder, HEDGED_ACTION_SPACE_VERSION,
     HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION, OBSERVATION_SPACE_VERSION,
     REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv, SpecId,
 };
@@ -380,7 +380,7 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
         .unwrap()
         .info()
         .spec;
-    assert!(known_versions(&id));
+    assert!(known_versions(&id, false));
     for change in 0..4 {
         let mut later = id;
         match change {
@@ -389,7 +389,7 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
             2 => later.reward += 1,
             _ => later.episode += 1,
         }
-        assert!(!known_versions(&later));
+        assert!(!known_versions(&later, false));
     }
     // An environment with a hedge lane in a second instrument is not one this bridge drives.
     let hedged = SpecId {
@@ -398,7 +398,7 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
         reward: HEDGED_REWARD_VERSION,
         ..id
     };
-    assert!(!known_versions(&hedged));
+    assert!(!known_versions(&hedged, false));
 }
 
 #[test]
@@ -771,7 +771,7 @@ fn test_hedge_actions_are_off_by_default_and_change_the_specification() {
     let hedged = Worker::spawn(bridge, long_rows(), None).unwrap();
     let (p, h) = (plain.info().spec, hedged.info().spec);
     // The same versions, so the bridge drives both; another identity.
-    assert!(known_versions(&p) && known_versions(&h));
+    assert!(known_versions(&p, false) && known_versions(&h, false));
     assert_ne!(p.fingerprint, h.fingerprint);
     // The flag in the configuration.
     let mut json: serde_json::Value =
@@ -1086,4 +1086,112 @@ fn test_a_malformed_schedule_is_refused() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn test_worker_with_the_cancel_action_is_equal_to_a_direct_environment_and_cancels() {
+    let rows: Vec<KernelTick> = (0..200_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect();
+    let mut bridge = config("close", "reject", 1000);
+    bridge.cancel_action = true;
+    bridge.latency.cancel_q = 1;
+    bridge.latency.submit_q = 1;
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    assert_eq!(env.spec().action.cancel, CancelActions::CancelOnly);
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let info = worker.info();
+    assert!(info.cancel_action);
+    assert_eq!(info.spec, env.spec().id());
+    assert_eq!(info.spec.action, BUILT_FOR_CANCEL_ACTION);
+    let mut events: Vec<market_maker_rs::backtest::kernel::KernelEvent> = Vec::new();
+    let mut state = env.reset_with(9, &mut events).unwrap();
+    worker.reset(9).unwrap();
+    let mut step = 0;
+    while !state.is_done() {
+        let action = if step % 3 == 2 {
+            RlAction::Cancel
+        } else {
+            actions(step)
+        };
+        let direct = env.step_with(&mut state, action, &mut events).unwrap();
+        let through = worker.step(action).unwrap();
+        assert_eq!(through.transition, direct, "step {step}");
+        assert_eq!(through.net, state.net());
+        step += 1;
+    }
+    let cancelled = events
+        .iter()
+        .filter(|e| {
+            matches!(e, market_maker_rs::backtest::kernel::KernelEvent::Report(r)
+                if r.kind == market_maker_rs::backtest::kernel::ExecKind::Canceled)
+        })
+        .count();
+    assert!(cancelled > 0, "no cancel took effect");
+}
+
+#[test]
+fn test_the_cancel_action_is_off_by_default_and_its_space_is_refused_without_it() {
+    let plain = Worker::spawn(config("close", "reject", 100), long_rows(), None).unwrap();
+    assert!(!plain.info().cancel_action);
+    assert_eq!(plain.info().spec.action, ACTION_SPACE_VERSION);
+    let mut bridge = config("close", "reject", 100);
+    assert!(!bridge.cancel_action);
+    bridge.cancel_action = true;
+    let cancel = Worker::spawn(bridge.clone(), long_rows(), None).unwrap();
+    let (p, c) = (plain.info().spec, cancel.info().spec);
+    assert_eq!(c.action, BUILT_FOR_CANCEL_ACTION);
+    assert_ne!(p.fingerprint, c.fingerprint);
+    // Each space is known only with the configuration that asks for it.
+    assert!(known_versions(&p, false) && !known_versions(&p, true));
+    assert!(known_versions(&c, true) && !known_versions(&c, false));
+    // A checkpoint of one is refused by the other, before any step.
+    assert!(matches!(
+        Worker::spawn(config("close", "reject", 100), long_rows(), Some(c)),
+        Err(BridgeError::Refused(_))
+    ));
+    assert!(matches!(
+        Worker::spawn(bridge, long_rows(), Some(p)),
+        Err(BridgeError::Refused(_))
+    ));
+    // Without it a cancel is a refused action, named as such.
+    let mut plain = plain;
+    plain.reset(1).unwrap();
+    let reply = plain.step(RlAction::Cancel).unwrap();
+    assert_eq!(
+        refused_because(reply.transition.action_status).as_deref(),
+        Some("cancel not available (code 203)")
+    );
+    // The flag in the configuration.
+    let mut json: serde_json::Value =
+        serde_json::from_str(&config_text("close", "mask", 100)).unwrap();
+    json["cancel_action"] = serde_json::Value::Bool(true);
+    assert!(
+        BridgeConfig::from_json(&json.to_string())
+            .unwrap()
+            .cancel_action
+    );
+}
+
+#[test]
+fn test_the_cancel_action_with_a_residual_policy_is_refused() {
+    let mut bridge = residual_config(AVELLANEDA);
+    bridge.cancel_action = true;
+    assert!(matches!(
+        Worker::spawn(bridge, long_rows(), None),
+        Err(BridgeError::Refused(reason)) if reason.contains("cancel_action")
+    ));
 }

@@ -17,6 +17,9 @@ pub const HEDGED_OBSERVATION_SPACE_VERSION: u16 = 2;
 /// Version of the action space with a hedge lane: version 2's actions, and
 /// [`CrossHedgeSpace`].
 pub const HEDGED_ACTION_SPACE_VERSION: u16 = 3;
+/// Version of the action space with the cancel-only action: version 2's actions, and
+/// [`CancelActions::CancelOnly`].
+pub const CANCEL_ACTION_SPACE_VERSION: u16 = 4;
 /// Version of the reward with a hedge lane: version 1's, with the hedge lane's ledger in the
 /// net result.
 pub const HEDGED_REWARD_VERSION: u16 = 2;
@@ -536,6 +539,29 @@ impl HedgeActions {
     }
 }
 
+/// Which cancel actions exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CancelActions {
+    /// None: a policy withdraws its quotes only by replacing them.
+    NotModelled,
+    /// [`RlAction::Cancel`](crate::rl::RlAction::Cancel): cancel every resting or pending
+    /// order and send nothing. Each cancel takes effect after the kernel's cancel latency,
+    /// so a fill before it stands, and a cancel that reaches an order already filled is
+    /// rejected. A quote sent at a decision and cancelled `d` decisions later, one per row,
+    /// rests `d` rows plus the cancel latency less the submission latency.
+    CancelOnly,
+}
+
+impl CancelActions {
+    const fn code(self) -> u16 {
+        match self {
+            Self::NotModelled => 1,
+            Self::CancelOnly => 2,
+        }
+    }
+}
+
 /// A hedge in a second instrument, the hedge lane of
 /// [`HedgedKernel`](crate::backtest::kernel::HedgedKernel): an immediate-or-cancel order at
 /// the hedge instrument's observed touch, on the side that reduces the net exposure of
@@ -565,7 +591,8 @@ pub struct CrossHedgeSpace {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ActionSpace {
-    /// [`ACTION_SPACE_VERSION`], or [`HEDGED_ACTION_SPACE_VERSION`] with a hedge lane.
+    /// [`ACTION_SPACE_VERSION`], [`HEDGED_ACTION_SPACE_VERSION`] with a hedge lane, or
+    /// [`CANCEL_ACTION_SPACE_VERSION`] with the cancel-only action.
     pub version: u16,
     /// Value of one tick, in quote per base.
     pub tick_size: Decimal,
@@ -587,6 +614,8 @@ pub struct ActionSpace {
     pub hedge: HedgeActions,
     /// The hedge in a second instrument, with a hedge lane.
     pub cross_hedge: Option<CrossHedgeSpace>,
+    /// Which cancel actions exist.
+    pub cancel: CancelActions,
 }
 
 /// The one kind of reward of this version.
@@ -813,6 +842,11 @@ impl RlSpec {
             for size in &c.sizes_lots {
                 put_u64(&mut out, *size);
             }
+        }
+        // As the hedge lane's: a specification without the cancel action does not write it.
+        if a.cancel != CancelActions::NotModelled {
+            out.extend_from_slice(b"CX");
+            put_u16(&mut out, a.cancel.code());
         }
         let r = &self.reward;
         put_u16(&mut out, r.version);
