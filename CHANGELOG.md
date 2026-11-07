@@ -27,10 +27,20 @@ project follows [Semantic Versioning](https://semver.org/).
   intensities per state, event sizes and estimates per day; and Poisson, queue-reactive and Hawkes
   flow on the holdout, the Hawkes decay chosen on validation. The protocol is fixed in the code
   before any data is read: the longest stretch with no reset, split by time into training,
-  validation and holdout, the holdout used for no choice, no randomness, fees declared and
-  funding not applied. It streams the files, keeps only thinned inputs and says what it keeps.
-  Not evaluated: #90 (b) and (c), which need a data trajectory the replay does not expose; #77,
-  #180 and #91 (b) do not apply to this capture. No data is in the repository.
+  validation and holdout, the holdout used for no choice, one fixed seed for the model runs,
+  fees declared and funding not applied. It streams the files, keeps only thinned inputs and
+  says what it keeps. #90 (b), (c) and (d) compare the data's sampled book and queue events with
+  the fitted model and its constant intensity baseline on declared windows (#263). #77, #180
+  and #91 (b) do not apply to this capture. No data is in the repository.
+- `backtest::hyperliquid` samples the rebuilt book on a time grid (#263), behind `serde`:
+  `ReplayConfig::with_book_samples` asks for the book at each multiple of an interval, showing
+  every diff before that time, in `ReplayOutput::book` as `BookLevels` (sizes by limit from the
+  mid, by the depths' rule, and the touch). A reset leaves no sample across the silence that
+  caused it, and grid times without a two sided touch are counted in
+  `Coverage::book_samples_without_touch`. `book_samples` converts them, warm ones only, into the
+  queue reactive model's `BookSample`, in event sizes as `queue_observations` counts a queue, with
+  the spread as the touch's width in ticks, so a data `Trajectory` can go to
+  `compare_trajectories`. Without the option nothing is sampled.
 - Hedge actions in the Python bridge (#258): `"hedge_actions": true` in its configuration builds
   the environment with `RlConfig::with_hedge_actions`, so its specification states
   `HedgeActions::MarketableAtTouch`; off by default, a configuration keeps its specification and
