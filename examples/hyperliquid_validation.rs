@@ -606,6 +606,9 @@ fn within_cap(segment: &HawkesSegment, cap: u32) -> bool {
 /// What a comparison window's fit is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowKind {
+    /// In sample, for #290's choice: the training fit, against the first hours of the training
+    /// part after the size window.
+    Train,
     /// Out of sample: the training fit, against the holdout's first hours.
     Holdout,
     /// In sample: that day's own fit, against its first hours.
@@ -626,6 +629,9 @@ struct BookWindow {
     /// Samples and events compared, once done.
     data: (u64, u64),
     result: Option<Vec<String>>,
+    /// #290's phase 3, once done: the data's mean touch queue and each estimator's lines, or
+    /// why it was not run.
+    result_290: Option<Result<(f64, Vec<Line290>), String>>,
 }
 
 impl BookWindow {
@@ -643,18 +649,28 @@ impl BookWindow {
             error: None,
             data: (0, 0),
             result: None,
+            result_290: None,
         }
     }
 
-    /// The holdout's first hours, then each whole UTC day's.
+    /// The training part's first hours, the holdout's, then each whole UTC day's.
     fn all(protocol: &Protocol) -> Vec<Self> {
+        let train = protocol.queue_train();
         let holdout = protocol.holdout();
-        let mut windows = vec![Self::new(
-            WindowKind::Holdout,
-            holdout.start_ms,
-            holdout.end_ms,
-            (holdout.start_ms + BOOK_WINDOW_MS).min(holdout.end_ms),
-        )];
+        let mut windows = vec![
+            Self::new(
+                WindowKind::Train,
+                train.start_ms,
+                train.end_ms,
+                train.end_ms,
+            ),
+            Self::new(
+                WindowKind::Holdout,
+                holdout.start_ms,
+                holdout.end_ms,
+                (holdout.start_ms + BOOK_WINDOW_MS).min(holdout.end_ms),
+            ),
+        ];
         for day in protocol.days() {
             windows.push(Self::new(
                 WindowKind::Day(day),
@@ -910,10 +926,12 @@ struct Phase290 {
     multi_event_blocks: u64,
     last_time_ns: Option<u64>,
     events_in_block: u64,
+    /// Phase 3's choice on the training window, or why there is none.
+    choice: Option<Result<&'static str, String>>,
 }
 
 impl Phase290 {
-    fn take_queue(&mut self, observations: &[QueueObservation], stride: u64) {
+    fn take_counts(&mut self, observations: &[QueueObservation]) {
         for o in observations {
             let kind = match o.kind {
                 QrEventKind::Limit => 0,
@@ -937,6 +955,10 @@ impl Phase290 {
                 *cell += 1;
             }
         }
+    }
+
+    /// Keeps the estimators' inputs, from every part, one in `stride`.
+    fn take_lists(&mut self, observations: &[QueueObservation], stride: u64) {
         for o in observations {
             if keep_one_in(&mut self.all_seen, stride) {
                 self.all.push(*o);
@@ -999,6 +1021,92 @@ impl Phase290 {
         let known = self.lives[0] + self.lives[1];
         (known > 0).then(|| self.lives[1] as f64 / known as f64)
     }
+}
+
+/// An estimator's name and its fit, or why there is none.
+type Fit290Input = (&'static str, Result<QrParameters, String>);
+
+/// #290's estimators, in the order a tie is broken.
+const ESTIMATORS_290: [&str; 3] = ["E0", "E1", "E2"];
+
+/// One run of #290's phase 3: an estimator's fit or its constant baseline against a window.
+#[derive(Debug)]
+struct Line290 {
+    estimator: &'static str,
+    baseline: bool,
+    /// The comparison and the model's mean touch queue.
+    outcome: Result<(DiscrepancyReport, f64), String>,
+}
+
+/// Each fit and its constant baseline against the window's data, from seed
+/// [`qr_290::QR_SEED`], with the data's mean touch queue.
+fn compare_290(data: &Trajectory, fits: &[Fit290Input], window: TimeWindow) -> (f64, Vec<Line290>) {
+    let seconds = (window.end_ms - window.start_ms) as f64 / 1e3;
+    let run = |model: &QrParameters| -> Result<(DiscrepancyReport, f64), String> {
+        let run = QrSimulator::new(model.clone(), qr_290::QR_SEED, 0)
+            .and_then(|mut s| s.run(seconds, BOOK_SAMPLE_MS as f64 / 1e3))
+            .map_err(|e| e.to_string())?;
+        let report =
+            compare_trajectories(data, &run, model, FLOW_INTERVAL_MS).map_err(|e| e.to_string())?;
+        Ok((report, mean_touch(&run.samples)))
+    };
+    let mut lines = Vec::new();
+    for (estimator, fit) in fits {
+        for baseline in [false, true] {
+            let outcome = match fit {
+                Err(error) => Err(format!("no fit: {error}")),
+                Ok(params) if baseline => params
+                    .constant_baseline()
+                    .map_err(|e| e.to_string())
+                    .and_then(|model| run(&model)),
+                Ok(params) => run(params),
+            };
+            lines.push(Line290 {
+                estimator,
+                baseline,
+                outcome,
+            });
+        }
+    }
+    (mean_touch(&data.samples), lines)
+}
+
+/// Whether a model's mean touch queue stays under #290's stationary share of the cap.
+fn stationary_290(mean_touch_queue: f64) -> bool {
+    !qr_290::reaches(mean_touch_queue, qr_290::STATIONARY_SHARE_OF_CAP)
+}
+
+/// Phase 3's choice on the training window: among the stationary fits, the lowest queue size
+/// total variation at limit 0, the first on a tie; none when no fit is stationary.
+fn choose_290(lines: &[Line290]) -> Result<&'static str, String> {
+    let mut best: Option<(&'static str, f64)> = None;
+    for line in lines.iter().filter(|l| !l.baseline) {
+        let Ok((report, mean)) = &line.outcome else {
+            continue;
+        };
+        let Some(tv) = report.queue_size.first().copied() else {
+            continue;
+        };
+        if stationary_290(*mean) && best.is_none_or(|(_, b)| tv < b) {
+            best = Some((line.estimator, tv));
+        }
+    }
+    best.map(|(name, _)| name)
+        .ok_or_else(|| "no estimator is stationary on the training window".to_string())
+}
+
+/// Whether `estimator`'s fit beats its constant baseline on queue size at every limit.
+fn beats_baseline_290(lines: &[Line290], estimator: &str) -> Option<bool> {
+    let tv = |baseline: bool| {
+        lines
+            .iter()
+            .find(|l| l.estimator == estimator && l.baseline == baseline)
+            .and_then(|l| l.outcome.as_ref().ok())
+            .map(|(report, _)| report.queue_size.clone())
+    };
+    let (fit, constant) = (tv(false)?, tv(true)?);
+    (fit.len() == constant.len() && !fit.is_empty())
+        .then(|| fit.iter().zip(&constant).all(|(f, c)| f < c))
 }
 
 /// One estimator's training fit for #290: the drift at the first limit and how its run behaves.
@@ -1257,20 +1365,87 @@ impl Collect {
             if window.result.is_some() || read_to_ms < window.due_ms {
                 continue;
             }
-            let fit = match window.kind {
-                WindowKind::Holdout => self.qr_train(),
+            let kind = window.kind;
+            let fit = match kind {
+                WindowKind::Train | WindowKind::Holdout => self.qr_train(),
                 WindowKind::Day(day) => self.qr_fit(&day),
             };
+            let fits_290 = self.fits_290(kind);
             let window = &mut self.book_windows[index];
             let samples = std::mem::take(&mut window.samples);
             let events = std::mem::take(&mut window.events);
             window.data = (samples.len() as u64, events.len() as u64);
+            let mut data = Trajectory::default();
+            data.samples = samples;
+            data.events = events;
+            window.result_290 = Some(match (&window.error, fits_290) {
+                (Some(error), _) => Err(format!("not evaluable: {error}")),
+                (None, Err(reason)) => Err(reason),
+                (None, Ok(fits)) => Ok(compare_290(&data, &fits, window.window)),
+            });
             window.result = Some(match (&window.error, fit) {
                 (Some(error), _) => vec![format!("not evaluable: {error}")],
                 (None, Err(error)) => vec![format!("not evaluable: no fit: {error}")],
-                (None, Ok(params)) => compare_window(samples, events, &params, window.window),
+                (None, Ok(params)) => {
+                    compare_window(data.samples, data.events, &params, window.window)
+                }
             });
+            if kind == WindowKind::Train {
+                let choice = match &window.result_290 {
+                    Some(Ok((_, lines))) => choose_290(lines),
+                    Some(Err(reason)) => Err(reason.clone()),
+                    None => Err("not compared".to_string()),
+                };
+                self.phase_290.choice = Some(choice);
+            }
         }
+    }
+
+    /// #290's training fit of `estimator` on the observations kept inside `window`.
+    fn fit_290(
+        &self,
+        estimator: &'static str,
+        window: &TimeWindow,
+    ) -> Result<QrParameters, String> {
+        let Some(Ok(event_sizes)) = self.sizes.as_ref().map(|s| &s.queue.sizes) else {
+            return Err("no event sizes".to_string());
+        };
+        let (events, zero_waits) = match estimator {
+            "E0" => (&self.queue, ZeroWaitPolicy::Drop),
+            "E1" => (&self.phase_290.all, ZeroWaitPolicy::Count),
+            _ => (&self.phase_290.collapsed, ZeroWaitPolicy::Count),
+        };
+        let record = estimate_parameters(
+            events,
+            &self.references,
+            event_sizes,
+            window,
+            &qr_config(self.tick).with_zero_waits(zero_waits),
+            &self.dataset,
+        )
+        .map_err(|error| format!("estimate_parameters: {error}"))?;
+        match record.fit {
+            QrFit::Calibrated(params) => Ok(params),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
+    /// The fits #290's phase 3 compares on a window of `kind`, or why it does not: the
+    /// holdout is compared only once the training window has chosen an estimator.
+    fn fits_290(&self, kind: WindowKind) -> Result<Vec<Fit290Input>, String> {
+        let window = match kind {
+            WindowKind::Train => self.protocol.queue_train(),
+            WindowKind::Holdout => match &self.phase_290.choice {
+                Some(Ok(_)) => self.protocol.queue_train(),
+                Some(Err(reason)) => return Err(format!("not run, stop rule: {reason}")),
+                None => return Err("not run: the training window was not compared".to_string()),
+            },
+            WindowKind::Day(day) => day,
+        };
+        Ok(ESTIMATORS_290
+            .iter()
+            .map(|name| (*name, self.fit_290(name, &window)))
+            .collect())
     }
 
     fn take_events(&mut self, all: &[BookEvent]) {
@@ -1348,13 +1523,14 @@ impl Collect {
                             }
                         }
                     }
+                    let values: Vec<QueueObservation> =
+                        conversion.observations.iter().map(|o| o.value).collect();
                     if part == Part::Train {
-                        let values: Vec<QueueObservation> =
-                            conversion.observations.iter().map(|o| o.value).collect();
-                        self.phase_290.take_queue(&values, self.strides.queue);
+                        self.phase_290.take_counts(&values);
                         self.phase_290
                             .take_book(events.iter().filter(|e| e.epoch == self.epoch));
                     }
+                    self.phase_290.take_lists(&values, self.strides.queue);
                     for observation in conversion.observations {
                         if observation.value.waiting_seconds > 0.0
                             && keep_one_in(&mut self.queue_seen, self.strides.queue)
@@ -1691,6 +1867,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     section_90(&mut report, &collect, &days);
     section_90_book(&mut report, &collect);
     section_290(&mut report, &collect);
+    section_290_book(&mut report, &collect);
     section_91(&mut report, &collect);
     section_rest(&mut report);
     section_kept(&mut report, &collect);
@@ -2483,6 +2660,101 @@ fn section_290(report: &mut Report, collect: &Collect) {
     );
 }
 
+/// #290's phase 3: each estimator and its constant baseline against #286's windows and the
+/// training window, the choice on the training window, and the holdout's verdict.
+fn section_290_book(report: &mut Report, collect: &Collect) {
+    say!(
+        report,
+        "\n== #290 phase 3: E0, E1 and E2 against the data, each with its constant baseline =="
+    );
+    say!(
+        report,
+        "Windows as #90 (b) to (d), plus the training part's first hours. #286 already read the \
+         holdout window. Stationary: the model's mean touch queue stays under {} of the cap of \
+         {}. Choice, fixed before any run: among the stationary fits on the training window, the \
+         lowest queue size TV at limit 1, the first of E0, E1, E2 on a tie. Stop rule: no \
+         stationary fit, no holdout. Success: the chosen fit's queue size TV below its constant \
+         baseline's at every limit on the holdout. Model runs from seed {}.",
+        qr_290::STATIONARY_SHARE_OF_CAP,
+        qr_290::MAX_QUEUE,
+        qr_290::QR_SEED
+    );
+    let list = |values: &[f64]| {
+        values
+            .iter()
+            .map(|v| format!("{v:.3}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for window in &collect.book_windows {
+        let name = match window.kind {
+            WindowKind::Train => "training window, training fits, in sample".to_string(),
+            WindowKind::Holdout => "holdout, training fits, out of sample".to_string(),
+            WindowKind::Day(_) => "day, own fits, in sample".to_string(),
+        };
+        say!(report, "{name}: {}", window_text(&window.window));
+        let lines = match &window.result_290 {
+            None => {
+                say!(report, "    not reached: the stretch ended before it");
+                continue;
+            }
+            Some(Err(reason)) => {
+                say!(report, "    {reason}");
+                continue;
+            }
+            Some(Ok((data_mean, lines))) => {
+                say!(report, "    data mean touch queue {data_mean:.2}");
+                lines
+            }
+        };
+        for line in lines {
+            let label = if line.baseline {
+                format!("{} constant", line.estimator)
+            } else {
+                line.estimator.to_string()
+            };
+            match &line.outcome {
+                Ok((r, mean)) => say!(
+                    report,
+                    "    {label}: queue size TV by limit [{}]; spread TV {:.3}; wait KS by limit \
+                     [{}]; flow relative error L/C/M [{}]; mean touch queue {mean:.2} ({}); \
+                     model {} events, stopped {:?}",
+                    list(&r.queue_size),
+                    r.spread,
+                    list(&r.waiting_law),
+                    list(&r.flow),
+                    if stationary_290(*mean) {
+                        "stationary"
+                    } else {
+                        "transient"
+                    },
+                    r.model_events,
+                    r.model_stopped
+                ),
+                Err(error) => say!(report, "    {label}: not evaluable: {error}"),
+            }
+        }
+        match window.kind {
+            WindowKind::Train => match &collect.phase_290.choice {
+                Some(Ok(chosen)) => say!(report, "    chosen: {chosen}"),
+                Some(Err(reason)) => say!(report, "    no choice: {reason}"),
+                None => say!(report, "    no choice made"),
+            },
+            WindowKind::Holdout => {
+                if let Some(Ok(chosen)) = &collect.phase_290.choice {
+                    let verdict = match beats_baseline_290(lines, chosen) {
+                        Some(true) => "success: below its constant baseline at every limit",
+                        Some(false) => "no success: not below its constant baseline at every limit",
+                        None => "not evaluable",
+                    };
+                    say!(report, "    {chosen} (chosen): {verdict}");
+                }
+            }
+            WindowKind::Day(_) => {}
+        }
+    }
+}
+
 fn flow_line(name: &str, params: &HawkesParameters, holdout: &[HawkesSegment]) -> String {
     match score_flow(holdout, params) {
         Ok(fit) => format!(
@@ -2679,6 +2951,7 @@ fn section_90_book(report: &mut Report, collect: &Collect) {
     );
     for window in &collect.book_windows {
         let name = match window.kind {
+            WindowKind::Train => "(290) training window, training fit, in sample",
             WindowKind::Holdout => "(b), (c) holdout, training fit, out of sample",
             WindowKind::Day(_) => "(d) day, own fit, in sample",
         };
@@ -2826,7 +3099,8 @@ mod tests {
             event(1, QrEventKind::Limit, 2, -1.0),
         ];
         let mut p = Phase290::default();
-        p.take_queue(&events, 1);
+        p.take_counts(&events);
+        p.take_lists(&events, 1);
         assert_eq!(p.counts[0], [[1, 0], [0, 1], [0, 1]]);
         assert_eq!(p.counts[1], [[0, 0], [0, 0], [1, 0]]);
         assert_eq!(p.invalid_waits, 1);
@@ -2840,8 +3114,73 @@ mod tests {
             ]
         );
         let mut thin = Phase290::default();
-        thin.take_queue(&events, 2);
+        thin.take_lists(&events, 2);
         assert_eq!(thin.all.len(), 3);
+    }
+
+    fn line(estimator: &'static str, baseline: bool, tv: &[f64], mean: f64) -> Line290 {
+        let report: DiscrepancyReport = serde_json::from_value(serde_json::json!({
+            "queue_size": tv, "spread": 0.0, "waiting_time": [0.0], "waiting_law": [0.0],
+            "flow": [0.0, 0.0, 0.0], "flow_law": [0.0, 0.0, 0.0], "coverage": 1.0,
+            "data_samples": 1, "data_events": 1, "model_samples": 1, "model_events": 1,
+            "model_stopped": null, "data_invalid_waiting": 0, "model_invalid_waiting": 0
+        }))
+        .unwrap();
+        Line290 {
+            estimator,
+            baseline,
+            outcome: Ok((report, mean)),
+        }
+    }
+
+    #[test]
+    fn test_290_choice_takes_the_lowest_first_limit_tv_among_stationary_fits() {
+        let lines = [
+            line("E0", false, &[0.2, 0.1], 150.0),
+            line("E0", true, &[0.0, 0.0], 1.0),
+            line("E1", false, &[0.4, 0.1], 20.0),
+            line("E2", false, &[0.3, 0.9], 99.9),
+        ];
+        assert_eq!(
+            choose_290(&lines),
+            Ok("E2"),
+            "E0 is transient, baselines never count"
+        );
+        let tie = [
+            line("E1", false, &[0.3], 1.0),
+            line("E2", false, &[0.3], 1.0),
+        ];
+        assert_eq!(choose_290(&tie), Ok("E1"), "the first on a tie");
+        let mut failed = line("E2", false, &[0.0], 1.0);
+        failed.outcome = Err("no fit".to_string());
+        let none = [line("E0", false, &[0.1], 100.0), failed];
+        assert!(
+            choose_290(&none).is_err(),
+            "no stationary fit, so no holdout"
+        );
+        assert!(stationary_290(99.99) && !stationary_290(100.0));
+    }
+
+    #[test]
+    fn test_290_success_needs_every_limit_below_its_own_baseline() {
+        let lines = [
+            line("E1", false, &[0.2, 0.3], 1.0),
+            line("E1", true, &[0.25, 0.35], 1.0),
+            line("E2", false, &[0.2, 0.4], 1.0),
+            line("E2", true, &[0.25, 0.4], 1.0),
+        ];
+        assert_eq!(beats_baseline_290(&lines, "E1"), Some(true));
+        assert_eq!(
+            beats_baseline_290(&lines, "E2"),
+            Some(false),
+            "a tie is not below"
+        );
+        assert_eq!(beats_baseline_290(&lines, "E0"), None);
+        let short = [
+            line("E1", false, &[0.1], 1.0),
+            line("E1", true, &[0.2, 0.2], 1.0),
+        ];
+        assert_eq!(beats_baseline_290(&short, "E1"), None);
     }
 
     #[test]
@@ -2970,13 +3309,24 @@ mod tests {
         );
         let holdout = protocol.holdout();
         let days = protocol.days();
-        assert_eq!(collect.book_windows.len(), 1 + days.len());
-        let first = &collect.book_windows[0];
+        assert_eq!(collect.book_windows.len(), 2 + days.len());
+        let train = &collect.book_windows[0];
+        assert_eq!(train.kind, WindowKind::Train);
+        assert_eq!(train.window.start_ms, protocol.queue_train().start_ms);
+        assert_eq!(
+            train.window.end_ms,
+            protocol.queue_train().start_ms + BOOK_WINDOW_MS
+        );
+        assert_eq!(
+            train.due_ms, protocol.train_end_ms,
+            "the training fit needs training"
+        );
+        let first = &collect.book_windows[1];
         assert_eq!(first.kind, WindowKind::Holdout);
         assert_eq!(first.window.start_ms, holdout.start_ms);
         assert_eq!(first.window.end_ms, holdout.start_ms + BOOK_WINDOW_MS);
         assert_eq!(first.due_ms, first.window.end_ms);
-        for (window, day) in collect.book_windows[1..].iter().zip(&days) {
+        for (window, day) in collect.book_windows[2..].iter().zip(&days) {
             assert_eq!(window.kind, WindowKind::Day(*day));
             assert_eq!(window.window.start_ms, day.start_ms);
             assert_eq!(window.window.end_ms, day.start_ms + BOOK_WINDOW_MS);
@@ -2991,8 +3341,8 @@ mod tests {
         // A short holdout bounds its window.
         let short = Protocol::new(START, START + 4 * HOUR_MS).unwrap();
         let windows = BookWindow::all(&short);
-        assert_eq!(windows[0].window.end_ms, short.end_ms);
-        assert_eq!(windows[0].due_ms, short.end_ms);
+        assert_eq!(windows[1].window.end_ms, short.end_ms);
+        assert_eq!(windows[1].due_ms, short.end_ms);
 
         // Nothing is compared before its time; then each once, and its data is dropped.
         let sample = BookSample {
@@ -3007,17 +3357,24 @@ mod tests {
         collect.compare_due(holdout.start_ms + BOOK_WINDOW_MS - 1);
         let day_due = days[0].end_ms;
         assert!(day_due < holdout.start_ms);
-        assert!(collect.book_windows[0].result.is_none());
-        assert_eq!(collect.book_windows[0].samples.len(), 1);
-        assert!(collect.book_windows[1].result.is_some());
+        assert!(collect.book_windows[1].result.is_none());
+        assert_eq!(collect.book_windows[1].samples.len(), 1);
+        assert!(collect.book_windows[0].result.is_some());
+        assert!(collect.book_windows[2].result.is_some());
+        // With no fit, nothing is stationary on the training window, so #290 stops there.
+        assert!(matches!(collect.phase_290.choice, Some(Err(_))));
         collect.compare_due(holdout.start_ms + BOOK_WINDOW_MS);
-        let window = &collect.book_windows[0];
+        let window = &collect.book_windows[1];
         assert!(window.samples.is_empty());
         assert_eq!(window.data, (1, 0));
         assert_eq!(
             window.result,
             Some(vec!["not evaluable: no fit: no event sizes".to_string()])
         );
+        assert!(matches!(
+            &window.result_290,
+            Some(Err(reason)) if reason.starts_with("not run, stop rule")
+        ));
         let read = holdout.start_ms + BOOK_WINDOW_MS;
         for window in &collect.book_windows {
             assert_eq!(window.result.is_some(), window.due_ms <= read);
@@ -3112,7 +3469,7 @@ mod tests {
                 .any(|s| s.value.timestamp_ms < protocol.holdout().start_ms)
         );
         collect.take(&output);
-        let window = &collect.book_windows[0];
+        let window = &collect.book_windows[1];
         assert_eq!(window.kind, WindowKind::Holdout);
         // The five bids at the touch, and none of the opening's diffs before the window.
         assert_eq!(window.events.len(), 5);
@@ -3129,6 +3486,11 @@ mod tests {
         );
         assert_eq!(window.samples_without_sizes, 0);
         assert!(window.result.is_none());
+        // #290 counts the training part only, and keeps its estimators' inputs from every part.
+        let counted = |c: &Collect| c.phase_290.counts.iter().flatten().flatten().sum::<u64>();
+        assert_eq!(counted(&collect), 0);
+        assert!(!collect.phase_290.all.is_empty());
+        let first_hour = output.events.clone();
 
         // An hour that reads past the window's end compares it and drops its data. Its diff ends
         // a silence that resets the replay, so no sample spans that silence.
@@ -3141,10 +3503,12 @@ mod tests {
             )
             .unwrap();
         collect.take(&output);
-        let window = &collect.book_windows[0];
+        let window = &collect.book_windows[1];
         assert!(window.result.is_some());
         assert!(window.samples.is_empty() && window.events.is_empty());
         assert_eq!(window.data, (5, 5));
+        collect.convert(Part::Train, &first_hour);
+        assert!(counted(&collect) > 0);
     }
 
     #[test]

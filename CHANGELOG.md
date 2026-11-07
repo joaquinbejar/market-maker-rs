@@ -17,7 +17,8 @@ project follows [Semantic Versioning](https://semver.org/).
   holds #290's protocol and its synthetic recovery check on #102's calm regime; example
   `hyperliquid_validation` gains #290's phase 1 on the capture's training part (counts with and
   without zero waits, block lengths, how touch-queue lives end, and the drift of each estimator's
-  fit).
+  fit) and phase 3 (each estimator and its constant baseline on #286's windows and the training
+  part's first hours, the choice and stop rule fixed before any run, and the holdout's verdict).
 - Example `time_travel_queues` (#109), behind `serde`: chronological replay against consistent
   time travel for a market maker at the touch, on queues. On #102's queue-reactive regimes the
   simulator continues from a state that holds the agent's order, so each mode is measured against
