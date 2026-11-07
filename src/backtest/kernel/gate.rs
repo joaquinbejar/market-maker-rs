@@ -158,27 +158,31 @@ pub(super) struct Balances {
     pub(super) base_free_lots: i128,
 }
 
-/// The quote reserved by a buy of `lots` at `price` ticks, in U: its
-/// notional plus `fee_num` of it, i.e. per unit of the lot's grid
-/// `price * mt * (F + fee_num)`.
-pub(super) fn buy_reservation_u(
-    tick: &Unit,
-    lot: &Unit,
-    fee_scale: i128,
-    fee_num: i128,
-    price: u64,
-    lots: u64,
-) -> Option<i128> {
-    per_grid_u(tick, fee_scale, fee_num, price)?
-        .checked_mul(i128::from(lots))?
-        .checked_mul(i128::from(lot.mantissa))
+/// What the balance gate reserves with: the tick and the lot, the fee scale `F` and the
+/// fee rate mantissa reserved on buys.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MarginTerms<'a> {
+    pub(super) tick: &'a Unit,
+    pub(super) lot: &'a Unit,
+    pub(super) fee_scale: i128,
+    pub(super) fee_num: i128,
 }
 
-/// The quote reserved per unit of the lot's grid at `price` ticks, in U.
-fn per_grid_u(tick: &Unit, fee_scale: i128, fee_num: i128, price: u64) -> Option<i128> {
-    i128::from(price)
-        .checked_mul(i128::from(tick.mantissa))?
-        .checked_mul(fee_scale.checked_add(fee_num)?)
+impl MarginTerms<'_> {
+    /// The quote reserved by a buy of `lots` at `price` ticks, in U: its notional plus
+    /// `fee_num` of it, i.e. per unit of the lot's grid `price * mt * (F + fee_num)`.
+    pub(super) fn buy_reservation_u(&self, price: u64, lots: u64) -> Option<i128> {
+        self.per_grid_u(price)?
+            .checked_mul(i128::from(lots))?
+            .checked_mul(i128::from(self.lot.mantissa))
+    }
+
+    /// The quote reserved per unit of the lot's grid at `price` ticks, in U.
+    fn per_grid_u(&self, price: u64) -> Option<i128> {
+        i128::from(price)
+            .checked_mul(i128::from(self.tick.mantissa))?
+            .checked_mul(self.fee_scale.checked_add(self.fee_num)?)
+    }
 }
 
 /// The balance gate for an order of `qty` lots at `price` ticks, as
@@ -190,20 +194,17 @@ fn per_grid_u(tick: &Unit, fee_scale: i128, fee_num: i128, price: u64) -> Option
 /// `None` if a value is not representable (unreachable inside the validated
 /// bounds).
 pub(super) fn margin_check(
-    tick: &Unit,
-    lot: &Unit,
-    fee_scale: i128,
-    fee_num: i128,
+    terms: &MarginTerms<'_>,
     balances: &Balances,
     dir: Dir,
     price: u64,
     qty: u64,
 ) -> Option<GateDecision> {
-    let ml = i128::from(lot.mantissa);
+    let ml = i128::from(terms.lot.mantissa);
     let wanted = i128::from(qty).checked_mul(ml)?;
     let covered = match dir {
         Dir::Buy => {
-            let per = per_grid_u(tick, fee_scale, fee_num, price)?;
+            let per = terms.per_grid_u(price)?;
             if per <= 0 {
                 return None;
             }

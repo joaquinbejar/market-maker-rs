@@ -14,11 +14,10 @@ use super::book::{
     Blank, Delivery, ExecKind, FillRec, MsgKind, ObsEntry, OrderState, Origin, ReportRec, VenueMsg,
     VenueOrder,
 };
-use super::config::ValidMargin;
 use super::config::{ValidFill, ValidatedConfig};
 use super::data::{KernelDataset, KernelTick, NS_PER_MS};
 use super::encode::insert_by_id;
-use super::gate::{self, Balances, GateCheck, GateVerdict};
+use super::gate::{self, Balances, GateCheck, GateVerdict, MarginTerms};
 use super::grid::{half_units_decimal, scaled_decimal};
 use super::state::{
     ActionStatus, EventSink, GateRecord, HaltReason, KernelEvent, KernelState, Phase, QueueLengths,
@@ -1110,19 +1109,15 @@ pub(super) fn quote_transaction<
             if let Some(record) = record.take() {
                 em.event(KernelEvent::Gate(record));
             }
-            let balances = balances(cfg, t, margin).ok_or(Halt::GateNumeric)?;
-            let fee_scale = cfg.fee_scale().ok_or(Halt::GateNumeric)?;
-            let decision = gate::margin_check(
-                &cfg.tick,
-                &cfg.lot,
-                fee_scale,
-                margin.fee_num,
-                &balances,
-                dir,
-                price,
-                size,
-            )
-            .ok_or(Halt::GateNumeric)?;
+            let terms = MarginTerms {
+                tick: &cfg.tick,
+                lot: &cfg.lot,
+                fee_scale: cfg.fee_scale().ok_or(Halt::GateNumeric)?,
+                fee_num: margin.fee_num,
+            };
+            let balances = balances(cfg, t, &terms).ok_or(Halt::GateNumeric)?;
+            let decision =
+                gate::margin_check(&terms, &balances, dir, price, size).ok_or(Halt::GateNumeric)?;
             record = Some(GateRecord {
                 order_id: id,
                 side: dir.into(),
@@ -1198,9 +1193,9 @@ pub(super) fn quote_transaction<
 fn balances<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
     cfg: &ValidatedConfig,
     t: &St<ORD, MSG, DLV, OBS>,
-    margin: &ValidMargin,
+    terms: &MarginTerms<'_>,
 ) -> Option<Balances> {
-    let fee_scale = cfg.fee_scale()?;
+    let margin = cfg.margin.as_ref()?;
     let activations = t.msgs.as_slice().iter().filter_map(|m| match &m.kind {
         MsgKind::Activate(order) => Some(order),
         MsgKind::Cancel { .. } => None,
@@ -1212,14 +1207,7 @@ fn balances<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usi
         .chain(activations)
         .filter(|o| o.side == Dir::Buy)
         .try_fold(0i128, |sum, o| {
-            sum.checked_add(gate::buy_reservation_u(
-                &cfg.tick,
-                &cfg.lot,
-                fee_scale,
-                margin.fee_num,
-                o.price,
-                o.remaining(),
-            )?)
+            sum.checked_add(terms.buy_reservation_u(o.price, o.remaining())?)
         })?;
     let quote_free_u = cfg
         .c0_u
