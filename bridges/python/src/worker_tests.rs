@@ -915,3 +915,175 @@ fn test_a_rational_queue_rate_is_configured_refused_at_zero_and_in_the_fingerpri
         .is_err()
     );
 }
+
+/// Two Avellaneda-Stoikov points that quote different sizes, so the classical action says which
+/// one quoted.
+fn scheduled(changes: &str) -> String {
+    let two = AVELLANEDA.replace(r#""size": "1""#, r#""size": "2""#);
+    format!(r#"{{"kind": "scheduled", "points": [{AVELLANEDA}, {two}], "changes": {changes}}}"#)
+}
+
+fn scheduled_rows() -> Vec<KernelTick> {
+    (0..100_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect()
+}
+
+fn classical_size(decision: &ResidualDecision) -> Option<u64> {
+    match decision.classical {
+        market_maker_rs::backtest::kernel::KernelAction::Quote { bid_lots, .. } => Some(bid_lots),
+        _ => None,
+    }
+}
+
+#[test]
+fn test_a_scheduled_change_applies_from_the_first_decision_that_has_observed_its_row() {
+    const CHANGE: u64 = 40;
+    let mut bridge = residual_config(&scheduled(&format!("[[{CHANGE}, 1]]")));
+    // Under an observation delay longer than the gap between rows.
+    bridge.latency.observation_q = 60;
+    let kernel = bridge.kernel().unwrap();
+    let rows = scheduled_rows();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let rl = bridge.rl().unwrap();
+    let Baseline::Scheduled(source) = parse_baseline(
+        &bridge.residual.as_ref().unwrap().baseline,
+        &bridge.lot_size,
+    )
+    .unwrap() else {
+        panic!("a scheduled baseline");
+    };
+    let bounds = ResidualBounds {
+        price_ticks: 4,
+        size_lots: 1,
+    };
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    worker.reset(3).unwrap();
+    let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
+        ResidualEnv::new(&kernel, &data, source, Decimal::ONE, bounds, rl).unwrap();
+    let mut state = env.reset(3).unwrap();
+    let (mut before, mut after) = (0, 0);
+    let mut first_after = None;
+    for step in 0_u64.. {
+        let seen = env.env().kernel().observe(state.kernel()).row;
+        let direct = env.step(&mut state, ResidualProposal::ZERO).unwrap();
+        let reply = worker.step_residual(ResidualProposal::ZERO).unwrap();
+        assert_eq!(reply.decision, Some(direct.decision));
+        assert_eq!(reply.transition, direct.transition);
+        if let Some(size) = classical_size(&direct.decision) {
+            if seen.is_some_and(|row| row >= CHANGE) {
+                assert_eq!(size, 2, "step {step} saw row {seen:?}");
+                after += 1;
+                first_after = first_after.or(seen);
+            } else {
+                assert_eq!(size, 1, "step {step} saw row {seen:?}");
+                before += 1;
+            }
+        }
+        if direct.transition.terminated || direct.transition.truncated {
+            break;
+        }
+    }
+    assert!(before > 0 && after > 0, "{before} {after}");
+    // The first decision on the new point is the one that observed the change's row.
+    assert_eq!(first_after, Some(CHANGE));
+}
+
+#[test]
+fn test_a_schedule_without_changes_is_its_first_point() {
+    let rows = scheduled_rows();
+    let mut plain = Worker::spawn(residual_config(AVELLANEDA), rows.clone(), None).unwrap();
+    let mut one = Worker::spawn(residual_config(&scheduled("[]")), rows, None).unwrap();
+    plain.reset(5).unwrap();
+    one.reset(5).unwrap();
+    loop {
+        let a = plain.step_residual(ResidualProposal::ZERO).unwrap();
+        let b = one.step_residual(ResidualProposal::ZERO).unwrap();
+        assert_eq!(a, b);
+        if a.transition.terminated || a.transition.truncated {
+            break;
+        }
+    }
+    assert_eq!(plain.attribution().unwrap(), one.attribution().unwrap());
+}
+
+#[test]
+fn test_the_point_in_force_is_that_of_the_last_change_at_or_before_the_row() {
+    let baseline: BaselineConfig =
+        serde_json::from_str(&scheduled("[[10, 1], [20, 0], [30, 1]]")).unwrap();
+    let Baseline::Scheduled(quoter) = parse_baseline(&baseline, "1").unwrap() else {
+        panic!("a scheduled baseline");
+    };
+    let bridge = residual_config(AVELLANEDA);
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(long_rows(), &kernel).unwrap();
+    let env: RlEnv<'_, 1, 1, ORD, MSG, DLV, OBS> = RlEnv::new(
+        &kernel,
+        &data,
+        ActionGrid::new([0], [0], [1]).unwrap(),
+        bridge.rl().unwrap(),
+    )
+    .unwrap();
+    let state = env.reset(1).unwrap();
+    let observed = env.kernel().observe(state.kernel());
+    let at = |row: Option<u64>| {
+        let mut obs = observed;
+        obs.row = row;
+        quoter.in_force(&obs)
+    };
+    let seen: Vec<usize> = [
+        None,
+        Some(0),
+        Some(9),
+        Some(10),
+        Some(19),
+        Some(20),
+        Some(29),
+        Some(30),
+        Some(99),
+    ]
+    .into_iter()
+    .map(at)
+    .collect();
+    assert_eq!(seen, [0, 0, 0, 1, 1, 0, 0, 1, 1]);
+}
+
+#[test]
+fn test_a_malformed_schedule_is_refused() {
+    let refused = |baseline: &str| {
+        let result = Worker::spawn(residual_config(baseline), long_rows(), None);
+        assert!(matches!(result, Err(BridgeError::Refused(_))), "{baseline}");
+    };
+    refused(r#"{"kind": "scheduled", "points": [], "changes": []}"#);
+    refused(&scheduled("[[5, 2]]"));
+    refused(&scheduled("[[5, 0]]"));
+    refused(&scheduled("[[5, 1], [5, 0]]"));
+    refused(&scheduled("[[5, 1], [4, 0]]"));
+    refused(&scheduled("[[5, 1], [6, 1]]"));
+    let nested = format!(
+        r#"{{"kind": "scheduled", "points": [{}], "changes": []}}"#,
+        scheduled("[]")
+    );
+    refused(&nested);
+    refused(&scheduled("[[5, 1]]").replace(r#""0.2""#, r#""not a number""#));
+    // Unknown fields are refused as in every baseline.
+    let extra = scheduled("[]").replace(r#""changes""#, r#""extra": 1, "changes""#);
+    assert!(serde_json::from_str::<BaselineConfig>(&extra).is_err());
+    assert!(
+        Worker::spawn(
+            residual_config(&scheduled("[[5, 1], [9, 0]]")),
+            long_rows(),
+            None
+        )
+        .is_ok()
+    );
+}

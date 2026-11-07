@@ -16,6 +16,9 @@ project follows [Semantic Versioning](https://semver.org/).
   with paired block bootstrap intervals, drawdowns, positions, breaches and the margin
   requirement. The design and the day digests were committed before any policy ran. Example
   `qr_days` takes an optional seed offset. Synthetic data only; the results are on the issue.
+- A `scheduled` baseline in the Python bridge's residual configuration: classical points in turn,
+  each change applying from the first decision that has observed its row, for #112's adaptive
+  and labelled arms. Existing baselines are unchanged.
 - Example `time_travel_queues` (#109), behind `serde`: chronological replay against consistent
   time travel for a market maker at the touch, on queues. On #102's queue-reactive regimes the
   simulator continues from a state that holds the agent's order, so each mode is measured against
