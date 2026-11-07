@@ -8,6 +8,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Example `time_travel_queues` (#109), behind `serde`: chronological replay against consistent
+  time travel for a market maker at the touch, on queues. On #102's queue-reactive regimes the
+  simulator continues from a state that holds the agent's order, so each mode is measured against
+  the market's true reaction; on the Hyperliquid capture each mode is measured without a truth.
+  Fixed rules only, time travel labelled in every row, no search across splits, the protocol
+  fixed in the code before any run, and a post-hoc noise floor labelled as such. No data is in the
+  repository.
 - The Python bridge builds against Python's stable ABI for 3.11 and loads on 3.11 and 3.12 (#284),
   both tested; nothing else in it changes.
 - The out-of-sample comparison of #102 in `bridges/python/experiments/m4_05`: a design fixed
