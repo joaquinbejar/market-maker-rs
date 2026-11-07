@@ -26,6 +26,10 @@ use super::state::{
 
 type Halt = HaltReason;
 
+/// The combined limits of a hedged kernel, with the counter of the orders
+/// they refuse; `None` for a kernel alone.
+pub(super) type Combined<'a> = Option<(&'a super::hedge::CombinedCheck, &'a mut u64)>;
+
 /// Counts the agent-facing events forwarded to the caller's sink.
 ///
 /// A run delivers at most three status reports per order, a fill report per
@@ -986,11 +990,12 @@ pub(super) fn apply_quote<
     cfg: &ValidatedConfig,
     s: &mut St<ORD, MSG, DLV, OBS>,
     legs: Legs,
+    combined: Combined<'_>,
     em: &mut E,
 ) -> Result<(), Halt> {
     let undo = Undo::save(s);
     let mut buf = Buf::new();
-    let mut result = quote_transaction(cfg, s, legs, &mut buf);
+    let mut result = quote_transaction(cfg, s, legs, combined, &mut buf);
     if result.is_ok() && buf.full {
         result = Err(Halt::CounterOverflow);
     }
@@ -1054,6 +1059,7 @@ pub(super) fn quote_transaction<
     cfg: &ValidatedConfig,
     t: &mut St<ORD, MSG, DLV, OBS>,
     legs: Legs,
+    mut combined: Combined<'_>,
     em: &mut E,
 ) -> Result<(), Halt> {
     let now = t.now_ns;
@@ -1074,20 +1080,44 @@ pub(super) fn quote_transaction<
         account::open(&mut t.account, id).map_err(|_| Halt::CounterOverflow)?;
         let mut refused = crossed;
         let mut size = lots;
+        let mut record = None;
         if !refused && let Some(limits) = &cfg.limits {
             let decision = gate::check(limits, &t.gate, &cfg.tick, &cfg.lot, dir, price, lots)
                 .map_err(|_| Halt::GateNumeric)?;
-            em.event(KernelEvent::Gate(GateRecord {
+            record = Some(GateRecord {
                 order_id: id,
                 side: dir.into(),
                 requested: lots,
                 verdict: decision.verdict,
                 submitted: decision.submitted,
-            }));
+            });
             match decision.verdict {
                 GateVerdict::Accepted | GateVerdict::Reduced => size = decision.submitted,
-                GateVerdict::ReducedOffLot | GateVerdict::Rejected => refused = true,
+                GateVerdict::ReducedOffLot | GateVerdict::Rejected => {
+                    refused = true;
+                }
             }
+        }
+        // The combined limits of a hedged kernel bind after the instrument's
+        // own, on what it would submit; without them nothing here changes.
+        if !refused && let Some((check, rejects)) = combined.as_mut() {
+            let admitted = check
+                .admits_quoted(&t.gate, &cfg.tick, &cfg.lot, dir, price, size)
+                .ok_or(Halt::GateNumeric)?;
+            if !admitted {
+                refused = true;
+                bump(rejects)?;
+                record = Some(GateRecord {
+                    order_id: id,
+                    side: dir.into(),
+                    requested: lots,
+                    verdict: GateVerdict::Rejected,
+                    submitted: 0,
+                });
+            }
+        }
+        if let Some(record) = record {
+            em.event(KernelEvent::Gate(record));
         }
         let order = VenueOrder {
             id,
