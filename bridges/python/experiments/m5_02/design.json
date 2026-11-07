@@ -6,9 +6,9 @@
  "data": "synthetic everywhere; nothing here is market data",
  "protocol": "#103's (experiments/m4_06/design.json, pinned below): its data for B, execution, fee rule and secondary fee, Box encoding with the reject policy, hyperparameter set, budget, training seeds, evaluation seed and bootstrap; one decision per row only",
  "pins": {
-  "m4_06_design": "6237538fbb7c951e57d4d5c2f76e7145704a997d10a11aeefe5c14e0348ce1f9",
-  "m4_06_digests": "f79f46f5294a3d358bdd9598345a4cbd85a0d26f2532ec89f90185a188d0319b",
-  "m4_06_commit": "9046fb5b156e1a41fe9b14fd649fbfda47fdd557"
+  "m4_06_design": "9a1d1423d1f0e70eca9dd169d03cf85dca1b81ae7bd81516098cd1654165af2a",
+  "m4_06_digests": "79c88f3329213048ceb88d001dbfd4d05d7faba74e3d9b60c29fe6b3d9a81e12",
+  "m4_06_commit": "283d4d47d3f60859b4519a1f5f0571833a4289b1"
  },
  "fee": {
   "value": null,
