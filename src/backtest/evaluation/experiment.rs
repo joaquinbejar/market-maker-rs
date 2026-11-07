@@ -203,6 +203,33 @@ fn resampled_means(values: &[f64], config: &BootstrapConfig, seed: u64) -> Vec<f
     means
 }
 
+/// A stationary block bootstrap of the mean of daily values, the one [`Experiment`]
+/// gives on the mean daily net result and on the daily difference to a baseline.
+///
+/// A block starts on a uniform day and goes on to the next day, round the end of the
+/// series, until it restarts, with a mean length of `config.mean_block_days`. The means
+/// of `config.replicates` resamples give a percentile interval at
+/// `config.confidence_percent`, with the same number of resamples cut from each tail.
+/// Fewer than `config.min_days` values give [`BootstrapOutcome::Insufficient`].
+///
+/// The resampled days depend on `config.seed` and on how many values there are, never
+/// on the values, so two series of one length are resampled on the same days. The
+/// interval on a paired comparison is therefore this function over the daily
+/// differences. [`Experiment`] derives a seed for each window and scenario from its
+/// configured one; this function uses `config.seed` as it is.
+///
+/// # Errors
+///
+/// Returns [`EvaluationError::InvalidInput`] for a configuration [`Experiment`] would
+/// refuse, and for a value with no finite `f64`.
+pub fn block_bootstrap(
+    series: &[Decimal],
+    config: &BootstrapConfig,
+) -> EvalResult<BootstrapOutcome> {
+    config.validate()?;
+    bootstrap(series, config, config.seed)
+}
+
 fn bootstrap(
     series: &[Decimal],
     config: &BootstrapConfig,
@@ -1363,6 +1390,84 @@ mod tests {
         assert!((u2 - 2.0 * u1).abs() < 1e-12);
         assert!((m2 - 2.0 * m1).abs() < 1e-12);
         assert!(l1 <= m1 && m1 <= u1);
+    }
+
+    #[test]
+    fn test_block_bootstrap_is_the_harness_bootstrap_under_its_seed() {
+        let series: Vec<Decimal> = [3, -1, 4, 1, -5, 9, 2, -6, 5, 3].map(dec).to_vec();
+        let seed = derived_seed(11, WindowKind::Validation, "scenario");
+        for block in [1, 2, 5] {
+            let harness = config(block);
+            let given = BootstrapConfig { seed, ..harness };
+            assert_eq!(
+                block_bootstrap(&series, &given).unwrap(),
+                bootstrap(&series, &harness, seed).unwrap()
+            );
+        }
+        // Another seed resamples other days.
+        let other = BootstrapConfig {
+            seed: seed.wrapping_add(1),
+            ..config(2)
+        };
+        assert_ne!(
+            block_bootstrap(&series, &other).unwrap(),
+            bootstrap(&series, &config(2), seed).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_block_bootstrap_refuses_what_the_harness_refuses() {
+        let series = [dec(1), dec(2), dec(3)];
+        for bad in [
+            BootstrapConfig {
+                replicates: 0,
+                ..config(2)
+            },
+            BootstrapConfig {
+                mean_block_days: 0,
+                ..config(2)
+            },
+            BootstrapConfig {
+                confidence_percent: 100,
+                ..config(2)
+            },
+            BootstrapConfig {
+                min_days: 1,
+                ..config(2)
+            },
+        ] {
+            assert!(
+                matches!(
+                    block_bootstrap(&series, &bad),
+                    Err(EvaluationError::InvalidInput { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        let mut few = config(2);
+        few.min_days = 4;
+        assert_eq!(
+            block_bootstrap(&series, &few).unwrap(),
+            BootstrapOutcome::Insufficient {
+                days: 3,
+                required: 4
+            }
+        );
+    }
+
+    #[test]
+    fn test_block_bootstrap_resamples_series_of_one_length_on_the_same_days() {
+        let a: Vec<f64> = (0..12).map(|i| f64::from(i * i % 7)).collect();
+        let b: Vec<f64> = (0..12).map(|i| f64::from(3 - i % 5)).collect();
+        let difference: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x - y).collect();
+        let (ma, mb, md) = (
+            resampled_means(&a, &config(3), 9),
+            resampled_means(&b, &config(3), 9),
+            resampled_means(&difference, &config(3), 9),
+        );
+        for ((x, y), d) in ma.iter().zip(&mb).zip(&md) {
+            assert!((x - y - d).abs() < 1e-12);
+        }
     }
 
     #[test]

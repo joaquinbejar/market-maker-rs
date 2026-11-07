@@ -18,7 +18,7 @@ use market_maker_rs::Decimal;
 use market_maker_rs::backtest::evaluation::{
     BootstrapConfig, BootstrapOutcome, Candidate, CandidateKind, EvaluationError, EvaluationRow,
     Experiment, ExperimentConfig, MetricId, MetricsSpec, Provenance, Reading, RowMetrics,
-    RowOutcome, Scenario, Splits, WindowKind,
+    RowOutcome, Scenario, Splits, WindowKind, block_bootstrap,
 };
 use market_maker_rs::backtest::{
     BacktestConfig, BacktestStrategy, FillModel, FillResult, ImmediateFillModel, MarketTick,
@@ -718,6 +718,50 @@ fn test_difference_to_a_baseline_that_never_trades_equals_the_row_itself() {
     assert!(lower <= mean && mean <= upper);
     let net = metrics.metrics.attribution.net_pnl;
     assert!((mean - f64::try_from(net).unwrap() / 4.0).abs() < 1e-9);
+}
+
+fn daily_net(metrics: &RowMetrics) -> Vec<Decimal> {
+    metrics
+        .daily
+        .iter()
+        .filter(|day| day.bucket.marks > 0)
+        .map(|day| day.bucket.attribution.net_pnl)
+        .collect()
+}
+
+#[test]
+fn test_block_bootstrap_of_a_rows_daily_results_has_its_mean_and_days() {
+    let config = experiment_config();
+    let validated = Experiment::new(
+        config.clone(),
+        ticks(),
+        with(vec![quoter("a", dec!(0.25))]),
+        vec![immediate()],
+    )
+    .unwrap()
+    .evaluate_validation();
+    let rows = &validated.report().rows;
+    let a = completed(row(rows, "a", "immediate"));
+    let fixed = completed(row(rows, "fixed-spread", "immediate"));
+    let series = daily_net(a);
+    let difference: Vec<Decimal> = series
+        .iter()
+        .zip(daily_net(fixed))
+        .map(|(x, y)| x - y)
+        .collect();
+    // The harness seeds each window and scenario on its own, so only the parts that do
+    // not depend on the seed are compared here: the mean and the days.
+    for (values, harness) in [
+        (&series, a.mean_daily_net),
+        (&difference, a.against_baselines["fixed-spread"]),
+    ] {
+        let (mean, lower, upper, days) =
+            interval(block_bootstrap(values, &config.bootstrap).unwrap());
+        let (expected_mean, _, _, expected_days) = interval(harness);
+        assert_eq!(days, expected_days);
+        assert!((mean - expected_mean).abs() < 1e-9);
+        assert!(lower <= mean && mean <= upper);
+    }
 }
 
 #[test]
