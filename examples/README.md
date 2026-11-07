@@ -25,6 +25,7 @@ cargo run --release --features serde --example hyperliquid_validation -- BTC 1 1
 # Research, on synthetic data only
 cargo run --example offline_rl_support
 cargo run --example consistent_time_travel
+cargo run --release --features serde --example time_travel_queues -- synthetic bridges/python/experiments/m4_05/design.json
 cargo run --release --example quote_duration
 cargo run --release --features chain --example chain_pricing_evaluation -- <commit> <toolchain>
 cargo run --release --features options,margin,multi-underlying --example option_quoting
