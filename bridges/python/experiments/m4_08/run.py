@@ -212,7 +212,8 @@ def episode(policy, env, rows, seed, design):
         "seed": seed, "steps": steps, "net": info["net"], "cost_means": means,
         "over_budget": {k: means[k] > budgets[k] for k in budgets},
         "actions_refused": refused, "orders": orders,
-        "legs_rejected_by_limits": orders["rejected"],
+        # Every leg the kernel refused: by the hard limits, or by its admission (range).
+        "legs_rejected": orders["rejected"],
         "attribution": {k: v for k, v in attribution.items() if k != "positions"},
         "peak_notional": str(peak),
         "limit_breach": Decimal(attribution["max_abs_position"]) > Decimal(limits["max_position"])

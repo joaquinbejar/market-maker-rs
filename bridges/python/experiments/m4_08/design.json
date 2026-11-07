@@ -23,7 +23,7 @@
   "changes": [
     "version 1, after the timing pilot and before any training: steps_per_epoch 17280 (two days of 8640 steps) for every arm instead of 2000, because OmniSafe's Lagrange update needs a finished episode in every epoch and PPOLag stopped on a NaN cost at 2000. The toy gate is run again at the same two episodes per epoch (steps_per_epoch 40), under the criterion of toy_gate.json; an algorithm that fails it is not an arm. Pilot timing, 50000 steps on pooled training days: PPO 13.9 and CPO 13.0 minutes per 2M steps. Nothing else was seen.",
     "version 1, after the re-gate and before any training: PPOLag failed the re-gate at two episodes per epoch (seed 2 cost 5.789, 0.211 from the limit) and is dropped as an arm; CPO passed (cost 5.905 and 6.052, return 6.142 and 6.156) and is the constrained arm.",
-    "version 1, before any training: the refusal metric is named for what the gate does, order legs rejected by the hard limits, beside actions refused; found by the smoke run of the runner."
+    "version 1, before any training: the refusal metric is named for what the kernel does, order legs rejected (by the hard limits or by admission), beside actions refused; found by the smoke run of the runner."
   ],
   "shocks": {
     "what": "an asset shock in the sense of margin-rs Scenario::shock: from 12:00 of the day on, the bid and the ask move by round(mid * shock) ticks of the kernel, the spread and sizes unchanged",
@@ -209,7 +209,7 @@
   "metrics": [
     "mean cost per step against each budget",
     "episodes over budget (per cost)",
-    "order legs rejected by the hard limits (the gate refuses legs, not whole actions), and actions refused, by reason",
+    "order legs rejected by the kernel (by the hard limits, which refuse legs and not whole actions, or by its admission), and actions refused, by reason",
     "proposals beyond the limits",
     "limit breaches (must be 0)",
     "net and the #102 metrics"
