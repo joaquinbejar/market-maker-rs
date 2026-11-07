@@ -1771,3 +1771,45 @@ fn test_a_config_without_zero_waits_reads_as_dropping_them() {
     let read: QrEstimationConfig = serde_json::from_value(value).unwrap();
     assert_eq!(read, cfg.with_zero_waits(ZeroWaitPolicy::Drop));
 }
+
+#[test]
+fn test_counted_size_with_no_time_is_unsupported_not_absorbing() {
+    use QrEventKind::{Cancel, Limit};
+    // Size 2 is only ever passed through inside a block: its events wait zero.
+    let mut events = Vec::new();
+    for i in 0..40u64 {
+        for (k, (kind, queue_before, waiting_seconds)) in [
+            (Limit, 1, 1.0),
+            (Limit, 2, 0.0),
+            (Cancel, 3, 1.0),
+            (Cancel, 2, 0.0),
+            (Cancel, 1, 1.0),
+            (Limit, 0, 1.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            events.push(QueueObservation {
+                timestamp_ms: 10 * i + k as u64,
+                kind,
+                queue_before,
+                waiting_seconds,
+                ..queue_event(QrSide::Bid, Limit, 0, 0.0)
+            });
+        }
+    }
+    let reference = ReferenceObservation {
+        timestamp_ms: 0,
+        moved: true,
+        reinitialized: false,
+    };
+    let cfg = estimation_config(1, 4, 30, 1, UnsupportedPolicy::NearestSupported)
+        .with_zero_waits(ZeroWaitPolicy::Count);
+    let record =
+        estimate_parameters(&events, &[reference], &[dec!(1)], &window(1_000), &cfg, "d").unwrap();
+    let fit = record
+        .parameters()
+        .expect("a size with no time has no rate, not a zero one");
+    assert!(fit.is_supported(0, 0) && fit.is_supported(0, 1) && fit.is_supported(0, 3));
+    assert!(!fit.is_supported(0, 2), "80 events, but no time at size 2");
+}

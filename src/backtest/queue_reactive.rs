@@ -121,7 +121,8 @@ pub enum ZeroWaitPolicy {
     #[default]
     Drop,
     /// Counts it at its queue size, adding no time there: the queue spent no measured time at
-    /// a size it passed through inside a block.
+    /// a size it passed through inside a block. A size whose counted events all waited zero has
+    /// no rate, so it is unsupported whatever its count.
     Count,
 }
 
@@ -1482,7 +1483,9 @@ pub fn estimate_parameters(
         let mut flags = Vec::with_capacity(rows);
         for ((limit, cancel, market), time) in table.iter().zip(times) {
             let count = limit.saturating_add(*cancel).saturating_add(*market);
-            flags.push(count >= config.min_events);
+            // A size whose events all waited zero has counts and no time, so no rate: it is
+            // unsupported, not a size whose rates are zero. Only counting zero waits makes one.
+            flags.push(count >= config.min_events && *time > 0.0);
             let rate = |c: u64| as_float(c) / *time;
             rate_rows.push(if *time > 0.0 {
                 (rate(*limit), rate(*cancel), rate(*market))

@@ -10,7 +10,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 - Counting of block-tied events in the queue-reactive estimator (#290):
   `QrEstimationConfig::zero_waits` with `ZeroWaitPolicy` (`Drop`, the default and the behaviour
-  so far, or `Count`, which counts an event with a zero wait and adds no time), set with
+  so far, or `Count`, which counts an event with a zero wait and adds no time, and leaves a size
+  with no time unsupported), set with
   `QrEstimationConfig::with_zero_waits`; a configuration written without the field reads as
   `Drop`. `queue_reactive::collapse_blocks` collapses each block's events at a queue into their
   net change, carrying the wait of a block with none. Example `qr_estimation`, behind `serde`,
