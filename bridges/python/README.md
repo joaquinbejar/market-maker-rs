@@ -32,6 +32,13 @@ hedge outside the mask is a charged hold. Either way a hedge replaces the restin
 other values are not read. A residual environment takes no hedge actions and refuses the flag. A
 checkpoint loads only into an environment with the same flag.
 
+A residual's baseline is `avellaneda_stoikov`, `glft`, or `scheduled`: `{"kind": "scheduled",
+"points": [...], "changes": [[row, index], ...]}` quotes with `points[0]` from the start and,
+from each change on, with the point it names. A change at row `r` applies from the first decision
+whose observation holds row `r` or a later one, so it never acts on a row the agent has not
+observed. The points are Avellaneda-Stoikov or GLFT configurations. Change rows must increase
+strictly, and each change must name a point other than the one in force.
+
 Money crosses the boundary only as decimal strings and rows as integer ticks and lots. The
 `f32` reward is the kernel's derived value, and `info` holds the exact reward and net result,
 together with the proposed, decoded and applied action.
