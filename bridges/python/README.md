@@ -45,6 +45,9 @@ observation of the episode, which the tests check.
 
 ## Running
 
+The extension is built against Python's stable ABI for 3.11, so it loads on 3.11 and 3.12;
+both are tested.
+
 ```sh
 uv venv --python 3.12 .venv && source .venv/bin/activate
 uv pip install "maturin>=1.16,<2"

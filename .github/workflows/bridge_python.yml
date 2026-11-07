@@ -14,8 +14,12 @@ env:
 
 jobs:
   bridge:
-    name: Bridge tests
+    name: Bridge tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
     defaults:
       run:
         working-directory: bridges/python
@@ -46,7 +50,7 @@ jobs:
         env:
           UV_TORCH_BACKEND: cpu
         run: |
-          uv venv --python 3.12 .venv
+          uv venv --python ${{ matrix.python }} .venv
           source .venv/bin/activate
           uv pip install "maturin>=1.16,<2"
           maturin develop --uv --extras test
