@@ -321,3 +321,34 @@ def test_observation_space_holds_every_observation():
         step += 1
     assert env.observation_space.contains(observation)
     env.close()
+
+
+def test_a_rational_queue_rate_fills_over_coarse_rows():
+    # Rows ten seconds apart, the ask resting at 99.5 with one lot from the second row on, so
+    # the bid of 2 at 99.5 waits behind one lot. Immediate fill takes all of it at once; one
+    # lot every 9 s clears none for it after 10 s, one after 20 s and the rest after 30 s.
+    rows = [row(1_000, 199, 201, 1, 1)] + [
+        row(ms, 197, 199, 1, 1) for ms in (11_000, 21_000, 31_000, 41_000)
+    ]
+
+    def positions(fill_model):
+        cfg = config(terminal="mark")
+        cfg["fill_model"] = fill_model
+        env = MaskableMarketMakingEnv(cfg, rows)
+        env.reset(seed=1)
+        out = []
+        action = [1, 1, 2, 1, 0]
+        for _ in range(3):
+            observation, _, terminated, truncated, info = env.step(action)
+            # The delivered position over its scale of 4.
+            out.append(float(observation[6]) * 4)
+            action = [0, 0, 0, 0, 0]
+        return out
+
+    assert positions({"kind": "immediate"}) == [2.0, 2.0, 2.0]
+    slow = {"kind": "queue_position_rational", "lots": 1, "per_ms": 9_000, "min_queue_ms": 0}
+    assert positions(slow) == [0.0, 1.0, 2.0]
+    with pytest.raises(ValueError):
+        cfg = config()
+        cfg["fill_model"] = dict(slow, lots=0)
+        MaskableMarketMakingEnv(cfg, rows)
