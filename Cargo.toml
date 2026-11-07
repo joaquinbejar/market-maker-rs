@@ -219,6 +219,10 @@ required-features = ["margin"]
 name = "kernel_margin"
 required-features = ["kernel", "margin"]
 
+[[test]]
+name = "kernel_margin_gate"
+required-features = ["kernel", "margin"]
+
 [[bench]]
 name = "quote_generation"
 harness = false

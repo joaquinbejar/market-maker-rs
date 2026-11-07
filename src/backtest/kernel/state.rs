@@ -5,7 +5,7 @@ use crate::Decimal;
 use super::account::AgentAccount;
 use super::book::{Arr, Delivery, FillRec, ObsEntry, ReportRec, VenueMsg, VenueOrder};
 use super::data::DatasetId;
-use super::gate::{GateState, GateVerdict};
+use super::gate::{GateCheck, GateState, GateVerdict};
 use super::hedge::HedgeEvent;
 use super::ledger::{AgentView, VenueLedger};
 use super::rng::KernelRng;
@@ -328,6 +328,8 @@ pub struct GateRecord {
     pub verdict: GateVerdict,
     /// Submitted lots (0 when refused).
     pub submitted: u64,
+    /// The check that decided.
+    pub check: GateCheck,
 }
 
 /// An event of the run, in event order.

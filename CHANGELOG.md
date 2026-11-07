@@ -31,6 +31,22 @@ project follows [Semantic Versioning](https://semver.org/).
 - A `scheduled` baseline in the Python bridge's residual configuration: classical points in turn,
   each change applying from the first decision that has observed its row, for #112's adaptive
   and labelled arms. Existing baselines are unchanged.
+- A balance gate for the kernel (feature `kernel`, #283): `KernelConfig::margin` takes a
+  `backtest::kernel::KernelMargin`, and the kernel, and so `rl::RlEnv`, then refuses or reduces
+  an order that `margin-rs`'s risk gate would refuse or reduce in `backtest::MarginAccount`. A
+  buy reserves its notional at its limit price plus its largest fee, `max(fee_rate, 0)` of it,
+  from the initial capital plus the fill cash flows less the fees and the live buys'
+  reservations; a sell reserves its quantity from `base_deposit` plus the venue position less
+  the live sells. The gate runs after `KernelConfig::limits`, in integers, with no new state and
+  no dependency: its reservations are recomputed from the live orders. A refused order is a
+  local reject that the agent receives; its `GateRecord` has `check: GateCheck::Margin`. On
+  synthetic scenarios, with latencies, partial fills and cancels racing fills, it decides order
+  by order as `BacktestEngine` with a `MarginAccount`, with the same reports, fills, ledger and
+  account balances. It is the spot, fully collateralised rule of `MarginAccount`: a
+  derivative's margin requirement (`DerivativeMarginAccount`), maintenance and liquidation
+  (margin-rs#7) are not modelled, and the Python bridge does not configure it yet. A hedged
+  kernel refuses it on either lane. A configuration without it keeps its bytes and its
+  fingerprint.
 - Example `time_travel_queues` (#109), behind `serde`: chronological replay against consistent
   time travel for a market maker at the touch, on queues. On #102's queue-reactive regimes the
   simulator continues from a state that holds the agent's order, so each mode is measured against
@@ -710,6 +726,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `backtest::kernel::KernelConfig` gains the public field `margin` and `GateRecord` the public
+  field `check` (#283), so a struct literal of `KernelConfig` must name `margin`
+  (`KernelConfig::new` sets `None`). `GateRecord` is `#[non_exhaustive]`, but its `Debug`
+  output, which some callers hash, now prints `check`.
 - `rl::ACTION_SPACE_VERSION` is 2 (#247), so every `rl::SpecId` changes and a checkpoint
   trained under action space 1 is refused by `RlSpec::ensure`. `rl::RlAction` gains `Hedge`,
   `rl::RlConfig` gains `hedge_actions`, and `rl::HedgeActions` gains `MarketableAtTouch`.
