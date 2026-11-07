@@ -879,7 +879,9 @@ pub struct ReplayOutput {
     /// Quotes and trades in time order. A trade comes before the quotes of its block, and its
     /// time is observed, where a quote's is inferred.
     pub market_events: Vec<Inferred<MarketEvent>>,
-    /// The mid, each time it changed.
+    /// The mid, each time it changed. A mid that stays put leaves no entry, also while the book
+    /// is live and its sizes change, so a stretch without one is not a silence of the book; the
+    /// mids of [`tops`](Self::tops) sample it at each change of the touch.
     pub prices: Vec<Inferred<PriceSample>>,
     /// Each mid move. Only moves are seen here, so `moved` is always true and `reinitialized`
     /// always false: a move the model would call eligible and that did not happen leaves no

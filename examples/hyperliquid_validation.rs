@@ -50,8 +50,11 @@
 //!   peaked at 1.6 GB resident, nearly all of it this.
 //! - Tops of book, training and holdout only, the last of each second ([`SAMPLE_MS`]): at most
 //!   3,600 an hour of 72 bytes, so at most about 150 MB for a month.
-//! - Mids for the walk-forward, the last of each second: at most 3,600 an hour of 24 bytes,
-//!   at most about 65 MB for a month. Its grid is of one second, so the grid prices are the same.
+//! - Mids for the walk-forward, the mid of the last top of each second: at most 3,600 an hour of
+//!   24 bytes, at most about 65 MB for a month. Its grid is of one second, so the grid prices are
+//!   the same. They come from the tops and not from the replay's `prices`, which hold the mid
+//!   only when it changed: a touch that stays put while its sizes change is a live book whose mid
+//!   did not move, and must be a sample, not a silence, for the walk-forward's gap check.
 //! - Mid moves (`ReferenceObservation`), all: about 4,500 an hour of 16 bytes, about 55 MB for a
 //!   month.
 //! - Order lives (`QuoteExposure`), one in [`EXPOSURE_STRIDE`] at the base rate: about 79,000 an
@@ -155,8 +158,8 @@ const MAX_PART_EVENTS: usize = 4_000_000;
 
 /// Price grid of the walk-forward.
 const WF_RESOLUTION_MS: u64 = SECOND_MS;
-/// Longest silence of the mid, in grid buckets: the reset gap. A mid that does not move leaves
-/// no sample, and a real gap that long would have reset the replay.
+/// Longest silence of the mid, in grid buckets: the reset gap. A mid is sampled at each change
+/// of the touch, sizes included, so a silence is a touch that did not change at all.
 const WF_MAX_GAP_BUCKETS: u32 = 60;
 /// Training windows of the folds, in days. Each fold tests on the next whole UTC day.
 const WF_TRAIN_DAYS: [u64; 3] = [1, 3, 7];
@@ -583,6 +586,16 @@ fn keep_last<T>(kept: &mut Vec<T>, item: T, time: impl Fn(&T) -> u64) {
     }
 }
 
+/// The mid of a top as a price sample, as the replay computes it. `None` on an overflow, which a
+/// price of the capture cannot reach.
+fn mid_of(top: &TopOfBook) -> Option<PriceSample> {
+    let price = top.bid.checked_add(top.ask)?.checked_div(Decimal::TWO)?;
+    Some(PriceSample {
+        timestamp_ms: top.timestamp_ms,
+        price,
+    })
+}
+
 /// Keeps one in `stride` by count.
 fn keep_one_in(seen: &mut u64, stride: u64) -> bool {
     let keep = seen.is_multiple_of(stride);
@@ -761,9 +774,11 @@ impl Collect {
                 _ => {}
             }
         }
-        for price in &output.prices {
-            if self.part(price.epoch, price.time.timestamp_ns).is_some() {
-                keep_last(&mut self.prices, price.value, |p| p.timestamp_ms);
+        for top in &output.tops {
+            if self.part(top.epoch, top.time.timestamp_ns).is_some()
+                && let Some(mid) = mid_of(&top.value)
+            {
+                keep_last(&mut self.prices, mid, |p| p.timestamp_ms);
             }
         }
         for exposure in &output.exposures {
@@ -1353,7 +1368,7 @@ fn section_87(report: &mut Report, collect: &mut Collect, days: &[TimeWindow]) {
     say!(
         report,
         "API: strategy::walk_forward::{{CalibrationData::new, calibrate_window, \
-         chronological_splits, walk_forward}}. Inputs: {} mids (last per second), {} order \
+         chronological_splits, walk_forward}}. Inputs: {} mids (of the last top per second), {} order \
          lives of every order on the book (1 in {}), {} fills among them. Order \
          lives are not a quoter's.",
         collect.prices.len(),
@@ -2139,5 +2154,76 @@ mod tests {
         let path = segment(&[(0.1, QrEventKind::Limit)], 1.0);
         assert!(within_cap(&path, 4));
         assert!(!within_cap(&path, 3));
+    }
+
+    #[test]
+    fn test_walk_forward_mids_sample_a_touch_that_does_not_move() {
+        use market_maker_rs::backtest::hyperliquid::{Inferred, InferredTime, TimeEvidence};
+        let end = whole_seconds(START + 2 * DAY_MS);
+        let protocol = Protocol::new(START, end).unwrap();
+        let mut collect = Collect::new(
+            protocol,
+            0,
+            dec!(1),
+            "synthetic".to_string(),
+            Strides::for_hours(1),
+        );
+        let at = |ms: u64| InferredTime {
+            timestamp_ns: ms * NS_PER_MS,
+            evidence: TimeEvidence::Joined,
+        };
+        // Two minutes of a live book whose touch stays at 100 / 101 while its sizes change each
+        // second, then one move. The replay's prices hold the mid only when it changes.
+        let mut output = ReplayOutput::default();
+        for second in 0..=120u64 {
+            let ms = START + second * SECOND_MS;
+            let ask = if second == 120 { dec!(102) } else { dec!(101) };
+            output.tops.push(Inferred {
+                value: TopOfBook {
+                    timestamp_ms: ms,
+                    bid: dec!(100),
+                    ask,
+                    bid_size: Decimal::from(second + 1),
+                    ask_size: dec!(1),
+                },
+                time: at(ms),
+                epoch: 0,
+            });
+        }
+        for (ms, price) in [(START, dec!(100.5)), (START + 120 * SECOND_MS, dec!(101))] {
+            output.prices.push(Inferred {
+                value: PriceSample {
+                    timestamp_ms: ms,
+                    price,
+                },
+                time: at(ms),
+                epoch: 0,
+            });
+        }
+        collect.take(&output);
+        assert_eq!(collect.prices.len(), 121);
+        let longest = collect
+            .prices
+            .windows(2)
+            .map(|pair| pair[1].timestamp_ms - pair[0].timestamp_ms)
+            .max();
+        assert_eq!(longest, Some(SECOND_MS));
+        assert_eq!(collect.prices[0].price, dec!(100.5));
+        assert_eq!(collect.prices[120].price, dec!(101));
+        // A second epoch's tops are not this stretch's.
+        let mut other = ReplayOutput::default();
+        other.tops.push(Inferred {
+            value: TopOfBook {
+                timestamp_ms: START + 200 * SECOND_MS,
+                bid: dec!(100),
+                ask: dec!(101),
+                bid_size: dec!(1),
+                ask_size: dec!(1),
+            },
+            time: at(START + 200 * SECOND_MS),
+            epoch: 1,
+        });
+        collect.take(&other);
+        assert_eq!(collect.prices.len(), 121);
     }
 }
