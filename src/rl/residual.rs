@@ -188,7 +188,8 @@ pub fn compose(
         ask_lots: ask_more,
     };
     let composed = match classical {
-        KernelAction::Hold | KernelAction::QuoteError(_) => {
+        // A cancel has no quote to move.
+        KernelAction::Hold | KernelAction::QuoteError(_) | KernelAction::Cancel => {
             return fallback(
                 classical,
                 proposal,

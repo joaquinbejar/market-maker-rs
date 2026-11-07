@@ -95,6 +95,7 @@ fn action_dict<'py>(py: Python<'py>, action: &KernelAction) -> PyResult<Bound<'p
             out.set_item("price", price)?;
             out.set_item("lots", lots)?;
         }
+        KernelAction::Cancel => out.set_item("kind", "cancel")?,
     }
     Ok(out)
 }
@@ -241,6 +242,7 @@ impl NativeEnv {
         out.set_item("offsets", info.offsets)?;
         out.set_item("sizes", info.sizes)?;
         out.set_item("hedge_actions", info.hedge_actions)?;
+        out.set_item("cancel_action", info.cancel_action)?;
         out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
         out.set_item("dataset_digest", hex(info.dataset_digest))?;
         out.set_item("rows", info.rows)?;
@@ -288,6 +290,11 @@ impl NativeEnv {
     ) -> PyResult<Py<PyDict>> {
         let side = if bid { QuoteSide::Bid } else { QuoteSide::Ask };
         self.take_step(py, RlAction::OneSided { side, offset, size })
+    }
+
+    /// Cancels every resting or pending order and sends nothing.
+    fn step_cancel(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.take_step(py, RlAction::Cancel)
     }
 
     /// Reduces the delivered position with a marketable order at the observed touch, of the

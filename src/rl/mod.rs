@@ -172,8 +172,8 @@ pub const LIBRARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use audit::{EpisodeRecorder, EpisodeRecords};
 pub use env::{
-    ERR_ACTION_OFF_GRID, ERR_CROSS_HEDGE_REFUSED, ERR_HEDGE_REFUSED, RlAction, RlConfig, RlEnv,
-    RlState, StepReward, TerminalClose, Transition,
+    ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_CROSS_HEDGE_REFUSED, ERR_HEDGE_REFUSED, RlAction,
+    RlConfig, RlEnv, RlState, StepReward, TerminalClose, Transition,
 };
 pub use features::{FeatureVector, HedgeFeatureVector};
 pub use queue_reactive::{MAX_QR_ROWS, QrEpisode, QrMarket, qr_market};
@@ -182,10 +182,11 @@ pub use residual::{
     ResidualFallback, ResidualProposal, ResidualStep, compose,
 };
 pub use spec::{
-    ACTION_SPACE_VERSION, ActionSpace, AsOf, CrossHedgeSpace, EPISODE_VERSION, EpisodeSpec,
-    FEATURE_COUNT, FeatureHorizon, FeatureId, FeatureSpec, FeatureUnit, HEDGE_FEATURE_COUNT,
-    HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION,
-    HedgeActions, HedgeScales, InvalidActionPolicy, OBSERVATION_SPACE_VERSION, ObservationScales,
-    ObservationSpace, REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec, SpaceShape,
-    SpecId, StateMemory, TerminalValuation,
+    ACTION_SPACE_VERSION, ActionSpace, AsOf, CANCEL_ACTION_SPACE_VERSION, CancelActions,
+    CrossHedgeSpace, EPISODE_VERSION, EpisodeSpec, FEATURE_COUNT, FeatureHorizon, FeatureId,
+    FeatureSpec, FeatureUnit, HEDGE_FEATURE_COUNT, HEDGED_ACTION_SPACE_VERSION,
+    HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION, HedgeActions, HedgeScales,
+    InvalidActionPolicy, OBSERVATION_SPACE_VERSION, ObservationScales, ObservationSpace,
+    REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec, SpaceShape, SpecId, StateMemory,
+    TerminalValuation,
 };
