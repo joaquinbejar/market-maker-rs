@@ -20,6 +20,8 @@
 //!   row `r` is written.
 //! - The diffusion draws from its own generator, seeded apart from the flow's, so the flow of
 //!   a day is the same in every impact setting and only the impact changes.
+//! - Next to each day's rows, `day-<n>.flow.json` holds each row's buy and sell market orders.
+//!   No policy reads it; only the report's probe of what the HSN states track does.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,7 +39,9 @@ const DAY_MS: u64 = 86_400_000;
 const SEED_STRIDE: u64 = 1_000_003;
 
 fn get<'a>(value: &'a Value, key: &str) -> Result<&'a Value, Failure> {
-    value.get(key).ok_or_else(|| format!("{key} is missing").into())
+    value
+        .get(key)
+        .ok_or_else(|| format!("{key} is missing").into())
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, Failure> {
@@ -249,9 +253,12 @@ fn main() -> Result<(), Failure> {
             }
             let seen = KernelDataset::from_ticks(&ticks, &config)?;
             let split = split_of(splits, day)?;
-            write_rows(
-                &out.join(split).join(name).join(format!("day-{day}.json")),
-                &seen,
+            let dir = out.join(split).join(name);
+            write_rows(&dir.join(format!("day-{day}.json")), &seen)?;
+            let flow: Vec<[u32; 2]> = buys.iter().zip(&sells).map(|(b, s)| [*b, *s]).collect();
+            fs::write(
+                dir.join(format!("day-{day}.flow.json")),
+                serde_json::to_vec(&flow)?,
             )?;
             records.push(json!({
                 "setting": name,
@@ -272,4 +279,69 @@ fn main() -> Result<(), Failure> {
         )?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flow() -> Value {
+        json!({
+            "queue_cap": 20,
+            "rates": {"limit": 1.5, "cancel_per_lot": 0.05, "market": 0.3},
+            "decays": [1.0, 0.1],
+            "weights": [
+                [[0.10, 0.05, 0.10], [0.05, 0.10, 0.05], [0.02, 0.02, 0.30]],
+                [[0.05, 0.02, 0.05], [0.02, 0.05, 0.02], [0.01, 0.01, 0.25]]
+            ]
+        })
+    }
+
+    #[test]
+    fn test_a_side_day_replays_its_queue_and_counts_its_market_orders() {
+        let params = parameters(&flow()).unwrap();
+        let (queues, markets) = side_day(&params, 7, 10, 500).unwrap();
+        assert_eq!(queues.len(), 500);
+        assert_eq!(queues[0], 10);
+        assert!(queues.iter().all(|q| *q <= 20));
+        let mut sim = HawkesSimulator::new(params, 7, 10).unwrap();
+        let (segment, _) = sim.run(500.0).unwrap();
+        let expected = segment
+            .events
+            .iter()
+            .filter(|e| e.kind == QrEventKind::Market)
+            .count();
+        assert_eq!(markets.iter().map(|m| *m as usize).sum::<usize>(), expected);
+        assert!(expected > 0);
+    }
+
+    #[test]
+    fn test_a_side_day_reproduces_by_seed() {
+        let params = parameters(&flow()).unwrap();
+        assert_eq!(
+            side_day(&params, 3, 10, 200).unwrap(),
+            side_day(&params, 3, 10, 200).unwrap()
+        );
+        assert_ne!(
+            side_day(&params, 3, 10, 200).unwrap(),
+            side_day(&params, 4, 10, 200).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_the_weights_must_be_three_by_three() {
+        let mut bad = flow();
+        bad["weights"] = json!([[[0.1, 0.1], [0.1, 0.1]]]);
+        assert!(parameters(&bad).is_err());
+    }
+
+    #[test]
+    fn test_the_noise_is_standard() {
+        let mut noise = Noise::new(11);
+        let draws: Vec<f64> = (0..200_000).map(|_| noise.normal()).collect();
+        let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+        let var = draws.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / draws.len() as f64;
+        assert!(mean.abs() < 0.01, "{mean}");
+        assert!((var - 1.0).abs() < 0.01, "{var}");
+    }
 }
