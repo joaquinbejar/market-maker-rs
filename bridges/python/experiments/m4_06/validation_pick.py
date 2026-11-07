@@ -5,7 +5,7 @@ compares every learned arm on the holdout and selects none. This reads no holdou
 
 From `bridges/python`:
 
-    python experiments/m4_06/validation_pick.py <data dir> <out dir> <commit> <frozen sha256>
+    python experiments/m4_06/validation_pick.py <data dir> <out dir> <commit> <frozen sha256> [<processes>]
 
 It checks the frozen manifest, the design, the digests and every checkpoint against their
 hashes. It evaluates each learned arm at one row, with its five training seeds, on the
@@ -59,16 +59,18 @@ def pick(rows):
 def main():
     data_dir, out_dir, commit, frozen_sha256 = sys.argv[1:5]
     ctx = run.Context(data_dir, out_dir, commit)
+    # Fewer processes than the design's, to run beside the holdout within the shared cap.
+    parallel = int(sys.argv[5]) if len(sys.argv) > 5 else ctx.parallel
     frozen = checked_frozen(ctx.out, frozen_sha256)
     runs = one_row_runs(frozen)
     report = ctx.header("validation_pick")
     report.update({"frozen_sha256": frozen_sha256, "fee": frozen["fee"], "every": 1,
                    "note": "after the freeze and before any holdout read; outside the frozen "
-                           "design, which selects no learned arm"})
+                           "design, which selects no learned arm", "processes": parallel})
     started = time.perf_counter()
     jobs = ctx.learned_jobs(runs, frozen["fee"], "validation",
                             run.days_of(ctx.design, "validation"))
-    rows = run.pool(jobs, run.evaluate_job, ctx.parallel, "validation pick")
+    rows = run.pool(jobs, run.evaluate_job, parallel, "validation pick")
     best, means = pick(rows)
     report.update({"rows": rows, "mean_daily_net": means, "selected": best,
                    "checkpoints": {f"{m['arm']}-seed{m['seed']}": m["checkpoint_sha256"]
