@@ -33,6 +33,12 @@ project follows [Semantic Versioning](https://semver.org/).
 - `backtest::evaluation::block_bootstrap` (#255): the harness's stationary block bootstrap of a
   mean over a daily series, the one `Experiment` gives on the mean daily net result and on the
   daily difference to a baseline, for runs that do not go through `Experiment`.
+- `backtest::kernel::quote_error_name` (feature `kernel`, #265): the name of the `MMError`
+  variant a strategy error's code stands for, the inverse of `quote_error_code`. The Python
+  bridge's `info["refused_because"]` now names a quote error by what it is (a strategy's error
+  by its variant, a strategy quote out of range, an action off the grid, or a hedge not available
+  at this decision) instead of reporting every one as off grid, a changed string for a caller
+  who matched on it.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are

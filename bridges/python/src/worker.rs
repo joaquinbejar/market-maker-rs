@@ -7,14 +7,15 @@ use std::thread::{self, JoinHandle};
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::evaluation::{Attribution, EvaluationInput, attribute};
 use market_maker_rs::backtest::kernel::{
-    ActionGrid, ActionMask, AvellanedaQuoter, GlftQuoter, KernelConfig, KernelDataset,
-    KernelFillModel, KernelLatency, KernelTick, QuoteSource,
+    ActionGrid, ActionMask, ActionStatus, AvellanedaQuoter, ERR_KERNEL_MISMATCH,
+    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, GlftQuoter, KernelConfig, KernelDataset,
+    KernelFillModel, KernelLatency, KernelTick, QuoteSource, quote_error_name,
 };
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    EpisodeRecorder, FeatureVector, InvalidActionPolicy, ObservationScales, ResidualBounds,
-    ResidualDecision, ResidualEnv, ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId,
-    TerminalValuation, Transition,
+    ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED, EpisodeRecorder, FeatureVector, InvalidActionPolicy,
+    ObservationScales, ResidualBounds, ResidualDecision, ResidualEnv, ResidualProposal, RlAction,
+    RlConfig, RlEnv, RlState, SpecId, TerminalValuation, Transition,
 };
 use market_maker_rs::strategy::glft::GLFTConfig;
 use serde::Deserialize;
@@ -39,6 +40,33 @@ pub const BUILT_FOR: (u16, u16, u16, u16) = (1, 2, 1, 1);
 
 fn known_versions(id: &SpecId) -> bool {
     (id.observation, id.action, id.reward, id.episode) == BUILT_FOR
+}
+
+/// Why an action was not applied, as `info["refused_because"]` reports it; `None` when it
+/// was. A kernel refusal is named by its reason. A quote error says what its code stands
+/// for: a strategy's error by its `MMError` variant, a strategy quote the kernel cannot
+/// take, an action off the grid, or a hedge not available at this decision; none of them
+/// reads as another.
+pub fn refused_because(status: ActionStatus) -> Option<String> {
+    match status {
+        ActionStatus::Applied => None,
+        ActionStatus::Rejected(reason) => Some(format!("{reason:?}")),
+        ActionStatus::QuoteError(code) => Some(match code {
+            ERR_ACTION_OFF_GRID => format!("off grid (code {})", code.0),
+            ERR_HEDGE_REFUSED => format!("hedge not available (code {})", code.0),
+            ERR_PRICE_OUT_OF_RANGE => {
+                format!("strategy quote price out of range (code {})", code.0)
+            }
+            ERR_SIZE_OUT_OF_RANGE => {
+                format!("strategy quote size out of range (code {})", code.0)
+            }
+            ERR_KERNEL_MISMATCH => format!("strategy quote for another kernel (code {})", code.0),
+            _ => match quote_error_name(code) {
+                Some(name) => format!("strategy error: {name} (code {})", code.0),
+                None => format!("quote error (code {})", code.0),
+            },
+        }),
+    }
 }
 
 /// Why the bridge refused or stopped.

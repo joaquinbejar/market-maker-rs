@@ -12,7 +12,7 @@ use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::worker::{BridgeConfig, BridgeError, ResetReply, StepReply, Worker};
+use crate::worker::{BridgeConfig, BridgeError, ResetReply, StepReply, Worker, refused_because};
 
 create_exception!(_native, BridgeFailure, PyException);
 
@@ -113,7 +113,7 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
     let (applied, reason) = match t.action_status {
         ActionStatus::Applied => (true, None),
         ActionStatus::Rejected(reason) => (false, Some(format!("{reason:?}"))),
-        ActionStatus::QuoteError(code) => (false, Some(format!("off grid ({})", code.0))),
+        ActionStatus::QuoteError(_) => (false, refused_because(t.action_status)),
     };
     out.set_item("applied", applied)?;
     out.set_item("refused_because", reason)?;

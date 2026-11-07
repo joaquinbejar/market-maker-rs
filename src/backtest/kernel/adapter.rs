@@ -63,6 +63,31 @@ pub fn quote_error_code(error: &MMError) -> ErrCode {
     })
 }
 
+/// The name of the `MMError` variant a strategy error's [`ErrCode`] stands for, the
+/// inverse of [`quote_error_code`]; `None` for a code that is not a strategy error's, such
+/// as [`ERR_PRICE_OUT_OF_RANGE`].
+#[must_use]
+pub fn quote_error_name(code: ErrCode) -> Option<&'static str> {
+    Some(match code.0 {
+        1 => "InvalidConfiguration",
+        2 => "InvalidMarketState",
+        3 => "NumericalError",
+        4 => "InvalidPositionUpdate",
+        5 => "InvalidQuoteGeneration",
+        6 => "InvalidTimestamp",
+        7 => "ConnectionError",
+        8 => "UnsupportedAction",
+        9 => "LockPoisoned",
+        10 => "UnsupportedContract",
+        11 => "PriceUnderflow",
+        12 => "FillNotBooked",
+        13 => "FillBookedCheckFailed",
+        14 => "GreeksMissFill",
+        15 => "QuotingHalted",
+        _ => return None,
+    })
+}
+
 /// A strategy quote: both sides, or one side only.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceQuote {

@@ -1739,3 +1739,42 @@ fn test_decode_stamp_bound_depends_on_the_fill_model() {
     t.stamp_seq = 3 * created + s.counters().venue_fills + 1;
     refused(&k, &t, "stamp_seq");
 }
+
+#[test]
+fn test_quote_error_name_inverts_quote_error_code_for_every_variant() {
+    let errors = [
+        MMError::InvalidConfiguration(String::new()),
+        MMError::InvalidMarketState(String::new()),
+        MMError::NumericalError(String::new()),
+        MMError::InvalidPositionUpdate(String::new()),
+        MMError::InvalidQuoteGeneration(String::new()),
+        MMError::InvalidTimestamp(String::new()),
+        MMError::ConnectionError(String::new()),
+        MMError::UnsupportedAction {
+            action: Action::Buy,
+        },
+        MMError::LockPoisoned(String::new()),
+        MMError::UnsupportedContract {
+            reason: String::new(),
+        },
+        MMError::PriceUnderflow,
+        MMError::FillNotBooked(String::new()),
+        MMError::FillBookedCheckFailed(String::new()),
+        MMError::GreeksMissFill,
+        MMError::QuotingHalted(String::new()),
+    ];
+    let mut codes = Vec::new();
+    for error in &errors {
+        let code = quote_error_code(error);
+        let debug = format!("{error:?}");
+        let variant = debug.split(['(', ' ', '{']).next().unwrap();
+        assert_eq!(quote_error_name(code), Some(variant), "{debug}");
+        codes.push(code.0);
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    assert_eq!(codes.len(), errors.len());
+    for code in [0, 16, 100, 101, 102, 200] {
+        assert_eq!(quote_error_name(ErrCode(code)), None);
+    }
+}
