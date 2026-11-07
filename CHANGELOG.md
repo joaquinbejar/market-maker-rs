@@ -14,7 +14,14 @@ project follows [Semantic Versioning](https://semver.org/).
   with no time unsupported), set with
   `QrEstimationConfig::with_zero_waits`; a configuration written without the field reads as
   `Drop`. `queue_reactive::collapse_blocks` collapses each block's events at a queue into their
-  net change, carrying the wait of a block with none. Example `qr_estimation`, behind `serde`,
+  net change, carrying the wait of a block with none. Touch resets, opt in (#290):
+  `QrParameters::with_resets` takes a rate per first-limit queue size and the law the queue is
+  redrawn from, read with `reset_rates` and `reset_law`; the simulator then ends a touch queue's
+  life without emptying at that rate, reported as the new `QrStep::Reset` and kept in the new
+  `Trajectory::resets`, as `ResetObservation`s. `estimate_parameters_with_resets` estimates
+  them with the other rates, a reset's wait counting as time at its size. Parameters without
+  resets, their exports and fingerprints, and every run from them are unchanged; exported
+  parameters gain `reset_rates` and `reset_law` only when set. Example `qr_estimation`, behind `serde`,
   holds #290's protocol and its synthetic recovery check on #102's calm regime; example
   `hyperliquid_validation` gains #290's phase 1 on the capture's training part (counts with and
   without zero waits, block lengths, how touch-queue lives end, and the drift of each estimator's

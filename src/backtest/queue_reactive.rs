@@ -156,6 +156,16 @@ pub struct QrParameters {
     supported: Vec<Vec<bool>>,
     policy: UnsupportedPolicy,
     invariant: Vec<Vec<f64>>,
+    /// Touch resets, if any (#290).
+    resets: Option<Resets>,
+}
+
+/// Rates at which the first limit's queue is redrawn, per size, and the law it is redrawn
+/// from.
+#[derive(Debug, Clone, PartialEq)]
+struct Resets {
+    rates: Vec<f64>,
+    law: Vec<f64>,
 }
 
 /// A float as text, which `serde_json` round trips exactly by default where a JSON
@@ -184,6 +194,10 @@ struct RawParameters {
     rates: Vec<Vec<[String; 3]>>,
     supported: Vec<Vec<bool>>,
     policy: UnsupportedPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_rates: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_law: Option<Vec<String>>,
 }
 
 #[cfg(feature = "serde")]
@@ -206,6 +220,13 @@ impl From<QrParameters> for RawParameters {
                 .collect(),
             supported: params.supported,
             policy: params.policy,
+            reset_rates: params
+                .resets
+                .as_ref()
+                .map(|r| r.rates.iter().copied().map(float_text).collect()),
+            reset_law: params
+                .resets
+                .map(|r| r.law.into_iter().map(float_text).collect()),
         }
     }
 }
@@ -225,7 +246,7 @@ impl TryFrom<RawParameters> for QrParameters {
                     .collect::<MMResult<RateTable>>()
             })
             .collect::<MMResult<Vec<_>>>()?;
-        Self::new(
+        let params = Self::new(
             raw.tick_size,
             text_float(&raw.theta)?,
             text_float(&raw.theta_reinit)?,
@@ -233,7 +254,20 @@ impl TryFrom<RawParameters> for QrParameters {
             rates,
             raw.supported,
             raw.policy,
-        )
+        )?;
+        let floats = |texts: Vec<String>| {
+            texts
+                .iter()
+                .map(|t| text_float(t))
+                .collect::<MMResult<Vec<_>>>()
+        };
+        match (raw.reset_rates, raw.reset_law) {
+            (None, None) => Ok(params),
+            (Some(rates), Some(law)) => params.with_resets(floats(rates)?, floats(law)?),
+            _ => Err(MMError::InvalidConfiguration(
+                "reset rates and their law come together".to_string(),
+            )),
+        }
     }
 }
 
@@ -315,6 +349,7 @@ impl QrParameters {
             supported,
             policy,
             invariant,
+            resets: None,
         })
     }
 
@@ -376,6 +411,52 @@ impl QrParameters {
         &self.event_sizes
     }
 
+    /// Adds touch resets (#290): with rate `rates[n]`, a first-limit queue of size `n` is
+    /// redrawn from `law`, a probability per queue size, so its life ends without emptying, as
+    /// a touch's does when the price moves away from it. The queue's clock restarts; no other
+    /// queue, nor the reference, changes, and the reset is no queue event, so it is reported as
+    /// [`QrStep::Reset`]. Without resets the simulator runs as before. The invariant laws
+    /// ignore the resets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] unless `rates` and `law` each hold one value
+    /// per queue size, the rates finite, not negative and at most [`MAX_RATE`] with none at
+    /// size 0, and the law finite, not negative and summing to 1 within `1e-9`.
+    pub fn with_resets(mut self, rates: Vec<f64>, law: Vec<f64>) -> MMResult<Self> {
+        let rows = self.max_queue().saturating_add(1);
+        let valid = |v: &f64| v.is_finite() && (0.0..=MAX_RATE).contains(v);
+        let probability = |v: &f64| v.is_finite() && *v >= 0.0;
+        if rates.len() != rows
+            || law.len() != rows
+            || !rates.iter().all(valid)
+            || rates.first().is_some_and(|r| *r > 0.0)
+            || !law.iter().all(probability)
+            || (law.iter().sum::<f64>() - 1.0).abs() > 1e-9
+        {
+            return Err(MMError::InvalidConfiguration(format!(
+                "resets: {} rates and a law of {} for {rows} sizes; rates finite, bounded and \
+                 none at 0; the law a probability",
+                rates.len(),
+                law.len()
+            )));
+        }
+        self.resets = Some(Resets { rates, law });
+        Ok(self)
+    }
+
+    /// Returns the touch reset rates per queue size, if any.
+    #[must_use]
+    pub fn reset_rates(&self) -> Option<&[f64]> {
+        self.resets.as_ref().map(|r| r.rates.as_slice())
+    }
+
+    /// Returns the law a reset redraws the touch queue from, if any.
+    #[must_use]
+    pub fn reset_law(&self) -> Option<&[f64]> {
+        self.resets.as_ref().map(|r| r.law.as_slice())
+    }
+
     /// Returns the FNV-1a 128 of the parameters, to tie a trajectory to them.
     #[must_use]
     pub fn fingerprint(&self) -> u128 {
@@ -398,12 +479,19 @@ impl QrParameters {
                 hash = fnv(hash, &[u8::from(*flag)]);
             }
         }
+        if let Some(resets) = &self.resets {
+            hash = fnv(hash, b"resets");
+            for value in resets.rates.iter().chain(&resets.law) {
+                hash = fnv(hash, &value.to_bits().to_le_bytes());
+            }
+        }
         hash
     }
 
     /// Returns the constant intensity baseline: each rate is its average under the
     /// invariant law, kept at zero where a queue rule requires it, with the same
-    /// `θ`, sizes and cap. The law is then a different one, as it should be.
+    /// `θ`, sizes and cap. The law is then a different one, as it should be. Touch reset
+    /// rates, if any, become their average under the first limit's law; their redraw law stays.
     ///
     /// # Errors
     ///
@@ -443,7 +531,7 @@ impl QrParameters {
             .iter()
             .map(|flags| vec![true; flags.len()])
             .collect();
-        Self::new(
+        let baseline = Self::new(
             self.tick_size,
             self.theta,
             self.theta_reinit,
@@ -451,7 +539,17 @@ impl QrParameters {
             rates,
             supported,
             self.policy,
-        )
+        )?;
+        match (&self.resets, self.invariant.first()) {
+            (Some(resets), Some(law)) => {
+                let mean: f64 = resets.rates.iter().zip(law).map(|(r, p)| r * p).sum();
+                let rates = (0..resets.rates.len())
+                    .map(|n| if n == 0 { 0.0 } else { mean })
+                    .collect();
+                baseline.with_resets(rates, resets.law.clone())
+            }
+            _ => Ok(baseline),
+        }
     }
 
     /// The rates at queue size `n`, or `None` where the policy stops.
@@ -763,6 +861,24 @@ pub struct ReferenceObservation {
     pub reinitialized: bool,
 }
 
+/// A touch reset (#290): a first-limit queue whose life ended without emptying, at its size
+/// then. From data, a side's touch at a move of the mid that emptied no touch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ResetObservation {
+    /// Time of the reset, in milliseconds.
+    pub timestamp_ms: u64,
+    /// Side of the queue.
+    pub side: QrSide,
+    /// Queue size before the reset, in event sizes.
+    pub queue_before: u32,
+    /// Time since the previous event at this queue, in seconds: the time it spent at
+    /// `queue_before` before the reset.
+    pub waiting_seconds: f64,
+    /// The new touch's size, in event sizes, if known.
+    pub queue_after: Option<u32>,
+}
+
 /// The result of a simulator step.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -789,6 +905,16 @@ pub enum QrStep {
     Stalled,
     /// A run reached its limit of events before its horizon.
     EventLimit,
+    /// A touch reset under [`QrParameters::with_resets`]: the first limit's queue on
+    /// `reset.side` was redrawn to `queue_after`.
+    Reset {
+        /// The reset.
+        reset: ResetObservation,
+        /// The queue's new size.
+        queue_after: u32,
+        /// The reference price outcome, if the new size made one eligible.
+        reference: Option<ReferenceObservation>,
+    },
 }
 
 /// A simulator of queues under [`QrParameters`].
@@ -891,8 +1017,9 @@ impl QrSimulator {
     pub fn step(&mut self) -> MMResult<QrStep> {
         let limits = self.params.limits();
         let mut total = 0.0f64;
-        let mut cells: Vec<(QrSide, usize, QrEventKind, f64)> =
-            Vec::with_capacity(MAX_LIMITS.saturating_mul(6));
+        // A cell without a kind is a touch reset.
+        let mut cells: Vec<(QrSide, usize, Option<QrEventKind>, f64)> =
+            Vec::with_capacity(MAX_LIMITS.saturating_mul(6).saturating_add(2));
         for side in [QrSide::Bid, QrSide::Ask] {
             for depth in 0..limits {
                 let queue = self.queue(side, depth);
@@ -907,9 +1034,19 @@ impl QrSimulator {
                 ] {
                     if rate > 0.0 {
                         total += rate;
-                        cells.push((side, depth, kind, rate));
+                        cells.push((side, depth, Some(kind), rate));
                     }
                 }
+            }
+            let touch = self.queue(side, 0);
+            let reset = self.params.resets.as_ref().and_then(|resets| {
+                usize::try_from(touch)
+                    .ok()
+                    .and_then(|n| resets.rates.get(n).copied())
+            });
+            if let Some(rate) = reset.filter(|r| *r > 0.0) {
+                total += rate;
+                cells.push((side, 0, None, rate));
             }
         }
         if total <= 0.0 {
@@ -932,6 +1069,9 @@ impl QrSimulator {
         }
         self.state.time_seconds = now;
         self.state.clock_seconds = self.state.clock_seconds.max(now);
+        let Some(kind) = kind else {
+            return self.reset(side, now);
+        };
         let before = self.queue(side, depth);
         let last = self.last_event(side, depth);
         let observation = QueueObservation {
@@ -960,6 +1100,36 @@ impl QrSimulator {
     }
 
     /// Whether a mid move moves the reference, and its effects.
+    /// Redraws the first limit's queue on `side` from its invariant law at `now`.
+    fn reset(&mut self, side: QrSide, now: f64) -> MMResult<QrStep> {
+        let before = self.queue(side, 0);
+        let waiting_seconds = now - self.last_event(side, 0);
+        let mid_before = self.mid_half_ticks();
+        let law = self
+            .params
+            .resets
+            .as_ref()
+            .map(|r| r.law.clone())
+            .or_overflow("reset law")?;
+        let after = self.draw(&law)?;
+        self.set_queue(side, 0, after)?;
+        self.set_last_event(side, 0, now)?;
+        let timestamp_ms = milliseconds(now)?;
+        let mid_after = self.mid_half_ticks();
+        let reference = self.reference_move(mid_before, mid_after, timestamp_ms)?;
+        Ok(QrStep::Reset {
+            reset: ResetObservation {
+                timestamp_ms,
+                side,
+                queue_before: before,
+                waiting_seconds,
+                queue_after: Some(after),
+            },
+            queue_after: after,
+            reference,
+        })
+    }
+
     fn reference_move(
         &mut self,
         before: i64,
@@ -1062,12 +1232,18 @@ impl QrSimulator {
     }
 
     fn draw_invariant(&mut self, depth: usize) -> MMResult<u32> {
-        let mut pick = self.unit();
         let law = self
             .params
             .invariant
             .get(depth)
-            .or_overflow("invariant law")?;
+            .or_overflow("invariant law")?
+            .clone();
+        self.draw(&law)
+    }
+
+    /// A queue size from `law`.
+    fn draw(&mut self, law: &[f64]) -> MMResult<u32> {
+        let mut pick = self.unit();
         let mut last = 0usize;
         for (n, p) in law.iter().enumerate() {
             if *p > 0.0 {
@@ -1377,6 +1553,59 @@ pub fn estimate_parameters(
     config: &QrEstimationConfig,
     dataset_id: &str,
 ) -> MMResult<QrRecord> {
+    estimate(
+        events,
+        None,
+        references,
+        event_sizes,
+        window,
+        config,
+        dataset_id,
+    )
+}
+
+/// Estimates as [`estimate_parameters`], and touch resets (#290) from `resets`: per
+/// first-limit queue size `n > 0`, the resets at `n` over the time the first limit's queues
+/// spent at `n`, and the law of the new touch's size over the counted resets that report it,
+/// a size past the cap counted at the cap. A reset's wait counts as time at its size for
+/// every rate, as an event's does, and is counted under the same rules; a reset at size 0 or
+/// beyond the cap is left out and counted as excluded. Both sides pool. A size with no time
+/// gets reset rate 0. With no new size reported, the law is the first limit's invariant law.
+/// The fit carries both through [`QrParameters::with_resets`].
+///
+/// # Errors
+///
+/// As [`estimate_parameters`], with `resets` out of order a
+/// [`MMError::InvalidMarketState`].
+pub fn estimate_parameters_with_resets(
+    events: &[QueueObservation],
+    resets: &[ResetObservation],
+    references: &[ReferenceObservation],
+    event_sizes: &[Decimal],
+    window: &TimeWindow,
+    config: &QrEstimationConfig,
+    dataset_id: &str,
+) -> MMResult<QrRecord> {
+    estimate(
+        events,
+        Some(resets),
+        references,
+        event_sizes,
+        window,
+        config,
+        dataset_id,
+    )
+}
+
+fn estimate(
+    events: &[QueueObservation],
+    resets: Option<&[ResetObservation]>,
+    references: &[ReferenceObservation],
+    event_sizes: &[Decimal],
+    window: &TimeWindow,
+    config: &QrEstimationConfig,
+    dataset_id: &str,
+) -> MMResult<QrRecord> {
     if config.limits == 0
         || usize::from(config.limits) > MAX_LIMITS
         || config.max_queue == 0
@@ -1391,6 +1620,9 @@ pub fn estimate_parameters(
     }
     if !events.is_sorted_by_key(|e| e.timestamp_ms)
         || !references.is_sorted_by_key(|r| r.timestamp_ms)
+        || !resets
+            .unwrap_or_default()
+            .is_sorted_by_key(|r| r.timestamp_ms)
     {
         return Err(MMError::InvalidMarketState(
             "observations are not in chronological order".to_string(),
@@ -1402,28 +1634,17 @@ pub fn estimate_parameters(
         .and_then(|m| m.checked_add(1))
         .or_overflow("rows")?;
     let mut counts = vec![vec![(0u64, 0u64, 0u64); rows]; limits];
+    let mut reset_counts = vec![0u64; rows];
+    let mut after_counts = vec![0u64; rows];
     let mut waiting = vec![vec![0.0f64; rows]; limits];
     let mut used = 0u64;
     let mut excluded = 0u64;
     let mut hash = FNV_OFFSET;
-    let last_row = rows.saturating_sub(1);
     for event in inside(events, window, |e| e.timestamp_ms) {
         hash = hash_event(hash, event);
         let depth = usize::from(event.depth);
         let n = usize::try_from(event.queue_before).unwrap_or(usize::MAX);
-        let departs = matches!(event.kind, QrEventKind::Cancel | QrEventKind::Market);
-        let arrives = matches!(event.kind, QrEventKind::Limit);
-        let waited = match config.zero_waits {
-            ZeroWaitPolicy::Drop => event.waiting_seconds > 0.0,
-            ZeroWaitPolicy::Count => event.waiting_seconds >= 0.0,
-        };
-        let valid = event.waiting_seconds.is_finite()
-            && waited
-            && depth < limits
-            && n < rows
-            && !(departs && n == 0)
-            && !(arrives && n == last_row);
-        if !valid {
+        if !counted(event, config, limits, rows) {
             excluded = excluded.saturating_add(1);
             continue;
         }
@@ -1442,6 +1663,40 @@ pub fn estimate_parameters(
             .and_then(|table| table.get_mut(n))
             .or_overflow("waiting row")?;
         *total += event.waiting_seconds;
+    }
+    for reset in inside(resets.unwrap_or_default(), window, |r| r.timestamp_ms) {
+        hash = fnv(hash, &reset.timestamp_ms.to_le_bytes());
+        hash = fnv(hash, &[u8::from(reset.side == QrSide::Bid)]);
+        hash = fnv(hash, &reset.queue_before.to_le_bytes());
+        hash = fnv(hash, &reset.waiting_seconds.to_bits().to_le_bytes());
+        hash = fnv(
+            hash,
+            &reset.queue_after.map_or(u64::MAX, u64::from).to_le_bytes(),
+        );
+        let n = usize::try_from(reset.queue_before).unwrap_or(usize::MAX);
+        let waited = match config.zero_waits {
+            ZeroWaitPolicy::Drop => reset.waiting_seconds > 0.0,
+            ZeroWaitPolicy::Count => reset.waiting_seconds >= 0.0,
+        };
+        let (Some(count), Some(total), true) = (
+            reset_counts.get_mut(n).filter(|_| n > 0),
+            waiting.first_mut().and_then(|times| times.get_mut(n)),
+            reset.waiting_seconds.is_finite() && waited,
+        ) else {
+            excluded = excluded.saturating_add(1);
+            continue;
+        };
+        used = used.saturating_add(1);
+        *count = count.saturating_add(1);
+        *total += reset.waiting_seconds;
+        if let Some(after) = reset.queue_after {
+            let at = usize::try_from(after)
+                .unwrap_or(usize::MAX)
+                .min(rows.saturating_sub(1));
+            if let Some(cell) = after_counts.get_mut(at) {
+                *cell = cell.saturating_add(1);
+            }
+        }
     }
     let mut eligible = 0u64;
     let mut moved = 0u64;
@@ -1504,6 +1759,13 @@ pub fn estimate_parameters(
     }
     let theta = as_float(moved) / as_float(eligible);
     let theta_reinit = as_float(reinitialized) / as_float(moved);
+    let reset_rates = resets.map(|_| {
+        reset_counts
+            .iter()
+            .zip(waiting.first().map(Vec::as_slice).unwrap_or_default())
+            .map(|(c, t)| if *t > 0.0 { as_float(*c) / *t } else { 0.0 })
+            .collect::<Vec<_>>()
+    });
     Ok(finish(
         match QrParameters::new(
             config.tick_size,
@@ -1513,7 +1775,22 @@ pub fn estimate_parameters(
             rates,
             supported,
             config.policy,
-        ) {
+        )
+        .and_then(|params| match reset_rates {
+            Some(rates) => {
+                let known: u64 = after_counts.iter().sum();
+                let law = if known > 0 {
+                    after_counts
+                        .iter()
+                        .map(|c| as_float(*c) / as_float(known))
+                        .collect()
+                } else {
+                    params.invariant(0).unwrap_or_default().to_vec()
+                };
+                params.with_resets(rates, law)
+            }
+            None => Ok(params),
+        }) {
             Ok(params) => QrFit::Calibrated(params),
             Err(MMError::NumericalError(_) | MMError::InvalidConfiguration(_)) => {
                 QrFit::Insufficient(QrFailure::InvalidEstimate)
@@ -1526,6 +1803,30 @@ pub fn estimate_parameters(
 #[allow(clippy::cast_precision_loss)] // Report values: counts far below 2^53.
 fn as_float(value: u64) -> f64 {
     value as f64
+}
+
+/// Whether the estimator counts `event`, under `config`'s zero waits, with `limits` limits
+/// and `rows` queue sizes.
+fn counted(
+    event: &QueueObservation,
+    config: &QrEstimationConfig,
+    limits: usize,
+    rows: usize,
+) -> bool {
+    let depth = usize::from(event.depth);
+    let n = usize::try_from(event.queue_before).unwrap_or(usize::MAX);
+    let departs = matches!(event.kind, QrEventKind::Cancel | QrEventKind::Market);
+    let arrives = matches!(event.kind, QrEventKind::Limit);
+    let waited = match config.zero_waits {
+        ZeroWaitPolicy::Drop => event.waiting_seconds > 0.0,
+        ZeroWaitPolicy::Count => event.waiting_seconds >= 0.0,
+    };
+    event.waiting_seconds.is_finite()
+        && waited
+        && depth < limits
+        && n < rows
+        && !(departs && n == 0)
+        && !(arrives && n.saturating_add(1) == rows)
 }
 
 fn inside<'a, T>(items: &'a [T], window: &TimeWindow, time: impl Fn(&T) -> u64) -> &'a [T] {
@@ -1574,6 +1875,8 @@ pub struct Trajectory {
     pub events: Vec<QueueObservation>,
     /// Reference price outcomes.
     pub references: Vec<ReferenceObservation>,
+    /// Touch resets, under [`QrParameters::with_resets`].
+    pub resets: Vec<ResetObservation>,
     /// Why it ended early, if it did.
     pub stopped: Option<QrStep>,
 }
@@ -1645,6 +1948,28 @@ impl QrSimulator {
                         break;
                     }
                     out.events.push(observation);
+                    if let Some(reference) = reference {
+                        out.references.push(reference);
+                    }
+                }
+                QrStep::Reset {
+                    reset, reference, ..
+                } => {
+                    while next_sample <= self.state.time_seconds && next_sample <= end {
+                        out.samples.push(BookSample {
+                            timestamp_ms: milliseconds(next_sample)?,
+                            bid: before.bid,
+                            ask: before.ask,
+                            spread_ticks: spread_of(&before, self.params.limits()),
+                        });
+                        next_sample += sample_seconds;
+                    }
+                    if self.state.time_seconds > end {
+                        self.state = before;
+                        self.state.clock_seconds = end;
+                        break;
+                    }
+                    out.resets.push(reset);
                     if let Some(reference) = reference {
                         out.references.push(reference);
                     }
