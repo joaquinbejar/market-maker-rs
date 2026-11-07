@@ -139,8 +139,18 @@ pub fn trajectory(k: &Kernel<'_>, sc: &Scenario) -> Trajectory {
     t
 }
 
+/// FNV-1a-128 of the events' `Debug` output, without the gate records'
+/// `check` field (added after these hashes were recorded): the hashes then
+/// show that a run without the balance gate emits the events it emitted.
 pub fn events_hash(events: &[KernelEvent]) -> u128 {
-    fnv1a128(format!("{events:?}").as_bytes())
+    let text = format!("{events:?}")
+        .replace(", check: Limits", "")
+        .replace(", check: Combined", "");
+    assert!(
+        !text.contains("check: "),
+        "a gate check outside the recorded hashes"
+    );
+    fnv1a128(text.as_bytes())
 }
 
 /// Whether replayed events include a new report, which means venue messages

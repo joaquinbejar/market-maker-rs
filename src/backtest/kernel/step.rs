@@ -14,10 +14,11 @@ use super::book::{
     Blank, Delivery, ExecKind, FillRec, MsgKind, ObsEntry, OrderState, Origin, ReportRec, VenueMsg,
     VenueOrder,
 };
+use super::config::ValidMargin;
 use super::config::{ValidFill, ValidatedConfig};
 use super::data::{KernelDataset, KernelTick, NS_PER_MS};
 use super::encode::insert_by_id;
-use super::gate::{self, GateVerdict};
+use super::gate::{self, Balances, GateCheck, GateVerdict};
 use super::grid::{half_units_decimal, scaled_decimal};
 use super::state::{
     ActionStatus, EventSink, GateRecord, HaltReason, KernelEvent, KernelState, Phase, QueueLengths,
@@ -1094,6 +1095,41 @@ pub(super) fn quote_transaction<
                 requested: lots,
                 verdict: decision.verdict,
                 submitted: decision.submitted,
+                check: GateCheck::Limits,
+            });
+            match decision.verdict {
+                GateVerdict::Accepted | GateVerdict::Reduced => size = decision.submitted,
+                GateVerdict::ReducedOffLot | GateVerdict::Rejected => {
+                    refused = true;
+                }
+            }
+        }
+        // The balance gate binds after the limits, on what they approved:
+        // their record is emitted first, then its own.
+        if !refused && let Some(margin) = &cfg.margin {
+            if let Some(record) = record.take() {
+                em.event(KernelEvent::Gate(record));
+            }
+            let balances = balances(cfg, t, margin).ok_or(Halt::GateNumeric)?;
+            let fee_scale = cfg.fee_scale().ok_or(Halt::GateNumeric)?;
+            let decision = gate::margin_check(
+                &cfg.tick,
+                &cfg.lot,
+                fee_scale,
+                margin.fee_num,
+                &balances,
+                dir,
+                price,
+                size,
+            )
+            .ok_or(Halt::GateNumeric)?;
+            record = Some(GateRecord {
+                order_id: id,
+                side: dir.into(),
+                requested: size,
+                verdict: decision.verdict,
+                submitted: decision.submitted,
+                check: GateCheck::Margin,
             });
             match decision.verdict {
                 GateVerdict::Accepted | GateVerdict::Reduced => size = decision.submitted,
@@ -1117,6 +1153,7 @@ pub(super) fn quote_transaction<
                     requested: lots,
                     verdict: GateVerdict::Rejected,
                     submitted: 0,
+                    check: GateCheck::Combined,
                 });
             }
         }
@@ -1152,6 +1189,50 @@ pub(super) fn quote_transaction<
         )?;
     }
     Ok(())
+}
+
+/// The balances of the balance gate: the quote balance (initial capital,
+/// fill cash flows and fees) less the reservations of the live buys (resting
+/// or in flight to the venue, as the gate's live lots), and the base deposit
+/// plus the venue position less the live sells.
+fn balances<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+    cfg: &ValidatedConfig,
+    t: &St<ORD, MSG, DLV, OBS>,
+    margin: &ValidMargin,
+) -> Option<Balances> {
+    let fee_scale = cfg.fee_scale()?;
+    let activations = t.msgs.as_slice().iter().filter_map(|m| match &m.kind {
+        MsgKind::Activate(order) => Some(order),
+        MsgKind::Cancel { .. } => None,
+    });
+    let reserved = t
+        .orders
+        .as_slice()
+        .iter()
+        .chain(activations)
+        .filter(|o| o.side == Dir::Buy)
+        .try_fold(0i128, |sum, o| {
+            sum.checked_add(gate::buy_reservation_u(
+                &cfg.tick,
+                &cfg.lot,
+                fee_scale,
+                margin.fee_num,
+                o.price,
+                o.remaining(),
+            )?)
+        })?;
+    let quote_free_u = cfg
+        .c0_u
+        .checked_add(t.venue.cash_u)?
+        .checked_sub(t.venue.fixed_fees_u)?
+        .checked_sub(reserved)?;
+    let base_free_lots = i128::from(margin.base_lots)
+        .checked_add(i128::from(t.gate.venue_pos_lots))?
+        .checked_sub(i128::from(t.gate.live_sell_lots))?;
+    Some(Balances {
+        quote_free_u,
+        base_free_lots,
+    })
 }
 
 /// Records the outcome of an action in the counters.
