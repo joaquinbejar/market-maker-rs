@@ -77,6 +77,11 @@
 //! these bounds every `Decimal` ledger operation is exact, so the engine's
 //! saturating arithmetic never saturates and the integer shadow equals it.
 //!
+//! # A hedge lane
+//!
+//! [`HedgedKernel`] adds a second instrument to hedge in, outside the
+//! supported subset. Without it, nothing here changes.
+//!
 //! # Example
 //!
 //! ```rust
@@ -109,6 +114,7 @@ mod data;
 mod encode;
 mod gate;
 mod grid;
+mod hedge;
 mod ledger;
 mod observe;
 mod rng;
@@ -131,6 +137,11 @@ pub use encode::{
     CONFIG_MAGIC, FORMAT_VERSION, STATE_MAGIC, decode, encode, fingerprint, fnv1a128,
 };
 pub use gate::GateVerdict;
+pub use hedge::{
+    CombinedLimits, FundingRate, HEDGE_FORMAT_VERSION, HEDGED_STATE_MAGIC, HedgeCounters,
+    HedgeFill, HedgeInstrument, HedgeLane, HedgeLaneConfig, HedgeRefusal, HedgeSummary, HedgeView,
+    HedgedAction, HedgedKernel, HedgedOutcome, HedgedState,
+};
 pub use observe::{ActionGrid, ActionMask, Observation};
 pub use rng::{KernelRng, RNG_ALGO_XORSHIFT64STAR};
 pub use state::{
@@ -400,6 +411,18 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         action: KernelAction,
         sink: &mut E,
     ) -> StepOutcome {
+        self.step_combined(s, action, None, sink)
+    }
+
+    /// As [`FinancialKernel::step_with`], with the combined limits of a
+    /// hedged kernel binding the orders it submits.
+    fn step_combined<E: EventSink>(
+        &self,
+        s: &mut KernelState<ORD, MSG, DLV, OBS>,
+        action: KernelAction,
+        mut combined: step::Combined<'_>,
+        sink: &mut E,
+    ) -> StepOutcome {
         let mut em = Em::new(sink);
         let terminal = ActionStatus::Rejected(RejectReason::Terminal);
         if !self.owns(s) {
@@ -463,6 +486,9 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                     ],
                     crossed: bid >= ask,
                 },
+                combined
+                    .as_mut()
+                    .map(|(check, rejects)| (*check, &mut **rejects)),
                 &mut em,
             ),
             KernelAction::OneSided { side, price, lots } => {
@@ -477,6 +503,9 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                         legs: [Some((dir, price, lots)), None],
                         crossed: false,
                     },
+                    combined
+                        .as_mut()
+                        .map(|(check, rejects)| (*check, &mut **rejects)),
                     &mut em,
                 )
             }
@@ -512,11 +541,12 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         s: &mut KernelState<ORD, MSG, DLV, OBS>,
         admitted: Result<(), RejectReason>,
         legs: step::Legs,
+        combined: step::Combined<'_>,
         em: &mut Em<'_, E>,
     ) -> ActionStatus {
         match admitted {
             Err(reason) => ActionStatus::Rejected(reason),
-            Ok(()) => match step::apply_quote(&self.cfg, s, legs, em) {
+            Ok(()) => match step::apply_quote(&self.cfg, s, legs, combined, em) {
                 Ok(()) => ActionStatus::Applied,
                 // The transaction was rolled back and the run halted: the
                 // action never took effect. `StepOutcome::status` carries
