@@ -1701,18 +1701,30 @@ fn test_collapse_carries_a_zero_net_block_wait_to_its_queue_next_event() {
 }
 
 #[test]
-fn test_collapse_starts_a_block_at_a_wait_or_a_queue_that_does_not_continue() {
+fn test_collapse_starts_a_block_at_a_wait_or_another_queue() {
     use QrEventKind::{Cancel, Limit};
     let waited = [
         queue_event(QrSide::Bid, Limit, 2, 1.0),
         queue_event(QrSide::Bid, Cancel, 3, 0.5),
     ];
     assert_eq!(collapse_blocks(&waited), waited.to_vec());
-    let jumped = [
+    let sized = [
         queue_event(QrSide::Bid, Limit, 2, 1.0),
-        queue_event(QrSide::Bid, Cancel, 7, 0.0),
+        queue_event(QrSide::Bid, Limit, 7, 0.0),
     ];
-    assert_eq!(collapse_blocks(&jumped), jumped.to_vec());
+    assert_eq!(
+        collapse_blocks(&sized),
+        vec![
+            queue_event(QrSide::Bid, Limit, 2, 1.0),
+            queue_event(QrSide::Bid, Limit, 3, 0.0),
+        ],
+        "one event size each, from the first event's queue"
+    );
+    let other_side = [
+        queue_event(QrSide::Bid, Limit, 2, 1.0),
+        queue_event(QrSide::Ask, Cancel, 3, 0.0),
+    ];
+    assert_eq!(collapse_blocks(&other_side), other_side.to_vec());
     let other_limit = [
         queue_event(QrSide::Bid, Limit, 2, 1.0),
         QueueObservation {

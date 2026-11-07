@@ -9,12 +9,13 @@
 //! - E1: every event counted, a zero wait adding no time;
 //! - E2: per queue, each block's events collapsed into their net change, then counted as E1;
 //! - E3: an explicit exit by price move while the touch queue is not empty, built only under
-//!   [`E3_CONDITION`].
+//!   the condition in `support/qr_290.rs`.
 //!
-//! The protocol below is fixed before any run. #286 already read the holdout windows used in
+//! The protocol, in `support/qr_290.rs`, is fixed before any run. #286 already read the holdout windows used in
 //! phase 3, as the report says.
 //!
-//! Modes:
+//! The capture's phases run in `hyperliquid_validation`, which holds the split and #286's
+//! windows. Modes here:
 //! - `synthetic`: the recovery check, run first. #102's calm regime is simulated with known
 //!   parameters, its events are tied into blocks whose lengths are exponential with each mean in
 //!   [`BLOCK_MEANS_SECONDS`], and each estimator is fitted on them. It reports the error in the
@@ -27,28 +28,9 @@ use market_maker_rs::backtest::queue_reactive::{
 use market_maker_rs::prelude::Decimal;
 use market_maker_rs::strategy::walk_forward::TimeWindow;
 
-/// The condition under which E3 is built, fixed before phase 1 runs: on the month's training
-/// part, at least this share of touch-queue lives ends by a mid move while the queue is not
-/// empty ...
-const E3_MIN_EXIT_BY_MOVE_SHARE: f64 = 0.5;
-
-/// ... and both E1 and E2 are transient: their simulated mean touch queue over a 2 h training
-/// window is at least this share of the cap.
-const E3_TRANSIENT_SHARE_OF_CAP: f64 = 0.5;
-
-/// The written condition, for the report.
-const E3_CONDITION: &str = "E3 is built if, on the month's training part, at least half of the touch-queue lives end by a mid move while the queue is not empty, and both E1 and E2 are transient (their simulated mean touch queue over a 2 h training window reaches half the cap)";
-
-/// The queue cap, as #263's comparison.
-const MAX_QUEUE: u32 = 200;
-
-/// Phase 3's choice: among the stationary estimators, the lowest training-window queue size
-/// total variation at limit 0. Stationary means the simulated mean touch queue stays under
-/// this share of the cap.
-const STATIONARY_SHARE_OF_CAP: f64 = 0.5;
-
-/// Seed of every model run, as #263's comparison.
-const QR_SEED: u64 = 263;
+#[path = "support/qr_290.rs"]
+mod qr_290;
+use qr_290::QR_SEED;
 
 /// The synthetic check's seeds and length: five runs of 4 hours.
 const SYNTHETIC_SEEDS: [u64; 5] = [QR_SEED, QR_SEED + 1, QR_SEED + 2, QR_SEED + 3, QR_SEED + 4];
@@ -391,13 +373,6 @@ fn synthetic() -> Result<(), Failure> {
 }
 
 fn main() -> Result<(), Failure> {
-    let _ = (
-        E3_MIN_EXIT_BY_MOVE_SHARE,
-        E3_TRANSIENT_SHARE_OF_CAP,
-        E3_CONDITION,
-        MAX_QUEUE,
-        STATIONARY_SHARE_OF_CAP,
-    );
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("synthetic") => synthetic(),

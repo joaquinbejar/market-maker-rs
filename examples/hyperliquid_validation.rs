@@ -101,14 +101,15 @@ use market_maker_rs::backtest::hawkes::{
     score_flow, select_decay,
 };
 use market_maker_rs::backtest::hyperliquid::{
-    BookEvent, Coverage, RepeatFilter, Replay, ReplayConfig, ReplayOutput, Warmth, book_samples,
-    decode_order_statuses_after, hawkes_segments, queue_observations, read_book_diffs_after,
-    read_trades_after, sized_events,
+    BookEvent, Coverage, EventCause, RepeatFilter, Replay, ReplayConfig, ReplayOutput, Warmth,
+    book_samples, decode_order_statuses_after, hawkes_segments, queue_observations,
+    read_book_diffs_after, read_trades_after, sized_events,
 };
 use market_maker_rs::backtest::queue_reactive::{
     BookSample, DiscrepancyReport, EventSizeRecord, QrEstimationConfig, QrEventKind, QrFit,
     QrParameters, QrSide, QrSimulator, QueueObservation, ReferenceObservation, SizedEvent,
-    Trajectory, UnsupportedPolicy, compare_trajectories, estimate_event_sizes, estimate_parameters,
+    Trajectory, UnsupportedPolicy, ZeroWaitPolicy, collapse_blocks, compare_trajectories,
+    estimate_event_sizes, estimate_parameters,
 };
 use market_maker_rs::dec;
 use market_maker_rs::risk::RiskLimits;
@@ -122,6 +123,9 @@ use market_maker_rs::strategy::walk_forward::{
 };
 use market_maker_rs::types::error::MMResult;
 use rust_decimal::prelude::FromStr;
+
+#[path = "support/qr_290.rs"]
+mod qr_290;
 
 const NS_PER_MS: u64 = 1_000_000;
 const SECOND_MS: u64 = 1_000;
@@ -840,6 +844,201 @@ struct Sizes {
     hawkes: EventSizeRecord,
 }
 
+/// What a touch queue's life ended with, at a move of the mid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Touch {
+    /// No event at the touch since the last move, or one whose effect is unknown.
+    Unobserved,
+    /// The size left by the last event at the touch since the last move.
+    Level(Decimal),
+}
+
+/// A book event as #290's phase 1 reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TouchEvent {
+    time_ns: u64,
+    mid: Option<Decimal>,
+    /// The side, for a warm event at the touch.
+    side: Option<usize>,
+    /// What it left at its level; `None` for an unknown cause.
+    level_after: Option<Decimal>,
+}
+
+impl TouchEvent {
+    fn of(event: &BookEvent) -> Self {
+        let at_touch = event.warmth == Warmth::Warm && event.depth == Some(0);
+        Self {
+            time_ns: event.time.timestamp_ns,
+            mid: event.mid_before,
+            side: at_touch.then(|| side_index(event.side)),
+            level_after: match event.cause {
+                EventCause::Limit => Some(event.level_before + event.size),
+                EventCause::Cancel | EventCause::Fill => Some(event.level_before - event.size),
+                _ => None,
+            },
+        }
+    }
+}
+
+fn side_index(side: QrSide) -> usize {
+    usize::from(side != QrSide::Bid)
+}
+
+/// #290's phase 1: what the training part shows about the drift of the queue model's fit. One
+/// estimator's input is every observation, the other's every observation with each block
+/// collapsed per queue; each is kept one in the queue stride, as the observations of #90 are.
+/// A block that straddles two hour files is collapsed as two.
+#[derive(Debug, Default)]
+struct Phase290 {
+    /// Per limit and kind (limit, cancel, market): with a positive wait, with a zero wait.
+    counts: [[[u64; 2]; 3]; LIMITS as usize],
+    /// Observations with a negative or not finite wait.
+    invalid_waits: u64,
+    all: Vec<QueueObservation>,
+    all_seen: u64,
+    collapsed: Vec<QueueObservation>,
+    collapsed_seen: u64,
+    /// Touch-queue lives at a move: emptied, moved while not empty, unobserved.
+    lives: [u64; 3],
+    touch: [Option<Touch>; 2],
+    mid: Option<Option<Decimal>>,
+    /// Block length histogram over [`qr_290::BLOCK_GAP_BOUNDS_MS`], with one bin above.
+    gaps: [u64; qr_290::BLOCK_GAP_BOUNDS_MS.len() + 1],
+    gap_total_ns: u128,
+    blocks: u64,
+    block_events: u64,
+    multi_event_blocks: u64,
+    last_time_ns: Option<u64>,
+    events_in_block: u64,
+}
+
+impl Phase290 {
+    fn take_queue(&mut self, observations: &[QueueObservation], stride: u64) {
+        for o in observations {
+            let kind = match o.kind {
+                QrEventKind::Limit => 0,
+                QrEventKind::Cancel => 1,
+                _ => 2,
+            };
+            let zero = if o.waiting_seconds > 0.0 {
+                0
+            } else if o.waiting_seconds == 0.0 {
+                1
+            } else {
+                self.invalid_waits += 1;
+                continue;
+            };
+            if let Some(cell) = self
+                .counts
+                .get_mut(usize::from(o.depth))
+                .and_then(|c| c.get_mut(kind))
+                .and_then(|c| c.get_mut(zero))
+            {
+                *cell += 1;
+            }
+        }
+        for o in observations {
+            if keep_one_in(&mut self.all_seen, stride) {
+                self.all.push(*o);
+            }
+        }
+        for o in collapse_blocks(observations) {
+            if keep_one_in(&mut self.collapsed_seen, stride) {
+                self.collapsed.push(o);
+            }
+        }
+    }
+
+    fn take_book<'a>(&mut self, events: impl Iterator<Item = &'a BookEvent>) {
+        for event in events {
+            self.take_touch(TouchEvent::of(event));
+        }
+    }
+
+    fn take_touch(&mut self, event: TouchEvent) {
+        if self.last_time_ns != Some(event.time_ns) {
+            if let Some(last) = self.last_time_ns {
+                let gap = event.time_ns.saturating_sub(last);
+                let ms = gap / NS_PER_MS;
+                let bin = qr_290::BLOCK_GAP_BOUNDS_MS.partition_point(|&bound| bound <= ms);
+                if let Some(cell) = self.gaps.get_mut(bin) {
+                    *cell += 1;
+                }
+                self.gap_total_ns += u128::from(gap);
+                self.blocks += 1;
+                self.multi_event_blocks += u64::from(self.events_in_block > 1);
+            }
+            self.last_time_ns = Some(event.time_ns);
+            self.events_in_block = 0;
+        }
+        self.events_in_block += 1;
+        self.block_events += 1;
+        if self.mid != Some(event.mid) {
+            if self.mid.is_some() {
+                for touch in self.touch {
+                    let end = match touch {
+                        Some(Touch::Level(level)) if level <= Decimal::ZERO => 0,
+                        Some(Touch::Level(_)) => 1,
+                        _ => 2,
+                    };
+                    self.lives[end] += 1;
+                }
+            }
+            self.mid = Some(event.mid);
+            self.touch = [None; 2];
+        }
+        if let Some(side) = event.side
+            && let Some(touch) = self.touch.get_mut(side)
+        {
+            *touch = Some(event.level_after.map_or(Touch::Unobserved, Touch::Level));
+        }
+    }
+
+    /// The share of lives that ended by a move while not empty, among those whose end is known.
+    fn exit_by_move_share(&self) -> Option<f64> {
+        let known = self.lives[0] + self.lives[1];
+        (known > 0).then(|| self.lives[1] as f64 / known as f64)
+    }
+}
+
+/// One estimator's training fit for #290: the drift at the first limit and how its run behaves.
+struct Fit290 {
+    name: &'static str,
+    events: u64,
+    excluded: u64,
+    params: Result<QrParameters, String>,
+}
+
+impl Fit290 {
+    /// The mean touch queue, both sides, over a 2 h run from seed [`qr_290::QR_SEED`], with
+    /// how the run ended.
+    fn run_mean_touch(&self) -> Result<(f64, Option<String>), String> {
+        let params = self.params.as_ref().map_err(Clone::clone)?;
+        let run = QrSimulator::new(params.clone(), qr_290::QR_SEED, 0)
+            .and_then(|mut s| s.run(qr_290::WINDOW_SECONDS, BOOK_SAMPLE_MS as f64 / 1e3))
+            .map_err(|e| e.to_string())?;
+        Ok((
+            mean_touch(&run.samples),
+            run.stopped.map(|s| format!("{s:?}")),
+        ))
+    }
+}
+
+fn mean_touch(samples: &[BookSample]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let total: f64 = samples
+        .iter()
+        .map(|s| f64::from(s.bid[0]) + f64::from(s.ask[0]))
+        .sum();
+    total / (2.0 * samples.len() as f64)
+}
+
+fn invariant_mean(law: &[f64]) -> f64 {
+    law.iter().enumerate().map(|(n, p)| n as f64 * p).sum()
+}
+
 /// What the second pass keeps.
 struct Collect {
     protocol: Protocol,
@@ -870,6 +1069,7 @@ struct Collect {
     sim_note: Option<String>,
     book_windows: Vec<BookWindow>,
     qr_train: Option<Result<QrParameters, String>>,
+    phase_290: Phase290,
 }
 
 impl Collect {
@@ -917,6 +1117,7 @@ impl Collect {
             sim_note: None,
             book_windows: BookWindow::all(&protocol),
             qr_train: None,
+            phase_290: Phase290::default(),
         }
     }
 
@@ -1146,6 +1347,13 @@ impl Collect {
                                 window.events.push(observation.value);
                             }
                         }
+                    }
+                    if part == Part::Train {
+                        let values: Vec<QueueObservation> =
+                            conversion.observations.iter().map(|o| o.value).collect();
+                        self.phase_290.take_queue(&values, self.strides.queue);
+                        self.phase_290
+                            .take_book(events.iter().filter(|e| e.epoch == self.epoch));
                     }
                     for observation in conversion.observations {
                         if observation.value.waiting_seconds > 0.0
@@ -1482,6 +1690,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     section_89(&mut report, &collect);
     section_90(&mut report, &collect, &days);
     section_90_book(&mut report, &collect);
+    section_290(&mut report, &collect);
     section_91(&mut report, &collect);
     section_rest(&mut report);
     section_kept(&mut report, &collect);
@@ -2078,6 +2287,202 @@ fn section_90(report: &mut Report, collect: &Collect, days: &[TimeWindow]) {
     }
 }
 
+/// #290 phase 1: on the training part, the counts by type with and without a zero wait, the
+/// capture's block lengths, how touch-queue lives end, and the drift of E0, E1 and E2's fits.
+fn section_290(report: &mut Report, collect: &Collect) {
+    let p = &collect.phase_290;
+    say!(
+        report,
+        "\n== #290 phase 1: why the queue-reactive fit is transient (training part {}) ==",
+        window_text(&collect.protocol.queue_train())
+    );
+    say!(
+        report,
+        "API: backtest::queue_reactive::{{ZeroWaitPolicy, collapse_blocks, estimate_parameters}}. \
+         E0 is #90's fit (zero waits left out); E1 counts every observation, a zero wait adding \
+         no time; E2 collapses each block per queue into its net change, then counts as E1. Each \
+         is kept one in {} observations. A touch-queue life is a side's limit 0 between two mid \
+         moves; it ended emptied if the last event at it left nothing, moved if it left a size.",
+        collect.strides.queue
+    );
+    say!(
+        report,
+        "(1) Observations by limit and type: with a positive wait / with a zero wait (zero share); \
+         {} with an invalid wait.",
+        p.invalid_waits
+    );
+    for (depth, kinds) in p.counts.iter().enumerate() {
+        let cells: Vec<String> = ["limit", "cancel", "market"]
+            .iter()
+            .zip(kinds)
+            .map(|(name, [positive, zero])| {
+                let share = *zero as f64 / (*positive + *zero).max(1) as f64;
+                format!("{name} {positive} / {zero} ({share:.3})")
+            })
+            .collect();
+        say!(report, "    limit {}: {}", depth + 1, cells.join("; "));
+    }
+    let mean_gap_ms = p.gap_total_ns as f64 / p.blocks.max(1) as f64 / NS_PER_MS as f64;
+    let bins: Vec<String> = p
+        .gaps
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let label = match (
+                i.checked_sub(1)
+                    .and_then(|j| qr_290::BLOCK_GAP_BOUNDS_MS.get(j)),
+                qr_290::BLOCK_GAP_BOUNDS_MS.get(i),
+            ) {
+                (None, Some(hi)) => format!("<{hi}"),
+                (Some(lo), Some(hi)) => format!("{lo}-{hi}"),
+                (Some(lo), None) => format!(">={lo}"),
+                (None, None) => "-".to_string(),
+            };
+            format!("{label} ms: {n}")
+        })
+        .collect();
+    say!(
+        report,
+        "(2) Blocks (distinct event times): {} gaps, mean {mean_gap_ms:.1} ms, {:.2} events per \
+         block, {:.3} of blocks with more than one event. Gaps: {}",
+        p.blocks,
+        p.block_events as f64 / (p.blocks + 1) as f64,
+        p.multi_event_blocks as f64 / p.blocks.max(1) as f64,
+        bins.join("; ")
+    );
+    let share = p.exit_by_move_share();
+    say!(
+        report,
+        "(3) Touch-queue lives at a mid move, both sides: emptied {}, moved while not empty {}, \
+         unobserved {}; share moved among the known {}",
+        p.lives[0],
+        p.lives[1],
+        p.lives[2],
+        share.map_or("-".to_string(), |s| format!("{s:.3}"))
+    );
+    let Some(Ok(event_sizes)) = collect.sizes.as_ref().map(|s| &s.queue.sizes) else {
+        say!(report, "(4): no event sizes.");
+        return;
+    };
+    let window = collect.protocol.queue_train();
+    let config = qr_config(collect.tick);
+    let fit = |name, events: &[QueueObservation], zero_waits| match estimate_parameters(
+        events,
+        &collect.references,
+        event_sizes,
+        &window,
+        &config.with_zero_waits(zero_waits),
+        &collect.dataset,
+    ) {
+        Ok(record) => Fit290 {
+            name,
+            events: record.events,
+            excluded: record.excluded_events,
+            params: match record.fit {
+                QrFit::Calibrated(params) => Ok(params),
+                other => Err(format!("{other:?}")),
+            },
+        },
+        Err(error) => Fit290 {
+            name,
+            events: 0,
+            excluded: 0,
+            params: Err(error.to_string()),
+        },
+    };
+    let fits = [
+        fit("E0", &collect.queue, ZeroWaitPolicy::Drop),
+        fit("E1", &p.all, ZeroWaitPolicy::Count),
+        fit("E2", &p.collapsed, ZeroWaitPolicy::Count),
+    ];
+    say!(
+        report,
+        "(4) Training fits; drift = limit - cancel - market per second at limit 1, at sizes \
+         {QR_DAY_SIZES:?}; mean touch queue under the invariant law at limit 1 and over a {} s \
+         run from seed {}:",
+        qr_290::WINDOW_SECONDS,
+        qr_290::QR_SEED
+    );
+    let mut transient = Vec::new();
+    for f in &fits {
+        let params = match &f.params {
+            Ok(params) => params,
+            Err(error) => {
+                say!(
+                    report,
+                    "    {}: {} events used, {} excluded; no fit: {error}",
+                    f.name,
+                    f.events,
+                    f.excluded
+                );
+                transient.push((f.name, None));
+                continue;
+            }
+        };
+        let rates = params.rates(0).unwrap_or_default();
+        let supported: Vec<usize> = (0..rates.len())
+            .filter(|n| params.is_supported(0, *n))
+            .collect();
+        let rising = supported
+            .iter()
+            .filter(|n| rates.get(**n).is_some_and(|(l, c, m)| l - c - m > 0.0))
+            .count();
+        let drifts: Vec<String> = QR_DAY_SIZES
+            .iter()
+            .map(|n| match rates.get(*n) {
+                Some((l, c, m)) if params.is_supported(0, *n) => format!("{n}: {:+.3}", l - c - m),
+                _ => format!("{n}: -"),
+            })
+            .collect();
+        let invariant = params.invariant(0).map_or(f64::NAN, invariant_mean);
+        let run = f.run_mean_touch();
+        let run_text = match &run {
+            Ok((mean, None)) => format!("{mean:.1}"),
+            Ok((mean, Some(stop))) => format!("{mean:.1} (stopped: {stop})"),
+            Err(error) => format!("not evaluable: {error}"),
+        };
+        say!(
+            report,
+            "    {}: {} events used, {} excluded; θ {:.4}; drift {}; rising at {rising} of {} \
+             supported sizes; invariant mean {invariant:.1}; run mean {run_text}",
+            f.name,
+            f.events,
+            f.excluded,
+            params.theta(),
+            drifts.join(", "),
+            supported.len()
+        );
+        transient.push((
+            f.name,
+            run.ok()
+                .map(|(mean, _)| qr_290::reaches(mean, qr_290::E3_TRANSIENT_SHARE_OF_CAP)),
+        ));
+    }
+    let transient_of = |name| {
+        transient
+            .iter()
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, t)| *t)
+    };
+    let moves = share.map(|s| s >= qr_290::E3_MIN_EXIT_BY_MOVE_SHARE);
+    let both = transient_of("E1")
+        .zip(transient_of("E2"))
+        .map(|(a, b)| a && b);
+    say!(report, "(5) {}.", qr_290::E3_CONDITION);
+    say!(
+        report,
+        "    Exits by move reach {}: {}; E1 and E2 transient: {}. E3 {}.",
+        qr_290::E3_MIN_EXIT_BY_MOVE_SHARE,
+        moves.map_or("unknown".to_string(), |m| m.to_string()),
+        both.map_or("unknown".to_string(), |b| b.to_string()),
+        match moves.zip(both) {
+            Some((true, true)) => "is built",
+            Some(_) => "is not built",
+            None => "cannot be decided",
+        }
+    );
+}
+
 fn flow_line(name: &str, params: &HawkesParameters, holdout: &[HawkesSegment]) -> String {
     match score_flow(holdout, params) {
         Ok(fit) => format!(
@@ -2357,6 +2762,112 @@ mod tests {
     };
 
     const START: u64 = 1_764_583_200_000;
+
+    fn touch(time_ms: u64, mid: i64, side: Option<usize>, level: Option<i64>) -> TouchEvent {
+        TouchEvent {
+            time_ns: time_ms * NS_PER_MS,
+            mid: Some(Decimal::from(mid)),
+            side,
+            level_after: level.map(Decimal::from),
+        }
+    }
+
+    #[test]
+    fn test_290_touch_lives_end_emptied_moved_or_unobserved() {
+        let mut p = Phase290::default();
+        p.take_touch(touch(0, 100, Some(0), Some(0)));
+        p.take_touch(touch(0, 100, Some(1), Some(5)));
+        assert_eq!(p.lives, [0, 0, 0], "the first mid closes nothing");
+        p.take_touch(touch(1, 101, None, Some(3)));
+        assert_eq!(p.lives, [1, 1, 0]);
+        p.take_touch(touch(2, 101, Some(0), None));
+        p.take_touch(touch(3, 102, None, None));
+        assert_eq!(
+            p.lives,
+            [1, 1, 2],
+            "an unknown cause and a quiet side are unobserved"
+        );
+        p.take_touch(touch(4, 102, Some(1), Some(-1)));
+        p.take_touch(touch(5, 101, None, None));
+        assert_eq!(p.lives, [2, 1, 3]);
+        assert_eq!(p.exit_by_move_share(), Some(1.0 / 3.0));
+        assert_eq!(Phase290::default().exit_by_move_share(), None);
+    }
+
+    #[test]
+    fn test_290_blocks_are_distinct_times_and_their_gaps_fall_in_bins() {
+        let mut p = Phase290::default();
+        for ms in [0, 0, 5, 5, 2_000] {
+            p.take_touch(touch(ms, 100, None, None));
+        }
+        assert_eq!((p.blocks, p.block_events, p.multi_event_blocks), (2, 5, 2));
+        let mut want = [0; qr_290::BLOCK_GAP_BOUNDS_MS.len() + 1];
+        want[1] = 1;
+        want[7] = 1;
+        assert_eq!(p.gaps, want);
+        assert_eq!(p.gap_total_ns, 2_000 * u128::from(NS_PER_MS));
+    }
+
+    #[test]
+    fn test_290_queue_counts_split_zero_waits_and_collapse_per_block() {
+        let event = |depth, kind, queue_before, waiting_seconds| QueueObservation {
+            timestamp_ms: 1,
+            side: QrSide::Bid,
+            depth,
+            kind,
+            queue_before,
+            waiting_seconds,
+        };
+        let events = [
+            event(0, QrEventKind::Limit, 1, 1.0),
+            event(0, QrEventKind::Cancel, 2, 0.0),
+            event(0, QrEventKind::Market, 1, 0.0),
+            event(1, QrEventKind::Market, 3, 2.0),
+            event(1, QrEventKind::Limit, 2, -1.0),
+        ];
+        let mut p = Phase290::default();
+        p.take_queue(&events, 1);
+        assert_eq!(p.counts[0], [[1, 0], [0, 1], [0, 1]]);
+        assert_eq!(p.counts[1], [[0, 0], [0, 0], [1, 0]]);
+        assert_eq!(p.invalid_waits, 1);
+        assert_eq!(p.all, events.to_vec());
+        assert_eq!(
+            p.collapsed,
+            vec![
+                event(0, QrEventKind::Market, 1, 1.0),
+                event(1, QrEventKind::Market, 3, 2.0),
+                event(1, QrEventKind::Limit, 2, -1.0),
+            ]
+        );
+        let mut thin = Phase290::default();
+        thin.take_queue(&events, 2);
+        assert_eq!(thin.all.len(), 3);
+    }
+
+    #[test]
+    fn test_290_protocol_matches_this_example() {
+        assert_eq!(qr_290::MAX_QUEUE, QR_MAX_QUEUE);
+        assert_eq!(qr_290::QR_SEED, QR_SEED);
+        assert_eq!(qr_290::WINDOW_SECONDS, BOOK_WINDOW_MS as f64 / 1e3);
+        assert!(qr_290::reaches(100.0, 0.5));
+        assert!(!qr_290::reaches(99.9, 0.5));
+        let samples = [
+            BookSample {
+                timestamp_ms: 0,
+                bid: [2, 0, 0, 0, 0],
+                ask: [4, 0, 0, 0, 0],
+                spread_ticks: 1,
+            },
+            BookSample {
+                timestamp_ms: 1,
+                bid: [0, 0, 0, 0, 0],
+                ask: [2, 0, 0, 0, 0],
+                spread_ticks: 1,
+            },
+        ];
+        assert_eq!(mean_touch(&samples), 2.0);
+        assert_eq!(mean_touch(&[]), 0.0);
+    }
 
     #[test]
     fn test_split_is_chronological_disjoint_and_covers_the_stretch() {

@@ -661,12 +661,14 @@ pub struct SizedEvent {
 /// Each block's events at each queue collapsed into their net change (#290).
 ///
 /// A block at a queue (side and limit) is a run of that queue's events, other queues' events
-/// aside, each after the first with a zero wait and the queue size the one before left, as the
-/// events of one block of a capture whose times are inferred per block are. Its net change in
-/// event sizes becomes that many events of one kind, at the queue sizes they pass through: limit
-/// orders for a net arrival; for a net departure, market orders if the block holds one,
-/// cancellations otherwise. They sit where the block's first event was; the first carries its
-/// time and wait, the others wait zero. A block with no net change leaves no event, and its wait
+/// aside, each after the first with a zero wait, as the events of one block of a capture whose
+/// times are inferred per block are. Each event counts as one event size, as the estimator reads
+/// it, whatever the queue sizes it reports. The block's net change becomes that many events of
+/// one kind, from the first event's queue size by one at a time: limit orders for a net arrival;
+/// for a net departure, market orders if the block holds one, cancellations otherwise. They sit
+/// where the block's first event was; the first carries its time and wait, the others wait zero.
+/// A zero wait after a move of the reference within one block time joins the queue's open block,
+/// since an event does not say that its queue's clock restarted. A block with no net change leaves no event, and its wait
 /// is carried to the next event its queue keeps, so the time the queue spent at its size is not
 /// lost. Events otherwise keep their order.
 #[must_use]
@@ -687,11 +689,7 @@ pub fn collapse_blocks(events: &[QueueObservation]) -> Vec<QueueObservation> {
         let joined = open
             .get(&key)
             .and_then(|&b| blocks.get_mut(b))
-            .filter(|block| {
-                event.waiting_seconds == 0.0
-                    && i64::from(block.first.queue_before).saturating_add(block.net)
-                        == i64::from(event.queue_before)
-            });
+            .filter(|_| event.waiting_seconds == 0.0);
         if let Some(block) = joined {
             block.net = block.net.saturating_add(step);
             block.market |= event.kind == QrEventKind::Market;
