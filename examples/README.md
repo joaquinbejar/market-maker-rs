@@ -20,6 +20,7 @@ cargo run --example display_example --features serde
 
 # Real data, not in this repository: decompressed files of the Hyperliquid capture
 cargo run --release --features serde --example hyperliquid_hour -- BTC 1 10 <statuses> <diffs> <trades>
+cargo run --release --features serde --example hyperliquid_validation -- BTC 1 10 <out dir> <statuses> <diffs> <trades>
 
 # Research, on synthetic data only
 cargo run --example offline_rl_support

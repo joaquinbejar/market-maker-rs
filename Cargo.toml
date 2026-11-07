@@ -102,6 +102,11 @@ name = "hyperliquid_hour"
 required-features = ["serde"]
 
 [[example]]
+name = "hyperliquid_validation"
+required-features = ["serde"]
+test = true
+
+[[example]]
 name = "l3_reconstruction"
 required-features = ["l3"]
 
