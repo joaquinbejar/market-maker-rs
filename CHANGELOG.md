@@ -8,6 +8,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The constrained learning comparison of #105 in `bridges/python/experiments/m4_08`: OmniSafe
+  CPO against PPO with a reward penalty and plain PPO, beside no-trade and Avellaneda-Stoikov,
+  on #102's regimes and shocked copies of their days. Inventory and notional costs are
+  constrained with budgets per step, measured apart from the reward, and a margin proxy is
+  reported; the kernel's limits, derived from the margin rule, stay the final authority for
+  every arm. Paired block bootstrap intervals on the holdout for the daily net and the daily
+  cost. The design was committed before any run, PPOLag was dropped after failing a toy gate,
+  and `report.py` was committed before the holdout was read. Synthetic data only; nothing here
+  is a safety guarantee.
+
 - The decision frequency and policy memory comparison of #103 in
   `bridges/python/experiments/m4_06`, with `DecisionInterval`, `EmaFeatures` and `history` in the
   bridge's wrappers and per-step order counts in its replies. On #102's regimes sampled every
