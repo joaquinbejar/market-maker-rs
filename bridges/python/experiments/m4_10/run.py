@@ -679,6 +679,9 @@ def training(ctx, fee, predictor, teacher_report):
 
 
 FROZEN_REPORTS = ("fee_rule", "predictor", "classical_selection", "teacher", "training")
+# The code the holdout runs: this runner and #103's, whose helpers it takes.
+FROZEN_CODE = {"code_sha256": HERE / "run.py",
+               "base_code_sha256": HERE.parent / "m4_06" / "run.py"}
 
 
 def freeze(ctx):
@@ -692,7 +695,7 @@ def freeze(ctx):
             raise ValueError(f"{sample['path']} changed after it was drawn")
     manifest = {**ctx.header("freeze"),
                 **{f"{name}_sha256": sha256(ctx.out / f"{name}.json") for name in FROZEN_REPORTS},
-                "code_sha256": sha256(HERE / "run.py"),
+                **{key: sha256(path) for key, path in FROZEN_CODE.items()},
                 "fee": reports["fee_rule"]["fee"],
                 "classical_selected": reports["classical_selection"]["selected"],
                 "runs": reports["training"]["runs"]}
@@ -708,10 +711,11 @@ def holdout(ctx, frozen_sha256):
     if (ctx.out / "holdout.json").exists():
         raise ValueError("the holdout was evaluated already")
     frozen = json.loads(path.read_text())
-    for key, name in (("design_sha256", "design.json"), ("digests_sha256", "digests.json"),
-                      ("code_sha256", "run.py")):
-        if frozen[key] != sha256(HERE / name):
-            raise ValueError(f"{name} changed after the freeze")
+    files = {"design_sha256": HERE / "design.json", "digests_sha256": HERE / "digests.json",
+             **FROZEN_CODE}
+    for key, path in files.items():
+        if frozen[key] != sha256(path):
+            raise ValueError(f"{path.parent.name}/{path.name} changed after the freeze")
     for name in FROZEN_REPORTS:
         if frozen[f"{name}_sha256"] != sha256(ctx.out / f"{name}.json"):
             raise ValueError(f"{name}.json changed after the freeze")

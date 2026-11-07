@@ -445,6 +445,7 @@ def test_the_freeze_refuses_a_changed_checkpoint_or_teacher_sample(tmp_path):
     assert manifest["runs"] == 1
     frozen = json.loads((tmp_path / "frozen.json").read_text())
     assert frozen["code_sha256"] == run.sha256(run.HERE / "run.py")
+    assert frozen["base_code_sha256"] == run.sha256(run.HERE.parent / "m4_06" / "run.py")
     assert set(f"{n}_sha256" for n in run.FROZEN_REPORTS) <= set(frozen)
     samples.write_text('{"changed": 1}')
     with pytest.raises(ValueError, match="changed after it was drawn"):
@@ -469,7 +470,8 @@ def test_the_holdout_runs_once_from_its_manifest_at_both_fees(tmp_path, stubbed)
             run.holdout(ctx, good)
         (tmp_path / f"{name}.json").write_text(original)
     manifest = json.loads((tmp_path / "frozen.json").read_text())
-    for key, name in (("design_sha256", "design.json"), ("code_sha256", "run.py")):
+    for key, name in (("design_sha256", "m4_10/design.json"), ("digests_sha256", "m4_10/digests.json"),
+                      ("code_sha256", "m4_10/run.py"), ("base_code_sha256", "m4_06/run.py")):
         changed = manifest | {key: "0" * 64}
         (tmp_path / "frozen.json").write_text(json.dumps(changed))
         with pytest.raises(ValueError, match=f"{name} changed"):
