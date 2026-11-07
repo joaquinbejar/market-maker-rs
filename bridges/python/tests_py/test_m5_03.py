@@ -84,3 +84,48 @@ def test_a_learned_arms_day_is_the_mean_over_its_seeds():
     out = run.daily(rows)
     assert out[("maskable_ppo", "calm", 1)] == 3
     assert out[("no_trade", "calm", 1)] == 0
+
+
+def test_the_holdout_refuses_digests_other_than_the_frozen_set(tmp_path):
+    for name, body in (("a.json", "1"), ("b.json", "2")):
+        (tmp_path / name).write_text(body)
+    frozen = {"digests_sha256": run.digest_hashes(tmp_path)}
+    run.check_frozen_digests(frozen, tmp_path)
+    (tmp_path / "b.json").write_text("3")
+    with pytest.raises(ValueError, match="digests changed"):
+        run.check_frozen_digests(frozen, tmp_path)
+    (tmp_path / "b.json").write_text("2")
+    (tmp_path / "c.json").write_text("4")
+    with pytest.raises(ValueError, match="digest files changed"):
+        run.check_frozen_digests(frozen, tmp_path)
+    (tmp_path / "c.json").unlink()
+    (tmp_path / "a.json").unlink()
+    with pytest.raises(ValueError, match="digest files changed"):
+        run.check_frozen_digests(frozen, tmp_path)
+    with pytest.raises(ValueError, match="no digests"):
+        run.check_frozen_digests({}, tmp_path)
+
+
+def test_the_holdout_checks_the_digests_before_any_job(tmp_path, monkeypatch):
+    calls = []
+
+    def refuse(*_):
+        raise ValueError("digests changed")
+
+    monkeypatch.setattr(run, "check_frozen_digests", refuse)
+    monkeypatch.setattr(run, "pool", lambda *a, **k: calls.append(a))
+    out = tmp_path
+    (out / "selection.json").write_text("{}")
+    header = {"design_sha256": "d", "code_sha256": "c"}
+    frozen = {**header, "selection_sha256": run.sha256(out / "selection.json"), "chosen": {}}
+    (out / "frozen.json").write_text(json.dumps(frozen))
+
+    class Study:
+        pass
+
+    study = Study()
+    study.out = out
+    study.header = lambda step: dict(header)
+    with pytest.raises(ValueError, match="digests changed"):
+        run.holdout(study, run.sha256(out / "frozen.json"))
+    assert calls == []

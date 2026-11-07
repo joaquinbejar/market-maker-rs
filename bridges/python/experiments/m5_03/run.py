@@ -396,11 +396,30 @@ def freeze(study):
     selection_path = study.out / "selection.json"
     manifest = study.header("freeze")
     manifest["selection_sha256"] = sha256(selection_path)
-    manifest["digests_sha256"] = {p.name: sha256(p) for p in sorted((HERE / "digests").glob("*.json"))}
+    manifest["digests_sha256"] = digest_hashes(HERE / "digests")
     manifest["chosen"] = json.loads(selection_path.read_text())["chosen"]
     path = study.out / "frozen.json"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return {"frozen_sha256": sha256(path)}
+
+
+def digest_hashes(digests_dir):
+    return {p.name: sha256(p) for p in sorted(pathlib.Path(digests_dir).glob("*.json"))}
+
+
+def check_frozen_digests(frozen, digests_dir):
+    """Refuses digests that are not the frozen set: a file added, removed or changed since
+    the freeze, so regenerated days cannot pass under the frozen manifest."""
+    here = digest_hashes(digests_dir)
+    frozen_set = frozen.get("digests_sha256")
+    if not isinstance(frozen_set, dict) or not frozen_set:
+        raise ValueError("the frozen manifest holds no digests")
+    if set(here) != set(frozen_set):
+        moved = sorted(set(here) ^ set(frozen_set))
+        raise ValueError(f"the digest files changed after the freeze: {moved}")
+    changed = sorted(name for name, digest in here.items() if frozen_set[name] != digest)
+    if changed:
+        raise ValueError(f"digests changed after the freeze: {changed}")
 
 
 def holdout(study, frozen_sha256):
@@ -416,6 +435,8 @@ def holdout(study, frozen_sha256):
             raise ValueError(f"{key} changed after the freeze")
     if frozen["selection_sha256"] != sha256(study.out / "selection.json"):
         raise ValueError("selection.json changed after the freeze")
+    # Before any job runs or any journaled row is reused.
+    check_frozen_digests(frozen, HERE / "digests")
     days = list(range(1, study.design["days"]["holdout"]["per_regime"] + 1))
     unperturbed = point_name({k: 1.0 for k in study.design["fixed_stress"]})
     stress = point_name(study.design["fixed_stress"])
