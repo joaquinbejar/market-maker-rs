@@ -222,7 +222,9 @@
     ]
   },
   "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
-  "changes": [],
+  "changes": [
+    "version 1, after the timing pilot and before any other run: observation scales stated (row gap 2000 ms for 1 s rows, the rest as #102); classical arms evaluated as #102 did; estimates set from the pilot (fee rule 60, training 240, holdout 120 minutes). Nothing but the pilot's timing was seen."
+  ],
   "kernel": {
     "tick_size": "0.005",
     "lot_size": "1",
@@ -332,7 +334,8 @@
           "from the volatility rule"
         ]
       },
-      "selection": "on validation, per regime, at each decision interval"
+      "selection": "on validation, per regime, at each decision interval",
+      "evaluation": "as a residual environment with a zero correction (bounds 4 ticks and 1 lot), as in #102"
     },
     "glft": {
       "kind": "classical",
@@ -362,7 +365,8 @@
           "from the volatility rule"
         ]
       },
-      "selection": "on validation, per regime, at each decision interval"
+      "selection": "on validation, per regime, at each decision interval",
+      "evaluation": "as a residual environment with a zero correction (bounds 4 ticks and 1 lot), as in #102"
     },
     "mlp": {
       "kind": "learned",
@@ -457,12 +461,24 @@
     {
       "name": "pilot",
       "what": "50000 decisions of lstm and of mlp on training days, to time them; nothing is selected",
-      "estimate_minutes": 20
+      "estimate_minutes": 20,
+      "measured": {
+        "mlp_minutes_per_2m": {
+          "1": 6.5,
+          "5": 11.2,
+          "10": 17.3
+        },
+        "lstm_minutes_per_2m": {
+          "1": 40.4,
+          "10": 52.8
+        },
+        "where": "calm training day 1, 50000 decisions, 2 to 3 jobs at once"
+      }
     },
     {
       "name": "fee_rule",
       "what": "the Avellaneda-Stoikov grid on training days at each candidate fee",
-      "estimate_minutes": 30
+      "estimate_minutes": 60
     },
     {
       "name": "classical_selection",
@@ -472,7 +488,7 @@
     {
       "name": "training",
       "what": "4 arms x 3 intervals x 5 seeds",
-      "estimate_minutes": "set from the pilot"
+      "estimate_minutes": 240
     },
     {
       "name": "freeze",
@@ -481,8 +497,16 @@
     {
       "name": "holdout",
       "what": "every arm once at the chosen fee and once at 0.0002",
-      "estimate_minutes": 60
+      "estimate_minutes": 120
     }
   ],
-  "volatility_rule": "Per regime, the population standard deviation of the change of the mid in price units between consecutive rows of the same day, over every training day, times the square root of 31536000 / 1: absolute price units per square root of a 365 day year, as Avellaneda-Stoikov and GLFT take it."
+  "volatility_rule": "Per regime, the population standard deviation of the change of the mid in price units between consecutive rows of the same day, over every training day, times the square root of 31536000 / 1: absolute price units per square root of a 365 day year, as Avellaneda-Stoikov and GLFT take it.",
+  "observation_scales": {
+    "spread_ticks": "10",
+    "mid_change_ticks": "10",
+    "row_gap_ms": "2000",
+    "size_lots": "10",
+    "position": "20",
+    "entry_gap": "1"
+  }
 }
