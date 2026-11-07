@@ -17,6 +17,10 @@ read:
 - Pooled means the days of every regime together.
 - The best classical arm is Avellaneda-Stoikov or GLFT, whichever has the higher mean daily
   net on the holdout, per regime and pooled; GLFT's quote rate is reported with it.
+
+An amendment, made after the validation results were seen and before the holdout was read
+(see AMENDMENT): each learned arm is also compared with no-trade, and with
+Avellaneda-Stoikov.
 """
 
 import json
@@ -28,6 +32,17 @@ from decimal import Decimal
 
 LEARNED = ("maskable_ppo", "sac_residual_avellaneda_stoikov")
 CLASSICAL = ("avellaneda_stoikov", "glft")
+AGAINST = CLASSICAL + ("no_trade",)
+AMENDMENT = (
+    "Made after the validation results of the selection step were seen, and before the "
+    "holdout was read. Read literally, the decision rule calls a learned arm that never "
+    "trades a success whenever the best classical arm loses, which it did on validation. So "
+    "each learned arm is also given a paired interval against no-trade: when that interval "
+    "includes 0, the arm is reported as equivalent to not trading, and its decision is "
+    "revise at best. The rule against the best classical arm is unchanged. Since the best "
+    "classical arm on validation was GLFT, which mostly does not quote (#264), each learned "
+    "arm is also reported against Avellaneda-Stoikov, the classical arm that quotes."
+)
 
 
 def mean(values):
@@ -109,10 +124,14 @@ def build(out):
         best = max(CLASSICAL, key=lambda a: mean(values[a].values()))
         comparisons[scope] = {"best_classical": best}
         for arm in LEARNED:
-            for against in CLASSICAL:
+            for against in AGAINST:
                 difference = [values[arm][day] - values[against][day] for day in values[arm]]
                 series[f"{scope}/{arm}-minus-{against}"] = [str(d) for d in difference]
     return holdout, tables, series, comparisons, rows
+
+
+def includes_zero(interval):
+    return interval.get("lower") is not None and interval["lower"] <= 0 <= interval["upper"]
 
 
 def decide(interval, learned, classical, breaches):
@@ -145,20 +164,36 @@ def main():
             chosen = [r for r in rows if r["regime"] in members]
             learned_dd = mean(drawdown_by_day([r for r in chosen if r["arm"] == arm]).values())
             classical_dd = mean(drawdown_by_day([r for r in chosen if r["arm"] == best]).values())
+            breaches = tables[scope][arm]["limit_breaches"]
             interval = intervals[f"{scope}/{arm}-minus-{best}"]
+            decision = decide(interval, learned_dd, classical_dd, breaches)
+            against_none = intervals[f"{scope}/{arm}-minus-no_trade"]
+            equivalent = includes_zero(against_none)
+            if equivalent and decision == "continue":
+                decision = "revise"
+            as_dd = mean(drawdown_by_day(
+                [r for r in chosen if r["arm"] == "avellaneda_stoikov"]).values())
+            against_as = intervals[f"{scope}/{arm}-minus-avellaneda_stoikov"]
             decisions[f"{scope}/{arm}"] = {
                 "against": best,
                 "interval": interval,
                 "mean_max_drawdown": [str(learned_dd), str(classical_dd)],
-                "limit_breaches": tables[scope][arm]["limit_breaches"],
-                "decision": decide(interval, learned_dd, classical_dd,
-                                   tables[scope][arm]["limit_breaches"]),
+                "limit_breaches": breaches,
+                "against_no_trade": against_none,
+                "equivalent_to_not_trading": equivalent,
+                "decision": decision,
+                "against_avellaneda_stoikov": {
+                    "interval": against_as,
+                    "mean_max_drawdown": [str(learned_dd), str(as_dd)],
+                    "by_the_same_rule": decide(against_as, learned_dd, as_dd, breaches),
+                },
             }
     report = {
         "commit": holdout["commit"],
         "data": holdout["data"],
         "bounds": holdout["bounds"],
         "frozen_sha256": holdout["frozen_sha256"],
+        "amendment": AMENDMENT,
         "tables": tables,
         "intervals": intervals,
         "decisions": decisions,
