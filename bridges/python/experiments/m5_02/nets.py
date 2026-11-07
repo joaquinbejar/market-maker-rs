@@ -178,7 +178,7 @@ EXTRACTORS = {
 
 def policy_kwargs(arm, layout, width):
     """The `policy_kwargs` of an arm: its extractor, shared by a policy and a value MLP."""
-    kwargs = {k: v for k, v in arm.items() if k not in ("extractor", "name")}
+    kwargs = {k: v for k, v in arm.items() if k not in ("extractor", "name", "note")}
     return {
         "features_extractor_class": EXTRACTORS[arm["extractor"]],
         "features_extractor_kwargs": {"layout": layout, **kwargs},

@@ -291,6 +291,177 @@
     24
    ]
   },
-  "seed": "1000003 + day for the day's flow (buy side 2 x seed, sell side 2 x seed + 1) and diffusion, the same in every setting"
+  "seed": "1000003 + day for the day's flow (buy side 2 x seed, sell side 2 x seed + 1) and diffusion, the same in every setting",
+  "note": "one policy per arm and impact setting, on that setting's training days"
+ },
+ "market": {
+  "data": "synthetic: the #102 queue-reactive days (3 regimes x 24), whose holdout #102 has already read; one policy per arm on the pooled training days, as #102",
+  "pins": {
+   "m4_05_design": "4f4950626599941906019ff6a4a3e4e95b85f364d4d1d0ea066d301b7a25f221",
+   "m4_05_digests": "e1f0c3bd60e8c5fe21b44843b340dc3ab6b3ae72ba5105fb0cc21b4d7f042462"
+  }
+ },
+ "execution": {
+  "same_for_every_arm": true,
+  "fill_model": {
+   "kind": "queue_position_rational",
+   "lots": 1,
+   "per_ms": 1000,
+   "min_queue_ms": 5000
+  },
+  "latency": {
+   "quantum_ns": 1000000,
+   "observation_q": 25,
+   "submit_q": 25,
+   "cancel_q": 25,
+   "ack_q": 10,
+   "jitter_q": 10
+  },
+  "rest": "#102's main execution otherwise: fee 0.0002, limits max position 20 and max notional 2500, terminal mark, the 5 x 5 x 2 grid with the mask policy"
+ },
+ "window": {
+  "buffer": 32,
+  "market_features": [
+   "spread",
+   "mid_change",
+   "row_gap",
+   "bid_size",
+   "ask_size",
+   "imbalance"
+  ],
+  "agent_features": [
+   "position",
+   "entry_gap",
+   "open_orders",
+   "awaiting_cancel",
+   "steps_left"
+  ],
+  "rule": "each market feature's normalized value and its presence flag are channels; ages are in decisions; the agent's values and flags are scalars"
+ },
+ "action_dims": [
+  2,
+  5,
+  5,
+  2,
+  2
+ ],
+ "arms": {
+  "mlp": {
+   "extractor": "frame_stack",
+   "frames": 1,
+   "note": "the #102 control: the current observation only"
+  },
+  "mlp_frame_stack": {
+   "extractor": "frame_stack",
+   "frames": 8
+  },
+  "mlp_fixed_ema": {
+   "extractor": "fixed_ema",
+   "decays": [
+    0.02,
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1.0,
+    2.0,
+    5.0
+   ]
+  },
+  "gru": {
+   "extractor": "recurrent",
+   "cell": "gru",
+   "embed": 8,
+   "hidden": 16
+  },
+  "lstm": {
+   "extractor": "recurrent",
+   "cell": "lstm",
+   "embed": 8,
+   "hidden": 14
+  },
+  "hsn": {
+   "extractor": "hsn",
+   "alphas": [
+    0.2,
+    0.4
+   ],
+   "betas": [
+    1.0,
+    0.1
+   ],
+   "floor": 0.0001
+  }
+ },
+ "parameters": {
+  "target": 12369,
+  "tolerance": 0.1,
+  "min_width": 8,
+  "max_width": 160,
+  "rule": "the #102 MaskablePPO MLP's trainable parameter count; each arm's policy and value MLPs have two hidden layers of the width nearest it"
+ },
+ "ppo": {
+  "learning_rate": 0.0003,
+  "n_steps": 2048,
+  "batch_size": 256,
+  "n_epochs": 5,
+  "ent_coef": 0.0
+ },
+ "budget_steps": 2000000,
+ "training_seeds": [
+  1,
+  2,
+  3,
+  4,
+  5
+ ],
+ "evaluation_seeds": [
+  101
+ ],
+ "references": {
+  "avellaneda_stoikov": {
+   "risk_aversion": "0.01",
+   "order_intensity": "50",
+   "size": "1",
+   "horizon_ms": 86400000
+  },
+  "glft": {
+   "risk_aversion": "0.001",
+   "order_intensity_k": "50",
+   "intensity_scale_a": "1.5",
+   "max_inventory_lots": 5,
+   "min_spread": "0.005",
+   "terminal_time": 86400000
+  },
+  "note": "the points #102 selected, not reselected here; volatility by #102's rule from each part's training days"
+ },
+ "bootstrap": {
+  "replicates": 2000,
+  "mean_block_days": 2,
+  "confidence_percent": 90,
+  "seed": 102,
+  "min_days": 4
+ },
+ "decision_rule": {
+  "against": "the best non-HSN learned arm by mean daily net on validation, chosen before the holdout",
+  "interval": "90 % block bootstrap over days on the paired daily difference, a learned arm's day being the mean over its seeds",
+  "hsn_helps": "the lower bound is above 0, HSN has no limit breach, its mean max drawdown is at most drawdown_factor times the control's, and its interval against no-trade excludes 0",
+  "revise": "the point estimate is above 0",
+  "no_gain": "otherwise",
+  "drawdown_factor": "1.2",
+  "applied": "B per regime and pooled; C per impact setting"
+ },
+ "audit": {
+  "observations": 10000,
+  "timed": 10000,
+  "rule": "a fixed set from the first validation day under a hold; two loads of every frozen checkpoint must give identical actions"
+ },
+ "widths": {
+  "mlp": 64,
+  "mlp_frame_stack": 38,
+  "mlp_fixed_ema": 40,
+  "gru": 58,
+  "lstm": 59,
+  "hsn": 59
  }
 }
