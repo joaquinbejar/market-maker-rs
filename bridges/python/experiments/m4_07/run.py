@@ -722,6 +722,63 @@ def holdout(study, frozen_sha256):
     return here
 
 
+def capture_bins(path, tick, edges):
+    """The design's bins of the capture's decisions, from a CSV of its tops every 10 s
+    (`ts_ms,bid,bid_size,ask,ask_size`, prices in price units), at a declared tick. The
+    features are what the policy would see: the spread and the mid change in ticks over #102's
+    scale of 10, and the imbalance of the touch sizes."""
+    import csv
+
+    tick = Decimal(tick)
+    rows = []
+    with open(path, newline="") as handle:
+        for row in csv.DictReader(handle):
+            rows.append(row)
+    obs = np.zeros((len(rows), 22))
+    previous_mid = None
+    for i, row in enumerate(rows):
+        bid, ask = Decimal(row["bid"]), Decimal(row["ask"])
+        bid_size, ask_size = Decimal(row["bid_size"]), Decimal(row["ask_size"])
+        mid = (bid + ask) / 2
+        obs[i, SPREAD] = float((ask - bid) / tick) / 10.0
+        if previous_mid is not None:
+            obs[i, MID_CHANGE] = float((mid - previous_mid) / tick) / 10.0
+            obs[i, 11 + MID_CHANGE] = 1.0
+        total = bid_size + ask_size
+        if total > 0:
+            obs[i, IMBALANCE] = float((bid_size - ask_size) / total)
+            obs[i, 11 + IMBALANCE] = 1.0
+        previous_mid = mid
+    return est.bin_states(obs, edges)
+
+
+def coverage(study, tops_path, ticks):
+    """The design's coverage diagnostic: the share of the capture's decisions in a bin the
+    synthetic training logs reach, and the reverse, per declared tick. The capture's states are
+    [observed]; this says where a simulator-trained policy would act outside what it saw."""
+    validation_report = json.loads((study.out / "validation.json").read_text())
+    edges = validation_report["imbalance_edges"]
+    train = [r for r in log_paths(study, "train") if r["behaviour"] == "as_grid_eps30"]
+    synthetic, _ = counting_table(study, train, edges)
+    synthetic_bins = set(np.unique(synthetic).tolist())
+    report = study.header("coverage")
+    report["tops_sha256"] = sha256(tops_path)
+    report["label"] = "[observed] capture states against the synthetic training logs' states"
+    report["by_tick"] = {}
+    for tick in ticks:
+        capture = capture_bins(tops_path, tick, edges)
+        capture_set = set(np.unique(capture).tolist())
+        report["by_tick"][tick] = {
+            "capture_decisions": int(len(capture)),
+            "capture_in_synthetic_bins": float(np.mean([b in synthetic_bins for b in capture])),
+            "synthetic_in_capture_bins": float(np.mean([b in capture_set for b in synthetic])),
+            "capture_bins": len(capture_set),
+            "synthetic_bins": len(synthetic_bins),
+        }
+    study.write("coverage", report)
+    return report
+
+
 def main():
     step, data_dir, run_dir, out_dir, commit = sys.argv[1:6]
     study = Study(data_dir, run_dir, out_dir, commit)
@@ -740,6 +797,8 @@ def main():
         report = freeze(study)
     elif step == "holdout":
         report = holdout(study, sys.argv[6])
+    elif step == "coverage":
+        report = coverage(study, sys.argv[6], sys.argv[7:])
     else:
         raise SystemExit(f"step {step!r} is not implemented yet")
     summary = {k: v for k, v in report.items() if not isinstance(v, list)}
