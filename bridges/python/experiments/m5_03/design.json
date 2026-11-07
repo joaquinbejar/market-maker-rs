@@ -1,6 +1,6 @@
 {
   "issue": 108,
-  "design_version": 2,
+  "design_version": 3,
   "data": "synthetic: perturbed copies of #102's queue-reactive regimes (a simulator with made-up parameters), no market data",
   "bounds": "One synthetic simulator, made-up parameters and its rows, which do not react to orders, bound what this study can show. It says how these policies behave under these bounded perturbations of this simulator, and nothing about a market. Impact is out of reach here: the kernel replays rows that do not react to orders, so an impact adversary would have to change the matching rules (#282). #102's main execution is in effect an immediate fill on 10 s rows (#267), and the conclusions carry that bound.",
   "reuses": {
@@ -41,10 +41,11 @@
     "fill_model": {
       "kind": "queue_position_rational",
       "lots": 1,
-      "per_ms": 1000,
+      "per_ms": 5000,
       "min_queue_ms": 0
     },
-    "note": "an extra holdout condition: the queue binds at one lot per second, as #273 allows, under unperturbed rows, with no minimum time in queue. The learned policies were trained under #102's main execution, so this is a stress for them too"
+    "note": "an extra holdout condition: the queue binds at one lot per 5 s with no minimum time in queue, a rate that binds on #102's 10 s rows (the team's standard for that row size), under unperturbed rows. The learned policies were trained under #102's main execution, so this is a stress for them too",
+    "check": "before the holdout, on calm selection day 1 unperturbed: fixed spread, Avellaneda-Stoikov and GLFT fill (peak positions -20, 3, -5) and their daily nets differ from the main execution's (-61.18 against -64.73, -27.08 against -35.95, -4.78 against -5.30); at one lot per 1 s they were equal, as that rate clears more than any touch per row"
   },
   "days": {
     "selection": {
@@ -115,6 +116,13 @@
       "seen": "selection runs under the unperturbed and perturbed rows with #102's main execution were partly done; nothing had run under the execution stress, and the holdout had not been read",
       "what": [
         "the execution stress's minimum time in queue is 0 instead of 5000 ms: an arm that requotes every 1 to 5 s never reaches 5 s in queue, so it would never fill (the team's standard since #103 found it)"
+      ]
+    },
+    {
+      "version": 3,
+      "seen": "as for version 2, plus a check of the stress on calm selection day 1 for the three classical arms",
+      "what": [
+        "the execution stress's rate is one lot per 5000 ms instead of per 1000 ms: on 10 s rows one lot per second clears 10 lots per row, more than any touch holds, so it equalled the main execution; one lot per 5 s binds and still fills"
       ]
     }
   ]
