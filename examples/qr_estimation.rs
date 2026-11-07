@@ -38,7 +38,11 @@ const SYNTHETIC_HOURS: f64 = 4.0;
 
 /// Mean block lengths, in seconds; 0 leaves the events untied. Phase 1 reports the capture's
 /// block lengths, and the check is rerun with them.
-const BLOCK_MEANS_SECONDS: [f64; 4] = [0.0, 0.05, 0.25, 1.0];
+const BLOCK_MEANS_SECONDS: [f64; 5] = [0.0, 0.05, CAPTURE_BLOCK_MEAN_SECONDS, 0.25, 1.0];
+
+/// The capture's mean block length on the training part, from phase 1 at 7249e46 (95.7 ms), as
+/// the design said the check would be rerun with. Added after phase 1 read the training part.
+const CAPTURE_BLOCK_MEAN_SECONDS: f64 = 0.0957;
 
 /// The estimation settings of the synthetic check: #102's cap of 4, both limits.
 const SYNTHETIC_MIN_EVENTS: u64 = 30;
