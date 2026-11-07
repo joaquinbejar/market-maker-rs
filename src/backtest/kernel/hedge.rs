@@ -903,9 +903,12 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     /// Whether `s` belongs to this kernel's datasets and configurations.
     #[must_use]
     pub fn owns(&self, s: &HedgedState<ORD, MSG, DLV, OBS>) -> bool {
-        self.kernel.owns(&s.kernel)
-            && s.lane.data_id == self.hedge.id
-            && s.lane.cfg_fp == self.lane.fingerprint
+        self.owns_parts(&s.kernel, &s.lane)
+    }
+
+    /// [`HedgedKernel::owns`] on the two lanes' states held apart.
+    pub(crate) fn owns_parts(&self, k: &KernelState<ORD, MSG, DLV, OBS>, l: &HedgeLane) -> bool {
+        self.kernel.owns(k) && l.data_id == self.hedge.id && l.cfg_fp == self.lane.fingerprint
     }
 
     /// The state at the first decision point (or the end of the run).
@@ -948,7 +951,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                 counters: HedgeCounters::default(),
             },
         };
-        self.catch_up(&mut s, &mut Em::new(sink));
+        self.catch_up(&mut s.kernel, &mut s.lane, &mut Em::new(sink));
         s
     }
 
@@ -968,15 +971,27 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         action: HedgedAction,
         sink: &mut E,
     ) -> HedgedOutcome {
-        if !self.owns(s) {
+        self.step_parts(&mut s.kernel, &mut s.lane, action, sink)
+    }
+
+    /// [`HedgedKernel::step_with`] on the two lanes' states held apart, so a caller that
+    /// holds them in its own state copies neither.
+    pub(crate) fn step_parts<E: EventSink>(
+        &self,
+        k: &mut KernelState<ORD, MSG, DLV, OBS>,
+        l: &mut HedgeLane,
+        action: HedgedAction,
+        sink: &mut E,
+    ) -> HedgedOutcome {
+        if !self.owns_parts(k, l) {
             let mut em = Em::new(sink);
-            if s.kernel.status().is_running() {
-                step::halt(&mut s.kernel, HaltReason::StateMismatch, &mut em);
+            if k.status().is_running() {
+                step::halt(k, HaltReason::StateMismatch, &mut em);
             }
             return HedgedOutcome {
                 kernel: StepOutcome {
                     applied: super::ActionStatus::Rejected(super::RejectReason::Terminal),
-                    status: s.kernel.status(),
+                    status: k.status(),
                     events: em.count,
                 },
                 hedge: None,
@@ -986,9 +1001,9 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         let (action, hedge) = match action {
             HedgedAction::Kernel(action) => (action, None),
             HedgedAction::Hedge { side, lots } => {
-                let admitted = self.admit_hedge(s, side, lots);
+                let admitted = self.admit_hedge(k, l, side, lots);
                 if let Err(reason) = admitted {
-                    let slot = s.lane.counters.refused.get_mut(reason.index());
+                    let slot = l.counters.refused.get_mut(reason.index());
                     if let Some(slot) = slot {
                         *slot = slot.saturating_add(1);
                     }
@@ -996,25 +1011,19 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                 (KernelAction::Hold, Some(admitted))
             }
         };
-        let check = self.combined_check(&s.lane);
+        let check = self.combined_check(l);
         let mut rejects = 0u64;
-        let kernel = self.kernel.step_combined(
-            &mut s.kernel,
-            action,
-            check.as_ref().map(|c| (c, &mut rejects)),
-            sink,
-        );
-        s.lane.counters.combined_quote_rejects = s
-            .lane
-            .counters
-            .combined_quote_rejects
-            .saturating_add(rejects);
+        let kernel =
+            self.kernel
+                .step_combined(k, action, check.as_ref().map(|c| (c, &mut rejects)), sink);
+        l.counters.combined_quote_rejects =
+            l.counters.combined_quote_rejects.saturating_add(rejects);
         let mut em = Em::new(sink);
-        self.catch_up(s, &mut em);
+        self.catch_up(k, l, &mut em);
         HedgedOutcome {
             kernel: StepOutcome {
                 events: kernel.events.saturating_add(em.count),
-                status: s.kernel.status(),
+                status: k.status(),
                 ..kernel
             },
             hedge,
@@ -1037,14 +1046,18 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
 
     /// The last hedge row the agent sees at the decision: run before it,
     /// and observed by then.
-    fn visible_row(&self, s: &HedgedState<ORD, MSG, DLV, OBS>) -> Option<(u64, KernelTick)> {
-        let now = s.kernel.now_ns();
+    fn visible_row(
+        &self,
+        k: &KernelState<ORD, MSG, DLV, OBS>,
+        l: &HedgeLane,
+    ) -> Option<(u64, KernelTick)> {
+        let now = k.now_ns();
         let delay = self
             .lane
             .inst
             .latency
             .ns(self.lane.inst.latency.observation_q)?;
-        let mut index = s.lane.last_row?;
+        let mut index = l.last_row?;
         loop {
             let tick = *self.hedge.row(index)?;
             if tick
@@ -1065,26 +1078,35 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     /// What the agent sees of the hedge lane.
     #[must_use]
     pub fn hedge_view(&self, s: &HedgedState<ORD, MSG, DLV, OBS>) -> HedgeView {
-        let visible = if self.owns(s) {
-            self.visible_row(s)
+        self.view_parts(&s.kernel, &s.lane)
+    }
+
+    /// [`HedgedKernel::hedge_view`] on the two lanes' states held apart.
+    pub(crate) fn view_parts(
+        &self,
+        k: &KernelState<ORD, MSG, DLV, OBS>,
+        l: &HedgeLane,
+    ) -> HedgeView {
+        let visible = if self.owns_parts(k, l) {
+            self.visible_row(k, l)
         } else {
             None
         };
-        let now = s.kernel.now_ns();
+        let now = k.now_ns();
         let position = self
             .lane
             .inst
             .lot
-            .to_decimal(i128::from(s.lane.agent_lots))
+            .to_decimal(i128::from(l.agent_lots))
             .unwrap_or(Decimal::ZERO);
         HedgeView {
             row: visible.map(|(r, _)| r),
             tick: visible.map(|(_, t)| t),
             stale: visible.is_none_or(|(_, t)| self.stale(&t, now)),
-            position_lots: s.lane.agent_lots,
+            position_lots: l.agent_lots,
             position,
-            avg_entry: s.lane.agent.avg_entry,
-            in_flight: s.lane.in_flight(),
+            avg_entry: l.agent.avg_entry,
+            in_flight: l.in_flight(),
         }
     }
 
@@ -1093,7 +1115,17 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     /// limits, which bind at admission, so a size here can still be refused.
     #[must_use]
     pub fn hedge_mask(&self, s: &HedgedState<ORD, MSG, DLV, OBS>, sizes: &[u64]) -> u64 {
-        if self.precheck(s).is_err() {
+        self.mask_parts(&s.kernel, &s.lane, sizes)
+    }
+
+    /// [`HedgedKernel::hedge_mask`] on the two lanes' states held apart.
+    pub(crate) fn mask_parts(
+        &self,
+        k: &KernelState<ORD, MSG, DLV, OBS>,
+        l: &HedgeLane,
+        sizes: &[u64],
+    ) -> u64 {
+        if self.precheck(k, l).is_err() {
             return 0;
         }
         let mut mask = 0u64;
@@ -1108,18 +1140,19 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     }
 
     /// The decision's checks that do not depend on the order.
-    fn precheck(&self, s: &HedgedState<ORD, MSG, DLV, OBS>) -> Result<KernelTick, HedgeRefusal> {
-        if !self.owns(s)
-            || !s.kernel.status().is_running()
-            || s.kernel.phase() != Phase::AwaitDecision
-        {
+    fn precheck(
+        &self,
+        k: &KernelState<ORD, MSG, DLV, OBS>,
+        l: &HedgeLane,
+    ) -> Result<KernelTick, HedgeRefusal> {
+        if !self.owns_parts(k, l) || !k.status().is_running() || k.phase() != Phase::AwaitDecision {
             return Err(HedgeRefusal::Terminal);
         }
-        if s.lane.in_flight() {
+        if l.in_flight() {
             return Err(HedgeRefusal::InFlight);
         }
-        let (_, tick) = self.visible_row(s).ok_or(HedgeRefusal::NoTouch)?;
-        if self.stale(&tick, s.kernel.now_ns()) {
+        let (_, tick) = self.visible_row(k, l).ok_or(HedgeRefusal::NoTouch)?;
+        if self.stale(&tick, k.now_ns()) {
             return Err(HedgeRefusal::Stale);
         }
         Ok(tick)
@@ -1127,11 +1160,12 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
 
     fn admit_hedge(
         &self,
-        s: &mut HedgedState<ORD, MSG, DLV, OBS>,
+        k: &KernelState<ORD, MSG, DLV, OBS>,
+        l: &mut HedgeLane,
         side: QuoteSide,
         lots: u64,
     ) -> Result<(), HedgeRefusal> {
-        let tick = self.precheck(s)?;
+        let tick = self.precheck(k, l)?;
         if lots == 0 || lots > self.lane.inst.q {
             return Err(HedgeRefusal::SizeRange);
         }
@@ -1141,7 +1175,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         };
         let mut lots = lots;
         if let Some(limits) = &self.lane.inst.limits {
-            let decision = gate_check(limits, &s.lane.gate, &self.lane.inst, dir, price, lots)
+            let decision = gate_check(limits, &l.gate, &self.lane.inst, dir, price, lots)
                 .ok_or(HedgeRefusal::Limits)?;
             match decision.0 {
                 GateVerdict::Accepted | GateVerdict::Reduced => lots = decision.1,
@@ -1150,9 +1184,9 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                 }
             }
         }
-        if let Some(check) = self.combined_check(&s.lane) {
+        if let Some(check) = self.combined_check(l) {
             let admitted = check.admits(
-                &s.kernel.gate,
+                &k.gate,
                 &self.kernel.cfg.tick,
                 &self.kernel.cfg.lot,
                 true,
@@ -1164,9 +1198,9 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                 return Err(HedgeRefusal::Combined);
             }
         }
-        let now = s.kernel.now_ns();
+        let now = k.now_ns();
         let latency = self.lane.inst.latency;
-        let mut rng = s.lane.rng;
+        let mut rng = l.rng;
         let jitter = rng.draw(latency.jitter_q);
         let exec_ns = latency
             .submit_q
@@ -1174,21 +1208,20 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
             .and_then(|q| latency.ns(q))
             .and_then(|ns| now.checked_add(ns))
             .ok_or(HedgeRefusal::Terminal)?;
-        let id = s.lane.next_id;
+        let id = l.next_id;
         let next_id = id.checked_add(1).ok_or(HedgeRefusal::Terminal)?;
-        let submitted = s
-            .lane
+        let submitted = l
             .counters
             .submitted
             .checked_add(1)
             .ok_or(HedgeRefusal::Terminal)?;
-        let mut gate = s.lane.gate;
+        let mut gate = l.gate;
         gate.reserve(dir, lots).ok_or(HedgeRefusal::Terminal)?;
-        s.lane.gate = gate;
-        s.lane.rng = rng;
-        s.lane.next_id = next_id;
-        s.lane.counters.submitted = submitted;
-        s.lane.order = Some(HedgeOrder {
+        l.gate = gate;
+        l.rng = rng;
+        l.next_id = next_id;
+        l.counters.submitted = submitted;
+        l.order = Some(HedgeOrder {
             id,
             dir,
             price,
@@ -1200,28 +1233,33 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
 
     /// Runs the hedge lane to the quoted lane's time: before it while
     /// deciding, through it once the run has ended. A failure halts the run.
-    fn catch_up<E: EventSink>(&self, s: &mut HedgedState<ORD, MSG, DLV, OBS>, em: &mut Em<'_, E>) {
-        if s.lane.closed {
+    fn catch_up<E: EventSink>(
+        &self,
+        k: &mut KernelState<ORD, MSG, DLV, OBS>,
+        l: &mut HedgeLane,
+        em: &mut Em<'_, E>,
+    ) {
+        if l.closed {
             return;
         }
-        let now = s.kernel.now_ns();
-        let running = s.kernel.status().is_running();
-        if let Err(reason) = self.run_lane(&mut s.lane, now, !running) {
-            if s.kernel.status().is_running() {
-                step::halt(&mut s.kernel, reason, em);
+        let now = k.now_ns();
+        let running = k.status().is_running();
+        if let Err(reason) = self.run_lane(l, now, !running) {
+            if k.status().is_running() {
+                step::halt(k, reason, em);
             }
-            s.lane.closed = true;
+            l.closed = true;
             return;
         }
-        if !s.kernel.status().is_running() {
-            let pending = u64::from(s.lane.order.is_some())
-                .saturating_add(u64::from(s.lane.report.is_some()));
-            if let Some(order) = s.lane.order.take() {
-                let _ = s.lane.gate.release(order.dir, order.lots);
+        if !k.status().is_running() {
+            let pending =
+                u64::from(l.order.is_some()).saturating_add(u64::from(l.report.is_some()));
+            if let Some(order) = l.order.take() {
+                let _ = l.gate.release(order.dir, order.lots);
             }
-            s.lane.report = None;
-            s.lane.counters.dropped_at_end = s.lane.counters.dropped_at_end.saturating_add(pending);
-            s.lane.closed = true;
+            l.report = None;
+            l.counters.dropped_at_end = l.counters.dropped_at_end.saturating_add(pending);
+            l.closed = true;
         }
     }
 
@@ -1477,14 +1515,23 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     /// Returns [`MMError::InvalidMarketState`] for a state of another kernel,
     /// and [`MMError::NumericalError`] if a value does not convert.
     pub fn summary(&self, s: &HedgedState<ORD, MSG, DLV, OBS>) -> MMResult<HedgeSummary> {
-        if !self.owns(s) {
+        self.summary_parts(&s.kernel, &s.lane)
+    }
+
+    /// [`HedgedKernel::summary`] on the two lanes' states held apart.
+    pub(crate) fn summary_parts(
+        &self,
+        k: &KernelState<ORD, MSG, DLV, OBS>,
+        l: &HedgeLane,
+    ) -> MMResult<HedgeSummary> {
+        if !self.owns_parts(k, l) {
             return Err(MMError::InvalidMarketState(
                 "summary of a state from another kernel".to_string(),
             ));
         }
         let fail = || MMError::NumericalError("hedge summary does not convert".to_string());
         let inst = &self.lane.inst;
-        let lane = &s.lane;
+        let lane = l;
         let money = |u: i128| scaled_decimal(u, inst.s).ok_or_else(fail);
         let (cash, fees, funding) = (
             money(lane.cash_u)?,
@@ -1511,7 +1558,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
             .and_then(|v| v.checked_add(funding))
             .and_then(|v| v.checked_add(mark_value))
             .ok_or_else(fail)?;
-        let quoted = self.kernel.venue_summary(&s.kernel)?;
+        let quoted = self.kernel.venue_summary(k)?;
         Ok(HedgeSummary {
             position,
             cash,

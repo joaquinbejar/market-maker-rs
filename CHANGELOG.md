@@ -29,6 +29,20 @@ project follows [Semantic Versioning](https://semver.org/).
   hedge, binned over the sizes, a hedge outside the mask being a charged hold. A hedge replaces
   the resting orders, so the other values are then not read. A residual environment refuses the
   flag, and a checkpoint loads only into an environment with the same one.
+- Hedges in a second instrument from the RL action space (feature `rl`, #256):
+  `RlEnv::new_hedged` builds an environment over a `HedgedKernel`, with hedge sizes and
+  `HedgeScales`. `RlAction::CrossHedge` sends the lane's immediate-or-cancel order on the side
+  that reduces the net exposure of both lanes' delivered positions, never past zero, as
+  `CrossHedgeSpace` states; `RlEnv::cross_hedge_mask` and `Transition::cross_hedge_mask` give
+  the sizes allowed, and one outside them follows the declared `InvalidActionPolicy`, with
+  `rl::ERR_CROSS_HEDGE_REFUSED`. `RlEnv::observe_hedge` and `Transition::hedge_observation`
+  give the hedge features (`FeatureId::HEDGE`): the hedge spread, the basis to the quoted mid,
+  the hedge row's age, the hedge position and whether a hedge is in flight. The reward adds the
+  hedge lane's cash, fees, funding and position at its last mid, and a close at the touch closes
+  both lanes. Such an environment's specification is of observation version 2, action version 3
+  and reward version 2; one without a lane keeps versions 1, 2 and 1 and its identity, so its
+  checkpoints and the Python bridge are unchanged. `RlEnv::reconcile` checks the quoted lane
+  against the attribution, the hedge lane's net being its own ledger's. Synthetic data only.
 - A hedge lane in a second instrument for the kernel (feature `kernel`, #256): `HedgedKernel`
   runs a `FinancialKernel` on the quoted instrument with a hedge lane on a spot or linear
   perpetual on the same underlying, with its own grid, fees, limits and data

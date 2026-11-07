@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use market_maker_rs::backtest::kernel::{KernelFillModel, quote_error_code};
 use market_maker_rs::rl::{
-    ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, OBSERVATION_SPACE_VERSION,
-    REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv,
+    ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, HEDGED_ACTION_SPACE_VERSION,
+    HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION, OBSERVATION_SPACE_VERSION,
+    REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv, SpecId,
 };
 use market_maker_rs::types::error::MMError;
 
@@ -390,6 +391,14 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
         }
         assert!(!known_versions(&later));
     }
+    // An environment with a hedge lane in a second instrument is not one this bridge drives.
+    let hedged = SpecId {
+        observation: HEDGED_OBSERVATION_SPACE_VERSION,
+        action: HEDGED_ACTION_SPACE_VERSION,
+        reward: HEDGED_REWARD_VERSION,
+        ..id
+    };
+    assert!(!known_versions(&hedged));
 }
 
 #[test]
