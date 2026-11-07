@@ -151,3 +151,48 @@ def test_an_interval_holds_a_residual_policys_orders_between_its_decisions():
             break
     assert placed > 0
     env.close()
+
+
+def test_a_chosen_duration_bins_the_last_value_and_holds_that_many_rows():
+    from mm_rl_bridge import BoxMarketMakingEnv
+    from mm_rl_bridge.wrappers import ChosenDuration
+
+    env = ChosenDuration(BoxMarketMakingEnv(config(policy="reject", max_steps=1000), walk()))
+    assert env.action_space.shape == (6,)
+    assert [env.duration_of(v) for v in (-1.0, -0.6, -0.4, 0.0, 0.4, 0.6, 1.0)] == [
+        1, 1, 5, 10, 10, 30, 30]
+    env.reset(seed=1)
+    quote = [1.0, 0.0, 0.5, 0.5, -1.0]
+    for value, rows in ((-1.0, 1), (-0.4, 5), (0.0, 10), (1.0, 30)):
+        _, _, terminated, truncated, info = env.step(quote + [value])
+        assert (info["duration"], info["rows"]) == (rows, rows)
+        assert not (terminated or truncated)
+    with pytest.raises(ValueError):
+        env.step(quote)
+    env.close()
+
+
+def test_a_chosen_duration_is_the_decision_then_direct_holds():
+    from mm_rl_bridge import BoxMarketMakingEnv
+    from mm_rl_bridge.wrappers import ChosenDuration
+
+    settings = config(policy="reject", max_steps=1000)
+    direct = BoxMarketMakingEnv(settings, walk())
+    wrapped = ChosenDuration(BoxMarketMakingEnv(settings, walk()))
+    direct.reset(seed=3)
+    wrapped.reset(seed=3)
+    quote = [1.0, 0.0, 0.0, 0.5, 0.5]
+    for step in range(20):
+        value = (-1.0, -0.4, 0.0)[step % 3]
+        observation, reward, terminated, truncated, info = wrapped.step(quote + [value])
+        rows = [direct.step(quote)]
+        while len(rows) < wrapped.duration_of(value) and not (rows[-1][2] or rows[-1][3]):
+            rows.append(direct.step_hold())
+        assert np.array_equal(observation, rows[-1][0]) and info["rows"] == len(rows)
+        assert Decimal(info["reward_exact"]) == sum(Decimal(r[4]["reward_exact"]) for r in rows)
+        for kind in info["orders"]:
+            assert info["orders"][kind] == sum(r[4]["orders"][kind] for r in rows)
+        if terminated or truncated:
+            break
+    direct.close()
+    wrapped.close()
