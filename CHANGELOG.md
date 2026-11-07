@@ -19,6 +19,17 @@ project follows [Semantic Versioning](https://semver.org/).
   without zero waits, block lengths, how touch-queue lives end, and the drift of each estimator's
   fit) and phase 3 (each estimator and its constant baseline on #286's windows and the training
   part's first hours, the choice and stop rule fixed before any run, and the holdout's verdict).
+- The robustness study of #108 in `bridges/python/experiments/m5_03`: #102's classical arms and
+  frozen learned policies under bounded perturbations of the queue-reactive flow (market, cancel
+  and limit rates and the reference's move probability), with an adversary that picks the worst
+  point per policy on selection days by the 5 % CVaR of daily loss. They are evaluated on unseen
+  holdout days unperturbed, at the adversary's point, at a fixed stress and under a binding queue,
+  with paired block bootstrap intervals, drawdowns, positions, breaches and the margin
+  requirement. The design and the day digests were committed before any policy ran. Example
+  `qr_days` takes an optional seed offset. Synthetic data only; the results are on the issue.
+- A `scheduled` baseline in the Python bridge's residual configuration: classical points in turn,
+  each change applying from the first decision that has observed its row, for #112's adaptive
+  and labelled arms. Existing baselines are unchanged.
 - Example `time_travel_queues` (#109), behind `serde`: chronological replay against consistent
   time travel for a market maker at the touch, on queues. On #102's queue-reactive regimes the
   simulator continues from a state that holds the agent's order, so each mode is measured against

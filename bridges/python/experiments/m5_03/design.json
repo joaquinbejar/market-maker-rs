@@ -1,0 +1,129 @@
+{
+  "issue": 108,
+  "design_version": 3,
+  "data": "synthetic: perturbed copies of #102's queue-reactive regimes (a simulator with made-up parameters), no market data",
+  "bounds": "One synthetic simulator, made-up parameters and its rows, which do not react to orders, bound what this study can show. It says how these policies behave under these bounded perturbations of this simulator, and nothing about a market. Impact is out of reach here: the kernel replays rows that do not react to orders, so an impact adversary would have to change the matching rules (#282). #102's main execution is in effect an immediate fill on 10 s rows (#267), and the conclusions carry that bound.",
+  "reuses": {
+    "design": "experiments/m4_05/design.json",
+    "design_sha256": "4f4950626599941906019ff6a4a3e4e95b85f364d4d1d0ea066d301b7a25f221",
+    "frozen_manifest_sha256": "9de757b5bf76274882306c9a9c3d9257389deca64d24074948d1a95646c19458",
+    "what": "the regimes' parameters before perturbation, the kernel, the main execution (fees, limits, queue model, latency), the grid, the selected classical points and the frozen PPO and residual SAC runs of #102, loaded across the action space version 1 to 2 change with hedges off, as #104 checked"
+  },
+  "perturbations": {
+    "market_rate_multiplier": [
+      1.0,
+      1.5,
+      2.0
+    ],
+    "cancel_rate_multiplier": [
+      1.0,
+      1.5
+    ],
+    "theta_multiplier": [
+      1.0,
+      1.2
+    ],
+    "limit_rate_multiplier": [
+      1.0,
+      0.7
+    ],
+    "applied_to": "every regime's rate tables (columns limit, cancel, market, at every depth and queue size) and theta, before a day is simulated",
+    "plausibility": "every multiplier within a factor of 2 of #102's regimes, and theta stays under 1 (thin's 0.8 becomes 0.96 at the largest); 24 points, the unperturbed one included",
+    "identifiable": "each multiplier moves one documented column of the model's rate tables or theta"
+  },
+  "fixed_stress": {
+    "market_rate_multiplier": 2.0,
+    "cancel_rate_multiplier": 1.5,
+    "theta_multiplier": 1.2,
+    "limit_rate_multiplier": 0.7
+  },
+  "execution_stress": {
+    "fill_model": {
+      "kind": "queue_position_rational",
+      "lots": 1,
+      "per_ms": 5000,
+      "min_queue_ms": 0
+    },
+    "note": "an extra holdout condition: the queue binds at one lot per 5 s with no minimum time in queue, a rate that binds on #102's 10 s rows (the team's standard for that row size), under unperturbed rows. The learned policies were trained under #102's main execution, so this is a stress for them too",
+    "check": "before the holdout, on calm selection day 1 unperturbed: fixed spread, Avellaneda-Stoikov and GLFT fill (peak positions -20, 3, -5) and their daily nets differ from the main execution's (-61.18 against -64.73, -27.08 against -35.95, -4.78 against -5.30); at one lot per 1 s they were equal, as that rate clears more than any touch per row"
+  },
+  "days": {
+    "selection": {
+      "per_regime": 10,
+      "seed_offset": 100000,
+      "note": "fresh days: the seed of day d of regime r is 1000003 r + d + the offset, never one of #102's"
+    },
+    "holdout": {
+      "per_regime": 10,
+      "seed_offset": 200000,
+      "note": "never seen by the adversary, by the selection or by #102"
+    },
+    "digests": "written by qr_days for every point and day before any policy runs, and committed"
+  },
+  "adversary": {
+    "picks": "for each policy separately, the grid point with the largest 5 % CVaR of the daily net loss over its selection days",
+    "cvar": "the mean loss of the worst ceil(5 % of the days) days, so of the worst 2 of 30",
+    "information": "it sets the parameters before a day and sees nothing of its path; it changes neither matching, accounting nor the limits",
+    "learned_arms": "the five seeds of a learned arm are one policy: its daily net is the mean over its seeds, as in #102"
+  },
+  "arms": {
+    "no_trade": "hold at every decision",
+    "fixed_spread": "#102's selected point per regime (4 ticks, 1 lot)",
+    "avellaneda_stoikov": "#102's selected point per regime, through the residual environment with a zero correction, as #102",
+    "glft": "#102's selected point per regime, in the exact form as #102 evaluated it; its refusals are counted, as #264 states",
+    "maskable_ppo": "#102's frozen set 0, seeds 1 to 5, deterministic",
+    "residual_sac": "#102's frozen set 2, seeds 1 to 5, deterministic"
+  },
+  "conditions": {
+    "unperturbed": "the holdout days at multipliers 1",
+    "adversary": "the holdout days at the arm's own selected point",
+    "fixed_stress": "the holdout days at the fixed stress",
+    "execution_stress": "the unperturbed holdout days under execution_stress"
+  },
+  "evaluation_seed": 101,
+  "metrics": [
+    "daily net and its attribution",
+    "largest and mean absolute position",
+    "max drawdown",
+    "5 % CVaR of the daily net",
+    "limit breaches, gate refusals, residual fallbacks and clips, GLFT refusals",
+    "margin shortfall: margin-rs linear-im/1 maintenance requirement of the day's largest absolute position at the price it was reached, less a declared capital of 250 (10 % of #102's notional limit, made up), floored at 0; measured, not enforced, and the day's equity is not credited"
+  ],
+  "intervals": {
+    "kind": "paired 90 % moving block bootstrap over holdout days of the daily difference, as #102",
+    "replicates": 2000,
+    "mean_block_days": 2,
+    "seed": 108,
+    "pairs": "each arm under each stressed condition against itself unperturbed, and against no-trade under the same condition"
+  },
+  "reading": "an interval that holds 0 is reported as such; it is never read as equivalence or as an absence of risk. Losses and breaches stay visible in every table",
+  "stop_rules": [
+    "If no condition changes any arm's holdout daily net by more than its interval, the study reports that with the intervals and stops there.",
+    "A step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds."
+  ],
+  "compute": {
+    "estimate": "selection: 24 points x 30 days x 14 policy runs x 8640 decisions; holdout: 4 conditions x 30 days x 14; to be measured on one day first",
+    "max_parallel_runs": 4,
+    "threads_per_run": 1
+  },
+  "follow_up": {
+    "adversarial_training": "#281",
+    "impact_in_a_reacting_environment": "#282"
+  },
+  "changes": [
+    {
+      "version": 2,
+      "seen": "selection runs under the unperturbed and perturbed rows with #102's main execution were partly done; nothing had run under the execution stress, and the holdout had not been read",
+      "what": [
+        "the execution stress's minimum time in queue is 0 instead of 5000 ms: an arm that requotes every 1 to 5 s never reaches 5 s in queue, so it would never fill (the team's standard since #103 found it)"
+      ]
+    },
+    {
+      "version": 3,
+      "seen": "as for version 2, plus a check of the stress on calm selection day 1 for the three classical arms",
+      "what": [
+        "the execution stress's rate is one lot per 5000 ms instead of per 1000 ms: on 10 s rows one lot per second clears 10 lots per row, more than any touch holds, so it equalled the main execution; one lot per 5 s binds and still fills"
+      ]
+    }
+  ]
+}

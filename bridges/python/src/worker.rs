@@ -11,7 +11,8 @@ use market_maker_rs::backtest::evaluation::{
 use market_maker_rs::backtest::kernel::{
     ActionGrid, ActionMask, ActionStatus, AvellanedaQuoter, ERR_KERNEL_MISMATCH,
     ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, GlftCounts, GlftForm, GlftQuoter, KernelConfig,
-    KernelDataset, KernelFillModel, KernelLatency, KernelTick, QuoteSource, quote_error_name,
+    KernelDataset, KernelFillModel, KernelLatency, KernelTick, Observation, QuoteSource,
+    SourceQuote, quote_error_name,
 };
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
@@ -232,6 +233,16 @@ pub enum BaselineConfig {
         /// which takes the closed form only where the exact quote is over its step cap.
         #[serde(default)]
         form: GlftFormConfig,
+    },
+    /// Classical strategies in turn: `points[0]` from the start, and from each change on the
+    /// point it names. A change at row `r` applies from the first decision whose observation
+    /// has row `r` or later, which latency may delay, so it never reads a row early.
+    Scheduled {
+        /// The strategies, none of them scheduled.
+        points: Vec<BaselineConfig>,
+        /// `[row, index]` pairs: rows strictly increasing, each index a point other than the
+        /// one in force.
+        changes: Vec<(u64, usize)>,
     },
 }
 
@@ -806,6 +817,7 @@ fn start_residual(job: Job<'_>, residual: &ResidualConfig) {
     match parsed {
         Ok((size, Baseline::Avellaneda(source))) => serve_residual(job, source, size, bounds),
         Ok((size, Baseline::Glft(source))) => serve_residual(job, source, size, bounds),
+        Ok((size, Baseline::Scheduled(source))) => serve_residual(job, source, size, bounds),
         Err(error) => {
             let _ = job.ready.send(Err(error));
         }
@@ -860,13 +872,130 @@ fn parse_baseline(baseline: &BaselineConfig, lot_size: &str) -> Result<Baseline,
                 counts: GlftCounts::default(),
             }))
         }
+        BaselineConfig::Scheduled { points, changes } => Ok(Baseline::Scheduled(parse_schedule(
+            points, changes, lot_size,
+        )?)),
     }
+}
+
+/// Parses a schedule, refusing one that is empty, nested, or whose changes are out of order,
+/// name no point, or name the point already in force.
+fn parse_schedule(
+    points: &[BaselineConfig],
+    changes: &[(u64, usize)],
+    lot_size: &str,
+) -> Result<ScheduledQuoter, BridgeError> {
+    let refuse = |why: String| Err(BridgeError::Refused(format!("scheduled baseline: {why}")));
+    if points.is_empty() {
+        return refuse("no points".to_string());
+    }
+    let mut parsed = Vec::with_capacity(points.len());
+    for point in points {
+        match parse_baseline(point, lot_size)? {
+            Baseline::Scheduled(_) => return refuse("a point is itself scheduled".to_string()),
+            plain => parsed.push(plain),
+        }
+    }
+    let mut in_force = 0;
+    let mut last_row = None;
+    for &(row, index) in changes {
+        if last_row.is_some_and(|last| row <= last) {
+            return refuse(format!("change rows are not increasing at row {row}"));
+        }
+        if index >= parsed.len() {
+            return refuse(format!("row {row} names point {index} of {}", parsed.len()));
+        }
+        if index == in_force {
+            return refuse(format!("row {row} names point {index}, already in force"));
+        }
+        last_row = Some(row);
+        in_force = index;
+    }
+    Ok(ScheduledQuoter {
+        points: parsed,
+        changes: changes.to_vec(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum Baseline {
     Avellaneda(AvellanedaQuoter),
     Glft(GlftQuoter),
+    Scheduled(ScheduledQuoter),
+}
+
+impl QuoteSource for Baseline {
+    fn quote(
+        &mut self,
+        obs: &Observation,
+        mid: Decimal,
+        inventory: Decimal,
+    ) -> market_maker_rs::types::error::MMResult<SourceQuote> {
+        match self {
+            Self::Avellaneda(source) => source.quote(obs, mid, inventory),
+            Self::Glft(source) => source.quote(obs, mid, inventory),
+            Self::Scheduled(source) => source.quote(obs, mid, inventory),
+        }
+    }
+
+    fn validate(&self, tick: Decimal, lot: Decimal) -> market_maker_rs::types::error::MMResult<()> {
+        match self {
+            Self::Avellaneda(source) => source.validate(tick, lot),
+            Self::Glft(source) => source.validate(tick, lot),
+            Self::Scheduled(source) => source.validate(tick, lot),
+        }
+    }
+}
+
+/// Classical strategies in turn, by the row the agent last observed. See
+/// [`BaselineConfig::Scheduled`].
+#[derive(Debug, Clone, PartialEq)]
+struct ScheduledQuoter {
+    /// The strategies, none of them scheduled.
+    points: Vec<Baseline>,
+    /// `(row, index)`, rows strictly increasing.
+    changes: Vec<(u64, usize)>,
+}
+
+impl ScheduledQuoter {
+    /// The point in force at an observation: that of the last change at or before its row,
+    /// or the first point before any row or change.
+    fn in_force(&self, obs: &Observation) -> usize {
+        let Some(row) = obs.row else {
+            return 0;
+        };
+        let passed = self.changes.partition_point(|(at, _)| *at <= row);
+        passed
+            .checked_sub(1)
+            .and_then(|last| self.changes.get(last))
+            .map_or(0, |(_, index)| *index)
+    }
+}
+
+impl QuoteSource for ScheduledQuoter {
+    fn quote(
+        &mut self,
+        obs: &Observation,
+        mid: Decimal,
+        inventory: Decimal,
+    ) -> market_maker_rs::types::error::MMResult<SourceQuote> {
+        let index = self.in_force(obs);
+        // Parsing checked every index against the points.
+        self.points
+            .get_mut(index)
+            .ok_or_else(|| {
+                market_maker_rs::types::error::MMError::InvalidConfiguration(format!(
+                    "no point {index}"
+                ))
+            })?
+            .quote(obs, mid, inventory)
+    }
+
+    fn validate(&self, tick: Decimal, lot: Decimal) -> market_maker_rs::types::error::MMResult<()> {
+        self.points
+            .iter()
+            .try_for_each(|point| point.validate(tick, lot))
+    }
 }
 
 /// What a worker thread serves.
