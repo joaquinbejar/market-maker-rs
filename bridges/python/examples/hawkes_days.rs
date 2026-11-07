@@ -15,7 +15,7 @@
 //!   order of the buy side lifts the ask and moves the mid up. Their queues are the touch
 //!   sizes (at least 1 lot) and are not tied to price levels, unlike the paper's QRH-I, which
 //!   restarts memory at each price change: here memory runs across the day.
-//! - The touch is `round(mid) -/+ half_spread_ticks`.
+//! - The touch is `floor(mid)` for the bid and `spread_ticks` above it for the ask.
 //! - A row shows what happened before its time: the events of simulated second `r` act after
 //!   row `r` is written.
 //! - The diffusion draws from its own generator, seeded apart from the flow's, so the flow of
@@ -214,7 +214,10 @@ fn main() -> Result<(), Failure> {
     let sample_ms = number(flow, "sample_ms")?;
     let initial = u32::try_from(number(flow, "initial_queue")?)?;
     let reference = i64::try_from(number(flow, "reference_ticks")?)?;
-    let half = i64::try_from(number(flow, "half_spread_ticks")?)?;
+    let spread = i64::try_from(number(flow, "spread_ticks")?)?;
+    if spread < 1 {
+        return Err("spread_ticks is at least 1".into());
+    }
     let diffusion = float(flow, "diffusion_ticks")?;
     let splits = get(causal, "splits")?;
     let days = number(causal, "days")?;
@@ -237,8 +240,8 @@ fn main() -> Result<(), Failure> {
                     let net = f64::from(buys[row - 1]) - f64::from(sells[row - 1]);
                     mid += impact * net + diffusion * noise.normal();
                 }
-                let center = mid.round() as i64;
-                let (bid, ask) = (center - half, center + half);
+                let bid = mid.floor() as i64;
+                let ask = bid + spread;
                 if bid < 1 {
                     return Err(format!("{name} day {day}: the bid left the grid").into());
                 }

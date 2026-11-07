@@ -3,6 +3,7 @@
 From `bridges/python`, with `<part>` either `market` (B, the 1 s queue-reactive days of
 #103) or `causal` (C, the Hawkes days of `examples/hawkes_days.rs`):
 
+    python experiments/m5_02/run_market.py classical causal <data dir> <out dir> <commit> <parallel>
     python experiments/m5_02/run_market.py train <part> <data dir> <out dir> <commit> <parallel>
     python experiments/m5_02/run_market.py select <part> <data dir> <out dir> <commit> <parallel>
     python experiments/m5_02/run_market.py freeze <part> <out dir>
@@ -102,12 +103,28 @@ def read_rows(part, data_dir, digests, group, day, split, holdout_allowed=False)
     return [tuple(row) for row in json.loads(path.read_text())], record
 
 
+def volatility(part, data_dir, design, base, digests, group):
+    """#103's volatility rule over the part's training days."""
+    tick = Decimal(base["kernel"]["tick_size"])
+    changes = []
+    for day in days_of(design, base, part, "train"):
+        rows, _ = read_rows(part, data_dir, digests, group, day, "train")
+        mids = [Decimal(r[1] + r[3]) / 2 * tick for r in rows]
+        changes.extend(float(b - a) for a, b in zip(mids, mids[1:]))
+    mean = sum(changes) / len(changes)
+    variance = sum((c - mean) ** 2 for c in changes) / len(changes)
+    seconds = base["simulator"]["sample_ms"] / 1000
+    return f"{(variance * m6.SECONDS_PER_YEAR / seconds) ** 0.5:.4f}"
+
+
 def build_env(job, digests, group, day, split, holdout_allowed=False):
     """One day for one arm: #103's configuration and wrappers, then the window if windowed."""
     design, base = load()
     rows, record = read_rows(job["part"], job["data_dir"], digests, group, day, split,
                              holdout_allowed)
     config = m6.base_config(base, job["fee"])
+    # The queue standard for 1 s rows, over #103's minimum time in queue (see the design).
+    config["fill_model"] = dict(job.get("fill_model") or design["execution"]["fill_model"])
     arm = job["arm"]
     if arm in m6.CLASSICAL:
         config["residual"] = {"baseline": m6.baseline_config(arm, job["point"], day),
@@ -271,8 +288,15 @@ class Context:
                 "split": split, "candidate": candidate, "policy": policy, "point": point,
                 "data_dir": self.data_dir}
 
+    def reference_points(self):
+        """B: the points #103 selected at one row, pinned in the design. C: this part's own
+        selection on its validation days, by #103's rule."""
+        if self.part == "market":
+            return self.design["references"]["points"]
+        return json.loads((self.out / "classical.json").read_text())["selected"]
+
     def reference_jobs(self, fee, split, days):
-        refs = self.design["references"]["points"]
+        refs = self.reference_points()
         jobs = []
         for group in self.groups:
             for day in days:
@@ -328,6 +352,34 @@ def check_widths(design, base):
     return found
 
 
+def classical(ctx, parallel):
+    """C only: #103's classical grids on C's validation days at the fee, and its rule."""
+    if ctx.part != "causal":
+        raise SystemExit("B takes #103's classical selection")
+    days = days_of(ctx.design, ctx.base, ctx.part, "validation")
+    jobs = []
+    sigmas = {}
+    for group in ctx.groups:
+        sigmas[group] = volatility(ctx.part, ctx.data_dir, ctx.design, ctx.base, ctx.digests, group)
+        for arm in m6.CLASSICAL:
+            for point in m6.grid_points(ctx.base["arms"][arm]["grid"], sigmas[group]):
+                for day in days:
+                    jobs.append(ctx.job(arm, ctx.fee, group, day, "validation",
+                                        json.dumps(point, sort_keys=True),
+                                        {"kind": "zero_residual"}, point))
+    rows = m6.pool(jobs, evaluate_job, parallel, "classical causal")
+    selected = {}
+    for group in ctx.groups:
+        selected[group] = {}
+        for arm in m6.CLASSICAL:
+            mine = [r for r in rows if r["group"] == group and r["arm"] == arm]
+            candidates = sorted({r["candidate"] for r in mine})
+            top = max(candidates, key=lambda c: (mean_daily([r for r in mine if r["candidate"] == c]), c))
+            selected[group][arm] = json.loads(top)
+    print(json.dumps(selected), ctx.write("classical", {**ctx.header("classical"), "rows": rows,
+                                                        "volatility": sigmas, "selected": selected}))
+
+
 def train(ctx, parallel):
     check_widths(ctx.design, ctx.base)
     if (ctx.out / "frozen.json").exists():
@@ -369,9 +421,11 @@ def freeze(ctx):
             raise SystemExit(f"{zip_path} was trained under another design")
         entries[zip_path.stem] = {"checkpoint": meta["checkpoint_sha256"],
                                   "metadata": sha256(zip_path.with_suffix(".json"))}
-    print(ctx.write("frozen", {"design_sha256": sha256(HERE / "design.json"),
-                               "validation_sha256": sha256(ctx.out / "validation.json"),
-                               "runs": entries}))
+    frozen = {"design_sha256": sha256(HERE / "design.json"),
+              "validation_sha256": sha256(ctx.out / "validation.json"), "runs": entries}
+    if ctx.part == "causal":
+        frozen["classical_sha256"] = sha256(ctx.out / "classical.json")
+    print(ctx.write("frozen", frozen))
 
 
 def holdout(ctx, frozen_sha, parallel):
@@ -382,6 +436,8 @@ def holdout(ctx, frozen_sha, parallel):
         raise SystemExit("the design differs from the frozen one")
     if frozen["validation_sha256"] != sha256(ctx.out / "validation.json"):
         raise SystemExit("the selection differs from the frozen one")
+    if ctx.part == "causal" and frozen["classical_sha256"] != sha256(ctx.out / "classical.json"):
+        raise SystemExit("the classical selection differs from the frozen one")
     runs = ctx.runs()
     for meta in runs:
         zip_path = pathlib.Path(meta["path"]).with_suffix(".zip")
@@ -537,6 +593,8 @@ def main():
         raise SystemExit("part is market or causal")
     if step == "train":
         train(Context(part, sys.argv[3], sys.argv[4], sys.argv[5]), int(sys.argv[6]))
+    elif step == "classical":
+        classical(Context(part, sys.argv[3], sys.argv[4], sys.argv[5]), int(sys.argv[6]))
     elif step == "select":
         select(Context(part, sys.argv[3], sys.argv[4], sys.argv[5]), int(sys.argv[6]))
     elif step == "freeze":

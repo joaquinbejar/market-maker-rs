@@ -19,7 +19,7 @@
   "data": "synthetic: #103's 1 s queue-reactive days (3 regimes x 24), whose holdout #103 reads before this part's freeze; one policy per arm on the pooled training days, as #103"
  },
  "causal": {
-  "data": "synthetic: Hawkes market orders from examples/hawkes_days.rs moving the mid by a linear impact plus a diffusion of 0.5 tick per row; made-up parameters; 1 s rows as #103",
+  "data": "synthetic: Hawkes market orders from examples/hawkes_days.rs moving the mid by a linear impact plus a diffusion of 1 tick per row, a one-tick spread; made-up parameters; 1 s rows as #103",
   "kernel": {
    "tick_size": "0.005",
    "lot_size": "1",
@@ -77,9 +77,9 @@
      ]
     ]
    ],
-   "diffusion_ticks": 0.5,
-   "half_spread_ticks": 1,
-   "reference_ticks": 10000
+   "diffusion_ticks": 1.0,
+   "reference_ticks": 10000,
+   "spread_ticks": 1
   },
   "settings": [
    {
@@ -111,7 +111,10 @@
    ]
   },
   "seed": "1000003 + day for the day's flow (buy side 2 x seed, sell side 2 x seed + 1) and diffusion, the same in every setting",
-  "note": "one policy per arm and impact setting, on that setting's training days"
+  "note": "one policy per arm and impact setting, on that setting's training days",
+  "changes": [
+   "before any training, after the queue check of training day 1: with a two-tick spread and a diffusion of 0.5 tick per row, the touch almost never crossed a quote, and Avellaneda-Stoikov filled 0 times at impact 0 and 0.25 even under immediate fill. The touch is now floor(mid) and one tick above it, and the diffusion 1 tick per row; the digests are regenerated."
+  ]
  },
  "window": {
   "buffer": 32,
@@ -180,7 +183,7 @@
  },
  "references": {
   "points": null,
-  "rule": "no-trade, and Avellaneda-Stoikov and GLFT as zero residuals at the points #103's classical selection chose at one decision per row (B, per regime); in C, the calm regime's points with the volatility from C's training days by #103's rule"
+  "rule": "no-trade, and Avellaneda-Stoikov and GLFT as zero residuals. B: the points #103's classical selection chose at one decision per row, per regime, pinned here. C: the step classical selects per impact setting on C's validation days, at the fee, by #103's rule over #103's grids, with the volatility from C's training days; its file is hashed into the freeze"
  },
  "decision_rule": {
   "against": "the best non-HSN learned arm by mean daily net on validation, chosen before the holdout",
@@ -221,5 +224,15 @@
   "With an earlier draft at 10 s rows: one generation of the Hawkes days, and the mid range, the change of the mid per row and the touch sizes of training day 1 of each impact setting. No holdout or validation row was read.",
   "Timing probes on 5000 synthetic rows (a random walk of the touch, not the design's data): 8192 PPO decisions of mlp, gru_window and hsn, timed and not evaluated (198, 534 and 246 microseconds a decision).",
   "Smoke tests of every arm on 300 synthetic rows."
- ]
+ ],
+ "execution": {
+  "fill_model": {
+   "kind": "queue_position_rational",
+   "lots": 1,
+   "per_ms": 500,
+   "min_queue_ms": 0
+  },
+  "rule": "the standard set for every study on 1 s rows on 2026-11-07: one lot per 500 ms and no minimum time in queue. At one lot per 1000 ms an order requoted every 1 s row is 975 ms in queue at the next row and clears nothing; at 500 ms it clears one lot, and the touch ahead still binds. #103 adopts the same in its design version 2, and this part keeps whatever #103's base_config gives only if it equals this",
+  "check": "before any training, check_queue.py shows that Avellaneda-Stoikov fills on training days of every group and that its net differs from immediate fill"
+ }
 }
