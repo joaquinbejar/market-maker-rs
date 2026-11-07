@@ -1,0 +1,199 @@
+{
+ "issue": 112,
+ "design_version": 1,
+ "status": "fixed before any run: change times, detector thresholds and decision rule",
+ "data": "synthetic simulators S1 and S2; the real Hyperliquid capture H for a descriptive check only",
+ "protocol": "#103's (experiments/m4_06/design.json, pinned): 1 s rows, its kernel, execution, fee rule result and secondary fee, Box encoding with the reject policy, hyperparameter set, budget, training seeds, evaluation seed and bootstrap; the queue standard for 1 s rows",
+ "pins": {
+  "m4_06_design": "9a1d1423d1f0e70eca9dd169d03cf85dca1b81ae7bd81516098cd1654165af2a",
+  "m4_06_commit": "283d4d47d3f60859b4519a1f5f0571833a4289b1",
+  "m5_02_design": "adeadf71b46d994d3b6732fb5d34cdc4d43161f3e3dd3bda0a51f19a24df6f59"
+ },
+ "fee": {
+  "value": "-0.0001",
+  "fee_rule_sha256": "cf3e2a3ab445cead9a7674dc4b39384233353f0851f6e6fbef60fc8ba3f5b26a",
+  "secondary": "0.0002"
+ },
+ "execution": {
+  "fill_model": {
+   "kind": "queue_position_rational",
+   "lots": 1,
+   "per_ms": 500,
+   "min_queue_ms": 0
+  },
+  "execution_change": {
+   "fill_model": {
+    "kind": "immediate"
+   },
+   "rule": "every frozen arm is also evaluated on the holdout under immediate fill, the execution-change comparison; nothing is trained or selected under it"
+  }
+ },
+ "days": 24,
+ "splits": {
+  "train": [
+   1,
+   14
+  ],
+  "validation": [
+   15,
+   19
+  ],
+  "holdout": [
+   20,
+   24
+  ]
+ },
+ "rows_per_day": 86400,
+ "sample_ms": 1000,
+ "regimes": {
+  "calm": "#103's calm rates (S1); S2: #107 C's flow at impact 1.0",
+  "stressed": "#103's stressed rates (S1); S2: Hawkes baselines x 2, buy side x 1.5 (tilt), diffusion x 3, as #237",
+  "thin": "#103's thin rates (S1); S2: limit order rate x 0.5"
+ },
+ "schedule": {
+  "rule": "a day is calm except for the segments below, in seconds of the UTC day, start inclusive and end exclusive; training holds thin but no stress, so stress is unseen when it comes and thin is seen",
+  "segments": {
+   "3": [
+    [
+     "thin",
+     28800,
+     43200
+    ]
+   ],
+   "7": [
+    [
+     "thin",
+     50400,
+     64800
+    ]
+   ],
+   "11": [
+    [
+     "thin",
+     7200,
+     21600
+    ]
+   ],
+   "17": [
+    [
+     "stressed",
+     36000,
+     50400
+    ]
+   ],
+   "18": [
+    [
+     "thin",
+     50400,
+     64800
+    ]
+   ],
+   "22": [
+    [
+     "stressed",
+     54000,
+     68400
+    ]
+   ],
+   "23": [
+    [
+     "thin",
+     21600,
+     36000
+    ]
+   ]
+  },
+  "splice": "S1 keeps its book across a change, its queues clipped to the new regime's cap and limits; S2 changes its rates and diffusion at the change; both disclosed in the report"
+ },
+ "detector": {
+  "inputs": "observed rows and the market orders known at the row (a sidecar of the generators; the capture's trades for H); never the latent regime",
+  "volatility": {
+   "estimator": "VolatilityEstimator EWMA, lambda 0.9, annualization 1",
+   "lookback_rows": 300,
+   "baseline": "the simple volatility of the mid over the arm's training days, per simulator"
+  },
+  "vpin": {
+   "bucket_volume": "50",
+   "buckets": 20,
+   "toxicity_threshold": "0.7"
+  },
+  "flow_window_s": 600,
+  "alarm_on_ratio": "1.8",
+  "alarm_off_ratio": "1.3",
+  "rule": "the alarm goes on when the volatility ratio reaches alarm_on or VPIN is toxic, and off when the ratio is below alarm_off and VPIN is not toxic; a ratio that fails to compute keeps the last one (#237)"
+ },
+ "arms": {
+  "no_trade": {
+   "kind": "baseline"
+  },
+  "fixed": {
+   "kind": "classical",
+   "rule": "Avellaneda-Stoikov at #103's point selected for calm, volatility from the arm's training days"
+  },
+  "adaptive": {
+   "kind": "classical",
+   "rule": "Avellaneda-Stoikov at the fixed point while the alarm is off, and at a stressed point while it is on; the stressed point is chosen on validation days from #103's 9-point grid by #103's rule, the calm point held"
+  },
+  "learned": {
+   "kind": "learned",
+   "rule": "the learned arm #103's validation selects as best at one row (mlp, ema, history or lstm), with #103's configuration, retrained here on this simulator's training days, budget and seeds; no regime input"
+  },
+  "learned_detector": {
+   "kind": "learned",
+   "rule": "the same arm, its observation extended by the detector's alarm and volatility ratio at the row (causal), trained the same way"
+  },
+  "oracle": {
+   "kind": "oracle-labelled",
+   "rule": "Avellaneda-Stoikov at a point per latent regime, each chosen on validation from #103's grid with the latent label: a privileged reference, never a realizable policy"
+  }
+ },
+ "comparisons": {
+  "data_shift": "each simulator's own holdout: fixed against adaptive, learned against learned_detector, every arm against no_trade",
+  "execution_change": "the same frozen arms on the same holdout under immediate fill",
+  "simulator_error": "arms calibrated, selected or trained on S1 evaluated on S2's holdout, and the reverse; S3 (#106's neural simulator) only if #106 has adopted it by this design's freeze of runs, else not run with the reason",
+  "real": "arms calibrated or trained on S1 evaluated on H's holdout part, descriptive, outside the go rule"
+ },
+ "metrics": [
+  "net and attribution",
+  "detection delay to each change, missed changes",
+  "false alarms per calm day",
+  "adverse selection: signed markout at 1 s and 10 s",
+  "fees",
+  "max drawdown",
+  "CVaR 5 % of daily net",
+  "peak notional",
+  "limit breaches",
+  "time in each alarm state against the latent regime"
+ ],
+ "decision_rule": {
+  "adaptation": "adaptive, and learned_detector against learned, go only if on every simulator and execution group: the paired 90 % block bootstrap interval of daily net against the non-adaptive arm has its lower bound above 0, the mean max drawdown is at most 1.2 times the other's, there is no breach, the mean delay to the holdout's stress is at most 300 s with no change missed, and the false alarms are at most 2 per calm day",
+  "favourable": "a favourable simulator does not carry the rule",
+  "transfer": "an arm worse than no_trade on a simulator it was not fitted on is a transfer failure, reported per pair",
+  "real": "H is reported beside the rule, never in it"
+ },
+ "seeds": {
+  "training": [
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "evaluation": [
+   101
+  ]
+ },
+ "bootstrap": "#103's: 2000 replicates, mean block 2 days, 90 %, seed 102, at least 4 days",
+ "compute": {
+  "estimate_job_hours": {
+   "learned_training": "2 arms x 5 seeds x 2 simulators: 2 to 14 job-hours, by #103's selected arm",
+   "classical_and_evaluation": 6
+  },
+  "rule": "after #107 B/C, under the shared cap; a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds"
+ },
+ "seen_before_freeze": [
+  "#237's design and holdout results (no-go) on its own 1 minute paths",
+  "#103's classical fee and selection figures",
+  "#107's queue checks on training day 1"
+ ]
+}
