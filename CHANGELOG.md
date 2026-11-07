@@ -21,6 +21,14 @@ project follows [Semantic Versioning](https://semver.org/).
   funding not applied. It streams the files, keeps only thinned inputs and says what it keeps.
   Not evaluated: #90 (b) and (c), which need a data trajectory the replay does not expose; #77,
   #180 and #91 (b) do not apply to this capture. No data is in the repository.
+- Hedge actions in the Python bridge (#258): `"hedge_actions": true` in its configuration builds
+  the environment with `RlConfig::with_hedge_actions`, so its specification states
+  `HedgeActions::MarketableAtTouch`; off by default, a configuration keeps its specification and
+  fingerprint. The maskable encoding gains a sixth value, 0 for no hedge and `i + 1` for the
+  grid's size `i`, masked by `hedge_mask`; the continuous one a sixth value above zero for a
+  hedge, binned over the sizes, a hedge outside the mask being a charged hold. A hedge replaces
+  the resting orders, so the other values are then not read. A residual environment refuses the
+  flag, and a checkpoint loads only into an environment with the same one.
 - Hedge actions in the RL action space (feature `rl`, #247): with
   `RlConfig::with_hedge_actions`, `rl::RlAction::Hedge` reduces the delivered position with a
   marketable limit order at the observed touch, of a size from the order size grid and never
