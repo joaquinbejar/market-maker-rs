@@ -39,6 +39,15 @@ project follows [Semantic Versioning](https://semver.org/).
   by its variant, a strategy quote out of range, an action off the grid, or a hedge not available
   at this decision) instead of reporting every one as off grid, a changed string for a caller
   who matched on it.
+- GLFT quotes in the form the caller states (#264): `GLFTStrategy::exact_quotes` tells a
+  horizon over the matrix exponential's step cap apart, as `ExactQuotes::OverStepCap`, from a
+  failure; `calculate_optimal_quotes` keeps its error there. `GlftQuoter` (feature `kernel`)
+  quotes in a `GlftForm`: `Exact` as before, `ClosedForm`, or `ExactOrClosedForm`, which takes
+  the closed form only where the exact quote is over the cap. `GlftQuoter::counts` says how many
+  quotes each form gave, how often the exact one was over the cap, and which form gave the last,
+  so nothing is substituted silently and a run can tell a holding strategy from a failing one.
+  `GlftQuoter::new` and `with_form` build one. The Python bridge's GLFT baseline takes an
+  optional `form`, `exact` by default.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are
@@ -581,6 +590,8 @@ project follows [Semantic Versioning](https://semver.org/).
   `rl::RlConfig` gains `hedge_actions`, and `rl::HedgeActions` gains `MarketableAtTouch`.
   Behaviour with hedge actions off is unchanged. The Python bridge is built for action
   space 2.
+- `backtest::kernel::GlftQuoter` (#264) gains the public fields `form` and `counts`, so a struct
+  literal must name them; `GlftQuoter::new` sets the exact form and no counts, as before.
 - `margin-rs` 0.2, whose types are in this crate's public API (#97, #98). `options::settlement`
   now settles an option held in the ledger as a registered `OptionInstrument`, through
   `Ledger::settle_option`: `OptionPosition::new` takes the option's `InstrumentId` instead of a

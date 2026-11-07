@@ -120,7 +120,8 @@ mod tests;
 
 pub use adapter::{
     AvellanedaQuoter, ERR_KERNEL_MISMATCH, ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE,
-    GlftQuoter, QuoteAdapter, QuoteSource, SourceQuote, quote_error_code, quote_error_name,
+    GlftCounts, GlftForm, GlftQuoteForm, GlftQuoter, QuoteAdapter, QuoteSource, SourceQuote,
+    quote_error_code, quote_error_name,
 };
 pub use book::{ExecKind, FillRec, Origin, ReportRec};
 pub use config::{

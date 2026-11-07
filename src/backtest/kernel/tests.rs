@@ -981,6 +981,8 @@ fn glft(size: Decimal, lot: Decimal, start: u64) -> GlftQuoter {
         volatility: dec!(1684.7),
         size,
         session_start_ms: start,
+        form: crate::backtest::kernel::GlftForm::Exact,
+        counts: crate::backtest::kernel::GlftCounts::default(),
     }
 }
 
