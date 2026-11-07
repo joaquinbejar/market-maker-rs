@@ -206,3 +206,24 @@ def test_position_bins_and_support_counts():
     assert offline.position_bin([-9, -6, -5, -1, 0, 1, 5, 6]).tolist() == [0, 0, 1, 1, 2, 3, 3, 4]
     keys = [(1, 0), (1, 0), (2, 5)]
     assert offline.support_counts(keys, [(1, 0), (2, 5), (3, 1)]).tolist() == [2, 1, 0]
+
+
+def test_cql_bootstraps_through_the_synced_target_network():
+    # Days of two decisions: the first pays 0, the last pays 1 and ends the day. With alpha 0
+    # and gamma 0.5, the first state's logged value is 0.5 * 1 only if the target network
+    # follows the trained one; a target left at its initial weights gives 0.5 * Q_init.
+    first = np.zeros(3, dtype=np.float32)
+    last = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    logged = {"observation": np.tile(np.stack([first, last]), (100, 1)),
+              "mask": np.ones((200, 16), dtype=bool), "action": np.zeros(200, dtype=np.int16),
+              "reward": np.tile([0.0, 1.0], 100)}
+    days = [{k: v[2 * i:2 * i + 2] for k, v in logged.items()} for i in range(100)]
+    actions = offline.Actions(5, 2)
+    data = offline.Transitions(actions, days, 1.0)
+    run = dict(settings("cql", 1500), alpha=0.0)
+    network, _, finished = offline.train("cql", data, 3, run)
+    assert finished
+    with torch.no_grad():
+        values = network(torch.as_tensor(np.stack([first, last])))[:, 0]
+    assert float(values[1]) == pytest.approx(1.0, abs=0.1)
+    assert float(values[0]) == pytest.approx(0.5, abs=0.1)
