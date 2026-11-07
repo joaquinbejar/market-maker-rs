@@ -86,11 +86,17 @@ def test_the_projection_counts_what_it_clamped_snapped_and_made_live():
     run.teacher_target(quote(188, 202), ODD, GRID, None, notes)
     run.teacher_target({"kind": "ask", "price": 202, "lots": 1}, ODD, GRID, None, notes)
     run.teacher_target({"kind": "hold"}, ODD, GRID, None, notes)
+    # At the mid and at the farthest offset exactly: neither clamped nor snapped.
+    run.teacher_target(quote(200, 209), ODD, GRID, None, notes)
+    notes["quotes"] -= 1
     assert notes == {"quotes": 3, "holds": 1, "one_sided": 1, "inside_mid": 1,
                      "beyond_grid": 1, "off_grid": 3, "error_ticks": 1 + 1 + 4}
 
 
 def test_bin_centres_fall_in_their_bins():
+    assert [run.bin_centre(i, 4) for i in range(4)] == [-0.75, -0.25, 0.25, 0.75]
+    assert run.teacher_target(quote(198, 205, 1, 2), ODD, GRID, DURATIONS) == pytest.approx(
+        [0.5, 0.0, 0.4, -0.5, 0.5, -0.75])
     for count in (2, 4, 5):
         for index in range(count):
             assert BoxMarketMakingEnv._bin(run.bin_centre(index, count), count) == index
@@ -153,8 +159,11 @@ def test_a_markout_is_the_signed_quantity_times_the_later_mid_less_the_price():
     assert out["1000"] == {"ticks": "3", "fills": 2}
     # After 2 s: the buy sees 101 (row at 2000), the sell 111 (row at 3000): 0 - 27.
     assert out["2000"] == {"ticks": "-27", "fills": 2}
-    # A fill with no row that late is left out.
+    # A fill with no row that late is left out; one landing on the last row is counted.
     assert run.markouts(positions, rows, (2000000,))["2000000"] == {"ticks": "0", "fills": 0}
+    assert run.markouts([(1000, 101, "1")], rows, (3000,))["3000"] == {"ticks": "10", "fills": 1}
+    # A horizon landing on a row reads that row.
+    assert run.markouts([(1000, 101, "1")], rows, (2000,))["2000"] == {"ticks": "10", "fills": 1}
 
 
 def test_cloning_moves_the_mean_toward_the_targets_and_nothing_else():
@@ -228,9 +237,22 @@ def test_predictor_samples_pair_each_observation_with_its_rows_change(one_day):
     assert all(change is not None for _, change in samples)
 
 
-def test_teacher_samples_are_the_classical_decisions_until_the_budget(one_day):
+def test_teacher_samples_are_the_classical_decisions_until_the_budget(one_day, monkeypatch):
     rows, reads = one_day
-    sigmas = {regime: "0.5" for regime in run.regimes_of(DESIGN)}
+    sigmas = dict(zip(run.regimes_of(DESIGN), ("0.5", "0.6", "0.7")))
+    volatilities, projected = [], []
+    baseline, project = run.baseline_config, run.teacher_target
+
+    def baseline_config(kind, point, day):
+        volatilities.append(point["volatility"])
+        return baseline(kind, point, day)
+
+    def teacher_target(classical, row, grid, durations, notes=None):
+        projected.append((classical, row))
+        return project(classical, row, grid, durations, notes)
+
+    monkeypatch.setattr(run, "baseline_config", baseline_config)
+    monkeypatch.setattr(run, "teacher_target", teacher_target)
     point = {"risk_aversion": "0.01", "order_intensity": "50", "size": "1",
              "horizon_ms": 7200000}
     job = {"arm": "full", "latency": "25", "seed": 4, "fee": "0", "point": point,
@@ -244,7 +266,27 @@ def test_teacher_samples_are_the_classical_decisions_until_the_budget(one_day):
     assert all(len(t) == 6 for t in targets) and any(t[0] > 0 for t in targets)
     # The same seed draws the same days and decisions.
     assert notes["quotes"] + notes["holds"] == 130 and notes["quotes"] > 0
+    # Each day's point has its regime's volatility.
+    assert volatilities == [sigmas[regime] for regime, *_ in reads]
+    # The first day again, directly: each target is of the row its decision observed.
+    regime, day, _ = reads[0]
+    rng = np.random.default_rng(4)
+    rng.integers(len(run.regimes_of(DESIGN)) * len(run.days_of(DESIGN, "train")))
+    cfg = run.config(DESIGN, "0", "25")
+    cfg["residual"] = {"baseline": baseline("avellaneda_stoikov",
+                                            point | {"volatility": sigmas[regime]}, day),
+                       "price_ticks": 4, "size_lots": 1, "default_order_size": "1"}
+    direct = run.ResidualMarketMakingEnv(cfg, walk_on(day))
+    _, info = direct.reset(seed=int(rng.integers(2**31)))
+    for k in range(20):
+        observed = walk_on(day)[info["row"]]
+        *_, info = direct.step([0.0, 0.0, 0.0, 0.0])
+        assert projected[k] == (info["residual"]["classical"], observed)
+    direct.close()
+    projected.clear()
     assert run.teacher_samples(job) == (observations, targets, notes)
+    loud = run.teacher_samples(job | {"predictor": {"coefficients": [0.0] * 22 + [3.0]}})
+    assert all(o[-1] == 1.0 for o in loud[0])
     plain = run.teacher_samples(job | {"arm": "no_predictor"})
     assert all(len(o) == 22 for o in plain[0])
     assert plain[1] == targets and [o[:22] for o in observations] == plain[0]
@@ -391,7 +433,7 @@ def frozen_run(tmp_path):
     (tmp_path / "teacher.json").write_text(json.dumps({"samples": [
         {"path": str(samples), "sha256": run.sha256(samples)}]}))
     (tmp_path / "training.json").write_text(json.dumps({"runs": [
-        {"arm": "full", "latency": "25", "seed": 1, "predictor": None,
+        {"arm": "full", "latency": "25", "seed": 1, "predictor": {"coefficients": [0.5]},
          "path": str(zipped.with_suffix("")), "checkpoint_sha256": run.sha256(zipped)}]}))
     return zipped, samples
 
@@ -445,8 +487,15 @@ def test_the_holdout_runs_once_from_its_manifest_at_both_fees(tmp_path, stubbed)
     assert len(classical) == 2 * 2 * 2 * 2 * len(run.days_of(DESIGN, "holdout"))
     assert {(r["latency"], r["every"]) for r in rows if r["arm"] == "no_trade"} == {
         (lat, every) for lat in ctx.latencies for every in run.CLASSICAL_INTERVALS}
+    # Each learned job carries its run's predictor.
+    assert all(r["predictor"] == {"coefficients": [0.5]} for r in rows if r["arm"] == "full")
     with pytest.raises(ValueError, match="evaluated already"):
         run.holdout(ctx, run.sha256(tmp_path / "frozen.json"))
+    # A chosen fee that is the secondary one is evaluated once.
+    (tmp_path / "holdout.json").unlink()
+    (tmp_path / "fee_rule.json").write_text(json.dumps({"fee": "0.0002"}))
+    report = run.holdout(ctx, run.freeze(ctx)["frozen_sha256"])
+    assert report["fees"] == ["0.0002"]
 
 
 def test_an_evaluated_day_counts_its_durations_rows_and_orders_per_hour():
@@ -465,6 +514,10 @@ def test_an_evaluated_day_counts_its_durations_rows_and_orders_per_hour():
             return np.asarray([1.0 if first else -1.0, 0.0, 0.0, 0.0, 0.0,
                                choice[5 if first else 1]], dtype=np.float32), None
 
+    class Longest(Policy):
+        def predict(self, observation, deterministic=True):
+            return np.asarray([-1.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32), None
+
     rows = walk(80)
     day = run.episode(Policy(), env, 1, DESIGN, rows)
     env.close()
@@ -474,7 +527,89 @@ def test_an_evaluated_day_counts_its_durations_rows_and_orders_per_hour():
     assert float(day["per_hour"]["accepted"]) == pytest.approx(day["orders"]["accepted"] / hours,
                                                                abs=1e-3)
     assert set(day["markouts_ticks"]) == {"1000", "5000", "30000"}
+    # The last duration chosen is cut by the end of the day, and still counted as chosen.
+    env = run.wrap(BoxMarketMakingEnv(run.config(DESIGN, "0", "25"), rows), DESIGN,
+                   "no_predictor", None)
+    day = run.episode(Longest(), env, 1, DESIGN, rows)
+    env.close()
+    assert day["durations"] == {"30": day["decisions"]} and day["rows"] < 30 * day["decisions"]
     plain = BoxMarketMakingEnv(run.config(DESIGN, "0", "25"), rows)
     day = run.episode(run.Constant(run.HOLD), plain, 1, DESIGN, rows)
     plain.close()
     assert day["rows"] == day["decisions"] and day["durations"] == {"1": day["decisions"]}
+
+
+def test_each_latency_has_its_own_delays():
+    for latency, delays in DESIGN["execution"]["latencies"].items():
+        cfg = run.config(DESIGN, "0.0002", latency)
+        assert cfg["latency"] == delays and cfg["fee_rate"] == "0.0002"
+        assert cfg["fill_model"] == DESIGN["execution"]["fill_model"]
+
+
+def test_a_day_is_evaluated_on_its_own_rows_and_only_the_holdout_step_reads_the_holdout(
+        one_day, monkeypatch):
+    allowed = []
+    plain = run.read_rows
+
+    def read_rows(data_dir, digests, regime, day, split, holdout_allowed=False):
+        allowed.append((split, holdout_allowed))
+        return plain(data_dir, digests, regime, day, split, holdout_allowed)
+
+    monkeypatch.setattr(run, "read_rows", read_rows)
+    job = {"arm": "no_trade", "latency": "25", "every": 10, "fee": "0", "regime": "calm",
+           "day": 20, "split": "holdout", "candidate": "hold", "policy": {"kind": "hold"},
+           "point": None, "data_dir": "x"}
+    row = run.evaluate_job(job)
+    assert set(allowed) == {("holdout", True)}
+    assert row["daily_value"] == "0" and row["latency"] == "25" and row["every"] == 10
+    day = row["episodes"][0]
+    assert day["durations"]["10"] >= 1 and sum(day["durations"].values()) == day["decisions"]
+    allowed.clear()
+    run.evaluate_job(job | {"split": "validation", "day": 15})
+    assert set(allowed) == {("validation", False)}
+
+
+def test_a_day_with_other_rows_than_its_digest_is_refused(monkeypatch):
+    monkeypatch.setattr(run, "read_rows", lambda *a, **k: (walk(30), {"dataset_digest": "x"}))
+    job = {"arm": "no_trade", "latency": "25", "every": 1, "fee": "0", "data_dir": "x"}
+    with pytest.raises(ValueError, match="other rows than digests.json"):
+        run.build_env(job, {}, "calm", 1, "train")
+
+
+def test_a_frozen_checkpoint_loads_only_where_it_was_trained(tmp_path):
+    env = BoxMarketMakingEnv(run.config(DESIGN, "0", "25"), walk(40, spacing_ms=100))
+    PPO("MlpPolicy", env, seed=1, device="cpu", n_steps=64, batch_size=32).save(tmp_path / "m")
+    metadata = {"path": str(tmp_path / "m"), "spec": list(env.spec_id), "config": env.config,
+                "checkpoint_sha256": run.sha256(tmp_path / "m.zip")}
+    assert run.load_frozen(metadata, env) is not None
+    # Another fee is the comparison's secondary row; another latency is another environment.
+    other_fee = BoxMarketMakingEnv(run.config(DESIGN, "0.0002", "25"), walk(40, spacing_ms=100))
+    assert run.load_frozen(metadata, other_fee) is not None
+    later = BoxMarketMakingEnv(run.config(DESIGN, "0", "500"), walk(40, spacing_ms=100))
+    with pytest.raises(ValueError, match="another configuration"):
+        run.load_frozen(metadata, later)
+    # Another grid is another specification.
+    wider = BoxMarketMakingEnv(run.config(DESIGN, "0", "25") | {"sizes": [1, 3]},
+                               walk(40, spacing_ms=100))
+    with pytest.raises(ValueError, match="another specification"):
+        run.load_frozen(metadata, wider)
+    wider.close()
+    with pytest.raises(ValueError, match="changed after training"):
+        run.load_frozen(metadata | {"checkpoint_sha256": "0" * 64}, env)
+    for e in (env, other_fee, later):
+        e.close()
+
+
+def test_a_learned_arm_decides_through_its_own_wrappers(one_day):
+    job = {"arm": "full", "latency": "25", "fee": "0", "data_dir": "x",
+           "predictor": {"coefficients": [0.0] * 23}, "every": None}
+    env = run.build_env(job, {}, "calm", 1, "train")
+    assert env.action_space.shape == (6,) and env.observation_space.shape == (23,)
+    env.close()
+    env = run.build_env(job | {"arm": "avellaneda_stoikov", "every": 10,
+                               "point": {"risk_aversion": "0.01", "order_intensity": "50",
+                                         "size": "1", "horizon_ms": 7200000,
+                                         "volatility": "0.5"}}, {}, "calm", 1, "train")
+    assert isinstance(env, run.DecisionInterval) and env.every == 10
+    env.close()
+
