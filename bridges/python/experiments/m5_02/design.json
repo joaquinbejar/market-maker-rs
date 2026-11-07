@@ -2,7 +2,7 @@
  "issue": 107,
  "parts": "B and C",
  "design_version": 2,
- "status": "draft: not frozen; nothing of B or C has been trained",
+ "status": "frozen before any training run of parts B and C",
  "data": "synthetic everywhere; nothing here is market data",
  "protocol": "#103's (experiments/m4_06/design.json, pinned below): its data for B, execution, fee rule and secondary fee, Box encoding with the reject policy, hyperparameter set, budget, training seeds, evaluation seed and bootstrap; one decision per row only",
  "pins": {
@@ -11,9 +11,10 @@
   "m4_06_commit": "283d4d47d3f60859b4519a1f5f0571833a4289b1"
  },
  "fee": {
-  "value": null,
-  "source": "the fee #103's fee_rule step chooses, from its fee_rule.json, pinned by sha256 before the freeze",
-  "fee_rule_sha256": null
+  "value": "-0.0001",
+  "source": "#103's fee_rule.json at design version 2 (283d4d4): the largest candidate at which its Avellaneda-Stoikov point has a positive mean daily net on training days",
+  "fee_rule_sha256": "cf3e2a3ab445cead9a7674dc4b39384233353f0851f6e6fbef60fc8ba3f5b26a",
+  "secondary": "0.0002, #103's fixed secondary row, on the holdout"
  },
  "market": {
   "data": "synthetic: #103's 1 s queue-reactive days (3 regimes x 24), whose holdout #103 reads before this part's freeze; one policy per arm on the pooled training days, as #103"
@@ -182,8 +183,64 @@
   "hsn": 55
  },
  "references": {
-  "points": null,
-  "rule": "no-trade, and Avellaneda-Stoikov and GLFT as zero residuals. B: the points #103's classical selection chose at one decision per row, per regime, pinned here. C: the step classical selects per impact setting on C's validation days, at the fee, by #103's rule over #103's grids, with the volatility from C's training days; its file is hashed into the freeze"
+  "points": {
+   "calm": {
+    "avellaneda_stoikov": {
+     "horizon_ms": 86400000,
+     "order_intensity": "50",
+     "risk_aversion": "0.0001",
+     "size": "1",
+     "volatility": "39.4970"
+    },
+    "glft": {
+     "intensity_scale_a": "1.5",
+     "max_inventory_lots": 5,
+     "min_spread": "0.005",
+     "order_intensity_k": "50",
+     "risk_aversion": "0.001",
+     "terminal_time": 86400000,
+     "volatility": "39.4970"
+    }
+   },
+   "stressed": {
+    "avellaneda_stoikov": {
+     "horizon_ms": 86400000,
+     "order_intensity": "50",
+     "risk_aversion": "0.01",
+     "size": "1",
+     "volatility": "63.4123"
+    },
+    "glft": {
+     "intensity_scale_a": "1.5",
+     "max_inventory_lots": 5,
+     "min_spread": "0.005",
+     "order_intensity_k": "50",
+     "risk_aversion": "0.001",
+     "terminal_time": 86400000,
+     "volatility": "63.4123"
+    }
+   },
+   "thin": {
+    "avellaneda_stoikov": {
+     "horizon_ms": 86400000,
+     "order_intensity": "50",
+     "risk_aversion": "0.01",
+     "size": "1",
+     "volatility": "71.0162"
+    },
+    "glft": {
+     "intensity_scale_a": "1.5",
+     "max_inventory_lots": 5,
+     "min_spread": "0.005",
+     "order_intensity_k": "50",
+     "risk_aversion": "0.001",
+     "terminal_time": 86400000,
+     "volatility": "71.0162"
+    }
+   }
+  },
+  "rule": "no-trade, and Avellaneda-Stoikov and GLFT as zero residuals. B: the points #103's classical selection chose at one decision per row, per regime, pinned here. C: the step classical selects per impact setting on C's validation days, at the fee, by #103's rule over #103's grids, with the volatility from C's training days; its file is hashed into the freeze",
+  "classical_selection_sha256": "902d4ca583db5af851a4ac8777894f639033306740cdd18e6b7ea48728e5402b"
  },
  "decision_rule": {
   "against": "the best non-HSN learned arm by mean daily net on validation, chosen before the holdout",
@@ -223,7 +280,9 @@
  "seen_before_freeze": [
   "With an earlier draft at 10 s rows: one generation of the Hawkes days, and the mid range, the change of the mid per row and the touch sizes of training day 1 of each impact setting. No holdout or validation row was read.",
   "Timing probes on 5000 synthetic rows (a random walk of the touch, not the design's data): 8192 PPO decisions of mlp, gru_window and hsn, timed and not evaluated (198, 534 and 246 microseconds a decision).",
-  "Smoke tests of every arm on 300 synthetic rows."
+  "Smoke tests of every arm on 300 synthetic rows.",
+  "The queue check (check_queue.py) on training day 1 of every group of B and C: Avellaneda-Stoikov's fills and nets over #103's grid at 0.0002, under the design's fill model and under immediate fill (check_queue-market.json 7b6cf33f, check_queue-causal.json 84fee4e9).",
+  "#103's fee rule and classical selection results at fee -0.0001 as #103 reported them: training-day and validation means of its classical arms. No learned result of #103."
  ],
  "execution": {
   "fill_model": {
@@ -234,5 +293,6 @@
   },
   "rule": "the standard set for every study on 1 s rows on 2026-11-07: one lot per 500 ms and no minimum time in queue. At one lot per 1000 ms an order requoted every 1 s row is 975 ms in queue at the next row and clears nothing; at 500 ms it clears one lot, and the touch ahead still binds. #103 adopts the same in its design version 2, and this part keeps whatever #103's base_config gives only if it equals this",
   "check": "before any training, check_queue.py shows that Avellaneda-Stoikov fills on training days of every group and that its net differs from immediate fill"
- }
+ },
+ "holdout_order": "#103 reads the shared holdout days of part B before this part's freeze; this part's report says so, and its author does not look at #103's holdout results before this part's holdout run"
 }
