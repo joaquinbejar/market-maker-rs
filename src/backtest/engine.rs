@@ -18,7 +18,11 @@
 //! acknowledgement delay; a cancel that arrives after a fill is reported as
 //! `CancelRejected` and the fill stands. Events scheduled between two ticks
 //! (observations, activations, cancels, report deliveries) happen at their
-//! own times, in chronological order, before the next tick is matched.
+//! own times, in chronological order, before the next tick is matched; so do
+//! events due at the tick's own time. An order that becomes active at a
+//! tick's time is eligible only from the next tick on (see
+//! [`crate::backtest::latency`] for what that means for a delay of exactly
+//! one tick interval).
 //! Jitter applies to every delay, observations included. Reports still in
 //! flight when the data ends are delivered after the last tick. Every
 //! transition is published as an
@@ -5322,6 +5326,41 @@ mod tests {
             .unwrap();
         assert_eq!(canceled.cumulative_quantity, dec!(1.5));
         assert_eq!(result.final_position, dec!(1.5));
+    }
+
+    /// Fills of a run on ticks every 10 ms that sell through a bid of 100,
+    /// with the strategy quoting on the first tick and then on every tick
+    /// (`requote`) or never again.
+    fn fills_with_latency(submit_ms: u64, cancel_ms: u64, requote: bool) -> usize {
+        let ticks: Vec<MarketTick> = (0..8)
+            .map(|i| create_test_tick(1000 + 10 * i, dec!(97.0), dec!(99.5)))
+            .collect();
+        let quotes = (0..8)
+            .map(|i| (i == 0 || requote).then_some((dec!(100), dec!(200))))
+            .collect();
+        let latency = SimLatencyConfig::new()
+            .with_submit_ms(submit_ms)
+            .with_cancel_ms(cancel_ms);
+        let mut engine = latency_engine(ticks, quotes, latency);
+        engine.run();
+        engine
+            .execution_reports()
+            .iter()
+            .filter(|r| matches!(r.kind, ExecutionKind::Fill | ExecutionKind::PartialFill))
+            .count()
+    }
+
+    #[test]
+    fn test_latency_of_exactly_one_tick_never_fills_when_every_tick_requotes() {
+        // An order active at a tick's time is not eligible on that tick, and
+        // the cancel of the next quote takes effect on the tick after, before
+        // matching: no order ever has a tick to fill on.
+        assert_eq!(fills_with_latency(10, 10, true), 0);
+        // One millisecond less and every order fills on the tick it reaches.
+        assert_eq!(fills_with_latency(9, 9, true), 7);
+        // Without the requote the order rests and fills on the tick after it
+        // becomes active.
+        assert_eq!(fills_with_latency(10, 10, false), 1);
     }
 
     #[test]
