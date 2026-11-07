@@ -21,7 +21,10 @@
 //! - single linear spot instrument on a tick and lot grid;
 //! - the immediate or the queue position fill model, on the lot grid, no
 //!   slippage, quote currency fees (any sign);
-//! - no pretrade policy, or the engine's `LimitsPolicy` (no circuit breaker);
+//! - no pretrade policy, the engine's `LimitsPolicy` (no circuit breaker),
+//!   or, with the balance gate ([`KernelMargin`]), a
+//!   [`MarginAccount`](crate::backtest::MarginAccount) set up as
+//!   [`KernelMargin`] states (`margin` feature);
 //! - the built-in bookkeeping (no external accountant);
 //! - all four latencies and jitter, in quanta of `quantum_ns`
 //!   (`quantum_ns = 1_000_000` matches the engine's milliseconds);
@@ -131,13 +134,14 @@ pub use adapter::{
 };
 pub use book::{ExecKind, FillRec, Origin, ReportRec};
 pub use config::{
-    CapacityNeed, KernelConfig, KernelFee, KernelFillModel, KernelLatency, MAX_KERNEL_STEPS,
+    CapacityNeed, KernelConfig, KernelFee, KernelFillModel, KernelLatency, KernelMargin,
+    MAX_KERNEL_STEPS,
 };
 pub use data::{DIGEST_FNV1A128, DatasetId, KernelDataset, KernelTick};
 pub use encode::{
     CONFIG_MAGIC, FORMAT_VERSION, STATE_MAGIC, decode, encode, fingerprint, fnv1a128,
 };
-pub use gate::GateVerdict;
+pub use gate::{GateCheck, GateVerdict};
 pub use hedge::{
     CombinedLimits, FundingRate, HEDGE_FORMAT_VERSION, HEDGED_STATE_MAGIC, HedgeCounters,
     HedgeEvent, HedgeFill, HedgeInstrument, HedgeLane, HedgeLaneConfig, HedgeRefusal, HedgeSummary,

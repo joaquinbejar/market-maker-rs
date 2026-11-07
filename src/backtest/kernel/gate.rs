@@ -84,6 +84,18 @@ pub enum GateVerdict {
     Rejected,
 }
 
+/// Which check of the gate took a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GateCheck {
+    /// [`super::KernelConfig::limits`].
+    Limits,
+    /// The combined limits of a hedged kernel ([`super::CombinedLimits`]).
+    Combined,
+    /// The balance gate ([`super::KernelMargin`]).
+    Margin,
+}
+
 /// Gate decision: the verdict and the lots submitted (0 when refused).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GateDecision {
@@ -135,6 +147,93 @@ pub(super) fn check(
         },
     };
     Ok(decision)
+}
+
+/// The balances the balance gate decides on, in U and lots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Balances {
+    /// Quote balance less the reservations of the live buys, in U.
+    pub(super) quote_free_u: i128,
+    /// Base balance less the live sells, in lots.
+    pub(super) base_free_lots: i128,
+}
+
+/// What the balance gate reserves with: the tick and the lot, the fee scale `F` and the
+/// fee rate mantissa reserved on buys.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MarginTerms<'a> {
+    pub(super) tick: &'a Unit,
+    pub(super) lot: &'a Unit,
+    pub(super) fee_scale: i128,
+    pub(super) fee_num: i128,
+}
+
+impl MarginTerms<'_> {
+    /// The quote reserved by a buy of `lots` at `price` ticks, in U: its notional plus
+    /// `fee_num` of it, i.e. per unit of the lot's grid `price * mt * (F + fee_num)`.
+    pub(super) fn buy_reservation_u(&self, price: u64, lots: u64) -> Option<i128> {
+        self.per_grid_u(price)?
+            .checked_mul(i128::from(lots))?
+            .checked_mul(i128::from(self.lot.mantissa))
+    }
+
+    /// The quote reserved per unit of the lot's grid at `price` ticks, in U.
+    fn per_grid_u(&self, price: u64) -> Option<i128> {
+        i128::from(price)
+            .checked_mul(i128::from(self.tick.mantissa))?
+            .checked_mul(self.fee_scale.checked_add(self.fee_num)?)
+    }
+}
+
+/// The balance gate for an order of `qty` lots at `price` ticks, as
+/// `RiskGate::submit` sizes it in units of the lot's grid (one lot is
+/// `lot.mantissa` of them): accepted when the balance covers it, otherwise
+/// reduced to the largest whole number of grid units it covers, refused
+/// below one, and refused when that is not a whole number of lots.
+///
+/// `None` if a value is not representable (unreachable inside the validated
+/// bounds).
+pub(super) fn margin_check(
+    terms: &MarginTerms<'_>,
+    balances: &Balances,
+    dir: Dir,
+    price: u64,
+    qty: u64,
+) -> Option<GateDecision> {
+    let ml = i128::from(terms.lot.mantissa);
+    let wanted = i128::from(qty).checked_mul(ml)?;
+    let covered = match dir {
+        Dir::Buy => {
+            let per = terms.per_grid_u(price)?;
+            if per <= 0 {
+                return None;
+            }
+            balances.quote_free_u.max(0).checked_div(per)?
+        }
+        Dir::Sell => balances.base_free_lots.max(0).checked_mul(ml)?,
+    };
+    let decision = if covered >= wanted {
+        GateDecision {
+            verdict: GateVerdict::Accepted,
+            submitted: qty,
+        }
+    } else if covered < 1 {
+        GateDecision {
+            verdict: GateVerdict::Rejected,
+            submitted: 0,
+        }
+    } else if covered.checked_rem(ml)? == 0 {
+        GateDecision {
+            verdict: GateVerdict::Reduced,
+            submitted: u64::try_from(covered.checked_div(ml)?).ok()?,
+        }
+    } else {
+        GateDecision {
+            verdict: GateVerdict::ReducedOffLot,
+            submitted: 0,
+        }
+    };
+    Some(decision)
 }
 
 /// `approved` in lots when it is a whole, positive number of lots, as the
