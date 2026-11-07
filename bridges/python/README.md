@@ -54,7 +54,7 @@ venue time the quote rests `d` rows plus the cancel latency less the submission 
 exactly `d` rows when the two are equal: with no latency it can fill on rows `t + 1` to `t + d`
 and not after. A fill before the cancel arrives stands, and a cancel that reaches an order
 already filled is rejected. A cancel scheduled in the kernel, exact in venue time whatever the
-latencies, is not modelled.
+latencies, is not modelled (#297).
 
 Money crosses the boundary only as decimal strings and rows as integer ticks and lots. The
 `f32` reward is the kernel's derived value, and `info` holds the exact reward and net result,

@@ -29,7 +29,8 @@ project follows [Semantic Versioning](https://semver.org/).
   (`rl::ERR_CANCEL_REFUSED` under the reject policy). An environment with a hedge lane refuses
   it. The Python bridge takes `cancel_action`, drives version 4 only with it, and adds
   `ExpiringQuote`, which cancels a quote `d` decisions after it, without the policy: the quote
-  rests `d` rows plus the cancel latency less the submission latency. Synthetic fixtures only.
+  rests `d` rows plus the cancel latency less the submission latency; an expiry scheduled in
+  the kernel, exact in venue time, is #297. Synthetic fixtures only.
 - Example `time_travel_queues` (#109), behind `serde`: chronological replay against consistent
   time travel for a market maker at the touch, on queues. On #102's queue-reactive regimes the
   simulator continues from a state that holds the agent's order, so each mode is measured against
