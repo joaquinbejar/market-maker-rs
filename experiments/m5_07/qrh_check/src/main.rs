@@ -239,8 +239,8 @@ fn price(
     paths: usize,
     seed: u64,
 ) -> (f64, f64) {
-    let grid = QuadraticRoughHestonGrid::try_new(Decimal::from_f64_retain(t).unwrap(), steps)
-        .unwrap();
+    let grid =
+        QuadraticRoughHestonGrid::try_new(Decimal::from_f64_retain(t).unwrap(), steps).unwrap();
     let e = price_vanilla_quadratic_rough_heston(
         p,
         &grid,
@@ -275,11 +275,16 @@ fn main() {
     for (i, (c, g)) in expected.iter().enumerate() {
         let ours_c = f(kernel.weights()[i]);
         let ours_g = f(kernel.discounts()[i]);
-        worst = worst.max(((ours_c - c) / c).abs()).max(((ours_g - g) / g).abs());
+        worst = worst
+            .max(((ours_c - c) / c).abs())
+            .max(((ours_g - g) / g).abs());
     }
-    report.insert("kernel_weights".into(), json!({
+    report.insert(
+        "kernel_weights".into(),
+        json!({
         "weights": kernel.weights(), "discounts": kernel.discounts(),
-        "closed_form": expected, "worst_relative_difference": worst, "pass": worst <= 1e-10}));
+        "closed_form": expected, "worst_relative_difference": worst, "pass": worst <= 1e-10}),
+    );
 
     // 2. Optimal ratio x*_10 against the printed values of Figure A.1.
     let mut ratios = serde_json::Map::new();
@@ -289,17 +294,30 @@ fn main() {
         let printed: f64 = printed.as_str().unwrap().parse().unwrap();
         let pass = (ours - printed).abs() <= 0.02;
         all &= pass;
-        ratios.insert(a.clone(), json!({"ours": ours, "printed": printed, "pass": pass}));
+        ratios.insert(
+            a.clone(),
+            json!({"ours": ours, "printed": printed, "pass": pass}),
+        );
     }
-    report.insert("optimal_ratio".into(), json!({"by_alpha": ratios, "pass": all}));
+    report.insert(
+        "optimal_ratio".into(),
+        json!({"by_alpha": ratios, "pass": all}),
+    );
 
     // 3. Initial variance.
     let p = params(&criteria, kernel.clone());
     let v0 = f(p.initial_variance());
-    let printed_v0: f64 = checks["initial_variance"]["value"].as_str().unwrap().parse().unwrap();
-    report.insert("initial_variance".into(), json!({
+    let printed_v0: f64 = checks["initial_variance"]["value"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    report.insert(
+        "initial_variance".into(),
+        json!({
         "z0": p.initial_z(), "v0": v0, "printed": printed_v0,
-        "pass": (v0 * 100.0).round() / 100.0 == printed_v0}));
+        "pass": (v0 * 100.0).round() / 100.0 == printed_v0}),
+    );
 
     // 4. Monte Carlo prices.
     let spot = f(p.spot().to_dec());
@@ -327,10 +345,12 @@ fn main() {
             let vol = implied_vol(call, spot, strike, t);
             vols.push(vol);
             calls.push((strike, call, call_se));
-            rows.push(json!({"maturity": t, "log_moneyness": k, "strike": strike, "steps": steps,
+            rows.push(
+                json!({"maturity": t, "log_moneyness": k, "strike": strike, "steps": steps,
                 "call": call, "call_se": call_se, "put": put, "put_se": put_se,
                 "parity_residual": parity, "parity_se": parity_se,
-                "call_half_dt": half, "call_half_dt_se": half_se, "implied_vol": vol}));
+                "call_half_dt": half, "call_half_dt_se": half_se, "implied_vol": vol}),
+            );
         }
         // Decreasing and convex in strike, up to Monte Carlo error (3 standard errors).
         for w in calls.windows(2) {
@@ -343,9 +363,9 @@ fn main() {
             let ((k0, c0, s0), (k1, c1, s1), (k2, c2, s2)) = (w[0], w[1], w[2]);
             let (h0, h1) = (k1 - k0, k2 - k1);
             let change = (c2 - c1) / h1 - (c1 - c0) / h0;
-            let error = ((s2 / h1).powi(2) + (s1 * (1.0 / h1 + 1.0 / h0)).powi(2)
-                + (s0 / h0).powi(2))
-            .sqrt();
+            let error =
+                ((s2 / h1).powi(2) + (s1 * (1.0 / h1 + 1.0 / h0)).powi(2) + (s0 / h0).powi(2))
+                    .sqrt();
             shape_ok &= change >= -3.0 * error;
         }
         let v: Vec<f64> = vols.iter().flatten().copied().collect();
@@ -368,7 +388,9 @@ fn main() {
         .filter(|r| r["log_moneyness"].as_f64() == Some(0.0))
         .filter_map(|r| r["implied_vol"].as_f64())
         .collect();
-    report.insert("monte_carlo".into(), json!({
+    report.insert(
+        "monte_carlo".into(),
+        json!({
         "paths": paths, "seed": seed, "dt": dt, "rows": rows,
         "parity_within_3se": parity_ok, "within_bounds": bounds_ok,
         "decreasing_and_convex": shape_ok, "negative_skew": skew_ok,
@@ -377,10 +399,14 @@ fn main() {
         "atm_implied_vols": atm, "sqrt_v0": v0.sqrt(),
         "paths_positive_variance_and_spot": path_ok,
         "pass": parity_ok && bounds_ok && shape_ok && skew_ok && convergence_ok
-            && (0.4..=0.6).contains(&se_ratio) && path_ok}));
+            && (0.4..=0.6).contains(&se_ratio) && path_ok}),
+    );
     let pass = report.values().all(|v| v["pass"].as_bool() == Some(true));
     report.insert("pass".into(), json!(pass));
-    println!("{}", serde_json::to_string_pretty(&Value::Object(report)).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&Value::Object(report)).unwrap()
+    );
 }
 
 fn norm_pdf(x: f64) -> f64 {
@@ -426,14 +452,16 @@ fn noise_free(
             };
         }
     }
-    (variance_of(&weights, &z, a, b, c).1, integral / (steps as f64 * dt))
+    (
+        variance_of(&weights, &z, a, b, c).1,
+        integral / (steps as f64 * dt),
+    )
 }
 
 fn step_1b(criteria: &Value) {
     let base: Value = serde_json::from_str(
         &std::fs::read_to_string(
-            std::path::Path::new(&std::env::args().nth(1).unwrap())
-                .with_file_name("criteria.json"),
+            std::path::Path::new(&std::env::args().nth(1).unwrap()).with_file_name("criteria.json"),
         )
         .unwrap(),
     )
@@ -492,7 +520,9 @@ fn step_1b(criteria: &Value) {
     let r1_rounds = (r1_v * 100.0).round() / 100.0 == printed;
     let interval_meets = lo < 0.185 && hi >= 0.175;
     let shifted = ((printed - c) / a).sqrt();
-    report.insert("initial_variance".into(), json!({
+    report.insert(
+        "initial_variance".into(),
+        json!({
         "readings": {
             "R1": {"z0": r1_z, "v0": r1_v, "optionstratlib_v0": p.initial_variance(),
                    "supported_by_the_text": true},
@@ -504,15 +534,24 @@ fn step_1b(criteria: &Value) {
         "printed": printed,
         "z0_giving_printed_v0": [b - shifted, b + shifted],
         "r1_rounds_to_printed": r1_rounds, "r1_rounding_interval_meets_printed": interval_meets,
-        "pass": r1_rounds || interval_meets}));
+        "pass": r1_rounds || interval_meets}),
+    );
 
     // 2. The time step sweep, and the noise-free diagnosis.
     let grid = &criteria["grid"];
     let floats = |key: &str| -> Vec<f64> {
-        grid[key].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()
+        grid[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect()
     };
     let (maturities, moneyness) = (floats("maturities"), floats("log_moneyness"));
-    let (paths, seed) = (grid["paths"].as_u64().unwrap() as usize, grid["seed"].as_u64().unwrap());
+    let (paths, seed) = (
+        grid["paths"].as_u64().unwrap() as usize,
+        grid["seed"].as_u64().unwrap(),
+    );
     let dts: Vec<f64> = checks["dt_convergence"]["dts"]
         .as_array()
         .unwrap()
@@ -531,7 +570,17 @@ fn step_1b(criteria: &Value) {
             let strike = spot * f64::exp(k);
             let sweep: Vec<(f64, f64)> = dts
                 .iter()
-                .map(|dt| price(&p, t, (t / dt).round() as usize, OptionStyle::Call, strike, paths, seed))
+                .map(|dt| {
+                    price(
+                        &p,
+                        t,
+                        (t / dt).round() as usize,
+                        OptionStyle::Call,
+                        strike,
+                        paths,
+                        seed,
+                    )
+                })
                 .collect();
             let n = sweep.len();
             let ((c3, s3), (c4, s4)) = (sweep[n - 2], sweep[n - 1]);
@@ -559,7 +608,11 @@ fn step_1b(criteria: &Value) {
                 "parity_residual": parity, "parity_se": parity_se, "intrinsic": intrinsic,
                 "implied_vol": vol, "implied_vol_se": vol_se}));
         }
-        let at = |m: f64| vols.iter().find(|(k, _, _)| (*k - m).abs() < 1e-12).unwrap();
+        let at = |m: f64| {
+            vols.iter()
+                .find(|(k, _, _)| (*k - m).abs() < 1e-12)
+                .unwrap()
+        };
         let ((_, low, low_se), (_, mid, mid_se)) = (at(-0.1), at(0.0));
         let skew = match (low, low_se, mid, mid_se) {
             (Some(l), Some(ls), Some(m), Some(ms)) => {
@@ -585,21 +638,39 @@ fn step_1b(criteria: &Value) {
             })
         })
         .collect();
-    report.insert("dt_convergence".into(), json!({
+    report.insert(
+        "dt_convergence".into(),
+        json!({
         "paths": paths, "seed": seed, "dts": dts, "rows": rows,
         "noise_free_diagnosis": {"max_gamma_dt_at_coarsest":
             closed.last().unwrap().1 * dts[0], "paths": noise},
-        "pass": converged}));
-    report.insert("no_arbitrage_bounds".into(), json!({"dt": finest, "pass": bounds_ok}));
-    report.insert("negative_skew".into(), json!({"dt": finest, "by_maturity": skews,
-        "pass": skew_ok}));
-    report.insert("put_call_parity".into(), json!({"dt": finest, "pass": parity_ok}));
-    report.insert("reported_only".into(), json!({
-        "atm_implied_vols_at_finest_dt": atm, "sqrt_v0_r1": r1_v.sqrt()}));
+        "pass": converged}),
+    );
+    report.insert(
+        "no_arbitrage_bounds".into(),
+        json!({"dt": finest, "pass": bounds_ok}),
+    );
+    report.insert(
+        "negative_skew".into(),
+        json!({"dt": finest, "by_maturity": skews,
+        "pass": skew_ok}),
+    );
+    report.insert(
+        "put_call_parity".into(),
+        json!({"dt": finest, "pass": parity_ok}),
+    );
+    report.insert(
+        "reported_only".into(),
+        json!({
+        "atm_implied_vols_at_finest_dt": atm, "sqrt_v0_r1": r1_v.sqrt()}),
+    );
     let pass = report
         .iter()
         .filter(|(k, _)| k.as_str() != "reported_only")
         .all(|(_, v)| v["pass"].as_bool() == Some(true));
     report.insert("pass".into(), json!(pass));
-    println!("{}", serde_json::to_string_pretty(&Value::Object(report)).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&Value::Object(report)).unwrap()
+    );
 }
