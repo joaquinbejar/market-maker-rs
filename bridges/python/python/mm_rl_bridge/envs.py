@@ -35,6 +35,10 @@ class MarketMakingEnv(gym.Env):
         self._features = self.bridge_info["features"]
         self._offsets = self.bridge_info["offsets"]
         self._sizes = self.bridge_info["sizes"]
+        # A hedge takes its size from the same grid of sizes as a quote, and `hedge_mask` has
+        # one bit per size.
+        self._hedge = bool(self.bridge_info["hedge_actions"])
+        self._hedge_mask = 0
         self.observation_space = gym.spaces.Box(
             low=-1.0,
             high=1.0,
@@ -70,6 +74,7 @@ class MarketMakingEnv(gym.Env):
         if reply["done"]:
             raise ValueError("the data holds no decision")
         self._mask = reply["mask"]
+        self._hedge_mask = reply["hedge_mask"]
         observed = reply["observation"]
         info = {"row": observed["row"], "raw_observation": observed["raw"], "seed": seed}
         return self._observation(observed), info
@@ -84,6 +89,8 @@ class MarketMakingEnv(gym.Env):
             reply = self._native.step_hold()
         elif kind == "quote":
             reply = self._native.step_quote(*indices)
+        elif kind == "hedge":
+            reply = self._native.step_hedge(*indices)
         else:
             raise ValueError(f"unknown action kind {kind!r}")
         extra = {
@@ -98,6 +105,7 @@ class MarketMakingEnv(gym.Env):
 
     def _transition(self, reply, action, extra):
         self._mask = reply["mask"]
+        self._hedge_mask = reply["hedge_mask"]
         observed = reply["observation"]
         info = {
             "proposed_action": _plain(action),
@@ -145,6 +153,13 @@ def _bits(mask, count):
 class MaskableMarketMakingEnv(MarketMakingEnv):
     """A discrete encoding for maskable PPO: `(hold or quote, bid, ask, bid size, ask size)`.
 
+    With `hedge_actions` in the configuration a sixth value is the hedge: 0 is no hedge, and
+    `i + 1` hedges with the grid's size `i`. A hedge reduces the delivered position with a
+    marketable order at the observed touch, on the side that reduces it, as the kernel's
+    `HedgeActions::MarketableAtTouch` states; it replaces the resting orders, so when the sixth
+    value is above 0 the first five are not read. Its mask comes from `hedge_mask`, which
+    allows no hedge at a flat position or larger than the position, so only 0 is open there.
+
     Requires the mask policy, so a trainer that leaves the mask ends the environment.
     """
 
@@ -152,9 +167,10 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
         if config["invalid_action"] != "mask":
             raise ValueError("the maskable encoding needs the mask policy")
         super().__init__(config, rows, expected_spec, seed)
-        self.action_space = gym.spaces.MultiDiscrete(
-            [2, self._offsets, self._offsets, self._sizes, self._sizes]
-        )
+        dims = [2, self._offsets, self._offsets, self._sizes, self._sizes]
+        if self._hedge:
+            dims.append(1 + self._sizes)
+        self.action_space = gym.spaces.MultiDiscrete(dims)
 
     def action_masks(self):
         """The admissible values per dimension, concatenated.
@@ -171,15 +187,23 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
         parts = [np.asarray([True, quote], dtype=bool)]
         for part in (bid, ask, size, size):
             parts.append(part if part.any() else np.ones_like(part))
+        if self._hedge:
+            # No hedge is always allowed.
+            parts.append(
+                np.concatenate(([True], _bits(self._hedge_mask, self._sizes)))
+            )
         return np.concatenate(parts)
 
     def _decode(self, action):
         values = [int(value) for value in np.asarray(action).ravel()]
-        if len(values) != 5:
-            raise ValueError(f"an action has 5 values, not {len(values)}")
+        expected = 6 if self._hedge else 5
+        if len(values) != expected:
+            raise ValueError(f"an action has {expected} values, not {len(values)}")
+        if self._hedge and values[5] > 0:
+            return "hedge", (values[5] - 1,)
         if values[0] == 0:
             return "hold", ()
-        return "quote", tuple(values[1:])
+        return "quote", tuple(values[1:5])
 
 
 class BoxMarketMakingEnv(MarketMakingEnv):
@@ -189,13 +213,22 @@ class BoxMarketMakingEnv(MarketMakingEnv):
     offset, the ask offset, the bid size and the ask size. A Box cannot state a mask, so
     this requires the reject policy: what falls outside the mask is a charged hold. A value
     that is not finite or is out of range is an error and ends nothing but this call.
+
+    With `hedge_actions` in the configuration a sixth value above zero asks for a hedge, of the
+    grid's size at bin `(2 v - 1)` of the sizes, and the first five are not read; at or below
+    zero they decide as without it. `2 v - 1` maps `(0, 1]` onto `(-1, 1]`, where the bin rule
+    of the quote sizes applies, so a `v` just above zero is the smallest size and, with two
+    sizes, `v` of 0.5 or more is the largest. A hedge reduces the delivered position on the side
+    that reduces it; one outside `hedge_mask` (a flat position, or a size above the position) is
+    a charged hold, as anything outside the mask is.
     """
 
     def __init__(self, config, rows, expected_spec=None, seed=0):
         if config["invalid_action"] != "reject":
             raise ValueError("the continuous encoding needs the reject policy")
         super().__init__(config, rows, expected_spec, seed)
-        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
+        shape = (6,) if self._hedge else (5,)
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=shape, dtype=np.float32)
 
     @staticmethod
     def _bin(value, count):
@@ -203,11 +236,14 @@ class BoxMarketMakingEnv(MarketMakingEnv):
 
     def _decode(self, action):
         values = [float(value) for value in np.asarray(action).ravel()]
-        if len(values) != 5:
-            raise ValueError(f"an action has 5 values, not {len(values)}")
+        expected = 6 if self._hedge else 5
+        if len(values) != expected:
+            raise ValueError(f"an action has {expected} values, not {len(values)}")
         for value in values:
             if not math.isfinite(value) or abs(value) > 1.0:
                 raise ValueError(f"an action value of {value} is not in [-1, 1]")
+        if self._hedge and values[5] > 0.0:
+            return "hedge", (self._bin(2.0 * values[5] - 1.0, self._sizes),)
         if values[0] <= 0.0:
             return "hold", ()
         return "quote", (
@@ -230,6 +266,8 @@ class ResidualMarketMakingEnv(MarketMakingEnv):
     def __init__(self, config, rows, expected_spec=None, seed=0):
         if config.get("residual") is None:
             raise ValueError("a residual environment needs a residual configuration")
+        if config.get("hedge_actions", False):
+            raise ValueError("a residual environment takes no hedge actions: drop hedge_actions")
         super().__init__(config, rows, expected_spec, seed)
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 

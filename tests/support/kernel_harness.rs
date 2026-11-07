@@ -395,6 +395,20 @@ pub fn run_engine(sc: &Scenario) -> EngineRun {
             let engine = BacktestEngine::with_fill_model(config, strategy, data, model).unwrap();
             finish_engine(sc, engine, log)
         }
+        KernelFillModel::QueuePositionRational {
+            lots,
+            per_ms,
+            min_queue_ms,
+        } => {
+            // Exact only when `per_ms` divides the lot volume in a Decimal.
+            let rate = (Decimal::from(lots) * sc.cfg.lot_size)
+                .checked_div(Decimal::from(per_ms))
+                .unwrap()
+                .normalize();
+            let model = QueuePositionFillModel::with_min_queue_time(rate, min_queue_ms);
+            let engine = BacktestEngine::with_fill_model(config, strategy, data, model).unwrap();
+            finish_engine(sc, engine, log)
+        }
         _ => finish_engine(sc, BacktestEngine::new(config, strategy, data), log),
     }
 }

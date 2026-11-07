@@ -34,8 +34,9 @@
 //! With [`RlConfig::with_hedge_actions`], [`RlAction::Hedge`] reduces the delivered
 //! position with a marketable limit order at the observed touch, in the one instrument the
 //! kernel holds, as [`HedgeActions::MarketableAtTouch`] states. Its size comes from the
-//! order size grid and is never larger than that position, as [`RlEnv::hedge_mask`]
-//! shows. It is an order like any other: the kernel's admission, its gate and its risk
+//! order size grid and is never larger than that position at the decision, as
+//! [`RlEnv::hedge_mask`] shows. With latency, a resting order can still fill before the
+//! hedge replaces it, so the hedge can then take the position past flat. It is an order like any other: the kernel's admission, its gate and its risk
 //! limits decide on it whatever the mask said, it fills under the kernel's fill model at
 //! its own price with the kernel's fee rate, and its cost reaches the reward only through
 //! the kernel's ledger. A hedge in another instrument is not modelled.

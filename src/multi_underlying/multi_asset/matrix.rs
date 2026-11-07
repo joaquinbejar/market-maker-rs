@@ -137,7 +137,8 @@ impl Matrix {
         }
     }
 
-    /// The principal square root of a symmetric positive semidefinite matrix.
+    /// The principal square root of a symmetric positive semidefinite matrix,
+    /// with the negative eigenvalue it set to zero past the floor of `tolerance`.
     ///
     /// An eigenvalue below zero by no more than `tolerance`, relative to the
     /// largest entry and per row, is rounding noise of a singular matrix and
@@ -146,20 +147,42 @@ impl Matrix {
     /// the size of the matrix times that, so a fixed floor would refuse large
     /// singular matrices for their rounding alone.
     ///
+    /// `band` is for a matrix that is positive semidefinite in exact arithmetic
+    /// and whose entries the caller knows to within a wider bound: that bound,
+    /// relative to the largest entry, so that `band` per row is the most rounding
+    /// can have moved an eigenvalue. An eigenvalue below the floor of `tolerance`
+    /// and above that of `band` counts as zero too, and the most negative such is
+    /// returned. With `band` equal to `tolerance` nothing is returned.
+    ///
     /// # Errors
     ///
-    /// Returns [`MMError::InvalidConfiguration`] if an eigenvalue is more
-    /// negative than that, and whatever [`Matrix::symmetric_eigen`] returns.
-    pub(super) fn principal_sqrt(&self, tolerance: f64) -> MMResult<Self> {
+    /// Returns [`MMError::InvalidConfiguration`] if an eigenvalue is below the
+    /// floor of `band`, or of `tolerance` when that is wider, and whatever
+    /// [`Matrix::symmetric_eigen`] returns.
+    pub(super) fn principal_sqrt(
+        &self,
+        tolerance: f64,
+        band: f64,
+    ) -> MMResult<(Self, Option<Clipped>)> {
         let (values, vectors) = self.symmetric_eigen()?;
-        let floor = -tolerance * self.size.max(1) as f64 * self.max_abs();
+        let rows = self.size.max(1) as f64;
+        let largest = self.max_abs();
+        let floor = -tolerance * rows;
+        let band_floor = -band.max(tolerance) * rows;
+        let lowest = values.iter().copied().fold(f64::INFINITY, f64::min);
+        if lowest < band_floor * largest {
+            return Err(MMError::InvalidConfiguration(format!(
+                "matrix is not positive semidefinite: eigenvalue {lowest} is below the floor {}",
+                band_floor * largest
+            )));
+        }
+        let clipped = (lowest < floor * largest).then(|| Clipped {
+            eigenvalue: lowest / largest,
+            floor,
+            band: band_floor,
+        });
         let mut root = Self::zeros(self.size);
         for (index, value) in values.iter().enumerate() {
-            if *value < floor {
-                return Err(MMError::InvalidConfiguration(format!(
-                    "matrix is not positive semidefinite: eigenvalue {value}"
-                )));
-            }
             let scale = value.max(0.0).sqrt();
             for row in 0..self.size {
                 for column in 0..self.size {
@@ -168,8 +191,25 @@ impl Matrix {
                 }
             }
         }
-        Ok(root)
+        Ok((root, clipped))
     }
+}
+
+/// A negative eigenvalue that [`Matrix::principal_sqrt`] set to zero below the
+/// floor of its `tolerance`. Each value is relative to the largest entry of the
+/// matrix.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(
+    not(all(feature = "options", feature = "margin")),
+    allow(dead_code, reason = "only the option quoter reports a clip")
+)]
+pub(super) struct Clipped {
+    /// The most negative eigenvalue.
+    pub(super) eigenvalue: f64,
+    /// The floor of the tolerance, which it is below.
+    pub(super) floor: f64,
+    /// The floor of the band, which it is above.
+    pub(super) band: f64,
 }
 
 #[cfg(test)]
@@ -191,7 +231,7 @@ mod tests {
         indefinite.set(1, 1, 1.0 - 1e-6);
         indefinite.set(0, 1, 1.0 + 1e-6);
         indefinite.set(1, 0, 1.0 + 1e-6);
-        assert!(indefinite.principal_sqrt(1e-12).is_err());
+        assert!(indefinite.principal_sqrt(1e-12, 1e-12).is_err());
     }
 
     #[test]
@@ -202,12 +242,81 @@ mod tests {
             diagonal.set(1, 1, 1.0);
             diagonal.set(2, 2, 1.0);
             diagonal.set(3, 3, eigenvalue);
-            diagonal.principal_sqrt(1e-12)
+            diagonal.principal_sqrt(1e-12, 1e-12)
         };
         // Four rows, so a floor of 4e-12 of the largest entry.
-        let within = at(-3e-12).unwrap();
+        let (within, clipped) = at(-3e-12).unwrap();
+        assert_eq!(clipped, None);
         assert_eq!(within.at(3, 3), 0.0);
         assert!(at(-5e-12).is_err());
+    }
+
+    /// Three eigenvalues of 2 and one given, so the largest entry is 2.
+    fn with_eigenvalue(eigenvalue: f64) -> Matrix {
+        let mut diagonal = Matrix::zeros(4);
+        for index in 0..3 {
+            diagonal.set(index, index, 2.0);
+        }
+        diagonal.set(3, 3, eigenvalue);
+        diagonal
+    }
+
+    #[test]
+    fn test_a_negative_eigenvalue_past_the_floor_and_within_the_band_is_clipped_and_returned() {
+        // Floors of 4e-12 and 4e-11 per row of four, of the largest entry of 2.
+        let (root, clipped) = with_eigenvalue(-2e-11)
+            .principal_sqrt(1e-12, 1e-11)
+            .unwrap();
+        assert_eq!(root.at(3, 3), 0.0);
+        assert_eq!(root.at(0, 0), 2.0_f64.sqrt());
+        assert_eq!(
+            clipped,
+            Some(Clipped {
+                eigenvalue: -1e-11,
+                floor: -4e-12,
+                band: -4e-11,
+            })
+        );
+        // The same matrix without the band is refused.
+        assert!(
+            with_eigenvalue(-2e-11)
+                .principal_sqrt(1e-12, 1e-12)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_a_negative_eigenvalue_past_the_band_is_refused_and_named() {
+        let error = with_eigenvalue(-1e-10)
+            .principal_sqrt(1e-12, 1e-11)
+            .unwrap_err();
+        let MMError::InvalidConfiguration(message) = error else {
+            panic!("{error:?}");
+        };
+        assert!(
+            message.contains(&format!("eigenvalue {}", -1e-10_f64)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("floor {}", -8e-11_f64)),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_no_eigenvalue_past_the_floor_returns_no_clip() {
+        let band = 1e-6;
+        let (_, definite) = matrix(&[&[4.0, 1.0], &[1.0, 3.0]])
+            .principal_sqrt(1e-12, band)
+            .unwrap();
+        assert_eq!(definite, None);
+        let (_, singular) = matrix(&[&[1.0, 1.0], &[1.0, 1.0]])
+            .principal_sqrt(1e-12, band)
+            .unwrap();
+        assert_eq!(singular, None);
+        // Negative, but within the floor of the tolerance: rounding as before.
+        let (_, within) = with_eigenvalue(-7e-12).principal_sqrt(1e-12, band).unwrap();
+        assert_eq!(within, None);
     }
 
     #[test]
@@ -222,7 +331,7 @@ mod tests {
                 low_rank.set(i, j, a.0 * b.0 + a.1 * b.1);
             }
         }
-        let root = low_rank.principal_sqrt(1e-12).unwrap();
+        let (root, _) = low_rank.principal_sqrt(1e-12, 1e-12).unwrap();
         let scale = low_rank.max_abs();
         for i in 0..size {
             for j in 0..size {
@@ -249,8 +358,8 @@ mod tests {
     #[test]
     fn test_matrix_sqrt_of_two_by_two_matches_closed_form() {
         // sqrt(M) = (M + sqrt(det) I) / sqrt(trace + 2 sqrt(det)).
-        let root = matrix(&[&[4.0, 1.0], &[1.0, 3.0]])
-            .principal_sqrt(1e-12)
+        let (root, _) = matrix(&[&[4.0, 1.0], &[1.0, 3.0]])
+            .principal_sqrt(1e-12, 1e-12)
             .unwrap();
         let det_root = 11.0_f64.sqrt();
         let norm = (7.0 + 2.0 * det_root).sqrt();
@@ -261,8 +370,8 @@ mod tests {
 
     #[test]
     fn test_matrix_sqrt_of_singular_matrix_keeps_null_direction() {
-        let root = matrix(&[&[1.0, 1.0], &[1.0, 1.0]])
-            .principal_sqrt(1e-12)
+        let (root, _) = matrix(&[&[1.0, 1.0], &[1.0, 1.0]])
+            .principal_sqrt(1e-12, 1e-12)
             .unwrap();
         let half_root = 1.0 / 2.0_f64.sqrt();
         for (i, j) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
@@ -273,7 +382,7 @@ mod tests {
     #[test]
     fn test_matrix_sqrt_of_indefinite_matrix_is_refused() {
         let error = matrix(&[&[1.0, 2.0], &[2.0, 1.0]])
-            .principal_sqrt(1e-12)
+            .principal_sqrt(1e-12, 1e-12)
             .unwrap_err();
         assert!(matches!(error, MMError::InvalidConfiguration(_)));
     }

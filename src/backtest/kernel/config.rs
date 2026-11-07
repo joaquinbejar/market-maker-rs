@@ -22,6 +22,13 @@ const MANTISSA_LIMIT: u128 = 1 << 96;
 /// quanta from the kernel's latency stream exactly as the engine draws it
 /// in milliseconds; with `quantum_ns = 1_000_000` the kernel reproduces an
 /// engine run with the same delays in milliseconds.
+///
+/// As in the engine, messages due at a row's time run before the row is
+/// matched, an order matches only on rows after the one it becomes active
+/// on, and every quote cancels the resting orders first. So with rows every
+/// `Δ`, a quote on every row, and `submit_q` and `cancel_q` both exactly `Δ`
+/// with no jitter, no order ever fills: the cancel always lands on the first
+/// row the order could fill on. See [`crate::backtest::latency`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelLatency {
     /// Length of one quantum, in nanoseconds; at least 1.
@@ -129,11 +136,38 @@ pub enum KernelFillModel {
     /// cumulative fill, so an order can fill over several rows
     /// ([`super::ExecKind::PartialFill`]).
     ///
+    /// The rate is at least one lot per millisecond. When the rate times the
+    /// time between rows exceeds every touch, a crossed order fills whole on
+    /// the first row it can, exactly as [`KernelFillModel::Immediate`];
+    /// [`KernelFillModel::QueuePositionRational`] clears less.
+    ///
     /// [`QueuePositionFillModel`]: crate::backtest::QueuePositionFillModel
     QueuePosition {
         /// Volume cleared per millisecond in queue: positive, on the lot grid
         /// and at its normalised scale.
         rate: Decimal,
+        /// Milliseconds in queue before any fill.
+        min_queue_ms: u64,
+    },
+    /// The queue position model at a rate of `lots` lots every `per_ms`
+    /// milliseconds, which can be below one lot per millisecond. After `t`
+    /// milliseconds in queue the cleared volume is `floor(lots * t / per_ms)`
+    /// lots, computed from the order's entry to the queue, so no remainder is
+    /// lost between rows; the rest is as [`KernelFillModel::QueuePosition`].
+    ///
+    /// It equals the engine's [`QueuePositionFillModel`] at a rate of
+    /// `lots * lot_size / per_ms` per millisecond whenever that cleared
+    /// volume is a whole number of lots, and with `per_ms = 1` it equals
+    /// [`KernelFillModel::QueuePosition`] at `lots * lot_size`. Otherwise the
+    /// engine can fill a fraction of a lot, and the kernel fills the whole
+    /// lots below it.
+    ///
+    /// [`QueuePositionFillModel`]: crate::backtest::QueuePositionFillModel
+    QueuePositionRational {
+        /// Lots cleared every `per_ms` milliseconds in queue; at least 1.
+        lots: u64,
+        /// Milliseconds in which `lots` clear; at least 1.
+        per_ms: u64,
         /// Milliseconds in queue before any fill.
         min_queue_ms: u64,
     },
@@ -144,10 +178,14 @@ pub enum KernelFillModel {
 pub(super) enum ValidFill {
     /// [`KernelFillModel::Immediate`].
     Immediate,
-    /// [`KernelFillModel::QueuePosition`].
+    /// [`KernelFillModel::QueuePosition`] and
+    /// [`KernelFillModel::QueuePositionRational`].
     QueuePosition {
-        /// Lots cleared per millisecond.
+        /// Lots cleared every `per_ms` milliseconds.
         rate_lots: u64,
+        /// Milliseconds in which `rate_lots` clear; 1 for
+        /// [`KernelFillModel::QueuePosition`].
+        per_ms: u64,
         /// Milliseconds in queue before any fill.
         min_queue_ms: u64,
     },
@@ -290,6 +328,16 @@ impl KernelConfig {
             KernelFillModel::QueuePosition { rate, min_queue_ms } => {
                 w.u16(2);
                 w.decimal(rate);
+                w.u64(min_queue_ms);
+            }
+            KernelFillModel::QueuePositionRational {
+                lots,
+                per_ms,
+                min_queue_ms,
+            } => {
+                w.u16(3);
+                w.u64(lots);
+                w.u64(per_ms);
                 w.u64(min_queue_ms);
             }
         }
@@ -451,6 +499,24 @@ pub(super) fn validate(cfg: &KernelConfig, relax: Relax) -> MMResult<ValidatedCo
                 })?;
             ValidFill::QueuePosition {
                 rate_lots,
+                per_ms: 1,
+                min_queue_ms,
+            }
+        }
+        KernelFillModel::QueuePositionRational {
+            lots,
+            per_ms,
+            min_queue_ms,
+        } => {
+            if lots == 0 || per_ms == 0 {
+                return Err(config_error(format!(
+                    "fill rate must be at least one lot in at least one ms, got {lots} lots \
+                     per {per_ms} ms"
+                )));
+            }
+            ValidFill::QueuePosition {
+                rate_lots: lots,
+                per_ms,
                 min_queue_ms,
             }
         }
@@ -716,15 +782,17 @@ pub(super) fn capacity_need(
         .ok_or_else(overflow)?;
     let partial_reports_per_order = match fill_model {
         KernelFillModel::Immediate => 0,
-        KernelFillModel::QueuePosition { .. } => rows_within(
-            timestamps,
-            latency
-                .ns(latency
-                    .ack_q
-                    .checked_add(latency.jitter_q)
-                    .ok_or_else(overflow)?)
-                .ok_or_else(overflow)?,
-        )?,
+        KernelFillModel::QueuePosition { .. } | KernelFillModel::QueuePositionRational { .. } => {
+            rows_within(
+                timestamps,
+                latency
+                    .ns(latency
+                        .ack_q
+                        .checked_add(latency.jitter_q)
+                        .ok_or_else(overflow)?)
+                    .ok_or_else(overflow)?,
+            )?
+        }
     };
     Ok(CapacityNeed {
         obs,

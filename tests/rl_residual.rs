@@ -314,6 +314,8 @@ fn glft() -> GlftQuoter {
         volatility: dec!(5),
         size: dec!(1),
         session_start_ms: 0,
+        form: market_maker_rs::backtest::kernel::GlftForm::Exact,
+        counts: market_maker_rs::backtest::kernel::GlftCounts::default(),
     }
 }
 

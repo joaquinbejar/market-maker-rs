@@ -16,6 +16,8 @@ project follows [Semantic Versioning](https://semver.org/).
   #102, a freeze and a single holdout (`run.py`), a coverage diagnostic of the Hyperliquid
   capture's states, and a report (`report.py`). The rule reads diagnostics only. Synthetic data,
   apart from the capture's states in the coverage diagnostic; the results are on the issue.
+- The Python bridge builds against Python's stable ABI for 3.11 and loads on 3.11 and 3.12 (#284),
+  both tested; nothing else in it changes.
 - The out-of-sample comparison of #102 in `bridges/python/experiments/m4_05`: a design fixed
   before any run (`design.json`, with the change log of every amendment and what was seen when),
   the digests of its synthetic queue-reactive days (example `qr_days`), a runner for selection,
@@ -37,10 +39,18 @@ project follows [Semantic Versioning](https://semver.org/).
   funding not applied. It streams the files, keeps only thinned inputs and says what it keeps.
   Not evaluated: #90 (b) and (c), which need a data trajectory the replay does not expose; #77,
   #180 and #91 (b) do not apply to this capture. No data is in the repository.
+- Hedge actions in the Python bridge (#258): `"hedge_actions": true` in its configuration builds
+  the environment with `RlConfig::with_hedge_actions`, so its specification states
+  `HedgeActions::MarketableAtTouch`; off by default, a configuration keeps its specification and
+  fingerprint. The maskable encoding gains a sixth value, 0 for no hedge and `i + 1` for the
+  grid's size `i`, masked by `hedge_mask`; the continuous one a sixth value above zero for a
+  hedge, binned over the sizes, a hedge outside the mask being a charged hold. A hedge replaces
+  the resting orders, so the other values are then not read. A residual environment refuses the
+  flag, and a checkpoint loads only into an environment with the same one.
 - Hedge actions in the RL action space (feature `rl`, #247): with
   `RlConfig::with_hedge_actions`, `rl::RlAction::Hedge` reduces the delivered position with a
   marketable limit order at the observed touch, of a size from the order size grid and never
-  larger than that position, as `HedgeActions::MarketableAtTouch` states. `RlEnv::hedge_mask`
+  larger than that position at the decision, as `HedgeActions::MarketableAtTouch` states. `RlEnv::hedge_mask`
   and `Transition::hedge_mask` give the sizes allowed; a hedge outside them follows the
   declared `InvalidActionPolicy`, and `rl::ERR_HEDGE_REFUSED` marks one taken as a hold. It is
   an order like any other: the kernel's admission, gate and limits decide on it, and its cost
@@ -49,6 +59,26 @@ project follows [Semantic Versioning](https://semver.org/).
 - `backtest::evaluation::block_bootstrap` (#255): the harness's stationary block bootstrap of a
   mean over a daily series, the one `Experiment` gives on the mean daily net result and on the
   daily difference to a baseline, for runs that do not go through `Experiment`.
+- `backtest::kernel::quote_error_name` (feature `kernel`, #265): the name of the `MMError`
+  variant a strategy error's code stands for, the inverse of `quote_error_code`. The Python
+  bridge's `info["refused_because"]` now names a quote error by what it is (a strategy's error
+  by its variant, a strategy quote out of range, an action off the grid, or a hedge not available
+  at this decision) instead of reporting every one as off grid, a changed string for a caller
+  who matched on it.
+- GLFT quotes in the form the caller states (#264): `GLFTStrategy::exact_quotes` tells a
+  horizon over the matrix exponential's step cap apart, as `ExactQuotes::OverStepCap`, from a
+  failure; `calculate_optimal_quotes` keeps its error there. `GlftQuoter` (feature `kernel`)
+  quotes in a `GlftForm`: `Exact` as before, `ClosedForm`, or `ExactOrClosedForm`, which takes
+  the closed form only where the exact quote is over the cap. `GlftQuoter::counts` says how many
+  quotes each form gave, how often the exact one was over the cap, and which form gave the last,
+  so nothing is substituted silently and a run can tell a holding strategy from a failing one.
+  `GlftQuoter::new` and `with_form` build one. The Python bridge's GLFT baseline takes an
+  optional `form`, `exact` by default.
+- The Python bridge takes the kernel's rational queue position rate (#269):
+  `{"kind": "queue_position_rational", "lots": n, "per_ms": d, "min_queue_ms": m}` as its
+  `fill_model`, mapped to `KernelFillModel::QueuePositionRational`, refused at a zero `lots` or
+  `per_ms` as the kernel refuses it, and carried by the kernel's fingerprint that the bridge
+  reports. Existing configurations and their fingerprints are unchanged.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are
@@ -67,6 +97,13 @@ project follows [Semantic Versioning](https://semver.org/).
   synthetic regime changes on queue-reactive and Hawkes flow, with detection delay, false alarms,
   a labelled oracle, transfer between the simulators and a go or no-go rule fixed before the
   holdout, which says no-go here. No new public API, and nothing learned.
+- `KernelFillModel::QueuePositionRational { lots, per_ms, min_queue_ms }` (#267): the kernel's
+  queue position model at `lots` lots every `per_ms` milliseconds, so it can clear less than one
+  lot per millisecond. The cleared volume is the floor of `lots * t / per_ms` lots from the
+  order's entry to the queue, so no remainder is lost between rows; it equals the engine's
+  `QueuePositionFillModel` whenever that volume is a whole number of lots. `QueuePosition`, whose
+  floor is one lot per millisecond, now documents that it fills as `Immediate` when the rate
+  times the row interval exceeds every touch. Additive: the enum is `#[non_exhaustive]`.
 - `backtest::hyperliquid` (#214), behind `serde`: decoders for the three streams of the
   Hyperliquid "An Open Book" capture, a book replay, and conversions to `TopOfBook`,
   `MarketEvent`, `PriceSample`, `SizedEvent`, `QueueObservation`, `ReferenceObservation`,
@@ -545,9 +582,19 @@ project follows [Semantic Versioning](https://semver.org/).
   rule) are exact near the `Decimal` bounds instead of saturating the sum,
   and every book and trade flow imbalance is invariant under a common
   scale of its sides, even when their sum is not representable.
+- Documented, and pinned by tests in the engine and the kernel, that a submit and cancel latency
+  of exactly one tick interval never fills a strategy that quotes on every tick (#268): events
+  due at a tick's time run before its matching, an order is eligible only on ticks after it
+  becomes active, and each quote cancels the resting orders, so the cancel always comes first.
+  One millisecond less and every order fills. No behaviour changes.
 
 ### Fixed
 
+- Example `hyperliquid_validation` (#262) samples the walk-forward's mid at each change of the
+  touch, from the replay's tops, instead of only when the mid changed. A touch that stays put
+  while its sizes change is a live book, so its mid is a sample; read as a silence, it failed the
+  calibration's gap check on the capture. `ReplayOutput::prices` now says that a stretch without
+  an entry is not a silence of the book.
 - `MarginLedgerAccountant` adds a replayed fill's base fee only once. A duplicate
   used to add it again, to `base_fees` and against the position; the engine never
   posts twice, so this reached direct callers only (#195).
@@ -566,6 +613,18 @@ project follows [Semantic Versioning](https://semver.org/).
   left out of the cancelled responses instead of failing every later
   call, and an order re-mapped by a concurrent modify is cancelled through
   its current book id (#146).
+- `OptionQuoter` no longer fails a round for the rounding of the correlation it derives
+  between contracts (#250). That correlation is positive semidefinite in exact arithmetic,
+  but where a contract's delta and vega nearly offset under a factor correlation near -1, its
+  rounding could leave an eigenvalue past the floor of `1e-12` per row, in about one random
+  book of 16 contracts in two thousand. A negative eigenvalue down to `1e-12 + min(5.3e-15 k,
+  2)` per row, relative to the largest entry, is now set to zero, where `k` is the round's
+  largest ratio of a contract's variance with every term taken positive to its variance: by
+  Weyl's inequality that bounds six roundings per covariance amplified by that cancellation,
+  and the old floor covers the rest of the rounding and the eigendecomposition.
+  `OptionQuoteRound::clipped_eigenvalue` reports one set to zero below the old floor, as a
+  `ClippedEigenvalue` with both floors. An eigenvalue below the round's band still fails the
+  round, and a correlation supplied to `MultiAssetModel::new` is still held to the old floor.
 
 ### Breaking
 
@@ -574,6 +633,8 @@ project follows [Semantic Versioning](https://semver.org/).
   `rl::RlConfig` gains `hedge_actions`, and `rl::HedgeActions` gains `MarketableAtTouch`.
   Behaviour with hedge actions off is unchanged. The Python bridge is built for action
   space 2.
+- `backtest::kernel::GlftQuoter` (#264) gains the public fields `form` and `counts`, so a struct
+  literal must name them; `GlftQuoter::new` sets the exact form and no counts, as before.
 - `margin-rs` 0.2, whose types are in this crate's public API (#97, #98). `options::settlement`
   now settles an option held in the ledger as a registered `OptionInstrument`, through
   `Ledger::settle_option`: `OptionPosition::new` takes the option's `InstrumentId` instead of a

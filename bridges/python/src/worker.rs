@@ -9,15 +9,16 @@ use market_maker_rs::backtest::evaluation::{
     Attribution, EvaluationInput, InventoryStats, attribute, inventory_stats, max_drawdown,
 };
 use market_maker_rs::backtest::kernel::{
-    ActionGrid, ActionMask, AvellanedaQuoter, GlftQuoter, KernelConfig, KernelDataset,
-    KernelFillModel, KernelLatency, KernelTick, QuoteSource,
+    ActionGrid, ActionMask, ActionStatus, AvellanedaQuoter, ERR_KERNEL_MISMATCH,
+    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, GlftCounts, GlftForm, GlftQuoter, KernelConfig,
+    KernelDataset, KernelFillModel, KernelLatency, KernelTick, QuoteSource, quote_error_name,
 };
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    EpisodeRecorder, FeatureVector, InvalidActionPolicy, ObservationScales, ResidualBounds,
-    ResidualDecision, ResidualEnv, ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId,
-    TerminalValuation, Transition,
+    ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED, EpisodeRecorder, FeatureVector, HedgeActions,
+    InvalidActionPolicy, ObservationScales, ResidualBounds, ResidualDecision, ResidualEnv,
+    ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId, TerminalValuation, Transition,
 };
 use market_maker_rs::strategy::glft::GLFTConfig;
 use serde::Deserialize;
@@ -42,6 +43,33 @@ pub const BUILT_FOR: (u16, u16, u16, u16) = (1, 2, 1, 1);
 
 fn known_versions(id: &SpecId) -> bool {
     (id.observation, id.action, id.reward, id.episode) == BUILT_FOR
+}
+
+/// Why an action was not applied, as `info["refused_because"]` reports it; `None` when it
+/// was. A kernel refusal is named by its reason. A quote error says what its code stands
+/// for: a strategy's error by its `MMError` variant, a strategy quote the kernel cannot
+/// take, an action off the grid, or a hedge not available at this decision; none of them
+/// reads as another.
+pub fn refused_because(status: ActionStatus) -> Option<String> {
+    match status {
+        ActionStatus::Applied => None,
+        ActionStatus::Rejected(reason) => Some(format!("{reason:?}")),
+        ActionStatus::QuoteError(code) => Some(match code {
+            ERR_ACTION_OFF_GRID => format!("off grid (code {})", code.0),
+            ERR_HEDGE_REFUSED => format!("hedge not available (code {})", code.0),
+            ERR_PRICE_OUT_OF_RANGE => {
+                format!("strategy quote price out of range (code {})", code.0)
+            }
+            ERR_SIZE_OUT_OF_RANGE => {
+                format!("strategy quote size out of range (code {})", code.0)
+            }
+            ERR_KERNEL_MISMATCH => format!("strategy quote for another kernel (code {})", code.0),
+            _ => match quote_error_name(code) {
+                Some(name) => format!("strategy error: {name} (code {})", code.0),
+                None => format!("quote error (code {})", code.0),
+            },
+        }),
+    }
 }
 
 /// Why the bridge refused or stopped.
@@ -98,6 +126,16 @@ pub enum FillConfig {
     QueuePosition {
         /// Lots cleared per millisecond, as a decimal string.
         rate: String,
+        /// Milliseconds in the queue before any fill.
+        min_queue_ms: u64,
+    },
+    /// The kernel's queue position model at `lots` lots every `per_ms` milliseconds,
+    /// which can be below one lot per millisecond. The kernel refuses either at 0.
+    QueuePositionRational {
+        /// Lots cleared every `per_ms` milliseconds.
+        lots: u64,
+        /// Milliseconds in which `lots` clear.
+        per_ms: u64,
         /// Milliseconds in the queue before any fill.
         min_queue_ms: u64,
     },
@@ -190,7 +228,34 @@ pub enum BaselineConfig {
         volatility: String,
         /// Session start, in milliseconds of the rows' clock.
         session_start_ms: u64,
+        /// Which quotes: `exact` (the default), `closed_form`, or `exact_or_closed_form`,
+        /// which takes the closed form only where the exact quote is over its step cap.
+        #[serde(default)]
+        form: GlftFormConfig,
     },
+}
+
+/// [`GlftForm`] in the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlftFormConfig {
+    /// [`GlftForm::Exact`].
+    #[default]
+    Exact,
+    /// [`GlftForm::ClosedForm`].
+    ClosedForm,
+    /// [`GlftForm::ExactOrClosedForm`].
+    ExactOrClosedForm,
+}
+
+impl From<GlftFormConfig> for GlftForm {
+    fn from(form: GlftFormConfig) -> Self {
+        match form {
+            GlftFormConfig::Exact => Self::Exact,
+            GlftFormConfig::ClosedForm => Self::ClosedForm,
+            GlftFormConfig::ExactOrClosedForm => Self::ExactOrClosedForm,
+        }
+    }
 }
 
 /// A residual policy over a classical strategy, in place of the action grid.
@@ -251,6 +316,10 @@ pub struct BridgeConfig {
     /// A residual policy, which then takes no action on the grid.
     #[serde(default)]
     pub residual: Option<ResidualConfig>,
+    /// Whether hedge actions exist (`RlAction::Hedge`, `HedgeActions::MarketableAtTouch`).
+    /// Off by default, which keeps a configuration's specification and fingerprint.
+    #[serde(default)]
+    pub hedge_actions: bool,
 }
 
 fn decimal(what: &str, text: &str) -> Result<Decimal, BridgeError> {
@@ -279,6 +348,15 @@ impl BridgeConfig {
                 rate: decimal("fill rate", rate)?,
                 min_queue_ms: *min_queue_ms,
             },
+            FillConfig::QueuePositionRational {
+                lots,
+                per_ms,
+                min_queue_ms,
+            } => KernelFillModel::QueuePositionRational {
+                lots: *lots,
+                per_ms: *per_ms,
+                min_queue_ms: *min_queue_ms,
+            },
         };
         let mut kernel = KernelConfig::new(
             decimal("tick_size", &self.tick_size)?,
@@ -304,6 +382,12 @@ impl BridgeConfig {
     }
 
     fn rl(&self) -> Result<RlConfig, BridgeError> {
+        if self.hedge_actions && self.residual.is_some() {
+            return Err(BridgeError::Refused(
+                "hedge_actions with a residual policy: a residual policy takes no hedge action"
+                    .to_string(),
+            ));
+        }
         let s = &self.scales;
         let scales = ObservationScales {
             spread_ticks: decimal("spread_ticks", &s.spread_ticks)?,
@@ -321,12 +405,17 @@ impl BridgeConfig {
             TerminalConfig::Mark => TerminalValuation::MarkAtLastMid,
             TerminalConfig::Close => TerminalValuation::CloseAtTouch,
         };
-        Ok(RlConfig::new(scales, decimal("f32_unit", &self.f32_unit)?)
+        let config = RlConfig::new(scales, decimal("f32_unit", &self.f32_unit)?)
             .with_invalid_action(
                 policy,
                 decimal("invalid_action_penalty", &self.invalid_action_penalty)?,
             )
-            .with_terminal(terminal))
+            .with_terminal(terminal);
+        Ok(if self.hedge_actions {
+            config.with_hedge_actions()
+        } else {
+            config
+        })
     }
 }
 
@@ -341,6 +430,8 @@ pub struct EnvInfo {
     pub offsets: usize,
     /// Sizes.
     pub sizes: usize,
+    /// Whether hedge actions exist, as the specification states.
+    pub hedge_actions: bool,
     /// Fingerprint of the kernel's configuration.
     pub kernel_fingerprint: u128,
     /// Digest of the dataset.
@@ -356,6 +447,8 @@ pub struct ResetReply {
     pub observation: FeatureVector,
     /// What it may do.
     pub mask: ActionMask,
+    /// The hedge sizes it may take, as bits over the sizes; 0 without hedge actions.
+    pub hedge_mask: u64,
     /// The data has no decision at all.
     pub done: bool,
 }
@@ -425,6 +518,7 @@ trait Driver {
     fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String>;
     fn observe(&self, state: &State) -> Result<FeatureVector, String>;
     fn mask(&self, state: &State) -> ActionMask;
+    fn hedge_mask(&self, state: &State) -> u64;
     fn step(
         &mut self,
         state: &mut State,
@@ -497,6 +591,10 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
         RlEnv::mask(self, state)
     }
 
+    fn hedge_mask(&self, state: &State) -> u64 {
+        RlEnv::hedge_mask(self, state)
+    }
+
     fn step(
         &mut self,
         state: &mut State,
@@ -543,6 +641,10 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
 
     fn mask(&self, state: &State) -> ActionMask {
         self.env().mask(state)
+    }
+
+    fn hedge_mask(&self, state: &State) -> u64 {
+        self.env().hedge_mask(state)
     }
 
     fn step(
@@ -598,6 +700,7 @@ fn answer<D: Driver>(
                     let reply = ResetReply {
                         observation: env.observe(&fresh)?,
                         mask: env.mask(&fresh),
+                        hedge_mask: env.hedge_mask(&fresh),
                         done: fresh.is_done(),
                     };
                     episode = Some((fresh, recorder));
@@ -654,6 +757,7 @@ fn serve_residual<S: QuoteSource + Clone>(
             features: shape.features,
             offsets: shape.bid_offsets,
             sizes: shape.sizes,
+            hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
             kernel_fingerprint: env.env().kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,
@@ -734,6 +838,7 @@ fn parse_baseline(baseline: &BaselineConfig, lot_size: &str) -> Result<Baseline,
             min_spread,
             volatility,
             session_start_ms,
+            form,
         } => {
             let lot = decimal("lot_size", lot_size)?;
             let model = GLFTConfig::new(
@@ -751,6 +856,8 @@ fn parse_baseline(baseline: &BaselineConfig, lot_size: &str) -> Result<Baseline,
                 volatility: decimal("volatility", volatility)?,
                 size: lot,
                 session_start_ms: *session_start_ms,
+                form: (*form).into(),
+                counts: GlftCounts::default(),
             }))
         }
     }
@@ -818,6 +925,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
             features: shape.features,
             offsets: shape.bid_offsets,
             sizes: shape.sizes,
+            hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
             kernel_fingerprint: env.kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,

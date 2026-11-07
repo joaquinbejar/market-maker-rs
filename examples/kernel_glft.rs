@@ -55,12 +55,7 @@ fn main() -> MMResult<()> {
     }
     let data = KernelDataset::from_ticks(&ticks, &cfg)?;
     let kernel: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data)?;
-    let quoter = GlftQuoter {
-        config: glft,
-        volatility: sigma,
-        size: dec!(1),
-        session_start_ms: 0,
-    };
+    let quoter = GlftQuoter::new(glft, sigma, dec!(1), 0);
     let mut adapter = QuoteAdapter::new(quoter, &kernel, dec!(1))?;
 
     let mut s = kernel.reset(1);

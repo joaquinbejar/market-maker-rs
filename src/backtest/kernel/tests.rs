@@ -981,6 +981,8 @@ fn glft(size: Decimal, lot: Decimal, start: u64) -> GlftQuoter {
         volatility: dec!(1684.7),
         size,
         session_start_ms: start,
+        form: crate::backtest::kernel::GlftForm::Exact,
+        counts: crate::backtest::kernel::GlftCounts::default(),
     }
 }
 
@@ -1738,4 +1740,197 @@ fn test_decode_stamp_bound_depends_on_the_fill_model() {
     let mut t = s;
     t.stamp_seq = 3 * created + s.counters().venue_fills + 1;
     refused(&k, &t, "stamp_seq");
+}
+
+#[test]
+fn test_quote_error_name_inverts_quote_error_code_for_every_variant() {
+    let errors = [
+        MMError::InvalidConfiguration(String::new()),
+        MMError::InvalidMarketState(String::new()),
+        MMError::NumericalError(String::new()),
+        MMError::InvalidPositionUpdate(String::new()),
+        MMError::InvalidQuoteGeneration(String::new()),
+        MMError::InvalidTimestamp(String::new()),
+        MMError::ConnectionError(String::new()),
+        MMError::UnsupportedAction {
+            action: Action::Buy,
+        },
+        MMError::LockPoisoned(String::new()),
+        MMError::UnsupportedContract {
+            reason: String::new(),
+        },
+        MMError::PriceUnderflow,
+        MMError::FillNotBooked(String::new()),
+        MMError::FillBookedCheckFailed(String::new()),
+        MMError::GreeksMissFill,
+        MMError::QuotingHalted(String::new()),
+    ];
+    let mut codes = Vec::new();
+    for error in &errors {
+        let code = quote_error_code(error);
+        let debug = format!("{error:?}");
+        let variant = debug.split(['(', ' ', '{']).next().unwrap();
+        assert_eq!(quote_error_name(code), Some(variant), "{debug}");
+        codes.push(code.0);
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    assert_eq!(codes.len(), errors.len());
+    for code in [0, 16, 100, 101, 102, 200] {
+        assert_eq!(quote_error_name(ErrCode(code)), None);
+    }
+}
+
+/// Venue fills of a run on rows every 10 ms whose ask sits at a bid of 14,
+/// with a quote on the first row and then on every row (`requote`) or never
+/// again, under the given submit and cancel delays in milliseconds.
+fn fills_with_latency(submit_ms: u64, cancel_ms: u64, requote: bool) -> u64 {
+    let cfg = config(KernelLatency::zero(MS).with_delays(0, submit_ms, cancel_ms, 0));
+    let rows = (0..8).map(|i| tick(1000 + 10 * i, 12, 14)).collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let actions: Vec<KernelAction> = (0..8)
+        .map(|i| {
+            if i == 0 || requote {
+                quote(14, 20)
+            } else {
+                KernelAction::Hold
+            }
+        })
+        .collect();
+    let (s, _) = drive(&k, &actions);
+    s.counters().venue_fills
+}
+
+#[test]
+fn test_kernel_latency_of_exactly_one_row_never_fills_when_every_row_requotes() {
+    // Events due at a row's time run before its matching, and an order is
+    // matched only on rows after the one it becomes active on, so the cancel
+    // of the next quote always lands first.
+    assert_eq!(fills_with_latency(10, 10, true), 0);
+    // One millisecond less and every order fills on the row it reaches.
+    assert_eq!(fills_with_latency(9, 9, true), 7);
+    // Without the requote the order rests and fills on the row after.
+    assert_eq!(fills_with_latency(10, 10, false), 1);
+}
+
+fn rational_config(lots: u64, per_ms: u64, min_queue_ms: u64) -> KernelConfig {
+    config(KernelLatency::zero(MS)).with_fill_model(KernelFillModel::QueuePositionRational {
+        lots,
+        per_ms,
+        min_queue_ms,
+    })
+}
+
+/// `(ms after the first row, kind, last, cum)` of order 1's fills.
+fn timed_fills(events: &[KernelEvent]) -> Vec<(u64, ExecKind, u64, u64)> {
+    reports(events, false)
+        .iter()
+        .filter(|r| r.order_id == 1 && matches!(r.kind, ExecKind::PartialFill | ExecKind::Fill))
+        .map(|r| (r.ts_ns / MS - 1000, r.kind, r.last, r.cum))
+        .collect()
+}
+
+#[test]
+fn test_queue_model_rational_rate_below_one_lot_per_row_fills_over_several_rows() {
+    // 1 lot every 25 ms on rows every 10 ms that trade through the bid: 0.4
+    // of a lot per row. Floors per row would never fill; the floor of the
+    // total from the queue entry fills at 30, 50 and 80 ms.
+    let cfg = rational_config(1, 25, 0);
+    let rows = (0..10)
+        .map(|i| lots_tick(1000 + 10 * i, 13, 1, 14, 1))
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let (s, events) = drive(&k, &[bid_at(15, 3)]);
+    assert_eq!(
+        timed_fills(&events),
+        vec![
+            (30, ExecKind::PartialFill, 1, 1),
+            (50, ExecKind::PartialFill, 1, 2),
+            (80, ExecKind::Fill, 1, 3),
+        ]
+    );
+    assert_eq!(s.counters().venue_fills, 3);
+    // The same order under immediate fill is whole on the first row.
+    let immediate = config(KernelLatency::zero(MS));
+    let rows = (0..10)
+        .map(|i| lots_tick(1000 + 10 * i, 13, 1, 14, 1))
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &immediate).unwrap();
+    let k = QueueKernel::new(&immediate, &data).unwrap();
+    let (_, events) = drive(&k, &[bid_at(15, 3)]);
+    assert_eq!(timed_fills(&events), vec![(10, ExecKind::Fill, 3, 3)]);
+}
+
+#[test]
+fn test_queue_model_rational_counts_the_touch_ahead_and_the_minimum_time() {
+    // 2 lots every 5 ms at the touch, 3 lots ahead, nothing before 10 ms:
+    // floor(2t/5) clears 2 at 5 ms (held by the minimum), 4 at 10 ms (1
+    // beyond the touch) and 6 at 15 ms (3 beyond).
+    let cfg = rational_config(2, 5, 10);
+    let rows = (0..4)
+        .map(|i| lots_tick(1000 + 5 * i, 14, 1, 15, 3))
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let (_, events) = drive(&k, &[bid_at(15, 4)]);
+    assert_eq!(
+        timed_fills(&events),
+        vec![
+            (10, ExecKind::PartialFill, 1, 1),
+            (15, ExecKind::PartialFill, 2, 3),
+        ]
+    );
+}
+
+#[test]
+fn test_queue_model_rational_per_ms_one_is_the_queue_position_model() {
+    let rows = || {
+        vec![
+            lots_tick(1000, 13, 1, 17, 1),
+            lots_tick(1001, 14, 1, 15, 1),
+            lots_tick(1002, 14, 1, 15, 1),
+            lots_tick(1003, 14, 1, 15, 5),
+            lots_tick(1005, 13, 1, 14, 9),
+            lots_tick(1017, 13, 1, 14, 1),
+        ]
+    };
+    let run = |cfg: KernelConfig| {
+        let data = KernelDataset::from_kernel_ticks(rows(), &cfg).unwrap();
+        let k = QueueKernel::new(&cfg, &data).unwrap();
+        let (s, events) = drive(&k, &[bid_at(15, 10)]);
+        (s.counters().venue_fills, timed_fills(&events))
+    };
+    let whole = queue_config(KernelLatency::zero(MS), dec!(2), 0);
+    let rational = rational_config(2, 1, 0);
+    let (fills, history) = run(whole.clone());
+    assert!(fills > 1, "partial fills to compare");
+    assert_eq!(run(rational.clone()), (fills, history));
+    // Different models, different configurations, and every field counts.
+    assert_ne!(whole.fingerprint(), rational.fingerprint());
+    let print = |lots, per_ms, min| rational_config(lots, per_ms, min).fingerprint();
+    assert_ne!(print(1, 25, 0), print(1, 50, 0));
+    assert_ne!(print(1, 25, 0), print(2, 25, 0));
+    assert_ne!(print(1, 25, 0), print(1, 25, 5));
+}
+
+#[test]
+fn test_queue_model_rational_validation_refuses_zero_lots_or_period() {
+    let refused = |lots: u64, per_ms: u64| {
+        let cfg = rational_config(lots, per_ms, 0);
+        let data = KernelDataset::from_kernel_ticks(vec![tick(1000, 14, 16)], &cfg).unwrap();
+        match QueueKernel::new(&cfg, &data) {
+            Ok(_) => false,
+            Err(MMError::InvalidConfiguration(message)) => {
+                message.contains("at least one lot in at least one ms")
+            }
+            Err(_) => false,
+        }
+    };
+    assert!(refused(0, 1));
+    assert!(refused(1, 0));
+    assert!(refused(0, 0));
+    assert!(!refused(1, 1));
+    assert!(!refused(1, 10_000));
 }

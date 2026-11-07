@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "mm-rl-bridge"
 version = "0.1.0"
 description = "A Python bridge for an external RL trainer over the market-maker-rs RL spaces"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 dependencies = [
     "gymnasium==1.4.0",
