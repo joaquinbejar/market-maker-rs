@@ -681,6 +681,74 @@ def check_ppo_hold(ctx):
     return report
 
 
+def frozen_runs(selection_report, ablations_report):
+    """The learned runs the holdout evaluates: the selected set of each arm, and every
+    ablation run."""
+    sets = selection_report["learned_selected_sets"]
+    runs = [m for m in selection_report["training"] if f"set{m['set']}" == sets[m["arm"]]]
+    for variant, part in ablations_report.items():
+        if isinstance(part, dict) and "training" in part:
+            runs.extend(dict(m, ablation=variant) for m in part["training"])
+    return runs
+
+
+def freeze(ctx):
+    """Records the hash of every checkpoint, configuration and choice the holdout uses,
+    before it is read."""
+    selection_report = json.loads((ctx.out / "selection.json").read_text())
+    ablations_report = json.loads((ctx.out / "ablations.json").read_text())
+    runs = frozen_runs(selection_report, ablations_report)
+    for metadata in runs:
+        if sha256(pathlib.Path(metadata["path"]).with_suffix(".zip")) != metadata["checkpoint_sha256"]:
+            raise ValueError(f"{metadata['path']} changed after training")
+    manifest = {
+        **ctx.header("freeze"),
+        "selection_sha256": sha256(ctx.out / "selection.json"),
+        "ablations_sha256": sha256(ctx.out / "ablations.json"),
+        "classical_selected": selection_report["classical_selected"],
+        "learned_selected_sets": selection_report["learned_selected_sets"],
+        "runs": runs,
+    }
+    path = ctx.write("frozen", manifest)
+    return {"frozen_sha256": sha256(path), "runs": len(runs)}
+
+
+def holdout(ctx, frozen_sha256):
+    """The holdout, once: every arm as frozen, under its execution."""
+    path = ctx.out / "frozen.json"
+    if sha256(path) != frozen_sha256:
+        raise ValueError("the frozen manifest is not the one given")
+    if (ctx.out / "holdout.json").exists():
+        raise ValueError("the holdout was evaluated already")
+    frozen = json.loads(path.read_text())
+    for key, name in (("design_sha256", "design.json"), ("digests_sha256", "digests.json")):
+        if frozen[key] != sha256(HERE / name):
+            raise ValueError(f"{name} changed after the freeze")
+    for name in ("selection", "ablations"):
+        if frozen[f"{name}_sha256"] != sha256(ctx.out / f"{name}.json"):
+            raise ValueError(f"{name}.json changed after the freeze")
+    report = ctx.header("holdout")
+    report["frozen_sha256"] = frozen_sha256
+    started = time.perf_counter()
+    days = days_of(ctx.design, "holdout")
+    chosen = {tuple(k.split("/")): v for k, v in frozen["classical_selected"].items()}
+    jobs = []
+    for variant in ["main"] + [v for v, s in ctx.design["execution"]["ablations"].items()
+                               if not s.get("training_only")]:
+        for job in ctx.classical_jobs(variant, "holdout", days, chosen):
+            jobs.append(job)
+    for metadata in frozen["runs"]:
+        variant = metadata["variant"]
+        for job in ctx.learned_jobs([metadata], variant, "holdout", days):
+            job["ablation"] = metadata.get("ablation")
+            jobs.append(job)
+    rows = pool(jobs, evaluate_job, ctx.parallel, "holdout")
+    report["rows"] = rows
+    report["seconds"] = {"holdout_seconds": round(time.perf_counter() - started, 1)}
+    ctx.write("holdout", report)
+    return report
+
+
 def main():
     step, data_dir, out_dir, commit = sys.argv[1:5]
     ctx = Context(data_dir, out_dir, commit)
@@ -691,6 +759,11 @@ def main():
         report = selection(ctx)
     elif step == "ablations":
         report = ablations(ctx, json.loads((ctx.out / "selection.json").read_text()))
+    elif step == "freeze":
+        report = freeze(ctx)
+        print(json.dumps(report))
+    elif step == "holdout":
+        report = holdout(ctx, sys.argv[5])
     else:
         raise SystemExit(f"step {step!r} is not implemented yet")
     print(json.dumps({"step": step, "seconds": report.get("seconds"),
