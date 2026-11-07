@@ -21,6 +21,15 @@ project follows [Semantic Versioning](https://semver.org/).
   funding not applied. It streams the files, keeps only thinned inputs and says what it keeps.
   Not evaluated: #90 (b) and (c), which need a data trajectory the replay does not expose; #77,
   #180 and #91 (b) do not apply to this capture. No data is in the repository.
+- Hedge actions in the RL action space (feature `rl`, #247): with
+  `RlConfig::with_hedge_actions`, `rl::RlAction::Hedge` reduces the delivered position with a
+  marketable limit order at the observed touch, of a size from the order size grid and never
+  larger than that position, as `HedgeActions::MarketableAtTouch` states. `RlEnv::hedge_mask`
+  and `Transition::hedge_mask` give the sizes allowed; a hedge outside them follows the
+  declared `InvalidActionPolicy`, and `rl::ERR_HEDGE_REFUSED` marks one taken as a hold. It is
+  an order like any other: the kernel's admission, gate and limits decide on it, and its cost
+  reaches the reward only through the kernel's ledger. A hedge in another instrument is not
+  modelled (#256). Checked on synthetic data only.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are
@@ -541,6 +550,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `rl::ACTION_SPACE_VERSION` is 2 (#247), so every `rl::SpecId` changes and a checkpoint
+  trained under action space 1 is refused by `RlSpec::ensure`. `rl::RlAction` gains `Hedge`,
+  `rl::RlConfig` gains `hedge_actions`, and `rl::HedgeActions` gains `MarketableAtTouch`.
+  Behaviour with hedge actions off is unchanged. The Python bridge is built for action
+  space 2.
 - `margin-rs` 0.2, whose types are in this crate's public API (#97, #98). `options::settlement`
   now settles an option held in the ledger as a registered `OptionInstrument`, through
   `Ledger::settle_option`: `OptionPosition::new` takes the option's `InstrumentId` instead of a

@@ -35,7 +35,7 @@ const STACK_BYTES: usize = 16 * 1024 * 1024;
 /// The versions of the spaces this bridge was written for: observation, action, reward and
 /// episode. They are literals, so that a new version in the library is refused here until
 /// the bridge has been checked against it.
-pub const BUILT_FOR: (u16, u16, u16, u16) = (1, 1, 1, 1);
+pub const BUILT_FOR: (u16, u16, u16, u16) = (1, 2, 1, 1);
 
 fn known_versions(id: &SpecId) -> bool {
     (id.observation, id.action, id.reward, id.episode) == BUILT_FOR

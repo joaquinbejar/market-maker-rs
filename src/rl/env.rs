@@ -29,6 +29,11 @@ use super::spec::{
 /// representable, under [`InvalidActionPolicy::Reject`].
 pub const ERR_ACTION_OFF_GRID: ErrCode = ErrCode(200);
 
+/// Code of a hedge that is not available at this decision, under
+/// [`InvalidActionPolicy::Reject`]: hedge actions are off, nothing has been observed, the
+/// delivered position is flat, or the size is larger than that position.
+pub const ERR_HEDGE_REFUSED: ErrCode = ErrCode(201);
+
 const NS_PER_MS: u64 = 1_000_000;
 
 /// The choices of an environment.
@@ -44,6 +49,8 @@ pub struct RlConfig {
     pub invalid_action_penalty: Decimal,
     /// What values the inventory on termination.
     pub terminal: TerminalValuation,
+    /// Whether [`RlAction::Hedge`] exists, as [`HedgeActions::MarketableAtTouch`].
+    pub hedge_actions: bool,
 }
 
 impl RlConfig {
@@ -57,6 +64,7 @@ impl RlConfig {
             invalid_action: InvalidActionPolicy::Mask,
             invalid_action_penalty: Decimal::ZERO,
             terminal: TerminalValuation::MarkAtLastMid,
+            hedge_actions: false,
         }
     }
 
@@ -72,6 +80,13 @@ impl RlConfig {
     #[must_use]
     pub fn with_terminal(mut self, terminal: TerminalValuation) -> Self {
         self.terminal = terminal;
+        self
+    }
+
+    /// Adds [`RlAction::Hedge`] to the action space, as [`HedgeActions::MarketableAtTouch`].
+    #[must_use]
+    pub fn with_hedge_actions(mut self) -> Self {
+        self.hedge_actions = true;
         self
     }
 }
@@ -100,6 +115,12 @@ pub enum RlAction {
         /// Index of the offset on that side.
         offset: usize,
         /// Index of the size.
+        size: usize,
+    },
+    /// Reduce the delivered position with a marketable order at the observed touch, as
+    /// [`HedgeActions::MarketableAtTouch`] states. It replaces the resting orders.
+    Hedge {
+        /// Index of the size in the grid's sizes, at most the delivered position.
         size: usize,
     },
 }
@@ -147,6 +168,8 @@ pub struct Transition {
     pub observation: FeatureVector,
     /// The mask after the step.
     pub mask: ActionMask,
+    /// [`RlEnv::hedge_mask`] after the step.
+    pub hedge_mask: u64,
     /// The reward of the step.
     pub reward: StepReward,
     /// What the kernel did with the action.
@@ -262,10 +285,11 @@ fn bit(mask: u64, index: usize) -> bool {
         .is_some_and(|v| v & 1 == 1)
 }
 
-/// Returns true if `action` is inside `mask`, while the run continues.
-fn allowed(mask: &ActionMask, action: RlAction) -> bool {
+/// Returns true if `action` is inside `mask` and `hedge`, while the run continues.
+fn allowed(mask: &ActionMask, hedge: u64, action: RlAction) -> bool {
     match action {
         RlAction::Hold => true,
+        RlAction::Hedge { size } => bit(hedge, size),
         RlAction::Quote {
             bid,
             ask,
@@ -371,8 +395,12 @@ impl<
                 ask_offsets_ticks: grid.ask_offsets().to_vec(),
                 sizes_lots: grid.sizes().to_vec(),
                 invalid_action: config.invalid_action,
-                hedge: HedgeActions::NotModelled {
-                    reason: HedgeNotModelledReason::SingleInstrument,
+                hedge: if config.hedge_actions {
+                    HedgeActions::MarketableAtTouch
+                } else {
+                    HedgeActions::NotModelled {
+                        reason: HedgeNotModelledReason::SingleInstrument,
+                    }
                 },
             },
             reward: RewardSpec {
@@ -484,6 +512,41 @@ impl<
         self.kernel.mask(&state.kernel, &self.grid)
     }
 
+    /// The sizes [`RlAction::Hedge`] may take at `state`, as bits over the grid's sizes:
+    /// those the [`mask`](Self::mask) allows that are no larger than the delivered
+    /// position. Zero when hedge actions are off, nothing has been observed, the position
+    /// is flat or the mask allows no order. It reads no risk limit: the kernel's admission
+    /// and its gate decide on the order as on any other.
+    #[must_use]
+    pub fn hedge_mask(&self, state: &RlState<ORD, MSG, DLV, OBS>) -> u64 {
+        if !self.config.hedge_actions || state.is_done() {
+            return 0;
+        }
+        let mask = self.mask(state);
+        let observed = self.kernel.observe(&state.kernel);
+        if !mask.global_quote_ok || observed.row.is_none() {
+            return 0;
+        }
+        let mut bits = 0_u64;
+        for (index, lots) in self.grid.sizes().iter().enumerate() {
+            if bit(mask.size, index) && self.reduces(&observed, *lots) {
+                let one = u32::try_from(index)
+                    .ok()
+                    .and_then(|shift| 1_u64.checked_shl(shift))
+                    .unwrap_or(0);
+                bits |= one;
+            }
+        }
+        bits
+    }
+
+    /// Returns true if `lots` is a positive quantity no larger than the delivered position.
+    fn reduces(&self, observed: &Observation, lots: u64) -> bool {
+        self.kernel
+            .quantity(lots)
+            .is_some_and(|quantity| quantity > Decimal::ZERO && quantity <= observed.position.abs())
+    }
+
     /// Takes one decision.
     ///
     /// # Errors
@@ -518,7 +581,7 @@ impl<
                 "the episode has ended".to_string(),
             ));
         }
-        let inside = allowed(&self.mask(state), action);
+        let inside = allowed(&self.mask(state), self.hedge_mask(state), action);
         if !inside && self.config.invalid_action == InvalidActionPolicy::Mask {
             return Err(MMError::InvalidQuoteGeneration(format!(
                 "{action:?} is outside the mask"
@@ -712,6 +775,31 @@ impl<
         let off_grid = KernelAction::QuoteError(ERR_ACTION_OFF_GRID);
         match action {
             RlAction::Hold => KernelAction::Hold,
+            RlAction::Hedge { size } => {
+                let refused = KernelAction::QuoteError(ERR_HEDGE_REFUSED);
+                let Some(lots) = self.grid.sizes().get(size).copied() else {
+                    return off_grid;
+                };
+                if !self.config.hedge_actions
+                    || decision.row.is_none()
+                    || !self.reduces(decision, lots)
+                {
+                    return refused;
+                }
+                if decision.position.is_sign_positive() {
+                    KernelAction::OneSided {
+                        side: QuoteSide::Ask,
+                        price: decision.bid,
+                        lots,
+                    }
+                } else {
+                    KernelAction::OneSided {
+                        side: QuoteSide::Bid,
+                        price: decision.ask,
+                        lots,
+                    }
+                }
+            }
             RlAction::Quote {
                 bid,
                 ask,
@@ -848,6 +936,7 @@ impl<
         Ok(Transition {
             observation: self.observe(state)?,
             mask: self.mask(state),
+            hedge_mask: self.hedge_mask(state),
             reward: StepReward {
                 ledger_change,
                 terminal_close,
@@ -1007,27 +1096,27 @@ mod tests {
     #[test]
     fn test_allowed_a_refused_mask_blocks_quotes_and_leaves_a_hold() {
         let mask = refused();
-        assert!(allowed(&mask, RlAction::Hold));
+        assert!(allowed(&mask, 0, RlAction::Hold));
         let quote = RlAction::Quote {
             bid: 0,
             ask: 0,
             bid_size: 0,
             ask_size: 0,
         };
-        assert!(!allowed(&mask, quote));
+        assert!(!allowed(&mask, 0, quote));
         for side in [QuoteSide::Bid, QuoteSide::Ask] {
             let one = RlAction::OneSided {
                 side,
                 offset: 0,
                 size: 0,
             };
-            assert!(!allowed(&mask, one));
+            assert!(!allowed(&mask, 0, one));
             let open = ActionMask {
                 global_quote_ok: true,
                 refusal: None,
                 ..mask
             };
-            assert!(allowed(&open, one));
+            assert!(allowed(&open, 0, one));
         }
     }
 
@@ -1041,11 +1130,11 @@ mod tests {
             refusal: None,
         };
         let one = |side, offset, size| RlAction::OneSided { side, offset, size };
-        assert!(allowed(&mask, one(QuoteSide::Bid, 0, 0)));
-        assert!(!allowed(&mask, one(QuoteSide::Bid, 1, 0)));
-        assert!(allowed(&mask, one(QuoteSide::Ask, 1, 0)));
-        assert!(!allowed(&mask, one(QuoteSide::Ask, 0, 0)));
-        assert!(!allowed(&mask, one(QuoteSide::Bid, 0, 1)));
-        assert!(!allowed(&mask, one(QuoteSide::Bid, 64, 0)));
+        assert!(allowed(&mask, 0, one(QuoteSide::Bid, 0, 0)));
+        assert!(!allowed(&mask, 0, one(QuoteSide::Bid, 1, 0)));
+        assert!(allowed(&mask, 0, one(QuoteSide::Ask, 1, 0)));
+        assert!(!allowed(&mask, 0, one(QuoteSide::Ask, 0, 0)));
+        assert!(!allowed(&mask, 0, one(QuoteSide::Bid, 0, 1)));
+        assert!(!allowed(&mask, 0, one(QuoteSide::Bid, 64, 0)));
     }
 }
