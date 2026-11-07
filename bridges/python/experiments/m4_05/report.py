@@ -20,7 +20,7 @@ read:
 
 An amendment, made after the validation results were seen and before the holdout was read
 (see AMENDMENT): each learned arm is also compared with no-trade, and with
-Avellaneda-Stoikov.
+Avellaneda-Stoikov. The bounds the ablations put on the execution are in EXECUTION_BOUNDS.
 """
 
 import json
@@ -42,6 +42,18 @@ AMENDMENT = (
     "revise at best. The rule against the best classical arm is unchanged. Since the best "
     "classical arm on validation was GLFT, which mostly does not quote (#264), each learned "
     "arm is also reported against Avellaneda-Stoikov, the classical arm that quotes."
+)
+EXECUTION_BOUNDS = (
+    "Found on validation by the ablations, before the holdout was read; the design was not "
+    "changed. (1) The main execution is in effect immediate fill: the queue model's rate "
+    "cannot be below one lot per millisecond (#267), so an order clears about 9975 lots by "
+    "the next 10 s row, more than any touch (8 lots at most on training and validation), and "
+    "the fill_immediate ablation gave the same result as the main execution on every "
+    "validation row. Queue position is therefore absent from this comparison. (2) The "
+    "latency_one_row ablation is degenerate: an order that arrives exactly on the next row "
+    "cannot match on it, and the cancel sent by that row's quote arrives on the row after, "
+    "before matching (#268), so no arm fills. It does not measure latency. Conclusions hold "
+    "only for immediate fills at 10 s rows with a latency well under a row."
 )
 
 
@@ -194,6 +206,7 @@ def main():
         "bounds": holdout["bounds"],
         "frozen_sha256": holdout["frozen_sha256"],
         "amendment": AMENDMENT,
+        "execution_bounds": EXECUTION_BOUNDS,
         "tables": tables,
         "intervals": intervals,
         "decisions": decisions,
