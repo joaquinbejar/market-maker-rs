@@ -1,0 +1,16 @@
+[package]
+name = "qrh-check"
+version = "0.1.0"
+edition = "2024"
+description = "Step 1 of #111: the quadratic rough Heston model of OptionStratLib against the values its papers state"
+license = "MIT"
+publish = false
+
+# Outside the root build, as the Python bridge: it needs OptionStratLib's simulation crate,
+# which market-maker-rs does not enable.
+[workspace]
+
+[dependencies]
+optionstratlib = { version = "=0.24.0", default-features = false, features = ["simulation"] }
+rust_decimal = "1"
+serde_json = "1"
