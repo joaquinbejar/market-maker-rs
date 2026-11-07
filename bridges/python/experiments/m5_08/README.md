@@ -47,8 +47,10 @@ From `bridges/python`:
 
 ## Results
 
-First and only read of the holdout (days 20 to 24), `report.json`, at the fee -0.0001. Mean
-daily net over the 5 days; intervals are 90 % block bootstrap of the paired daily difference.
+First and only read of the holdout (days 20 to 24), at the fee -0.0001: `report-v2.json`
+(sha256 `a1b207ba...b0c7`), recomputed after review from the outputs already written (see
+"Corrections after the holdout"). Mean daily net over the 5 days; intervals are 90 % block
+bootstrap of the paired daily difference.
 
 **Decision: NO-GO for both comparisons, on every simulator and execution group.**
 
@@ -80,7 +82,8 @@ daily net over the 5 days; intervals are 90 % block bootstrap of the paired dail
   S2's flow moves the mid with its market orders, and every arm loses to it.
 - Transfer (an arm worse than no-trade on the simulator it was not fitted on): fitted on S1 and
   run on S2, every arm fails (fixed -82.9, adaptive -19.1, oracle -35.0, learned -49.8,
-  learned_detector -117.7), its detector on for most of each day; fitted on S2 and run on S1,
+  learned_detector -117.7), its detector on for most of each day, already on at both changes,
+  so it misses the stress and catches thin only 629 s in; fitted on S2 and run on S1,
   the classical arms fail by about 0.01 (they barely fill), the S2-fitted detector never fires
   and misses both changes, and the learned arms gain (+3.5, +3.8).
 - At the secondary fee 0.0002, on the own simulator under the queue: S1 fixed -4.13, adaptive
@@ -90,13 +93,13 @@ daily net over the 5 days; intervals are 90 % block bootstrap of the paired dail
 
 Chosen after seeing the validation alarms, on days already read: the detector alone with lambda
 `0.9^(1/60)` (#237's wall-clock memory on 1 s rows), every other setting frozen. No arm is
-evaluated under it. `sensitivity.json` (sha256 `191d23dc...5c38`):
+evaluated under it. `sensitivity-v2.json` (sha256 `1a9b122b...d212`, with the delay as corrected in (j)):
 
 | fitted -> data | onsets a calm day | stress delay | thin delay |
 |---|---|---|---|
 | S1 -> S1 | 257.0 (64.7 as frozen) | 158 s | 133 s |
 | S2 -> S2 | 91.7 (27.7) | 298 s | 159 s |
-| S1 -> S2 | 1.0, on all day (29.3) | 0 s | 0 s |
+| S1 -> S2 | 1.0, on all day (29.3) | missed (on before it) | 634 s |
 | S2 -> S1 | 0, never on (0) | missed | missed |
 
 A longer memory makes it noisier, not quieter. `calculate_ewma` starts from the sample variance
@@ -104,6 +107,34 @@ of the window's first 5 returns, which keeps a weight of `lambda^300`, about 0.5
 lambda: over a sliding window, the ratio then follows those 5 returns. Neither lambda gives a
 usable detector here; that is a finding about this detector on 1 s rows, not a reason to retune
 inside the rule.
+
+## Corrections after the holdout
+
+From review, recorded as changes (j) and (k) in `design.json`, with no retraining, retuning or
+new holdout read:
+
+- **(j) Delay.** The first report credited an alarm already on at a change's start with a delay
+  of 0, against change (h), which counts the first onset at or after the start. Only onsets
+  count now; an alarm latched on from before a change is a miss. Recomputed from the same alarm
+  files and holdout rows (`report.json`, sha256 `53dc509a...27dc`, kept beside it):
+
+  | fitted -> data | change | first report | now |
+  |---|---|---|---|
+  | S1 -> S1 | stress / thin | 48 s / 33 s | 48 s / 33 s |
+  | S2 -> S2 | stress / thin | 3 s / missed | 3 s / missed |
+  | S1 -> S2 | stress / thin | 0 s / 0 s | missed (on at start) / 629 s |
+  | S2 -> S1 | stress / thin | missed / missed | missed / missed |
+
+  Only the S1 -> S2 transfer row changes. The go rule reads the own simulator's rows, which do
+  not change: every verdict is the same NO-GO, and the intervals, nets and transfer failures
+  are identical.
+- **(k) Flow window.** The design lists a 600 s flow window under the detector, but the rule's
+  alarm reads only the volatility ratio and VPIN, and VPIN runs over its 20 buckets of 50 lots,
+  restarting each day; the window is not used. It came from #237, where it fed the adaptive
+  arm's flow-based quote, which no arm here has. It stays unused, since implementing it now
+  would mean recomputing the alarms after the holdout read.
+- The frozen alarm files are now selected by name, so a tagged sensitivity run's files no
+  longer enter `freeze` or `holdout`.
 
 ## Not run
 
