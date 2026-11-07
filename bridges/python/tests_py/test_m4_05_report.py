@@ -98,3 +98,28 @@ def test_a_series_without_an_interval_is_an_error_not_a_decision():
     assert report.decide(dict(interval, mean=-1.0, lower=-2.0), report.Decimal(1),
                          report.Decimal(1), 0) == "discard"
     assert not report.includes_zero(interval) and report.includes_zero(dict(interval, lower=0.0))
+
+
+def seed_day(day, seed, net, drawdown):
+    attribution = {"max_drawdown": drawdown, "spread_capture": "0", "inventory_pnl": "0",
+                   "quote_fees": "0", "fills": 0, "mean_abs_position": "0",
+                   "max_abs_position": "0"}
+    episode = {"attribution": attribution, "steps": 10, "peak_notional": "0",
+               "time_beyond_5_lots": 0.0, "refusals": 0, "residual_fallbacks": 0,
+               "residual_clipped": 0, "limit_breach": False}
+    return {"arm": "maskable_ppo", "candidate": f"set0-seed{seed}", "regime": "calm",
+            "day": day, "daily_value": net, "episodes": [episode]}
+
+
+def test_a_learned_arms_day_is_the_mean_over_its_seeds_in_the_table():
+    # Every day one seed loses 100 and four gain 25: each day's mean is 0.
+    rows = [seed_day(day, seed, net, dd)
+            for day in range(20, 25)
+            for seed, (net, dd) in enumerate(
+                [("-100", "100"), ("25", "0"), ("25", "0"), ("25", "0"), ("25", "0")], 1)]
+    row = report.summary(rows)
+    assert (row["days"], row["seed_days"]) == (5, 25)
+    assert report.Decimal(row["mean_daily_net"]) == 0
+    assert report.Decimal(row["cvar_5_daily_net"]) == 0
+    assert report.Decimal(row["mean_max_drawdown"]) == 20
+    assert report.Decimal(row["worst_max_drawdown"]) == 20

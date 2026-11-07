@@ -129,13 +129,20 @@ def cvar(values, share=Decimal("0.05")):
 
 
 def summary(rows):
-    """The table row of one arm over some days."""
+    """The table row of one arm over some days.
+
+    A day is a regime and day; a learned arm's day is the mean over its seeds, so the
+    daily net, its CVaR and the drawdowns are over those days. Means of the attribution and
+    positions are over every seed's day, which is the same for equal seeds per day; the
+    largest position, peak notional and time beyond 5 lots are the largest of any seed's day.
+    """
     episodes = [r["episodes"][0] for r in rows]
-    nets = [Decimal(r["daily_value"]) for r in rows]
-    drawdowns = [Decimal(e["attribution"]["max_drawdown"]) for e in episodes]
+    nets = list(daily(rows).values())
+    drawdowns = list(drawdown_by_day(rows).values())
     steps = sum(e["steps"] for e in episodes)
     return {
-        "days": len(rows),
+        "days": len(nets),
+        "seed_days": len(rows),
         "mean_daily_net": str(mean(nets)),
         "spread_capture": str(mean(Decimal(e["attribution"]["spread_capture"]) for e in episodes)),
         "inventory_pnl": str(mean(Decimal(e["attribution"]["inventory_pnl"]) for e in episodes)),
