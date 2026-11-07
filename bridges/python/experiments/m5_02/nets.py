@@ -12,6 +12,9 @@ they are. The extractors differ only in how they summarize the buffer:
   `beta` positive (softplus plus a floor) and learned end to end, as in arXiv:2610.16524v1;
 - `Recurrent`: a GRU or LSTM over the valid items, oldest first, after a linear embedding.
 
+With `with_current`, `Hsn` and `Recurrent` also pass the newest item's values on as they are,
+so that they see the current observation as a plain MLP does.
+
 A fixed EMA is never called HSN: only `Hsn` has learnable decays, and its tests check that its
 decays move under a gradient.
 """
@@ -83,6 +86,11 @@ class FrameStack(_Extractor):
         return torch.cat([items.flatten(1), scalars], 1)
 
 
+def _current(valid, values):
+    """The newest item's values, zero if there is none."""
+    return values[:, 0] * valid[:, :1]
+
+
 def _filtered(ages, valid, values, alphas, betas):
     """`alpha_cj sum_i valid_i x_ic exp(-beta_cj age_i)`, shape (batch, C * p)."""
     # (batch, L, 1, 1) * (C, p) -> (batch, L, C, p)
@@ -108,14 +116,16 @@ class FixedEma(_Extractor):
 class Hsn(_Extractor):
     """The learnable mixture of exponentials, `p` modes per channel."""
 
-    def __init__(self, observation_space, layout, alphas, betas, floor):
+    def __init__(self, observation_space, layout, alphas, betas, floor, with_current=False):
         if len(alphas) != len(betas) or not alphas:
             raise ValueError("one alpha per beta")
         if min(alphas) <= floor or min(betas) <= floor:
             raise ValueError("initial alpha and beta above the floor")
         p = len(betas)
-        super().__init__(observation_space, layout, layout.channels * p + layout.scalars)
+        current = layout.channels if with_current else 0
+        super().__init__(observation_space, layout, layout.channels * p + current + layout.scalars)
         self.floor = floor
+        self.with_current = with_current
 
         def raw(values):
             start = torch.tensor([_inverse_softplus(v - floor) for v in values])
@@ -132,14 +142,19 @@ class Hsn(_Extractor):
 
     def forward(self, obs):
         ages, valid, values, scalars = self.layout.split(obs)
-        return torch.cat([_filtered(ages, valid, values, self.alphas(), self.betas()), scalars], 1)
+        parts = [_filtered(ages, valid, values, self.alphas(), self.betas())]
+        if self.with_current:
+            parts.append(_current(valid, values))
+        return torch.cat(parts + [scalars], 1)
 
 
 class Recurrent(_Extractor):
     """A GRU or LSTM over the valid items, oldest first; no item gives a zero summary."""
 
-    def __init__(self, observation_space, layout, cell, embed, hidden):
-        super().__init__(observation_space, layout, hidden + layout.scalars)
+    def __init__(self, observation_space, layout, cell, embed, hidden, with_current=False):
+        current = layout.channels if with_current else 0
+        super().__init__(observation_space, layout, hidden + current + layout.scalars)
+        self.with_current = with_current
         self.embed = nn.Linear(1 + layout.channels, embed)
         kinds = {"gru": nn.GRU, "lstm": nn.LSTM}
         if cell not in kinds:
@@ -164,7 +179,8 @@ class Recurrent(_Extractor):
         _, state = self.rnn(packed)
         last = (state[0] if self.cell == "lstm" else state)[-1]
         last = last * (counts > 0).to(last.dtype)[:, None]
-        return torch.cat([last, scalars], 1)
+        parts = [last, _current(valid, values)] if self.with_current else [last]
+        return torch.cat(parts + [scalars], 1)
 
 
 EXTRACTORS = {

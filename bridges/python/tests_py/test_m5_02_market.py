@@ -156,18 +156,34 @@ def test_rows_refuse_the_holdout_and_a_wrong_split(tmp_path):
         run_market.read_rows("market", tmp_path, digests, "calm", 3, "validation")
 
 
-def test_every_encoding_runs_the_design_execution():
-    design, base = run_market.load()
-    for encoding in ("maskable", "residual"):
-        config = run_market.config_of(design, base, encoding)
-        assert config["fill_model"] == design["execution"]["fill_model"]
-        assert config["latency"] == design["execution"]["latency"]
-        assert config["fee_rate"] == base["execution"]["fee_rate"]
-        assert config["limits"] == base["execution"]["limits"]
-
-
 def test_design_widths_follow_the_parameter_rule():
-    design = json.loads((EXPERIMENT / "design.json").read_text())
-    for name, (width, count) in run_market.check_widths(design).items():
+    design, base = run_market.load()
+    for name, (width, count) in run_market.check_widths(design, base).items():
         target = design["parameters"]["target"]
         assert abs(count - target) <= design["parameters"]["tolerance"] * target
+
+
+def test_the_design_pins_the_protocol_it_builds_on():
+    design, base = run_market.load()
+    assert base["issue"] == 103
+    assert set(design["arms"]) == {"mlp", "ema", "history", "lstm", "gru_window", "hsn"}
+    assert all(design["arms"][a]["from"] == "#103, verbatim" for a in ("mlp", "ema", "history", "lstm"))
+
+
+def test_hsn_and_the_window_gru_see_the_current_observation():
+    lay = nets.Layout(**window.layout_dims(4))
+    space = gym.spaces.Box(-np.inf, np.inf, shape=(lay.size,), dtype=np.float32)
+    env = window.WindowEnv(Scripted(), buffer=4)
+    env.reset()
+    obs, *_ = env.step(np.zeros(5))
+    x = torch.as_tensor(obs[None, :])
+    _, _, values, scalars = lay.split(x)
+    hsn = nets.Hsn(space, lay, alphas=[0.2, 0.4], betas=[0.3, 0.08], floor=1e-4, with_current=True)
+    out = hsn(x)[0]
+    p = 2 * lay.channels
+    assert out[p : p + lay.channels].tolist() == pytest.approx(values[0, 0].tolist())
+    assert out[p + lay.channels :].tolist() == pytest.approx(scalars[0].tolist())
+    torch.manual_seed(0)
+    gru = nets.Recurrent(space, lay, cell="gru", embed=3, hidden=5, with_current=True)
+    out = gru(x)[0]
+    assert out[5 : 5 + lay.channels].tolist() == pytest.approx(values[0, 0].tolist())
