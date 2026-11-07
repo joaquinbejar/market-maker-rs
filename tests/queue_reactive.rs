@@ -1621,3 +1621,141 @@ fn test_event_sizes_reach_the_parameters_they_are_for() {
     .unwrap();
     assert_eq!(fit.parameters().expect("calibrated").event_sizes(), sizes);
 }
+
+fn queue_event(
+    side: QrSide,
+    kind: QrEventKind,
+    queue_before: u32,
+    waiting_seconds: f64,
+) -> QueueObservation {
+    QueueObservation {
+        timestamp_ms: 7,
+        side,
+        depth: 0,
+        kind,
+        queue_before,
+        waiting_seconds,
+    }
+}
+
+#[test]
+fn test_collapse_keeps_a_block_net_change_in_place() {
+    use QrEventKind::{Cancel, Limit};
+    let other = queue_event(QrSide::Ask, Cancel, 5, 0.25);
+    let events = [
+        queue_event(QrSide::Bid, Limit, 3, 2.0),
+        other,
+        queue_event(QrSide::Bid, Limit, 4, 0.0),
+        queue_event(QrSide::Bid, Cancel, 5, 0.0),
+        queue_event(QrSide::Bid, Limit, 4, 0.0),
+    ];
+    assert_eq!(
+        collapse_blocks(&events),
+        vec![
+            queue_event(QrSide::Bid, Limit, 3, 2.0),
+            queue_event(QrSide::Bid, Limit, 4, 0.0),
+            other,
+        ]
+    );
+}
+
+#[test]
+fn test_collapse_names_a_net_departure_by_whether_it_holds_a_market_order() {
+    use QrEventKind::{Cancel, Limit, Market};
+    let with_market = [
+        queue_event(QrSide::Bid, Cancel, 4, 1.0),
+        queue_event(QrSide::Bid, Market, 3, 0.0),
+        queue_event(QrSide::Bid, Limit, 2, 0.0),
+        queue_event(QrSide::Bid, Cancel, 3, 0.0),
+    ];
+    assert_eq!(
+        collapse_blocks(&with_market),
+        vec![
+            queue_event(QrSide::Bid, Market, 4, 1.0),
+            queue_event(QrSide::Bid, Market, 3, 0.0),
+        ]
+    );
+    let cancels = [
+        queue_event(QrSide::Ask, Cancel, 4, 1.0),
+        queue_event(QrSide::Ask, Cancel, 3, 0.0),
+    ];
+    assert_eq!(collapse_blocks(&cancels), cancels.to_vec());
+}
+
+#[test]
+fn test_collapse_carries_a_zero_net_block_wait_to_its_queue_next_event() {
+    use QrEventKind::{Cancel, Limit};
+    let events = [
+        queue_event(QrSide::Bid, Limit, 2, 1.5),
+        queue_event(QrSide::Bid, Cancel, 3, 0.0),
+        queue_event(QrSide::Ask, Limit, 1, 0.75),
+        queue_event(QrSide::Bid, Cancel, 2, 0.5),
+    ];
+    assert_eq!(
+        collapse_blocks(&events),
+        vec![
+            queue_event(QrSide::Ask, Limit, 1, 0.75),
+            queue_event(QrSide::Bid, Cancel, 2, 2.0),
+        ]
+    );
+}
+
+#[test]
+fn test_collapse_starts_a_block_at_a_wait_or_a_queue_that_does_not_continue() {
+    use QrEventKind::{Cancel, Limit};
+    let waited = [
+        queue_event(QrSide::Bid, Limit, 2, 1.0),
+        queue_event(QrSide::Bid, Cancel, 3, 0.5),
+    ];
+    assert_eq!(collapse_blocks(&waited), waited.to_vec());
+    let jumped = [
+        queue_event(QrSide::Bid, Limit, 2, 1.0),
+        queue_event(QrSide::Bid, Cancel, 7, 0.0),
+    ];
+    assert_eq!(collapse_blocks(&jumped), jumped.to_vec());
+    let other_limit = [
+        queue_event(QrSide::Bid, Limit, 2, 1.0),
+        QueueObservation {
+            depth: 1,
+            ..queue_event(QrSide::Bid, Cancel, 3, 0.0)
+        },
+    ];
+    assert_eq!(collapse_blocks(&other_limit), other_limit.to_vec());
+}
+
+#[test]
+fn test_zero_waits_are_dropped_by_default_and_counted_on_request() {
+    use QrEventKind::{Cancel, Limit};
+    let events = [
+        queue_event(QrSide::Bid, Limit, 1, 1.0),
+        queue_event(QrSide::Bid, Limit, 2, 0.0),
+        queue_event(QrSide::Bid, Cancel, 3, 0.0),
+        queue_event(QrSide::Bid, Cancel, 2, -1.0),
+    ];
+    let reference = ReferenceObservation {
+        timestamp_ms: 7,
+        moved: true,
+        reinitialized: false,
+    };
+    let base = estimation_config(1, 3, 1, 1, UnsupportedPolicy::NearestSupported);
+    assert_eq!(base.zero_waits, ZeroWaitPolicy::Drop);
+    let run = |cfg: &QrEstimationConfig| {
+        estimate_parameters(&events, &[reference], &[dec!(1)], &window(100), cfg, "d").unwrap()
+    };
+    let dropped = run(&base);
+    assert_eq!((dropped.events, dropped.excluded_events), (1, 3));
+    let counted = run(&base.with_zero_waits(ZeroWaitPolicy::Count));
+    assert_eq!((counted.events, counted.excluded_events), (3, 1));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_a_config_without_zero_waits_reads_as_dropping_them() {
+    let cfg = estimation_config(1, 3, 1, 1, UnsupportedPolicy::NearestSupported)
+        .with_zero_waits(ZeroWaitPolicy::Count);
+    let mut value = serde_json::to_value(cfg).unwrap();
+    assert_eq!(value["zero_waits"], "Count");
+    value.as_object_mut().unwrap().remove("zero_waits");
+    let read: QrEstimationConfig = serde_json::from_value(value).unwrap();
+    assert_eq!(read, cfg.with_zero_waits(ZeroWaitPolicy::Drop));
+}

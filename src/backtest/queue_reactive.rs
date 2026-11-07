@@ -111,6 +111,20 @@ pub enum QrSide {
     Ask,
 }
 
+/// What an estimation does with an event whose waiting time is zero, as the events of one
+/// block of a capture whose times are inferred per block are (#290).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum ZeroWaitPolicy {
+    /// Leaves it out and counts it as excluded, as before.
+    #[default]
+    Drop,
+    /// Counts it at its queue size, adding no time there: the queue spent no measured time at
+    /// a size it passed through inside a block.
+    Count,
+}
+
 /// What to do at a queue size with too few observations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -644,6 +658,83 @@ pub struct SizedEvent {
     pub size: Decimal,
 }
 
+/// Each block's events at each queue collapsed into their net change (#290).
+///
+/// A block at a queue (side and limit) is a run of that queue's events, other queues' events
+/// aside, each after the first with a zero wait and the queue size the one before left, as the
+/// events of one block of a capture whose times are inferred per block are. Its net change in
+/// event sizes becomes that many events of one kind, at the queue sizes they pass through: limit
+/// orders for a net arrival; for a net departure, market orders if the block holds one,
+/// cancellations otherwise. They sit where the block's first event was; the first carries its
+/// time and wait, the others wait zero. A block with no net change leaves no event, and its wait
+/// is carried to the next event its queue keeps, so the time the queue spent at its size is not
+/// lost. Events otherwise keep their order.
+#[must_use]
+pub fn collapse_blocks(events: &[QueueObservation]) -> Vec<QueueObservation> {
+    struct Block {
+        first: QueueObservation,
+        net: i64,
+        market: bool,
+    }
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut open: std::collections::HashMap<(bool, u8), usize> = std::collections::HashMap::new();
+    for event in events {
+        let key = (matches!(event.side, QrSide::Bid), event.depth);
+        let step = match event.kind {
+            QrEventKind::Limit => 1,
+            QrEventKind::Cancel | QrEventKind::Market => -1,
+        };
+        let joined = open
+            .get(&key)
+            .and_then(|&b| blocks.get_mut(b))
+            .filter(|block| {
+                event.waiting_seconds == 0.0
+                    && i64::from(block.first.queue_before).saturating_add(block.net)
+                        == i64::from(event.queue_before)
+            });
+        if let Some(block) = joined {
+            block.net = block.net.saturating_add(step);
+            block.market |= event.kind == QrEventKind::Market;
+        } else {
+            open.insert(key, blocks.len());
+            blocks.push(Block {
+                first: *event,
+                net: step,
+                market: event.kind == QrEventKind::Market,
+            });
+        }
+    }
+    let mut carried: std::collections::HashMap<(bool, u8), f64> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(events.len());
+    for block in blocks {
+        let first = block.first;
+        let key = (matches!(first.side, QrSide::Bid), first.depth);
+        let wait = first.waiting_seconds + carried.remove(&key).unwrap_or(0.0);
+        if block.net == 0 {
+            carried.insert(key, wait);
+            continue;
+        }
+        let kind = if block.net > 0 {
+            QrEventKind::Limit
+        } else if block.market {
+            QrEventKind::Market
+        } else {
+            QrEventKind::Cancel
+        };
+        let mut queue = i64::from(first.queue_before);
+        for k in 0..block.net.unsigned_abs() {
+            out.push(QueueObservation {
+                kind,
+                queue_before: u32::try_from(queue.max(0)).unwrap_or(u32::MAX),
+                waiting_seconds: if k == 0 { wait } else { 0.0 },
+                ..first
+            });
+            queue = queue.saturating_add(block.net.signum());
+        }
+    }
+    out
+}
+
 /// Event sizes together with what they were estimated from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1083,6 +1174,10 @@ pub struct QrEstimationConfig {
     pub min_reference_moves: u64,
     /// Policy at an unsupported size.
     pub policy: UnsupportedPolicy,
+    /// What to do with an event whose waiting time is zero; [`ZeroWaitPolicy::Drop`] unless
+    /// [`QrEstimationConfig::with_zero_waits`] says otherwise.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub zero_waits: ZeroWaitPolicy,
 }
 
 impl QrEstimationConfig {
@@ -1103,7 +1198,15 @@ impl QrEstimationConfig {
             min_events,
             min_reference_moves,
             policy,
+            zero_waits: ZeroWaitPolicy::Drop,
         }
+    }
+
+    /// The same settings with another policy for events whose waiting time is zero.
+    #[must_use]
+    pub fn with_zero_waits(mut self, zero_waits: ZeroWaitPolicy) -> Self {
+        self.zero_waits = zero_waits;
+        self
     }
 }
 
@@ -1258,7 +1361,8 @@ pub fn estimate_event_sizes(
 /// Estimates on the observations inside `window` and nothing else.
 ///
 /// An event is left out and counted if its waiting time is not finite and
-/// positive, its depth is outside the limits, it departs from an empty queue, or
+/// positive (or, under [`ZeroWaitPolicy::Count`], not finite and not negative), its
+/// depth is outside the limits, it departs from an empty queue, or
 /// its size is above the cap. An arrival at the cap is left out too.
 ///
 /// # Errors
@@ -1310,8 +1414,12 @@ pub fn estimate_parameters(
         let n = usize::try_from(event.queue_before).unwrap_or(usize::MAX);
         let departs = matches!(event.kind, QrEventKind::Cancel | QrEventKind::Market);
         let arrives = matches!(event.kind, QrEventKind::Limit);
+        let waited = match config.zero_waits {
+            ZeroWaitPolicy::Drop => event.waiting_seconds > 0.0,
+            ZeroWaitPolicy::Count => event.waiting_seconds >= 0.0,
+        };
         let valid = event.waiting_seconds.is_finite()
-            && event.waiting_seconds > 0.0
+            && waited
             && depth < limits
             && n < rows
             && !(departs && n == 0)

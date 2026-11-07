@@ -8,6 +8,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Counting of block-tied events in the queue-reactive estimator (#290):
+  `QrEstimationConfig::zero_waits` with `ZeroWaitPolicy` (`Drop`, the default and the behaviour
+  so far, or `Count`, which counts an event with a zero wait and adds no time), set with
+  `QrEstimationConfig::with_zero_waits`; a configuration written without the field reads as
+  `Drop`. `queue_reactive::collapse_blocks` collapses each block's events at a queue into their
+  net change, carrying the wait of a block with none. Example `qr_estimation`, behind `serde`,
+  holds #290's protocol and its synthetic recovery check on #102's calm regime.
 - Example `time_travel_queues` (#109), behind `serde`: chronological replay against consistent
   time travel for a market maker at the touch, on queues. On #102's queue-reactive regimes the
   simulator continues from a state that holds the agent's order, so each mode is measured against
