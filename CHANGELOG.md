@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The out-of-sample comparison of #102 in `bridges/python/experiments/m4_05`: a design fixed
+  before any run (`design.json`, with the change log of every amendment and what was seen when),
+  the digests of its synthetic queue-reactive days (example `qr_days`), a runner for selection,
+  ablations, freeze and a single holdout (`run.py`), and a report with paired block bootstrap
+  intervals and the decision rule (`report.py`, example `m4_05_intervals`). The bridge's
+  attribution now also reports the position path, the mean and largest absolute position, the
+  final position, the largest drawdown and the window. Synthetic data only; the results are on
+  the issue.
 - Example `hyperliquid_validation` (Refs #214), behind `serde`: evaluates on the Hyperliquid
   capture the criteria of #87, #88, #89, #90 and #91 that the existing interfaces can evaluate,
   with no new library code. It reports walk-forward errors per day against constant parameters
