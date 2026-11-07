@@ -64,6 +64,11 @@ project follows [Semantic Versioning](https://semver.org/).
   so nothing is substituted silently and a run can tell a holding strategy from a failing one.
   `GlftQuoter::new` and `with_form` build one. The Python bridge's GLFT baseline takes an
   optional `form`, `exact` by default.
+- The Python bridge takes the kernel's rational queue position rate (#269):
+  `{"kind": "queue_position_rational", "lots": n, "per_ms": d, "min_queue_ms": m}` as its
+  `fill_model`, mapped to `KernelFillModel::QueuePositionRational`, refused at a zero `lots` or
+  `per_ms` as the kernel refuses it, and carried by the kernel's fingerprint that the bridge
+  reports. Existing configurations and their fingerprints are unchanged.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are

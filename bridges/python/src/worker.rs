@@ -129,6 +129,16 @@ pub enum FillConfig {
         /// Milliseconds in the queue before any fill.
         min_queue_ms: u64,
     },
+    /// The kernel's queue position model at `lots` lots every `per_ms` milliseconds,
+    /// which can be below one lot per millisecond. The kernel refuses either at 0.
+    QueuePositionRational {
+        /// Lots cleared every `per_ms` milliseconds.
+        lots: u64,
+        /// Milliseconds in which `lots` clear.
+        per_ms: u64,
+        /// Milliseconds in the queue before any fill.
+        min_queue_ms: u64,
+    },
 }
 
 /// Hard limits in the configuration, as decimal strings.
@@ -336,6 +346,15 @@ impl BridgeConfig {
             FillConfig::Immediate => KernelFillModel::Immediate,
             FillConfig::QueuePosition { rate, min_queue_ms } => KernelFillModel::QueuePosition {
                 rate: decimal("fill rate", rate)?,
+                min_queue_ms: *min_queue_ms,
+            },
+            FillConfig::QueuePositionRational {
+                lots,
+                per_ms,
+                min_queue_ms,
+            } => KernelFillModel::QueuePositionRational {
+                lots: *lots,
+                per_ms: *per_ms,
                 min_queue_ms: *min_queue_ms,
             },
         };
