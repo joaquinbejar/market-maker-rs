@@ -1,0 +1,11 @@
+{
+  "what": "the gate an external constrained optimizer passes on the toy CMDP of toy_cmdp.py before #105 uses it; fixed before the pending PPOLag configuration runs were read",
+  "pass": "over seeds 1 and 2, every final epoch has |episode cost - 6| <= 0.2 and episode return >= 6.0",
+  "candidates": [
+    {"algorithm": "PPOLag", "steps": 600000, "overrides": {}},
+    {"algorithm": "PPOLag", "steps": 200000, "overrides": {"standardized_rew_adv": false, "standardized_cost_adv": false}},
+    {"algorithm": "CPO", "steps": 200000, "overrides": {}}
+  ],
+  "already_seen": "CPO at 200000 steps, default configuration: return 6.066 and 6.099, cost 5.946 and 6.034 (seeds 1 and 2). PPOLag at 200000 steps, default configuration: return 6.225 and 6.226, cost 7.627 and 7.642 (fails). PPO: cost 7.851 and 7.946.",
+  "rule": "the configuration of each algorithm that passes is the one #105 uses, unchanged; an algorithm with no passing configuration is reported as failing the gate and is not a #105 arm"
+}
