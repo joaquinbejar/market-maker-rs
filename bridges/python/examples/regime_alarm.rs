@@ -1,11 +1,13 @@
 //! The causal regime detector of #112 over the days `regime_days` writes.
 //!
 //! `cargo run --release --example regime_alarm -- <m5_08 design> <data dir> [threads]`. For each
-//! simulator it takes the baseline volatility from the training days, then for every day writes
-//! `day-<n>.alarm.json` next to its rows: per row, the alarm (0 or 1), the volatility ratio and
-//! VPIN (null until it has its buckets), each from that row and the rows and market orders before
-//! it only. It prints the baseline and, for the training and validation days only, the alarms;
-//! the holdout's are left for the report.
+//! simulator it takes the baseline volatility from the training days. Then, for each simulator
+//! `<fit>` the detector is fitted on and every day of either simulator, it writes
+//! `day-<n>.alarm-<fit>.json` next to its rows: per row, the alarm (0 or 1), the volatility ratio
+//! and VPIN (null until it has its buckets), each from that row and the rows and market orders
+//! before it only. A detector fitted on one simulator and run on the other's days is the
+//! comparison of simulator error. It prints the baselines and, for the training and validation
+//! days only, the alarms; the holdout's are left for the report.
 //!
 //! Everything here is SYNTHETIC.
 //!
@@ -227,6 +229,19 @@ fn summary(rows: &[AlarmRow], times: &[u64]) -> (Vec<u64>, u64) {
     (onsets, on)
 }
 
+/// The rows of an alarm file: alarm, ratio and VPIN, decimals as text rounded to 6 places.
+fn written(out: &[AlarmRow]) -> Vec<Value> {
+    out.iter()
+        .map(|(alarm, ratio, vpin)| {
+            json!([
+                u8::from(*alarm),
+                ratio.map(|r| r.round_dp(6).to_string()),
+                vpin.map(|v| v.round_dp(6).to_string())
+            ])
+        })
+        .collect()
+}
+
 fn main() -> Result<(), Failure> {
     let mut args = std::env::args().skip(1);
     let design: Value = serde_json::from_slice(&fs::read(PathBuf::from(
@@ -236,75 +251,71 @@ fn main() -> Result<(), Failure> {
     let threads: usize = args.next().map_or(Ok(4), |t| t.parse())?;
     let settings = Settings::of(&design)?;
     let splits = get(&design, "splits")?;
-    let mut report = Vec::new();
+    let mut baselines = Vec::new();
     for simulator in SIMULATORS {
         let train: Vec<Day> = days_of(splits, "train")?
             .into_iter()
             .map(|day| read_day(&data.join("train").join(simulator), day))
             .collect::<Result<_, _>>()?;
-        let base = baseline(&train)?;
-        drop(train);
-        let mut jobs = Vec::new();
-        for split in ["train", "validation", "holdout"] {
-            for day in days_of(splits, split)? {
-                jobs.push((split, day));
+        baselines.push((simulator, baseline(&train)?));
+    }
+    let mut report = Vec::new();
+    for (fitted, base) in &baselines {
+        for simulator in SIMULATORS {
+            let mut jobs = Vec::new();
+            for split in ["train", "validation", "holdout"] {
+                for day in days_of(splits, split)? {
+                    jobs.push((split, day));
+                }
             }
-        }
-        let chunks: Vec<Vec<(&str, u64)>> = (0..threads)
-            .map(|t| jobs.iter().copied().skip(t).step_by(threads).collect())
-            .collect();
-        let results: Vec<Result<Vec<Value>, Failure>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = chunks
-                .iter()
-                .map(|chunk| {
-                    let data = &data;
-                    scope.spawn(move || -> Result<Vec<Value>, Failure> {
-                        let mut records = Vec::new();
-                        for (split, day) in chunk {
-                            let dir = data.join(split).join(simulator);
-                            let rows = read_day(&dir, *day)?;
-                            let out = detect(&rows, base, &settings)?;
-                            let written: Vec<Value> = out
-                                .iter()
-                                .map(|(alarm, ratio, vpin)| {
-                                    json!([
-                                        u8::from(*alarm),
-                                        ratio.map(|r| r.round_dp(6).to_string()),
-                                        vpin.map(|v| v.round_dp(6).to_string())
-                                    ])
-                                })
-                                .collect();
-                            fs::write(
-                                dir.join(format!("day-{day}.alarm.json")),
-                                serde_json::to_vec(&written)?,
-                            )?;
-                            if *split != "holdout" {
-                                let (onsets, on) = summary(&out, &rows.times);
-                                records.push(json!({
-                                    "simulator": simulator, "split": split, "day": day,
-                                    "alarm_onsets_s": onsets, "seconds_on": on,
-                                }));
-                            }
-                        }
-                        Ok(records)
-                    })
-                })
+            let chunks: Vec<Vec<(&str, u64)>> = (0..threads)
+                .map(|t| jobs.iter().copied().skip(t).step_by(threads).collect())
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Err("a thread panicked".into())))
-                .collect()
-        });
-        let mut records = Vec::new();
-        for result in results {
-            records.extend(result?);
+            let results: Vec<Result<Vec<Value>, Failure>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .map(|chunk| {
+                        let data = &data;
+                        let base = *base;
+                        scope.spawn(move || -> Result<Vec<Value>, Failure> {
+                            let mut records = Vec::new();
+                            for (split, day) in chunk {
+                                let dir = data.join(split).join(simulator);
+                                let rows = read_day(&dir, *day)?;
+                                let out = detect(&rows, base, &settings)?;
+                                fs::write(
+                                    dir.join(format!("day-{day}.alarm-{fitted}.json")),
+                                    serde_json::to_vec(&written(&out))?,
+                                )?;
+                                if *split != "holdout" {
+                                    let (onsets, on) = summary(&out, &rows.times);
+                                    records.push(json!({
+                                        "split": split, "day": day,
+                                        "alarm_onsets_s": onsets, "seconds_on": on,
+                                    }));
+                                }
+                            }
+                            Ok(records)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Err("a thread panicked".into())))
+                    .collect()
+            });
+            let mut records = Vec::new();
+            for result in results {
+                records.extend(result?);
+            }
+            records.sort_by_key(|r| r["day"].as_u64());
+            report.push(json!({
+                "fitted_on": fitted,
+                "simulator": simulator,
+                "baseline": base.round_dp(12).to_string(),
+                "days": records,
+            }));
         }
-        records.sort_by_key(|r| r["day"].as_u64());
-        report.push(json!({
-            "simulator": simulator,
-            "baseline": base.round_dp(12).to_string(),
-            "days": records,
-        }));
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
