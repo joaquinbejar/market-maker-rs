@@ -191,6 +191,61 @@ pub(super) enum ValidFill {
     },
 }
 
+/// A balance gate on the kernel's own ledger, as `margin_rs::risk::RiskGate`
+/// decides for a spot instrument in [`crate::backtest::MarginAccount`]
+/// (`margin` feature): fully collateralised, with no leverage.
+///
+/// - A buy reserves its notional at its limit price plus its largest fee,
+///   `max(fee_rate, 0)` of that notional, from the quote balance:
+///   [`KernelConfig::initial_capital`] plus the fill cash flows, minus the
+///   fees and the reservations of the live buys.
+/// - A sell reserves its quantity from the base balance: `base_deposit`
+///   plus the venue position, minus the live sells. Selling short draws on
+///   the deposit.
+///
+/// An order beyond the balance is reduced to what the balance covers, as the
+/// gate reduces it, or refused when that is less than one unit of the lot's
+/// grid; a reduction that is not a whole number of lots is refused, as the
+/// engine refuses it. A live order is one submitted and not yet filled,
+/// cancelled at the venue or rejected there: a requested cancel keeps its
+/// reservation, since the order can still fill. A fill releases what it
+/// filled. The gate runs after [`KernelConfig::limits`], on the lots they
+/// approved, and its decisions are [`super::GateRecord`]s with
+/// [`super::GateCheck::Margin`].
+///
+/// The kernel and an engine with a `MarginAccount` decide alike when the
+/// account's quote asset has the kernel's money scale (tick, lot and fee
+/// scales summed), its base asset and the instrument's quantity the lot's
+/// scale, the instrument's price scale the tick's, the deposits are
+/// `initial_capital` and `base_deposit`, `max_fee_rate` is `max(fee_rate,
+/// 0)` with fees in quote, and no other limit of the account is set.
+/// Margin requirements of a derivative, maintenance and liquidation are not
+/// modelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KernelMargin {
+    /// Base deposit, on the lot grid; zero or more. Sells draw on it.
+    pub base_deposit: Decimal,
+}
+
+impl KernelMargin {
+    /// A balance gate with `base_deposit` of base; the quote balance is the
+    /// kernel's initial capital.
+    #[must_use]
+    pub fn new(base_deposit: Decimal) -> Self {
+        Self { base_deposit }
+    }
+}
+
+/// The validated balance gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ValidMargin {
+    /// Base deposit, in lots.
+    pub(super) base_lots: u64,
+    /// The fee rate mantissa reserved on buys: `max(rate_num, 0)`.
+    pub(super) fee_num: i128,
+}
+
 /// User facing kernel configuration, in `Decimal`.
 ///
 /// [`super::FinancialKernel::new`] validates it into integers and checks
@@ -220,6 +275,8 @@ pub struct KernelConfig {
     pub limits: Option<RiskLimits>,
     /// Fill model.
     pub fill_model: KernelFillModel,
+    /// Optional balance gate on the kernel's ledger ([`KernelMargin`]).
+    pub margin: Option<KernelMargin>,
 }
 
 impl KernelConfig {
@@ -245,6 +302,7 @@ impl KernelConfig {
             latency: KernelLatency::default(),
             limits: None,
             fill_model: KernelFillModel::Immediate,
+            margin: None,
         }
     }
 
@@ -280,6 +338,13 @@ impl KernelConfig {
     #[must_use]
     pub fn with_limits(mut self, limits: RiskLimits) -> Self {
         self.limits = Some(limits);
+        self
+    }
+
+    /// Sets the balance gate.
+    #[must_use]
+    pub fn with_margin(mut self, margin: KernelMargin) -> Self {
+        self.margin = Some(margin);
         self
     }
 
@@ -341,6 +406,12 @@ impl KernelConfig {
                 w.u64(min_queue_ms);
             }
         }
+        // A section that a configuration without the balance gate does not
+        // write, so its bytes and fingerprint stay as they were.
+        if let Some(margin) = &self.margin {
+            w.bytes(b"MG");
+            w.decimal(margin.base_deposit);
+        }
         w.finish()
     }
 
@@ -374,6 +445,7 @@ pub(super) struct ValidatedConfig {
     pub(super) bound_b: u128,
     pub(super) latency: KernelLatency,
     pub(super) limits: Option<RiskLimits>,
+    pub(super) margin: Option<ValidMargin>,
     pub(super) fill: ValidFill,
     /// [`CapacityNeed::partial_reports_per_order`] on the dataset.
     pub(super) partial_reports_per_order: u64,
@@ -593,6 +665,29 @@ pub(super) fn validate(cfg: &KernelConfig, relax: Relax) -> MMResult<ValidatedCo
             limits.max_position, limits.max_notional
         )));
     }
+    let margin = match &cfg.margin {
+        None => None,
+        Some(m) => {
+            let base_lots = if m.base_deposit.is_zero() {
+                Some(0)
+            } else {
+                lot.count(m.base_deposit)
+                    .and_then(|v| u64::try_from(v).ok())
+                    .filter(|v| i64::try_from(*v).is_ok())
+            };
+            let base_lots = base_lots.ok_or_else(|| {
+                config_error(format!(
+                    "margin base_deposit {} must be zero or a positive multiple of lot_size {} \
+                     fitting i64 lots",
+                    m.base_deposit, cfg.lot_size
+                ))
+            })?;
+            Some(ValidMargin {
+                base_lots,
+                fee_num: rate_num.max(0),
+            })
+        }
+    };
     let (x_eff, bound_b) = if relax.bounds {
         (i64::MAX.unsigned_abs(), u128::MAX / 40)
     } else {
@@ -614,6 +709,7 @@ pub(super) fn validate(cfg: &KernelConfig, relax: Relax) -> MMResult<ValidatedCo
         bound_b,
         latency: cfg.latency,
         limits: cfg.limits.clone(),
+        margin,
         fill,
         partial_reports_per_order: 0,
         fingerprint,
