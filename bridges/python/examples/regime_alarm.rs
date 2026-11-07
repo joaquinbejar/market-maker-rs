@@ -9,6 +9,9 @@
 //! comparison of simulator error. It prints the baselines and, for the training and validation
 //! days only, the alarms; the holdout's are left for the report.
 //!
+//! `[lambda] [tag]` after the threads is a post hoc sensitivity run, outside the design's rule:
+//! the same detector with another EWMA lambda, its files named `day-<n>.alarm-<fit>-<tag>.json`.
+//!
 //! Everything here is SYNTHETIC.
 //!
 //! - The volatility is `VolatilityEstimator`'s EWMA of the mid's log returns over the last
@@ -249,7 +252,15 @@ fn main() -> Result<(), Failure> {
     ))?)?;
     let data = PathBuf::from(args.next().ok_or("the data directory")?);
     let threads: usize = args.next().map_or(Ok(4), |t| t.parse())?;
-    let settings = Settings::of(&design)?;
+    let mut settings = Settings::of(&design)?;
+    // A post hoc sensitivity run: another lambda, written under a tag beside the frozen files.
+    let tag = match args.next() {
+        Some(lambda) => {
+            settings.lambda = lambda.parse()?;
+            format!("-{}", args.next().ok_or("a sensitivity run needs a tag")?)
+        }
+        None => String::new(),
+    };
     let splits = get(&design, "splits")?;
     let mut baselines = Vec::new();
     for simulator in SIMULATORS {
@@ -277,6 +288,7 @@ fn main() -> Result<(), Failure> {
                     .map(|chunk| {
                         let data = &data;
                         let base = *base;
+                        let tag = &tag;
                         scope.spawn(move || -> Result<Vec<Value>, Failure> {
                             let mut records = Vec::new();
                             for (split, day) in chunk {
@@ -284,7 +296,7 @@ fn main() -> Result<(), Failure> {
                                 let rows = read_day(&dir, *day)?;
                                 let out = detect(&rows, base, &settings)?;
                                 fs::write(
-                                    dir.join(format!("day-{day}.alarm-{fitted}.json")),
+                                    dir.join(format!("day-{day}.alarm-{fitted}{tag}.json")),
                                     serde_json::to_vec(&written(&out))?,
                                 )?;
                                 if *split != "holdout" {
