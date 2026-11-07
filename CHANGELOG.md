@@ -24,7 +24,7 @@ project follows [Semantic Versioning](https://semver.org/).
 - Hedge actions in the RL action space (feature `rl`, #247): with
   `RlConfig::with_hedge_actions`, `rl::RlAction::Hedge` reduces the delivered position with a
   marketable limit order at the observed touch, of a size from the order size grid and never
-  larger than that position, as `HedgeActions::MarketableAtTouch` states. `RlEnv::hedge_mask`
+  larger than that position at the decision, as `HedgeActions::MarketableAtTouch` states. `RlEnv::hedge_mask`
   and `Transition::hedge_mask` give the sizes allowed; a hedge outside them follows the
   declared `InvalidActionPolicy`, and `rl::ERR_HEDGE_REFUSED` marks one taken as a hold. It is
   an order like any other: the kernel's admission, gate and limits decide on it, and its cost

@@ -120,7 +120,7 @@ pub enum RlAction {
     /// Reduce the delivered position with a marketable order at the observed touch, as
     /// [`HedgeActions::MarketableAtTouch`] states. It replaces the resting orders.
     Hedge {
-        /// Index of the size in the grid's sizes, at most the delivered position.
+        /// Index of the size in the grid's sizes, at most the delivered position at the decision.
         size: usize,
     },
 }

@@ -394,7 +394,7 @@ pub enum HedgeActions {
     },
     /// A hedge in the quoted instrument: a marketable limit order at the observed touch
     /// on the side that reduces the delivered position, of a size from the order size
-    /// grid, never larger than that position. It replaces the resting orders, as a
+    /// grid, never larger than that position at the decision. It replaces the resting orders, as a
     /// quote does, and fills under the kernel's fill model at its own price, with the
     /// kernel's fee rate: when a later row's touch reaches it, after the latencies, and
     /// otherwise it rests. A hedge in another instrument is not modelled.
