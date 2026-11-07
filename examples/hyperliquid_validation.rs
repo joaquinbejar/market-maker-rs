@@ -32,8 +32,14 @@
 //!   the Hawkes kernel, by `select_decay` on training and validation only; the test at the end
 //!   of this file checks that a holdout it never reads cannot change it. Every horizon, window
 //!   length, fee and latency is reported, and none is picked.
-//! - **No randomness.** Nothing draws a random number: the thinning below is by count. So there
-//!   is no seed to fix.
+//! - **One seed.** The thinning below is by count, so it draws nothing. The only random numbers
+//!   are the queue-reactive model's runs of #90 (b), (c) and (d), all from [`QR_SEED`].
+//! - **The book's windows for #90 (b), (c) and (d).** The data's book, sampled every
+//!   [`BOOK_SAMPLE_MS`], and its queue events are compared with the model's on windows of
+//!   [`BOOK_WINDOW_MS`] from their start: the holdout's first hours against the training fit,
+//!   out of sample, and each whole UTC day's first hours against that day's own fit, in sample, as
+//!   a per-day diagnostic. Each model is run for the window's length, and so is its constant
+//!   intensity baseline.
 //! - **Fees and funding** are in no file of the capture. The fees are the declared grid
 //!   [`FEE_RATES`], not the venue's schedule. Funding is not applied, as the simulator has no
 //!   input for it.
@@ -67,8 +73,13 @@
 //! - The sized events of the size window only, at most an hour of them.
 //! - Market events of the holdout, one file at a time: the part of the holdout in each file is
 //!   simulated on its own, from a flat inventory, and only the totals are kept.
+//! - The book's windows, whole: about 2 million queue events an hour of 24 bytes and a sample a
+//!   second, so about 100 MB per window of [`BOOK_WINDOW_MS`], two at most at a time (a day's
+//!   until its end, and the holdout's), and as much again for a model run. A window is compared
+//!   once what its fit needs has been read, and then dropped.
 //!
-//! So a month needs about 0.5 GB kept beside the hour being read. The report ends with what was
+//! So a month needs about 0.5 GB kept beside the hour being read, and about 0.4 GB more at
+//! most for the book's windows. The report ends with what was
 //! kept, counted. Thinning by count, independently of what happened, leaves a rate per second of
 //! exposure or of waiting where it was in expectation, and drops evidence: it widens the error of
 //! each estimate.
@@ -90,13 +101,14 @@ use market_maker_rs::backtest::hawkes::{
     score_flow, select_decay,
 };
 use market_maker_rs::backtest::hyperliquid::{
-    BookEvent, Coverage, RepeatFilter, Replay, ReplayConfig, ReplayOutput, Warmth,
+    BookEvent, Coverage, RepeatFilter, Replay, ReplayConfig, ReplayOutput, Warmth, book_samples,
     decode_order_statuses_after, hawkes_segments, queue_observations, read_book_diffs_after,
     read_trades_after, sized_events,
 };
 use market_maker_rs::backtest::queue_reactive::{
-    EventSizeRecord, QrEstimationConfig, QrEventKind, QrFit, QrSide, QueueObservation,
-    ReferenceObservation, SizedEvent, UnsupportedPolicy, estimate_event_sizes, estimate_parameters,
+    BookSample, DiscrepancyReport, EventSizeRecord, QrEstimationConfig, QrEventKind, QrFit,
+    QrParameters, QrSide, QrSimulator, QueueObservation, ReferenceObservation, SizedEvent,
+    Trajectory, UnsupportedPolicy, compare_trajectories, estimate_event_sizes, estimate_parameters,
 };
 use market_maker_rs::dec;
 use market_maker_rs::risk::RiskLimits;
@@ -206,6 +218,16 @@ const QR_MIN_EVENTS: u64 = 30;
 const QR_MIN_REFERENCE_MOVES: u64 = 30;
 /// Queue sizes of the first limit whose rates each day's estimate prints.
 const QR_DAY_SIZES: [usize; 5] = [1, 2, 5, 10, 20];
+/// Length of each window the book is compared on, from its start: the holdout's first hours for
+/// (b) and (c), and each whole UTC day's first hours for (d). A window's events are kept whole,
+/// about two million an hour, so it is bounded.
+const BOOK_WINDOW_MS: u64 = 2 * HOUR_MS;
+/// The book's sampling grid, in the data and in the model.
+const BOOK_SAMPLE_MS: u64 = SECOND_MS;
+/// Interval the flow law counts events in.
+const FLOW_INTERVAL_MS: u64 = SECOND_MS;
+/// Seed of every model run, the only randomness here.
+const QR_SEED: u64 = 263;
 
 // #91, Poisson, queue-reactive and Hawkes flow on the first limit.
 
@@ -577,6 +599,145 @@ fn within_cap(segment: &HawkesSegment, cap: u32) -> bool {
     true
 }
 
+/// What a comparison window's fit is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowKind {
+    /// Out of sample: the training fit, against the holdout's first hours.
+    Holdout,
+    /// In sample: that day's own fit, against its first hours.
+    Day(TimeWindow),
+}
+
+/// A window the book is compared on, for #90 (b), (c) and (d).
+#[derive(Debug)]
+struct BookWindow {
+    kind: WindowKind,
+    window: TimeWindow,
+    /// When everything its fit needs has been read.
+    due_ms: u64,
+    samples: Vec<BookSample>,
+    events: Vec<QueueObservation>,
+    samples_without_sizes: u64,
+    error: Option<String>,
+    /// Samples and events compared, once done.
+    data: (u64, u64),
+    result: Option<Vec<String>>,
+}
+
+impl BookWindow {
+    fn new(kind: WindowKind, start_ms: u64, limit_ms: u64, due_ms: u64) -> Self {
+        Self {
+            kind,
+            window: TimeWindow {
+                start_ms,
+                end_ms: (start_ms + BOOK_WINDOW_MS).min(limit_ms),
+            },
+            due_ms,
+            samples: Vec::new(),
+            events: Vec::new(),
+            samples_without_sizes: 0,
+            error: None,
+            data: (0, 0),
+            result: None,
+        }
+    }
+
+    /// The holdout's first hours, then each whole UTC day's.
+    fn all(protocol: &Protocol) -> Vec<Self> {
+        let holdout = protocol.holdout();
+        let mut windows = vec![Self::new(
+            WindowKind::Holdout,
+            holdout.start_ms,
+            holdout.end_ms,
+            (holdout.start_ms + BOOK_WINDOW_MS).min(holdout.end_ms),
+        )];
+        for day in protocol.days() {
+            windows.push(Self::new(
+                WindowKind::Day(day),
+                day.start_ms,
+                day.end_ms,
+                day.end_ms,
+            ));
+        }
+        windows
+    }
+
+    fn holds(&self, ms: u64) -> bool {
+        self.window.start_ms <= ms && ms < self.window.end_ms
+    }
+}
+
+fn qr_config(tick: Decimal) -> QrEstimationConfig {
+    QrEstimationConfig::new(
+        tick,
+        LIMITS,
+        QR_MAX_QUEUE,
+        QR_MIN_EVENTS,
+        QR_MIN_REFERENCE_MOVES,
+        UnsupportedPolicy::NearestSupported,
+    )
+}
+
+/// The data of one window against `params` and its constant intensity baseline, each run for
+/// the window's length from seed [`QR_SEED`] and sampled on the same grid.
+fn compare_window(
+    samples: Vec<BookSample>,
+    events: Vec<QueueObservation>,
+    params: &QrParameters,
+    window: TimeWindow,
+) -> Vec<String> {
+    let mut data = Trajectory::default();
+    data.samples = samples;
+    data.events = events;
+    let seconds = (window.end_ms - window.start_ms) as f64 / 1e3;
+    let mut lines = Vec::new();
+    let baseline = params.constant_baseline();
+    for (name, model) in [("fit", Ok(params.clone())), ("constant", baseline)] {
+        let line = model
+            .and_then(|model| {
+                let run = QrSimulator::new(model.clone(), QR_SEED, 0)?
+                    .run(seconds, BOOK_SAMPLE_MS as f64 / 1e3)?;
+                compare_trajectories(&data, &run, &model, FLOW_INTERVAL_MS)
+            })
+            .map_or_else(
+                |error| format!("{name}: not evaluable: {error}"),
+                |report| format!("{name}: {}", discrepancy_text(&report)),
+            );
+        lines.push(line);
+    }
+    lines
+}
+
+fn discrepancy_text(r: &DiscrepancyReport) -> String {
+    let list = |values: &[f64]| {
+        values
+            .iter()
+            .map(|v| format!("{v:.3}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!(
+        "queue size TV by limit [{}]; spread TV {:.3}; mean wait relative error by limit [{}]; \
+         wait KS by limit [{}]; flow relative error L/C/M [{}]; flow law TV L/C/M [{}]; state \
+         coverage {:.4}; data {} samples, {} events ({} without a positive wait); model {} \
+         samples, {} events ({} without), stopped {:?}",
+        list(&r.queue_size),
+        r.spread,
+        list(&r.waiting_time),
+        list(&r.waiting_law),
+        list(&r.flow),
+        list(&r.flow_law),
+        r.coverage,
+        r.data_samples,
+        r.data_events,
+        r.data_invalid_waiting,
+        r.model_samples,
+        r.model_events,
+        r.model_invalid_waiting,
+        r.model_stopped
+    )
+}
+
 /// Keeps the last item of each bucket of the clock.
 fn keep_last<T>(kept: &mut Vec<T>, item: T, time: impl Fn(&T) -> u64) {
     let bucket = time(&item) / SAMPLE_MS;
@@ -707,6 +868,8 @@ struct Collect {
     train_record: Option<Result<CalibrationRecord, String>>,
     sim: Vec<SimCell>,
     sim_note: Option<String>,
+    book_windows: Vec<BookWindow>,
+    qr_train: Option<Result<QrParameters, String>>,
 }
 
 impl Collect {
@@ -752,6 +915,8 @@ impl Collect {
             train_record: None,
             sim,
             sim_note: None,
+            book_windows: BookWindow::all(&protocol),
+            qr_train: None,
         }
     }
 
@@ -799,6 +964,7 @@ impl Collect {
             }
         }
         self.take_events(&output.events);
+        self.take_book(output);
         let holdout: Vec<MarketEvent> = output
             .market_events
             .iter()
@@ -808,9 +974,102 @@ impl Collect {
         if !holdout.is_empty() {
             self.simulate_hour(&holdout);
         }
-        output.events.last().is_some_and(|last| {
-            last.epoch > self.epoch || last.time.timestamp_ns / NS_PER_MS >= self.protocol.end_ms
-        })
+        let read_to_ms = output.events.last().map(|last| {
+            if last.epoch > self.epoch {
+                u64::MAX
+            } else {
+                last.time.timestamp_ns / NS_PER_MS
+            }
+        });
+        if let Some(read_to_ms) = read_to_ms {
+            self.compare_due(read_to_ms);
+        }
+        read_to_ms.is_some_and(|ms| ms >= self.protocol.end_ms)
+    }
+
+    /// Keeps the book samples inside a comparison window, in the model's units.
+    fn take_book(&mut self, output: &ReplayOutput) {
+        let event_sizes = match &self.sizes {
+            Some(sizes) => sizes.queue.sizes.as_ref().ok(),
+            None => None,
+        };
+        for window in &mut self.book_windows {
+            if window.result.is_some() {
+                continue;
+            }
+            let inside: Vec<_> = output
+                .book
+                .iter()
+                .filter(|s| s.epoch == self.epoch && window.holds(s.value.timestamp_ms))
+                .cloned()
+                .collect();
+            if inside.is_empty() {
+                continue;
+            }
+            let Some(event_sizes) = event_sizes else {
+                window.samples_without_sizes += inside.len() as u64;
+                continue;
+            };
+            match book_samples(&inside, event_sizes, self.tick) {
+                Ok(samples) => window.samples.extend(samples.into_iter().map(|s| s.value)),
+                Err(error) => window.error = Some(format!("book_samples: {error}")),
+            }
+        }
+    }
+
+    /// The queue-reactive fit on training, once training has been read.
+    fn qr_train(&mut self) -> Result<QrParameters, String> {
+        if self.qr_train.is_none() {
+            let fit = self.qr_fit(&self.protocol.queue_train());
+            self.qr_train = Some(fit);
+        }
+        self.qr_train
+            .clone()
+            .unwrap_or_else(|| Err("not fitted".to_string()))
+    }
+
+    /// The queue-reactive fit on the observations kept inside `window`.
+    fn qr_fit(&self, window: &TimeWindow) -> Result<QrParameters, String> {
+        let Some(Ok(event_sizes)) = self.sizes.as_ref().map(|s| &s.queue.sizes) else {
+            return Err("no event sizes".to_string());
+        };
+        let record = estimate_parameters(
+            &self.queue,
+            &self.references,
+            event_sizes,
+            window,
+            &qr_config(self.tick),
+            &self.dataset,
+        )
+        .map_err(|error| format!("estimate_parameters: {error}"))?;
+        match record.fit {
+            QrFit::Calibrated(params) => Ok(params),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
+    /// Compares every window whose fit can be made once the data has been read to `read_to_ms`,
+    /// and drops its data.
+    fn compare_due(&mut self, read_to_ms: u64) {
+        for index in 0..self.book_windows.len() {
+            let window = &self.book_windows[index];
+            if window.result.is_some() || read_to_ms < window.due_ms {
+                continue;
+            }
+            let fit = match window.kind {
+                WindowKind::Holdout => self.qr_train(),
+                WindowKind::Day(day) => self.qr_fit(&day),
+            };
+            let window = &mut self.book_windows[index];
+            let samples = std::mem::take(&mut window.samples);
+            let events = std::mem::take(&mut window.events);
+            window.data = (samples.len() as u64, events.len() as u64);
+            window.result = Some(match (&window.error, fit) {
+                (Some(error), _) => vec![format!("not evaluable: {error}")],
+                (None, Err(error)) => vec![format!("not evaluable: no fit: {error}")],
+                (None, Ok(params)) => compare_window(samples, events, &params, window.window),
+            });
+        }
     }
 
     fn take_events(&mut self, all: &[BookEvent]) {
@@ -880,6 +1139,14 @@ impl Collect {
                     self.queue_left_out[1] += conversion.unknown_cause;
                     self.queue_left_out[2] += conversion.no_depth;
                     self.queue_left_out[3] += conversion.zero_waits;
+                    for observation in &conversion.observations {
+                        let at = observation.value.timestamp_ms;
+                        for window in &mut self.book_windows {
+                            if window.result.is_none() && window.holds(at) {
+                                window.events.push(observation.value);
+                            }
+                        }
+                    }
                     for observation in conversion.observations {
                         if observation.value.waiting_seconds > 0.0
                             && keep_one_in(&mut self.queue_seen, self.strides.queue)
@@ -1085,7 +1352,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(out_dir)?;
     let tick = Decimal::from_str(tick)?;
     let minutes: u64 = warmup.parse()?;
-    let config = ReplayConfig::new(tick, LIMITS, minutes * 60 * 1_000_000_000, RESET_GAP_NS)?;
+    let config = ReplayConfig::new(tick, LIMITS, minutes * 60 * 1_000_000_000, RESET_GAP_NS)?
+        .with_book_samples(BOOK_SAMPLE_MS)?;
     let mut report = Report::default();
     say!(
         report,
@@ -1200,6 +1468,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if collect.sizes.is_none() && collect.queue_error.is_none() {
         collect.close_sizes();
     }
+    collect.compare_due(u64::MAX);
     if collect.unsorted_hours > 0 {
         say!(
             report,
@@ -1212,6 +1481,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     section_88(&mut report, &collect);
     section_89(&mut report, &collect);
     section_90(&mut report, &collect, &days);
+    section_90_book(&mut report, &collect);
     section_91(&mut report, &collect);
     section_rest(&mut report);
     section_kept(&mut report, &collect);
@@ -1248,7 +1518,8 @@ fn print_config(report: &mut Report, coin: &str, tick: Decimal, minutes: u64, st
     );
     say!(
         report,
-        "Randomness: none; thinning is by count or by clock, so there is no seed."
+        "Randomness: thinning is by count or by clock; the queue-reactive model runs of #90 (b), \
+         (c) and (d) use seed {QR_SEED}."
     );
     say!(
         report,
@@ -1287,7 +1558,12 @@ fn print_config(report: &mut Report, coin: &str, tick: Decimal, minutes: u64, st
         report,
         "#90: queue cap {QR_MAX_QUEUE} event sizes, at least {QR_MIN_EVENTS} events per size, \
          {QR_MIN_REFERENCE_MOVES} mid moves; nearest supported size where unsupported; per day \
-         the rates of sizes {QR_DAY_SIZES:?} of the first limit."
+         the rates of sizes {QR_DAY_SIZES:?} of the first limit. (b), (c), (d): the book sampled \
+         every {BOOK_SAMPLE_MS} ms on windows of {} min from their start (the holdout's, against \
+         the training fit; each whole UTC day's, against its own fit), the model and its \
+         constant intensity baseline run for as long on the same grid, events counted per \
+         {FLOW_INTERVAL_MS} ms for the flow law.",
+        BOOK_WINDOW_MS / 60_000
     );
     say!(
         report,
@@ -1975,13 +2251,56 @@ fn section_rest(report: &mut Report) {
         report,
         "#91 (b) Wu et al. as a replication: a different instrument and different data."
     );
-    say!(report, "\n== Not done ==");
+}
+
+fn section_90_book(report: &mut Report, collect: &Collect) {
     say!(
         report,
-        "#90 (b) distribution comparison and (c) out-of-sample discrepancies with \
-         compare_trajectories: it needs a data Trajectory of BookSample, which the replay does \
-         not expose."
+        "\n== #90 (b) queue size, spread, waiting time and flow laws against the data and a \
+         constant intensity baseline, (c) out-of-sample discrepancies and state coverage, (d) \
+         discrepancies per day =="
     );
+    say!(
+        report,
+        "API: hyperliquid::{{ReplayConfig::with_book_samples, book_samples, \
+         queue_observations}} for the data, backtest::queue_reactive::{{QrSimulator::run, \
+         QrParameters::constant_baseline, compare_trajectories}}. A sample shows the book after \
+         every diff before its time, its limits counted from the mid as the depths are, in event \
+         sizes; the spread is the touch's width in ticks. Events of one block share a time, so \
+         most data waits are zero: compare_trajectories leaves them out of the waiting times and \
+         counts them, and they stay in the flow. The model's limits count from a reference half \
+         a tick off the grid, so a touch two ticks wide is a spread of 2 here with both first \
+         limits filled, which the model shows only with one empty."
+    );
+    for window in &collect.book_windows {
+        let name = match window.kind {
+            WindowKind::Holdout => "(b), (c) holdout, training fit, out of sample",
+            WindowKind::Day(_) => "(d) day, own fit, in sample",
+        };
+        say!(
+            report,
+            "{name}: {}; {} samples and {} events compared{}",
+            window_text(&window.window),
+            window.data.0,
+            window.data.1,
+            if window.samples_without_sizes > 0 {
+                format!(
+                    "; {} samples before the event sizes were known, left out",
+                    window.samples_without_sizes
+                )
+            } else {
+                String::new()
+            }
+        );
+        match &window.result {
+            Some(lines) => {
+                for line in lines {
+                    say!(report, "    {line}");
+                }
+            }
+            None => say!(report, "    not reached: the stretch ended before it"),
+        }
+    }
 }
 
 fn section_kept(report: &mut Report, collect: &Collect) {
@@ -2032,6 +2351,10 @@ fn section_kept(report: &mut Report, collect: &Collect) {
 mod tests {
     use super::*;
     use market_maker_rs::backtest::hawkes::HawkesEvent;
+    use market_maker_rs::backtest::hyperliquid::{
+        BookDiff, ORDER_STATUS_RECORD_BYTES, OrderStatusRecord, STATUS_OPEN, decode_order_status,
+        parse_book_diff,
+    };
 
     const START: u64 = 1_764_583_200_000;
 
@@ -2119,6 +2442,198 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn test_book_windows_are_declared_and_compared_once_their_fit_can_be_made() {
+        // Starts at 20:00 UTC, so the stretch holds whole days and the holdout starts mid-day.
+        let start = 1_764_619_200_000;
+        let end = start + 5 * DAY_MS;
+        let protocol = Protocol::new(start, end).unwrap();
+        let mut collect = Collect::new(
+            protocol,
+            0,
+            dec!(1),
+            "synthetic".to_string(),
+            Strides::for_hours(1),
+        );
+        let holdout = protocol.holdout();
+        let days = protocol.days();
+        assert_eq!(collect.book_windows.len(), 1 + days.len());
+        let first = &collect.book_windows[0];
+        assert_eq!(first.kind, WindowKind::Holdout);
+        assert_eq!(first.window.start_ms, holdout.start_ms);
+        assert_eq!(first.window.end_ms, holdout.start_ms + BOOK_WINDOW_MS);
+        assert_eq!(first.due_ms, first.window.end_ms);
+        for (window, day) in collect.book_windows[1..].iter().zip(&days) {
+            assert_eq!(window.kind, WindowKind::Day(*day));
+            assert_eq!(window.window.start_ms, day.start_ms);
+            assert_eq!(window.window.end_ms, day.start_ms + BOOK_WINDOW_MS);
+            assert_eq!(
+                window.due_ms, day.end_ms,
+                "a day's own fit needs the whole day"
+            );
+            assert!(window.holds(day.start_ms));
+            assert!(!window.holds(day.start_ms + BOOK_WINDOW_MS));
+            assert!(!window.holds(day.start_ms - 1));
+        }
+        // A short holdout bounds its window.
+        let short = Protocol::new(START, START + 4 * HOUR_MS).unwrap();
+        let windows = BookWindow::all(&short);
+        assert_eq!(windows[0].window.end_ms, short.end_ms);
+        assert_eq!(windows[0].due_ms, short.end_ms);
+
+        // Nothing is compared before its time; then each once, and its data is dropped.
+        let sample = BookSample {
+            timestamp_ms: holdout.start_ms,
+            bid: [1; 5],
+            ask: [1; 5],
+            spread_ticks: 1,
+        };
+        for window in &mut collect.book_windows {
+            window.samples.push(sample);
+        }
+        collect.compare_due(holdout.start_ms + BOOK_WINDOW_MS - 1);
+        let day_due = days[0].end_ms;
+        assert!(day_due < holdout.start_ms);
+        assert!(collect.book_windows[0].result.is_none());
+        assert_eq!(collect.book_windows[0].samples.len(), 1);
+        assert!(collect.book_windows[1].result.is_some());
+        collect.compare_due(holdout.start_ms + BOOK_WINDOW_MS);
+        let window = &collect.book_windows[0];
+        assert!(window.samples.is_empty());
+        assert_eq!(window.data, (1, 0));
+        assert_eq!(
+            window.result,
+            Some(vec!["not evaluable: no fit: no event sizes".to_string()])
+        );
+        let read = holdout.start_ms + BOOK_WINDOW_MS;
+        for window in &collect.book_windows {
+            assert_eq!(window.result.is_some(), window.due_ms <= read);
+        }
+        assert!(collect.book_windows.iter().any(|w| w.result.is_none()));
+        collect.compare_due(u64::MAX);
+        assert!(collect.book_windows.iter().all(|w| w.result.is_some()));
+    }
+
+    /// An order status record, by the schema's offsets, with two decimals.
+    fn status(
+        ns: u64,
+        id: u8,
+        is_ask: bool,
+        cents: u32,
+        size_cents: u32,
+        oid: u64,
+    ) -> OrderStatusRecord {
+        let fixed = |value: u32| (2u32 << 29) | value;
+        let mut bytes = vec![0u8; ORDER_STATUS_RECORD_BYTES];
+        bytes[0..8].copy_from_slice(&ns.to_le_bytes());
+        bytes[13] = id;
+        bytes[14] = u8::from(is_ask);
+        bytes[15..19].copy_from_slice(&fixed(cents).to_le_bytes());
+        bytes[19..23].copy_from_slice(&fixed(size_cents).to_le_bytes());
+        bytes[23..31].copy_from_slice(&oid.to_le_bytes());
+        decode_order_status(&bytes).unwrap()
+    }
+
+    fn diff(oid: u64, side: &str, price: &str, size: &str) -> BookDiff {
+        let line = format!(
+            r#"{{"user":"0x1","oid":{oid},"coin":"BTC","side":"{side}","px":"{price}","raw_book_diff":{{"new":{{"sz":"{size}"}}}}}}"#
+        );
+        parse_book_diff(&line).unwrap().1
+    }
+
+    #[test]
+    fn test_a_book_window_keeps_the_events_and_samples_inside_it_only() {
+        let protocol = Protocol::new(START, START + 10 * HOUR_MS).unwrap();
+        let mut collect = Collect::new(
+            protocol,
+            0,
+            dec!(1),
+            "synthetic".to_string(),
+            Strides::for_hours(1),
+        );
+        let sized: Vec<SizedEvent> = (0..MIN_SIZED_EVENTS)
+            .flat_map(|i| {
+                (0..3u8).map(move |depth| SizedEvent {
+                    timestamp_ms: START + i * SECOND_MS,
+                    depth,
+                    size: dec!(1),
+                })
+            })
+            .collect();
+        let sizes = |limits| {
+            estimate_event_sizes(&sized, &protocol.sizes(), limits, MIN_SIZED_EVENTS).unwrap()
+        };
+        collect.sizes = Some(Sizes {
+            queue: sizes(LIMITS),
+            hawkes: sizes(1),
+        });
+        // A two sided book 10 s before the holdout, then one bid a second for 5 s from its start.
+        let h = protocol.holdout().start_ms * NS_PER_MS;
+        let ns = |seconds: i64| h.checked_add_signed(seconds * 1_000_000_000).unwrap();
+        let mut statuses = vec![
+            status(ns(-10), STATUS_OPEN, false, 10_000, 200, 1),
+            status(ns(-9), STATUS_OPEN, true, 10_100, 300, 2),
+            status(ns(-8), STATUS_OPEN, true, 10_200, 100, 3),
+        ];
+        // The third is an observation, at limit 1, before the window.
+        let mut diffs = vec![
+            diff(1, "B", "100", "2"),
+            diff(2, "A", "101", "3"),
+            diff(3, "A", "102", "1"),
+        ];
+        for (i, at) in (0..5).enumerate() {
+            let oid = 10 + i as u64;
+            statuses.push(status(ns(at), STATUS_OPEN, false, 10_000, 100, oid));
+            diffs.push(diff(oid, "B", "100", "1"));
+        }
+        let config = ReplayConfig::new(dec!(1), LIMITS, 0, RESET_GAP_NS)
+            .unwrap()
+            .with_book_samples(BOOK_SAMPLE_MS)
+            .unwrap();
+        let mut replay = Replay::new(config);
+        let output = replay.ingest(&statuses, &diffs, &[]).unwrap();
+        assert!(
+            output
+                .book
+                .iter()
+                .any(|s| s.value.timestamp_ms < protocol.holdout().start_ms)
+        );
+        collect.take(&output);
+        let window = &collect.book_windows[0];
+        assert_eq!(window.kind, WindowKind::Holdout);
+        // The five bids at the touch, and none of the opening's diffs before the window.
+        assert_eq!(window.events.len(), 5);
+        assert!(window.events.iter().all(|e| window.holds(e.timestamp_ms)));
+        // The grid times from the holdout's start to the last diff: 0 to 4 s, each showing the
+        // bids before it.
+        let bids: Vec<u32> = window.samples.iter().map(|s| s.bid[0]).collect();
+        assert_eq!(bids, vec![2, 3, 4, 5, 6]);
+        assert!(
+            window
+                .samples
+                .iter()
+                .all(|s| s.ask[0] == 3 && s.ask[1] == 1)
+        );
+        assert_eq!(window.samples_without_sizes, 0);
+        assert!(window.result.is_none());
+
+        // An hour that reads past the window's end compares it and drops its data. Its diff ends
+        // a silence that resets the replay, so no sample spans that silence.
+        let past = ns(i64::try_from(BOOK_WINDOW_MS / SECOND_MS).unwrap() + 1);
+        let output = replay
+            .ingest(
+                &[status(past, STATUS_OPEN, false, 10_000, 100, 20)],
+                &[diff(20, "B", "100", "1")],
+                &[],
+            )
+            .unwrap();
+        collect.take(&output);
+        let window = &collect.book_windows[0];
+        assert!(window.result.is_some());
+        assert!(window.samples.is_empty() && window.events.is_empty());
+        assert_eq!(window.data, (5, 5));
     }
 
     #[test]

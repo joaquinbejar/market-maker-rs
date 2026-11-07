@@ -1,0 +1,529 @@
+{
+  "issue": 102,
+  "design_version": 4,
+  "data": "synthetic: a queue-reactive simulator with made-up parameters, no market data",
+  "bounds": "One synthetic simulator, made-up parameters and 24 days per regime bound what this comparison can show.",
+  "simulator": {
+    "kind": "queue_reactive",
+    "sample_ms": 10000,
+    "rows_per_day": 8640,
+    "reference_ticks": 10000,
+    "regimes": [
+      {
+        "name": "calm",
+        "tick_size": "0.01",
+        "theta": 0.6,
+        "theta_reinit": 0.2,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              4.0,
+              0.0,
+              0.0
+            ],
+            [
+              4.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              2.0,
+              1.0
+            ],
+            [
+              2.0,
+              3.0,
+              1.0
+            ],
+            [
+              0.0,
+              4.0,
+              1.0
+            ]
+          ],
+          [
+            [
+              4.0,
+              0.0,
+              0.0
+            ],
+            [
+              4.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              2.0,
+              1.0
+            ],
+            [
+              2.0,
+              3.0,
+              1.0
+            ],
+            [
+              0.0,
+              4.0,
+              1.0
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      },
+      {
+        "name": "stressed",
+        "tick_size": "0.01",
+        "theta": 0.7,
+        "theta_reinit": 0.3,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              6.0,
+              0.0,
+              0.0
+            ],
+            [
+              6.0,
+              2.0,
+              2.5
+            ],
+            [
+              5.0,
+              3.0,
+              2.5
+            ],
+            [
+              4.0,
+              4.0,
+              2.5
+            ],
+            [
+              0.0,
+              5.0,
+              2.5
+            ]
+          ],
+          [
+            [
+              6.0,
+              0.0,
+              0.0
+            ],
+            [
+              6.0,
+              2.0,
+              2.5
+            ],
+            [
+              5.0,
+              3.0,
+              2.5
+            ],
+            [
+              4.0,
+              4.0,
+              2.5
+            ],
+            [
+              0.0,
+              5.0,
+              2.5
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      },
+      {
+        "name": "thin",
+        "tick_size": "0.01",
+        "theta": 0.8,
+        "theta_reinit": 0.4,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              2.0,
+              0.0,
+              0.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ],
+            [
+              1.0,
+              2.0,
+              1.0
+            ],
+            [
+              0.0,
+              2.0,
+              1.0
+            ]
+          ],
+          [
+            [
+              2.0,
+              0.0,
+              0.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ],
+            [
+              1.0,
+              2.0,
+              1.0
+            ],
+            [
+              0.0,
+              2.0,
+              1.0
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      }
+    ],
+    "regime_note": "The simulator's rates are the same on both sides, so a skewed flow is not available; the third regime is a thin book instead.",
+    "seed": "1000003 * regime_number + day, regime_number from 1 in the order above, day from 1",
+    "start_ms": "(day - 1) * 86400000, so each day is one UTC day"
+  },
+  "days": 24,
+  "splits": {
+    "train": [
+      1,
+      14
+    ],
+    "validation": [
+      15,
+      19
+    ],
+    "holdout": [
+      20,
+      24
+    ]
+  },
+  "changes": [
+    "version 2, before any training: the queue position rate must be on the lot grid, so it is 1 lot per millisecond, and the queue delay comes from a minimum of 5000 ms in queue; 0.0005 was refused.",
+    "version 3, before any training: the version 2 classical grids could not trade. Avellaneda-Stoikov measures time in years and volatility in absolute price units per square root of a year, and its half spread is close to 1/k, so k = 1.5 quoted about 1.0, some 200 kernel ticks, away. Volatility now comes from the training days by the rule below, and k from a grid near the touch.",
+    "version 3: GLFT with max_inventory_lots 20 cost about 146 s per 8640 step episode, and still about 68 s with 5. Its grid is cut to 3 points, and max_inventory_lots 5 is a model approximation under a position limit of 20 for every arm; the report says how often a GLFT position exceeds 5. The residual over GLFT is not run.",
+    "What was seen on validation before version 3: a dry run of the runner with a budget of 6000 steps, a check of the code, evaluated the version 2 Avellaneda-Stoikov and GLFT points with a zero residual on the calm validation days, and was stopped before it wrote or showed any result. Timing probes on calm validation day 15 showed, for whole episodes with evaluation seed 101: Avellaneda-Stoikov risk aversion 0.01, volatility 0.05, k 1.5: net 0, 0 fills, 5.19 s; Avellaneda-Stoikov risk aversion 1, volatility 0.2, k 1.5: net 0, 0 fills, 1.35 s; GLFT risk aversion 0.1, k 1, volatility 0.2, max inventory 20: net 0, 0 fills, 146.61 s. Two more probes timed 2000 steps of the first of those and of a hold, and showed only their time per step (310 and 144 microseconds). No version 3 point, no learned arm and no other regime was evaluated on validation. The holdout was never read; the runner refuses it.",
+    "Version 3 probes ran on training day 1 of the calm regime only.",
+    "Step 1, the reduced step, ran at commit da14f8f with design version 3: calm only, 2 seeds, 50000 steps, validation only. It took 525.6 s. Its three evaluation seeds never gave different nets, over 100 rows.",
+    "version 4, before step 2: with rows every 10 s, a latency of 50 ms with 10 ms jitter never changes the row an order lands in, so latency and its seeds have no effect at the main execution. The latency ablation is one row instead: orders and cancels arrive 10 s after they are sent. Evaluation uses one seed from step 2 on, since three gave identical results.",
+    "version 4: each learned arm trains one policy on the pooled training days of all three regimes, since a regime is not observed, and is evaluated per regime and pooled. The classical arms keep a volatility and a validation choice per regime, which makes them the stronger baseline. The residual over Avellaneda-Stoikov corrects each regime's selected point.",
+    "version 4: the bridge's attribution adds the position over the window (largest and mean absolute, final), the largest drawdown and the position after each fill, from which the runner reports peak notional, the share of time beyond 5 lots and limit breaches. Markout is not reported: the attribution has no markout horizon over these rows."
+  ],
+  "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
+  "kernel": {
+    "tick_size": "0.005",
+    "lot_size": "1",
+    "max_price": "1000",
+    "max_order_size": "10"
+  },
+  "execution": {
+    "fee_rate": "0.0002",
+    "initial_capital": "0",
+    "terminal": "mark",
+    "limits": {
+      "max_position": "20",
+      "max_notional": "2500",
+      "scaling_factor": "1"
+    },
+    "main": {
+      "fill_model": {
+        "kind": "queue_position",
+        "rate": "1",
+        "min_queue_ms": 5000
+      },
+      "latency": {
+        "quantum_ns": 1000000,
+        "observation_q": 25,
+        "submit_q": 25,
+        "cancel_q": 25,
+        "ack_q": 10,
+        "jitter_q": 10
+      }
+    },
+    "ablations": {
+      "fill_immediate": {
+        "fill_model": {
+          "kind": "immediate"
+        }
+      },
+      "reward_inventory_penalty": {
+        "training_only": true,
+        "penalty_per_squared_lot_per_step": "0.00001"
+      },
+      "latency_one_row": {
+        "latency": {
+          "quantum_ns": 1000000,
+          "observation_q": 0,
+          "submit_q": 10000,
+          "cancel_q": 10000,
+          "ack_q": 0,
+          "jitter_q": 0
+        }
+      }
+    },
+    "not_run": {
+      "alpha": "no alpha signal exists in the crate",
+      "hedge": "HedgeActions::NotModelled, and hedge plans are not wired into the kernel",
+      "margin": "margin and liquidation stress are not connected to the kernel; capital is peak notional and peak inventory"
+    }
+  },
+  "evaluation": {
+    "episode": "one UTC day",
+    "evaluation_seeds": [
+      101,
+      102,
+      103
+    ],
+    "daily_value": "the mean over the evaluation seeds of a day's exact net result",
+    "selection": "the best mean daily net over validation days, per arm, under the main execution",
+    "bootstrap": {
+      "replicates": 2000,
+      "mean_block_days": 2,
+      "confidence_percent": 90,
+      "seed": 102,
+      "min_days": 4
+    },
+    "metrics": [
+      "net_pnl and its attribution",
+      "inventory: largest and mean absolute position, final position",
+      "max_drawdown",
+      "cvar_5_of_daily_net",
+      "rejections: gate refusals, residual fallbacks and clips",
+      "peak_notional at fill prices",
+      "time_beyond_5_lots",
+      "limit_breaches"
+    ],
+    "evaluation_seeds_from_step_2": [
+      101
+    ]
+  },
+  "arms": {
+    "no_trade": {
+      "kind": "baseline"
+    },
+    "fixed_spread": {
+      "kind": "baseline",
+      "grid": {
+        "offset_ticks": [
+          1,
+          2,
+          4
+        ],
+        "size_lots": [
+          1
+        ]
+      }
+    },
+    "avellaneda_stoikov": {
+      "kind": "classical",
+      "grid": {
+        "risk_aversion": [
+          "0.0001",
+          "0.001",
+          "0.01"
+        ],
+        "order_intensity": [
+          "50",
+          "100",
+          "200"
+        ],
+        "size": [
+          "1"
+        ],
+        "horizon_ms": [
+          86400000
+        ],
+        "volatility": [
+          "from the volatility rule"
+        ]
+      }
+    },
+    "glft": {
+      "kind": "classical",
+      "grid": {
+        "risk_aversion": [
+          "0.001"
+        ],
+        "order_intensity_k": [
+          "50",
+          "100",
+          "200"
+        ],
+        "intensity_scale_a": [
+          "1.5"
+        ],
+        "max_inventory_lots": [
+          5
+        ],
+        "min_spread": [
+          "0.005"
+        ],
+        "terminal_time": [
+          86400000
+        ],
+        "volatility": [
+          "from the volatility rule"
+        ]
+      }
+    },
+    "maskable_ppo": {
+      "kind": "pure_rl",
+      "grid": {
+        "bid_offsets": [
+          0,
+          1,
+          2,
+          4,
+          8
+        ],
+        "ask_offsets": [
+          0,
+          1,
+          2,
+          4,
+          8
+        ],
+        "sizes": [
+          1,
+          2
+        ]
+      },
+      "invalid_action": "mask",
+      "hyperparameter_sets": [
+        {
+          "learning_rate": 0.0003,
+          "n_steps": 2048,
+          "batch_size": 256,
+          "n_epochs": 5,
+          "ent_coef": 0.0
+        },
+        {
+          "learning_rate": 0.0001,
+          "n_steps": 2048,
+          "batch_size": 256,
+          "n_epochs": 5,
+          "ent_coef": 0.0
+        },
+        {
+          "learning_rate": 0.0003,
+          "n_steps": 2048,
+          "batch_size": 256,
+          "n_epochs": 5,
+          "ent_coef": 0.01
+        }
+      ],
+      "budget_steps": 2000000
+    },
+    "sac_residual_avellaneda_stoikov": {
+      "kind": "residual_rl",
+      "baseline": "the avellaneda_stoikov parameters selected on validation",
+      "bounds": {
+        "price_ticks": 4,
+        "size_lots": 1
+      },
+      "invalid_action": "reject",
+      "hyperparameter_sets": [
+        {
+          "learning_rate": 0.0003,
+          "batch_size": 256,
+          "buffer_size": 200000,
+          "learning_starts": 5000,
+          "tau": 0.005
+        },
+        {
+          "learning_rate": 0.0001,
+          "batch_size": 256,
+          "buffer_size": 200000,
+          "learning_starts": 5000,
+          "tau": 0.005
+        },
+        {
+          "learning_rate": 0.0003,
+          "batch_size": 256,
+          "buffer_size": 200000,
+          "learning_starts": 5000,
+          "tau": 0.02
+        }
+      ],
+      "budget_steps": 500000
+    },
+    "sac_residual_glft": {
+      "kind": "residual_rl",
+      "not_run": "GLFT costs about 68 s per episode, so a residual over it does not fit the budget"
+    }
+  },
+  "training_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "training_days": "each learned run trains on the pooled training days of every regime; every reset draws one of those days from the run's seed",
+  "steps": [
+    {
+      "name": "reduced",
+      "regimes": [
+        "calm"
+      ],
+      "training_seeds": [
+        1,
+        2
+      ],
+      "budget_steps": 50000,
+      "estimate_minutes": 15
+    },
+    {
+      "name": "selection",
+      "estimate_minutes": 100,
+      "note": "30 runs: 2 learned arms, 3 sets, 5 seeds; the main comparison uses the selected set's 5 runs, so it trains nothing"
+    },
+    {
+      "name": "ablations",
+      "estimate_minutes": 100,
+      "note": "30 runs: 3 ablations, 2 learned arms, the selected set, 5 seeds"
+    },
+    {
+      "name": "holdout",
+      "estimate_minutes": 10
+    }
+  ],
+  "compute": {
+    "machine": "Apple M4 Max",
+    "device": "cpu",
+    "threads_per_run": 1,
+    "max_parallel_runs": 6,
+    "overrun_rule": "a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds"
+  },
+  "decision_rule": {
+    "against": "the best classical arm on the holdout, avellaneda_stoikov or glft, by mean daily net",
+    "interval": "90 % block bootstrap over days, on the paired daily difference",
+    "continue": "the lower bound is above 0, there is no limit breach, and max drawdown is at most 1.2 times the classical arm's",
+    "revise": "the point estimate is above 0 but the interval includes 0, or the drawdown condition fails",
+    "discard": "otherwise",
+    "applied": "per regime and pooled"
+  },
+  "volatility_rule": "Per regime, the population standard deviation of the change of the mid in price units between consecutive rows of the same day, over every training day, times the square root of 31536000 / 10: absolute price units per square root of a 365 day year, as Avellaneda-Stoikov and GLFT take it."
+}

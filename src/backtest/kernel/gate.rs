@@ -79,7 +79,8 @@ pub enum GateVerdict {
     /// Reduced to a quantity that is not a whole number of lots: refused,
     /// as the engine refuses and releases it.
     ReducedOffLot,
-    /// Refused by a limit.
+    /// Refused by a limit, or by the combined limits of a hedged kernel
+    /// ([`super::CombinedLimits`]), which never reduce.
     Rejected,
 }
 

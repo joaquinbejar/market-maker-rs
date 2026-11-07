@@ -11,15 +11,21 @@ use std::sync::Arc;
 
 use market_maker_rs::backtest::kernel::{KernelFillModel, quote_error_code};
 use market_maker_rs::rl::{
-    ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, OBSERVATION_SPACE_VERSION,
-    REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv,
+    ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, HEDGED_ACTION_SPACE_VERSION,
+    HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION, OBSERVATION_SPACE_VERSION,
+    REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv, SpecId,
 };
 use market_maker_rs::types::error::MMError;
 
 use super::*;
 
 fn config(terminal: &str, policy: &str, max_steps: u64) -> BridgeConfig {
-    BridgeConfig::from_json(&format!(
+    BridgeConfig::from_json(&config_text(terminal, policy, max_steps)).unwrap()
+}
+
+/// The JSON of [`config`].
+fn config_text(terminal: &str, policy: &str, max_steps: u64) -> String {
+    format!(
         r#"{{
             "tick_size": "0.5", "lot_size": "1", "max_price": "1000", "max_order_size": "10",
             "max_steps": {max_steps}, "fee_rate": "0.001", "initial_capital": "0",
@@ -33,8 +39,7 @@ fn config(terminal: &str, policy: &str, max_steps: u64) -> BridgeConfig {
             "f32_unit": "1", "invalid_action": "{policy}", "invalid_action_penalty": "0.25",
             "terminal": "{terminal}"
         }}"#
-    ))
-    .unwrap()
+    )
 }
 
 /// The hand computed long trajectory of the crate's own tests, on its grid.
@@ -386,6 +391,14 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
         }
         assert!(!known_versions(&later));
     }
+    // An environment with a hedge lane in a second instrument is not one this bridge drives.
+    let hedged = SpecId {
+        observation: HEDGED_OBSERVATION_SPACE_VERSION,
+        action: HEDGED_ACTION_SPACE_VERSION,
+        reward: HEDGED_REWARD_VERSION,
+        ..id
+    };
+    assert!(!known_versions(&hedged));
 }
 
 #[test]
@@ -547,6 +560,25 @@ fn test_worker_attribution_splits_the_hand_computed_trajectory() {
     // The same net of fees, split between the fills' edge and the position's moves.
     let gross = a.spread_capture + a.inventory_pnl;
     assert_eq!(gross.normalize().to_string(), "1");
+    // Bought two lots, then closed at the touch at the end.
+    let path: Vec<(String, String)> = reply
+        .positions
+        .iter()
+        .map(|p| {
+            (
+                p.price.normalize().to_string(),
+                p.position.normalize().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(path.len(), 2);
+    assert_eq!(path[0].1, "2");
+    assert_eq!(path[1].1, "0");
+    assert!(reply.positions[0].timestamp_ms <= reply.positions[1].timestamp_ms);
+    assert_eq!(reply.inventory.max_abs.normalize().to_string(), "2");
+    assert_eq!(reply.inventory.final_position.normalize().to_string(), "0");
+    assert!(reply.window_ms.0 < reply.window_ms.1);
+    assert!(reply.max_drawdown >= Decimal::ZERO);
 }
 
 #[test]
@@ -670,4 +702,216 @@ fn test_refusals_and_quote_errors_name_their_cause() {
     for code in 1..=15 {
         assert!(quote(ErrCode(code)).starts_with("strategy error: "));
     }
+}
+
+#[test]
+fn test_worker_with_hedge_actions_is_equal_to_a_direct_environment_and_hedges() {
+    let rows: Vec<KernelTick> = (0..200_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect();
+    let mut bridge = config("close", "reject", 1000);
+    bridge.hedge_actions = true;
+    bridge.latency = LatencyConfig {
+        quantum_ns: 1_000_000,
+        observation_q: 1,
+        submit_q: 1,
+        cancel_q: 1,
+        ack_q: 2,
+        jitter_q: 2,
+    };
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    assert_eq!(env.spec().action.hedge, HedgeActions::MarketableAtTouch);
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let info = worker.info();
+    assert!(info.hedge_actions);
+    assert_eq!(info.spec, env.spec().id());
+    let mut recorder = EpisodeRecorder::default();
+    let mut state = env.reset_with(9, &mut recorder).unwrap();
+    let reset = worker.reset(9).unwrap();
+    assert_eq!(reset.hedge_mask, env.hedge_mask(&state));
+    // Quote, and hedge whenever the hedge mask allows the first size: a hedge is taken.
+    let (mut step, mut hedges) = (0, 0);
+    while !state.is_done() {
+        let action = if env.hedge_mask(&state) & 1 == 1 && step % 3 == 0 {
+            hedges += 1;
+            RlAction::Hedge { size: 0 }
+        } else {
+            actions(step)
+        };
+        let direct = env.step_with(&mut state, action, &mut recorder).unwrap();
+        let through = worker.step(action).unwrap();
+        assert_eq!(through.transition, direct, "step {step}");
+        assert_eq!(through.net, state.net());
+        step += 1;
+    }
+    assert!(hedges > 0, "no hedge was taken");
+    env.reconcile(&state, &recorder).unwrap();
+}
+
+#[test]
+fn test_hedge_actions_are_off_by_default_and_change_the_specification() {
+    let plain = Worker::spawn(config("close", "mask", 100), long_rows(), None).unwrap();
+    assert!(!plain.info().hedge_actions);
+    let mut bridge = config("close", "mask", 100);
+    assert!(!bridge.hedge_actions);
+    bridge.hedge_actions = true;
+    let hedged = Worker::spawn(bridge, long_rows(), None).unwrap();
+    let (p, h) = (plain.info().spec, hedged.info().spec);
+    // The same versions, so the bridge drives both; another identity.
+    assert!(known_versions(&p) && known_versions(&h));
+    assert_ne!(p.fingerprint, h.fingerprint);
+    // The flag in the configuration.
+    let mut json: serde_json::Value =
+        serde_json::from_str(&config_text("close", "mask", 100)).unwrap();
+    json["hedge_actions"] = serde_json::Value::Bool(true);
+    let parsed = BridgeConfig::from_json(&json.to_string()).unwrap();
+    assert!(parsed.hedge_actions);
+}
+
+#[test]
+fn test_hedge_actions_with_a_residual_policy_are_refused() {
+    let mut bridge = residual_config(AVELLANEDA);
+    bridge.hedge_actions = true;
+    assert!(matches!(
+        Worker::spawn(bridge, long_rows(), None),
+        Err(BridgeError::Refused(reason)) if reason.contains("hedge_actions")
+    ));
+}
+
+/// Rows ten seconds apart, the ask resting at 99.5 with one lot from the second row on:
+/// the hand computed bid of 2 at 99.5 is at the touch, one lot ahead of it.
+fn slow_rows() -> Vec<KernelTick> {
+    let row = |ms: u64, bid, ask| KernelTick {
+        ts_ns: ms * 1_000_000,
+        bid,
+        bid_lots: 1,
+        ask,
+        ask_lots: 1,
+    };
+    vec![
+        row(1_000, 199, 201),
+        row(11_000, 197, 199),
+        row(21_000, 197, 199),
+        row(31_000, 197, 199),
+        row(41_000, 197, 199),
+    ]
+}
+
+/// The delivered position after each step of a bid of 2 at 99.5, then holds.
+fn positions(fill_model: FillConfig) -> Vec<Decimal> {
+    let mut bridge = config("mark", "mask", 100);
+    bridge.fill_model = fill_model;
+    let mut worker = Worker::spawn(bridge, slow_rows(), None).unwrap();
+    worker.reset(1).unwrap();
+    let mut out = Vec::new();
+    let mut action = RlAction::Quote {
+        bid: 1,
+        ask: 2,
+        bid_size: 1,
+        ask_size: 0,
+    };
+    loop {
+        let reply = worker.step(action).unwrap();
+        out.push(reply.transition.observation.raw[6].unwrap());
+        if reply.transition.terminated || reply.transition.truncated {
+            return out;
+        }
+        action = RlAction::Hold;
+    }
+}
+
+#[test]
+fn test_a_rational_queue_rate_fills_over_rows_where_immediate_fills_at_once() {
+    let d = |text: &str| Decimal::from_str(text).unwrap();
+    // Immediate: the whole bid at the first row whose ask reaches it.
+    assert_eq!(
+        positions(FillConfig::Immediate)[..3],
+        [d("2"), d("2"), d("2")]
+    );
+    // One lot every 9 s, one ahead: after 10 s, 1 cleared and none for us; after 20 s, 2
+    // cleared and 1 for us; after 30 s, all of it.
+    let slow = FillConfig::QueuePositionRational {
+        lots: 1,
+        per_ms: 9_000,
+        min_queue_ms: 0,
+    };
+    assert_eq!(positions(slow)[..3], [d("0"), d("1"), d("2")]);
+}
+
+#[test]
+fn test_a_rational_queue_rate_is_configured_refused_at_zero_and_in_the_fingerprint() {
+    let json = |fill: &str| -> FillConfig { serde_json::from_str(fill).unwrap() };
+    let rational = json(
+        r#"{"kind": "queue_position_rational", "lots": 2, "per_ms": 5000, "min_queue_ms": 7}"#,
+    );
+    assert_eq!(
+        rational,
+        FillConfig::QueuePositionRational {
+            lots: 2,
+            per_ms: 5_000,
+            min_queue_ms: 7,
+        }
+    );
+    let mut bridge = config("mark", "mask", 100);
+    bridge.fill_model = rational.clone();
+    assert_eq!(
+        bridge.kernel().unwrap().fill_model,
+        KernelFillModel::QueuePositionRational {
+            lots: 2,
+            per_ms: 5_000,
+            min_queue_ms: 7,
+        }
+    );
+    // The kernel's fingerprint carries it, and the worker reports that fingerprint.
+    let info = |fill: FillConfig| {
+        let mut bridge = config("mark", "mask", 100);
+        bridge.fill_model = fill;
+        Worker::spawn(bridge, long_rows(), None)
+            .unwrap()
+            .info()
+            .kernel_fingerprint
+    };
+    let base = info(rational.clone());
+    assert_ne!(
+        base,
+        info(FillConfig::QueuePositionRational {
+            lots: 2,
+            per_ms: 5_001,
+            min_queue_ms: 7,
+        })
+    );
+    assert_ne!(base, info(FillConfig::Immediate));
+    // Refused as the kernel refuses it: no environment, nothing ran.
+    for (lots, per_ms) in [(0, 5_000), (2, 0)] {
+        let mut bridge = config("mark", "mask", 100);
+        bridge.fill_model = FillConfig::QueuePositionRational {
+            lots,
+            per_ms,
+            min_queue_ms: 7,
+        };
+        assert!(matches!(
+            Worker::spawn(bridge, long_rows(), None),
+            Err(BridgeError::Refused(_))
+        ));
+    }
+    // Unknown fields are refused, as for the other fill models.
+    assert!(
+        serde_json::from_str::<FillConfig>(
+            r#"{"kind": "queue_position_rational", "lots": 1, "per_ms": 2, "min_queue_ms": 0, "rate": "1"}"#
+        )
+        .is_err()
+    );
 }

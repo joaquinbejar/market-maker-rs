@@ -944,7 +944,7 @@ fn test_kernel_transaction_undo_restores_the_state_exactly() {
                 let mut s = s0;
                 let undo = step::Undo::save(&s);
                 let mut sink = Vec::new();
-                step::quote_transaction(&k.cfg, &mut s, legs, &mut sink).unwrap();
+                step::quote_transaction(&k.cfg, &mut s, legs, None, &mut sink).unwrap();
                 if s != s0 {
                     changed += 1;
                 }

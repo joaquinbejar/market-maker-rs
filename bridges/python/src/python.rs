@@ -59,6 +59,7 @@ fn reset_dict<'py>(py: Python<'py>, reply: &ResetReply) -> PyResult<Bound<'py, P
     let out = PyDict::new(py);
     out.set_item("observation", observation_dict(py, &reply.observation)?)?;
     out.set_item("mask", mask_dict(py, &reply.mask)?)?;
+    out.set_item("hedge_mask", reply.hedge_mask)?;
     out.set_item("done", reply.done)?;
     Ok(out)
 }
@@ -103,6 +104,7 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
     let out = PyDict::new(py);
     out.set_item("observation", observation_dict(py, &t.observation)?)?;
     out.set_item("mask", mask_dict(py, &t.mask)?)?;
+    out.set_item("hedge_mask", t.hedge_mask)?;
     out.set_item("reward_f32", t.reward.as_f32)?;
     out.set_item("reward", exact(t.reward.total))?;
     out.set_item("ledger_change", exact(t.reward.ledger_change))?;
@@ -238,6 +240,7 @@ impl NativeEnv {
         out.set_item("features", info.features)?;
         out.set_item("offsets", info.offsets)?;
         out.set_item("sizes", info.sizes)?;
+        out.set_item("hedge_actions", info.hedge_actions)?;
         out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
         out.set_item("dataset_digest", hex(info.dataset_digest))?;
         out.set_item("rows", info.rows)?;
@@ -287,6 +290,12 @@ impl NativeEnv {
         self.take_step(py, RlAction::OneSided { side, offset, size })
     }
 
+    /// Reduces the delivered position with a marketable order at the observed touch, of the
+    /// size at `size` in the grid's sizes.
+    fn step_hedge(&self, py: Python<'_>, size: usize) -> PyResult<Py<PyDict>> {
+        self.take_step(py, RlAction::Hedge { size })
+    }
+
     /// Takes one decision of a residual policy.
     fn step_residual(
         &self,
@@ -317,6 +326,18 @@ impl NativeEnv {
         out.set_item("base_fees", exact(a.base_fees))?;
         out.set_item("net_pnl", exact(a.net_pnl))?;
         out.set_item("fills", reply.fills)?;
+        let inventory = reply.inventory;
+        out.set_item("max_abs_position", exact(inventory.max_abs))?;
+        out.set_item("mean_abs_position", inventory.mean_abs.map(exact))?;
+        out.set_item("final_position", exact(inventory.final_position))?;
+        out.set_item("max_drawdown", exact(reply.max_drawdown))?;
+        out.set_item("window_ms", vec![reply.window_ms.0, reply.window_ms.1])?;
+        let positions: Vec<(u64, String, String)> = reply
+            .positions
+            .iter()
+            .map(|p| (p.timestamp_ms, exact(p.price), exact(p.position)))
+            .collect();
+        out.set_item("positions", positions)?;
         Ok(out)
     }
 
