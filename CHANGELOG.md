@@ -19,6 +19,18 @@ project follows [Semantic Versioning](https://semver.org/).
 - A `scheduled` baseline in the Python bridge's residual configuration: classical points in turn,
   each change applying from the first decision that has observed its row, for #112's adaptive
   and labelled arms. Existing baselines are unchanged.
+- A cancel-only action and a quote that expires by itself (#288). `backtest::kernel::KernelAction::Cancel`
+  cancels every resting or pending order and sends nothing: each cancel takes effect after the
+  cancel latency, a fill before it stands, and a cancel that reaches a filled order is rejected.
+  It is admitted whenever a hold is and is outside the engine-equivalence subset.
+  `rl::RlConfig::with_cancel_action` adds `rl::RlAction::Cancel` to the action space as
+  `rl::CancelActions::CancelOnly`, of the new `rl::CANCEL_ACTION_SPACE_VERSION` 4; without it a
+  specification keeps its bytes and identity, and a cancel is outside the space
+  (`rl::ERR_CANCEL_REFUSED` under the reject policy). An environment with a hedge lane refuses
+  it. The Python bridge takes `cancel_action`, drives version 4 only with it, and adds
+  `ExpiringQuote`, which cancels a quote `d` decisions after it, without the policy: the quote
+  rests `d` rows plus the cancel latency less the submission latency; an expiry scheduled in
+  the kernel, exact in venue time, is #297. Synthetic fixtures only.
 - A balance gate for the kernel (feature `kernel`, #283): `KernelConfig::margin` takes a
   `backtest::kernel::KernelMargin`, and the kernel, and so `rl::RlEnv`, then refuses or reduces
   an order that `margin-rs`'s risk gate would refuse or reduce in `backtest::MarginAccount`. A
@@ -714,6 +726,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `backtest::kernel::KernelAction` gains the variant `Cancel` (#288), so an exhaustive match on
+  it must handle it, and `rl::RlConfig` the public field `cancel_action`, so a struct literal
+  must name it (`RlConfig::new` sets `false`). `rl::ActionSpace` gains `cancel` and
+  `rl::RlAction` `Cancel`; both are `#[non_exhaustive]`.
 - `backtest::kernel::KernelConfig` gains the public field `margin` and `GateRecord` the public
   field `check` (#283), so a struct literal of `KernelConfig` must name `margin`
   (`KernelConfig::new` sets `None`). `GateRecord` is `#[non_exhaustive]`, but its `Debug`

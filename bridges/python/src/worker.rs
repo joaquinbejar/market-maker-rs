@@ -17,9 +17,10 @@ use market_maker_rs::backtest::kernel::{
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED, EpisodeRecorder, FeatureVector, HedgeActions,
-    InvalidActionPolicy, ObservationScales, ResidualBounds, ResidualDecision, ResidualEnv,
-    ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId, TerminalValuation, Transition,
+    CancelActions, ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_HEDGE_REFUSED, EpisodeRecorder,
+    FeatureVector, HedgeActions, InvalidActionPolicy, ObservationScales, ResidualBounds,
+    ResidualDecision, ResidualEnv, ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId,
+    TerminalValuation, Transition,
 };
 use market_maker_rs::strategy::glft::GLFTConfig;
 use serde::Deserialize;
@@ -42,8 +43,21 @@ const STACK_BYTES: usize = 16 * 1024 * 1024;
 /// the bridge has been checked against it.
 pub const BUILT_FOR: (u16, u16, u16, u16) = (1, 2, 1, 1);
 
-fn known_versions(id: &SpecId) -> bool {
-    (id.observation, id.action, id.reward, id.episode) == BUILT_FOR
+/// The action space version this bridge was written for with the cancel action
+/// (`cancel_action`), a literal for the same reason.
+pub const BUILT_FOR_CANCEL_ACTION: u16 = 4;
+
+/// The versions are the ones this bridge was written for, and the action space is the one
+/// the configuration asks for: version [`BUILT_FOR_CANCEL_ACTION`] with `cancel_action`
+/// and only then.
+fn known_versions(id: &SpecId, cancel_action: bool) -> bool {
+    let (observation, action, reward, episode) = BUILT_FOR;
+    let action = if cancel_action {
+        BUILT_FOR_CANCEL_ACTION
+    } else {
+        action
+    };
+    (id.observation, id.action, id.reward, id.episode) == (observation, action, reward, episode)
 }
 
 /// Why an action was not applied, as `info["refused_because"]` reports it; `None` when it
@@ -58,6 +72,7 @@ pub fn refused_because(status: ActionStatus) -> Option<String> {
         ActionStatus::QuoteError(code) => Some(match code {
             ERR_ACTION_OFF_GRID => format!("off grid (code {})", code.0),
             ERR_HEDGE_REFUSED => format!("hedge not available (code {})", code.0),
+            ERR_CANCEL_REFUSED => format!("cancel not available (code {})", code.0),
             ERR_PRICE_OUT_OF_RANGE => {
                 format!("strategy quote price out of range (code {})", code.0)
             }
@@ -331,6 +346,12 @@ pub struct BridgeConfig {
     /// Off by default, which keeps a configuration's specification and fingerprint.
     #[serde(default)]
     pub hedge_actions: bool,
+    /// Whether the cancel action exists (`RlAction::Cancel`, `CancelActions::CancelOnly`), of
+    /// action space version [`BUILT_FOR_CANCEL_ACTION`]. Off by default, which keeps a
+    /// configuration's specification and fingerprint; a specification with it is refused
+    /// by a configuration without it.
+    #[serde(default)]
+    pub cancel_action: bool,
 }
 
 fn decimal(what: &str, text: &str) -> Result<Decimal, BridgeError> {
@@ -399,6 +420,12 @@ impl BridgeConfig {
                     .to_string(),
             ));
         }
+        if self.cancel_action && self.residual.is_some() {
+            return Err(BridgeError::Refused(
+                "cancel_action with a residual policy: a residual policy takes no cancel action"
+                    .to_string(),
+            ));
+        }
         let s = &self.scales;
         let scales = ObservationScales {
             spread_ticks: decimal("spread_ticks", &s.spread_ticks)?,
@@ -422,8 +449,13 @@ impl BridgeConfig {
                 decimal("invalid_action_penalty", &self.invalid_action_penalty)?,
             )
             .with_terminal(terminal);
-        Ok(if self.hedge_actions {
+        let config = if self.hedge_actions {
             config.with_hedge_actions()
+        } else {
+            config
+        };
+        Ok(if self.cancel_action {
+            config.with_cancel_action()
         } else {
             config
         })
@@ -443,6 +475,8 @@ pub struct EnvInfo {
     pub sizes: usize,
     /// Whether hedge actions exist, as the specification states.
     pub hedge_actions: bool,
+    /// Whether the cancel action exists, as the specification states.
+    pub cancel_action: bool,
     /// Fingerprint of the kernel's configuration.
     pub kernel_fingerprint: u128,
     /// Digest of the dataset.
@@ -761,7 +795,7 @@ fn serve_residual<S: QuoteSource + Clone>(
                 .map_err(refuse)?;
         let spec = env.env().spec();
         let id = spec.id();
-        check_spec(spec, id, expected)?;
+        check_spec(spec, id, expected, false)?;
         let shape = spec.shape();
         let info = EnvInfo {
             spec: id,
@@ -769,6 +803,7 @@ fn serve_residual<S: QuoteSource + Clone>(
             offsets: shape.bid_offsets,
             sizes: shape.sizes,
             hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
+            cancel_action: spec.action.cancel == CancelActions::CancelOnly,
             kernel_fingerprint: env.env().kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,
@@ -791,8 +826,9 @@ fn check_spec(
     spec: &market_maker_rs::rl::RlSpec,
     id: SpecId,
     expected: Option<SpecId>,
+    cancel_action: bool,
 ) -> Result<(), BridgeError> {
-    if !known_versions(&id) {
+    if !known_versions(&id, cancel_action) {
         return Err(BridgeError::Refused(format!("unknown versions in {id:?}")));
     }
     if let Some(expected) = expected {
@@ -1047,7 +1083,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
             RlEnv::new(kernel_config, data, grid, config.rl()?).map_err(refuse)?;
         let spec = env.spec();
         let id = spec.id();
-        check_spec(spec, id, expected)?;
+        check_spec(spec, id, expected, config.cancel_action)?;
         let shape = spec.shape();
         let info = EnvInfo {
             spec: id,
@@ -1055,6 +1091,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
             offsets: shape.bid_offsets,
             sizes: shape.sizes,
             hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
+            cancel_action: spec.action.cancel == CancelActions::CancelOnly,
             kernel_fingerprint: env.kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,

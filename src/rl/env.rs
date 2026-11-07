@@ -21,10 +21,11 @@ use crate::types::error::{MMError, MMResult};
 use super::audit::{EpisodeRecorder, EpisodeRecords};
 use super::features::{FeatureVector, HedgeFeatureVector, PreviousRow, feature_vector};
 use super::spec::{
-    ACTION_SPACE_VERSION, ActionSpace, CrossHedgeSpace, EPISODE_VERSION, EpisodeSpec,
-    HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION,
-    HedgeActions, HedgeScales, InvalidActionPolicy, ObservationScales, ObservationSpace,
-    REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec, TerminalValuation,
+    ACTION_SPACE_VERSION, ActionSpace, CANCEL_ACTION_SPACE_VERSION, CancelActions, CrossHedgeSpace,
+    EPISODE_VERSION, EpisodeSpec, HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION,
+    HEDGED_REWARD_VERSION, HedgeActions, HedgeScales, InvalidActionPolicy, ObservationScales,
+    ObservationSpace, REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec,
+    TerminalValuation,
 };
 
 /// Code of an action whose indices are not on the grid, or whose price is not
@@ -41,6 +42,10 @@ pub const ERR_HEDGE_REFUSED: ErrCode = ErrCode(201);
 /// in flight, no row or a stale one), the net exposure is flat, or the size would take it
 /// past zero.
 pub const ERR_CROSS_HEDGE_REFUSED: ErrCode = ErrCode(202);
+
+/// Code of a cancel when the action space has none ([`CancelActions::NotModelled`]),
+/// under [`InvalidActionPolicy::Reject`].
+pub const ERR_CANCEL_REFUSED: ErrCode = ErrCode(203);
 
 const NS_PER_MS: u64 = 1_000_000;
 
@@ -59,6 +64,8 @@ pub struct RlConfig {
     pub terminal: TerminalValuation,
     /// Whether [`RlAction::Hedge`] exists, as [`HedgeActions::MarketableAtTouch`].
     pub hedge_actions: bool,
+    /// Whether [`RlAction::Cancel`] exists, as [`CancelActions::CancelOnly`].
+    pub cancel_action: bool,
 }
 
 impl RlConfig {
@@ -73,6 +80,7 @@ impl RlConfig {
             invalid_action_penalty: Decimal::ZERO,
             terminal: TerminalValuation::MarkAtLastMid,
             hedge_actions: false,
+            cancel_action: false,
         }
     }
 
@@ -95,6 +103,14 @@ impl RlConfig {
     #[must_use]
     pub fn with_hedge_actions(mut self) -> Self {
         self.hedge_actions = true;
+        self
+    }
+
+    /// Adds [`RlAction::Cancel`] to the action space, as [`CancelActions::CancelOnly`], of
+    /// version [`CANCEL_ACTION_SPACE_VERSION`].
+    #[must_use]
+    pub fn with_cancel_action(mut self) -> Self {
+        self.cancel_action = true;
         self
     }
 }
@@ -138,6 +154,9 @@ pub enum RlAction {
         /// Index of the size in the hedge sizes, never taking the net exposure past zero.
         size: usize,
     },
+    /// Cancel every resting or pending order and send nothing, as [`CancelActions::CancelOnly`]
+    /// states. Outside the mask without it.
+    Cancel,
 }
 
 /// The inventory closed on termination, under [`TerminalValuation::CloseAtTouch`].
@@ -329,10 +348,12 @@ fn bit(mask: u64, index: usize) -> bool {
         .is_some_and(|v| v & 1 == 1)
 }
 
-/// Returns true if `action` is inside `mask`, `hedge` and `cross`, while the run continues.
-fn allowed(mask: &ActionMask, hedge: u64, cross: u64, action: RlAction) -> bool {
+/// Returns true if `action` is inside `mask`, `hedge`, `cross` and `cancel`, while the run
+/// continues.
+fn allowed(mask: &ActionMask, hedge: u64, cross: u64, cancel: bool, action: RlAction) -> bool {
     match action {
         RlAction::Hold => true,
+        RlAction::Cancel => cancel,
         RlAction::Hedge { size } => bit(hedge, size),
         RlAction::CrossHedge { size } => bit(cross, size),
         RlAction::Quote {
@@ -450,7 +471,11 @@ impl<
                 Decimal::from(kernel_config.max_steps),
             ),
             action: ActionSpace {
-                version: ACTION_SPACE_VERSION,
+                version: if config.cancel_action {
+                    CANCEL_ACTION_SPACE_VERSION
+                } else {
+                    ACTION_SPACE_VERSION
+                },
                 tick_size: kernel_config.tick_size,
                 lot_size: kernel_config.lot_size,
                 max_price: kernel_config.max_price,
@@ -467,6 +492,11 @@ impl<
                     }
                 },
                 cross_hedge: None,
+                cancel: if config.cancel_action {
+                    CancelActions::CancelOnly
+                } else {
+                    CancelActions::NotModelled
+                },
             },
             reward: RewardSpec {
                 version: REWARD_VERSION,
@@ -521,6 +551,11 @@ impl<
             return Err(MMError::InvalidConfiguration(format!(
                 "hedge sizes must be 1 to 64 positive lots, got {hedge_sizes:?}"
             )));
+        }
+        if config.cancel_action {
+            return Err(MMError::InvalidConfiguration(
+                "the cancel action is not available with a hedge lane".to_string(),
+            ));
         }
         let mut env = Self::new(kernel_config, data, grid, config)?;
         let hedged = HedgedKernel::new(kernel_config, data, lane, hedge_data)?;
@@ -878,6 +913,7 @@ impl<
             &self.mask(state),
             self.hedge_mask(state),
             self.cross_hedge_mask(state),
+            self.config.cancel_action,
             action,
         );
         if !inside && self.config.invalid_action == InvalidActionPolicy::Mask {
@@ -1237,6 +1273,8 @@ impl<
         let off_grid = KernelAction::QuoteError(ERR_ACTION_OFF_GRID);
         match action {
             RlAction::Hold => KernelAction::Hold,
+            RlAction::Cancel if self.config.cancel_action => KernelAction::Cancel,
+            RlAction::Cancel => KernelAction::QuoteError(ERR_CANCEL_REFUSED),
             RlAction::CrossHedge { .. } => KernelAction::QuoteError(ERR_CROSS_HEDGE_REFUSED),
             RlAction::Hedge { size } => {
                 let refused = KernelAction::QuoteError(ERR_HEDGE_REFUSED);
@@ -1639,27 +1677,27 @@ mod tests {
     #[test]
     fn test_allowed_a_refused_mask_blocks_quotes_and_leaves_a_hold() {
         let mask = refused();
-        assert!(allowed(&mask, 0, 0, RlAction::Hold));
+        assert!(allowed(&mask, 0, 0, false, RlAction::Hold));
         let quote = RlAction::Quote {
             bid: 0,
             ask: 0,
             bid_size: 0,
             ask_size: 0,
         };
-        assert!(!allowed(&mask, 0, 0, quote));
+        assert!(!allowed(&mask, 0, 0, false, quote));
         for side in [QuoteSide::Bid, QuoteSide::Ask] {
             let one = RlAction::OneSided {
                 side,
                 offset: 0,
                 size: 0,
             };
-            assert!(!allowed(&mask, 0, 0, one));
+            assert!(!allowed(&mask, 0, 0, false, one));
             let open = ActionMask {
                 global_quote_ok: true,
                 refusal: None,
                 ..mask
             };
-            assert!(allowed(&open, 0, 0, one));
+            assert!(allowed(&open, 0, 0, false, one));
         }
     }
 
@@ -1673,11 +1711,11 @@ mod tests {
             refusal: None,
         };
         let one = |side, offset, size| RlAction::OneSided { side, offset, size };
-        assert!(allowed(&mask, 0, 0, one(QuoteSide::Bid, 0, 0)));
-        assert!(!allowed(&mask, 0, 0, one(QuoteSide::Bid, 1, 0)));
-        assert!(allowed(&mask, 0, 0, one(QuoteSide::Ask, 1, 0)));
-        assert!(!allowed(&mask, 0, 0, one(QuoteSide::Ask, 0, 0)));
-        assert!(!allowed(&mask, 0, 0, one(QuoteSide::Bid, 0, 1)));
-        assert!(!allowed(&mask, 0, 0, one(QuoteSide::Bid, 64, 0)));
+        assert!(allowed(&mask, 0, 0, false, one(QuoteSide::Bid, 0, 0)));
+        assert!(!allowed(&mask, 0, 0, false, one(QuoteSide::Bid, 1, 0)));
+        assert!(allowed(&mask, 0, 0, false, one(QuoteSide::Ask, 1, 0)));
+        assert!(!allowed(&mask, 0, 0, false, one(QuoteSide::Ask, 0, 0)));
+        assert!(!allowed(&mask, 0, 0, false, one(QuoteSide::Bid, 0, 1)));
+        assert!(!allowed(&mask, 0, 0, false, one(QuoteSide::Bid, 64, 0)));
     }
 }
