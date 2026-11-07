@@ -550,6 +550,18 @@ project follows [Semantic Versioning](https://semver.org/).
   left out of the cancelled responses instead of failing every later
   call, and an order re-mapped by a concurrent modify is cancelled through
   its current book id (#146).
+- `OptionQuoter` no longer fails a round for the rounding of the correlation it derives
+  between contracts (#250). That correlation is positive semidefinite in exact arithmetic,
+  but where a contract's delta and vega nearly offset under a factor correlation near -1, its
+  rounding could leave an eigenvalue past the floor of `1e-12` per row, in about one random
+  book of 16 contracts in two thousand. A negative eigenvalue down to `1e-12 + min(5.3e-15 k,
+  2)` per row, relative to the largest entry, is now set to zero, where `k` is the round's
+  largest ratio of a contract's variance with every term taken positive to its variance: by
+  Weyl's inequality that bounds six roundings per covariance amplified by that cancellation,
+  and the old floor covers the rest of the rounding and the eigendecomposition.
+  `OptionQuoteRound::clipped_eigenvalue` reports one set to zero below the old floor, as a
+  `ClippedEigenvalue` with both floors. An eigenvalue below the round's band still fails the
+  round, and a correlation supplied to `MultiAssetModel::new` is still held to the old floor.
 
 ### Breaking
 

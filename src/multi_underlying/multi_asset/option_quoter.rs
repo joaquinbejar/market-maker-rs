@@ -84,6 +84,11 @@ use crate::types::error::{MMError, MMResult};
 /// Milliseconds in a day.
 const DAY_MS: Decimal = Decimal::from_parts(86_400_000, 0, 0, false, 0);
 
+/// Rounding of an entry of the derived correlation, per unit of cancellation: `8 gamma_6`, where
+/// `gamma_k = k u / (1 - k u)` and `u` is half the machine epsilon, about `5.3e-15`. The
+/// derivation is on [`OptionQuoter::round_model`].
+const CANCELLATION_ERROR: f64 = 24.0 * f64::EPSILON / (1.0 - 3.0 * f64::EPSILON);
+
 /// The terms of one contract and how it is quoted. A quantity is in units of the underlying, as
 /// [`OptionValuation`] is.
 #[derive(Debug, Clone, PartialEq)]
@@ -353,6 +358,26 @@ pub struct OptionCapital {
     pub committed: Decimal,
 }
 
+/// A negative eigenvalue of the round's correlation, set to zero.
+///
+/// The correlation between contracts is derived from their loadings and is positive semidefinite
+/// in exact arithmetic, so a negative eigenvalue is rounding. One within the floor that
+/// [`MultiAssetModel::new`] holds a supplied correlation to is not reported; one below it and
+/// within what the rounding of this round's loadings can reach is set to zero and reported here;
+/// one beyond that fails the round. Each value is relative to the largest entry of its matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClippedEigenvalue {
+    /// The most negative eigenvalue.
+    pub eigenvalue: Decimal,
+    /// The floor of a supplied correlation, `-1e-12` per row, which it is below.
+    pub floor: Decimal,
+    /// The floor of this round, `-(1e-12 + min(5.3e-15 k, 2))` per row, which it is above. `k` is
+    /// the largest ratio, over the assets, of the variance with every term taken positive to the
+    /// variance, which is one unless a contract's delta and vega offset.
+    pub band: Decimal,
+}
+
 /// What one round produced. The crate does not print: this is the log, for the caller to keep.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -368,6 +393,9 @@ pub struct OptionQuoteRound {
     /// The hedge the delta threshold asks for. It is only sized: the caller decides whether to
     /// send it, through its own gate for the spot instrument.
     pub hedge: Option<HedgeOrder>,
+    /// The negative eigenvalue of the correlation set to zero, when it is below the floor of a
+    /// supplied correlation.
+    pub clipped_eigenvalue: Option<ClippedEigenvalue>,
 }
 
 /// What a fill booked.
@@ -924,12 +952,51 @@ impl OptionQuoter {
         }))
     }
 
-    /// The joint model of the round, with the underlying as asset 0, and each contract's asset
-    /// where it has one.
+    /// The joint model of the round, with the underlying as asset 0, each contract's asset where
+    /// it has one, and the eigenvalue clipped, if any.
+    ///
+    /// # The rounding of the correlation
+    ///
+    /// The correlation of assets `p` and `q` is `c(p, q) / sqrt(c(p, p) c(q, q))`, where
+    /// `c(a, b) = a_d b_d s^2 + a_v b_v v^2 + (a_d b_v + a_v b_d) rho s v` is evaluated in `f64`
+    /// from the loadings (delta, vega) and the factors. Converting those inputs from `Decimal`
+    /// rounds the inputs, not the matrix: the exact correlation of the rounded inputs is positive
+    /// semidefinite, since `|rho| <= 1` survives the conversion, and it is the reference. Then:
+    ///
+    /// - Each path from an input to `c(a, b)` takes at most six roundings (three products and two
+    ///   sums for a squared term; two products, the inner sum, three products and the outer sum
+    ///   for the cross term), so its error is at most `gamma_6 A(a, b)`, where `A` is `c` with
+    ///   each term in absolute value.
+    /// - `A` is the form of a positive semidefinite matrix, so
+    ///   `A(p, q) <= sqrt(A(p, p) A(q, q))`. With `k_p = A(p, p) / c(p, p)`, the cancellation of
+    ///   asset `p`, the error of the numerator moves the entry by at most `gamma_6 sqrt(k_p k_q)`,
+    ///   and those of the denominators by `gamma_6 (k_p + k_q) / 2` to first order: at most
+    ///   `2 gamma_6 k` for `k` the largest cancellation. With `x = gamma_6 k`, the exact error is
+    ///   at most `2x / (1 - x)`, and `k` computed is at least `k / (1 + x)`, so four times the
+    ///   first order term, [`CANCELLATION_ERROR`] `k`, holds while `x <= 3/5`; past `x = 1/3` it
+    ///   is above 2, which no error exceeds, as both values are in `[-1, 1]`.
+    /// - The other roundings, two square roots, a product, a quotient, the clamp, which only
+    ///   moves towards the exact value, and the round trip through `Decimal`, which keeps about
+    ///   15.6 significant digits, add some 16 `u` per entry whatever the cancellation. With the
+    ///   error of the eigendecomposition they are within the floor of a supplied correlation.
+    /// - The volatilities are rounded once per asset, a positive diagonal congruence, which keeps
+    ///   a positive semidefinite matrix so.
+    ///
+    /// Beyond what that floor covers, each entry off the diagonal is therefore within
+    /// `min(CANCELLATION_ERROR k, 2)` of a positive semidefinite matrix with the same unit
+    /// diagonal, and by Weyl's inequality an eigenvalue is moved by at most the size of the
+    /// matrix times that. The cancellation is about one unless `rho` is near `-1` (or `1`, with
+    /// deltas and vegas of opposite signs) and a contract's delta and vega nearly offset. A book
+    /// of 16 random contracts at `rho = -1` with a cancellation of about 2.2e6 had an eigenvalue
+    /// of -1.94e-11: past the floor of -1.7e-11 for 17 assets, and within the round's -2.0e-7.
     fn round_model(
         &self,
         valued: &[Option<Valued>],
-    ) -> MMResult<(MultiAssetModel, Vec<Option<usize>>)> {
+    ) -> MMResult<(
+        MultiAssetModel,
+        Vec<Option<usize>>,
+        Option<ClippedEigenvalue>,
+    )> {
         let factors = &self.config.factors;
         let to_f64 = |value: Decimal, name: &str| {
             value.to_f64().ok_or_else(|| {
@@ -943,6 +1010,9 @@ impl OptionQuoter {
         );
         let covariance = |a: (f64, f64), b: (f64, f64)| {
             a.0 * b.0 * s * s + a.1 * b.1 * v * v + (a.0 * b.1 + a.1 * b.0) * rho * s * v
+        };
+        let magnitude = |a: (f64, f64)| {
+            a.0 * a.0 * s * s + a.1 * a.1 * v * v + 2.0 * (a.0 * a.1).abs() * rho.abs() * s * v
         };
 
         let underlying = &self.config.underlying;
@@ -1005,14 +1075,34 @@ impl OptionQuoter {
             }
             correlation.push(row);
         }
-        let model = MultiAssetModel::new(
+        let cancellation = loadings
+            .iter()
+            .map(|loading| magnitude(*loading) / covariance(*loading, *loading))
+            .fold(1.0_f64, f64::max);
+        let (model, clipped) = MultiAssetModel::derived(
             params,
             &correlation,
             self.config.risk_aversion,
             self.config.objective,
             self.config.risk_view,
+            (CANCELLATION_ERROR * cancellation).min(2.0),
         )?;
-        Ok((model, assets))
+        let clipped = match clipped {
+            Some(clipped) => {
+                let decimal = |value: f64| {
+                    Decimal::from_f64(value).ok_or_else(|| {
+                        MMError::NumericalError(format!("eigenvalue {value} is not a decimal"))
+                    })
+                };
+                Some(ClippedEigenvalue {
+                    eigenvalue: decimal(clipped.eigenvalue)?,
+                    floor: decimal(clipped.floor)?,
+                    band: decimal(clipped.band)?,
+                })
+            }
+            None => None,
+        };
+        Ok((model, assets, clipped))
     }
 
     /// What the live orders can do to the positions.
@@ -1462,7 +1552,7 @@ impl OptionQuoter {
                 }
             }
         }
-        let (model, assets) = self.round_model(&valued)?;
+        let (model, assets, clipped_eigenvalue) = self.round_model(&valued)?;
         let mut inventory = vec![hedge];
         for (position, asset) in self.positions.iter().zip(&assets) {
             if asset.is_some() {
@@ -1568,6 +1658,7 @@ impl OptionQuoter {
             capital: self.capital(&valued, hedge, market.spot)?,
             net_delta,
             hedge: self.hedge_order(net_delta, spot_scale, market.spot),
+            clipped_eigenvalue,
         })
     }
 
