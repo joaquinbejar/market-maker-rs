@@ -96,6 +96,14 @@ class MarketMakingEnv(gym.Env):
         }
         return self._transition(reply, action, extra)
 
+    def step_hold(self):
+        """A hold, whatever the encoding: the resting orders stay and nothing is sent."""
+        reply = self._native.step_hold()
+        hold = {"kind": "hold", "indices": []}
+        return self._transition(
+            reply, None, {"decoded_action": hold, "applied_action": hold}
+        )
+
     def _transition(self, reply, action, extra):
         self._mask = reply["mask"]
         observed = reply["observation"]
@@ -109,6 +117,7 @@ class MarketMakingEnv(gym.Env):
             "net": reply["net"],
             "penalties": reply["penalties"],
             "close": reply["close"],
+            "orders": dict(reply["orders"]),
             "row": observed["row"],
             "raw_observation": observed["raw"],
             **extra,

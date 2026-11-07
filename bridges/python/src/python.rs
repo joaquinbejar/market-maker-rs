@@ -110,6 +110,13 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
     out.set_item("penalty", exact(t.reward.penalty))?;
     out.set_item("net", exact(reply.net))?;
     out.set_item("penalties", exact(reply.penalties))?;
+    let orders = PyDict::new(py);
+    orders.set_item("accepted", reply.orders.accepted)?;
+    orders.set_item("rejected", reply.orders.rejected)?;
+    orders.set_item("canceled", reply.orders.canceled)?;
+    orders.set_item("cancel_rejected", reply.orders.cancel_rejected)?;
+    orders.set_item("fills", reply.orders.fills)?;
+    out.set_item("orders", orders)?;
     let (applied, reason) = match t.action_status {
         ActionStatus::Applied => (true, None),
         ActionStatus::Rejected(reason) => (false, Some(format!("{reason:?}"))),
