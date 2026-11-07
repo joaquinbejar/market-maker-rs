@@ -8,6 +8,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The Python bridge builds against Python's stable ABI for 3.11 and loads on 3.11 and 3.12 (#284),
+  both tested; nothing else in it changes.
 - The out-of-sample comparison of #102 in `bridges/python/experiments/m4_05`: a design fixed
   before any run (`design.json`, with the change log of every amendment and what was seen when),
   the digests of its synthetic queue-reactive days (example `qr_days`), a runner for selection,
