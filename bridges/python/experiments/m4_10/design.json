@@ -23,7 +23,8 @@
   "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
   "changes": [
     "version 2, before any run: rows of 100 ms instead of 1 s. On 1 s rows the latency had no effect below half a row and a cliff at 500 ms: Avellaneda-Stoikov (risk aversion 0.01, intensity 50) on #103's calm validation day 15 at fee 0.0002, deciding every row, queue at 1 lot per 500 ms against immediate fill: 25, 100, 250 and 400 ms all 22 fills and -0.020169 against 64 fills and -0.31108; 500 ms 0 fills and 0 against 64 and -0.31108; at a decision every 5 rows 736 fills and -19.103243 against 738 and -19.102291 at 25, 250 and 400 ms. Matching happens only at rows, so latency below a row cannot be measured there.",
-    "version 2, the rate, chosen before any training on calm validation day 15, Avellaneda-Stoikov (risk aversion 0.01, intensity 50, a 2 hour horizon), fee 0.0002, fills and net. Deciding every row: no rate fills at 25 ms (immediate fill 0 fills too), at 100 ms only 1 lot per 10 ms (2 fills, 0.77, as immediate fill), at 500 ms 1 lot per 50 ms 22 fills and -1.247, per 25 ms 42 and -0.944, against immediate fill 72 and -1.441. Deciding every 10 rows, against immediate fill: 25 ms immediate 23 and -0.722, 1 lot per 1000 ms 0 and 0, per 750 ms 8 and -0.569, per 500 ms 8 and -0.569, per 250 ms 23 and -0.722; 100 ms immediate 28 and -0.452, per 1000 ms 0, per 750 ms 9 and -0.464, per 500 ms 9 and -0.464, per 250 ms 26 and -0.722; 500 ms immediate 59 and 0.327, per 1000 ms 0, per 750 ms 12 and -0.309, per 500 ms 14 and -0.273, per 250 ms 54 and -0.098. Every 30 rows the queue equals immediate fill at 500 and 250 ms (90, 94, 128 fills). The rate is 1 lot per 750 ms: the slowest that fills and binds at every latency; the check holds at 10 rows, not at 1 (where nothing binds at 25 ms) nor at 30. The classical arm is selected at intervals of 1 and 10 rows, as stated."
+    "version 2, the rate, chosen before any training on calm validation day 15, Avellaneda-Stoikov (risk aversion 0.01, intensity 50, a 2 hour horizon), fee 0.0002, fills and net. Deciding every row: no rate fills at 25 ms (immediate fill 0 fills too), at 100 ms only 1 lot per 10 ms (2 fills, 0.77, as immediate fill), at 500 ms 1 lot per 50 ms 22 fills and -1.247, per 25 ms 42 and -0.944, against immediate fill 72 and -1.441. Deciding every 10 rows, against immediate fill: 25 ms immediate 23 and -0.722, 1 lot per 1000 ms 0 and 0, per 750 ms 8 and -0.569, per 500 ms 8 and -0.569, per 250 ms 23 and -0.722; 100 ms immediate 28 and -0.452, per 1000 ms 0, per 750 ms 9 and -0.464, per 500 ms 9 and -0.464, per 250 ms 26 and -0.722; 500 ms immediate 59 and 0.327, per 1000 ms 0, per 750 ms 12 and -0.309, per 500 ms 14 and -0.273, per 250 ms 54 and -0.098. Every 30 rows the queue equals immediate fill at 500 and 250 ms (90, 94, 128 fills). The rate is 1 lot per 750 ms: the slowest that fills and binds at every latency; the check holds at 10 rows, not at 1 (where nothing binds at 25 ms) nor at 30. The classical arm is selected at intervals of 1 and 10 rows, as stated.",
+    "version 2, after the timing pilot only (nothing selected): training estimated at about 1300 run-minutes, 240 minutes at 6 jobs."
   ],
   "execution": {
     "fee": "by the rule of #103 (largest of 0.0002, 0 and -0.0001 at which the training-day Avellaneda-Stoikov point has a positive mean daily net), run on these training days at a decision every row and 25 ms latency; 0.0002 if none",
@@ -248,7 +249,20 @@
     {
       "name": "training",
       "what": "4 learned arms x 3 latencies x 5 seeds",
-      "estimate_minutes": 210
+      "estimate_minutes": 240,
+      "pilot": {
+        "latency 25": {
+          "minutes_per_2m": 29.8
+        },
+        "latency 100": {
+          "minutes_per_2m": 26.9
+        },
+        "latency 500": {
+          "minutes_per_2m": 22.3
+        },
+        "where": "PPO with a chosen duration, calm training day 1, 50000 decisions, one job",
+        "no_duration_arm": "about 7 minutes per 2M, a decision every row"
+      }
     },
     {
       "name": "freeze",
