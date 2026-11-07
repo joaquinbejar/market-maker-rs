@@ -21,8 +21,13 @@ read:
 An amendment, made after the validation results were seen and before the holdout was read
 (see AMENDMENT): each learned arm is also compared with no-trade, and with
 Avellaneda-Stoikov. The bounds the ablations put on the execution are in EXECUTION_BOUNDS.
+
+A correction, made after report.py was first run on the holdout (see FIRST_READ): the rows of
+`holdout.json` carry no ablation label, so the learned runs are labelled from the order the
+runner submitted them in (see `relabel`), and every row must match it.
 """
 
+import hashlib
 import json
 import math
 import pathlib
@@ -55,6 +60,61 @@ EXECUTION_BOUNDS = (
     "before matching (#268), so no arm fills. It does not measure latency. Conclusions hold "
     "only for immediate fills at 10 s rows with a latency well under a row."
 )
+FIRST_READ = (
+    "The holdout was evaluated once. The first run of this report on it counted the learned "
+    "runs trained with the reward_inventory_penalty ablation together with the main runs, "
+    "because the runner wrote no ablation label into the holdout rows: the learned arms' tables "
+    "had 150 pooled days instead of 75, and their decisions were made on that mixture. What it "
+    "showed: maskable PPO 'continue' in calm (interval against GLFT [0.0016, 3.91], against "
+    "no-trade [-6.65, -1.95]) and 'revise', equivalent to not trading, in stressed, thin and "
+    "pooled; the residual SAC 'discard' everywhere against GLFT and better than "
+    "Avellaneda-Stoikov everywhere; the PPO run that traded heavily was a penalty-trained one. "
+    "The bug was then found and the rows relabelled from the order the runner submitted them "
+    "in, with no new evaluation and no change to any rule or threshold; the tables and "
+    "decisions here are from the relabelled rows only."
+)
+TRAINING_ONLY = "reward_inventory_penalty"
+
+
+def relabel(out, holdout, design):
+    """Labels the holdout's learned rows with their ablation, from submission order.
+
+    The runner submits every classical job first, then each frozen learned run, in the order
+    of `frozen.json`, over the regimes and then the holdout days, and keeps the results in
+    that order. Every row must match the job it is labelled from on arm, candidate,
+    execution variant, regime and day, or nothing is reported.
+    """
+    path = out / "frozen.json"
+    if hashlib.sha256(path.read_bytes()).hexdigest() != holdout["frozen_sha256"]:
+        raise ValueError("frozen.json is not the manifest the holdout was evaluated from")
+    frozen = json.loads(path.read_text())
+    regimes = [r["name"] for r in design["simulator"]["regimes"]]
+    first, last = design["splits"]["holdout"]
+    expected = [
+        (m["arm"], f"set{m['set']}-seed{m['seed']}", m["variant"], regime, day,
+         m.get("ablation"))
+        for m in frozen["runs"]
+        for regime in regimes
+        for day in range(first, last + 1)
+    ]
+    rows = holdout["rows"]
+    learned = [i for i, row in enumerate(rows) if row["arm"] in LEARNED]
+    start = len(rows) - len(expected)
+    if learned != list(range(start, len(rows))):
+        raise ValueError("the learned rows are not the last rows, in one block")
+    for row in rows[:start]:
+        if row.get("ablation") is not None:
+            raise ValueError(f"a classical row carries an ablation: {row['arm']}")
+        row["ablation"] = None
+    for row, (arm, candidate, variant, regime, day, ablation) in zip(rows[start:], expected):
+        seen = (row["arm"], row["candidate"], row["variant"], row["regime"], row["day"])
+        submitted = (arm, candidate, variant, regime, day)
+        if seen != submitted:
+            raise ValueError(f"row {seen} is not the submitted job {submitted}")
+        if row.get("ablation", ablation) != ablation:
+            raise ValueError(f"row {seen} is labelled {row['ablation']}, submitted {ablation}")
+        row["ablation"] = ablation
+    return rows
 
 
 def mean(values):
@@ -113,9 +173,33 @@ def drawdown_by_day(rows):
     return {key: mean(values) for key, values in sorted(by_day.items())}
 
 
-def build(out):
+def ablation_tables(rows, regimes):
+    """Per ablation, the tables of every arm it evaluated on the holdout. An execution
+    ablation has the classical arms and the learned runs retrained under it; the training-only
+    one has the learned runs it trained, under the main execution."""
+    labels = sorted({r["variant"] for r in rows if r["variant"] != "main"}) + [TRAINING_ONLY]
+    out = {}
+    for label in labels:
+        if label == TRAINING_ONLY:
+            chosen = [r for r in rows if r["ablation"] == label]
+        else:
+            chosen = [r for r in rows if r["variant"] == label]
+        scopes = {regime: [regime] for regime in regimes}
+        scopes["pooled"] = regimes
+        out[label] = {
+            scope: {
+                arm: summary([r for r in chosen if r["arm"] == arm and r["regime"] in members])
+                for arm in sorted({r["arm"] for r in chosen})
+            }
+            for scope, members in scopes.items()
+        }
+    return out
+
+
+def build(out, design):
     holdout = json.loads((out / "holdout.json").read_text())
-    rows = [r for r in holdout["rows"] if r.get("ablation") is None and r["variant"] == "main"]
+    labelled = relabel(out, holdout, design)
+    rows = [r for r in labelled if r["ablation"] is None and r["variant"] == "main"]
     regimes = sorted({r["regime"] for r in rows})
     scopes = {regime: [regime] for regime in regimes}
     scopes["pooled"] = regimes
@@ -139,7 +223,7 @@ def build(out):
             for against in AGAINST:
                 difference = [values[arm][day] - values[against][day] for day in values[arm]]
                 series[f"{scope}/{arm}-minus-{against}"] = [str(d) for d in difference]
-    return holdout, tables, series, comparisons, rows
+    return holdout, tables, series, comparisons, rows, ablation_tables(labelled, regimes)
 
 
 def includes_zero(interval):
@@ -161,7 +245,7 @@ def main():
     out = pathlib.Path(sys.argv[1])
     binary = sys.argv[2]
     design = json.loads((pathlib.Path(__file__).resolve().parent / "design.json").read_text())
-    holdout, tables, series, comparisons, rows = build(out)
+    holdout, tables, series, comparisons, rows, ablations = build(out, design)
     payload = {"bootstrap": design["evaluation"]["bootstrap"], "series": series}
     (out / "series.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
     intervals = json.loads(
@@ -205,9 +289,11 @@ def main():
         "data": holdout["data"],
         "bounds": holdout["bounds"],
         "frozen_sha256": holdout["frozen_sha256"],
+        "first_read": FIRST_READ,
         "amendment": AMENDMENT,
         "execution_bounds": EXECUTION_BOUNDS,
         "tables": tables,
+        "ablation_tables": ablations,
         "intervals": intervals,
         "decisions": decisions,
     }

@@ -423,6 +423,7 @@ def evaluate_job(job):
         "regime": job["regime"],
         "day": job["day"],
         "split": job["split"],
+        "ablation": job.get("ablation"),
         "daily_value": str(sum(nets, Decimal(0)) / len(nets)),
         "episodes": days,
     }
