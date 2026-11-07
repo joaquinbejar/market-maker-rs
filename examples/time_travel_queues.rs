@@ -4,7 +4,8 @@
 //! - (a) on #102's queue-reactive days (`synthetic`), where the market reacts to an order;
 //! - (b) on the Hyperliquid capture (`capture`).
 //!
-//! In (a) the queue-reactive simulator continues from a state that holds the agent's order. So
+//! In (a) the queue-reactive simulator continues, from the decision's time, from a state that
+//! holds the agent's order. So
 //! the true continuation after an action is known, and each mode is measured against it. In (b)
 //! there is no truth, only each mode's own measures.
 //!
@@ -220,6 +221,15 @@ fn grid(sim: &mut QrSimulator, steps: usize, start: f64) -> Result<Vec<QrState>,
         out.push(current);
     }
     Ok(out)
+}
+
+/// The state continued from `start` seconds: its next event is drawn from that time, so nothing
+/// happens between the last event before the decision and the decision under the changed
+/// queues. The waits are exponential, so starting the draw later changes no law.
+fn at_time(mut state: QrState, start: f64) -> QrState {
+    state.time_seconds = start.max(state.time_seconds);
+    state.clock_seconds = state.clock_seconds.max(state.time_seconds);
+    state
 }
 
 /// What a market maker does at the touch at one decision.
@@ -452,7 +462,8 @@ impl Truths<'_> {
                 None => None,
                 Some(forced) => {
                     let start = at.1 as f64 * GRID_MS as f64 / 1000.0;
-                    let mut sim = QrSimulator::from_state(self.params.clone(), forced)?;
+                    let mut sim =
+                        QrSimulator::from_state(self.params.clone(), at_time(forced, start))?;
                     let states = grid(&mut sim, HORIZON_STEPS + 1, start)?;
                     let next = sample_of(&states[1], self.limits).state();
                     let moved = states[HORIZON_STEPS].reference_ticks - day.samples[at.1].mid;
@@ -812,7 +823,7 @@ fn noise_floor(params: &[QrParameters], days: &[Day], every: usize) -> Result<()
                 let mut mixer = Rng(other.rng_state ^ 0xD1B5_4A32_D192_ED03);
                 other.rng_state = mixer.next() | 1;
                 let start = k as f64 * GRID_MS as f64 / 1000.0;
-                let mut sim = QrSimulator::from_state(p.clone(), other)?;
+                let mut sim = QrSimulator::from_state(p.clone(), at_time(other, start))?;
                 let states = grid(&mut sim, HORIZON_STEPS + 1, start)?;
                 let independent_move = states[HORIZON_STEPS].reference_ticks - day.samples[k].mid;
                 let tape_move = day.samples[k + HORIZON_STEPS].mid - day.samples[k].mid;
@@ -1607,5 +1618,33 @@ mod tests {
             3,
         );
         assert_eq!((chrono.jumps, chrono.no_candidate), (0, 0));
+    }
+
+    #[test]
+    fn test_a_continuation_has_no_event_before_its_decision() {
+        // A continuation drawn with an independent generator, as the noise floor's, would
+        // often put an event between the last event before the decision and the decision; from
+        // the decision's time it cannot, so the state at the decision is the one it started
+        // from.
+        let p = small();
+        let mut sim = QrSimulator::new(p.clone(), 5, 1_000).unwrap();
+        let tape = grid(&mut sim, 300, 0.0).unwrap();
+        let mut checked = 0;
+        for (k, state) in tape.iter().enumerate().skip(1).take(250) {
+            if state.time_seconds >= k as f64 {
+                continue;
+            }
+            let mut other = *state;
+            other.rng_state = Rng(other.rng_state ^ 0xA5A5).next() | 1;
+            let mut fork = QrSimulator::from_state(p.clone(), at_time(other, k as f64)).unwrap();
+            let states = grid(&mut fork, 2, k as f64).unwrap();
+            assert_eq!(
+                (states[0].bid, states[0].ask),
+                (state.bid, state.ask),
+                "step {k}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 50);
     }
 }
