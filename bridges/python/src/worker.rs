@@ -683,13 +683,29 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
         self.env().hedge_mask(state)
     }
 
+    /// Only a hold: the resting orders stay, and the classical strategy is not asked, so
+    /// a decision interval can hold a residual policy's orders between its decisions.
     fn step(
         &mut self,
-        _state: &mut State,
-        _action: RlAction,
-        _audit: &mut Audit,
+        state: &mut State,
+        action: RlAction,
+        audit: &mut Audit,
     ) -> Result<StepReply, String> {
-        Err("a grid action on a residual environment".to_string())
+        if action != RlAction::Hold {
+            return Err("a grid action on a residual environment".to_string());
+        }
+        audit.orders = OrderCounts::default();
+        let transition = self
+            .env()
+            .step_with(state, RlAction::Hold, audit)
+            .map_err(|e| e.to_string())?;
+        Ok(StepReply {
+            transition,
+            net: state.net(),
+            penalties: state.penalties(),
+            decision: None,
+            orders: audit.orders,
+        })
     }
 
     fn step_residual(
