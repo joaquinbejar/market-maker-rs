@@ -1,11 +1,11 @@
 {
   "issue": 110,
-  "design_version": 1,
+  "design_version": 2,
   "data": "synthetic: a queue-reactive simulator with made-up parameters, no market data",
   "bounds": "One synthetic simulator, made-up parameters and 24 days per regime bound what this comparison can show.",
-  "origin": "The days, digests, splits, execution and fee rule of #103 (experiments/m4_06): queue-reactive days sampled every second. #110 reads #103's digests and its fee rule output; it generates no data.",
+  "origin": "The regimes, seeds rule and day-based splits of #103 (experiments/m4_06), sampled every 100 ms for a 2 hour session per day (72000 rows): new data with its own digests (experiments/m4_10/digests.json). The protocol of #103 otherwise.",
   "base_design": "experiments/m4_06/design.json",
-  "base_digests": "experiments/m4_06/digests.json",
+  "base_digests": "experiments/m4_10/digests.json",
   "splits": {
     "train": [
       1,
@@ -21,15 +21,18 @@
     ]
   },
   "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
-  "changes": [],
+  "changes": [
+    "version 2, before any run: rows of 100 ms instead of 1 s. On 1 s rows the latency had no effect below half a row and a cliff at 500 ms: Avellaneda-Stoikov (risk aversion 0.01, intensity 50) on #103's calm validation day 15 at fee 0.0002, deciding every row, queue at 1 lot per 500 ms against immediate fill: 25, 100, 250 and 400 ms all 22 fills and -0.020169 against 64 fills and -0.31108; 500 ms 0 fills and 0 against 64 and -0.31108; at a decision every 5 rows 736 fills and -19.103243 against 738 and -19.102291 at 25, 250 and 400 ms. Matching happens only at rows, so latency below a row cannot be measured there.",
+    "version 2, the rate, chosen before any training on calm validation day 15, Avellaneda-Stoikov (risk aversion 0.01, intensity 50, a 2 hour horizon), fee 0.0002, fills and net. Deciding every row: no rate fills at 25 ms (immediate fill 0 fills too), at 100 ms only 1 lot per 10 ms (2 fills, 0.77, as immediate fill), at 500 ms 1 lot per 50 ms 22 fills and -1.247, per 25 ms 42 and -0.944, against immediate fill 72 and -1.441. Deciding every 10 rows, against immediate fill: 25 ms immediate 23 and -0.722, 1 lot per 1000 ms 0 and 0, per 750 ms 8 and -0.569, per 500 ms 8 and -0.569, per 250 ms 23 and -0.722; 100 ms immediate 28 and -0.452, per 1000 ms 0, per 750 ms 9 and -0.464, per 500 ms 9 and -0.464, per 250 ms 26 and -0.722; 500 ms immediate 59 and 0.327, per 1000 ms 0, per 750 ms 12 and -0.309, per 500 ms 14 and -0.273, per 250 ms 54 and -0.098. Every 30 rows the queue equals immediate fill at 500 and 250 ms (90, 94, 128 fills). The rate is 1 lot per 750 ms: the slowest that fills and binds at every latency; the check holds at 10 rows, not at 1 (where nothing binds at 25 ms) nor at 30. The classical arm is selected at intervals of 1 and 10 rows, as stated."
+  ],
   "execution": {
-    "fee": "the fee #103's fee_rule step chose, read from its output and pinned by hash; and the secondary row at 0.0002",
+    "fee": "by the rule of #103 (largest of 0.0002, 0 and -0.0001 at which the training-day Avellaneda-Stoikov point has a positive mean daily net), run on these training days at a decision every row and 25 ms latency; 0.0002 if none",
     "secondary_fee_rate": "0.0002",
     "fill_model": {
       "kind": "queue_position_rational",
       "lots": 1,
-      "per_ms": 1000,
-      "min_queue_ms": 5000
+      "per_ms": 750,
+      "min_queue_ms": 0
     },
     "limits": {
       "max_position": "20",
@@ -64,7 +67,8 @@
         "jitter_q": 10
       }
     },
-    "latency_note": "submit and cancel delays of 25 (as #103), 100 and 500 ms; every delay is well under a row of 1 s, so the one-row boundary of #268 cannot occur"
+    "latency_note": "submit and cancel delays of 25, 100 and 500 ms on rows of 100 ms: below a row, one row, and five rows",
+    "fill_note": "the slowest rate of 1 lot per 1000, 750, 500, 250, 100, 50, 25 or 10 ms that passes the check: Avellaneda-Stoikov fills and its net differs from immediate fill at every latency"
   },
   "duration": {
     "meaning": "the policy chooses, with each decision, how many rows its quote rests before it decides again: the decision time, a wrapper over the environment (as DecisionInterval, with the interval chosen per action). Self-expiring orders need a cancel-only action the environment lacks (#288).",
@@ -139,7 +143,28 @@
     },
     "avellaneda_stoikov": {
       "kind": "classical",
-      "selection": "as #103, on validation, at every latency"
+      "selection": "as #103, on validation, at every latency, at decision intervals of 1 and 10 rows",
+      "grid": {
+        "risk_aversion": [
+          "0.0001",
+          "0.001",
+          "0.01"
+        ],
+        "order_intensity": [
+          "50",
+          "100",
+          "200"
+        ],
+        "size": [
+          "1"
+        ],
+        "horizon_ms": [
+          7200000
+        ],
+        "volatility": [
+          "from the volatility rule"
+        ]
+      }
     },
     "no_trade": {
       "kind": "baseline"
@@ -233,5 +258,225 @@
       "name": "holdout",
       "estimate_minutes": 90
     }
-  ]
+  ],
+  "simulator": {
+    "kind": "queue_reactive",
+    "sample_ms": 100,
+    "rows_per_day": 72000,
+    "reference_ticks": 10000,
+    "regimes": [
+      {
+        "name": "calm",
+        "tick_size": "0.01",
+        "theta": 0.6,
+        "theta_reinit": 0.2,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              4.0,
+              0.0,
+              0.0
+            ],
+            [
+              4.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              2.0,
+              1.0
+            ],
+            [
+              2.0,
+              3.0,
+              1.0
+            ],
+            [
+              0.0,
+              4.0,
+              1.0
+            ]
+          ],
+          [
+            [
+              4.0,
+              0.0,
+              0.0
+            ],
+            [
+              4.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              2.0,
+              1.0
+            ],
+            [
+              2.0,
+              3.0,
+              1.0
+            ],
+            [
+              0.0,
+              4.0,
+              1.0
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      },
+      {
+        "name": "stressed",
+        "tick_size": "0.01",
+        "theta": 0.7,
+        "theta_reinit": 0.3,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              6.0,
+              0.0,
+              0.0
+            ],
+            [
+              6.0,
+              2.0,
+              2.5
+            ],
+            [
+              5.0,
+              3.0,
+              2.5
+            ],
+            [
+              4.0,
+              4.0,
+              2.5
+            ],
+            [
+              0.0,
+              5.0,
+              2.5
+            ]
+          ],
+          [
+            [
+              6.0,
+              0.0,
+              0.0
+            ],
+            [
+              6.0,
+              2.0,
+              2.5
+            ],
+            [
+              5.0,
+              3.0,
+              2.5
+            ],
+            [
+              4.0,
+              4.0,
+              2.5
+            ],
+            [
+              0.0,
+              5.0,
+              2.5
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      },
+      {
+        "name": "thin",
+        "tick_size": "0.01",
+        "theta": 0.8,
+        "theta_reinit": 0.4,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              2.0,
+              0.0,
+              0.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ],
+            [
+              1.0,
+              2.0,
+              1.0
+            ],
+            [
+              0.0,
+              2.0,
+              1.0
+            ]
+          ],
+          [
+            [
+              2.0,
+              0.0,
+              0.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ],
+            [
+              1.0,
+              2.0,
+              1.0
+            ],
+            [
+              0.0,
+              2.0,
+              1.0
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      }
+    ],
+    "regime_note": "The simulator's rates are the same on both sides, so a skewed flow is not available; the third regime is a thin book instead.",
+    "seed": "1000003 * regime_number + day, regime_number from 1 in the order above, day from 1",
+    "start_ms": "(day - 1) * 86400000, so each day is one UTC day"
+  },
+  "days": 24,
+  "kernel": {
+    "tick_size": "0.005",
+    "lot_size": "1",
+    "max_price": "1000",
+    "max_order_size": "10"
+  },
+  "observation_scales": {
+    "spread_ticks": "10",
+    "mid_change_ticks": "10",
+    "row_gap_ms": "200",
+    "size_lots": "10",
+    "position": "20",
+    "entry_gap": "1"
+  },
+  "session_ms": 7200000,
+  "volatility_rule": "Per regime, the population standard deviation of the change of the mid in price units between consecutive rows of the same day, over every training day, times the square root of 31536000 / 0.1: absolute price units per square root of a 365 day year, as Avellaneda-Stoikov and GLFT take it.",
+  "check_before_training": "for each latency, the classical arm fills a nonzero number of times at a decision interval of 1 or 10 rows, and its net differs from immediate fill, on one validation day; the table is recorded in changes"
 }
