@@ -535,6 +535,11 @@ project follows [Semantic Versioning](https://semver.org/).
   rule) are exact near the `Decimal` bounds instead of saturating the sum,
   and every book and trade flow imbalance is invariant under a common
   scale of its sides, even when their sum is not representable.
+- Documented, and pinned by tests in the engine and the kernel, that a submit and cancel latency
+  of exactly one tick interval never fills a strategy that quotes on every tick (#268): events
+  due at a tick's time run before its matching, an order is eligible only on ticks after it
+  becomes active, and each quote cancels the resting orders, so the cancel always comes first.
+  One millisecond less and every order fills. No behaviour changes.
 
 ### Fixed
 

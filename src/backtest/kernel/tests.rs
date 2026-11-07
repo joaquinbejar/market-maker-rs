@@ -1778,3 +1778,36 @@ fn test_quote_error_name_inverts_quote_error_code_for_every_variant() {
         assert_eq!(quote_error_name(ErrCode(code)), None);
     }
 }
+
+/// Venue fills of a run on rows every 10 ms whose ask sits at a bid of 14,
+/// with a quote on the first row and then on every row (`requote`) or never
+/// again, under the given submit and cancel delays in milliseconds.
+fn fills_with_latency(submit_ms: u64, cancel_ms: u64, requote: bool) -> u64 {
+    let cfg = config(KernelLatency::zero(MS).with_delays(0, submit_ms, cancel_ms, 0));
+    let rows = (0..8).map(|i| tick(1000 + 10 * i, 12, 14)).collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k = QueueKernel::new(&cfg, &data).unwrap();
+    let actions: Vec<KernelAction> = (0..8)
+        .map(|i| {
+            if i == 0 || requote {
+                quote(14, 20)
+            } else {
+                KernelAction::Hold
+            }
+        })
+        .collect();
+    let (s, _) = drive(&k, &actions);
+    s.counters().venue_fills
+}
+
+#[test]
+fn test_kernel_latency_of_exactly_one_row_never_fills_when_every_row_requotes() {
+    // Events due at a row's time run before its matching, and an order is
+    // matched only on rows after the one it becomes active on, so the cancel
+    // of the next quote always lands first.
+    assert_eq!(fills_with_latency(10, 10, true), 0);
+    // One millisecond less and every order fills on the row it reaches.
+    assert_eq!(fills_with_latency(9, 9, true), 7);
+    // Without the requote the order rests and fills on the row after.
+    assert_eq!(fills_with_latency(10, 10, false), 1);
+}

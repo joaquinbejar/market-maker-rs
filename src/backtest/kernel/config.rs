@@ -22,6 +22,13 @@ const MANTISSA_LIMIT: u128 = 1 << 96;
 /// quanta from the kernel's latency stream exactly as the engine draws it
 /// in milliseconds; with `quantum_ns = 1_000_000` the kernel reproduces an
 /// engine run with the same delays in milliseconds.
+///
+/// As in the engine, messages due at a row's time run before the row is
+/// matched, an order matches only on rows after the one it becomes active
+/// on, and every quote cancels the resting orders first. So with rows every
+/// `Δ`, a quote on every row, and `submit_q` and `cancel_q` both exactly `Δ`
+/// with no jitter, no order ever fills: the cancel always lands on the first
+/// row the order could fill on. See [`crate::backtest::latency`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelLatency {
     /// Length of one quantum, in nanoseconds; at least 1.

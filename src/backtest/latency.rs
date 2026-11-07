@@ -18,6 +18,18 @@
 //! messages. This module measures nothing; for wall clock measurement see
 //! [`crate::execution::LatencyTracker`].
 //!
+//! # Delays of a whole number of tick intervals
+//!
+//! Events due at a tick's time run before that tick is matched, and an order
+//! is eligible only on ticks after the one it becomes active on. With ticks
+//! every `Δ`, a strategy that quotes on every tick, and `submit_ms` and
+//! `cancel_ms` both exactly `Δ` with no jitter, an order sent on one tick
+//! becomes active on the next, where it cannot match, and the cancel sent by
+//! that tick's quote takes effect on the tick after, before matching. No
+//! order ever fills. With a delay one millisecond shorter every order fills
+//! on the tick it reaches, and an order left resting fills on the tick after
+//! it becomes active. The backtest kernel follows the same rules.
+//!
 //! # Example
 //!
 //! ```rust
