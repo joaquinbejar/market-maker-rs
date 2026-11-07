@@ -20,7 +20,9 @@
     ]
   },
   "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
-  "changes": [],
+  "changes": [
+    "version 1, after the timing pilot and before any training: steps_per_epoch 17280 (two days of 8640 steps) for every arm instead of 2000, because OmniSafe's Lagrange update needs a finished episode in every epoch and PPOLag stopped on a NaN cost at 2000. The toy gate is run again at the same two episodes per epoch (steps_per_epoch 40), under the criterion of toy_gate.json; an algorithm that fails it is not an arm. Pilot timing, 50000 steps on pooled training days: PPO 13.9 and CPO 13.0 minutes per 2M steps. Nothing else was seen."
+  ],
   "shocks": {
     "what": "an asset shock in the sense of margin-rs Scenario::shock: from 12:00 of the day on, the bid and the ask move by round(mid * shock) ticks of the kernel, the spread and sizes unchanged",
     "shocks": [
@@ -173,10 +175,11 @@
     "failed_gate": "OmniSafe PPOLag with its default configuration failed the toy gate and is not an arm"
   },
   "algorithm_cfgs": {
-    "steps_per_epoch": 2000,
+    "steps_per_epoch": 17280,
     "update_iters": 10,
     "device": "cpu",
-    "torch_threads": 1
+    "torch_threads": 1,
+    "episodes_per_epoch": 2
   },
   "budget_steps": 2000000,
   "training_seeds": [
@@ -233,7 +236,12 @@
     {
       "name": "pilot",
       "what": "50000 steps of each OmniSafe algorithm on training days, to time them",
-      "estimate_minutes": 20
+      "estimate_minutes": 20,
+      "measured": {
+        "PPO_minutes_per_2m": 13.9,
+        "CPO_minutes_per_2m": 13.0,
+        "PPOLag": "stopped at steps_per_epoch 2000 (NaN episode cost)"
+      }
     },
     {
       "name": "fee_rule",
@@ -246,7 +254,7 @@
     {
       "name": "training",
       "what": "ppo, ppo_lagrangian, cpo x 5 seeds, and ppo_penalized x 3 lambdas x 5 seeds",
-      "estimate_minutes": "set from the pilot"
+      "estimate_minutes": 90
     },
     {
       "name": "penalty_selection",

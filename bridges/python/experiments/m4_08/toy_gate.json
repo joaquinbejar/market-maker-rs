@@ -72,5 +72,26 @@
       "rest": "OmniSafe 0.5.0 defaults"
     }
   },
-  "note": "OmniSafe's default PPOLag standardizes the reward and the cost advantages apart; when both move with the same action, as here, the multiplier is weighed against 1 rather than against the reward's true slope, and the cost settles above the limit."
+  "note": "OmniSafe's default PPOLag standardizes the reward and the cost advantages apart; when both move with the same action, as here, the multiplier is weighed against 1 rather than against the reward's true slope, and the cost settles above the limit.",
+  "regate": {
+    "why": "the market comparison needs two finished episodes per epoch (steps_per_epoch 17280 for days of 8640 steps); the gate is run again at two episodes per epoch on the toy, steps_per_epoch 40, under the same pass criterion, before its results are read",
+    "candidates": [
+      {
+        "algorithm": "PPOLag",
+        "steps": 200000,
+        "overrides": {
+          "standardized_rew_adv": false,
+          "standardized_cost_adv": false,
+          "steps_per_epoch": 40
+        }
+      },
+      {
+        "algorithm": "CPO",
+        "steps": 200000,
+        "overrides": {
+          "steps_per_epoch": 40
+        }
+      }
+    ]
+  }
 }
