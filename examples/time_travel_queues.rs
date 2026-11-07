@@ -952,15 +952,386 @@ fn synthetic(design_path: &str) -> Result<(), Failure> {
     Ok(())
 }
 
+/// (b): the replay's limits, warm-up and reset gap, as #257's example.
+const CAPTURE_LIMITS: u8 = 3;
+/// (b): warm-up of the replay, in minutes.
+const CAPTURE_WARMUP_MINUTES: u64 = 10;
+/// (b): a silence above this resets the replay, in nanoseconds.
+const CAPTURE_RESET_GAP_NS: u64 = 60_000_000_000;
+/// (b): one in this many sized events is kept for the event sizes, by count.
+const SIZED_STRIDE: usize = 10;
+/// (b): the event sizes need at least this many events per limit.
+const MIN_SIZED_EVENTS: u64 = 30;
+/// (b): the bootstrap's unit, in grid steps: one hour.
+const CAPTURE_UNIT_STEPS: usize = 3_600;
+
+/// The capture's book at each grid time of its longest warm stretch with no gap.
+struct CaptureTape {
+    samples: Vec<Sample>,
+    start_ms: u64,
+}
+
+/// The state the action forces on what the capture shows: joining adds one event size to
+/// the side's touch queue, taking removes one, and taking the last one opens the spread by a
+/// tick with an unknown queue there, put in the lowest bucket.
+fn force_sample(sample: &Sample, action: Action) -> Option<State> {
+    let mut s = *sample;
+    match action {
+        Action::Hold => {}
+        Action::JoinBid => s.bid += 1,
+        Action::JoinAsk => s.ask += 1,
+        Action::JoinBoth => {
+            s.bid += 1;
+            s.ask += 1;
+        }
+        Action::TakeBid | Action::TakeAsk => {
+            let queue = if action == Action::TakeBid {
+                &mut s.bid
+            } else {
+                &mut s.ask
+            };
+            if *queue == 0 {
+                return None;
+            }
+            *queue -= 1;
+            if *queue == 0 {
+                s.spread += 1;
+            }
+        }
+    }
+    Some(s.state())
+}
+
+fn read_capture(coin: &str, tick: Decimal, files: &[String]) -> Result<CaptureTape, Failure> {
+    use std::io::{self, BufReader};
+
+    use market_maker_rs::backtest::hyperliquid::{
+        BookLevels, Inferred, RepeatFilter, Replay, ReplayConfig, Warmth, book_samples,
+        decode_order_statuses_after, read_book_diffs_after, read_trades_after, sized_events,
+    };
+    use market_maker_rs::backtest::queue_reactive::{SizedEvent, estimate_event_sizes};
+    use market_maker_rs::strategy::walk_forward::TimeWindow;
+
+    let config = ReplayConfig::new(
+        tick,
+        CAPTURE_LIMITS,
+        CAPTURE_WARMUP_MINUTES * 60_000_000_000,
+        CAPTURE_RESET_GAP_NS,
+    )?
+    .with_book_samples(GRID_MS)?;
+    let mut replay = Replay::new(config);
+    let mut filters = [
+        RepeatFilter::new(),
+        RepeatFilter::new(),
+        RepeatFilter::new(),
+    ];
+    let mut book: Vec<Inferred<BookLevels>> = Vec::new();
+    let mut sized: Vec<SizedEvent> = Vec::new();
+    let mut seen = 0usize;
+    for triple in files.chunks(3) {
+        let [statuses, diffs, trades] = triple else {
+            return Err("files come in triples of statuses, diffs and trades".into());
+        };
+        let [status_filter, diff_filter, trade_filter] = &mut filters;
+        let status_rows = decode_order_statuses_after(&fs::read(statuses)?, status_filter)?;
+        let mut reader = BufReader::new(fs::File::open(diffs)?);
+        let diff_rows = read_book_diffs_after(&mut reader, coin, diff_filter)?;
+        io::copy(&mut reader, &mut io::sink())?;
+        let mut reader = BufReader::new(fs::File::open(trades)?);
+        let trade_rows = read_trades_after(&mut reader, coin, trade_filter)?;
+        let output = replay.ingest(&status_rows.rows, &diff_rows.rows, &trade_rows.rows)?;
+        book.extend(
+            output
+                .book
+                .into_iter()
+                .filter(|b| b.value.warmth == Warmth::Warm),
+        );
+        for event in sized_events(&output.events) {
+            if seen.is_multiple_of(SIZED_STRIDE) {
+                sized.push(event.value);
+            }
+            seen += 1;
+        }
+        eprintln!("read {statuses}");
+    }
+    // The longest run of consecutive warm grid times in one epoch.
+    let mut best = (0usize, 0usize);
+    let mut start = 0usize;
+    for i in 1..=book.len() {
+        let breaks = i == book.len()
+            || book[i].epoch != book[i - 1].epoch
+            || book[i].value.timestamp_ms != book[i - 1].value.timestamp_ms + GRID_MS;
+        if breaks {
+            if i - start > best.1 - best.0 {
+                best = (start, i);
+            }
+            start = i;
+        }
+    }
+    let stretch = &book[best.0..best.1];
+    let first = stretch.first().ok_or("no warm stretch")?.value.timestamp_ms;
+    let last = stretch.last().ok_or("no warm stretch")?.value.timestamp_ms;
+    let train_end = first + ((last - first) as f64 * CAPTURE_SPLIT[0]) as u64;
+    let window = TimeWindow::new(first, train_end)?;
+    let record = estimate_event_sizes(&sized, &window, CAPTURE_LIMITS, MIN_SIZED_EVENTS)?;
+    let sizes = record.sizes.map_err(|f| format!("no event sizes: {f:?}"))?;
+    let converted = book_samples(stretch, &sizes, tick)?;
+    if converted.len() != stretch.len() {
+        return Err("book samples were left out inside the warm stretch".into());
+    }
+    let limits = usize::from(CAPTURE_LIMITS);
+    let samples = converted
+        .iter()
+        .zip(stretch)
+        .map(|(sample, levels)| {
+            let touch_of = |queues: &[u32; MAX_LIMITS]| touch(queues, limits).1;
+            let mid2 = (levels.value.best_bid + levels.value.best_ask) / tick;
+            Sample {
+                spread: sample.value.spread_ticks,
+                bid: touch_of(&sample.value.bid),
+                ask: touch_of(&sample.value.ask),
+                mid: mid2.round().try_into().unwrap_or(0),
+            }
+        })
+        .collect();
+    println!(
+        "REAL DATA: the Hyperliquid capture, {coin}, tick {tick}. Longest warm stretch: {} grid times from {first} ms; event sizes {sizes:?} from the training part's sized events, one in {SIZED_STRIDE}. The mid is in half ticks.",
+        stretch.len()
+    );
+    Ok(CaptureTape {
+        samples,
+        start_ms: first,
+    })
+}
+
+/// Each mode and rule's walks over a split of the capture, one per search seed.
+type CaptureResults = BTreeMap<(Mode, Rule), Vec<Walk>>;
+
+/// One rule's walk over one split of the capture in one mode. There is no truth here.
+fn walk_capture(
+    samples: &[Sample],
+    split: (usize, usize),
+    rule: Rule,
+    mode: Mode,
+    separation: usize,
+    seed: u64,
+) -> Walk {
+    let segment = Day {
+        regime: 0,
+        day: 0,
+        states: Vec::new(),
+        samples: samples[split.0..split.1].to_vec(),
+    };
+    let window = [&segment];
+    let search = Search::new(&window);
+    let mut out = Walk::default();
+    let mut landed: HashSet<Position> = HashSet::new();
+    let mut rng = Rng(seed);
+    let mut at: Position = (0, 0);
+    let len = segment.samples.len();
+    for _ in 0..len.saturating_sub(HORIZON_STEPS + 2) {
+        if at.1 + HORIZON_STEPS + 1 >= len {
+            break;
+        }
+        let sample = segment.samples[at.1];
+        let action = rule.act(&sample);
+        let natural = segment.samples[at.1 + 1].state();
+        // A hold forces nothing: the tape's own next state.
+        let forced = if action == Action::Hold {
+            Some(natural)
+        } else {
+            force_sample(&sample, action)
+        };
+        if action != Action::Hold && forced.is_none() {
+            out.unforceable += 1;
+        }
+        let mut base = at;
+        let mut next = (0, at.1 + 1);
+        if mode != Mode::Chronological
+            && let Some(target) = forced.filter(|f| *f != natural)
+        {
+            let key = (sample.state(), target);
+            match search.land(
+                key,
+                at,
+                separation,
+                mode == Mode::TimeTravelForward,
+                &mut rng,
+            ) {
+                Some(landing) => {
+                    out.jumps += 1;
+                    out.jump_steps += landing.1.abs_diff(at.1);
+                    if !landed.insert(landing) {
+                        out.reused += 1;
+                    }
+                    out.landing_move += (segment.samples[landing.1 + HORIZON_STEPS].mid
+                        - segment.samples[landing.1].mid)
+                        as f64;
+                    out.landing_control += search.mean_move.get(&key).copied().unwrap_or(0.0);
+                    base = landing;
+                    next = (0, landing.1 + 1);
+                }
+                None => out.no_candidate += 1,
+            }
+        }
+        let moved = segment.samples[base.1 + HORIZON_STEPS].mid - segment.samples[base.1].mid;
+        let half = f64::from(sample.spread) / 2.0;
+        match action {
+            Action::TakeAsk | Action::TakeBid => {
+                let sign = if action == Action::TakeAsk { 1.0 } else { -1.0 };
+                out.takes += 1;
+                // The mid is in half ticks.
+                out.take_markout_mode += sign * moved as f64 / 2.0 - half;
+            }
+            Action::JoinBid | Action::JoinAsk => {
+                let sign = if action == Action::JoinBid { 1.0 } else { -1.0 };
+                out.joins += 1;
+                out.join_move_mode += sign * moved as f64 / 2.0;
+            }
+            _ => {}
+        }
+        out.steps += 1;
+        at = next;
+    }
+    out
+}
+
+fn capture(args: &[String]) -> Result<(), Failure> {
+    let [coin, tick, files @ ..] = args else {
+        return Err("capture <coin> <tick> (<statuses> <diffs> <trades>)+".into());
+    };
+    if files.is_empty() || files.len() % 3 != 0 {
+        return Err("files come in triples of statuses, diffs and trades".into());
+    }
+    let tape = read_capture(coin, tick.parse::<Decimal>()?, files)?;
+    let n = tape.samples.len();
+    let cut = |share: f64| (n as f64 * share) as usize;
+    let train = (0, cut(CAPTURE_SPLIT[0]));
+    let validation = (train.1, train.1 + cut(CAPTURE_SPLIT[1]));
+    let holdout = (validation.1, n);
+    println!(
+        "Split by time from {} ms: train {train:?}, validation {validation:?}, holdout {holdout:?} grid steps.",
+        tape.start_ms
+    );
+    let run = |split: (usize, usize), separation: usize| -> CaptureResults {
+        let mut out: CaptureResults = BTreeMap::new();
+        for rule in RULES {
+            for mode in MODES {
+                let seeds: &[u64] = if mode == Mode::Chronological {
+                    &SEARCH_SEEDS[..1]
+                } else {
+                    &SEARCH_SEEDS
+                };
+                for seed in seeds {
+                    out.entry((mode, rule)).or_default().push(walk_capture(
+                        &tape.samples,
+                        split,
+                        rule,
+                        mode,
+                        separation,
+                        *seed,
+                    ));
+                }
+            }
+        }
+        out
+    };
+    let share_of = |results: &CaptureResults, mode: Mode| {
+        let mut part = 0;
+        let mut whole = 0;
+        for ((m, rule), walks) in results {
+            if *m == mode && *rule != Rule::Hold {
+                for w in walks {
+                    part += w.no_candidate;
+                    whole += w.steps;
+                }
+            }
+        }
+        share(part, whole)
+    };
+    let print = |label: &str, separation: usize, results: &CaptureResults| {
+        println!("\n== (b) capture, {label}, separation {separation} s ==");
+        println!(
+            "mode | rule | steps | jumps | mean jump (s) | reuse | no candidate | unforceable | landing move - control (half ticks) | take markout (ticks) | join move (ticks)"
+        );
+        for ((mode, rule), walks) in results {
+            let mut t = Walk::default();
+            for w in walks {
+                add(&mut t, w);
+            }
+            println!(
+                "{} | {:?} | {} | {:.4} | {:.1} | {:.4} | {:.4} | {:.4} | {:.3} | {:.3} | {:.3}",
+                mode.label(),
+                rule,
+                t.steps,
+                share(t.jumps, t.steps),
+                if t.jumps == 0 {
+                    0.0
+                } else {
+                    t.jump_steps as f64 / t.jumps as f64 * GRID_MS as f64 / 1000.0
+                },
+                share(t.reused, t.jumps),
+                share(t.no_candidate, t.steps),
+                share(t.unforceable, t.steps),
+                if t.jumps == 0 {
+                    0.0
+                } else {
+                    (t.landing_move - t.landing_control) / t.jumps as f64
+                },
+                if t.takes == 0 {
+                    0.0
+                } else {
+                    t.take_markout_mode / t.takes as f64
+                },
+                if t.joins == 0 {
+                    0.0
+                } else {
+                    t.join_move_mode / t.joins as f64
+                },
+            );
+        }
+    };
+    let trained = run(train, SEPARATIONS[1]);
+    print("train", SEPARATIONS[1], &trained);
+    let unusable = share_of(&trained, Mode::TimeTravelAny) > MAX_NO_CANDIDATE_SHARE;
+    let mut best: Option<(f64, usize, CaptureResults)> = None;
+    for separation in SEPARATIONS {
+        let results = run(validation, separation);
+        let s = share_of(&results, Mode::TimeTravelAny);
+        println!("validation: separation {separation} s, no-candidate share {s:.4}");
+        if best.as_ref().is_none_or(|b| s < b.0) {
+            best = Some((s, separation, results));
+        }
+    }
+    let (_, separation, validated) = best.ok_or("no separation")?;
+    print("validation", separation, &validated);
+    if unusable {
+        println!(
+            "\nStop rule: time travel's no-candidate share on train is above {MAX_NO_CANDIDATE_SHARE}; the mode is unusable on this capture and its holdout is not read."
+        );
+        let mut chronological = run(holdout, separation);
+        chronological.retain(|(mode, _), _| *mode == Mode::Chronological);
+        print(
+            "holdout, chronological replay only",
+            separation,
+            &chronological,
+        );
+    } else {
+        print("holdout", separation, &run(holdout, separation));
+    }
+    let _ = CAPTURE_UNIT_STEPS;
+    Ok(())
+}
+
 fn main() -> Result<(), Failure> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("synthetic") => synthetic(&args.next().ok_or("#102's design file")?),
-        Some("capture") => {
-            let _ = (CAPTURE_SPLIT, MAX_NO_CANDIDATE_SHARE);
-            Err("part (b) reads #263's book samples and lands with it".into())
-        }
-        _ => Err("usage: synthetic <design.json> | capture <dir>".into()),
+        Some("capture") => capture(&args.collect::<Vec<_>>()),
+        _ => Err(
+            "usage: synthetic <design.json> | capture <coin> <tick> (<statuses> <diffs> <trades>)+"
+                .into(),
+        ),
     }
 }
 
@@ -1153,5 +1524,88 @@ mod tests {
         assert!(w.compared > 0);
         assert!(w.state_mismatch > 0);
         assert_eq!(w.jumps, 0);
+    }
+
+    #[test]
+    fn test_the_capture_forces_on_what_it_shows() {
+        let s = Sample {
+            spread: 1,
+            bid: 1,
+            ask: 3,
+            mid: 0,
+        };
+        assert_eq!(
+            force_sample(&s, Action::JoinBoth),
+            Some(
+                Sample {
+                    spread: 1,
+                    bid: 2,
+                    ask: 4,
+                    mid: 0
+                }
+                .state()
+            )
+        );
+        // Taking the last one opens the spread, with the queue there put in the lowest bucket.
+        assert_eq!(
+            force_sample(&s, Action::TakeBid),
+            Some(
+                Sample {
+                    spread: 2,
+                    bid: 0,
+                    ask: 3,
+                    mid: 0
+                }
+                .state()
+            )
+        );
+        assert_eq!(
+            force_sample(&s, Action::TakeAsk),
+            Some(
+                Sample {
+                    spread: 1,
+                    bid: 1,
+                    ask: 2,
+                    mid: 0
+                }
+                .state()
+            )
+        );
+        let empty = Sample {
+            spread: 1,
+            bid: 0,
+            ask: 3,
+            mid: 0,
+        };
+        assert_eq!(force_sample(&empty, Action::TakeBid), None);
+        assert_eq!(force_sample(&s, Action::Hold), Some(s.state()));
+    }
+
+    #[test]
+    fn test_a_capture_walk_holds_in_order_and_time_travel_lands_inside_its_split() {
+        let p = small();
+        let day = tape_day(0, 1, &p, 21);
+        let samples = day.samples.clone();
+        let hold = walk_capture(&samples, (50, 350), Rule::Hold, Mode::TimeTravelAny, 5, 3);
+        assert_eq!((hold.jumps, hold.no_candidate), (0, 0));
+        assert!(hold.steps > 250);
+        let join = walk_capture(
+            &samples,
+            (50, 350),
+            Rule::JoinBoth,
+            Mode::TimeTravelAny,
+            5,
+            3,
+        );
+        assert!(join.jumps + join.no_candidate + join.unforceable > 0);
+        let chrono = walk_capture(
+            &samples,
+            (50, 350),
+            Rule::JoinBoth,
+            Mode::Chronological,
+            5,
+            3,
+        );
+        assert_eq!((chrono.jumps, chrono.no_candidate), (0, 0));
     }
 }
