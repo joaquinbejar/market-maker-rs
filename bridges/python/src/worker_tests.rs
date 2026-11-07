@@ -544,6 +544,25 @@ fn test_worker_attribution_splits_the_hand_computed_trajectory() {
     // The same net of fees, split between the fills' edge and the position's moves.
     let gross = a.spread_capture + a.inventory_pnl;
     assert_eq!(gross.normalize().to_string(), "1");
+    // Bought two lots, then closed at the touch at the end.
+    let path: Vec<(String, String)> = reply
+        .positions
+        .iter()
+        .map(|p| {
+            (
+                p.price.normalize().to_string(),
+                p.position.normalize().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(path.len(), 2);
+    assert_eq!(path[0].1, "2");
+    assert_eq!(path[1].1, "0");
+    assert!(reply.positions[0].timestamp_ms <= reply.positions[1].timestamp_ms);
+    assert_eq!(reply.inventory.max_abs.normalize().to_string(), "2");
+    assert_eq!(reply.inventory.final_position.normalize().to_string(), "0");
+    assert!(reply.window_ms.0 < reply.window_ms.1);
+    assert!(reply.max_drawdown >= Decimal::ZERO);
 }
 
 #[test]
