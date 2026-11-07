@@ -23,6 +23,7 @@ import itertools
 import json
 import math
 import multiprocessing
+import os
 import pathlib
 import subprocess
 import sys
@@ -275,16 +276,42 @@ def arm_jobs(design, m4_05, runs, scenario, days, common):
     return jobs
 
 
-def pool(jobs, parallel, label):
+def job_key(job):
+    seed = job.get("metadata", {}).get("seed")
+    execution = json.dumps(job.get("execution"), sort_keys=True)
+    return (job["scenario"], job.get("condition"), execution, job["arm"], seed, job["regime"],
+            job["day"])
+
+
+def pool(jobs, parallel, label, journal):
+    """Runs the jobs, appending each result to `journal` as it ends, and skips the jobs a
+    previous run of the same step already journaled. A result does not depend on the order or
+    the number of processes, so a step can be stopped and resumed with fewer of them."""
+    journal = pathlib.Path(journal)
+    done_rows = {}
+    if journal.exists():
+        for line in journal.read_text().splitlines():
+            entry = json.loads(line)
+            done_rows[tuple(json.loads(entry["key"]))] = entry["row"]
+    keys = [job_key(job) for job in jobs]
+    todo = [(k, j) for k, j in zip(keys, jobs, strict=True) if k not in done_rows]
     context = multiprocessing.get_context("spawn")
     started = time.perf_counter()
-    with concurrent.futures.ProcessPoolExecutor(parallel, mp_context=context) as executor:
-        futures = [executor.submit(run_arm, job) for job in jobs]
-        for done, _ in enumerate(concurrent.futures.as_completed(futures), start=1):
-            if done % 50 == 0 or done == len(jobs):
-                print(f"{label}: {done}/{len(jobs)} after {round(time.perf_counter() - started)} s",
+    print(f"{label}: {len(jobs) - len(todo)} of {len(jobs)} already done; {parallel} processes",
+          file=sys.stderr, flush=True)
+    with concurrent.futures.ProcessPoolExecutor(parallel, mp_context=context) as executor, \
+            journal.open("a") as out:
+        futures = {executor.submit(run_arm, job): key for key, job in todo}
+        for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            row = future.result()
+            key = futures[future]
+            done_rows[key] = row
+            out.write(json.dumps({"key": json.dumps(list(key)), "row": row}) + "\n")
+            out.flush()
+            if done % 50 == 0 or done == len(todo):
+                print(f"{label}: {done}/{len(todo)} after {round(time.perf_counter() - started)} s",
                       file=sys.stderr, flush=True)
-        return [future.result() for future in futures]
+    return [done_rows[key] for key in keys]
 
 
 def daily(rows):
@@ -330,7 +357,10 @@ class Study:
             raise ValueError("#102's frozen manifest is not the one this study reuses")
         self.frozen = json.loads(frozen_path.read_text())
         self.runs = learned_runs(self.frozen, run_dir)
-        self.parallel = self.design["compute"]["max_parallel_runs"]
+        # The team's shared compute cap may lower the design's process count; it changes no
+        # result.
+        cap = self.design["compute"]["max_parallel_runs"]
+        self.parallel = min(cap, int(os.environ.get("M5_03_PROCESSES", cap)))
 
     def header(self, step):
         return {"step": step, "commit": self.commit, "data": self.design["data"],
@@ -350,7 +380,7 @@ def selection(study):
     for name, _ in points(study.design):
         jobs += arm_jobs(study.design, study.m4_05, study.runs, f"selection-{name}", days,
                          study.common())
-    rows = pool(jobs, study.parallel, "selection")
+    rows = pool(jobs, study.parallel, "selection", study.out / "selection.journal")
     by_point = {}
     for name, _ in points(study.design):
         scoped = daily([r for r in rows if r["scenario"] == f"selection-{name}"])
@@ -403,7 +433,7 @@ def holdout(study, frozen_sha256):
                             days, study.common()):
             if job["arm"] == arm:
                 jobs.append({**job, "condition": "adversary"})
-    rows = pool(jobs, study.parallel, "holdout")
+    rows = pool(jobs, study.parallel, "holdout", study.out / "holdout.journal")
     here["frozen_sha256"] = frozen_sha256
     here["rows"] = rows
     study.write("holdout", here)
