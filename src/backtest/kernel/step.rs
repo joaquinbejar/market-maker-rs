@@ -63,6 +63,10 @@ impl<E: EventSink> EventSink for Em<'_, E> {
         self.sink.event(event);
     }
 
+    fn hedge(&mut self, event: super::hedge::HedgeEvent) {
+        self.sink.hedge(event);
+    }
+
     fn queues(&mut self, lengths: QueueLengths) {
         self.sink.queues(lengths);
     }

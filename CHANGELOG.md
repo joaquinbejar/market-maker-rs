@@ -16,6 +16,21 @@ project follows [Semantic Versioning](https://semver.org/).
   #102, a freeze and a single holdout (`run.py`), a coverage diagnostic of the Hyperliquid
   capture's states, and a report (`report.py`). The rule reads diagnostics only. Synthetic data,
   apart from the capture's states in the coverage diagnostic; the results are on the issue.
+- The attribution of a hedge in a second instrument (#266). The hedge lane sends its rows, fills
+  and funding payments to the new provided `EventSink::hedge` as `backtest::kernel::HedgeEvent`,
+  in its own order. `EvaluationInput::with_hedge` takes a second instrument's marks, fills and
+  `FundingPayment`s. The hedge is then attributed against its own marks into
+  `HedgeAttribution`:
+  - spread captured, inventory result, fees and funding, and their net;
+  - `HedgeAttribution::costs`, `fees - spread_capture - funding`, as `HedgeCosts::Attributed`.
+  `Attribution::net_pnl` stays the quoted lane's. Each hedge term goes into the quoted bucket in
+  force at its time, so the buckets still sum to the run, and the hedge has its own direct check
+  against its cash, position and funding. `BucketedAttribution::reconcile_lanes` checks both
+  lanes' nets and final positions (`hedge_final_position`) to the last digit, and
+  `MetricId::HedgeCosts` reads the hedge's costs. `RlEnv::records` returns the hedge lane's
+  records, its terminal close included, and `RlEnv::reconcile` checks both lanes. A run with one
+  instrument is unchanged: `HedgeCosts::NotModelled { SingleInstrument }` and the same checks.
+  The reward and the specification do not change. Synthetic data only.
 - The Python bridge builds against Python's stable ABI for 3.11 and loads on 3.11 and 3.12 (#284),
   both tested; nothing else in it changes.
 - The out-of-sample comparison of #102 in `bridges/python/experiments/m4_05`: a design fixed
@@ -69,8 +84,8 @@ project follows [Semantic Versioning](https://semver.org/).
   hedge lane's cash, fees, funding and position at its last mid, and a close at the touch closes
   both lanes. Such an environment's specification is of observation version 2, action version 3
   and reward version 2; one without a lane keeps versions 1, 2 and 1 and its identity, so its
-  checkpoints and the Python bridge are unchanged. `RlEnv::reconcile` checks the quoted lane
-  against the attribution, the hedge lane's net being its own ledger's. Synthetic data only.
+  checkpoints and the Python bridge are unchanged. `RlEnv::reconcile` checks both lanes against
+  the attribution (#266). Synthetic data only.
 - A hedge lane in a second instrument for the kernel (feature `kernel`, #256): `HedgedKernel`
   runs a `FinancialKernel` on the quoted instrument with a hedge lane on a spot or linear
   perpetual on the same underlying, with its own grid, fees, limits and data
@@ -307,8 +322,8 @@ project follows [Semantic Versioning](https://semver.org/).
   Buckets by UTC day or by a caller's label sum exactly to the run. It reports signed
   markout, realized and effective spread, price impact, fills, volume, time weighted
   inventory and drawdown, each with a declared unit, sign, horizon and capital
-  denominator (`MetricId::definition`). It covers linear spot positions. Hedge costs
-  are reported as `HedgeCosts::NotModelled`, not as zero.
+  denominator (`MetricId::definition`). It covers linear spot positions. With one
+  instrument, hedge costs are reported as `HedgeCosts::NotModelled`, not as zero.
 - Experiments that compare strategies under one set of rules (#92):
   `backtest::evaluation::Experiment` holds the fees, fill model, latency and windows, and
   a `Candidate` brings only a strategy built from the training ticks. A simple baseline

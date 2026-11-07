@@ -13,9 +13,12 @@
 
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::MarketTick;
+use market_maker_rs::backtest::evaluation::{
+    EvaluationInput, HedgeAttribution, HedgeCosts, attribute, attribute_by,
+};
 use market_maker_rs::backtest::kernel::{
-    ActionGrid, ActionStatus, HedgeInstrument, HedgeLaneConfig, KernelAction, KernelConfig,
-    KernelDataset,
+    ActionGrid, ActionStatus, FundingRate, HedgeInstrument, HedgeLaneConfig, KernelAction,
+    KernelConfig, KernelDataset,
 };
 use market_maker_rs::dec;
 use market_maker_rs::rl::{
@@ -134,8 +137,16 @@ fn buy_two() -> RlAction {
 }
 
 /// Runs `actions` from the first decision, then holds to the end, checking the reward
-/// against the quoted lane's attribution at every step.
+/// against both lanes' attribution at every step.
 fn run(env: &RlEnv<'_, 3, 2>, actions: &[RlAction]) -> (RlState, Vec<u64>) {
+    let (state, masks, _) = run_recorded(env, actions);
+    (state, masks)
+}
+
+fn run_recorded(
+    env: &RlEnv<'_, 3, 2>,
+    actions: &[RlAction],
+) -> (RlState, Vec<u64>, EpisodeRecorder) {
     let mut recorder = EpisodeRecorder::default();
     let mut state = env.reset_with(1, &mut recorder).unwrap();
     let mut masks = vec![env.cross_hedge_mask(&state)];
@@ -150,7 +161,44 @@ fn run(env: &RlEnv<'_, 3, 2>, actions: &[RlAction]) -> (RlState, Vec<u64>) {
         env.reconcile(&state, &recorder).unwrap();
     }
     assert_eq!(total, state.net());
-    (state, masks)
+    (state, masks, recorder)
+}
+
+/// The hedge lane's attribution of an episode, and the whole window's split by quoted row.
+fn hedge_attribution(
+    env: &RlEnv<'_, 3, 2>,
+    state: &RlState,
+    recorder: &EpisodeRecorder,
+) -> (
+    HedgeAttribution,
+    Option<Decimal>,
+    Vec<(u64, HedgeAttribution)>,
+) {
+    let records = env.records(state, recorder).unwrap();
+    let input = EvaluationInput::new(records.window, &records.marks, &records.fills, dec!(1))
+        .unwrap()
+        .with_hedge(
+            &records.hedge_marks,
+            &records.hedge_fills,
+            &records.hedge_funding,
+        )
+        .unwrap();
+    let of = |costs: HedgeCosts| match costs {
+        HedgeCosts::Attributed(hedge) => hedge,
+        other => panic!("expected an attributed hedge, got {other:?}"),
+    };
+    let total = attribute(&input).unwrap();
+    let by_row = attribute_by(&input, |m| m.timestamp_ms).unwrap();
+    let buckets = by_row
+        .buckets
+        .iter()
+        .map(|(t, b)| (*t, of(b.attribution.hedge_costs)))
+        .collect();
+    (
+        of(total.total.hedge_costs),
+        total.hedge_final_position,
+        buckets,
+    )
 }
 
 #[test]
@@ -420,4 +468,73 @@ fn test_the_cross_mask_is_empty_while_the_lane_refuses() {
         env.step(&mut state, RlAction::CrossHedge { size: 0 })
             .is_err()
     );
+}
+
+#[test]
+fn test_the_hedge_lane_is_attributed_by_hand_apart_from_the_quoted_lane() {
+    let d = data();
+    let env = env(&d, RlConfig::new(scales(), dec!(1)));
+    let (state, _, recorder) = run_recorded(&env, &[buy_two(), RlAction::CrossHedge { size: 0 }]);
+    let (hedge, position, buckets) = hedge_attribution(&env, &state, &recorder);
+    // Sold 1 at 99 at 2 000 ms against the hedge mark in force, 99.5 (row at 1 500): -0.5.
+    // Short 1 through the marks 100, 100.5 and 100.5: -1. Fee 0.0495, no funding.
+    assert_eq!(hedge.spread_capture, dec!(-0.5));
+    assert_eq!(hedge.inventory_pnl, dec!(-1));
+    assert_eq!(hedge.fees, dec!(0.0495));
+    assert_eq!(hedge.funding, dec!(0));
+    assert_eq!(hedge.net_pnl, dec!(-1.5495));
+    assert_eq!(hedge.costs().unwrap(), dec!(0.5495));
+    assert_eq!(position, Some(dec!(-1)));
+    // By quoted row: the fill and the move at 2 500 in the row at 2 000, the move at 3 500
+    // in the row at 3 000, and the flat move at 4 500 in the row at 4 000.
+    let net = |t: u64| buckets.iter().find(|(at, _)| *at == t).unwrap().1.net_pnl;
+    assert_eq!(net(1000), dec!(0));
+    assert_eq!(net(2000), dec!(-1.0495));
+    assert_eq!(net(3000), dec!(-0.5));
+    assert_eq!(net(4000), dec!(0));
+    assert_eq!(net(5000), dec!(0));
+}
+
+#[test]
+fn test_the_hedge_close_is_a_hedge_fill_of_the_attribution() {
+    let d = data();
+    let rl = RlConfig::new(scales(), dec!(1)).with_terminal(TerminalValuation::CloseAtTouch);
+    let env = env(&d, rl);
+    let (state, _, recorder) = run_recorded(&env, &[buy_two(), RlAction::CrossHedge { size: 0 }]);
+    let (hedge, position, _) = hedge_attribution(&env, &state, &recorder);
+    // Plus the close: bought 1 at 101 against the mark 100.5, -0.5, with a fee of 0.0505.
+    assert_eq!(hedge.spread_capture, dec!(-1));
+    assert_eq!(hedge.inventory_pnl, dec!(-1));
+    assert_eq!(hedge.fees, dec!(0.1));
+    assert_eq!(hedge.net_pnl, dec!(-1.5495) + dec!(-0.5505));
+    assert_eq!(position, Some(dec!(0)));
+}
+
+#[test]
+fn test_a_perpetual_hedge_attributes_its_funding() {
+    let mut d = data();
+    // A rate of 0.0001 at 3 000 ms, valued at the mark of the hedge row run before it,
+    // 100 (row at 2 500): the short of 1 receives 1 * 100 * 0.0001 = 0.01.
+    d.lane = HedgeLaneConfig::new(
+        instrument(),
+        HedgeInstrument::LinearPerpetual {
+            funding: vec![FundingRate {
+                at_ns: 3000 * MS,
+                rate: dec!(0.0001),
+            }],
+        },
+        dec!(1),
+        10_000 * MS,
+    );
+    let env = env(&d, RlConfig::new(scales(), dec!(1)));
+    let (state, _, recorder) = run_recorded(&env, &[buy_two(), RlAction::CrossHedge { size: 0 }]);
+    let (hedge, _, buckets) = hedge_attribution(&env, &state, &recorder);
+    assert_eq!(hedge.funding, dec!(0.01));
+    assert_eq!(hedge.net_pnl, dec!(-1.5495) + dec!(0.01));
+    assert_eq!(hedge.costs().unwrap(), dec!(0.5395));
+    assert_eq!(state.lane().unwrap().counters().funding_paid, 1);
+    // The payment at 3 000 ms is in the row at 3 000.
+    let at = |t: u64| buckets.iter().find(|(a, _)| *a == t).unwrap().1.funding;
+    assert_eq!(at(3000), dec!(0.01));
+    assert_eq!(state.net(), dec!(2.801) + dec!(-1.5495) + dec!(0.01));
 }

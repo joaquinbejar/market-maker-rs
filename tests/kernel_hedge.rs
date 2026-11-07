@@ -15,11 +15,12 @@
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::MarketTick;
 use market_maker_rs::backtest::kernel::{
-    CombinedLimits, FinancialKernel, FundingRate, HedgeInstrument, HedgeLaneConfig, HedgeRefusal,
-    HedgedAction, HedgedKernel, HedgedState, KernelAction, KernelConfig, KernelDataset,
-    KernelLatency, QuoteSide,
+    CombinedLimits, EventSink, FinancialKernel, FundingRate, HedgeEvent, HedgeInstrument,
+    HedgeLaneConfig, HedgeRefusal, HedgedAction, HedgedKernel, HedgedState, KernelAction,
+    KernelConfig, KernelDataset, KernelEvent, KernelLatency, QuoteSide,
 };
 use market_maker_rs::dec;
+use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 
 const MS: u64 = 1_000_000;
@@ -763,4 +764,75 @@ fn test_a_touch_with_no_lots_cancels_and_a_rate_with_too_many_places_is_refused(
     assert!(K::new(&cfg, &data, &ok, &rows).is_ok());
     let fine = perpetual(inst, &[(1_500, dec!(0.00000000000000000000000001))], 1_000);
     assert!(K::new(&cfg, &data, &fine, &rows).is_err());
+}
+
+/// Keeps the hedge lane's events and counts the quoted lane's.
+#[derive(Default)]
+struct HedgeSink {
+    hedge: Vec<HedgeEvent>,
+    quoted: usize,
+}
+
+impl EventSink for HedgeSink {
+    fn event(&mut self, _event: KernelEvent) {
+        self.quoted += 1;
+    }
+
+    fn hedge(&mut self, event: HedgeEvent) {
+        self.hedge.push(event);
+    }
+}
+
+#[test]
+fn test_the_lane_sends_its_rows_fills_and_funding_in_its_own_order() {
+    let l = latency(1, 1, 0);
+    let (cfg, data) = quoted(l);
+    let inst = instrument(l);
+    let rows = hedge_rows(
+        &inst,
+        &[
+            (500, dec!(100.00), dec!(100.04), dec!(5)),
+            (1_500, dec!(100.04), dec!(100.08), dec!(5)),
+        ],
+    );
+    let lane = perpetual(inst, &[(1_500, dec!(0.0001))], 10_000);
+    let k: K<'_> = HedgedKernel::new(&cfg, &data, &lane, &rows).unwrap();
+    let mut sink = HedgeSink::default();
+    let mut s: S = k.reset_with(7, &mut sink);
+    k.step_with(&mut s, hedge(QuoteSide::Bid, 2), &mut sink);
+    // Money scale 6 (tick 2, lot 0, fee 4). Buy 2 at the ask 100.04 at 1 001 ms, fee
+    // 2 * 100.04 * 0.0005 = 0.10004. At 1 500 ms, funding first, at the mark of the row at
+    // 500 ms, then that row: the long of 2 pays 0.020004.
+    assert_eq!(
+        sink.hedge,
+        vec![
+            HedgeEvent::Row {
+                row: 0,
+                ts_ns: 500 * MS,
+                mid2: Some(20_004),
+            },
+            HedgeEvent::Fill {
+                ts_ns: 1_001 * MS,
+                side: Action::Buy,
+                price: 10_004,
+                lots: 2,
+                fee_u: 100_040,
+            },
+            HedgeEvent::Funding {
+                at_ns: 1_500 * MS,
+                received_u: -20_004,
+                mid2: 20_004,
+            },
+            HedgeEvent::Row {
+                row: 1,
+                ts_ns: 1_500 * MS,
+                mid2: Some(20_012),
+            },
+        ]
+    );
+    assert!(sink.quoted > 0);
+    // The ledger agrees with the events: fees and funding are their sums.
+    let summary = k.summary(&s).unwrap();
+    assert_eq!(summary.funding, dec!(-0.020004));
+    assert_eq!(summary.fees, dec!(0.10004));
 }

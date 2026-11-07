@@ -140,8 +140,8 @@ pub use encode::{
 pub use gate::GateVerdict;
 pub use hedge::{
     CombinedLimits, FundingRate, HEDGE_FORMAT_VERSION, HEDGED_STATE_MAGIC, HedgeCounters,
-    HedgeFill, HedgeInstrument, HedgeLane, HedgeLaneConfig, HedgeRefusal, HedgeSummary, HedgeView,
-    HedgedAction, HedgedKernel, HedgedOutcome, HedgedState,
+    HedgeEvent, HedgeFill, HedgeInstrument, HedgeLane, HedgeLaneConfig, HedgeRefusal, HedgeSummary,
+    HedgeView, HedgedAction, HedgedKernel, HedgedOutcome, HedgedState,
 };
 pub use observe::{ActionGrid, ActionMask, Observation};
 pub use rng::{KernelRng, RNG_ALGO_XORSHIFT64STAR};
