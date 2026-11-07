@@ -156,6 +156,7 @@ class BatchEnv(gym.Env):
         self.fees = Decimal(0)
         self.fills = []
         self.batches = []
+        self.late = {"orders": 0, "cancels": 0}
         self.net = Decimal(0)
         return self._observe(), self._info()
 
@@ -200,9 +201,11 @@ class BatchEnv(gym.Env):
 
     def _replace(self, quote, now):
         arrival = now + self.latency_ms
+        late = fba.batch_of(arrival, self.batch_ms) != fba.batch_of(now, self.batch_ms)
         for o in self.resting:
             if o.cancel_ms is None:
                 o.cancel_ms = arrival
+                self.late["cancels"] += late
         if quote is None:
             return
         bid_off, ask_off, bid_lots, ask_lots = quote
@@ -213,6 +216,7 @@ class BatchEnv(gym.Env):
             if lots <= 0:
                 continue
             self.ids += 1
+            self.late["orders"] += late
             self.resting.append(Resting(-self.ids, side, centre - side * (offset + 1), lots, arrival))
 
     def _clear(self, close):

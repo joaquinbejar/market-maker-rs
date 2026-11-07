@@ -163,5 +163,14 @@
  "seen_before_freeze": [
   "the fixtures of fba.py and env.py",
   "one full day (seed 1) of the default flow at 60 ms, for the environment's speed: Avellaneda-Stoikov at risk aversion 0.0001, intensity 50 and sigma 0.003 filled 1164 times for a net of -6.93 at fee 0; hold, 0"
+ ],
+ "teacher_fit": {
+  "decisions": 100000,
+  "learning_rate": 0.001,
+  "batch_size": 256,
+  "epochs": 10
+ },
+ "changes": [
+  "before any run: the teacher's fit as a structured entry (teacher_fit), the same numbers as the text of teacher"
  ]
 }

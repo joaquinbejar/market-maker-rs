@@ -143,6 +143,7 @@ def test_the_same_last_row_update_makes_the_batch_at_30_ms_and_misses_it_at_100_
     # the close, which puts it in batch 1, where the sell has expired.
     env = _run(_env(latency, [(450, -1, 9_999, 1)]), [HOLD] * 4 + [QUOTE] + [HOLD] * 5)
     assert len(env.fills) == fills
+    assert env.late["orders"] == (2 if latency == 100 else 0)
     if fills:
         assert env.fills[0] == (500, 1, 9_999, 1)
         assert env.position == 1
@@ -208,3 +209,65 @@ def test_the_quote_never_takes_the_position_past_its_limit():
     for _ in range(200):
         env.step(np.asarray([1.0, -1, -1, 1, 1, -1], dtype=np.float32))
     assert env.position == 4
+
+
+_RUN_SPEC = importlib.util.spec_from_file_location(
+    "m5_05_batch_run", HERE.parent / "experiments" / "m5_05_batch" / "run.py")
+batch_run = importlib.util.module_from_spec(_RUN_SPEC)
+_RUN_SPEC.loader.exec_module(batch_run)
+
+
+def test_markouts_follow_the_reference_after_each_fill():
+    env = _env(30, [])
+    env.reset()
+    env.batches = [(500, 100, 1), (1000, 103, 1), (1500, None, 0), (2000, 98, 1)]
+    env.fills = [(500, 1, 100, 2), (1000, -1, 103, 1)]
+    out = batch_run.markouts(env)
+    tick = env.tick
+    # At 1 s: the buy at 500 sees the reference of 1500, still 103; the sell at 1000 sees 98.
+    assert Decimal(out["1000"]) == 2 * (103 - 100) * tick + -1 * (98 - 103) * tick
+    # At 5 s both horizons pass the last close and are left out.
+    assert Decimal(out["5000"]) == 0
+
+
+def test_the_drawdown_is_the_largest_fall_from_a_peak():
+    values = [Decimal(v) for v in ("1", "3", "2", "5", "1", "4")]
+    assert batch_run.drawdown(values) == Decimal(4)
+    assert batch_run.drawdown([Decimal("-2")]) == Decimal(2)
+
+
+def test_the_best_point_is_the_highest_mean_net_with_ties_by_text():
+    rows = [{"candidate": '{"a": 1}', "net": "1"}, {"candidate": '{"a": 1}', "net": "3"},
+            {"candidate": '{"a": 2}', "net": "2"}, {"candidate": '{"a": 2}', "net": "2"}]
+    assert batch_run.best(rows) == ({"a": 2}, "2")
+
+
+def test_an_episode_reports_its_day():
+    env = batch_env.BatchEnv(seed=2, rows=500, latency_ms=100, fee_rate="0.0002")
+    day = batch_run.episode(batch_run.as_policy({"risk_aversion": "0.001", "order_intensity": "100"},
+                                                0.003, batch_run.load()), env)
+    assert day["fills"] == len(env.fills) and day["decisions"] == 500
+    assert day["durations"] == {"1": 500}
+    assert set(day["markouts"]) == {"1000", "5000", "30000"}
+    assert day["late"]["orders"] > 0
+
+
+def test_the_teacher_is_cloned_into_the_policy():
+    from stable_baselines3 import PPO
+
+    design = batch_run.load()
+    predictor = batch_run.Predictor([0.0] * 5)
+    envs = [batch_env.BatchEnv(seed=s, rows=200, latency_ms=30, fee_rate="0", predictor=predictor)
+            for s in (1, 2)]
+    model = PPO("MlpPolicy", envs[0], seed=1, device="cpu", n_steps=64, batch_size=32)
+    teacher = {"risk_aversion": "0.001", "order_intensity": "100"}
+    design = {**design, "teacher_fit": {**design["teacher_fit"], "epochs": 30}}
+    losses = batch_run.clone(model, envs, teacher, 0.003, design, 400, seed=1)
+    assert losses[-1] < losses[0] / 4
+
+
+def test_holdout_days_are_refused_outside_their_step():
+    design = batch_run.load()
+    with pytest.raises(PermissionError):
+        batch_run.make_env(design, 20, 30, "0", "full")
+    assert batch_run.make_env(design, 15, 30, "0", "no_duration").action_space.shape == (5,)
