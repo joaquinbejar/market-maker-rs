@@ -4,13 +4,14 @@ use rust_decimal::prelude::ToPrimitive;
 
 use crate::Decimal;
 use crate::backtest::evaluation::{
-    EvaluationError, EvaluationInput, ExecutedFill, HedgeNotModelledReason, LedgerTotals, Mark,
-    MetricId, MetricUnit, attribute,
+    EvaluationError, EvaluationInput, ExecutedFill, FundingPayment, HedgeNotModelledReason,
+    LedgerTotals, Mark, MetricId, MetricUnit, attribute,
 };
 use crate::backtest::kernel::{
-    ActionGrid, ActionMask, ActionStatus, ErrCode, EventSink, FinancialKernel, KernelAction,
-    KernelConfig, KernelDataset, KernelEvent, KernelState, KernelTick, NoSink, Observation,
-    QueueLengths, QuoteSide, Status, StepOutcome, TermReason,
+    ActionGrid, ActionMask, ActionStatus, ErrCode, EventSink, FinancialKernel, HedgeEvent,
+    HedgeInstrument, HedgeLane, HedgeLaneConfig, HedgeRefusal, HedgeView, HedgedAction,
+    HedgedKernel, KernelAction, KernelConfig, KernelDataset, KernelEvent, KernelState, KernelTick,
+    NoSink, Observation, QueueLengths, QuoteSide, Status, StepOutcome, TermReason,
 };
 use crate::execution::Action;
 use crate::strategy::walk_forward::TimeWindow;
@@ -18,11 +19,12 @@ use crate::types::decimal::{exact_add, exact_product};
 use crate::types::error::{MMError, MMResult};
 
 use super::audit::{EpisodeRecorder, EpisodeRecords};
-use super::features::{FeatureVector, PreviousRow, feature_vector};
+use super::features::{FeatureVector, HedgeFeatureVector, PreviousRow, feature_vector};
 use super::spec::{
-    ACTION_SPACE_VERSION, ActionSpace, EPISODE_VERSION, EpisodeSpec, HedgeActions,
-    InvalidActionPolicy, ObservationScales, ObservationSpace, REWARD_VERSION, RewardKind,
-    RewardMark, RewardSpec, RlSpec, TerminalValuation,
+    ACTION_SPACE_VERSION, ActionSpace, CrossHedgeSpace, EPISODE_VERSION, EpisodeSpec,
+    HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION,
+    HedgeActions, HedgeScales, InvalidActionPolicy, ObservationScales, ObservationSpace,
+    REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec, TerminalValuation,
 };
 
 /// Code of an action whose indices are not on the grid, or whose price is not
@@ -33,6 +35,12 @@ pub const ERR_ACTION_OFF_GRID: ErrCode = ErrCode(200);
 /// [`InvalidActionPolicy::Reject`]: hedge actions are off, nothing has been observed, the
 /// delivered position is flat, or the size is larger than that position.
 pub const ERR_HEDGE_REFUSED: ErrCode = ErrCode(201);
+
+/// Code of a hedge in the second instrument that is not available at this decision, under
+/// [`InvalidActionPolicy::Reject`]: there is no hedge lane, the lane refuses one now (one
+/// in flight, no row or a stale one), the net exposure is flat, or the size would take it
+/// past zero.
+pub const ERR_CROSS_HEDGE_REFUSED: ErrCode = ErrCode(202);
 
 const NS_PER_MS: u64 = 1_000_000;
 
@@ -123,6 +131,13 @@ pub enum RlAction {
         /// Index of the size in the grid's sizes, at most the delivered position at the decision.
         size: usize,
     },
+    /// Reduce the net exposure of both lanes' delivered positions with an
+    /// immediate-or-cancel order in the hedge instrument, as [`CrossHedgeSpace`] states. The
+    /// quoted lane holds.
+    CrossHedge {
+        /// Index of the size in the hedge sizes, never taking the net exposure past zero.
+        size: usize,
+    },
 }
 
 /// The inventory closed on termination, under [`TerminalValuation::CloseAtTouch`].
@@ -180,6 +195,15 @@ pub struct Transition {
     pub truncated: bool,
     /// The close, on a termination that closed inventory.
     pub close: Option<TerminalClose>,
+    /// [`RlEnv::cross_hedge_mask`] after the step; zero with no hedge lane.
+    pub cross_hedge_mask: u64,
+    /// The hedge features after the step, with a hedge lane.
+    pub hedge_observation: Option<HedgeFeatureVector>,
+    /// For a hedge in the second instrument that reached the lane, whether it was
+    /// submitted.
+    pub cross_hedge: Option<Result<(), HedgeRefusal>>,
+    /// The hedge lane's close, on a termination that closed its inventory.
+    pub hedge_close: Option<TerminalClose>,
 }
 
 /// The state of an episode: a `Copy` value, so a copy is a snapshot.
@@ -199,6 +223,8 @@ pub struct RlState<
     penalties: Decimal,
     close: Option<TerminalClose>,
     fault: bool,
+    lane: Option<HedgeLane>,
+    hedge_close: Option<(TerminalClose, Decimal)>,
 }
 
 impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
@@ -236,6 +262,20 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     pub fn close(&self) -> Option<TerminalClose> {
         self.close
     }
+
+    /// The hedge lane's state, with a hedge lane.
+    ///
+    /// Diagnostic: it holds venue progress, and a policy must not read it.
+    #[must_use]
+    pub fn lane(&self) -> Option<&HedgeLane> {
+        self.lane.as_ref()
+    }
+
+    /// The hedge lane's terminal close, if there was one.
+    #[must_use]
+    pub fn hedge_close(&self) -> Option<TerminalClose> {
+        self.hedge_close.map(|(close, _)| close)
+    }
 }
 
 /// Forwards every event, and notes the last completed row.
@@ -254,6 +294,10 @@ impl<E: EventSink> EventSink for Tap<'_, E> {
 
     fn queues(&mut self, lengths: QueueLengths) {
         self.inner.queues(lengths);
+    }
+
+    fn hedge(&mut self, event: HedgeEvent) {
+        self.inner.hedge(event);
     }
 }
 
@@ -285,11 +329,12 @@ fn bit(mask: u64, index: usize) -> bool {
         .is_some_and(|v| v & 1 == 1)
 }
 
-/// Returns true if `action` is inside `mask` and `hedge`, while the run continues.
-fn allowed(mask: &ActionMask, hedge: u64, action: RlAction) -> bool {
+/// Returns true if `action` is inside `mask`, `hedge` and `cross`, while the run continues.
+fn allowed(mask: &ActionMask, hedge: u64, cross: u64, action: RlAction) -> bool {
     match action {
         RlAction::Hold => true,
         RlAction::Hedge { size } => bit(hedge, size),
+        RlAction::CrossHedge { size } => bit(cross, size),
         RlAction::Quote {
             bid,
             ask,
@@ -324,6 +369,25 @@ pub struct RlEnv<
     config: RlConfig,
     fee_rate: Decimal,
     spec: RlSpec,
+    cross: Option<Cross<'d, ORD, MSG, DLV, OBS>>,
+}
+
+/// The hedge lane of an environment.
+#[derive(Debug, Clone)]
+struct Cross<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize> {
+    kernel: HedgedKernel<'d, ORD, MSG, DLV, OBS>,
+    sizes: Vec<u64>,
+    multiplier: Decimal,
+    tick: Decimal,
+    lot: Decimal,
+    fee_rate: Decimal,
+}
+
+/// What an action becomes.
+#[derive(Debug, Clone, Copy)]
+enum Resolved {
+    Kernel(KernelAction),
+    Cross(QuoteSide, u64),
 }
 
 impl<
@@ -402,6 +466,7 @@ impl<
                         reason: HedgeNotModelledReason::SingleInstrument,
                     }
                 },
+                cross_hedge: None,
             },
             reward: RewardSpec {
                 version: REWARD_VERSION,
@@ -425,7 +490,204 @@ impl<
             config,
             fee_rate: kernel_config.fee_rate,
             spec,
+            cross: None,
         })
+    }
+
+    /// Builds an environment over a kernel with a hedge lane on a second instrument
+    /// ([`HedgedKernel`]), with the hedge sizes in hedge lots and the hedge features'
+    /// scales. Its specification is of observation version
+    /// [`HEDGED_OBSERVATION_SPACE_VERSION`], action version [`HEDGED_ACTION_SPACE_VERSION`]
+    /// and reward version [`HEDGED_REWARD_VERSION`]; an environment without a lane keeps
+    /// the versions before them, and its identity.
+    ///
+    /// # Errors
+    ///
+    /// As [`RlEnv::new`], and for whatever [`HedgedKernel::new`] refuses, a hedge scale
+    /// that is not positive, or no hedge sizes, more than 64 or one of zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_hedged(
+        kernel_config: &KernelConfig,
+        data: &'d KernelDataset,
+        lane: &HedgeLaneConfig,
+        hedge_data: &'d KernelDataset,
+        grid: ActionGrid<K, M>,
+        hedge_sizes: Vec<u64>,
+        hedge_scales: HedgeScales,
+        config: RlConfig,
+    ) -> MMResult<Self> {
+        hedge_scales.validate()?;
+        if hedge_sizes.is_empty() || hedge_sizes.len() > 64 || hedge_sizes.contains(&0) {
+            return Err(MMError::InvalidConfiguration(format!(
+                "hedge sizes must be 1 to 64 positive lots, got {hedge_sizes:?}"
+            )));
+        }
+        let mut env = Self::new(kernel_config, data, grid, config)?;
+        let hedged = HedgedKernel::new(kernel_config, data, lane, hedge_data)?;
+        env.spec.observation.version = HEDGED_OBSERVATION_SPACE_VERSION;
+        env.spec.observation.hedge_features = hedge_scales.features();
+        env.spec.action.version = HEDGED_ACTION_SPACE_VERSION;
+        env.spec.action.cross_hedge = Some(CrossHedgeSpace {
+            tick_size: lane.instrument.tick_size,
+            lot_size: lane.instrument.lot_size,
+            max_order_size: lane.instrument.max_order_size,
+            multiplier: lane.multiplier,
+            instrument: match lane.kind {
+                HedgeInstrument::Spot => 1,
+                _ => 2,
+            },
+            max_staleness_ns: lane.max_staleness_ns,
+            sizes_lots: hedge_sizes.clone(),
+        });
+        env.spec.reward.version = HEDGED_REWARD_VERSION;
+        env.cross = Some(Cross {
+            kernel: hedged,
+            sizes: hedge_sizes,
+            multiplier: lane.multiplier,
+            tick: lane.instrument.tick_size,
+            lot: lane.instrument.lot_size,
+            fee_rate: lane.instrument.fee_rate,
+        });
+        Ok(env)
+    }
+
+    /// What the agent sees of the hedge lane, with one. The lanes' states are read in
+    /// place: the kernel's is large, and a copy of it in each frame would fill the stack.
+    fn hedge_view(&self, state: &RlState<ORD, MSG, DLV, OBS>) -> Option<HedgeView> {
+        let cross = self.cross.as_ref()?;
+        Some(cross.kernel.view_parts(&state.kernel, state.lane.as_ref()?))
+    }
+
+    /// The net exposure of both lanes' delivered positions, in quoted base units.
+    fn net_exposure(
+        &self,
+        state: &RlState<ORD, MSG, DLV, OBS>,
+        observed: &Observation,
+    ) -> Option<Decimal> {
+        let cross = self.cross.as_ref()?;
+        let view = self.hedge_view(state)?;
+        observed
+            .position
+            .checked_add(view.position.checked_mul(cross.multiplier)?)
+    }
+
+    /// The side and lots of a hedge of the size at `index` in the second instrument, if it
+    /// reduces the net exposure without taking it past zero.
+    fn cross_order(
+        &self,
+        state: &RlState<ORD, MSG, DLV, OBS>,
+        observed: &Observation,
+        index: usize,
+    ) -> Option<(QuoteSide, u64)> {
+        let cross = self.cross.as_ref()?;
+        let lots = *cross.sizes.get(index)?;
+        let net = self.net_exposure(state, observed)?;
+        let exposure = Decimal::from(lots)
+            .checked_mul(cross.lot)?
+            .checked_mul(cross.multiplier)?;
+        if net.is_zero() || exposure > net.abs() {
+            return None;
+        }
+        let side = if net.is_sign_positive() {
+            QuoteSide::Ask
+        } else {
+            QuoteSide::Bid
+        };
+        Some((side, lots))
+    }
+
+    /// The sizes [`RlAction::CrossHedge`] may take at `state`, as bits over the hedge sizes:
+    /// those the lane would take now (no hedge in flight, a fresh hedge row seen) that reduce
+    /// the net exposure of both lanes' delivered positions without taking it past zero.
+    /// Zero with no hedge lane. It reads no risk limit: the lane's admission, its own limits
+    /// and the combined limits decide on the order.
+    #[must_use]
+    pub fn cross_hedge_mask(&self, state: &RlState<ORD, MSG, DLV, OBS>) -> u64 {
+        let (Some(cross), Some(lane)) = (self.cross.as_ref(), state.lane.as_ref()) else {
+            return 0;
+        };
+        if state.is_done() {
+            return 0;
+        }
+        let lane = cross.kernel.mask_parts(&state.kernel, lane, &cross.sizes);
+        let observed = self.kernel.observe(&state.kernel);
+        let mut bits = 0_u64;
+        for index in 0..cross.sizes.len() {
+            if bit(lane, index) && self.cross_order(state, &observed, index).is_some() {
+                let one = u32::try_from(index)
+                    .ok()
+                    .and_then(|shift| 1_u64.checked_shl(shift))
+                    .unwrap_or(0);
+                bits |= one;
+            }
+        }
+        bits
+    }
+
+    /// The hedge features at `state`, with a hedge lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidMarketState`] for a state of another kernel, and
+    /// [`MMError::NumericalError`] if a value does not convert.
+    pub fn observe_hedge(
+        &self,
+        state: &RlState<ORD, MSG, DLV, OBS>,
+    ) -> MMResult<Option<HedgeFeatureVector>> {
+        self.check_owned(state)?;
+        let (Some(cross), Some(view)) = (self.cross.as_ref(), self.hedge_view(state)) else {
+            return Ok(None);
+        };
+        let numeric = |what: &str| MMError::NumericalError(format!("{what} does not convert"));
+        let tick = view.tick;
+        let spread = tick
+            .map(|t| t.ask.checked_sub(t.bid).map(Decimal::from))
+            .map(|v| v.ok_or_else(|| numeric("hedge spread")))
+            .transpose()?;
+        let hedge_mid = tick
+            .map(|t| {
+                t.mid2()
+                    .map(Decimal::from)
+                    .and_then(|m| m.checked_mul(cross.tick))
+                    .and_then(|m| m.checked_div(Decimal::TWO))
+                    .ok_or_else(|| numeric("hedge mid"))
+            })
+            .transpose()?;
+        let observed = self.kernel.observe(&state.kernel);
+        let quoted_mid = match observed.row {
+            Some(_) => Some(
+                self.mid_of(
+                    observed
+                        .bid
+                        .checked_add(observed.ask)
+                        .ok_or_else(|| numeric("mid"))?,
+                )?,
+            ),
+            None => None,
+        };
+        let basis = match (hedge_mid, quoted_mid) {
+            (Some(h), Some(q)) => Some(h.checked_sub(q).ok_or_else(|| numeric("basis"))?),
+            _ => None,
+        };
+        let age = tick
+            .map(|t| {
+                let ns = state.kernel.now_ns().saturating_sub(t.ts_ns);
+                Decimal::try_from_i128_with_scale(i128::from(ns), 6)
+                    .map_err(|_| numeric("hedge row age"))
+            })
+            .transpose()?;
+        let position = view
+            .position
+            .checked_mul(cross.multiplier)
+            .ok_or_else(|| numeric("hedge position"))?;
+        let raw = [
+            spread,
+            basis,
+            age,
+            Some(position),
+            Some(Decimal::from(u8::from(view.in_flight))),
+        ];
+        HedgeFeatureVector::new(view.row, raw, &self.spec.observation.hedge_features).map(Some)
     }
 
     /// The specification of the spaces.
@@ -464,6 +726,9 @@ impl<
             inner: sink,
             row: None,
         };
+        if let Some(cross) = &self.cross {
+            return self.reset_hedged(cross, seed, tap);
+        }
         let kernel = self.kernel.reset_with(seed, &mut tap);
         let mut state = RlState {
             kernel,
@@ -473,6 +738,34 @@ impl<
             penalties: Decimal::ZERO,
             close: None,
             fault: false,
+            lane: None,
+            hedge_close: None,
+        };
+        state.net = self.net_of(&state)?;
+        Ok(state)
+    }
+
+    /// [`RlEnv::reset_with`] with a hedge lane. Apart, and never inlined, so that an
+    /// environment without one does not hold this frame's copies of the kernel's state,
+    /// which is large, on its stack.
+    #[inline(never)]
+    fn reset_hedged<E: EventSink>(
+        &self,
+        cross: &Cross<'d, ORD, MSG, DLV, OBS>,
+        seed: u64,
+        mut tap: Tap<'_, E>,
+    ) -> MMResult<RlState<ORD, MSG, DLV, OBS>> {
+        let both = cross.kernel.reset_with(seed, &mut tap);
+        let mut state = RlState {
+            kernel: both.kernel,
+            previous: None,
+            mark_row: tap.row,
+            net: Decimal::ZERO,
+            penalties: Decimal::ZERO,
+            close: None,
+            fault: false,
+            lane: Some(both.lane),
+            hedge_close: None,
         };
         state.net = self.net_of(&state)?;
         Ok(state)
@@ -581,20 +874,33 @@ impl<
                 "the episode has ended".to_string(),
             ));
         }
-        let inside = allowed(&self.mask(state), self.hedge_mask(state), action);
+        let inside = allowed(
+            &self.mask(state),
+            self.hedge_mask(state),
+            self.cross_hedge_mask(state),
+            action,
+        );
         if !inside && self.config.invalid_action == InvalidActionPolicy::Mask {
             return Err(MMError::InvalidQuoteGeneration(format!(
                 "{action:?} is outside the mask"
             )));
         }
         let decision = self.kernel.observe(&state.kernel);
-        let kernel_action = self.resolve(&decision, state, action);
+        let resolved = match action {
+            RlAction::CrossHedge { size } => {
+                match (inside, self.cross_order(state, &decision, size)) {
+                    (true, Some((side, lots))) => Resolved::Cross(side, lots),
+                    _ => Resolved::Kernel(KernelAction::QuoteError(ERR_CROSS_HEDGE_REFUSED)),
+                }
+            }
+            _ => Resolved::Kernel(self.resolve(&decision, state, action)),
+        };
         let penalty = if inside {
             Decimal::ZERO
         } else {
             self.config.invalid_action_penalty
         };
-        self.apply(state, &decision, kernel_action, penalty, sink)
+        self.apply(state, &decision, resolved, penalty, sink)
     }
 
     /// Steps the kernel with a quote composed outside the grid. Its admission and its gate
@@ -616,14 +922,20 @@ impl<
             ));
         }
         let decision = self.kernel.observe(&state.kernel);
-        self.apply(state, &decision, action, Decimal::ZERO, sink)
+        self.apply(
+            state,
+            &decision,
+            Resolved::Kernel(action),
+            Decimal::ZERO,
+            sink,
+        )
     }
 
     fn apply<E: EventSink>(
         &self,
         state: &mut RlState<ORD, MSG, DLV, OBS>,
         decision: &Observation,
-        kernel_action: KernelAction,
+        resolved: Resolved,
         penalty: Decimal,
         sink: &mut E,
     ) -> MMResult<Transition> {
@@ -631,9 +943,29 @@ impl<
             inner: sink,
             row: None,
         };
-        let outcome = self
-            .kernel
-            .step_with(&mut state.kernel, kernel_action, &mut tap);
+        let (outcome, cross_hedge) = match (&self.cross, state.lane.as_mut()) {
+            (Some(cross), Some(lane)) => {
+                let action = match resolved {
+                    Resolved::Kernel(action) => HedgedAction::Kernel(action),
+                    Resolved::Cross(side, lots) => HedgedAction::Hedge { side, lots },
+                };
+                let out = cross
+                    .kernel
+                    .step_parts(&mut state.kernel, lane, action, &mut tap);
+                (out.kernel, out.hedge)
+            }
+            _ => {
+                let action = match resolved {
+                    Resolved::Kernel(action) => action,
+                    // A hedge in the second instrument resolves only with a lane.
+                    Resolved::Cross(..) => KernelAction::QuoteError(ERR_CROSS_HEDGE_REFUSED),
+                };
+                (
+                    self.kernel.step_with(&mut state.kernel, action, &mut tap),
+                    None,
+                )
+            }
+        };
         if let Some(row) = tap.row {
             state.mark_row = Some(row);
         }
@@ -645,19 +977,21 @@ impl<
                 ts_ns: decision.ts_ns,
             });
         }
-        let settled = self.settle(state, penalty, outcome);
+        let settled = self.settle(state, penalty, outcome, cross_hedge);
         if settled.is_err() {
             state.fault = true;
         }
         settled
     }
 
-    /// An episode's records in the form of the evaluation.
+    /// An episode's records in the form of the evaluation; with a hedge lane, its records
+    /// too, its terminal close included, and a window that covers both lanes (#266).
     ///
     /// # Errors
     ///
-    /// Returns [`EvaluationError::InvalidInput`] with no completed row, and
-    /// [`EvaluationError::Inexact`] if a value does not convert.
+    /// Returns [`EvaluationError::InvalidInput`] with no completed row or with a hedge
+    /// row that has no positive mid, and [`EvaluationError::Inexact`] if a value does
+    /// not convert.
     pub fn records(
         &self,
         state: &RlState<ORD, MSG, DLV, OBS>,
@@ -703,28 +1037,111 @@ impl<
                 base_fee: Decimal::ZERO,
             });
         }
-        let last = |records: &[u64]| records.last().copied().unwrap_or(0);
-        let mark_times: Vec<u64> = marks.iter().map(|m| m.timestamp_ms).collect();
-        let fill_times: Vec<u64> = fills.iter().map(|f| f.timestamp_ms).collect();
-        let Some(start_ms) = mark_times.first().copied() else {
+        let (hedge_marks, hedge_fills, hedge_funding) = self.hedge_records(state, recorder)?;
+        let Some(first_mark) = marks.first().map(|m| m.timestamp_ms) else {
             return Err(EvaluationError::InvalidInput {
                 reason: "the episode has no completed row".to_string(),
             });
         };
-        let end_ms = last(&mark_times)
-            .max(last(&fill_times))
-            .checked_add(1)
-            .ok_or(convert("window"))?;
+        let times = marks
+            .iter()
+            .map(|m| m.timestamp_ms)
+            .chain(fills.iter().map(|f| f.timestamp_ms))
+            .chain(hedge_marks.iter().map(|m| m.timestamp_ms))
+            .chain(hedge_fills.iter().map(|f| f.timestamp_ms))
+            .chain(hedge_funding.iter().map(|f| f.timestamp_ms));
+        let (start_ms, last_ms) = times.fold((first_mark, first_mark), |(lo, hi), t| {
+            (lo.min(t), hi.max(t))
+        });
+        let end_ms = last_ms.checked_add(1).ok_or(convert("window"))?;
         Ok(EpisodeRecords {
             window: TimeWindow { start_ms, end_ms },
             marks,
             fills,
+            hedge_marks,
+            hedge_fills,
+            hedge_funding,
         })
+    }
+
+    /// The hedge lane's records, its terminal close included; empty without a lane.
+    #[allow(clippy::type_complexity)]
+    fn hedge_records(
+        &self,
+        state: &RlState<ORD, MSG, DLV, OBS>,
+        recorder: &EpisodeRecorder,
+    ) -> Result<(Vec<Mark>, Vec<ExecutedFill>, Vec<FundingPayment>), EvaluationError> {
+        let convert = |what| EvaluationError::Inexact { what };
+        let Some(cross) = &self.cross else {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        };
+        let scale = cross.kernel.lane_money_scale();
+        let money = |units: i128| {
+            Decimal::try_from_i128_with_scale(units, scale).map_err(|_| convert("hedge money"))
+        };
+        let ms = |ns: u64| ns.checked_div(NS_PER_MS).unwrap_or(0);
+        let (mut marks, mut fills, mut funding) = (Vec::new(), Vec::new(), Vec::new());
+        for event in &recorder.hedge {
+            match *event {
+                HedgeEvent::Row { row, ts_ns, mid2 } => {
+                    let mid2 = mid2.ok_or_else(|| EvaluationError::InvalidInput {
+                        reason: format!("hedge row {row} has no positive mid"),
+                    })?;
+                    let mid = Decimal::from(mid2)
+                        .checked_mul(cross.tick)
+                        .and_then(|m| m.checked_mul(Decimal::new(5, 1)))
+                        .ok_or(convert("hedge mark"))?;
+                    marks.push(Mark {
+                        timestamp_ms: ms(ts_ns),
+                        mid,
+                    });
+                }
+                HedgeEvent::Fill {
+                    ts_ns,
+                    side,
+                    price,
+                    lots,
+                    fee_u,
+                } => fills.push(ExecutedFill {
+                    timestamp_ms: ms(ts_ns),
+                    side,
+                    price: Decimal::from(price)
+                        .checked_mul(cross.tick)
+                        .ok_or(convert("hedge fill price"))?,
+                    quantity: Decimal::from(lots)
+                        .checked_mul(cross.lot)
+                        .ok_or(convert("hedge fill size"))?,
+                    quote_fee: money(fee_u)?,
+                    base_fee: Decimal::ZERO,
+                }),
+                HedgeEvent::Funding {
+                    at_ns, received_u, ..
+                } => funding.push(FundingPayment {
+                    timestamp_ms: ms(at_ns),
+                    amount: money(received_u)?,
+                }),
+            }
+        }
+        if let Some((close, _)) = state.hedge_close {
+            fills.push(ExecutedFill {
+                timestamp_ms: ms(close.ts_ns),
+                side: close.side,
+                price: close.price,
+                quantity: close.quantity,
+                quote_fee: close.fee,
+                base_fee: Decimal::ZERO,
+            });
+        }
+        Ok((marks, fills, funding))
     }
 
     /// Checks the reward against the evaluation: [`RlState::net`] must equal the net
     /// result of [`attribute`] over the same marks and fills to the last digit, and the
     /// position left must agree. Holds at every decision, not only at the end.
+    ///
+    /// With a hedge lane, each lane is checked against its own records (#266): the
+    /// hedge lane's attribution against its ledger's net, its close included, and its
+    /// final position against the lane's; the quoted lane's against the rest of the net.
     ///
     /// # Errors
     ///
@@ -750,14 +1167,59 @@ impl<
                     .position
             }
         };
-        attribute(&input)?.reconcile(LedgerTotals {
-            net_pnl: state.net,
+        // With a hedge lane, each lane is attributed against its own records (#266): the
+        // hedge lane's net, its close included, is its ledger's, checked by its shadow,
+        // and the quoted lane's is the rest of the net.
+        let lane = self
+            .lane_net(state)
+            .ok()
+            .and_then(|net| net.checked_add(state.hedge_close.map_or(Decimal::ZERO, |(_, c)| c)))
+            .ok_or(EvaluationError::Inexact {
+                what: "hedge lane net",
+            })?;
+        let quoted = LedgerTotals {
+            net_pnl: state
+                .net
+                .checked_sub(lane)
+                .ok_or(EvaluationError::Inexact { what: "quoted net" })?,
             position,
-        })
+        };
+        let (Some(cross), Some(hedge_lane)) = (&self.cross, state.lane.as_ref()) else {
+            return attribute(&input)?.reconcile(quoted);
+        };
+        let hedge_position = match state.hedge_close {
+            Some(_) => Decimal::ZERO,
+            None => {
+                cross
+                    .kernel
+                    .summary_parts(&state.kernel, hedge_lane)
+                    .map_err(|error| EvaluationError::InvalidInput {
+                        reason: error.to_string(),
+                    })?
+                    .position
+            }
+        };
+        let input = input.with_hedge(
+            &records.hedge_marks,
+            &records.hedge_fills,
+            &records.hedge_funding,
+        )?;
+        attribute(&input)?.reconcile_lanes(
+            quoted,
+            LedgerTotals {
+                net_pnl: lane,
+                position: hedge_position,
+            },
+        )
     }
 
     fn check_owned(&self, state: &RlState<ORD, MSG, DLV, OBS>) -> MMResult<()> {
-        if self.kernel.owns(&state.kernel) {
+        let owned = match (&self.cross, state.lane.as_ref()) {
+            (None, _) => self.kernel.owns(&state.kernel) && state.lane.is_none(),
+            (Some(cross), Some(lane)) => cross.kernel.owns_parts(&state.kernel, lane),
+            (Some(_), None) => false,
+        };
+        if owned {
             return Ok(());
         }
         Err(MMError::InvalidMarketState(
@@ -775,6 +1237,7 @@ impl<
         let off_grid = KernelAction::QuoteError(ERR_ACTION_OFF_GRID);
         match action {
             RlAction::Hold => KernelAction::Hold,
+            RlAction::CrossHedge { .. } => KernelAction::QuoteError(ERR_CROSS_HEDGE_REFUSED),
             RlAction::Hedge { size } => {
                 let refused = KernelAction::QuoteError(ERR_HEDGE_REFUSED);
                 let Some(lots) = self.grid.sizes().get(size).copied() else {
@@ -842,16 +1305,82 @@ impl<
     fn net_of(&self, state: &RlState<ORD, MSG, DLV, OBS>) -> MMResult<Decimal> {
         let summary = self.kernel.venue_summary(&state.kernel)?;
         let cash = sub(summary.realized, summary.total_fees, "net")?;
-        match self.mark_tick(state) {
+        let quoted = match self.mark_tick(state) {
             Some(tick) => {
                 let mid2 = tick.mid2().ok_or_else(|| inexact("mark"))?;
                 let value = mul(summary.position, self.mid_of(mid2)?, "position value")?;
-                add(cash, value, "net")
+                add(cash, value, "net")?
             }
             // Nothing can have filled: the first order follows the first decision, and
             // the row after it is matched only once this one has completed.
-            None => Ok(cash),
+            None => cash,
+        };
+        add(quoted, self.lane_net(state)?, "net")
+    }
+
+    /// The hedge lane's net: cash, less fees, plus funding and its position at the mid of
+    /// the last hedge row it ran. Zero with no lane.
+    fn lane_net(&self, state: &RlState<ORD, MSG, DLV, OBS>) -> MMResult<Decimal> {
+        match (&self.cross, state.lane.as_ref()) {
+            (Some(cross), Some(lane)) => Ok(cross.kernel.summary_parts(&state.kernel, lane)?.net),
+            _ => Ok(Decimal::ZERO),
         }
+    }
+
+    /// The hedge lane's close on termination, at the touch of the last hedge row it ran,
+    /// with its fee rate, and what it changes in the net result.
+    fn hedge_terminal_close(
+        &self,
+        state: &RlState<ORD, MSG, DLV, OBS>,
+    ) -> MMResult<Option<(TerminalClose, Decimal)>> {
+        let (Some(cross), Some(lane)) = (&self.cross, state.lane.as_ref()) else {
+            return Ok(None);
+        };
+        let summary = cross.kernel.summary_parts(&state.kernel, lane)?;
+        let position = summary.position;
+        if position.is_zero() {
+            return Ok(None);
+        }
+        let tick = lane
+            .cursor()
+            .checked_sub(1)
+            .and_then(|row| usize::try_from(row).ok())
+            .and_then(|row| cross.kernel.hedge_data().ticks().get(row).copied())
+            .ok_or_else(|| MMError::NumericalError("a hedge position with no row".to_string()))?;
+        let long = position.is_sign_positive();
+        let (side, touch, shown) = if long {
+            (Action::Sell, tick.bid, tick.bid_lots)
+        } else {
+            (Action::Buy, tick.ask, tick.ask_lots)
+        };
+        let price = mul(Decimal::from(touch), cross.tick, "hedge close")?;
+        let quantity = position.abs();
+        let fee = mul(
+            mul(quantity, price, "hedge close")?,
+            cross.fee_rate,
+            "hedge close fee",
+        )?;
+        let displayed = mul(Decimal::from(shown), cross.lot, "hedge close")?;
+        let beyond_touch = sub(quantity, displayed, "hedge close")?.max(Decimal::ZERO);
+        let mid2 = tick.mid2().ok_or_else(|| inexact("hedge mark"))?;
+        let mid = mul(
+            mul(Decimal::from(mid2), cross.tick, "hedge mark")?,
+            Decimal::new(5, 1),
+            "hedge mark",
+        )?;
+        let edge = sub(price, mid, "hedge close")?;
+        let change = sub(mul(position, edge, "hedge close")?, fee, "hedge close")?;
+        Ok(Some((
+            TerminalClose {
+                side,
+                price,
+                quantity,
+                fee,
+                beyond_touch,
+                ts_ns: tick.ts_ns,
+            },
+            change,
+        )))
     }
 
     /// The inventory's close on termination, and what it changes in the net result.
@@ -903,6 +1432,7 @@ impl<
         state: &mut RlState<ORD, MSG, DLV, OBS>,
         penalty: Decimal,
         outcome: StepOutcome,
+        cross_hedge: Option<Result<(), HedgeRefusal>>,
     ) -> MMResult<Transition> {
         let (terminated, truncated) = match outcome.status {
             Status::Running => (false, false),
@@ -920,7 +1450,15 @@ impl<
             (true, TerminalValuation::CloseAtTouch) => self.terminal_close(state)?,
             (true, TerminalValuation::MarkAtLastMid) | (false, _) => None,
         };
-        let terminal_close = closing.map_or(Decimal::ZERO, |(_, change)| change);
+        let hedge_closing = match (terminated, self.config.terminal) {
+            (true, TerminalValuation::CloseAtTouch) => self.hedge_terminal_close(state)?,
+            (true, TerminalValuation::MarkAtLastMid) | (false, _) => None,
+        };
+        let terminal_close = add(
+            closing.map_or(Decimal::ZERO, |(_, change)| change),
+            hedge_closing.map_or(Decimal::ZERO, |(_, change)| change),
+            "terminal close",
+        )?;
         let total = sub(
             add(ledger_change, terminal_close, "reward")?,
             penalty,
@@ -933,6 +1471,7 @@ impl<
         state.net = add(net, terminal_close, "net")?;
         state.penalties = add(state.penalties, penalty, "penalties")?;
         state.close = closing.map(|(close, _)| close);
+        state.hedge_close = hedge_closing;
         Ok(Transition {
             observation: self.observe(state)?,
             mask: self.mask(state),
@@ -948,6 +1487,10 @@ impl<
             terminated,
             truncated,
             close: state.close,
+            cross_hedge_mask: self.cross_hedge_mask(state),
+            hedge_observation: self.observe_hedge(state)?,
+            cross_hedge,
+            hedge_close: state.hedge_close(),
         })
     }
 }
@@ -1096,27 +1639,27 @@ mod tests {
     #[test]
     fn test_allowed_a_refused_mask_blocks_quotes_and_leaves_a_hold() {
         let mask = refused();
-        assert!(allowed(&mask, 0, RlAction::Hold));
+        assert!(allowed(&mask, 0, 0, RlAction::Hold));
         let quote = RlAction::Quote {
             bid: 0,
             ask: 0,
             bid_size: 0,
             ask_size: 0,
         };
-        assert!(!allowed(&mask, 0, quote));
+        assert!(!allowed(&mask, 0, 0, quote));
         for side in [QuoteSide::Bid, QuoteSide::Ask] {
             let one = RlAction::OneSided {
                 side,
                 offset: 0,
                 size: 0,
             };
-            assert!(!allowed(&mask, 0, one));
+            assert!(!allowed(&mask, 0, 0, one));
             let open = ActionMask {
                 global_quote_ok: true,
                 refusal: None,
                 ..mask
             };
-            assert!(allowed(&open, 0, one));
+            assert!(allowed(&open, 0, 0, one));
         }
     }
 
@@ -1130,11 +1673,11 @@ mod tests {
             refusal: None,
         };
         let one = |side, offset, size| RlAction::OneSided { side, offset, size };
-        assert!(allowed(&mask, 0, one(QuoteSide::Bid, 0, 0)));
-        assert!(!allowed(&mask, 0, one(QuoteSide::Bid, 1, 0)));
-        assert!(allowed(&mask, 0, one(QuoteSide::Ask, 1, 0)));
-        assert!(!allowed(&mask, 0, one(QuoteSide::Ask, 0, 0)));
-        assert!(!allowed(&mask, 0, one(QuoteSide::Bid, 0, 1)));
-        assert!(!allowed(&mask, 0, one(QuoteSide::Bid, 64, 0)));
+        assert!(allowed(&mask, 0, 0, one(QuoteSide::Bid, 0, 0)));
+        assert!(!allowed(&mask, 0, 0, one(QuoteSide::Bid, 1, 0)));
+        assert!(allowed(&mask, 0, 0, one(QuoteSide::Ask, 1, 0)));
+        assert!(!allowed(&mask, 0, 0, one(QuoteSide::Ask, 0, 0)));
+        assert!(!allowed(&mask, 0, 0, one(QuoteSide::Bid, 0, 1)));
+        assert!(!allowed(&mask, 0, 0, one(QuoteSide::Bid, 64, 0)));
     }
 }

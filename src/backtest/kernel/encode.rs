@@ -154,13 +154,13 @@ fn err(message: impl Into<String>) -> MMError {
 }
 
 /// Little endian reader that never panics.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+pub(super) struct Reader<'a> {
+    pub(super) bytes: &'a [u8],
+    pub(super) pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> MMResult<&'a [u8]> {
+    pub(super) fn take(&mut self, n: usize) -> MMResult<&'a [u8]> {
         let end = self
             .pos
             .checked_add(n)
@@ -172,45 +172,45 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(slice)
     }
-    fn arr<const N: usize>(&mut self) -> MMResult<[u8; N]> {
+    pub(super) fn arr<const N: usize>(&mut self) -> MMResult<[u8; N]> {
         <[u8; N]>::try_from(self.take(N)?).map_err(|_| err("short read"))
     }
-    fn u8(&mut self) -> MMResult<u8> {
+    pub(super) fn u8(&mut self) -> MMResult<u8> {
         Ok(u8::from_le_bytes(self.arr()?))
     }
-    fn bool(&mut self) -> MMResult<bool> {
+    pub(super) fn bool(&mut self) -> MMResult<bool> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
             v => Err(err(format!("invalid bool {v}"))),
         }
     }
-    fn u16(&mut self) -> MMResult<u16> {
+    pub(super) fn u16(&mut self) -> MMResult<u16> {
         Ok(u16::from_le_bytes(self.arr()?))
     }
-    fn u32(&mut self) -> MMResult<u32> {
+    pub(super) fn u32(&mut self) -> MMResult<u32> {
         Ok(u32::from_le_bytes(self.arr()?))
     }
-    fn u64(&mut self) -> MMResult<u64> {
+    pub(super) fn u64(&mut self) -> MMResult<u64> {
         Ok(u64::from_le_bytes(self.arr()?))
     }
-    fn i64(&mut self) -> MMResult<i64> {
+    pub(super) fn i64(&mut self) -> MMResult<i64> {
         Ok(i64::from_le_bytes(self.arr()?))
     }
-    fn u128(&mut self) -> MMResult<u128> {
+    pub(super) fn u128(&mut self) -> MMResult<u128> {
         Ok(u128::from_le_bytes(self.arr()?))
     }
-    fn i128(&mut self) -> MMResult<i128> {
+    pub(super) fn i128(&mut self) -> MMResult<i128> {
         Ok(i128::from_le_bytes(self.arr()?))
     }
-    fn option_u64(&mut self) -> MMResult<Option<u64>> {
+    pub(super) fn option_u64(&mut self) -> MMResult<Option<u64>> {
         Ok(if self.bool()? {
             Some(self.u64()?)
         } else {
             None
         })
     }
-    fn decimal(&mut self) -> MMResult<Decimal> {
+    pub(super) fn decimal(&mut self) -> MMResult<Decimal> {
         let mantissa = self.i128()?;
         let scale = self.u8()?;
         if scale > 28 || mantissa.unsigned_abs() >= (1u128 << 96) {
@@ -221,7 +221,7 @@ impl<'a> Reader<'a> {
         Decimal::try_from_i128_with_scale(mantissa, u32::from(scale))
             .map_err(|e| err(e.to_string()))
     }
-    fn dir(&mut self) -> MMResult<Dir> {
+    pub(super) fn dir(&mut self) -> MMResult<Dir> {
         let code = self.u8()?;
         dir_from_code(code).ok_or_else(|| err(format!("invalid side {code}")))
     }

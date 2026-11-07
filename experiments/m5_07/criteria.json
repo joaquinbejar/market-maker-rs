@@ -1,0 +1,80 @@
+{
+  "issue": 111,
+  "step": 1,
+  "version": 1,
+  "what": "a bounded numerical reproduction of the quadratic rough Heston model as OptionStratLib 0.24 implements it, against values the papers state; fixed before anything runs",
+  "papers": {
+    "market_making": "Rosenbaum and Zhang, Multi-asset market making under the quadratic rough Heston, arXiv:2212.10164v1",
+    "calibration": "Rosenbaum and Zhang, Deep calibration of the quadratic rough Heston model, arXiv:2107.01611 (reference [28] of the first, the source of its kernel)"
+  },
+  "declared": [
+    "the parameters are the papers' SPX values, used as such; they are calibrated to nothing here and never stand for BTC or any other market",
+    "only the SPX part is reproduced: VIX futures and options under the model, the joint SPX/VIX calibration and the neural pricing of the papers are out of scope (OptionStratLib has no VIX pricing or calibration under the model; issues are opened there)",
+    "the market making results of 2212.10164 are figures of value functions and controls, not numbers; they are not reproduced in step 1"
+  ],
+  "model": {
+    "alpha": "0.51",
+    "factors": 10,
+    "ratio_x_n": "3.92",
+    "source": "2107.01611 Appendix A: geometric partition with x*_10 = 3.92 at alpha = 0.51 (Figure A.1), n = 10 (Section 2.2)",
+    "parameters_2212_10164": {
+      "lambda": "1.7",
+      "eta": "1.5",
+      "a": "0.265",
+      "b": "0.246",
+      "c": "0.0001",
+      "z0": [
+        "-0.009",
+        "0.015",
+        "0.011",
+        "0.036",
+        "0.002",
+        "-0.011",
+        "-0.018",
+        "0.074",
+        "0.142",
+        "-0.171"
+      ],
+      "spot": "3000",
+      "source": "2212.10164v1 Section 4.2.1"
+    }
+  },
+  "checks": {
+    "kernel_weights": {
+      "what": "OptionStratLib's (c_i, gamma_i) for alpha 0.51, n 10, x_n 3.92 against the closed form of 2107.01611 Appendix A, computed independently here",
+      "pass": "every c_i and gamma_i equal to the closed form within a relative 1e-10"
+    },
+    "optimal_ratio": {
+      "what": "argmin over x_n > 1 of the L2(0, 0.1) distance between K^n and the fractional kernel, for n = 10",
+      "values": {
+        "0.51": "3.92",
+        "0.55": "3.91",
+        "0.6": "3.94",
+        "0.65": "4.11",
+        "0.7": "5.59"
+      },
+      "source": "2107.01611 Figure A.1 (printed values)",
+      "pass": "within 0.02 of each printed value (they are printed to two decimals)"
+    },
+    "initial_variance": {
+      "what": "V0 = a (Z0 - b)^2 + c with Z0 = sum c_i z0_i",
+      "value": "0.18",
+      "unit": "per year",
+      "source": "2212.10164v1 Section 4.2.1",
+      "pass": "equal to 0.18 when rounded to two decimals"
+    },
+    "monte_carlo": {
+      "what": "OptionStratLib's Monte Carlo vanilla prices at the 2212.10164 parameters, spot 3000, maturities 0.03, 0.05, 0.07 and 0.09 years (the maturities of 2107.01611's data, Section 3.1), log-moneyness strikes from -0.15 to 0.05",
+      "pass": [
+        "put-call parity within 3 Monte Carlo standard errors at every strike and maturity",
+        "prices within no-arbitrage bounds (call between max(S - K, 0) and S), and decreasing and convex in strike up to Monte Carlo error",
+        "convergence: halving dt changes no price by more than 3 standard errors; quadrupling paths shrinks the standard error by about half",
+        "implied volatilities: a negative skew (higher implied volatility at lower strikes) at every maturity, as the papers' SPX smiles show, and an at-the-money level in the range of the initial volatility sqrt(V0), stated as a shape check, not a number from the papers",
+        "no NaN, positive variance on every path"
+      ]
+    }
+  },
+  "rule": "step 1 passes when every check passes; if any fails, step 1 stops and is reported, and step 2 does not start",
+  "compute": "one core; minutes",
+  "data": "synthetic: Monte Carlo paths of the model at the papers' parameters; no market data"
+}
