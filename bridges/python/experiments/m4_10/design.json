@@ -1,6 +1,7 @@
 {
   "issue": 110,
-  "design_version": 2,
+  "design_version": 3,
+  "data_design_version": 2,
   "data": "synthetic: a queue-reactive simulator with made-up parameters, no market data",
   "bounds": "One synthetic simulator, made-up parameters and 24 days per regime bound what this comparison can show.",
   "origin": "The regimes, seeds rule and day-based splits of #103 (experiments/m4_06), sampled every 100 ms for a 2 hour session per day (72000 rows): new data with its own digests (experiments/m4_10/digests.json). The protocol of #103 otherwise.",
@@ -24,7 +25,8 @@
   "changes": [
     "version 2, before any run: rows of 100 ms instead of 1 s. On 1 s rows the latency had no effect below half a row and a cliff at 500 ms: Avellaneda-Stoikov (risk aversion 0.01, intensity 50) on #103's calm validation day 15 at fee 0.0002, deciding every row, queue at 1 lot per 500 ms against immediate fill: 25, 100, 250 and 400 ms all 22 fills and -0.020169 against 64 fills and -0.31108; 500 ms 0 fills and 0 against 64 and -0.31108; at a decision every 5 rows 736 fills and -19.103243 against 738 and -19.102291 at 25, 250 and 400 ms. Matching happens only at rows, so latency below a row cannot be measured there.",
     "version 2, the rate, chosen before any training on calm validation day 15, Avellaneda-Stoikov (risk aversion 0.01, intensity 50, a 2 hour horizon), fee 0.0002, fills and net. Deciding every row: no rate fills at 25 ms (immediate fill 0 fills too), at 100 ms only 1 lot per 10 ms (2 fills, 0.77, as immediate fill), at 500 ms 1 lot per 50 ms 22 fills and -1.247, per 25 ms 42 and -0.944, against immediate fill 72 and -1.441. Deciding every 10 rows, against immediate fill: 25 ms immediate 23 and -0.722, 1 lot per 1000 ms 0 and 0, per 750 ms 8 and -0.569, per 500 ms 8 and -0.569, per 250 ms 23 and -0.722; 100 ms immediate 28 and -0.452, per 1000 ms 0, per 750 ms 9 and -0.464, per 500 ms 9 and -0.464, per 250 ms 26 and -0.722; 500 ms immediate 59 and 0.327, per 1000 ms 0, per 750 ms 12 and -0.309, per 500 ms 14 and -0.273, per 250 ms 54 and -0.098. Every 30 rows the queue equals immediate fill at 500 and 250 ms (90, 94, 128 fills). The rate is 1 lot per 750 ms: the slowest that fills and binds at every latency; the check holds at 10 rows, not at 1 (where nothing binds at 25 ms) nor at 30. The classical arm is selected at intervals of 1 and 10 rows, as stated.",
-    "version 2, after the timing pilot only (nothing selected): training estimated at about 1300 run-minutes, 240 minutes at 6 jobs."
+    "version 2, after the timing pilot only (nothing selected): training estimated at about 1300 run-minutes, 240 minutes at 6 jobs.",
+    "version 3, before any run beyond the timing pilot and with no change to the data (digests.json stays version 2): the runner's choices the design left open, in runner_choices; agreed before the runner read any training day"
   ],
   "execution": {
     "fee": "by the rule of #103 (largest of 0.0002, 0 and -0.0001 at which the training-day Avellaneda-Stoikov point has a positive mean daily net), run on these training days at a decision every row and 25 ms latency; 0.0002 if none",
@@ -234,6 +236,10 @@
     "shared_with": "#103 and #105, run after them"
   },
   "steps": [
+    {
+      "name": "fee_rule",
+      "estimate_minutes": 60
+    },
     {
       "name": "predictor_fit",
       "estimate_minutes": 10
@@ -492,5 +498,49 @@
   },
   "session_ms": 7200000,
   "volatility_rule": "Per regime, the population standard deviation of the change of the mid in price units between consecutive rows of the same day, over every training day, times the square root of 31536000 / 0.1: absolute price units per square root of a 365 day year, as Avellaneda-Stoikov and GLFT take it.",
-  "check_before_training": "for each latency, the classical arm fills a nonzero number of times at a decision interval of 1 or 10 rows, and its net differs from immediate fill, on one validation day; the table is recorded in changes"
+  "check_before_training": "for each latency, the classical arm fills a nonzero number of times at a decision interval of 1 or 10 rows, and its net differs from immediate fill, on one validation day; the table is recorded in changes",
+  "runner_choices": {
+    "fee_rule": {
+      "candidates": [
+        "0.0002",
+        "0",
+        "-0.0001"
+      ],
+      "latency": "25",
+      "every_rows": 1,
+      "point": "a point is its parameters but the volatility, which the volatility rule sets per regime; the point with the highest mean daily net over every regime's training days is chosen, a tie going to the greater point",
+      "rule": "#103's: the largest candidate at which the chosen point's mean daily net is positive; 0.0002 if none, reported as no profitable classical arm",
+      "artifact": "this design's own fee_rule.json, run on these 100 ms days; no artifact of #103 is read"
+    },
+    "predictor": {
+      "target": "for the observation returned at decision t, which is of row r = info[\"row\"], the mid change from row r to row r + 5 of the same day, in ticks, divided by observation_scales.mid_change_ticks; each day is its own file and split, so no target crosses a day or a split, and a row with fewer than 5 rows after it in its day has no target",
+      "inputs": "the 22 values of that observation (11 features and their presence flags), all causally available at t, and an intercept",
+      "solver": "numpy.linalg.lstsq with rcond=None: the minimum norm least squares solution, its rank recorded; under the hold policy the position and order features are constant, so their weights are not identified apart from the intercept, which the minimum norm splits between them; this is stated as a limit",
+      "samples": "every decision of every training day of every regime, under the hold policy at the fee rule's fee and latency 25; training days only, never validation or holdout",
+      "feature": "the forecast clipped to [-1, 1], appended to the observation; fixed after the fit, never refitted on validation or holdout days; its coefficients, rank and r2 in predictor.json, whose hash the freeze records",
+      "cost": "its wall time is reported apart from the training runs'"
+    },
+    "teacher": {
+      "decisions": 100000,
+      "samples": "with numpy.random.default_rng(the run's training seed): draw a (regime, training day) pair uniformly with replacement from the 42, and an environment seed below 2**31; run the fee rule's point, its volatility per regime by the volatility rule, with a zero residual at the arm's latency, from the day's start, recording every decision; repeat until 100000 decisions, the last day cut there",
+      "target": "each decision's classical action on the arm's Box at its bins' centres. The first value is exactly 0.5 for a quote and exactly -0.5 for a hold or a strategy error. A side's distance is, in ticks, floor(mid2 / 2) less the bid, or the ask less ceil(mid2 / 2), from mid2 of the row the decision observed, as observe.rs measures grid offsets; it is clamped to [0, the farthest grid offset] first and then snapped to the nearest grid offset, a tie to the farther; a size snaps to the nearest grid size, a tie to the larger. The duration value is the centre of the shortest choice's bin, as the classical point decides every row. A hold's other values are 0.0",
+      "one_sided": "the Box quotes both sides, so a one-sided classical quote has no exact image: this teacher is a two-sided surrogate, whose missing side is made live at the farthest offset and the smallest size",
+      "log": "per teacher run, counted before any training: quotes, holds, one-sided quotes made two-sided, sides inside the mid clamped to 0, sides beyond the grid clamped to its farthest offset, sides snapped off their distance, and the ticks moved in all",
+      "observation": "the arm's own: with the forecast when the arm has the predictor"
+    },
+    "cloning": {
+      "loss": "mean squared error between the policy's mean action and the target, the mean over the batch and every action value, a hold's included",
+      "optimizer": "Adam on the policy network and the action head only",
+      "learning_rate": 0.0003,
+      "batch_size": 256,
+      "epochs": 10,
+      "batches": "each epoch a permutation of the samples from torch.Generator seeded with the run's seed, in batches of 256, the last smaller batch kept",
+      "kept": "the value network and the log standard deviation stay as initialised",
+      "seed": "the run's training seed, also torch.manual_seed before the fit",
+      "then": "PPO from those weights for the arm's whole budget of decisions; the cloning's samples are not counted in that budget",
+      "cost": "its wall time is reported apart from PPO's in each run's metadata"
+    },
+    "no_duration": "the plain 5 value Box, a decision every row, with no duration value. Between decisions it has the same semantics as the duration arms: orders rest until the policy's next quote replaces them (cancels after the cancel latency) and a hold keeps them; nothing is cancelled automatically in any arm",
+    "classical_selection": "#103's rule per regime, latency and decision interval (1 and 10 rows), on validation days at the fee rule's fee"
+  }
 }
