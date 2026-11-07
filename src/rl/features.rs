@@ -6,7 +6,7 @@ use crate::Decimal;
 use crate::backtest::kernel::Observation;
 use crate::types::error::{MMError, MMResult};
 
-use super::spec::{FEATURE_COUNT, FeatureId, ObservationSpace};
+use super::spec::{FEATURE_COUNT, FeatureId, FeatureSpec, HEDGE_FEATURE_COUNT, ObservationSpace};
 
 /// Nanoseconds as a `Decimal` count of milliseconds has this scale.
 const NS_SCALE: u32 = 6;
@@ -32,6 +32,40 @@ pub struct FeatureVector {
     /// `raw / divisor`, clipped to `[-1, 1]`, and 0 for a feature with no value.
     /// Derived from [`FeatureVector::raw`].
     pub values: [f32; FEATURE_COUNT],
+}
+
+/// The hedge features at a decision, with a hedge lane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct HedgeFeatureVector {
+    /// The hedge row the agent sees, which the row values are as of.
+    pub row: Option<u64>,
+    /// Each hedge feature's value before normalization, in its declared unit, and `None`
+    /// when it has no value. In the order of [`FeatureId::HEDGE`].
+    pub raw: [Option<Decimal>; HEDGE_FEATURE_COUNT],
+    /// `raw / divisor`, clipped to `[-1, 1]`, and 0 for a feature with no value.
+    pub values: [f32; HEDGE_FEATURE_COUNT],
+}
+
+impl HedgeFeatureVector {
+    pub(super) fn new(
+        row: Option<u64>,
+        raw: [Option<Decimal>; HEDGE_FEATURE_COUNT],
+        specs: &[FeatureSpec],
+    ) -> MMResult<Self> {
+        let mut values = [0.0_f32; HEDGE_FEATURE_COUNT];
+        for ((value, exact), spec) in values.iter_mut().zip(&raw).zip(specs) {
+            if let Some(exact) = exact {
+                *value = exact
+                    .checked_div(spec.divisor)
+                    .ok_or_else(|| numeric("normalized hedge feature"))?
+                    .clamp(Decimal::NEGATIVE_ONE, Decimal::ONE)
+                    .to_f32()
+                    .ok_or_else(|| numeric("normalized hedge feature"))?;
+            }
+        }
+        Ok(Self { row, raw, values })
+    }
 }
 
 fn numeric(what: &str) -> MMError {
@@ -106,6 +140,12 @@ fn raw_value(
         FeatureId::OpenOrders => Some(Decimal::from(obs.open_orders)),
         FeatureId::AwaitingCancel => Some(Decimal::from(obs.awaiting_cancel_outcome)),
         FeatureId::StepsLeft => Some(Decimal::from(max_steps.saturating_sub(obs.step))),
+        // The hedge features are in the hedge vector.
+        FeatureId::HedgeSpread
+        | FeatureId::HedgeBasis
+        | FeatureId::HedgeRowAge
+        | FeatureId::HedgePosition
+        | FeatureId::HedgeInFlight => None,
     })
 }
 
