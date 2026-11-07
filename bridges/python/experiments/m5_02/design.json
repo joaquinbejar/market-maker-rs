@@ -195,5 +195,31 @@
   "observations": 10000,
   "timed": 10000,
   "rule": "a fixed set from the first validation day of the first group under a hold; two loads of every frozen checkpoint must give identical actions"
- }
+ },
+ "compute": {
+  "machine": "Apple M4 Max",
+  "device": "cpu",
+  "threads_per_run": 1,
+  "estimate_job_minutes": {
+   "per_seed_market": {
+    "mlp": 6.6,
+    "ema": 7,
+    "history": 8,
+    "lstm": 40,
+    "gru_window": 18,
+    "hsn": 8
+   },
+   "market_training": 440,
+   "causal_training": 1320,
+   "evaluation_each_part": 120
+  },
+  "parallel": "as the shared cap allows, agreed on the bus",
+  "overrun_rule": "a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds",
+  "cut_rule": "if compute forces a cut, C drops to impact 0 and 1.0 and one Hawkes decay before any seed is cut, and the design states it"
+ },
+ "seen_before_freeze": [
+  "With an earlier draft at 10 s rows: one generation of the Hawkes days, and the mid range, the change of the mid per row and the touch sizes of training day 1 of each impact setting. No holdout or validation row was read.",
+  "Timing probes on 5000 synthetic rows (a random walk of the touch, not the design's data): 8192 PPO decisions of mlp, gru_window and hsn, timed and not evaluated (198, 534 and 246 microseconds a decision).",
+  "Smoke tests of every arm on 300 synthetic rows."
+ ]
 }

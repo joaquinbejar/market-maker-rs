@@ -187,3 +187,68 @@ def test_hsn_and_the_window_gru_see_the_current_observation():
     gru = nets.Recurrent(space, lay, cell="gru", embed=3, hidden=5, with_current=True)
     out = gru(x)[0]
     assert out[5 : 5 + lay.channels].tolist() == pytest.approx(values[0, 0].tolist())
+
+
+def _rows(count=300):
+    """A synthetic touch that walks a tick now and then, in kernel ticks and lots."""
+    rng = np.random.default_rng(0)
+    mid, rows = 10000, []
+    for i in range(count):
+        mid += int(rng.integers(-1, 2))
+        rows.append((i * 1_000_000_000, mid - 1, 3, mid + 1, 4))
+    return rows
+
+
+@pytest.fixture
+def synthetic_day(monkeypatch):
+    design, base = run_market.load()
+    rows = _rows()
+    probe = run_market.BoxMarketMakingEnv(run_market.m6.base_config(base, "0.0002"), rows)
+    digest = probe.bridge_info["dataset_digest"]
+    probe.close()
+    record = {"split": "validation", "group": "calm", "day": 15, "dataset_digest": digest}
+    monkeypatch.setattr(run_market, "read_rows", lambda *args, **kwargs: (rows, record))
+    return {("calm", 15): record}
+
+
+@pytest.mark.parametrize("arm", ["mlp", "ema", "history", "lstm", "gru_window", "hsn",
+                                 "avellaneda_stoikov"])
+def test_every_arm_builds_steps_and_evaluates_a_day(synthetic_day, arm):
+    design, base = run_market.load()
+    job = {"part": "market", "arm": arm, "fee": "0.0002", "data_dir": None,
+           "point": {"risk_aversion": "0.01", "volatility": "0.5", "order_intensity": "50",
+                     "horizon_ms": 86400000, "size": "1"}}
+    env = run_market.build_env(job, synthetic_day, "calm", 15, "validation")
+    try:
+        assert env.unwrapped.config["fill_model"] == base["execution"]["fill_model"]
+        if arm in run_market.WINDOWED:
+            assert env.observation_space.shape == (run_market.layout(design).size,)
+            model = run_market.model_of(design, base, arm, env, seed=1)
+            assert nets.parameter_count(model.policy) == pytest.approx(
+                design["parameters"]["target"], rel=design["parameters"]["tolerance"])
+            policy = model
+        elif arm == "avellaneda_stoikov":
+            policy = run_market.m6.ZeroResidual()
+        else:
+            policy = run_market.model_of(design, base, arm, env, seed=1)
+        day = run_market.m6.episode(policy, env, 101, arm == "lstm", base)
+        # One decision per row but the last, which only ends the day.
+        assert day["rows"] == day["decisions"] == len(_rows()) - 1
+    finally:
+        env.close()
+
+
+def test_the_window_starts_empty_on_every_day(synthetic_day):
+    design, _ = run_market.load()
+    job = {"part": "market", "arm": "hsn", "fee": "0.0002", "data_dir": None}
+    env = run_market.build_env(job, synthetic_day, "calm", 15, "validation")
+    try:
+        lay = run_market.layout(design)
+        env.reset(seed=101)
+        for _ in range(40):
+            env.step(np.asarray(run_market.m6.HOLD, dtype=np.float32))
+        obs, _ = env.reset(seed=101)
+        _, valid, _, _ = lay.split(torch.as_tensor(obs[None, :]))
+        assert valid[0].sum().item() == 1.0
+    finally:
+        env.close()
