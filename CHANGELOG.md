@@ -8,6 +8,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A `scheduled` baseline in the Python bridge's residual configuration: classical points in turn,
+  each change applying from the first decision that has observed its row, for #112's adaptive
+  and labelled arms. Existing baselines are unchanged.
 - The Python bridge builds against Python's stable ABI for 3.11 and loads on 3.11 and 3.12 (#284),
   both tested; nothing else in it changes.
 - The out-of-sample comparison of #102 in `bridges/python/experiments/m4_05`: a design fixed
