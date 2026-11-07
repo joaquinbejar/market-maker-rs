@@ -43,7 +43,10 @@ def test_without_the_flag_nothing_changes_and_with_it_the_space_is_version_4():
 def test_the_maskable_cancel_is_the_third_kind_and_always_allowed():
     env = MaskableMarketMakingEnv(cancelling(), LONG_ROWS)
     env.reset(seed=1)
-    assert list(env.action_masks()[:3]) == [True, True, True]
+    mask = env.action_masks()
+    # One value per choice of every dimension, the cancel among the kinds.
+    assert len(mask) == sum(env.action_space.nvec)
+    assert list(mask[:3]) == [True, True, True]
     assert env._decode([2, 0, 0, 0, 0]) == ("cancel", ())
     assert env._decode([0, 2, 2, 1, 1]) == ("hold", ())
     assert env._decode(BID)[0] == "quote"
