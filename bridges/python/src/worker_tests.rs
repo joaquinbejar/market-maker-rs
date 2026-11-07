@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use market_maker_rs::backtest::kernel::{KernelFillModel, quote_error_code};
 use market_maker_rs::rl::{
-    ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, OBSERVATION_SPACE_VERSION,
-    REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv,
+    ACTION_SPACE_VERSION, EPISODE_VERSION, EpisodeRecorder, HEDGED_ACTION_SPACE_VERSION,
+    HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION, OBSERVATION_SPACE_VERSION,
+    REWARD_VERSION, ResidualBounds, ResidualEnv, ResidualProposal, RlAction, RlEnv, SpecId,
 };
 use market_maker_rs::types::error::MMError;
 
@@ -390,6 +391,14 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
         }
         assert!(!known_versions(&later));
     }
+    // An environment with a hedge lane in a second instrument is not one this bridge drives.
+    let hedged = SpecId {
+        observation: HEDGED_OBSERVATION_SPACE_VERSION,
+        action: HEDGED_ACTION_SPACE_VERSION,
+        reward: HEDGED_REWARD_VERSION,
+        ..id
+    };
+    assert!(!known_versions(&hedged));
 }
 
 #[test]
@@ -780,4 +789,129 @@ fn test_hedge_actions_with_a_residual_policy_are_refused() {
         Worker::spawn(bridge, long_rows(), None),
         Err(BridgeError::Refused(reason)) if reason.contains("hedge_actions")
     ));
+}
+
+/// Rows ten seconds apart, the ask resting at 99.5 with one lot from the second row on:
+/// the hand computed bid of 2 at 99.5 is at the touch, one lot ahead of it.
+fn slow_rows() -> Vec<KernelTick> {
+    let row = |ms: u64, bid, ask| KernelTick {
+        ts_ns: ms * 1_000_000,
+        bid,
+        bid_lots: 1,
+        ask,
+        ask_lots: 1,
+    };
+    vec![
+        row(1_000, 199, 201),
+        row(11_000, 197, 199),
+        row(21_000, 197, 199),
+        row(31_000, 197, 199),
+        row(41_000, 197, 199),
+    ]
+}
+
+/// The delivered position after each step of a bid of 2 at 99.5, then holds.
+fn positions(fill_model: FillConfig) -> Vec<Decimal> {
+    let mut bridge = config("mark", "mask", 100);
+    bridge.fill_model = fill_model;
+    let mut worker = Worker::spawn(bridge, slow_rows(), None).unwrap();
+    worker.reset(1).unwrap();
+    let mut out = Vec::new();
+    let mut action = RlAction::Quote {
+        bid: 1,
+        ask: 2,
+        bid_size: 1,
+        ask_size: 0,
+    };
+    loop {
+        let reply = worker.step(action).unwrap();
+        out.push(reply.transition.observation.raw[6].unwrap());
+        if reply.transition.terminated || reply.transition.truncated {
+            return out;
+        }
+        action = RlAction::Hold;
+    }
+}
+
+#[test]
+fn test_a_rational_queue_rate_fills_over_rows_where_immediate_fills_at_once() {
+    let d = |text: &str| Decimal::from_str(text).unwrap();
+    // Immediate: the whole bid at the first row whose ask reaches it.
+    assert_eq!(
+        positions(FillConfig::Immediate)[..3],
+        [d("2"), d("2"), d("2")]
+    );
+    // One lot every 9 s, one ahead: after 10 s, 1 cleared and none for us; after 20 s, 2
+    // cleared and 1 for us; after 30 s, all of it.
+    let slow = FillConfig::QueuePositionRational {
+        lots: 1,
+        per_ms: 9_000,
+        min_queue_ms: 0,
+    };
+    assert_eq!(positions(slow)[..3], [d("0"), d("1"), d("2")]);
+}
+
+#[test]
+fn test_a_rational_queue_rate_is_configured_refused_at_zero_and_in_the_fingerprint() {
+    let json = |fill: &str| -> FillConfig { serde_json::from_str(fill).unwrap() };
+    let rational = json(
+        r#"{"kind": "queue_position_rational", "lots": 2, "per_ms": 5000, "min_queue_ms": 7}"#,
+    );
+    assert_eq!(
+        rational,
+        FillConfig::QueuePositionRational {
+            lots: 2,
+            per_ms: 5_000,
+            min_queue_ms: 7,
+        }
+    );
+    let mut bridge = config("mark", "mask", 100);
+    bridge.fill_model = rational.clone();
+    assert_eq!(
+        bridge.kernel().unwrap().fill_model,
+        KernelFillModel::QueuePositionRational {
+            lots: 2,
+            per_ms: 5_000,
+            min_queue_ms: 7,
+        }
+    );
+    // The kernel's fingerprint carries it, and the worker reports that fingerprint.
+    let info = |fill: FillConfig| {
+        let mut bridge = config("mark", "mask", 100);
+        bridge.fill_model = fill;
+        Worker::spawn(bridge, long_rows(), None)
+            .unwrap()
+            .info()
+            .kernel_fingerprint
+    };
+    let base = info(rational.clone());
+    assert_ne!(
+        base,
+        info(FillConfig::QueuePositionRational {
+            lots: 2,
+            per_ms: 5_001,
+            min_queue_ms: 7,
+        })
+    );
+    assert_ne!(base, info(FillConfig::Immediate));
+    // Refused as the kernel refuses it: no environment, nothing ran.
+    for (lots, per_ms) in [(0, 5_000), (2, 0)] {
+        let mut bridge = config("mark", "mask", 100);
+        bridge.fill_model = FillConfig::QueuePositionRational {
+            lots,
+            per_ms,
+            min_queue_ms: 7,
+        };
+        assert!(matches!(
+            Worker::spawn(bridge, long_rows(), None),
+            Err(BridgeError::Refused(_))
+        ));
+    }
+    // Unknown fields are refused, as for the other fill models.
+    assert!(
+        serde_json::from_str::<FillConfig>(
+            r#"{"kind": "queue_position_rational", "lots": 1, "per_ms": 2, "min_queue_ms": 0, "rate": "1"}"#
+        )
+        .is_err()
+    );
 }

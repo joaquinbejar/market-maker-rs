@@ -8,6 +8,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The offline evaluation support study of #104 in `bridges/python/experiments/m4_07`: a design
+  and a go or no-go rule fixed before any log (`design.json`, `decide.py`, with the change log of
+  every amendment and what was seen when), epsilon-greedy behaviours with recorded propensities
+  on #102's synthetic days, per-decision importance sampling, a direct method and a doubly robust
+  estimator with their diagnostics (`estimate.py`), a runner with a consistency check against
+  #102, a freeze and a single holdout (`run.py`), a coverage diagnostic of the Hyperliquid
+  capture's states, and a report (`report.py`). The rule reads diagnostics only. Synthetic data,
+  apart from the capture's states in the coverage diagnostic; the results are on the issue.
+- The Python bridge builds against Python's stable ABI for 3.11 and loads on 3.11 and 3.12 (#284),
+  both tested; nothing else in it changes.
 - The out-of-sample comparison of #102 in `bridges/python/experiments/m4_05`: a design fixed
   before any run (`design.json`, with the change log of every amendment and what was seen when),
   the digests of its synthetic queue-reactive days (example `qr_days`), a runner for selection,
@@ -25,10 +35,20 @@ project follows [Semantic Versioning](https://semver.org/).
   intensities per state, event sizes and estimates per day; and Poisson, queue-reactive and Hawkes
   flow on the holdout, the Hawkes decay chosen on validation. The protocol is fixed in the code
   before any data is read: the longest stretch with no reset, split by time into training,
-  validation and holdout, the holdout used for no choice, no randomness, fees declared and
-  funding not applied. It streams the files, keeps only thinned inputs and says what it keeps.
-  Not evaluated: #90 (b) and (c), which need a data trajectory the replay does not expose; #77,
-  #180 and #91 (b) do not apply to this capture. No data is in the repository.
+  validation and holdout, the holdout used for no choice, one fixed seed for the model runs,
+  fees declared and funding not applied. It streams the files, keeps only thinned inputs and
+  says what it keeps. #90 (b), (c) and (d) compare the data's sampled book and queue events with
+  the fitted model and its constant intensity baseline on declared windows (#263). #77, #180
+  and #91 (b) do not apply to this capture. No data is in the repository.
+- `backtest::hyperliquid` samples the rebuilt book on a time grid (#263), behind `serde`:
+  `ReplayConfig::with_book_samples` asks for the book at each multiple of an interval, showing
+  every diff before that time, in `ReplayOutput::book` as `BookLevels` (sizes by limit from the
+  mid, by the depths' rule, and the touch). A reset leaves no sample across the silence that
+  caused it, and grid times without a two sided touch are counted in
+  `Coverage::book_samples_without_touch`. `book_samples` converts them, warm ones only, into the
+  queue reactive model's `BookSample`, in event sizes as `queue_observations` counts a queue, with
+  the spread as the touch's width in ticks, so a data `Trajectory` can go to
+  `compare_trajectories`. Without the option nothing is sampled.
 - Hedge actions in the Python bridge (#258): `"hedge_actions": true` in its configuration builds
   the environment with `RlConfig::with_hedge_actions`, so its specification states
   `HedgeActions::MarketableAtTouch`; off by default, a configuration keeps its specification and
@@ -37,6 +57,33 @@ project follows [Semantic Versioning](https://semver.org/).
   hedge, binned over the sizes, a hedge outside the mask being a charged hold. A hedge replaces
   the resting orders, so the other values are then not read. A residual environment refuses the
   flag, and a checkpoint loads only into an environment with the same one.
+- Hedges in a second instrument from the RL action space (feature `rl`, #256):
+  `RlEnv::new_hedged` builds an environment over a `HedgedKernel`, with hedge sizes and
+  `HedgeScales`. `RlAction::CrossHedge` sends the lane's immediate-or-cancel order on the side
+  that reduces the net exposure of both lanes' delivered positions, never past zero, as
+  `CrossHedgeSpace` states; `RlEnv::cross_hedge_mask` and `Transition::cross_hedge_mask` give
+  the sizes allowed, and one outside them follows the declared `InvalidActionPolicy`, with
+  `rl::ERR_CROSS_HEDGE_REFUSED`. `RlEnv::observe_hedge` and `Transition::hedge_observation`
+  give the hedge features (`FeatureId::HEDGE`): the hedge spread, the basis to the quoted mid,
+  the hedge row's age, the hedge position and whether a hedge is in flight. The reward adds the
+  hedge lane's cash, fees, funding and position at its last mid, and a close at the touch closes
+  both lanes. Such an environment's specification is of observation version 2, action version 3
+  and reward version 2; one without a lane keeps versions 1, 2 and 1 and its identity, so its
+  checkpoints and the Python bridge are unchanged. `RlEnv::reconcile` checks the quoted lane
+  against the attribution, the hedge lane's net being its own ledger's. Synthetic data only.
+- A hedge lane in a second instrument for the kernel (feature `kernel`, #256): `HedgedKernel`
+  runs a `FinancialKernel` on the quoted instrument with a hedge lane on a spot or linear
+  perpetual on the same underlying, with its own grid, fees, limits and data
+  (`HedgeLaneConfig`). `HedgedAction::Hedge` sends an immediate-or-cancel order at the observed
+  hedge touch, one at a time; after the submission delay it fills at the touch standing then, up
+  to its lots, and is cancelled if the touch moved through its limit or the lane went stale. A
+  perpetual pays a declared funding schedule on the venue position at the last mid before each
+  payment, rounded half to even. `CombinedLimits` bound the net exposure and the gross notional
+  of both lanes, live orders filled at worst, for every order of either lane, apart from the
+  policy and its masks. The lanes meet only at decisions, so the hedge lane runs to each decision
+  time in order; at equal times the quoted lane comes first. The lane's integers are checked
+  against a `Decimal` shadow; no engine runs two instruments, so it is checked by hand-computed
+  fixtures, and the quoted lane alone is unchanged. Synthetic data only.
 - Hedge actions in the RL action space (feature `rl`, #247): with
   `RlConfig::with_hedge_actions`, `rl::RlAction::Hedge` reduces the delivered position with a
   marketable limit order at the observed touch, of a size from the order size grid and never
@@ -64,6 +111,11 @@ project follows [Semantic Versioning](https://semver.org/).
   so nothing is substituted silently and a run can tell a holding strategy from a failing one.
   `GlftQuoter::new` and `with_form` build one. The Python bridge's GLFT baseline takes an
   optional `form`, `exact` by default.
+- The Python bridge takes the kernel's rational queue position rate (#269):
+  `{"kind": "queue_position_rational", "lots": n, "per_ms": d, "min_queue_ms": m}` as its
+  `fill_model`, mapped to `KernelFillModel::QueuePositionRational`, refused at a zero `lots` or
+  `per_ms` as the kernel refuses it, and carried by the kernel's fingerprint that the bridge
+  reports. Existing configurations and their fingerprints are unchanged.
 - `options::surface::upstream` (#96), behind `options`: `UpstreamSurface` reads OptionStratLib's
   calibrated `ImpliedVolatilitySurface` and its derivatives as a `VolSurface`, so the pricer and
   the chain take it unchanged; the interpolation, wings and short and long expiries are
