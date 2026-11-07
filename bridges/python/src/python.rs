@@ -59,6 +59,7 @@ fn reset_dict<'py>(py: Python<'py>, reply: &ResetReply) -> PyResult<Bound<'py, P
     let out = PyDict::new(py);
     out.set_item("observation", observation_dict(py, &reply.observation)?)?;
     out.set_item("mask", mask_dict(py, &reply.mask)?)?;
+    out.set_item("hedge_mask", reply.hedge_mask)?;
     out.set_item("done", reply.done)?;
     Ok(out)
 }
@@ -103,6 +104,7 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
     let out = PyDict::new(py);
     out.set_item("observation", observation_dict(py, &t.observation)?)?;
     out.set_item("mask", mask_dict(py, &t.mask)?)?;
+    out.set_item("hedge_mask", t.hedge_mask)?;
     out.set_item("reward_f32", t.reward.as_f32)?;
     out.set_item("reward", exact(t.reward.total))?;
     out.set_item("ledger_change", exact(t.reward.ledger_change))?;
@@ -238,6 +240,7 @@ impl NativeEnv {
         out.set_item("features", info.features)?;
         out.set_item("offsets", info.offsets)?;
         out.set_item("sizes", info.sizes)?;
+        out.set_item("hedge_actions", info.hedge_actions)?;
         out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
         out.set_item("dataset_digest", hex(info.dataset_digest))?;
         out.set_item("rows", info.rows)?;
@@ -285,6 +288,12 @@ impl NativeEnv {
     ) -> PyResult<Py<PyDict>> {
         let side = if bid { QuoteSide::Bid } else { QuoteSide::Ask };
         self.take_step(py, RlAction::OneSided { side, offset, size })
+    }
+
+    /// Reduces the delivered position with a marketable order at the observed touch, of the
+    /// size at `size` in the grid's sizes.
+    fn step_hedge(&self, py: Python<'_>, size: usize) -> PyResult<Py<PyDict>> {
+        self.take_step(py, RlAction::Hedge { size })
     }
 
     /// Takes one decision of a residual policy.

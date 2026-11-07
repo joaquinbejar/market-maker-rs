@@ -21,6 +21,17 @@ The trainer is pinned: `stable-baselines3==2.9.2` and `sb3-contrib==2.9.2`, on t
 one thread per run. `MaskablePPO` here has no Box actions and no recurrence, and a Box
 cannot state a mask, so the continuous encoding uses the reject policy.
 
+With `"hedge_actions": true` in the configuration (off by default, which keeps a
+configuration's specification and fingerprint), the action space has hedges in the quoted
+instrument, as the library's `HedgeActions::MarketableAtTouch` states: a marketable order at the
+observed touch on the side that reduces the delivered position, of a size from the grid of
+sizes and never larger than that position; a flat position allows none. The maskable encoding
+adds a sixth value, 0 for no hedge and `i + 1` for the size `i`, masked by `hedge_mask`; the
+continuous one adds a sixth value, above zero for a hedge of the size at bin `(2 v - 1)`, and a
+hedge outside the mask is a charged hold. Either way a hedge replaces the resting orders, so the
+other values are not read. A residual environment takes no hedge actions and refuses the flag. A
+checkpoint loads only into an environment with the same flag.
+
 Money crosses the boundary only as decimal strings and rows as integer ticks and lots. The
 `f32` reward is the kernel's derived value, and `info` holds the exact reward and net result,
 together with the proposed, decoded and applied action.

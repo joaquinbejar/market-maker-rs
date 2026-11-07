@@ -18,7 +18,12 @@ use market_maker_rs::rl::{
 use super::*;
 
 fn config(terminal: &str, policy: &str, max_steps: u64) -> BridgeConfig {
-    BridgeConfig::from_json(&format!(
+    BridgeConfig::from_json(&config_text(terminal, policy, max_steps)).unwrap()
+}
+
+/// The JSON of [`config`].
+fn config_text(terminal: &str, policy: &str, max_steps: u64) -> String {
+    format!(
         r#"{{
             "tick_size": "0.5", "lot_size": "1", "max_price": "1000", "max_order_size": "10",
             "max_steps": {max_steps}, "fee_rate": "0.001", "initial_capital": "0",
@@ -32,8 +37,7 @@ fn config(terminal: &str, policy: &str, max_steps: u64) -> BridgeConfig {
             "f32_unit": "1", "invalid_action": "{policy}", "invalid_action_penalty": "0.25",
             "terminal": "{terminal}"
         }}"#
-    ))
-    .unwrap()
+    )
 }
 
 /// The hand computed long trajectory of the crate's own tests, on its grid.
@@ -574,4 +578,91 @@ fn test_baselines_parse_to_what_they_state() {
             session_start_ms: 0,
         })
     );
+}
+
+#[test]
+fn test_worker_with_hedge_actions_is_equal_to_a_direct_environment_and_hedges() {
+    let rows: Vec<KernelTick> = (0..200_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect();
+    let mut bridge = config("close", "reject", 1000);
+    bridge.hedge_actions = true;
+    bridge.latency = LatencyConfig {
+        quantum_ns: 1_000_000,
+        observation_q: 1,
+        submit_q: 1,
+        cancel_q: 1,
+        ack_q: 2,
+        jitter_q: 2,
+    };
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    assert_eq!(env.spec().action.hedge, HedgeActions::MarketableAtTouch);
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let info = worker.info();
+    assert!(info.hedge_actions);
+    assert_eq!(info.spec, env.spec().id());
+    let mut recorder = EpisodeRecorder::default();
+    let mut state = env.reset_with(9, &mut recorder).unwrap();
+    let reset = worker.reset(9).unwrap();
+    assert_eq!(reset.hedge_mask, env.hedge_mask(&state));
+    // Quote, and hedge whenever the hedge mask allows the first size: a hedge is taken.
+    let (mut step, mut hedges) = (0, 0);
+    while !state.is_done() {
+        let action = if env.hedge_mask(&state) & 1 == 1 && step % 3 == 0 {
+            hedges += 1;
+            RlAction::Hedge { size: 0 }
+        } else {
+            actions(step)
+        };
+        let direct = env.step_with(&mut state, action, &mut recorder).unwrap();
+        let through = worker.step(action).unwrap();
+        assert_eq!(through.transition, direct, "step {step}");
+        assert_eq!(through.net, state.net());
+        step += 1;
+    }
+    assert!(hedges > 0, "no hedge was taken");
+    env.reconcile(&state, &recorder).unwrap();
+}
+
+#[test]
+fn test_hedge_actions_are_off_by_default_and_change_the_specification() {
+    let plain = Worker::spawn(config("close", "mask", 100), long_rows(), None).unwrap();
+    assert!(!plain.info().hedge_actions);
+    let mut bridge = config("close", "mask", 100);
+    assert!(!bridge.hedge_actions);
+    bridge.hedge_actions = true;
+    let hedged = Worker::spawn(bridge, long_rows(), None).unwrap();
+    let (p, h) = (plain.info().spec, hedged.info().spec);
+    // The same versions, so the bridge drives both; another identity.
+    assert!(known_versions(&p) && known_versions(&h));
+    assert_ne!(p.fingerprint, h.fingerprint);
+    // The flag in the configuration.
+    let mut json: serde_json::Value =
+        serde_json::from_str(&config_text("close", "mask", 100)).unwrap();
+    json["hedge_actions"] = serde_json::Value::Bool(true);
+    let parsed = BridgeConfig::from_json(&json.to_string()).unwrap();
+    assert!(parsed.hedge_actions);
+}
+
+#[test]
+fn test_hedge_actions_with_a_residual_policy_are_refused() {
+    let mut bridge = residual_config(AVELLANEDA);
+    bridge.hedge_actions = true;
+    assert!(matches!(
+        Worker::spawn(bridge, long_rows(), None),
+        Err(BridgeError::Refused(reason)) if reason.contains("hedge_actions")
+    ));
 }
