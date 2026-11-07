@@ -906,3 +906,28 @@ fn test_a_rational_queue_rate_is_configured_refused_at_zero_and_in_the_fingerpri
         .is_err()
     );
 }
+
+#[test]
+fn test_worker_counts_the_order_reports_of_each_step() {
+    let mut worker = Worker::spawn(config("close", "mask", 100), long_rows(), None).unwrap();
+    worker.reset(1).unwrap();
+    let counts = |accepted, canceled, fills| OrderCounts {
+        accepted,
+        rejected: 0,
+        canceled,
+        cancel_rejected: 0,
+        fills,
+    };
+    // Two orders rest and the bid fills on the next row.
+    assert_eq!(
+        worker.step(quote(1, 2, 1, 0)).unwrap().orders,
+        counts(2, 0, 1)
+    );
+    // A new quote cancels the ask still resting and places two more.
+    assert_eq!(
+        worker.step(quote(2, 2, 0, 0)).unwrap().orders,
+        counts(2, 1, 0)
+    );
+    // A hold sends nothing; the close at the end is not an order.
+    assert_eq!(worker.step(RlAction::Hold).unwrap().orders, counts(0, 0, 0));
+}
