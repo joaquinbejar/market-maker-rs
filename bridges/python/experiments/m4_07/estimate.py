@@ -40,6 +40,25 @@ def log_window_weights(rho, window=None):
     return out
 
 
+def log_previous_weights(rho, window=None):
+    """The log of the product of the ratios in the target's window before each decision's own
+    ratio: over decisions t - window + 1 to t - 1, or 0 to t - 1 when `window` is None; 0 (a
+    weight of 1) where that span is empty, as at the first decision or for a window of 1."""
+    rho = np.asarray(rho, dtype=float)
+    if window is not None and window < 1:
+        raise ValueError("a window has at least one decision")
+    before = np.concatenate(([1.0], rho[:-1]))
+    if window is None:
+        out = log_window_weights(before)
+        out[0] = 0.0
+        return out
+    if window == 1:
+        return np.zeros(len(rho))
+    out = log_window_weights(before, window - 1)
+    out[0] = 0.0
+    return out
+
+
 def _stack(arrays, fill=0.0):
     """Trajectories as one matrix. Every estimator here normalizes at each decision across
     trajectories, so a trajectory that ended earlier would leave the denominator and the
@@ -81,19 +100,23 @@ def direct(predicted_target):
     return float(np.mean([np.sum(p) for p in predicted_target]))
 
 
-def doubly_robust(rewards, log_weights, predicted_logged, predicted_target):
+def doubly_robust(rewards, log_weights, predicted_logged, predicted_target, log_previous=None):
     """Per-decision doubly robust with a one-step reward model, the weights normalized at each
     decision across trajectories:
     sum over t of mean_w(r - q(s, a)) + mean_w_prev(q(s, pi(s))),
-    where `w_prev` is the weight before the decision's own ratio (1 at the first decision)."""
+    where `w_prev` is the weight before the decision's own ratio (1 at the first decision):
+    `log_previous` from `log_previous_weights` with the same window; without it, the weights
+    are taken as cumulative from the first decision, and shifted by one."""
     r = _stack(rewards)
     w = per_decision(log_weights)
     q_logged = _stack(predicted_logged)
     q_target = _stack(predicted_target)
     present = _stack([np.ones(len(x)) for x in rewards])
     # The weight before each decision's own ratio, normalized at that decision.
-    log_prev = [np.concatenate(([0.0], np.asarray(lw, dtype=float)[:-1])) for lw in log_weights]
-    w_prev = per_decision(log_prev) * present
+    if log_previous is None:
+        log_previous = [np.concatenate(([0.0], np.asarray(lw, dtype=float)[:-1]))
+                        for lw in log_weights]
+    w_prev = per_decision(log_previous) * present
     return float((_mean_by(w, r - q_logged) + _mean_by(w_prev, q_target)).sum())
 
 

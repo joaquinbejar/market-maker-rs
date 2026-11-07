@@ -219,3 +219,34 @@ def test_the_row_estimators_equal_the_list_ones():
                                          units, 2.0, 50, 104)
     assert point == pytest.approx(est.pdwis(rewards, log_w))
     assert low <= high
+
+
+def test_the_previous_weight_is_the_targets_window_without_its_own_ratio():
+    rho = [2.0, 3.0, 0.5, 4.0]
+    # Full window: the product of every ratio before the decision.
+    assert np.exp(est.log_previous_weights(rho)) == pytest.approx([1.0, 2.0, 6.0, 3.0])
+    # A window of 1 holds the decision's own ratio only, so nothing comes before it.
+    assert np.exp(est.log_previous_weights(rho, 1)) == pytest.approx([1.0, 1.0, 1.0, 1.0])
+    # A window of 2: the one ratio before the decision.
+    assert np.exp(est.log_previous_weights(rho, 2)) == pytest.approx([1.0, 2.0, 3.0, 0.5])
+    # A window of 3: the two before it.
+    assert np.exp(est.log_previous_weights(rho, 3)) == pytest.approx([1.0, 2.0, 6.0, 1.5])
+    with pytest.raises(ValueError):
+        est.log_previous_weights(rho, 0)
+
+
+def test_a_window_one_doubly_robust_weights_the_target_term_by_one():
+    # Rewards 1, a model of 0 for the logged action and 10 then 20 for the target's: at the
+    # second decision both trajectories' previous weights are 1, so the target term is 15,
+    # where the shifted window weights 2 and 0 would give 10.
+    rho = [np.array([2.0, 2.0]), np.array([0.0, 2.0])]
+    rewards = [np.ones(2), np.ones(2)]
+    logged = [np.zeros(2), np.zeros(2)]
+    target = [np.array([0.0, 10.0]), np.array([0.0, 20.0])]
+    log_w = [est.log_window_weights(r, 1) for r in rho]
+    log_prev = [est.log_previous_weights(r, 1) for r in rho]
+    assert est.doubly_robust(rewards, log_w, logged, target, log_prev) == pytest.approx(17.0)
+    r = est.stacked(rewards)
+    present = est.stacked([np.ones(2), np.ones(2)])
+    assert est.doubly_robust_rows(r, est.stacked(log_w), est.stacked(log_prev), est.stacked(logged),
+                                  est.stacked(target), present) == pytest.approx(17.0)

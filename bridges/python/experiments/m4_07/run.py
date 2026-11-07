@@ -577,7 +577,7 @@ def assess(study, split, behaviour, target, data, rewards, q_logged, units, wind
     if window is None:
         window = est.choose_window(ess, rule.MIN_EFFECTIVE_SAMPLE)
     log_w = [est.log_window_weights(r, window) for r in data["rho"]]
-    log_prev = [np.concatenate(([0.0], lw[:-1])) for lw in log_w]
+    log_prev = [est.log_previous_weights(r, window) for r in data["rho"]]
     r = est.stacked(rewards)
     lw = est.stacked(log_w, fill=-np.inf)
     lp = est.stacked(log_prev, fill=-np.inf)
@@ -789,6 +789,46 @@ def coverage(study, tops_path, ticks):
     return report
 
 
+def reanalysis(study):
+    """After the holdout was read: the validation and holdout estimates again, from the same
+    logs and with the frozen choices (windows, ridge alphas, counting bins), with the doubly
+    robust estimator's previous weight corrected to the target's window without its own ratio.
+    Nothing is chosen here; the original reports stay as they were, and these are written
+    beside them, labelled."""
+    frozen = json.loads((study.out / "frozen.json").read_text())
+    check_frozen_inputs(study.out, frozen)
+    validation_report = json.loads((study.out / "validation.json").read_text())
+    if frozen["validation_sha256"] != sha256(study.out / "validation.json"):
+        raise ValueError("validation.json changed after the freeze")
+    edges = validation_report["imbalance_edges"]
+    train = [r for r in log_paths(study, "train") if r["behaviour"] == "as_grid_eps30"]
+    counting = counting_table(study, train, edges)
+    out = {}
+    for split in ("validation", "holdout"):
+        rows = []
+        for name in behaviours(study):
+            logged = "as_grid_eps30" if name == COUNTED else name
+            beta = np.asarray(validation_report["direct_method"][logged]["beta"])
+            names, per_target, rewards, q_logged, units = trajectories(
+                study, split, name, beta, counting, edges)
+            for target in names:
+                window = validation_report["settings"][f"{name}/{target}"]
+                rows.append(assess(study, split, name, target, per_target[target], rewards,
+                                   q_logged, units, window))
+        report = study.header(f"{split} reanalysis")
+        report["note"] = ("recomputed after the holdout was read, with the doubly robust "
+                          "estimator's previous weight corrected; same logs and frozen choices")
+        report["frozen_sha256"] = sha256(study.out / "frozen.json")
+        report["rows"] = rows
+        report["truth"] = truth_by_target(study, split)
+        report["out_of_support_by_construction"] = study.design["out_of_support_by_construction"]
+        if split == "holdout":
+            report["real_data"] = study.design["decision_rule"]["real_data"]
+        study.write(f"{split}-reanalysis", report)
+        out[split] = {"rows": len(rows)}
+    return out
+
+
 def main():
     step, data_dir, run_dir, out_dir, commit = sys.argv[1:6]
     study = Study(data_dir, run_dir, out_dir, commit)
@@ -807,6 +847,8 @@ def main():
         report = freeze(study)
     elif step == "holdout":
         report = holdout(study, sys.argv[6])
+    elif step == "reanalysis":
+        report = reanalysis(study)
     elif step == "coverage":
         report = coverage(study, sys.argv[6], sys.argv[7:])
     else:
