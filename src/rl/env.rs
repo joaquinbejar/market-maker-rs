@@ -4,14 +4,14 @@ use rust_decimal::prelude::ToPrimitive;
 
 use crate::Decimal;
 use crate::backtest::evaluation::{
-    EvaluationError, EvaluationInput, ExecutedFill, HedgeNotModelledReason, LedgerTotals, Mark,
-    MetricId, MetricUnit, attribute,
+    EvaluationError, EvaluationInput, ExecutedFill, FundingPayment, HedgeNotModelledReason,
+    LedgerTotals, Mark, MetricId, MetricUnit, attribute,
 };
 use crate::backtest::kernel::{
-    ActionGrid, ActionMask, ActionStatus, ErrCode, EventSink, FinancialKernel, HedgeInstrument,
-    HedgeLane, HedgeLaneConfig, HedgeRefusal, HedgeView, HedgedAction, HedgedKernel, KernelAction,
-    KernelConfig, KernelDataset, KernelEvent, KernelState, KernelTick, NoSink, Observation,
-    QueueLengths, QuoteSide, Status, StepOutcome, TermReason,
+    ActionGrid, ActionMask, ActionStatus, ErrCode, EventSink, FinancialKernel, HedgeEvent,
+    HedgeInstrument, HedgeLane, HedgeLaneConfig, HedgeRefusal, HedgeView, HedgedAction,
+    HedgedKernel, KernelAction, KernelConfig, KernelDataset, KernelEvent, KernelState, KernelTick,
+    NoSink, Observation, QueueLengths, QuoteSide, Status, StepOutcome, TermReason,
 };
 use crate::execution::Action;
 use crate::strategy::walk_forward::TimeWindow;
@@ -294,6 +294,10 @@ impl<E: EventSink> EventSink for Tap<'_, E> {
 
     fn queues(&mut self, lengths: QueueLengths) {
         self.inner.queues(lengths);
+    }
+
+    fn hedge(&mut self, event: HedgeEvent) {
+        self.inner.hedge(event);
     }
 }
 
@@ -980,12 +984,14 @@ impl<
         settled
     }
 
-    /// An episode's records in the form of the evaluation.
+    /// An episode's records in the form of the evaluation; with a hedge lane, its records
+    /// too, its terminal close included, and a window that covers both lanes (#266).
     ///
     /// # Errors
     ///
-    /// Returns [`EvaluationError::InvalidInput`] with no completed row, and
-    /// [`EvaluationError::Inexact`] if a value does not convert.
+    /// Returns [`EvaluationError::InvalidInput`] with no completed row or with a hedge
+    /// row that has no positive mid, and [`EvaluationError::Inexact`] if a value does
+    /// not convert.
     pub fn records(
         &self,
         state: &RlState<ORD, MSG, DLV, OBS>,
@@ -1031,28 +1037,111 @@ impl<
                 base_fee: Decimal::ZERO,
             });
         }
-        let last = |records: &[u64]| records.last().copied().unwrap_or(0);
-        let mark_times: Vec<u64> = marks.iter().map(|m| m.timestamp_ms).collect();
-        let fill_times: Vec<u64> = fills.iter().map(|f| f.timestamp_ms).collect();
-        let Some(start_ms) = mark_times.first().copied() else {
+        let (hedge_marks, hedge_fills, hedge_funding) = self.hedge_records(state, recorder)?;
+        let Some(first_mark) = marks.first().map(|m| m.timestamp_ms) else {
             return Err(EvaluationError::InvalidInput {
                 reason: "the episode has no completed row".to_string(),
             });
         };
-        let end_ms = last(&mark_times)
-            .max(last(&fill_times))
-            .checked_add(1)
-            .ok_or(convert("window"))?;
+        let times = marks
+            .iter()
+            .map(|m| m.timestamp_ms)
+            .chain(fills.iter().map(|f| f.timestamp_ms))
+            .chain(hedge_marks.iter().map(|m| m.timestamp_ms))
+            .chain(hedge_fills.iter().map(|f| f.timestamp_ms))
+            .chain(hedge_funding.iter().map(|f| f.timestamp_ms));
+        let (start_ms, last_ms) = times.fold((first_mark, first_mark), |(lo, hi), t| {
+            (lo.min(t), hi.max(t))
+        });
+        let end_ms = last_ms.checked_add(1).ok_or(convert("window"))?;
         Ok(EpisodeRecords {
             window: TimeWindow { start_ms, end_ms },
             marks,
             fills,
+            hedge_marks,
+            hedge_fills,
+            hedge_funding,
         })
+    }
+
+    /// The hedge lane's records, its terminal close included; empty without a lane.
+    #[allow(clippy::type_complexity)]
+    fn hedge_records(
+        &self,
+        state: &RlState<ORD, MSG, DLV, OBS>,
+        recorder: &EpisodeRecorder,
+    ) -> Result<(Vec<Mark>, Vec<ExecutedFill>, Vec<FundingPayment>), EvaluationError> {
+        let convert = |what| EvaluationError::Inexact { what };
+        let Some(cross) = &self.cross else {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        };
+        let scale = cross.kernel.lane_money_scale();
+        let money = |units: i128| {
+            Decimal::try_from_i128_with_scale(units, scale).map_err(|_| convert("hedge money"))
+        };
+        let ms = |ns: u64| ns.checked_div(NS_PER_MS).unwrap_or(0);
+        let (mut marks, mut fills, mut funding) = (Vec::new(), Vec::new(), Vec::new());
+        for event in &recorder.hedge {
+            match *event {
+                HedgeEvent::Row { row, ts_ns, mid2 } => {
+                    let mid2 = mid2.ok_or_else(|| EvaluationError::InvalidInput {
+                        reason: format!("hedge row {row} has no positive mid"),
+                    })?;
+                    let mid = Decimal::from(mid2)
+                        .checked_mul(cross.tick)
+                        .and_then(|m| m.checked_mul(Decimal::new(5, 1)))
+                        .ok_or(convert("hedge mark"))?;
+                    marks.push(Mark {
+                        timestamp_ms: ms(ts_ns),
+                        mid,
+                    });
+                }
+                HedgeEvent::Fill {
+                    ts_ns,
+                    side,
+                    price,
+                    lots,
+                    fee_u,
+                } => fills.push(ExecutedFill {
+                    timestamp_ms: ms(ts_ns),
+                    side,
+                    price: Decimal::from(price)
+                        .checked_mul(cross.tick)
+                        .ok_or(convert("hedge fill price"))?,
+                    quantity: Decimal::from(lots)
+                        .checked_mul(cross.lot)
+                        .ok_or(convert("hedge fill size"))?,
+                    quote_fee: money(fee_u)?,
+                    base_fee: Decimal::ZERO,
+                }),
+                HedgeEvent::Funding {
+                    at_ns, received_u, ..
+                } => funding.push(FundingPayment {
+                    timestamp_ms: ms(at_ns),
+                    amount: money(received_u)?,
+                }),
+            }
+        }
+        if let Some((close, _)) = state.hedge_close {
+            fills.push(ExecutedFill {
+                timestamp_ms: ms(close.ts_ns),
+                side: close.side,
+                price: close.price,
+                quantity: close.quantity,
+                quote_fee: close.fee,
+                base_fee: Decimal::ZERO,
+            });
+        }
+        Ok((marks, fills, funding))
     }
 
     /// Checks the reward against the evaluation: [`RlState::net`] must equal the net
     /// result of [`attribute`] over the same marks and fills to the last digit, and the
     /// position left must agree. Holds at every decision, not only at the end.
+    ///
+    /// With a hedge lane, each lane is checked against its own records (#266): the
+    /// hedge lane's attribution against its ledger's net, its close included, and its
+    /// final position against the lane's; the quoted lane's against the rest of the net.
     ///
     /// # Errors
     ///
@@ -1078,8 +1167,9 @@ impl<
                     .position
             }
         };
-        // With a hedge lane, the attribution covers the quoted lane: the hedge lane's net,
-        // its close included, is its own ledger's, checked by its shadow.
+        // With a hedge lane, each lane is attributed against its own records (#266): the
+        // hedge lane's net, its close included, is its ledger's, checked by its shadow,
+        // and the quoted lane's is the rest of the net.
         let lane = self
             .lane_net(state)
             .ok()
@@ -1087,14 +1177,40 @@ impl<
             .ok_or(EvaluationError::Inexact {
                 what: "hedge lane net",
             })?;
-        let quoted = state
-            .net
-            .checked_sub(lane)
-            .ok_or(EvaluationError::Inexact { what: "quoted net" })?;
-        attribute(&input)?.reconcile(LedgerTotals {
-            net_pnl: quoted,
+        let quoted = LedgerTotals {
+            net_pnl: state
+                .net
+                .checked_sub(lane)
+                .ok_or(EvaluationError::Inexact { what: "quoted net" })?,
             position,
-        })
+        };
+        let (Some(cross), Some(hedge_lane)) = (&self.cross, state.lane.as_ref()) else {
+            return attribute(&input)?.reconcile(quoted);
+        };
+        let hedge_position = match state.hedge_close {
+            Some(_) => Decimal::ZERO,
+            None => {
+                cross
+                    .kernel
+                    .summary_parts(&state.kernel, hedge_lane)
+                    .map_err(|error| EvaluationError::InvalidInput {
+                        reason: error.to_string(),
+                    })?
+                    .position
+            }
+        };
+        let input = input.with_hedge(
+            &records.hedge_marks,
+            &records.hedge_fills,
+            &records.hedge_funding,
+        )?;
+        attribute(&input)?.reconcile_lanes(
+            quoted,
+            LedgerTotals {
+                net_pnl: lane,
+                position: hedge_position,
+            },
+        )
     }
 
     fn check_owned(&self, state: &RlState<ORD, MSG, DLV, OBS>) -> MMResult<()> {
