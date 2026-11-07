@@ -1,0 +1,725 @@
+{
+  "days": [
+    {
+      "dataset_digest": "797d7b59b75286b345173146c5e5669b",
+      "day": 1,
+      "market_orders": 143710,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000004,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "03653707562f47e3a69cf8dce8707de3",
+      "day": 1,
+      "market_orders": 143710,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000004,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "af40e8475a6410f2b33a66c7b9ad14f3",
+      "day": 1,
+      "market_orders": 143710,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000004,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "8187f9f32af30d0b8913c1bd35013a90",
+      "day": 2,
+      "market_orders": 143358,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000005,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "3fc2fdcf6e039828d01de28948bb25cc",
+      "day": 2,
+      "market_orders": 143358,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000005,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f192950ed8b2470b3b1ae26b0c6f0ca1",
+      "day": 2,
+      "market_orders": 143358,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000005,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "54fb55bf61720e4af67461a406a9b260",
+      "day": 3,
+      "market_orders": 144572,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000006,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "4e27068ce661637009a9310e1b2d84ab",
+      "day": 3,
+      "market_orders": 144572,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000006,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "d03597e1cda218818757c7addcd488ec",
+      "day": 3,
+      "market_orders": 144572,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000006,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "a6ecdc7c58621b6b72e1eb3fa728f57a",
+      "day": 4,
+      "market_orders": 142905,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000007,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "d51ea32046100329fc93896b12b7d81e",
+      "day": 4,
+      "market_orders": 142905,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000007,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "2cc3ea208909c3f60420ab3640f43aca",
+      "day": 4,
+      "market_orders": 142905,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000007,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "5f1a087886fad3af2a9066afef90cb2d",
+      "day": 5,
+      "market_orders": 144583,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000008,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "add60f76a41042e59c5079aee9f0bd98",
+      "day": 5,
+      "market_orders": 144583,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000008,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "1814f3d28abd476d3ebd6a247d0d6ffe",
+      "day": 5,
+      "market_orders": 144583,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000008,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "cbf72e123ea6a8ce050570ceea633e31",
+      "day": 6,
+      "market_orders": 142318,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000009,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "6677561d148497ca033fba175fef1310",
+      "day": 6,
+      "market_orders": 142318,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000009,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "29cf132da195a229560b1ebb7a7a07c2",
+      "day": 6,
+      "market_orders": 142318,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000009,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "d36da7146fac55f32da0823b5c9488bd",
+      "day": 7,
+      "market_orders": 144120,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000010,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "86221d8fd06298c6acdc1186dbdb8869",
+      "day": 7,
+      "market_orders": 144120,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000010,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "155cd4036bffd5f6cfc4cdd4ae6d0d5d",
+      "day": 7,
+      "market_orders": 144120,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000010,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "b86878dd81ebbdba83e8547b62daaf82",
+      "day": 8,
+      "market_orders": 144373,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000011,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f04b7f433c5a1e52943982a065df5951",
+      "day": 8,
+      "market_orders": 144373,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000011,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f3000b9cebd95599f6643e7c5c14096a",
+      "day": 8,
+      "market_orders": 144373,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000011,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "770c8acc9d22d3c9bbd608290e213c2e",
+      "day": 9,
+      "market_orders": 143679,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000012,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "9ab6f7c4283621251370214c40f0cc3e",
+      "day": 9,
+      "market_orders": 143679,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000012,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "3d212707d745548e2ef51d84999547a5",
+      "day": 9,
+      "market_orders": 143679,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000012,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "faf9a4904d77f87cd0635b6e4924cb3d",
+      "day": 10,
+      "market_orders": 142567,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000013,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "af314a04142d840f989a604ed3eff992",
+      "day": 10,
+      "market_orders": 142567,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000013,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "c3b6bbcce3dd84b7de7eb144a1521bba",
+      "day": 10,
+      "market_orders": 142567,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000013,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "cff8adc90d6d1bead5a4c9ad58a7b655",
+      "day": 11,
+      "market_orders": 143586,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000014,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "d3600cf08213ab84a7a12b208690d485",
+      "day": 11,
+      "market_orders": 143586,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000014,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "94d4f3421cb59d30f36182948f7f9111",
+      "day": 11,
+      "market_orders": 143586,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000014,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "da11a915d37326a656b0e93e6965cc3a",
+      "day": 12,
+      "market_orders": 144672,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000015,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "96431eaf5ab1a8670014198b312d7fd5",
+      "day": 12,
+      "market_orders": 144672,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000015,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "bf884719f212ad356cd2d5d4147736d6",
+      "day": 12,
+      "market_orders": 144672,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000015,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "35b71e5a51784ef5b4afca8be4eff00a",
+      "day": 13,
+      "market_orders": 142583,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000016,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "887d0a84fb4184a80dd790ba72de32e4",
+      "day": 13,
+      "market_orders": 142583,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000016,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f5a22aef0227cb9aa6b663a022cd2886",
+      "day": 13,
+      "market_orders": 142583,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000016,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "d657add76bdd0e3c849c2af965b12b3e",
+      "day": 14,
+      "market_orders": 143771,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000017,
+      "setting": "impact_0",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "0f9e9d3605b2758517e7cb303065ae3a",
+      "day": 14,
+      "market_orders": 143771,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000017,
+      "setting": "impact_low",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f23b77a43f7ac30f7b05c50512956409",
+      "day": 14,
+      "market_orders": 143771,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000017,
+      "setting": "impact_high",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f9d53bbdcad83307fd89a9d02255ba77",
+      "day": 15,
+      "market_orders": 144355,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000018,
+      "setting": "impact_0",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "ee7223d3efcd17565af44afc49590b28",
+      "day": 15,
+      "market_orders": 144355,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000018,
+      "setting": "impact_low",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "49f98a4e0541bb27a965af511120b42e",
+      "day": 15,
+      "market_orders": 144355,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000018,
+      "setting": "impact_high",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "fb6652d00caf93cc3ee83a880d308d81",
+      "day": 16,
+      "market_orders": 143856,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000019,
+      "setting": "impact_0",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "4cedeb574af7e6ca5eb9d87759371d32",
+      "day": 16,
+      "market_orders": 143856,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000019,
+      "setting": "impact_low",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "1fc371bdd43b454200a6df19417ccff3",
+      "day": 16,
+      "market_orders": 143856,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000019,
+      "setting": "impact_high",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "6e15a98b81d8a8000a4a442c519ca4ff",
+      "day": 17,
+      "market_orders": 144874,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000020,
+      "setting": "impact_0",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "48bd8da78e47005e950faa93aa7ad711",
+      "day": 17,
+      "market_orders": 144874,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000020,
+      "setting": "impact_low",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "dd8d63990a47a73de36081da5124591e",
+      "day": 17,
+      "market_orders": 144874,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000020,
+      "setting": "impact_high",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "1dbc2e718afaa56cec5cf665617891a8",
+      "day": 18,
+      "market_orders": 143230,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000021,
+      "setting": "impact_0",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "66b38d6d37ece2f0f6afb3ccac6a5db3",
+      "day": 18,
+      "market_orders": 143230,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000021,
+      "setting": "impact_low",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "ba7f92021adb215820f0d77dc90567fe",
+      "day": 18,
+      "market_orders": 143230,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000021,
+      "setting": "impact_high",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "bbb4b0cb075b9845598c4936cd52c835",
+      "day": 19,
+      "market_orders": 143371,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000022,
+      "setting": "impact_0",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "a6e715ae337a1e93b2f234fd243d15fa",
+      "day": 19,
+      "market_orders": 143371,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000022,
+      "setting": "impact_low",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "22feeb591f7213f0822e1e49a7c89a2f",
+      "day": 19,
+      "market_orders": 143371,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000022,
+      "setting": "impact_high",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "15db52a470b528c3fd5838b00927fb83",
+      "day": 20,
+      "market_orders": 143457,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000023,
+      "setting": "impact_0",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "e6727d4b589628544024b4b54234d67b",
+      "day": 20,
+      "market_orders": 143457,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000023,
+      "setting": "impact_low",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "89adde42b8a53464a43f4cefda0f94f5",
+      "day": 20,
+      "market_orders": 143457,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000023,
+      "setting": "impact_high",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "519dccba2699a9fa214a56f3c084de9d",
+      "day": 21,
+      "market_orders": 144578,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000024,
+      "setting": "impact_0",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "05a3af199ddb8e7dfb8638d44f048286",
+      "day": 21,
+      "market_orders": 144578,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000024,
+      "setting": "impact_low",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "af12aa4ed4c3eed651d2675a91bafc1c",
+      "day": 21,
+      "market_orders": 144578,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000024,
+      "setting": "impact_high",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "904f4aa0d7dd902828c6fdb575e8382b",
+      "day": 22,
+      "market_orders": 144335,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000025,
+      "setting": "impact_0",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "6cc4897af7508a5cef574c4d60ff9ce2",
+      "day": 22,
+      "market_orders": 144335,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000025,
+      "setting": "impact_low",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "7618e4472c64128d622314758b19bbb8",
+      "day": 22,
+      "market_orders": 144335,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000025,
+      "setting": "impact_high",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "34fac95fa7624c6b7f9e7a475973ede2",
+      "day": 23,
+      "market_orders": 144504,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000026,
+      "setting": "impact_0",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "a3e9828aedb666abfb26174f7569e55e",
+      "day": 23,
+      "market_orders": 144504,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000026,
+      "setting": "impact_low",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "b75384005c7a7efb0363f041fb5083e4",
+      "day": 23,
+      "market_orders": 144504,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000026,
+      "setting": "impact_high",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "cf598ad9dfa02eb5863d945fedb36021",
+      "day": 24,
+      "market_orders": 145939,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000027,
+      "setting": "impact_0",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "d42556a62e228fa136a994cd43a113dd",
+      "day": 24,
+      "market_orders": 145939,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000027,
+      "setting": "impact_low",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "a8e89cd77714473217c7949503ed65d7",
+      "day": 24,
+      "market_orders": 145939,
+      "parameters_fingerprint": "81e8d36dd3c7ffcb99303b4ab52f82f1",
+      "rows": 86400,
+      "seed": 1000027,
+      "setting": "impact_high",
+      "split": "holdout"
+    }
+  ],
+  "design_version": 2
+}
