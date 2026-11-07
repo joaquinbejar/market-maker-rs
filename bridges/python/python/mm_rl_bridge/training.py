@@ -155,6 +155,14 @@ def load_for_inference(path, env):
     path = pathlib.Path(path)
     metadata = json.loads(_metadata_path(path).read_text())
     _check_algorithm(metadata["algorithm"], env)
+    # A checkpoint from before hedge actions has no such key, and had none.
+    trained = bool(metadata["config"].get("hedge_actions", False))
+    here = bool(env.config.get("hedge_actions", False))
+    if trained != here:
+        raise ValueError(
+            f"the checkpoint was trained with hedge_actions={trained}, "
+            f"this environment has hedge_actions={here}"
+        )
     if tuple(metadata["spec"]) != env.spec_id:
         raise ValueError(f"the checkpoint is for {metadata['spec']}, this is {env.spec_id}")
     if metadata["kernel_fingerprint"] != env.bridge_info["kernel_fingerprint"]:

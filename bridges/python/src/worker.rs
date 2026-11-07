@@ -13,9 +13,9 @@ use market_maker_rs::backtest::kernel::{
 };
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED, EpisodeRecorder, FeatureVector, InvalidActionPolicy,
-    ObservationScales, ResidualBounds, ResidualDecision, ResidualEnv, ResidualProposal, RlAction,
-    RlConfig, RlEnv, RlState, SpecId, TerminalValuation, Transition,
+    ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED, EpisodeRecorder, FeatureVector, HedgeActions,
+    InvalidActionPolicy, ObservationScales, ResidualBounds, ResidualDecision, ResidualEnv,
+    ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId, TerminalValuation, Transition,
 };
 use market_maker_rs::strategy::glft::GLFTConfig;
 use serde::Deserialize;
@@ -303,6 +303,10 @@ pub struct BridgeConfig {
     /// A residual policy, which then takes no action on the grid.
     #[serde(default)]
     pub residual: Option<ResidualConfig>,
+    /// Whether hedge actions exist (`RlAction::Hedge`, `HedgeActions::MarketableAtTouch`).
+    /// Off by default, which keeps a configuration's specification and fingerprint.
+    #[serde(default)]
+    pub hedge_actions: bool,
 }
 
 fn decimal(what: &str, text: &str) -> Result<Decimal, BridgeError> {
@@ -356,6 +360,12 @@ impl BridgeConfig {
     }
 
     fn rl(&self) -> Result<RlConfig, BridgeError> {
+        if self.hedge_actions && self.residual.is_some() {
+            return Err(BridgeError::Refused(
+                "hedge_actions with a residual policy: a residual policy takes no hedge action"
+                    .to_string(),
+            ));
+        }
         let s = &self.scales;
         let scales = ObservationScales {
             spread_ticks: decimal("spread_ticks", &s.spread_ticks)?,
@@ -373,12 +383,17 @@ impl BridgeConfig {
             TerminalConfig::Mark => TerminalValuation::MarkAtLastMid,
             TerminalConfig::Close => TerminalValuation::CloseAtTouch,
         };
-        Ok(RlConfig::new(scales, decimal("f32_unit", &self.f32_unit)?)
+        let config = RlConfig::new(scales, decimal("f32_unit", &self.f32_unit)?)
             .with_invalid_action(
                 policy,
                 decimal("invalid_action_penalty", &self.invalid_action_penalty)?,
             )
-            .with_terminal(terminal))
+            .with_terminal(terminal);
+        Ok(if self.hedge_actions {
+            config.with_hedge_actions()
+        } else {
+            config
+        })
     }
 }
 
@@ -393,6 +408,8 @@ pub struct EnvInfo {
     pub offsets: usize,
     /// Sizes.
     pub sizes: usize,
+    /// Whether hedge actions exist, as the specification states.
+    pub hedge_actions: bool,
     /// Fingerprint of the kernel's configuration.
     pub kernel_fingerprint: u128,
     /// Digest of the dataset.
@@ -408,6 +425,8 @@ pub struct ResetReply {
     pub observation: FeatureVector,
     /// What it may do.
     pub mask: ActionMask,
+    /// The hedge sizes it may take, as bits over the sizes; 0 without hedge actions.
+    pub hedge_mask: u64,
     /// The data has no decision at all.
     pub done: bool,
 }
@@ -458,6 +477,7 @@ trait Driver {
     fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String>;
     fn observe(&self, state: &State) -> Result<FeatureVector, String>;
     fn mask(&self, state: &State) -> ActionMask;
+    fn hedge_mask(&self, state: &State) -> u64;
     fn step(
         &mut self,
         state: &mut State,
@@ -506,6 +526,10 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
         RlEnv::mask(self, state)
     }
 
+    fn hedge_mask(&self, state: &State) -> u64 {
+        RlEnv::hedge_mask(self, state)
+    }
+
     fn step(
         &mut self,
         state: &mut State,
@@ -552,6 +576,10 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
 
     fn mask(&self, state: &State) -> ActionMask {
         self.env().mask(state)
+    }
+
+    fn hedge_mask(&self, state: &State) -> u64 {
+        self.env().hedge_mask(state)
     }
 
     fn step(
@@ -607,6 +635,7 @@ fn answer<D: Driver>(
                     let reply = ResetReply {
                         observation: env.observe(&fresh)?,
                         mask: env.mask(&fresh),
+                        hedge_mask: env.hedge_mask(&fresh),
                         done: fresh.is_done(),
                     };
                     episode = Some((fresh, recorder));
@@ -663,6 +692,7 @@ fn serve_residual<S: QuoteSource + Clone>(
             features: shape.features,
             offsets: shape.bid_offsets,
             sizes: shape.sizes,
+            hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
             kernel_fingerprint: env.env().kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,
@@ -830,6 +860,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
             features: shape.features,
             offsets: shape.bid_offsets,
             sizes: shape.sizes,
+            hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
             kernel_fingerprint: env.kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,
