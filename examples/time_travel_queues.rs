@@ -1207,6 +1207,32 @@ fn walk_capture(
     out
 }
 
+/// Every rule's walks over a split of the capture in the given modes only, one per search seed
+/// for time travel.
+fn capture_results(
+    samples: &[Sample],
+    split: (usize, usize),
+    separation: usize,
+    modes: &[Mode],
+) -> CaptureResults {
+    let mut out: CaptureResults = BTreeMap::new();
+    for rule in RULES {
+        for &mode in modes {
+            let seeds: &[u64] = if mode == Mode::Chronological {
+                &SEARCH_SEEDS[..1]
+            } else {
+                &SEARCH_SEEDS
+            };
+            for seed in seeds {
+                out.entry((mode, rule))
+                    .or_default()
+                    .push(walk_capture(samples, split, rule, mode, separation, *seed));
+            }
+        }
+    }
+    out
+}
+
 fn capture(args: &[String]) -> Result<(), Failure> {
     let [coin, tick, files @ ..] = args else {
         return Err("capture <coin> <tick> (<statuses> <diffs> <trades>)+".into());
@@ -1224,28 +1250,8 @@ fn capture(args: &[String]) -> Result<(), Failure> {
         "Split by time from {} ms: train {train:?}, validation {validation:?}, holdout {holdout:?} grid steps.",
         tape.start_ms
     );
-    let run = |split: (usize, usize), separation: usize| -> CaptureResults {
-        let mut out: CaptureResults = BTreeMap::new();
-        for rule in RULES {
-            for mode in MODES {
-                let seeds: &[u64] = if mode == Mode::Chronological {
-                    &SEARCH_SEEDS[..1]
-                } else {
-                    &SEARCH_SEEDS
-                };
-                for seed in seeds {
-                    out.entry((mode, rule)).or_default().push(walk_capture(
-                        &tape.samples,
-                        split,
-                        rule,
-                        mode,
-                        separation,
-                        *seed,
-                    ));
-                }
-            }
-        }
-        out
+    let run = |split: (usize, usize), separation: usize| {
+        capture_results(&tape.samples, split, separation, &MODES)
     };
     let share_of = |results: &CaptureResults, mode: Mode| {
         let mut part = 0;
@@ -1320,8 +1326,9 @@ fn capture(args: &[String]) -> Result<(), Failure> {
         println!(
             "\nStop rule: time travel's no-candidate share on train is above {MAX_NO_CANDIDATE_SHARE}; the mode is unusable on this capture and its holdout is not read."
         );
-        let mut chronological = run(holdout, separation);
-        chronological.retain(|(mode, _), _| *mode == Mode::Chronological);
+        // Only chronological replay walks the holdout: time travel never reads it.
+        let chronological =
+            capture_results(&tape.samples, holdout, separation, &[Mode::Chronological]);
         print(
             "holdout, chronological replay only",
             separation,
@@ -1646,5 +1653,22 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 50);
+    }
+
+    #[test]
+    fn test_a_stopped_holdout_walks_chronological_replay_only() {
+        let p = small();
+        let day = tape_day(0, 1, &p, 31);
+        let only = capture_results(&day.samples, (0, 300), 5, &[Mode::Chronological]);
+        assert!(only.keys().all(|(mode, _)| *mode == Mode::Chronological));
+        assert_eq!(only.len(), RULES.len());
+        assert!(only.values().all(|walks| walks.len() == 1));
+        let all = capture_results(&day.samples, (0, 300), 5, &MODES);
+        assert_eq!(all.len(), RULES.len() * MODES.len());
+        // Time travel runs one walk per search seed.
+        assert_eq!(
+            all[&(Mode::TimeTravelAny, Rule::JoinBoth)].len(),
+            SEARCH_SEEDS.len()
+        );
     }
 }
