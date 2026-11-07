@@ -2,8 +2,10 @@
 
     python experiments/m5_03/report.py <out dir>/holdout.json
 
-A learned arm's day is the mean over its five seeds, as #102. Intervals are paired 90 % moving
-block bootstraps over the 30 holdout days of the daily difference, as the design states.
+A learned arm's day is the mean over its five seeds, as #102. Intervals are paired 90 % stationary
+block bootstraps (geometric blocks of mean length 2, as #102) over the 30 holdout days of the daily
+difference. design.json calls this a moving block bootstrap; it is the stationary one, and
+design.json is left as committed.
 """
 
 import importlib.util
