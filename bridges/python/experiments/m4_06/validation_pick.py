@@ -16,16 +16,15 @@ the highest mean daily net, with a tie going to the greater name. It writes
 Everything here is synthetic.
 """
 
-import importlib.util
 import json
 import pathlib
 import sys
 import time
 
 HERE = pathlib.Path(__file__).resolve().parent
-_SPEC = importlib.util.spec_from_file_location("m4_06_run_for_pick", HERE / "run.py")
-run = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(run)
+# Imported by name, so that the spawned workers of `run.pool` can find `run.evaluate_job`.
+sys.path.insert(0, str(HERE))
+import run  # noqa: E402
 
 
 def checked_frozen(out, frozen_sha256):
