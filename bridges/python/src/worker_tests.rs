@@ -485,6 +485,8 @@ fn test_worker_residual_logs_and_equals_a_direct_environment() {
                 volatility: d("5"),
                 size: d("1"),
                 session_start_ms: 0,
+                form: market_maker_rs::backtest::kernel::GlftForm::Exact,
+                counts: market_maker_rs::backtest::kernel::GlftCounts::default(),
             });
         }
     }
@@ -573,8 +575,37 @@ fn test_baselines_parse_to_what_they_state() {
             volatility: d("5"),
             size: d("1"),
             session_start_ms: 0,
+            form: market_maker_rs::backtest::kernel::GlftForm::Exact,
+            counts: market_maker_rs::backtest::kernel::GlftCounts::default(),
         })
+    ); // The form, when stated.
+    let fallback = GLFT.replace(
+        r#""session_start_ms": 0}"#,
+        r#""session_start_ms": 0, "form": "exact_or_closed_form"}"#,
     );
+    let Baseline::Glft(quoter) = parsed(&fallback) else {
+        panic!("a glft baseline");
+    };
+    assert_eq!(
+        quoter.form,
+        market_maker_rs::backtest::kernel::GlftForm::ExactOrClosedForm
+    );
+    let closed = GLFT.replace(
+        r#""session_start_ms": 0}"#,
+        r#""session_start_ms": 0, "form": "closed_form"}"#,
+    );
+    let Baseline::Glft(quoter) = parsed(&closed) else {
+        panic!("a glft baseline");
+    };
+    assert_eq!(
+        quoter.form,
+        market_maker_rs::backtest::kernel::GlftForm::ClosedForm
+    );
+    let unknown = GLFT.replace(
+        r#""session_start_ms": 0}"#,
+        r#""session_start_ms": 0, "form": "fast"}"#,
+    );
+    assert!(serde_json::from_str::<BaselineConfig>(&unknown).is_err());
 }
 
 #[test]

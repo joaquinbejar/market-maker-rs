@@ -8,8 +8,8 @@ use market_maker_rs::Decimal;
 use market_maker_rs::backtest::evaluation::{Attribution, EvaluationInput, attribute};
 use market_maker_rs::backtest::kernel::{
     ActionGrid, ActionMask, ActionStatus, AvellanedaQuoter, ERR_KERNEL_MISMATCH,
-    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, GlftQuoter, KernelConfig, KernelDataset,
-    KernelFillModel, KernelLatency, KernelTick, QuoteSource, quote_error_name,
+    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, GlftCounts, GlftForm, GlftQuoter, KernelConfig,
+    KernelDataset, KernelFillModel, KernelLatency, KernelTick, QuoteSource, quote_error_name,
 };
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
@@ -215,7 +215,34 @@ pub enum BaselineConfig {
         volatility: String,
         /// Session start, in milliseconds of the rows' clock.
         session_start_ms: u64,
+        /// Which quotes: `exact` (the default), `closed_form`, or `exact_or_closed_form`,
+        /// which takes the closed form only where the exact quote is over its step cap.
+        #[serde(default)]
+        form: GlftFormConfig,
     },
+}
+
+/// [`GlftForm`] in the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlftFormConfig {
+    /// [`GlftForm::Exact`].
+    #[default]
+    Exact,
+    /// [`GlftForm::ClosedForm`].
+    ClosedForm,
+    /// [`GlftForm::ExactOrClosedForm`].
+    ExactOrClosedForm,
+}
+
+impl From<GlftFormConfig> for GlftForm {
+    fn from(form: GlftFormConfig) -> Self {
+        match form {
+            GlftFormConfig::Exact => Self::Exact,
+            GlftFormConfig::ClosedForm => Self::ClosedForm,
+            GlftFormConfig::ExactOrClosedForm => Self::ExactOrClosedForm,
+        }
+    }
 }
 
 /// A residual policy over a classical strategy, in place of the action grid.
@@ -716,6 +743,7 @@ fn parse_baseline(baseline: &BaselineConfig, lot_size: &str) -> Result<Baseline,
             min_spread,
             volatility,
             session_start_ms,
+            form,
         } => {
             let lot = decimal("lot_size", lot_size)?;
             let model = GLFTConfig::new(
@@ -733,6 +761,8 @@ fn parse_baseline(baseline: &BaselineConfig, lot_size: &str) -> Result<Baseline,
                 volatility: decimal("volatility", volatility)?,
                 size: lot,
                 session_start_ms: *session_start_ms,
+                form: (*form).into(),
+                counts: GlftCounts::default(),
             }))
         }
     }

@@ -24,7 +24,7 @@
 use crate::Decimal;
 use crate::backtest::engine::round_to_step;
 use crate::strategy::avellaneda_stoikov::calculate_optimal_quotes;
-use crate::strategy::glft::{GLFTConfig, GLFTStrategy};
+use crate::strategy::glft::{ExactQuotes, GLFTConfig, GLFTStrategy, GlftQuotes, over_cap_error};
 use crate::strategy::quote::Quote;
 use crate::types::error::{MMError, MMResult};
 
@@ -185,10 +185,54 @@ impl QuoteSource for AvellanedaQuoter {
     }
 }
 
+/// Which GLFT quotes a [`GlftQuoter`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum GlftForm {
+    /// The exact quotes of Theorem 1, [`GLFTStrategy::exact_quotes`]. Where the rest of
+    /// the horizon is over the matrix exponential's step cap there is none, and the quote
+    /// is a strategy error, `NumericalError`: the decision holds.
+    #[default]
+    Exact,
+    /// The closed form approximation, [`GLFTStrategy::closed_form_quotes`], at every
+    /// decision. It does not depend on the time left.
+    ClosedForm,
+    /// The exact quotes, and the closed form only where the exact quote is over the step
+    /// cap; any other error of the exact quote stays an error.
+    ExactOrClosedForm,
+}
+
+/// Which form gave a quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GlftQuoteForm {
+    /// The exact quotes of Theorem 1.
+    Exact,
+    /// The closed form approximation.
+    ClosedForm,
+}
+
+/// What a [`GlftQuoter`] has done, so a run can tell a strategy that holds from one that
+/// fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct GlftCounts {
+    /// Quotes from the exact form.
+    pub exact: u64,
+    /// Quotes from the closed form.
+    pub closed_form: u64,
+    /// Decisions where the exact quote was over the step cap, under either form that
+    /// asks for it.
+    pub over_step_cap: u64,
+    /// The form of the last quote given, if any.
+    pub last: Option<GlftQuoteForm>,
+}
+
 /// GLFT quotes (Guéant, Lehalle and Fernandez-Tapia, arXiv:1105.3115,
-/// Theorem 1) through [`GLFTStrategy::calculate_optimal_quotes`], with the
-/// model time measured from the session start. At an inventory bound the
-/// model posts one side only, which becomes a one-sided action.
+/// Theorem 1, and its closed form approximation), in the [`GlftForm`] the caller
+/// states, with the model time measured from the session start. At an inventory bound
+/// the model posts one side only, which becomes a one-sided action. Which form gave each
+/// quote is in [`GlftQuoter::counts`]: nothing is substituted silently.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlftQuoter {
     /// Model configuration; its `lot_size` must equal the kernel lot.
@@ -199,6 +243,91 @@ pub struct GlftQuoter {
     pub size: Decimal,
     /// Session start (model time 0), in milliseconds of the rows' clock.
     pub session_start_ms: u64,
+    /// Which quotes it gives.
+    pub form: GlftForm,
+    /// What it has done; it starts at zero, and the quoter counts.
+    pub counts: GlftCounts,
+}
+
+impl GlftQuoter {
+    /// A quoter of the exact quotes, as [`GlftForm::Exact`], with no counts yet.
+    #[must_use]
+    pub fn new(
+        config: GLFTConfig,
+        volatility: Decimal,
+        size: Decimal,
+        session_start_ms: u64,
+    ) -> Self {
+        Self {
+            config,
+            volatility,
+            size,
+            session_start_ms,
+            form: GlftForm::Exact,
+            counts: GlftCounts::default(),
+        }
+    }
+
+    /// Sets the form.
+    #[must_use]
+    pub fn with_form(mut self, form: GlftForm) -> Self {
+        self.form = form;
+        self
+    }
+
+    fn exact(
+        &mut self,
+        mid: Decimal,
+        inventory: Decimal,
+        elapsed: u64,
+    ) -> MMResult<Result<GlftQuotes, MMError>> {
+        match GLFTStrategy::exact_quotes(mid, inventory, &self.config, self.volatility, elapsed)? {
+            ExactQuotes::Quotes(quotes) => Ok(Ok(quotes)),
+            ExactQuotes::OverStepCap {
+                steps_needed,
+                budget,
+            } => {
+                self.counts.over_step_cap = self.counts.over_step_cap.saturating_add(1);
+                Ok(Err(over_cap_error(steps_needed, budget)))
+            }
+        }
+    }
+
+    fn closed_form(
+        &mut self,
+        mid: Decimal,
+        inventory: Decimal,
+    ) -> MMResult<(GlftQuotes, GlftQuoteForm)> {
+        let quotes =
+            GLFTStrategy::closed_form_quotes(mid, inventory, &self.config, self.volatility)?;
+        Ok((quotes, GlftQuoteForm::ClosedForm))
+    }
+
+    /// The quotes in the stated form, counted.
+    fn quotes(&mut self, mid: Decimal, inventory: Decimal, elapsed: u64) -> MMResult<GlftQuotes> {
+        self.counts.last = None;
+        let (quotes, form) = match self.form {
+            GlftForm::ClosedForm => self.closed_form(mid, inventory)?,
+            GlftForm::Exact | GlftForm::ExactOrClosedForm => {
+                match self.exact(mid, inventory, elapsed)? {
+                    Ok(quotes) => (quotes, GlftQuoteForm::Exact),
+                    Err(_) if self.form == GlftForm::ExactOrClosedForm => {
+                        self.closed_form(mid, inventory)?
+                    }
+                    // The error the exact quote has always given there.
+                    Err(over_cap) => return Err(over_cap),
+                }
+            }
+        };
+        match form {
+            GlftQuoteForm::Exact => self.counts.exact = self.counts.exact.saturating_add(1),
+            GlftQuoteForm::ClosedForm => {
+                self.counts.closed_form = self.counts.closed_form.saturating_add(1);
+            }
+        }
+        self.counts.last = Some(form);
+        Ok(quotes)
+    }
 }
 
 impl QuoteSource for GlftQuoter {
@@ -209,13 +338,7 @@ impl QuoteSource for GlftQuoter {
         inventory: Decimal,
     ) -> MMResult<SourceQuote> {
         let elapsed = elapsed_ms(obs, self.session_start_ms)?;
-        let quotes = GLFTStrategy::calculate_optimal_quotes(
-            mid,
-            inventory,
-            &self.config,
-            self.volatility,
-            elapsed,
-        )?;
+        let quotes = self.quotes(mid, inventory, elapsed)?;
         match (quotes.bid, quotes.ask) {
             (Some(bid), Some(ask)) => Ok(SourceQuote::Both(Quote {
                 bid_price: bid,

@@ -270,6 +270,44 @@ pub struct GlftQuotes {
     pub ask: Option<Decimal>,
 }
 
+/// What [`GLFTStrategy::exact_quotes`] gave.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum ExactQuotes {
+    /// The quotes of Theorem 1.
+    Quotes(GlftQuotes),
+    /// The rest of the horizon needs more steps of the matrix exponential than the
+    /// 11 000 it allows, so there is no exact quote; [`GLFTStrategy::closed_form_quotes`]
+    /// is the approximation the model has for it.
+    OverStepCap {
+        /// Steps the rest of the horizon needed.
+        steps_needed: f64,
+        /// Steps that were left.
+        budget: u32,
+    },
+}
+
+/// A failure of the matrix exponential: over its step cap, or another error.
+enum Expm {
+    OverCap { steps_needed: f64, budget: u32 },
+    Failed(MMError),
+}
+
+impl From<MMError> for Expm {
+    fn from(error: MMError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// The error of an exact quote over the step cap.
+pub(crate) fn over_cap_error(steps_needed: f64, budget: u32) -> MMError {
+    numerical(&format!(
+        "horizon too stiff: more than {MAX_EXPM_STEPS} steps of the matrix exponential \
+         ({steps_needed} needed for the rest of the horizon, {budget} left); \
+         use GLFTStrategy::closed_form_quotes, or reduce max_inventory_lots or terminal_time"
+    ))
+}
+
 /// GLFT strategy: quotes of Theorem 1 of Guéant, Lehalle and Fernandez-Tapia.
 ///
 /// # Cost
@@ -337,12 +375,48 @@ impl GLFTStrategy {
         volatility: Decimal,
         current_time: u64,
     ) -> MMResult<GlftQuotes> {
+        match Self::exact_quotes(mid_price, inventory, config, volatility, current_time)? {
+            ExactQuotes::Quotes(quotes) => Ok(quotes),
+            ExactQuotes::OverStepCap {
+                steps_needed,
+                budget,
+            } => Err(over_cap_error(steps_needed, budget)),
+        }
+    }
+
+    /// The quotes of [`GLFTStrategy::calculate_optimal_quotes`], with a horizon over the
+    /// matrix exponential's step cap told apart from a failure: it is
+    /// [`ExactQuotes::OverStepCap`], so a caller can choose what to do there, such as
+    /// [`GLFTStrategy::closed_form_quotes`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`GLFTStrategy::calculate_optimal_quotes`], except the step cap.
+    pub fn exact_quotes(
+        mid_price: Decimal,
+        inventory: Decimal,
+        config: &GLFTConfig,
+        volatility: Decimal,
+        current_time: u64,
+    ) -> MMResult<ExactQuotes> {
         let (model, q) = Model::new(mid_price, inventory, config, volatility)?;
         let tau_s = seconds_to_terminal(config.terminal_time, current_time)?;
         let mut vv = ValueVector::new();
-        model.value_vector(tau_s, &mut vv)?;
+        match model.value_vector(tau_s, &mut vv) {
+            Ok(()) => {}
+            Err(Expm::OverCap {
+                steps_needed,
+                budget,
+            }) => {
+                return Ok(ExactQuotes::OverStepCap {
+                    steps_needed,
+                    budget,
+                });
+            }
+            Err(Expm::Failed(error)) => return Err(error),
+        }
         let (bid, ask) = model.exact_distances(&vv, q)?;
-        build_quotes(mid_price, bid, ask, config.min_spread)
+        build_quotes(mid_price, bid, ask, config.min_spread).map(ExactQuotes::Quotes)
     }
 
     /// Closed form approximation after Proposition 3, valid for large
@@ -559,7 +633,7 @@ impl Model {
         eta: f64,
         factors: &Factors<'_>,
         budget: u32,
-    ) -> MMResult<(u32, f64)> {
+    ) -> Result<(u32, f64), Expm> {
         let mut norm = 0.0_f64;
         for (i, d) in diag_s.iter().enumerate() {
             let left = factors.left.get(i).copied().unwrap_or(0.0);
@@ -571,12 +645,9 @@ impl Model {
         let steps = Decimal::from_f64(steps_f)
             .and_then(|s| s.to_u32())
             .filter(|s| *s <= budget)
-            .ok_or_else(|| {
-                numerical(&format!(
-                    "horizon too stiff: more than {MAX_EXPM_STEPS} steps of the matrix exponential \
-                     ({steps_f} needed for the rest of the horizon, {budget} left); \
-                     use GLFTStrategy::closed_form_quotes, or reduce max_inventory_lots or terminal_time"
-                ))
+            .ok_or(Expm::OverCap {
+                steps_needed: steps_f,
+                budget,
             })?;
         Ok((steps, tau_s / f64::from(steps)))
     }
@@ -587,7 +658,7 @@ impl Model {
     /// `REBALANCE_FLOOR` of the largest one; then every entry is moved into
     /// its offset (`l_i += ln w_i`, `w_i = 1`) and the operator becomes the
     /// diagonal similarity `D⁻¹ B D`, which has the same exponential.
-    fn value_vector(&self, tau_s: f64, out: &mut ValueVector) -> MMResult<()> {
+    fn value_vector(&self, tau_s: f64, out: &mut ValueVector) -> Result<(), Expm> {
         let n = self.dim()?;
         out.n = n;
         let (w_all, l_all) = (&mut out.w, &mut out.log_offset);
