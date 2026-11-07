@@ -21,7 +21,8 @@
   },
   "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
   "changes": [
-    "version 1, after the timing pilot and before any training: steps_per_epoch 17280 (two days of 8640 steps) for every arm instead of 2000, because OmniSafe's Lagrange update needs a finished episode in every epoch and PPOLag stopped on a NaN cost at 2000. The toy gate is run again at the same two episodes per epoch (steps_per_epoch 40), under the criterion of toy_gate.json; an algorithm that fails it is not an arm. Pilot timing, 50000 steps on pooled training days: PPO 13.9 and CPO 13.0 minutes per 2M steps. Nothing else was seen."
+    "version 1, after the timing pilot and before any training: steps_per_epoch 17280 (two days of 8640 steps) for every arm instead of 2000, because OmniSafe's Lagrange update needs a finished episode in every epoch and PPOLag stopped on a NaN cost at 2000. The toy gate is run again at the same two episodes per epoch (steps_per_epoch 40), under the criterion of toy_gate.json; an algorithm that fails it is not an arm. Pilot timing, 50000 steps on pooled training days: PPO 13.9 and CPO 13.0 minutes per 2M steps. Nothing else was seen.",
+    "version 1, after the re-gate and before any training: PPOLag failed the re-gate at two episodes per epoch (seed 2 cost 5.789, 0.211 from the limit) and is dropped as an arm; CPO passed (cost 5.905 and 6.052, return 6.142 and 6.156) and is the constrained arm."
   ],
   "shocks": {
     "what": "an asset shock in the sense of margin-rs Scenario::shock: from 12:00 of the day on, the bid and the ask move by round(mid * shock) ticks of the kernel, the spread and sizes unchanged",
@@ -162,17 +163,12 @@
       ],
       "selection": "on validation: the best mean daily net among the lambdas whose mean cost per step is within the budget; if none is, the lowest cost"
     },
-    "ppo_lagrangian": {
-      "kind": "learned",
-      "implementation": "OmniSafe 0.5.0 PPOLag",
-      "config": "standardized_rew_adv false, standardized_cost_adv false; the rest as the toy gate (experiments/m4_08/toy_gate.json)"
-    },
     "cpo": {
       "kind": "learned",
       "implementation": "OmniSafe 0.5.0 CPO",
       "config": "defaults, as the toy gate"
     },
-    "failed_gate": "OmniSafe PPOLag with its default configuration failed the toy gate and is not an arm"
+    "failed_gate": "OmniSafe PPOLag is not an arm: it failed the toy gate with its defaults, and at two episodes per epoch with advantage standardization off (toy_gate.json)"
   },
   "algorithm_cfgs": {
     "steps_per_epoch": 17280,
@@ -218,7 +214,7 @@
     "net and the #102 metrics"
   ],
   "decision_rule": {
-    "constrained_better": "for ppo_lagrangian and for cpo, against ppo_penalized, paired 90 % block bootstrap over days: the daily net interval includes or is above 0 and the daily constrained cost interval is below 0, with no breach",
+    "constrained_better": "for cpo against ppo_penalized, paired 90 % block bootstrap over days: the daily net interval includes or is above 0 and the daily constrained cost interval is below 0, with no breach",
     "also": "every learned arm against no_trade and against ppo, the same way; nothing here is a safety guarantee"
   },
   "venv": {
@@ -253,7 +249,7 @@
     },
     {
       "name": "training",
-      "what": "ppo, ppo_lagrangian, cpo x 5 seeds, and ppo_penalized x 3 lambdas x 5 seeds",
+      "what": "ppo and cpo x 5 seeds, and ppo_penalized x 3 lambdas x 5 seeds",
       "estimate_minutes": 90
     },
     {

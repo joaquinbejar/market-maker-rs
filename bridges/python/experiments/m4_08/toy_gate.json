@@ -59,15 +59,8 @@
     }
   },
   "used_by_105": {
-    "PPOLag": {
-      "steps_per_epoch": 2000,
-      "update_iters": 10,
-      "standardized_rew_adv": false,
-      "standardized_cost_adv": false,
-      "rest": "OmniSafe 0.5.0 defaults"
-    },
     "CPO": {
-      "steps_per_epoch": 2000,
+      "steps_per_epoch": "two episodes (17280 on the market days)",
       "update_iters": 10,
       "rest": "OmniSafe 0.5.0 defaults"
     }
@@ -92,6 +85,34 @@
           "steps_per_epoch": 40
         }
       }
-    ]
+    ],
+    "results": {
+      "PPOLag, standardization off, steps_per_epoch 40": {
+        "seed 1": {
+          "return": 6.161,
+          "cost": 6.149
+        },
+        "seed 2": {
+          "return": 6.118,
+          "cost": 5.789
+        },
+        "pass": false,
+        "why": "seed 2's cost is 0.211 from 6, over the 0.2 of the criterion"
+      },
+      "CPO, steps_per_epoch 40": {
+        "seed 1": {
+          "return": 6.142,
+          "cost": 5.905
+        },
+        "seed 2": {
+          "return": 6.156,
+          "cost": 6.052
+        },
+        "pass": true
+      }
+    }
+  },
+  "not_arms": {
+    "PPOLag": "fails the gate with its default configuration, and with advantage standardization off at two episodes per epoch (it passed that configuration at 100 episodes per epoch, which the market days cannot have)"
   }
 }
