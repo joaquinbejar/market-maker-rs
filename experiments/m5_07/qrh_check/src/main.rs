@@ -458,6 +458,39 @@ fn noise_free(
     )
 }
 
+/// The range of V0 = a (Z0 - b)^2 + c when Z0 lies in `z` and each of (a, b, c) lies within
+/// `half_widths` of its printed value; `a` stays positive over its range.
+fn v0_interval(
+    z: (f64, f64),
+    (a, b, c): (f64, f64, f64),
+    (da, db, dc): (f64, f64, f64),
+) -> (f64, f64) {
+    let (bl, bh) = (b - db, b + db);
+    let nearest = (z.0 - bh).max(bl - z.1).max(0.0);
+    let farthest = (z.1 - bl).abs().max((z.0 - bh).abs());
+    (
+        (a - da) * nearest * nearest + (c - dc),
+        (a + da) * farthest * farthest + (c + dc),
+    )
+}
+
+/// Whether some value in `range` rounds to `printed` at two decimals.
+fn meets_two_decimals(range: (f64, f64), printed: f64) -> bool {
+    range.0 < printed + 0.005 && range.1 >= printed - 0.005
+}
+
+/// The time step criterion: the prices at the last two steps differ by less than 2 standard
+/// errors, the larger of the two.
+fn converged_pair((c3, s3): (f64, f64), (c4, s4): (f64, f64)) -> bool {
+    (c4 - c3).abs() < 2.0 * s3.max(s4)
+}
+
+/// The skew criterion: the lower strike's implied volatility is above the at-the-money one by
+/// more than 3 combined standard errors.
+fn skew_significant((low, low_se): (f64, f64), (atm, atm_se): (f64, f64)) -> bool {
+    low - atm > 3.0 * (low_se * low_se + atm_se * atm_se).sqrt()
+}
+
 fn step_1b(criteria: &Value) {
     let base: Value = serde_json::from_str(
         &std::fs::read_to_string(
@@ -497,28 +530,16 @@ fn step_1b(criteria: &Value) {
     let (r2_z, r2_v) = variance_of(&unscaled, &z0, a, b, c);
     let (r3_z, r3_v) = variance_of(&weights, &reversed, a, b, c);
     let (r4_z, r4_v) = variance_of(&ones, &z0, a, b, c);
-    // R1 over the rounding of the printed values: Z0 moves by at most 0.0005 sum c_i; V0 is
-    // a (Z0 - b)^2 + c, so its extremes are at the corners of (a, b, c, Z0), or at Z0 = b.
+    // R1 over the rounding of the printed values: Z0 moves by at most 0.0005 sum c_i.
     let spread = 0.0005 * weights.iter().sum::<f64>();
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for aa in [a - 0.0005, a + 0.0005] {
-        for bb in [b - 0.0005, b + 0.0005] {
-            for cc in [c - 0.00005, c + 0.00005] {
-                let (zl, zh) = (r1_z - spread, r1_z + spread);
-                for zz in [zl, zh] {
-                    let v = aa * (zz - bb).powi(2) + cc;
-                    lo = lo.min(v);
-                    hi = hi.max(v);
-                }
-                if (zl..=zh).contains(&bb) {
-                    lo = lo.min(cc);
-                }
-            }
-        }
-    }
+    let (lo, hi) = v0_interval(
+        (r1_z - spread, r1_z + spread),
+        (a, b, c),
+        (0.0005, 0.0005, 0.00005),
+    );
     let printed: f64 = 0.18;
     let r1_rounds = (r1_v * 100.0).round() / 100.0 == printed;
-    let interval_meets = lo < 0.185 && hi >= 0.175;
+    let interval_meets = meets_two_decimals((lo, hi), printed);
     let shifted = ((printed - c) / a).sqrt();
     report.insert(
         "initial_variance".into(),
@@ -584,7 +605,7 @@ fn step_1b(criteria: &Value) {
                 .collect();
             let n = sweep.len();
             let ((c3, s3), (c4, s4)) = (sweep[n - 2], sweep[n - 1]);
-            let row_converged = (c4 - c3).abs() < 2.0 * s3.max(s4);
+            let row_converged = converged_pair((c3, s3), (c4, s4));
             converged &= row_converged;
             let (call, call_se) = (c4, s4);
             let steps = (t / finest).round() as usize;
@@ -618,7 +639,7 @@ fn step_1b(criteria: &Value) {
             (Some(l), Some(ls), Some(m), Some(ms)) => {
                 let combined = (ls * ls + ms * ms).sqrt();
                 json!({"maturity": t, "iv_minus_010": l, "iv_atm": m, "difference": l - m,
-                       "combined_se": combined, "pass": l - m > 3.0 * combined})
+                       "combined_se": combined, "pass": skew_significant((*l, *ls), (*m, *ms))})
             }
             _ => json!({"maturity": t, "pass": false, "why": "no implied volatility"}),
         };
@@ -673,4 +694,119 @@ fn step_1b(criteria: &Value) {
         "{}",
         serde_json::to_string_pretty(&Value::Object(report)).unwrap()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_closed_form_partition_is_optionstratlibs() {
+        let kernel = QuadraticRoughHestonKernel::try_new(dec("0.51"), 10, dec("3.92")).unwrap();
+        for (i, (c, g)) in closed_form(0.51, 10, 3.92).iter().enumerate() {
+            assert!((f(kernel.weights()[i]) / c - 1.0).abs() < 1e-10);
+            assert!((f(kernel.discounts()[i]) / g - 1.0).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn the_variance_is_the_quadratic_of_the_weighted_factors() {
+        // Z0 = 2 * 0.5 + 1 * (-3) = -2; V0 = 0.5 * (-2 - 1)^2 + 0.1 = 4.6.
+        let (z, v) = variance_of(&[2.0, 1.0], &[0.5, -3.0], 0.5, 1.0, 0.1);
+        assert_eq!(z, -2.0);
+        assert!((v - 4.6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_interval_reaches_c_when_z0_can_equal_b() {
+        // Z0 in [0.9, 1.1] meets b in [0.95, 1.05] inside both ranges, at no corner of either.
+        let (lo, hi) = v0_interval((0.9, 1.1), (2.0, 1.0, 0.1), (0.1, 0.05, 0.01));
+        assert!((lo - 0.09).abs() < 1e-12);
+        // Farthest |Z0 - b| is 1.1 - 0.95 = 0.15: 2.1 * 0.0225 + 0.11.
+        assert!((hi - (2.1 * 0.0225 + 0.11)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_interval_is_the_corners_when_z0_is_away_from_b() {
+        let (lo, hi) = v0_interval(
+            (-0.74, -0.72),
+            (0.265, 0.246, 0.0001),
+            (0.0005, 0.0005, 0.00005),
+        );
+        assert!((lo - (0.2645 * (0.9655_f64).powi(2) + 0.00005)).abs() < 1e-12);
+        assert!((hi - (0.2655 * (0.9865_f64).powi(2) + 0.00015)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_range_meets_a_printed_value_only_through_its_rounding_interval() {
+        assert!(meets_two_decimals((0.17, 0.176), 0.18));
+        assert!(meets_two_decimals((0.1849, 0.19), 0.18));
+        assert!(!meets_two_decimals((0.185, 0.19), 0.18));
+        assert!(!meets_two_decimals((0.16, 0.1749), 0.18));
+        // The lower end of the rounding interval is in it: 0.175 rounds to 0.18.
+        assert!(meets_two_decimals((0.1, 0.18 - 0.005), 0.18));
+    }
+
+    #[test]
+    fn convergence_needs_the_last_two_within_two_standard_errors() {
+        assert!(converged_pair((10.0, 0.2), (10.39, 0.1)));
+        assert!(!converged_pair((10.0, 0.2), (10.4, 0.1)));
+        assert!(!converged_pair((10.4, 0.1), (10.0, 0.2)));
+    }
+
+    #[test]
+    fn the_skew_must_clear_three_combined_standard_errors() {
+        // Combined standard error 0.05: the difference must exceed 0.15.
+        assert!(skew_significant((0.36, 0.03), (0.2, 0.04)));
+        assert!(!skew_significant((0.35, 0.03), (0.2, 0.04)));
+        assert!(!skew_significant((0.2, 0.03), (0.36, 0.04)));
+    }
+
+    #[test]
+    fn the_noise_free_factor_decays_by_each_rule() {
+        // One factor, lambda 0: Z^1_n = z (1 + g dt)^-n by the implicit step, z exp(-g t) exactly.
+        let kernel = [(1.0, 100.0)];
+        let (a, b, c) = (1.0, 0.0, 0.0);
+        let (implicit, _) = noise_free(&kernel, &[1.0], (a, b, c, 0.0), 0.01, 0.001, false);
+        let (exact, _) = noise_free(&kernel, &[1.0], (a, b, c, 0.0), 0.01, 0.001, true);
+        assert!((implicit - 1.1_f64.powi(-20)).abs() < 1e-12);
+        assert!((exact - (-2.0_f64).exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_noise_free_mean_uses_the_left_point() {
+        // One step: the mean is V_0 alone.
+        let (_, mean) = noise_free(
+            &[(1.0, 100.0)],
+            &[2.0],
+            (1.0, 0.0, 0.5, 0.0),
+            0.01,
+            0.01,
+            false,
+        );
+        assert!((mean - 4.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_noise_free_forcing_pulls_by_lambda() {
+        // One factor with weight 1, gamma 1, lambda 2, one step of 0.1 from z 1:
+        // implicit (1 - 2 * 1 * 0.1) / 1.1; exact 1 e^-0.1 - 2 (1 - e^-0.1).
+        let kernel = [(1.0, 1.0)];
+        let (vi, _) = noise_free(&kernel, &[1.0], (1.0, 0.0, 0.0, 2.0), 0.1, 0.1, false);
+        let (ve, _) = noise_free(&kernel, &[1.0], (1.0, 0.0, 0.0, 2.0), 0.1, 0.1, true);
+        let e = (-0.1_f64).exp();
+        assert!((vi - (0.8_f64 / 1.1).powi(2)).abs() < 1e-12);
+        assert!((ve - (e - 2.0 * (1.0 - e)).powi(2)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_implied_volatility_inverts_black_scholes_and_vega_is_its_slope() {
+        let (s, k, t, vol) = (3000.0, 2900.0, 0.05, 0.23);
+        let price = bs_call(s, k, t, vol);
+        assert!((implied_vol(price, s, k, t).unwrap() - vol).abs() < 1e-6);
+        assert!(implied_vol(s - k, s, k, t).is_none());
+        let h = 1e-5;
+        let slope = (bs_call(s, k, t, vol + h) - bs_call(s, k, t, vol - h)) / (2.0 * h);
+        assert!((bs_vega(s, k, t, vol) / slope - 1.0).abs() < 1e-4);
+    }
 }
