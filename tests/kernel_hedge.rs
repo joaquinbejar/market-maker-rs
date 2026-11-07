@@ -17,7 +17,7 @@ use market_maker_rs::backtest::MarketTick;
 use market_maker_rs::backtest::kernel::{
     CombinedLimits, EventSink, FinancialKernel, FundingRate, HedgeEvent, HedgeInstrument,
     HedgeLaneConfig, HedgeRefusal, HedgedAction, HedgedKernel, HedgedState, KernelAction,
-    KernelConfig, KernelDataset, KernelEvent, KernelLatency, QuoteSide,
+    KernelConfig, KernelDataset, KernelEvent, KernelLatency, KernelMargin, QuoteSide,
 };
 use market_maker_rs::dec;
 use market_maker_rs::execution::Action;
@@ -835,4 +835,18 @@ fn test_the_lane_sends_its_rows_fills_and_funding_in_its_own_order() {
     let summary = k.summary(&s).unwrap();
     assert_eq!(summary.funding, dec!(-0.020004));
     assert_eq!(summary.fees, dec!(0.10004));
+}
+
+#[test]
+fn test_a_hedged_kernel_refuses_a_balance_gate_on_either_lane() {
+    let l = latency(1, 1, 0);
+    let (cfg, data) = quoted(l);
+    let inst = instrument(l);
+    let rows = hedge_rows(&inst, &[(500, dec!(100.00), dec!(100.04), dec!(5))]);
+    let gated = cfg.clone().with_margin(KernelMargin::new(dec!(0)));
+    let error = K::new(&gated, &data, &spot(inst.clone()), &rows).unwrap_err();
+    assert!(error.to_string().contains("balance gate"), "{error}");
+    let lane = spot(inst.with_margin(KernelMargin::new(dec!(0))));
+    let error = K::new(&cfg, &data, &lane, &rows).unwrap_err();
+    assert!(error.to_string().contains("balance gate"), "{error}");
 }

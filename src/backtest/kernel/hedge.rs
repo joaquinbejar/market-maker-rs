@@ -200,6 +200,9 @@ fn validate_lane(lane: &HedgeLaneConfig, quoted: &KernelConfig) -> MMResult<Vali
             "the hedge lane holds no capital: initial_capital must be zero".to_string(),
         ));
     }
+    if i.margin.is_some() {
+        return Err(invalid("the hedge lane takes no balance gate".to_string()));
+    }
     if i.fee_currency != KernelFee::Quote || i.fill_model != KernelFillModel::Immediate {
         return Err(invalid(
             "the hedge lane takes quote fees and fills immediately".to_string(),
@@ -874,14 +877,21 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     /// refused by [`FinancialKernel::new`], if the lane's instrument breaks
     /// a rule of [`HedgeLaneConfig::instrument`] or a bound, if the
     /// multiplier is not positive, a combined limit negative, or funding
-    /// times not strictly increasing, or if `hedge` was built on another
-    /// grid.
+    /// times not strictly increasing, if `hedge` was built on another
+    /// grid, or if the quoted lane has a balance gate
+    /// ([`KernelConfig::margin`]), which reads one instrument's balances
+    /// only.
     pub fn new(
         cfg: &KernelConfig,
         data: &'d KernelDataset,
         lane: &HedgeLaneConfig,
         hedge: &'d KernelDataset,
     ) -> MMResult<Self> {
+        if cfg.margin.is_some() {
+            return Err(invalid(
+                "a hedged kernel does not take a balance gate on its quoted lane".to_string(),
+            ));
+        }
         let kernel = FinancialKernel::new(cfg, data)?;
         let lane = validate_lane(lane, cfg)?;
         let grid = hedge.grid;
