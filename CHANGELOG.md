@@ -27,6 +27,10 @@ project follows [Semantic Versioning](https://semver.org/).
   without zero waits, block lengths, how touch-queue lives end, and the drift of each estimator's
   fit) and phase 3 (each estimator and its constant baseline on #286's windows and the training
   part's first hours, the choice and stop rule fixed before any run, and the holdout's verdict).
+  E3, built because phase 1 met its condition, is E1 with touch resets read from the capture
+  (a side's touch at a move of the mid that emptied no touch, its new size from the side's next
+  touch event); its redraw law is the observed new sizes, with the invariant law as a
+  sensitivity row only. `qr_estimation synthetic-e3` checks that E3 recovers known resets.
 - The robustness study of #108 in `bridges/python/experiments/m5_03`: #102's classical arms and
   frozen learned policies under bounded perturbations of the queue-reactive flow (market, cancel
   and limit rates and the reference's move probability), with an adversary that picks the worst

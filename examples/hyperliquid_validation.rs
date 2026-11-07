@@ -106,10 +106,11 @@ use market_maker_rs::backtest::hyperliquid::{
     read_book_diffs_after, read_trades_after, sized_events,
 };
 use market_maker_rs::backtest::queue_reactive::{
-    BookSample, DiscrepancyReport, EventSizeRecord, QrEstimationConfig, QrEventKind, QrFit,
-    QrParameters, QrSide, QrSimulator, QueueObservation, ReferenceObservation, SizedEvent,
-    Trajectory, UnsupportedPolicy, ZeroWaitPolicy, collapse_blocks, compare_trajectories,
-    estimate_event_sizes, estimate_parameters,
+    BookSample, DiscrepancyReport, EventSizeRecord, QrEstimationConfig, QrEventKind, QrFailure,
+    QrFit, QrParameters, QrRecord, QrSide, QrSimulator, QueueObservation, ReferenceObservation,
+    ResetObservation, SizedEvent, Trajectory, UnsupportedPolicy, ZeroWaitPolicy, collapse_blocks,
+    compare_trajectories, estimate_event_sizes, estimate_parameters,
+    estimate_parameters_with_resets,
 };
 use market_maker_rs::dec;
 use market_maker_rs::risk::RiskLimits;
@@ -122,7 +123,7 @@ use market_maker_rs::strategy::walk_forward::{
     calibrate_window, chronological_splits, walk_forward,
 };
 use market_maker_rs::types::error::MMResult;
-use rust_decimal::prelude::FromStr;
+use rust_decimal::prelude::{FromStr, ToPrimitive};
 
 #[path = "support/qr_290.rs"]
 mod qr_290;
@@ -878,6 +879,8 @@ struct TouchEvent {
     side: Option<usize>,
     /// What it left at its level; `None` for an unknown cause.
     level_after: Option<Decimal>,
+    /// What its level held before it.
+    level_before: Decimal,
 }
 
 impl TouchEvent {
@@ -892,6 +895,7 @@ impl TouchEvent {
                 EventCause::Cancel | EventCause::Fill => Some(event.level_before - event.size),
                 _ => None,
             },
+            level_before: event.level_before,
         }
     }
 }
@@ -928,6 +932,21 @@ struct Phase290 {
     events_in_block: u64,
     /// Phase 3's choice on the training window, or why there is none.
     choice: Option<Result<&'static str, String>>,
+    /// E3's touch resets, from every part, one in the queue stride; out of time order until
+    /// sorted for a fit.
+    resets: Vec<ResetObservation>,
+    resets_seen: u64,
+    /// On the training part: resets made, and sides at a move with no emptied touch that
+    /// gave none, for want of a seen touch.
+    resets_made: u64,
+    resets_skipped: u64,
+    /// A reset per side waiting for its new touch's size.
+    pending: [Option<ResetObservation>; 2],
+    /// Time of each side's last touch event in the current life.
+    touch_ns: [Option<u64>; 2],
+    /// On the training part, per limit and kind: the summed size change in event sizes and
+    /// the events.
+    size_change: [[(f64, u64); 3]; LIMITS as usize],
 }
 
 impl Phase290 {
@@ -971,49 +990,135 @@ impl Phase290 {
         }
     }
 
-    fn take_book<'a>(&mut self, events: impl Iterator<Item = &'a BookEvent>) {
+    /// Reads the book's events: on the training part (`counting`) for phase 1's counts, and on
+    /// every part for E3's resets, in units of `touch_size` and kept one in `stride`.
+    fn take_book<'a>(
+        &mut self,
+        events: impl Iterator<Item = &'a BookEvent>,
+        counting: bool,
+        sizes: &[Decimal],
+        stride: u64,
+    ) {
         for event in events {
-            self.take_touch(TouchEvent::of(event));
+            if counting
+                && event.warmth == Warmth::Warm
+                && let Some(depth) = event.depth
+                && let (Some(size), Some(row)) = (
+                    sizes.get(usize::from(depth)),
+                    self.size_change.get_mut(usize::from(depth)),
+                )
+            {
+                let kind = match event.cause {
+                    EventCause::Limit => Some(0),
+                    EventCause::Cancel => Some(1),
+                    EventCause::Fill => Some(2),
+                    _ => None,
+                };
+                if let Some(cell) = kind.and_then(|k| row.get_mut(k))
+                    && let Some(units) = (event.size / *size).to_f64()
+                {
+                    cell.0 += units;
+                    cell.1 += 1;
+                }
+            }
+            let touch_size = sizes.first().copied().unwrap_or(Decimal::ONE);
+            self.take_touch(TouchEvent::of(event), counting, touch_size, stride);
         }
     }
 
-    fn take_touch(&mut self, event: TouchEvent) {
-        if self.last_time_ns != Some(event.time_ns) {
-            if let Some(last) = self.last_time_ns {
-                let gap = event.time_ns.saturating_sub(last);
-                let ms = gap / NS_PER_MS;
-                let bin = qr_290::BLOCK_GAP_BOUNDS_MS.partition_point(|&bound| bound <= ms);
-                if let Some(cell) = self.gaps.get_mut(bin) {
-                    *cell += 1;
-                }
-                self.gap_total_ns += u128::from(gap);
-                self.blocks += 1;
-                self.multi_event_blocks += u64::from(self.events_in_block > 1);
-            }
-            self.last_time_ns = Some(event.time_ns);
-            self.events_in_block = 0;
+    fn keep_reset(&mut self, reset: ResetObservation, stride: u64) {
+        if keep_one_in(&mut self.resets_seen, stride) {
+            self.resets.push(reset);
         }
-        self.events_in_block += 1;
-        self.block_events += 1;
+    }
+
+    fn take_touch(&mut self, event: TouchEvent, counting: bool, touch_size: Decimal, stride: u64) {
+        let units = |level: Decimal| (level / touch_size).round().to_u32().unwrap_or(u32::MAX);
+        if counting {
+            if self.last_time_ns != Some(event.time_ns) {
+                if let Some(last) = self.last_time_ns {
+                    let gap = event.time_ns.saturating_sub(last);
+                    let ms = gap / NS_PER_MS;
+                    let bin = qr_290::BLOCK_GAP_BOUNDS_MS.partition_point(|&bound| bound <= ms);
+                    if let Some(cell) = self.gaps.get_mut(bin) {
+                        *cell += 1;
+                    }
+                    self.gap_total_ns += u128::from(gap);
+                    self.blocks += 1;
+                    self.multi_event_blocks += u64::from(self.events_in_block > 1);
+                }
+                self.last_time_ns = Some(event.time_ns);
+                self.events_in_block = 0;
+            }
+            self.events_in_block += 1;
+            self.block_events += 1;
+        }
         if self.mid != Some(event.mid) {
-            if self.mid.is_some() {
-                for touch in self.touch {
-                    let end = match touch {
-                        Some(Touch::Level(level)) if level <= Decimal::ZERO => 0,
-                        Some(Touch::Level(_)) => 1,
-                        _ => 2,
-                    };
+            let ends = self.touch.map(|touch| match touch {
+                Some(Touch::Level(level)) if level <= Decimal::ZERO => 0,
+                Some(Touch::Level(_)) => 1,
+                _ => 2,
+            });
+            if counting && self.mid.is_some() {
+                for end in ends {
                     self.lives[end] += 1;
+                }
+            }
+            // A reset still waiting for its new size ends with none.
+            for side in 0..2 {
+                if let Some(reset) = self.pending.get_mut(side).and_then(Option::take) {
+                    self.keep_reset(reset, stride);
+                }
+            }
+            let both = matches!(self.mid, Some(Some(_))) && event.mid.is_some();
+            if both && !ends.contains(&0) {
+                for side in 0..2 {
+                    match (self.touch.get(side), self.touch_ns.get(side)) {
+                        (Some(Some(Touch::Level(level))), Some(Some(at))) => {
+                            if counting {
+                                self.resets_made += 1;
+                            }
+                            if let Some(slot) = self.pending.get_mut(side) {
+                                *slot = Some(ResetObservation {
+                                    timestamp_ms: event.time_ns / NS_PER_MS,
+                                    side: if side == 0 { QrSide::Bid } else { QrSide::Ask },
+                                    queue_before: units(*level),
+                                    waiting_seconds: event.time_ns.saturating_sub(*at) as f64 / 1e9,
+                                    queue_after: None,
+                                });
+                            }
+                        }
+                        _ => {
+                            if counting {
+                                self.resets_skipped += 1;
+                            }
+                        }
+                    }
                 }
             }
             self.mid = Some(event.mid);
             self.touch = [None; 2];
+            self.touch_ns = [None; 2];
         }
-        if let Some(side) = event.side
-            && let Some(touch) = self.touch.get_mut(side)
-        {
-            *touch = Some(event.level_after.map_or(Touch::Unobserved, Touch::Level));
+        if let Some(side) = event.side {
+            if let Some(mut reset) = self.pending.get_mut(side).and_then(Option::take) {
+                reset.queue_after = Some(units(event.level_before));
+                self.keep_reset(reset, stride);
+            }
+            if let Some(touch) = self.touch.get_mut(side) {
+                *touch = Some(event.level_after.map_or(Touch::Unobserved, Touch::Level));
+            }
+            if let Some(at) = self.touch_ns.get_mut(side) {
+                *at = Some(event.time_ns);
+            }
         }
+    }
+
+    /// E3's resets in time order.
+    fn sorted_resets(&self) -> Vec<ResetObservation> {
+        let mut resets = self.resets.clone();
+        resets.sort_by_key(|r| r.timestamp_ms);
+        resets
     }
 
     /// The share of lives that ended by a move while not empty, among those whose end is known.
@@ -1026,8 +1131,12 @@ impl Phase290 {
 /// An estimator's name and its fit, or why there is none.
 type Fit290Input = (&'static str, Result<QrParameters, String>);
 
-/// #290's estimators, in the order a tie is broken.
-const ESTIMATORS_290: [&str; 3] = ["E0", "E1", "E2"];
+/// #290's estimators, in the order a tie is broken, then E3's sensitivity row, which is
+/// reported and never chosen.
+const ESTIMATORS_290: [&str; 5] = ["E0", "E1", "E2", "E3", "E3 inv"];
+
+/// The estimators phase 3 chooses among.
+const CHOSEN_AMONG_290: [&str; 4] = ["E0", "E1", "E2", "E3"];
 
 /// One run of #290's phase 3: an estimator's fit or its constant baseline against a window.
 #[derive(Debug)]
@@ -1080,7 +1189,10 @@ fn stationary_290(mean_touch_queue: f64) -> bool {
 /// total variation at limit 0, the first on a tie; none when no fit is stationary.
 fn choose_290(lines: &[Line290]) -> Result<&'static str, String> {
     let mut best: Option<(&'static str, f64)> = None;
-    for line in lines.iter().filter(|l| !l.baseline) {
+    for line in lines
+        .iter()
+        .filter(|l| !l.baseline && CHOSEN_AMONG_290.contains(&l.estimator))
+    {
         let Ok((report, mean)) = &line.outcome else {
             continue;
         };
@@ -1407,27 +1519,65 @@ impl Collect {
         estimator: &'static str,
         window: &TimeWindow,
     ) -> Result<QrParameters, String> {
-        let Some(Ok(event_sizes)) = self.sizes.as_ref().map(|s| &s.queue.sizes) else {
-            return Err("no event sizes".to_string());
-        };
-        let (events, zero_waits) = match estimator {
-            "E0" => (&self.queue, ZeroWaitPolicy::Drop),
-            "E1" => (&self.phase_290.all, ZeroWaitPolicy::Count),
-            _ => (&self.phase_290.collapsed, ZeroWaitPolicy::Count),
-        };
-        let record = estimate_parameters(
-            events,
-            &self.references,
-            event_sizes,
-            window,
-            &qr_config(self.tick).with_zero_waits(zero_waits),
-            &self.dataset,
-        )
-        .map_err(|error| format!("estimate_parameters: {error}"))?;
+        let record = self.record_290(estimator, window)?;
         match record.fit {
             QrFit::Calibrated(params) => Ok(params),
             other => Err(format!("{other:?}")),
         }
+    }
+
+    /// #290's record of `estimator` on the observations kept inside `window`. E3 is E1 with
+    /// the touch resets; "E3 inv", a sensitivity row only, is E3 redrawing from the first
+    /// limit's invariant law instead of the observed new sizes.
+    fn record_290(&self, estimator: &'static str, window: &TimeWindow) -> Result<QrRecord, String> {
+        let Some(Ok(event_sizes)) = self.sizes.as_ref().map(|s| &s.queue.sizes) else {
+            return Err("no event sizes".to_string());
+        };
+        let config = |zero_waits| qr_config(self.tick).with_zero_waits(zero_waits);
+        let plain = |events: &[QueueObservation], zero_waits| {
+            estimate_parameters(
+                events,
+                &self.references,
+                event_sizes,
+                window,
+                &config(zero_waits),
+                &self.dataset,
+            )
+        };
+        let record = match estimator {
+            "E0" => plain(&self.queue, ZeroWaitPolicy::Drop),
+            "E1" => plain(&self.phase_290.all, ZeroWaitPolicy::Count),
+            "E2" => plain(&self.phase_290.collapsed, ZeroWaitPolicy::Count),
+            _ => estimate_parameters_with_resets(
+                &self.phase_290.all,
+                &self.phase_290.sorted_resets(),
+                &self.references,
+                event_sizes,
+                window,
+                &config(ZeroWaitPolicy::Count),
+                &self.dataset,
+            ),
+        }
+        .map_err(|error| format!("estimate_parameters: {error}"))?;
+        if estimator != "E3 inv" {
+            return Ok(record);
+        }
+        let mut record = record;
+        record.fit = match std::mem::replace(
+            &mut record.fit,
+            QrFit::Insufficient(QrFailure::InvalidEstimate),
+        ) {
+            QrFit::Calibrated(params) => {
+                let rates = params.reset_rates().unwrap_or_default().to_vec();
+                let law = params.invariant(0).unwrap_or_default().to_vec();
+                params.with_resets(rates, law).map_or(
+                    QrFit::Insufficient(QrFailure::InvalidEstimate),
+                    QrFit::Calibrated,
+                )
+            }
+            other => other,
+        };
+        Ok(record)
     }
 
     /// The fits #290's phase 3 compares on a window of `kind`, or why it does not: the
@@ -1525,11 +1675,16 @@ impl Collect {
                     }
                     let values: Vec<QueueObservation> =
                         conversion.observations.iter().map(|o| o.value).collect();
-                    if part == Part::Train {
+                    let counting = part == Part::Train;
+                    if counting {
                         self.phase_290.take_counts(&values);
-                        self.phase_290
-                            .take_book(events.iter().filter(|e| e.epoch == self.epoch));
                     }
+                    self.phase_290.take_book(
+                        events.iter().filter(|e| e.epoch == self.epoch),
+                        counting,
+                        event_sizes,
+                        self.strides.queue,
+                    );
                     self.phase_290.take_lists(&values, self.strides.queue);
                     for observation in conversion.observations {
                         if observation.value.waiting_seconds > 0.0
@@ -2499,6 +2654,23 @@ fn section_290(report: &mut Report, collect: &Collect) {
             .collect();
         say!(report, "    limit {}: {}", depth + 1, cells.join("; "));
     }
+    say!(
+        report,
+        "    Mean size change per warm event, in event sizes (descriptive): {}",
+        p.size_change
+            .iter()
+            .enumerate()
+            .map(|(depth, kinds)| {
+                let cells: Vec<String> = ["limit", "cancel", "market"]
+                    .iter()
+                    .zip(kinds)
+                    .map(|(name, (sum, n))| format!("{name} {:.3}", sum / (*n).max(1) as f64))
+                    .collect();
+                format!("limit {}: {}", depth + 1, cells.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
     let mean_gap_ms = p.gap_total_ns as f64 / p.blocks.max(1) as f64 / NS_PER_MS as f64;
     let bins: Vec<String> = p
         .gaps
@@ -2537,41 +2709,42 @@ fn section_290(report: &mut Report, collect: &Collect) {
         p.lives[2],
         share.map_or("-".to_string(), |s| format!("{s:.3}"))
     );
-    let Some(Ok(event_sizes)) = collect.sizes.as_ref().map(|s| &s.queue.sizes) else {
+    say!(
+        report,
+        "    E3's touch resets on the training part: {} at a move with no emptied touch, {} \
+         sides with no touch seen since the last move left out; {} kept from every part, one \
+         in {}, {} of them with the new touch's size.",
+        p.resets_made,
+        p.resets_skipped,
+        p.resets.len(),
+        collect.strides.queue,
+        p.resets.iter().filter(|r| r.queue_after.is_some()).count()
+    );
+    if !matches!(collect.sizes.as_ref().map(|s| &s.queue.sizes), Some(Ok(_))) {
         say!(report, "(4): no event sizes.");
         return;
-    };
+    }
     let window = collect.protocol.queue_train();
-    let config = qr_config(collect.tick);
-    let fit = |name, events: &[QueueObservation], zero_waits| match estimate_parameters(
-        events,
-        &collect.references,
-        event_sizes,
-        &window,
-        &config.with_zero_waits(zero_waits),
-        &collect.dataset,
-    ) {
-        Ok(record) => Fit290 {
-            name,
-            events: record.events,
-            excluded: record.excluded_events,
-            params: match record.fit {
-                QrFit::Calibrated(params) => Ok(params),
-                other => Err(format!("{other:?}")),
+    let fits: Vec<Fit290> = ESTIMATORS_290
+        .iter()
+        .map(|name| match collect.record_290(name, &window) {
+            Ok(record) => Fit290 {
+                name,
+                events: record.events,
+                excluded: record.excluded_events,
+                params: match record.fit {
+                    QrFit::Calibrated(params) => Ok(params),
+                    other => Err(format!("{other:?}")),
+                },
             },
-        },
-        Err(error) => Fit290 {
-            name,
-            events: 0,
-            excluded: 0,
-            params: Err(error.to_string()),
-        },
-    };
-    let fits = [
-        fit("E0", &collect.queue, ZeroWaitPolicy::Drop),
-        fit("E1", &p.all, ZeroWaitPolicy::Count),
-        fit("E2", &p.collapsed, ZeroWaitPolicy::Count),
-    ];
+            Err(error) => Fit290 {
+                name,
+                events: 0,
+                excluded: 0,
+                params: Err(error),
+            },
+        })
+        .collect();
     say!(
         report,
         "(4) Training fits; drift = limit - cancel - market per second at limit 1, at sizes \
@@ -3042,36 +3215,116 @@ mod tests {
             mid: Some(Decimal::from(mid)),
             side,
             level_after: level.map(Decimal::from),
+            level_before: Decimal::ZERO,
         }
     }
 
     #[test]
     fn test_290_touch_lives_end_emptied_moved_or_unobserved() {
         let mut p = Phase290::default();
-        p.take_touch(touch(0, 100, Some(0), Some(0)));
-        p.take_touch(touch(0, 100, Some(1), Some(5)));
+        p.take_touch(touch(0, 100, Some(0), Some(0)), true, Decimal::ONE, 1);
+        p.take_touch(touch(0, 100, Some(1), Some(5)), true, Decimal::ONE, 1);
         assert_eq!(p.lives, [0, 0, 0], "the first mid closes nothing");
-        p.take_touch(touch(1, 101, None, Some(3)));
+        p.take_touch(touch(1, 101, None, Some(3)), true, Decimal::ONE, 1);
         assert_eq!(p.lives, [1, 1, 0]);
-        p.take_touch(touch(2, 101, Some(0), None));
-        p.take_touch(touch(3, 102, None, None));
+        p.take_touch(touch(2, 101, Some(0), None), true, Decimal::ONE, 1);
+        p.take_touch(touch(3, 102, None, None), true, Decimal::ONE, 1);
         assert_eq!(
             p.lives,
             [1, 1, 2],
             "an unknown cause and a quiet side are unobserved"
         );
-        p.take_touch(touch(4, 102, Some(1), Some(-1)));
-        p.take_touch(touch(5, 101, None, None));
+        p.take_touch(touch(4, 102, Some(1), Some(-1)), true, Decimal::ONE, 1);
+        p.take_touch(touch(5, 101, None, None), true, Decimal::ONE, 1);
         assert_eq!(p.lives, [2, 1, 3]);
         assert_eq!(p.exit_by_move_share(), Some(1.0 / 3.0));
         assert_eq!(Phase290::default().exit_by_move_share(), None);
     }
 
     #[test]
+    fn test_290_a_move_that_empties_no_touch_resets_each_seen_side() {
+        let mut p = Phase290::default();
+        let at = |p: &mut Phase290, e: TouchEvent, counting| {
+            p.take_touch(e, counting, Decimal::from(2), 1);
+        };
+        at(&mut p, touch(0, 100, Some(0), Some(10)), true);
+        at(&mut p, touch(1, 100, Some(1), Some(6)), true);
+        // The move: both touches left a size, so both reset, their sizes in units of 2.
+        at(&mut p, touch(3, 101, None, None), true);
+        assert_eq!(p.resets_made, 2);
+        assert!(p.resets.is_empty(), "each waits for its new size");
+        // The bid's next touch event gives its new size, from the level before it.
+        let next = TouchEvent {
+            level_before: Decimal::from(14),
+            ..touch(4, 101, Some(0), Some(16))
+        };
+        at(&mut p, next, true);
+        assert_eq!(
+            p.resets,
+            vec![ResetObservation {
+                timestamp_ms: 3,
+                side: QrSide::Bid,
+                queue_before: 5,
+                waiting_seconds: 0.003,
+                queue_after: Some(7),
+            }]
+        );
+        // The next move ends the ask's wait with no new size, and resets the bid again.
+        at(&mut p, touch(6, 100, None, None), true);
+        assert_eq!(p.resets.len(), 2);
+        assert_eq!(
+            p.resets[1],
+            ResetObservation {
+                timestamp_ms: 3,
+                side: QrSide::Ask,
+                queue_before: 3,
+                waiting_seconds: 0.002,
+                queue_after: None,
+            }
+        );
+        assert_eq!(
+            (p.resets_made, p.resets_skipped),
+            (3, 1),
+            "the ask was not seen"
+        );
+        // A move that empties a touch resets nothing.
+        at(&mut p, touch(7, 100, Some(1), Some(0)), true);
+        at(&mut p, touch(8, 100, Some(0), Some(4)), true);
+        at(&mut p, touch(9, 99, None, None), true);
+        assert_eq!((p.resets_made, p.resets_skipped), (3, 1));
+        assert_eq!(
+            p.resets.len(),
+            3,
+            "the bid's reset took its new size at its next touch event"
+        );
+        // Off the training part, resets are kept but not counted.
+        at(&mut p, touch(10, 99, Some(0), Some(4)), false);
+        at(&mut p, touch(10, 99, Some(1), Some(4)), false);
+        at(&mut p, touch(11, 100, None, None), false);
+        at(&mut p, touch(12, 101, None, None), false);
+        assert_eq!(p.resets.len(), 5);
+        assert_eq!((p.resets_made, p.resets_skipped), (3, 1));
+        let sorted = p.sorted_resets();
+        assert!(sorted.is_sorted_by_key(|r| r.timestamp_ms));
+        // From a one sided book, no reset.
+        let mut q = Phase290::default();
+        at(&mut q, touch(0, 100, Some(0), Some(4)), true);
+        at(
+            &mut q,
+            TouchEvent {
+                mid: None,
+                ..touch(1, 0, None, None)
+            },
+            true,
+        );
+        assert_eq!(q.resets_made + q.resets_skipped, 0);
+    }
+
+    #[test]
     fn test_290_blocks_are_distinct_times_and_their_gaps_fall_in_bins() {
         let mut p = Phase290::default();
         for ms in [0, 0, 5, 5, 2_000] {
-            p.take_touch(touch(ms, 100, None, None));
+            p.take_touch(touch(ms, 100, None, None), true, Decimal::ONE, 1);
         }
         assert_eq!((p.blocks, p.block_events, p.multi_event_blocks), (2, 5, 2));
         let mut want = [0; qr_290::BLOCK_GAP_BOUNDS_MS.len() + 1];
@@ -3151,6 +3404,15 @@ mod tests {
             line("E2", false, &[0.3], 1.0),
         ];
         assert_eq!(choose_290(&tie), Ok("E1"), "the first on a tie");
+        let sensitivity = [
+            line("E3 inv", false, &[0.0], 1.0),
+            line("E3", false, &[0.5], 1.0),
+        ];
+        assert_eq!(
+            choose_290(&sensitivity),
+            Ok("E3"),
+            "a sensitivity row is never chosen"
+        );
         let mut failed = line("E2", false, &[0.0], 1.0);
         failed.outcome = Err("no fit".to_string());
         let none = [line("E0", false, &[0.1], 100.0), failed];
@@ -3509,6 +3771,14 @@ mod tests {
         assert_eq!(window.data, (5, 5));
         collect.convert(Part::Train, &first_hour);
         assert!(counted(&collect) > 0);
+        assert!(
+            collect
+                .phase_290
+                .size_change
+                .iter()
+                .flatten()
+                .any(|(_, n)| *n > 0)
+        );
     }
 
     #[test]

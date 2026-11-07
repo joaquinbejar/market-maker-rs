@@ -20,10 +20,15 @@
 //!   parameters, its events are tied into blocks whose lengths are exponential with each mean in
 //!   [`BLOCK_MEANS_SECONDS`], and each estimator is fitted on them. It reports the error in the
 //!   rates and the fitted chain's mean touch queue against the truth's.
+//! - `synthetic-e3`: E3's recovery check. The calm regime with touch resets of known rate
+//!   [`E3_SYNTHETIC_RESET_RATE`] and redraw law (a quarter on each size from 1 to 4), untied
+//!   and tied at the capture's mean block length, fitted as E3. It reports the error in the
+//!   reset rates, their law and the other rates, and the mean touch queue of a 2 h run.
 
 use market_maker_rs::backtest::queue_reactive::{
     QrEstimationConfig, QrParameters, QrRecord, QrSimulator, QrStep, QueueObservation,
-    ReferenceObservation, UnsupportedPolicy, ZeroWaitPolicy, collapse_blocks, estimate_parameters,
+    ReferenceObservation, ResetObservation, UnsupportedPolicy, ZeroWaitPolicy, collapse_blocks,
+    estimate_parameters, estimate_parameters_with_resets,
 };
 use market_maker_rs::prelude::Decimal;
 use market_maker_rs::strategy::walk_forward::TimeWindow;
@@ -146,6 +151,95 @@ fn simulate(params: &QrParameters, seed: u64, horizon_seconds: f64) -> Result<Ve
             other => return Err(format!("the simulation ended early: {other:?}").into()),
         }
     }
+}
+
+/// E3's synthetic reset rate, per second, at every touch size from 1.
+const E3_SYNTHETIC_RESET_RATE: f64 = 0.5;
+
+/// The calm regime with E3's synthetic resets.
+fn calm_with_resets() -> Result<QrParameters, Failure> {
+    let calm = calm()?;
+    let rows = calm.max_queue() + 1;
+    let rates = (0..rows)
+        .map(|n| if n == 0 { 0.0 } else { E3_SYNTHETIC_RESET_RATE })
+        .collect();
+    let law = (0..rows)
+        .map(|n| if (1..=4).contains(&n) { 0.25 } else { 0.0 })
+        .collect();
+    Ok(calm.with_resets(rates, law)?)
+}
+
+/// A simulated reset with its exact time, and the move it made, if any.
+#[derive(Debug, Clone, Copy)]
+struct TimedReset {
+    now: f64,
+    reset: ResetObservation,
+    reference: Option<ReferenceObservation>,
+}
+
+/// Events and resets of a run with resets.
+fn simulate_with_resets(
+    params: &QrParameters,
+    seed: u64,
+    horizon_seconds: f64,
+) -> Result<(Vec<Timed>, Vec<TimedReset>), Failure> {
+    let mut simulator = QrSimulator::new(params.clone(), seed, REFERENCE_TICKS)?;
+    let (mut events, mut resets) = (Vec::new(), Vec::new());
+    loop {
+        let step = simulator.step()?;
+        let now = simulator.state().time_seconds;
+        if now > horizon_seconds {
+            return Ok((events, resets));
+        }
+        match step {
+            QrStep::Event {
+                observation,
+                reference,
+            } => events.push(Timed {
+                now,
+                observation,
+                reference,
+            }),
+            QrStep::Reset {
+                reset, reference, ..
+            } => resets.push(TimedReset {
+                now,
+                reset,
+                reference,
+            }),
+            other => return Err(format!("the simulation ended early: {other:?}").into()),
+        }
+    }
+}
+
+/// Resets tied as [`tied`] ties events, with the moves they made.
+fn tied_resets(
+    resets: &[TimedReset],
+    ends: &[f64],
+) -> (Vec<ResetObservation>, Vec<ReferenceObservation>) {
+    let at = |t: f64| if ends.is_empty() { t } else { tie(ends, t) };
+    let mut out = Vec::with_capacity(resets.len());
+    let mut moves = Vec::new();
+    for r in resets {
+        let now = at(r.now);
+        let last = at(r.now - r.reset.waiting_seconds);
+        out.push(ResetObservation {
+            timestamp_ms: milliseconds(now),
+            waiting_seconds: if ends.is_empty() {
+                r.reset.waiting_seconds
+            } else {
+                now - last
+            },
+            ..r.reset
+        });
+        if let Some(reference) = r.reference {
+            moves.push(ReferenceObservation {
+                timestamp_ms: milliseconds(now),
+                ..reference
+            });
+        }
+    }
+    (out, moves)
 }
 
 /// SplitMix64, for the block boundaries.
@@ -376,11 +470,162 @@ fn synthetic() -> Result<(), Failure> {
     Ok(())
 }
 
+/// The mean touch queue, both sides, of a 2 h run of `params` from seed [`QR_SEED`].
+fn run_mean_touch(params: &QrParameters) -> Result<f64, Failure> {
+    let run = QrSimulator::new(params.clone(), QR_SEED, REFERENCE_TICKS)?.run(7_200.0, 1.0)?;
+    let samples = run.samples.len().max(1) as f64;
+    Ok(run
+        .samples
+        .iter()
+        .map(|s| f64::from(s.bid[0]) + f64::from(s.ask[0]))
+        .sum::<f64>()
+        / (2.0 * samples))
+}
+
+/// One row of E3's check: a block mean and E3's errors, averaged over the seeds.
+struct E3Row {
+    block_mean: f64,
+    /// Mean absolute error of the reset rates at sizes 1 to the cap.
+    reset_rate: f64,
+    /// Total variation between the fitted and the true redraw law.
+    reset_law: f64,
+    /// The other rates' errors at each limit.
+    errors: Vec<Errors>,
+    /// The fit's mean touch queue over a 2 h run.
+    run_mean: f64,
+}
+
+fn e3_rows(hours: f64, seeds: &[u64], block_means: &[f64]) -> Result<Vec<E3Row>, Failure> {
+    let truth = calm_with_resets()?;
+    let horizon = hours * 3600.0;
+    let config = QrEstimationConfig::new(
+        truth.tick_size(),
+        u8::try_from(truth.limits())?,
+        u32::try_from(truth.max_queue())?,
+        SYNTHETIC_MIN_EVENTS,
+        SYNTHETIC_MIN_REFERENCE_MOVES,
+        UnsupportedPolicy::NearestSupported,
+    )
+    .with_zero_waits(ZeroWaitPolicy::Count);
+    let runs = seeds
+        .iter()
+        .map(|&seed| Ok((seed, simulate_with_resets(&truth, seed, horizon)?)))
+        .collect::<Result<Vec<_>, Failure>>()?;
+    let true_rates = truth.reset_rates().ok_or("rates")?;
+    let true_law = truth.reset_law().ok_or("law")?;
+    let mut rows = Vec::new();
+    for &block_mean in block_means {
+        let mut row = E3Row {
+            block_mean,
+            reset_rate: 0.0,
+            reset_law: 0.0,
+            errors: vec![Errors::default(); truth.limits()],
+            run_mean: 0.0,
+        };
+        for (seed, (events, resets)) in &runs {
+            let ends = if block_mean > 0.0 {
+                block_ends(block_mean, horizon, *seed)
+            } else {
+                Vec::new()
+            };
+            let (observations, mut references) = tied(events, &ends);
+            let (resets, moves) = tied_resets(resets, &ends);
+            references.extend(moves);
+            references.sort_by_key(|r| r.timestamp_ms);
+            let end = observations
+                .last()
+                .map_or(0, |o| o.timestamp_ms)
+                .max(resets.last().map_or(0, |r| r.timestamp_ms))
+                + 1;
+            let record = estimate_parameters_with_resets(
+                &observations,
+                &resets,
+                &references,
+                truth.event_sizes(),
+                &TimeWindow::new(0, end)?,
+                &config,
+                "synthetic",
+            )?;
+            let fit = record
+                .parameters()
+                .ok_or_else(|| format!("E3 did not fit: {:?}", record.fit))?;
+            let rates = fit.reset_rates().ok_or("no reset rates")?;
+            let law = fit.reset_law().ok_or("no reset law")?;
+            let sizes = (rates.len() - 1) as f64;
+            row.reset_rate += rates
+                .iter()
+                .zip(true_rates)
+                .skip(1)
+                .map(|(g, w)| (g - w).abs())
+                .sum::<f64>()
+                / sizes;
+            row.reset_law += law
+                .iter()
+                .zip(true_law)
+                .map(|(g, w)| (g - w).abs())
+                .sum::<f64>()
+                / 2.0;
+            for (depth, total) in row.errors.iter_mut().enumerate() {
+                let e = errors(fit, &truth, depth)?;
+                total.relative += e.relative;
+                total.drift += e.drift;
+                total.unsupported += e.unsupported;
+            }
+            row.run_mean += run_mean_touch(fit)?;
+        }
+        let k = runs.len() as f64;
+        row.reset_rate /= k;
+        row.reset_law /= k;
+        row.run_mean /= k;
+        for e in &mut row.errors {
+            e.relative /= k;
+            e.drift /= k;
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn synthetic_e3() -> Result<(), Failure> {
+    let truth = calm_with_resets()?;
+    let block_means = [0.0, CAPTURE_BLOCK_MEAN_SECONDS];
+    let rows = e3_rows(SYNTHETIC_HOURS, &SYNTHETIC_SEEDS, &block_means)?;
+    println!("## #290 E3 synthetic recovery (#102 calm regime with touch resets)\n");
+    println!(
+        "Seeds {SYNTHETIC_SEEDS:?}, {SYNTHETIC_HOURS} h each; means over the seeds. True reset \
+         rate {E3_SYNTHETIC_RESET_RATE} at every size from 1, redrawn uniformly on 1 to 4; the \
+         truth's mean touch queue over a 2 h run {:.3}. E3 counts zero waits.\n",
+        run_mean_touch(&truth)?
+    );
+    println!(
+        "| block mean (s) | reset rate error | reset law TV | rate error L0 | rate error L1 \
+         | max drift error L0 | unsupported | run mean touch |"
+    );
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for row in &rows {
+        let e0 = row.errors.first().copied().unwrap_or_default();
+        let e1 = row.errors.get(1).copied().unwrap_or_default();
+        println!(
+            "| {} | {:.4} | {:.4} | {:.3} | {:.3} | {:.3} | {} | {:.3} |",
+            row.block_mean,
+            row.reset_rate,
+            row.reset_law,
+            e0.relative,
+            e1.relative,
+            e0.drift,
+            e0.unsupported + e1.unsupported,
+            row.run_mean,
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Failure> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("synthetic") => synthetic(),
-        _ => Err("usage: qr_estimation synthetic".into()),
+        Some("synthetic-e3") => synthetic_e3(),
+        _ => Err("usage: qr_estimation synthetic | synthetic-e3".into()),
     }
 }
 
@@ -458,6 +703,44 @@ mod tests {
         assert_eq!(e1.excluded, untied.excluded);
         assert!(e0.used < e1.used);
         assert!(e2.used + e2.excluded < e1.used + e1.excluded);
+    }
+
+    #[test]
+    fn test_e3_recovers_its_resets_untied() {
+        let rows = e3_rows(1.0, &[QR_SEED], &[0.0]).unwrap();
+        let row = &rows[0];
+        assert!(row.reset_rate < 0.1, "{}", row.reset_rate);
+        assert!(row.reset_law < 0.05, "{}", row.reset_law);
+    }
+
+    #[test]
+    fn test_tied_resets_keep_their_moves_and_tie_their_waits() {
+        let reset = ResetObservation {
+            timestamp_ms: 900,
+            side: QrSide::Ask,
+            queue_before: 2,
+            waiting_seconds: 0.5,
+            queue_after: Some(3),
+        };
+        let reference = ReferenceObservation {
+            timestamp_ms: 900,
+            moved: true,
+            reinitialized: false,
+        };
+        let timed = [TimedReset {
+            now: 0.9,
+            reset,
+            reference: Some(reference),
+        }];
+        let (resets, moves) = tied_resets(&timed, &[0.0, 1.0, 2.5]);
+        assert_eq!(
+            (resets[0].timestamp_ms, resets[0].waiting_seconds),
+            (1000, 0.0)
+        );
+        assert_eq!(resets[0].queue_after, Some(3));
+        assert_eq!(moves[0].timestamp_ms, 1000);
+        let (untied, _) = tied_resets(&timed, &[]);
+        assert_eq!(untied[0], reset);
     }
 
     #[test]
