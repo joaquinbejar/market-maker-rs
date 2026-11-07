@@ -529,7 +529,10 @@
       "one_sided": "the Box quotes both sides, so a one-sided classical quote has no exact image: this teacher is a two-sided surrogate, whose missing side is made live at the farthest offset and the smallest size",
       "log": "per teacher run, counted before any training: quotes, holds, one-sided quotes made two-sided, sides inside the mid clamped to 0, sides beyond the grid clamped to its farthest offset, sides snapped off their distance, and the ticks moved in all, and the rollout's own fills; training refuses any teacher run whose rollout never filled",
       "observation": "the arm's own: with the forecast when the arm has the predictor",
-      "every_rows": 10
+      "every_rows": 10,
+      "gate": "the teacher gate is on each teacher run's whole rollout, its 100000 decisions (not rows) for one arm, latency and seed, the last cut day included, not on single days; a failed gate stops the step and is reported: no rerun, no other seed and no other point is tried to get fills",
+      "timing": "each sample is the observation returned before the decision and the target of the classical action taken at that decision, before the 10 rows advance",
+      "fills_note": "1000 ms in queue makes a fill possible, not certain: latency, the queue ahead and the price decide; the fills measured by the fee rule and the teacher log decide, and the design's queue against immediate fill check stays as recorded"
     },
     "cloning": {
       "loss": "mean squared error between the policy's mean action and the target, the mean over the batch and every action value, a hold's included",
@@ -543,7 +546,7 @@
       "then": "PPO from those weights for the arm's whole budget of decisions; the cloning's samples are not counted in that budget",
       "cost": "its wall time is reported apart from PPO's in each run's metadata"
     },
-    "no_duration": "the plain 5 value Box, a decision every row, with no duration value. Between decisions it has the same semantics as the duration arms: orders rest until the policy's next quote replaces them (cancels after the cancel latency) and a hold keeps them; nothing is cancelled automatically in any arm. Under this queue an arm deciding every row fills only by holding its quote for at least 8 rows, which it must learn without a duration action: its result reads as the cost of having no duration action under this queue, not as a learning failure. The report gives its holds per decision and its fills, and, beside the holdout as a descriptive row with no decision attached, the no_duration checkpoints evaluated under immediate fill at the chosen fee and each latency",
+    "no_duration": "the plain 5 value Box, a decision every row, with no duration value. Between decisions it has the same semantics as the duration arms: orders rest until the policy's next quote replaces them (cancels after the cancel latency) and a hold keeps them; nothing is cancelled automatically in any arm. Under this queue an arm deciding every row fills only by holding its quote for at least 8 rows, which it must learn without a duration action: its result reads as the cost of having no duration action under this queue, not as a learning failure. The report gives its holds per decision and its fills, and, beside the holdout as a descriptive row with no decision attached, the no_duration checkpoints evaluated under immediate fill at the chosen fee and each latency. Its warm start clones the 10 row teacher's quote targets into a policy that decides every row: the timing differs, so this is a warm start from the teacher's quotes, not a clone of its trajectory",
     "classical_selection": "#103's rule per regime, latency and decision interval (1 and 10 rows), on validation days at the fee rule's fee"
   }
 }
