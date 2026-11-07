@@ -83,3 +83,18 @@ def test_relabel_refuses_another_manifest_a_split_block_and_a_wrong_label(tmp_pa
     rows[-1]["ablation"] = None
     with pytest.raises(ValueError, match="is labelled None"):
         report.relabel(tmp_path, written(tmp_path, rows), DESIGN)
+
+
+def test_a_series_without_an_interval_is_an_error_not_a_decision():
+    short = {"insufficient": True, "days": 2, "required": 4}
+    with pytest.raises(ValueError, match="no interval"):
+        report.decide(short, report.Decimal(0), report.Decimal(1), 0)
+    with pytest.raises(ValueError, match="no interval"):
+        report.includes_zero(short)
+    interval = {"mean": 1.0, "lower": 0.5, "upper": 1.5, "days": 5}
+    assert report.decide(interval, report.Decimal(1), report.Decimal(1), 0) == "continue"
+    assert report.decide(dict(interval, lower=-0.5), report.Decimal(1), report.Decimal(1), 0) == (
+        "revise")
+    assert report.decide(dict(interval, mean=-1.0, lower=-2.0), report.Decimal(1),
+                         report.Decimal(1), 0) == "discard"
+    assert not report.includes_zero(interval) and report.includes_zero(dict(interval, lower=0.0))

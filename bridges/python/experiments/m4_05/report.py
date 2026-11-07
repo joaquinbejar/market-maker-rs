@@ -226,17 +226,24 @@ def build(out, design):
     return holdout, tables, series, comparisons, rows, ablation_tables(labelled, regimes)
 
 
+def bounds(interval):
+    """`(mean, lower, upper)` of an interval; a series without one is an error, not a decision."""
+    if any(interval.get(key) is None for key in ("mean", "lower", "upper")):
+        raise ValueError(f"no interval to decide on: {interval}")
+    return interval["mean"], interval["lower"], interval["upper"]
+
+
 def includes_zero(interval):
-    return interval.get("lower") is not None and interval["lower"] <= 0 <= interval["upper"]
+    _, lower, upper = bounds(interval)
+    return lower <= 0 <= upper
 
 
 def decide(interval, learned, classical, breaches):
-    lower = interval.get("lower")
-    point = interval.get("mean")
+    point, lower, _ = bounds(interval)
     drawdown_ok = learned <= Decimal("1.2") * classical
-    if lower is not None and lower > 0 and breaches == 0 and drawdown_ok:
+    if lower > 0 and breaches == 0 and drawdown_ok:
         return "continue"
-    if point is not None and point > 0:
+    if point > 0:
         return "revise"
     return "discard"
 
