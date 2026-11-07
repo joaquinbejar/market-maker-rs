@@ -47,15 +47,28 @@ def test_pdwis_on_policy_is_the_mean_daily_reward():
 
 def test_pdwis_by_hand():
     # Decision 0: weights 2 and 0 -> 1.0; decision 1: weights 1 and 3 -> (1*4 + 3*0) / 4 = 1.0;
-    # decision 2: only the first trajectory is that long -> 5.0.
-    rewards = [np.array([1.0, 4.0, 5.0]), np.array([7.0, 0.0])]
-    weights = [np.array([2.0, 1.0, 1.0]), np.array([0.0, 3.0])]
-    assert est.pdwis(rewards, logs(weights)) == pytest.approx(7.0)
+    # decision 2: weights 1 and 1 -> (5 + 1) / 2 = 3.0.
+    rewards = [np.array([1.0, 4.0, 5.0]), np.array([7.0, 0.0, 1.0])]
+    weights = [np.array([2.0, 1.0, 1.0]), np.array([0.0, 3.0, 1.0])]
+    assert est.pdwis(rewards, logs(weights)) == pytest.approx(5.0)
     # A decision where every weight is zero adds nothing.
     assert est.pdwis([np.array([5.0])], logs([[0.0]])) == 0.0
     # Weights of any common scale at a decision give the same estimate.
     huge = [w + 900.0 for w in logs(weights)]
-    assert est.pdwis(rewards, huge) == pytest.approx(7.0)
+    assert est.pdwis(rewards, huge) == pytest.approx(5.0)
+
+
+def test_unequal_lengths_are_refused_rather_than_conditioned_on_survivors():
+    # On policy, rewards [1, 2] and [3] have a true mean daily value of 3; normalizing at each
+    # decision over the trajectories still running would give 2 + 2 = 4.
+    rewards = [np.array([1.0, 2.0]), np.array([3.0])]
+    zero = [np.zeros(2), np.zeros(1)]
+    with pytest.raises(ValueError, match="unequal"):
+        est.pdwis(rewards, zero)
+    with pytest.raises(ValueError, match="unequal"):
+        est.doubly_robust(rewards, zero, rewards, rewards)
+    with pytest.raises(ValueError, match="unequal"):
+        est.effective_sample_share(zero)
 
 
 def test_doubly_robust_with_no_model_is_pdwis_and_with_an_exact_model_is_direct():
@@ -187,7 +200,7 @@ def test_bins_and_counted_propensities():
 
 def test_the_row_estimators_equal_the_list_ones():
     rng = np.random.default_rng(11)
-    lengths = [5, 5, 4]
+    lengths = [5, 5, 5]
     rewards = [rng.normal(size=n) for n in lengths]
     log_w = [np.log(rng.uniform(0.1, 3.0, size=n)) for n in lengths]
     logged = [rng.normal(size=n) for n in lengths]

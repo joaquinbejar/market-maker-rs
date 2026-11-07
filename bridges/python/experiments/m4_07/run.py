@@ -683,6 +683,15 @@ def freeze(study):
     return {"frozen_sha256": sha256(path)}
 
 
+def check_frozen_inputs(out, frozen):
+    """Refuses a holdout whose training or validation logs or interactive runs changed after
+    the freeze: the counted propensities and the direct method read the training logs again."""
+    for kind in ("logs", "truth"):
+        for split, digest in frozen[kind].items():
+            if sha256(pathlib.Path(out) / f"{kind}-{split}.json") != digest:
+                raise ValueError(f"{kind}-{split}.json changed after the freeze")
+
+
 def holdout(study, frozen_sha256):
     """The holdout's logs, truth, estimates and decisions, once, with the frozen settings."""
     path = study.out / "frozen.json"
@@ -697,6 +706,7 @@ def holdout(study, frozen_sha256):
             raise ValueError(f"{key} changed after the freeze")
     if frozen["validation_sha256"] != sha256(study.out / "validation.json"):
         raise ValueError("validation.json changed after the freeze")
+    check_frozen_inputs(study.out, frozen)
     validation_report = json.loads((study.out / "validation.json").read_text())
     run_logs(study, "holdout")
     run_truth(study, "holdout")

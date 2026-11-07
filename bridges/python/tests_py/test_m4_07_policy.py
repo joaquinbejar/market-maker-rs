@@ -91,3 +91,18 @@ def test_as_grid_skews_against_the_position_and_widens_with_time_left():
     action = rule(None, raw, mask())
     assert action[0] == 1 and action[1] == action[2] and action[3:] == (0, 0)
     assert rule(None, raw, mask(quote=False)) == run.HOLD
+
+
+def test_a_holdout_refuses_training_logs_or_truth_changed_after_the_freeze(tmp_path):
+    for name in ("logs-train.json", "logs-validation.json", "truth-train.json"):
+        (tmp_path / name).write_text("{}")
+    frozen = {"logs": {s: run.sha256(tmp_path / f"logs-{s}.json") for s in ("train", "validation")},
+              "truth": {"train": run.sha256(tmp_path / "truth-train.json")}}
+    run.check_frozen_inputs(tmp_path, frozen)
+    (tmp_path / "logs-train.json").write_text('{"changed": true}')
+    with pytest.raises(ValueError, match="logs-train.json changed"):
+        run.check_frozen_inputs(tmp_path, frozen)
+    (tmp_path / "logs-train.json").write_text("{}")
+    (tmp_path / "truth-train.json").write_text("[]")
+    with pytest.raises(ValueError, match="truth-train.json changed"):
+        run.check_frozen_inputs(tmp_path, frozen)

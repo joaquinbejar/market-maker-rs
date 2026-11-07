@@ -41,12 +41,15 @@ def log_window_weights(rho, window=None):
 
 
 def _stack(arrays, fill=0.0):
-    """Trajectories of unequal length as one matrix, padded with `fill`."""
-    length = max(len(a) for a in arrays)
-    out = np.full((len(arrays), length), fill)
-    for i, a in enumerate(arrays):
-        out[i, : len(a)] = a
-    return out
+    """Trajectories as one matrix. Every estimator here normalizes at each decision across
+    trajectories, so a trajectory that ended earlier would leave the denominator and the
+    estimate would condition on the trajectories still running; unequal lengths are refused
+    instead. Every day of #102's data has the same number of decisions. `fill` is unused and
+    kept for the callers."""
+    lengths = {len(a) for a in arrays}
+    if len(lengths) != 1:
+        raise ValueError(f"trajectories of unequal lengths {sorted(lengths)} are refused")
+    return np.asarray([np.asarray(a, dtype=float) for a in arrays])
 
 
 def per_decision(log_weights):
