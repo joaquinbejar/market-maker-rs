@@ -1,7 +1,7 @@
 {
  "issue": 106,
- "design_version": 1,
- "status": "stage S0 fixed before any fit; the main study's windows, splits and holdout are fixed in a later version of this file before any read of the capture, recorded in changes",
+ "design_version": 2,
+ "status": "version 2: stage S0 as in version 1 (run and passed), and the main study on the capture fixed here before any read of the capture",
  "question": "does a small MDQR (a queue-reactive book whose intensities come from a neural network of the state, after Bodor and Carlier, arXiv 2501.08822v1) fix what #286 found for the fitted QR model (transient, queues climbing to the cap, worse than its constant baseline on queue TV) without artefacts, and do #102's policies transfer to it",
  "approval": "design note v0 (bus 61956), approved with changes (bus 61960): the Hyperliquid capture is the main data, synthetic QR days only as stage S0; K = 3 with the gap from the paper's 5 stated; current QR and its constant baseline are the controls, without waiting for #290; #102's policies transfer at their own execution",
  "paper_gap": "the paper models 5 limits a side on FGBL futures, MLP 256-64 tanh, sizes 1 to 200; here K = 3 (the replay's declared depth, #263), MLP 128-64 tanh, sizes 1 to 64 in event-size units, and in S0 the truth's own 2 limits; no code was released with the paper, so this is a reimplementation from its text",
@@ -121,23 +121,122 @@
   "compute": "0 job slots: CPU torch, 1 thread, in this window's share; an estimate is recorded after a timing pilot of one seed on one window"
  },
  "main_study": {
-  "status": "not fixed yet: its version of this file comes before any read of the capture and after S0 passes",
-  "data": "the Hyperliquid BTC capture of December 2025 (Zenodo 18184441) through the replay at the declared depth K = 3 and tick 1 (#263), the Protocol split of hyperliquid_validation, declared windows per training day, extracted only from those windows' members",
-  "arms": "QR as fitted (#90) and its constant baseline (#286); Hawkes (#91) and Poisson; MDQR-small at K = 3 with 5 training seeds",
-  "clock": "block level: the total intensity is the block rate, and events inside a block are a sequence closed by an end-of-block token, so no event is dropped",
-  "generative_metrics": "queue size TV by limit, spread TV, waiting KS, flow law TV, coverage, best bid and ask queue correlation, P(kind | queue, limit) TV, next mid move balanced accuracy, gamma shape of queue sizes, events at the cap",
-  "transfer": "#102's frozen arms in each generator's rows at #102's own execution: 10 s rows, the rational queue at 1 lot per 5000 ms, min_queue 0 (bus 61960); before any run, a classical arm fills and its net differs from immediate fill",
-  "stop_rules": {
-   "S1": "on validation, MDQR is discarded if it produces NaN or more than 1 % of its events at the cap in 24 simulated hours",
-   "S2": "adopted only if on the holdout its queue TV beats QR and the constant baseline at every limit with intervals excluding zero, no dependency metric is worse than QR's interval, and the transfer rank tau against QR is at least 0.6"
+  "data": {
+   "label": "REAL DATA: the public Hyperliquid Order Flow Dataset, BTC perpetual, December 2025 (Zenodo 18184441, version 1.0, CC BY 4.0), as recorded on #76; Hyperliquid only, never mixed with another dataset",
+   "archives": "the raw archives at /Users/joaquin/Downloads/hyperliquid_202512, read only: book_diffs_202512.tar (sha256 b95f6166…13e8ec), btc_orders_202512.tar.xz (7bee8701…c9d4), trades_2025_12.tar (f2fbb81f…50cc, checked 2026-11-08)",
+   "members": "every hour of the epoch's replay, 2025-12-21 h15 to 2025-12-30 h18 UTC (220 hours), each as its three files o/<day>/btc_<hh>.data, d/<day>/ex<h> and t/<day>/<h>, gunzipped into /Users/joaquin/tmp/worktrees/market-maker-rs/m5_01_data/; each file's sha256 is checked against #76's per-file manifest (2232 lines, sha256 94752eb07b5a4ad101806654704764489b60e9916e3ff2af234597ba2554a337) before it is read, and the report states that every file matched; the directory is deleted after the holdout",
+   "replay": "src/backtest/hyperliquid.rs as examples/hyperliquid_validation.rs runs it (#263): tick 1, limits K = 3, a reset on a silence over 60 s, a warm-up of 10 minutes, book samples every 1 s; the hours are ingested in order from h15 of 2025-12-21, the file holding the reset at 15:03:26"
   },
-  "seeds_and_bootstrap": "MDQR 5 training seeds; simulation seeds declared; 2000 replicates, mean block 2, seed declared",
-  "compute": "2 job slots once #107 B frees them (bus 62495); any change in the job count announced on the bus"
+  "epoch": {
+   "window_utc": [
+    "2025-12-21T15:13:27Z",
+    "2025-12-30T18:33:42Z"
+   ],
+   "seconds": 789615,
+   "why": "the longest reset-free stretch of the month, warm after the reset at 15:03:26 and its 10 minute warm-up, as #263 and #290 used (bus 62810)"
+  },
+  "split": {
+   "rule": "hyperliquid_validation's Protocol: training 600 per mille, validation 200, holdout the rest, by time, each boundary rounded down to a whole second; the first 100 per mille of training, at most 1 h, estimates the event sizes, and the rest is the queue fit's training",
+   "sizes": [
+    "2025-12-21T15:13:27Z",
+    "2025-12-21T16:13:27Z"
+   ],
+   "queue_train": [
+    "2025-12-21T16:13:27Z",
+    "2025-12-27T02:49:36Z"
+   ],
+   "validation": [
+    "2025-12-27T02:49:36Z",
+    "2025-12-28T22:41:39Z"
+   ],
+   "holdout": [
+    "2025-12-28T22:41:39Z",
+    "2025-12-30T18:33:42Z"
+   ],
+   "check": "the extractor computes the split with Protocol from the replay's own epoch and refuses to go on if it differs from these boundaries"
+  },
+  "windows": {
+   "rule": "2 h windows, fixed here; a window's events and samples come from the continuous replay, so its book carries its history",
+   "mdqr_train": [
+    [
+     "2025-12-22T12:00:00Z",
+     "2025-12-22T14:00:00Z"
+    ],
+    [
+     "2025-12-23T12:00:00Z",
+     "2025-12-23T14:00:00Z"
+    ],
+    [
+     "2025-12-24T12:00:00Z",
+     "2025-12-24T14:00:00Z"
+    ],
+    [
+     "2025-12-25T12:00:00Z",
+     "2025-12-25T14:00:00Z"
+    ],
+    [
+     "2025-12-26T12:00:00Z",
+     "2025-12-26T14:00:00Z"
+    ]
+   ],
+   "validation": [
+    [
+     "2025-12-27T12:00:00Z",
+     "2025-12-27T14:00:00Z"
+    ],
+    [
+     "2025-12-28T12:00:00Z",
+     "2025-12-28T14:00:00Z"
+    ]
+   ],
+   "holdout": [
+    [
+     "2025-12-28T22:41:39Z",
+     "2025-12-29T00:41:39Z"
+    ],
+    [
+     "2025-12-29T12:00:00Z",
+     "2025-12-29T14:00:00Z"
+    ],
+    [
+     "2025-12-30T12:00:00Z",
+     "2025-12-30T14:00:00Z"
+    ]
+   ],
+   "why": "MDQR trains on one 2 h window a training day (the full stretch, about 10 M events a day, is too many for CPU training at this budget); QR, Hawkes and Poisson fit on the whole queue_train as #263 does, so the controls are as strong as they were; the holdout's first window is #263's out-of-sample book window",
+   "disclosed": "#286 already compared QR and its constant baseline with the data on #263's holdout book window, and #290 read the training part; MDQR's fit and every MDQR figure are new, but the holdout is not unseen for the QR arms"
+  },
+  "arms": {
+   "qr": "#90's estimate on queue_train, as #263 fits it (ZeroWaitPolicy Drop, the default); #290 found it transient, so S1's cap rule is read for it too and reported",
+   "qr_constant": "its constant baseline (#286), the only stationary QR model on this window per #290",
+   "hawkes": "fit_hawkes on queue_train's first-limit segments, the decay chosen on validation from [0.1, 1, 10, 100] as #263 does",
+   "poisson": "fit_poisson on the same segments",
+   "mdqr": "MDQR-small at K = 3: the QR book's mechanics (theta, theta_reinit and the invariant laws estimated on the mdqr_train windows), an intensity network MLP 128-64 tanh, a size network MLP 128-64 tanh over sizes 1 to 64 event sizes (64 meaning 64 or more), 5 training seeds"
+  },
+  "clock": {
+   "blocks": "events at one timestamp form a block (80 to 89 % of waits are zero on the capture, #290: 54.9 events a block); the network's total intensity is the block rate, and a block's events are a sequence: after each event the state updates and the network chooses the next event or an end-of-block token, so no event is dropped",
+   "likelihood": "the block's waiting time under the block rate at the state after the previous block, plus the cross-entropy of each event and of the end token within the block, plus each event's size under the size network",
+   "zero_waits": "QR is fitted as #90 does (zero waits dropped), the comparison #290 found transient; MDQR's block clock is the stated alternative"
+  },
+  "state": "log(1 + queue) of the 6 queues in event sizes, the spread in ticks, the signed trade imbalance over the last 20 s, 1 min, 5 min and 15 min, the kind of the last event at each queue, the time since it, and the hour of the day as sine and cosine",
+  "fit": "as S0: Adam, learning rate 0.001, minibatch 4096 blocks, 8 epochs, float64, torch with 1 thread, seeds 1 to 5; early stopping on the validation windows' log-likelihood, at most 8 epochs, the epoch kept fixed before any holdout read",
+  "generative_metrics": "per holdout window, each arm's simulation from the window's starting book against the data: compare_trajectories (queue size TV per limit, spread TV, waiting KS, flow law TV, coverage), best bid and ask queue correlation, P(kind | queue, limit) TV, next mid move balanced accuracy, gamma shape of queue sizes, share of events at the cap; 2000 block bootstrap replicates over the 3 windows' 10 min blocks, mean block 2, seed 106",
+  "transfer": {
+   "rule": "#102's frozen arms (Avellaneda-Stoikov, GLFT, fixed spread, maskable PPO seeds 1 to 5, residual SAC seeds 1 to 5) run on each generator's rows at #102's own execution: 10 s rows, queue_position_rational at 1 lot per 5000 ms, min_queue 0, #102's fee, latency and limits (bus 61960); rows from a generator's sampled book at 10 s, top of book in kernel ticks and lots",
+   "check": "before any transfer run, on a validation window's generated rows, a classical arm fills and its net differs from immediate fill",
+   "read": "each policy's net per generator, the Kendall tau of the policies' ranking under MDQR against under QR and against the data's own rows, with bootstrap intervals; rows do not react to the policy's orders, as in #102"
+  },
+  "stop_rules": {
+   "S1": "on validation, MDQR is discarded if it produces a NaN or more than 1 % of its events at the cap in 24 simulated hours; reported with the failure mode",
+   "S2": "adopted only if on the holdout its queue size TV beats both QR and the constant baseline at every limit with intervals excluding zero, no dependency metric is worse than QR's interval, and the transfer tau against QR is at least 0.6; else discarded with the evidence"
+  },
+  "compute": "extraction and replay at 0 job slots, one process; MDQR training 5 seeds on 2 slots once granted (bus 62495), announced on the bus; an estimate from a timing pilot of one seed on one training window, recorded in changes before the other fits"
  },
  "pins": {
   "m4_06_design_sha256": "9a1d1423d1f0e70eca9dd169d03cf85dca1b81ae7bd81516098cd1654165af2a"
  },
  "changes": [
-  "2026-11-08, design version 1 committed after one timing pilot and before any other S0 run: training seed 1 fitted on all 4 training windows (1309561 events) in 23 s on 1 thread, rather than one seed on one window as the compute line says; its fit was seen (log-likelihood per event by epoch, theta 0.604, theta_reinit 0.196, cap 4) and nothing else, no simulation and no comparison. The estimate: fit about 25 s a seed, so S0 needs no job slot."
+  "2026-11-08, design version 1 committed after one timing pilot and before any other S0 run: training seed 1 fitted on all 4 training windows (1309561 events) in 23 s on 1 thread, rather than one seed on one window as the compute line says; its fit was seen (log-likelihood per event by epoch, theta 0.604, theta_reinit 0.196, cap 4) and nothing else, no simulation and no comparison. The estimate: fit about 25 s a seed, so S0 needs no job slot.",
+  "2026-11-08, version 2, before any read of the capture: the main study fixed (data, members and manifest check, epoch, split, windows, arms, block clock, state, fit, metrics, transfer, stop rules). Seen before it: #263's and #290's published figures on this epoch (zero waits, block lengths, QR's transience), #286's holdout comparison of QR, and S0's own results; no capture file has been read by this window."
  ]
 }
