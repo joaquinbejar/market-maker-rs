@@ -337,6 +337,11 @@ impl<
         bounds: ResidualBounds,
         config: RlConfig,
     ) -> MMResult<Self> {
+        if config.quote_lives.is_some() {
+            return Err(MMError::InvalidConfiguration(
+                "quote lives are not available with a residual policy".to_string(),
+            ));
+        }
         // The grid of the inner environment is not used: quotes come from `compose`.
         let grid = ActionGrid::new([0], [0], [1])?;
         let env = RlEnv::new(kernel_config, data, grid, config)?;

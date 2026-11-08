@@ -1,5 +1,7 @@
 //! The environment over one kernel.
 
+use std::num::NonZeroU64;
+
 use rust_decimal::prelude::ToPrimitive;
 
 use crate::Decimal;
@@ -22,10 +24,10 @@ use super::audit::{EpisodeRecorder, EpisodeRecords};
 use super::features::{FeatureVector, HedgeFeatureVector, PreviousRow, feature_vector};
 use super::spec::{
     ACTION_SPACE_VERSION, ActionSpace, CANCEL_ACTION_SPACE_VERSION, CancelActions, CrossHedgeSpace,
-    EPISODE_VERSION, EpisodeSpec, HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION,
-    HEDGED_REWARD_VERSION, HedgeActions, HedgeScales, InvalidActionPolicy, ObservationScales,
-    ObservationSpace, REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec,
-    TerminalValuation,
+    EPISODE_VERSION, EXPIRY_ACTION_SPACE_VERSION, EpisodeSpec, HEDGED_ACTION_SPACE_VERSION,
+    HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION, HedgeActions, HedgeScales,
+    InvalidActionPolicy, ObservationScales, ObservationSpace, QuoteExpiry, QuoteLives,
+    REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec, TerminalValuation,
 };
 
 /// Code of an action whose indices are not on the grid, or whose price is not
@@ -47,6 +49,10 @@ pub const ERR_CROSS_HEDGE_REFUSED: ErrCode = ErrCode(202);
 /// under [`InvalidActionPolicy::Reject`].
 pub const ERR_CANCEL_REFUSED: ErrCode = ErrCode(203);
 
+/// Code of an expiring quote when the action space has no lives
+/// ([`QuoteExpiry::NotModelled`]), under [`InvalidActionPolicy::Reject`].
+pub const ERR_EXPIRY_REFUSED: ErrCode = ErrCode(204);
+
 const NS_PER_MS: u64 = 1_000_000;
 
 /// The choices of an environment.
@@ -66,6 +72,8 @@ pub struct RlConfig {
     pub hedge_actions: bool,
     /// Whether [`RlAction::Cancel`] exists, as [`CancelActions::CancelOnly`].
     pub cancel_action: bool,
+    /// The lives of [`RlAction::ExpiringQuote`], as [`QuoteExpiry::Lives`].
+    pub quote_lives: Option<QuoteLives>,
 }
 
 impl RlConfig {
@@ -81,6 +89,7 @@ impl RlConfig {
             terminal: TerminalValuation::MarkAtLastMid,
             hedge_actions: false,
             cancel_action: false,
+            quote_lives: None,
         }
     }
 
@@ -111,6 +120,14 @@ impl RlConfig {
     #[must_use]
     pub fn with_cancel_action(mut self) -> Self {
         self.cancel_action = true;
+        self
+    }
+
+    /// Adds [`RlAction::ExpiringQuote`] with these lives, of action space version
+    /// [`EXPIRY_ACTION_SPACE_VERSION`], with or without the cancel action.
+    #[must_use]
+    pub fn with_quote_lives(mut self, lives: QuoteLives) -> Self {
+        self.quote_lives = Some(lives);
         self
     }
 }
@@ -157,6 +174,21 @@ pub enum RlAction {
     /// Cancel every resting or pending order and send nothing, as [`CancelActions::CancelOnly`]
     /// states. Outside the mask without it.
     Cancel,
+    /// Replace the resting orders with a bid and an ask that expire by themselves, as
+    /// [`QuoteExpiry::Lives`] states. Outside the mask without lives, or with `life` out of
+    /// range.
+    ExpiringQuote {
+        /// Index of the bid offset.
+        bid: usize,
+        /// Index of the ask offset.
+        ask: usize,
+        /// Index of the bid size.
+        bid_size: usize,
+        /// Index of the ask size.
+        ask_size: usize,
+        /// Index of the life in [`RlConfig::quote_lives`].
+        life: usize,
+    },
 }
 
 /// The inventory closed on termination, under [`TerminalValuation::CloseAtTouch`].
@@ -357,14 +389,28 @@ fn bit(mask: u64, index: usize) -> bool {
         .is_some_and(|v| v & 1 == 1)
 }
 
-/// Returns true if `action` is inside `mask`, `hedge`, `cross` and `cancel`, while the run
-/// continues.
-fn allowed(mask: &ActionMask, hedge: u64, cross: u64, cancel: bool, action: RlAction) -> bool {
+/// Returns true if `action` is inside `mask`, `hedge`, `cross`, `cancel` and the `lives`
+/// available, while the run continues.
+fn allowed(
+    mask: &ActionMask,
+    hedge: u64,
+    cross: u64,
+    cancel: bool,
+    lives: usize,
+    action: RlAction,
+) -> bool {
     match action {
         RlAction::Hold => true,
         RlAction::Cancel => cancel,
         RlAction::Hedge { size } => bit(hedge, size),
         RlAction::CrossHedge { size } => bit(cross, size),
+        RlAction::ExpiringQuote {
+            bid,
+            ask,
+            bid_size,
+            ask_size,
+            life,
+        } => life < lives && mask.allows(bid, ask, bid_size, ask_size),
         RlAction::Quote {
             bid,
             ask,
@@ -480,7 +526,9 @@ impl<
                 Decimal::from(kernel_config.max_steps),
             ),
             action: ActionSpace {
-                version: if config.cancel_action {
+                version: if config.quote_lives.is_some() {
+                    EXPIRY_ACTION_SPACE_VERSION
+                } else if config.cancel_action {
                     CANCEL_ACTION_SPACE_VERSION
                 } else {
                     ACTION_SPACE_VERSION
@@ -505,6 +553,10 @@ impl<
                     CancelActions::CancelOnly
                 } else {
                     CancelActions::NotModelled
+                },
+                expiry: match &config.quote_lives {
+                    Some(lives) => QuoteExpiry::Lives(lives.as_slice().to_vec()),
+                    None => QuoteExpiry::NotModelled,
                 },
             },
             reward: RewardSpec {
@@ -564,6 +616,11 @@ impl<
         if config.cancel_action {
             return Err(MMError::InvalidConfiguration(
                 "the cancel action is not available with a hedge lane".to_string(),
+            ));
+        }
+        if config.quote_lives.is_some() {
+            return Err(MMError::InvalidConfiguration(
+                "quote lives are not available with a hedge lane".to_string(),
             ));
         }
         let mut env = Self::new(kernel_config, data, grid, config)?;
@@ -923,6 +980,9 @@ impl<
             self.hedge_mask(state),
             self.cross_hedge_mask(state),
             self.config.cancel_action,
+            self.config
+                .quote_lives
+                .map_or(0, |lives| lives.as_slice().len()),
             action,
         );
         if !inside && self.config.invalid_action == InvalidActionPolicy::Mask {
@@ -1284,6 +1344,44 @@ impl<
             RlAction::Hold => KernelAction::Hold,
             RlAction::Cancel if self.config.cancel_action => KernelAction::Cancel,
             RlAction::Cancel => KernelAction::QuoteError(ERR_CANCEL_REFUSED),
+            RlAction::ExpiringQuote {
+                bid,
+                ask,
+                bid_size,
+                ask_size,
+                life,
+            } => {
+                let Some(lives) = self.config.quote_lives else {
+                    return KernelAction::QuoteError(ERR_EXPIRY_REFUSED);
+                };
+                let Some(life_ns) = lives
+                    .as_slice()
+                    .get(life)
+                    .copied()
+                    .and_then(NonZeroU64::new)
+                else {
+                    return off_grid;
+                };
+                match self.kernel.grid_action(
+                    &state.kernel,
+                    &self.grid,
+                    (bid, ask, bid_size, ask_size),
+                ) {
+                    Some(KernelAction::Quote {
+                        bid,
+                        ask,
+                        bid_lots,
+                        ask_lots,
+                    }) => KernelAction::ExpiringQuote {
+                        bid,
+                        ask,
+                        bid_lots,
+                        ask_lots,
+                        life_ns,
+                    },
+                    _ => off_grid,
+                }
+            }
             RlAction::CrossHedge { .. } => KernelAction::QuoteError(ERR_CROSS_HEDGE_REFUSED),
             RlAction::Hedge { size } => {
                 let refused = KernelAction::QuoteError(ERR_HEDGE_REFUSED);
@@ -1686,27 +1784,27 @@ mod tests {
     #[test]
     fn test_allowed_a_refused_mask_blocks_quotes_and_leaves_a_hold() {
         let mask = refused();
-        assert!(allowed(&mask, 0, 0, false, RlAction::Hold));
+        assert!(allowed(&mask, 0, 0, false, 0, RlAction::Hold));
         let quote = RlAction::Quote {
             bid: 0,
             ask: 0,
             bid_size: 0,
             ask_size: 0,
         };
-        assert!(!allowed(&mask, 0, 0, false, quote));
+        assert!(!allowed(&mask, 0, 0, false, 0, quote));
         for side in [QuoteSide::Bid, QuoteSide::Ask] {
             let one = RlAction::OneSided {
                 side,
                 offset: 0,
                 size: 0,
             };
-            assert!(!allowed(&mask, 0, 0, false, one));
+            assert!(!allowed(&mask, 0, 0, false, 0, one));
             let open = ActionMask {
                 global_quote_ok: true,
                 refusal: None,
                 ..mask
             };
-            assert!(allowed(&open, 0, 0, false, one));
+            assert!(allowed(&open, 0, 0, false, 0, one));
         }
     }
 
@@ -1720,11 +1818,11 @@ mod tests {
             refusal: None,
         };
         let one = |side, offset, size| RlAction::OneSided { side, offset, size };
-        assert!(allowed(&mask, 0, 0, false, one(QuoteSide::Bid, 0, 0)));
-        assert!(!allowed(&mask, 0, 0, false, one(QuoteSide::Bid, 1, 0)));
-        assert!(allowed(&mask, 0, 0, false, one(QuoteSide::Ask, 1, 0)));
-        assert!(!allowed(&mask, 0, 0, false, one(QuoteSide::Ask, 0, 0)));
-        assert!(!allowed(&mask, 0, 0, false, one(QuoteSide::Bid, 0, 1)));
-        assert!(!allowed(&mask, 0, 0, false, one(QuoteSide::Bid, 64, 0)));
+        assert!(allowed(&mask, 0, 0, false, 0, one(QuoteSide::Bid, 0, 0)));
+        assert!(!allowed(&mask, 0, 0, false, 0, one(QuoteSide::Bid, 1, 0)));
+        assert!(allowed(&mask, 0, 0, false, 0, one(QuoteSide::Ask, 1, 0)));
+        assert!(!allowed(&mask, 0, 0, false, 0, one(QuoteSide::Ask, 0, 0)));
+        assert!(!allowed(&mask, 0, 0, false, 0, one(QuoteSide::Bid, 0, 1)));
+        assert!(!allowed(&mask, 0, 0, false, 0, one(QuoteSide::Bid, 64, 0)));
     }
 }
