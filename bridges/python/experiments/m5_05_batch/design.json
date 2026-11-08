@@ -171,6 +171,7 @@
   "epochs": 10
  },
  "changes": [
-  "before any run: the teacher's fit as a structured entry (teacher_fit), the same numbers as the text of teacher"
+  "before any run: the teacher's fit as a structured entry (teacher_fit), the same numbers as the text of teacher",
+  "before any run, in the runner only: the freeze records the sha256 of run.py, env.py and fba.py and the holdout refuses changed code; the holdout creates an exclusive marker before any holdout day is read, keeps it if the evaluation fails, and refuses to start while it exists, so the holdout is read once"
  ]
 }

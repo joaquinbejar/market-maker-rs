@@ -15,6 +15,7 @@ import hashlib
 import itertools
 import json
 import multiprocessing
+import os
 import pathlib
 import subprocess
 import sys
@@ -35,6 +36,8 @@ sys.path.insert(0, str(HERE))
 import env as batch  # noqa: E402
 
 LEARNED = ("full", "no_duration")
+CODE = ("run.py", "env.py", "fba.py")
+HOLDOUT_MARKER = "holdout.started"
 HOLD = np.asarray([-1.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32)
 MARKOUT_MS = (1000, 5000, 30_000)
 
@@ -480,6 +483,7 @@ def freeze(ctx):
         entries[path.stem] = {"checkpoint": meta["checkpoint_sha256"],
                               "metadata": sha256(path.with_suffix(".json"))}
     print(ctx.write("frozen", {"design_sha256": sha256(HERE / "design.json"),
+                               "code_sha256": {name: sha256(HERE / name) for name in CODE},
                                **{f"{n}_sha256": sha256(ctx.out / f"{n}.json")
                                   for n in ("predictor", "fee_rule", "check", "classical", "pilot")},
                                "runs": entries}))
@@ -491,6 +495,9 @@ def holdout(ctx, frozen_sha):
     frozen = json.loads((ctx.out / "frozen.json").read_text())
     if frozen["design_sha256"] != sha256(HERE / "design.json"):
         raise SystemExit("the design differs")
+    for name, digest in frozen["code_sha256"].items():
+        if sha256(HERE / name) != digest:
+            raise SystemExit(f"{name} changed after the freeze")
     for n in ("predictor", "fee_rule", "check", "classical", "pilot"):
         if frozen[f"{n}_sha256"] != sha256(ctx.out / f"{n}.json"):
             raise SystemExit(f"{n}.json differs")
@@ -502,6 +509,22 @@ def holdout(ctx, frozen_sha):
             raise SystemExit(f"{path.stem} changed after the freeze")
     if (ctx.out / "holdout.json").exists():
         raise SystemExit("the holdout runs once")
+    if (ctx.out / HOLDOUT_MARKER).exists():
+        raise SystemExit("the holdout was started already; a failed or concurrent attempt is not "
+                         "run again, and recovery is by hand")
+    jobs = holdout_jobs(ctx, runs)
+    # Before any job reads a holdout day: created only if absent, so a concurrent attempt fails
+    # here, and kept if the evaluation fails, so it is never run again on its own.
+    descriptor = os.open(ctx.out / HOLDOUT_MARKER, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    with os.fdopen(descriptor, "w") as marker:
+        marker.write(json.dumps({"commit": ctx.commit, "frozen_sha256": frozen_sha,
+                                 "jobs": len(jobs), "at": time.time()}))
+    rows = pool(jobs, evaluate_job, ctx.parallel, "holdout")
+    print(ctx.write("holdout", {**ctx.header("holdout"), "frozen_sha256": frozen_sha, "rows": rows}))
+
+
+def holdout_jobs(ctx, runs):
+    """Every arm on the holdout days, at each latency, at the fee and the secondary fee."""
     selected = ctx.read("classical")["selected"]
     coefficients = ctx.read("predictor")["coefficients"]
     jobs = []
@@ -516,8 +539,7 @@ def holdout(ctx, frozen_sha):
                     if meta["latency"] == lat:
                         jobs.append(ctx.job(meta["arm"], day, lat, fee, f"seed{meta['seed']}",
                                             {"kind": "frozen", "metadata": meta}, coefficients))
-    rows = pool(jobs, evaluate_job, ctx.parallel, "holdout")
-    print(ctx.write("holdout", {**ctx.header("holdout"), "frozen_sha256": frozen_sha, "rows": rows}))
+    return jobs
 
 
 def daily(rows, arm, latency, fee, days):

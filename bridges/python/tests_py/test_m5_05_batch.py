@@ -271,3 +271,97 @@ def test_holdout_days_are_refused_outside_their_step():
     with pytest.raises(PermissionError):
         batch_run.make_env(design, 20, 30, "0", "full")
     assert batch_run.make_env(design, 15, 30, "0", "no_duration").action_space.shape == (5,)
+
+
+REPORTS = ("predictor", "fee_rule", "check", "classical", "pilot")
+
+
+def frozen_context(tmp_path, monkeypatch, pool):
+    import json
+
+    ctx = batch_run.Context(tmp_path, "c0ffee", 1)
+    for name in REPORTS:
+        (tmp_path / f"{name}.json").write_text("{}")
+    manifest = {"design_sha256": batch_run.sha256(batch_run.HERE / "design.json"),
+                "code_sha256": {n: batch_run.sha256(batch_run.HERE / n) for n in batch_run.CODE},
+                **{f"{n}_sha256": batch_run.sha256(tmp_path / f"{n}.json") for n in REPORTS},
+                "runs": {}}
+    (tmp_path / "frozen.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(ctx, "runs", lambda: [])
+    monkeypatch.setattr(ctx, "header", lambda step: {"step": step})
+    monkeypatch.setattr(batch_run, "holdout_jobs", lambda ctx, runs: [{"day": 20}])
+    monkeypatch.setattr(batch_run, "pool", pool)
+    return ctx, manifest, batch_run.sha256(tmp_path / "frozen.json")
+
+
+def test_the_freeze_records_the_code_and_the_holdout_refuses_changed_code(tmp_path, monkeypatch):
+    import json
+
+    calls = []
+    ctx, manifest, good = frozen_context(
+        tmp_path, monkeypatch, lambda jobs, worker, parallel, label: calls.append(1) or [{}])
+    assert set(batch_run.CODE) == {"run.py", "env.py", "fba.py"}
+    for name in batch_run.CODE:
+        changed = {**manifest["code_sha256"], name: "0" * 64}
+        (tmp_path / "frozen.json").write_text(json.dumps(manifest | {"code_sha256": changed}))
+        with pytest.raises(SystemExit, match=f"{name} changed after the freeze"):
+            batch_run.holdout(ctx, batch_run.sha256(tmp_path / "frozen.json"))
+        assert not (tmp_path / batch_run.HOLDOUT_MARKER).exists() and calls == []
+    (tmp_path / "frozen.json").write_text(json.dumps(manifest))
+    batch_run.holdout(ctx, good)
+    assert calls == [1] and (tmp_path / "holdout.json").exists()
+    # The freeze writes the digests of the code the holdout checks.
+    fresh = batch_run.Context(tmp_path / "fresh", "c0ffee", 1)
+    for name in REPORTS:
+        (fresh.out / f"{name}.json").write_text("{}")
+    monkeypatch.setattr(fresh, "runs", lambda: [])
+    batch_run.freeze(fresh)
+    written = json.loads((fresh.out / "frozen.json").read_text())
+    assert written["code_sha256"] == manifest["code_sha256"]
+
+
+def test_a_failed_or_concurrent_holdout_is_never_run_again(tmp_path, monkeypatch):
+    import json
+    import pathlib as paths
+
+    calls = []
+
+    def failing(jobs, worker, parallel, label):
+        calls.append(len(jobs))
+        raise RuntimeError("a worker failed after reading days")
+
+    ctx, _, good = frozen_context(tmp_path, monkeypatch, failing)
+    with pytest.raises(RuntimeError, match="worker failed"):
+        batch_run.holdout(ctx, good)
+    marker = tmp_path / batch_run.HOLDOUT_MARKER
+    assert marker.exists() and not (tmp_path / "holdout.json").exists()
+    assert json.loads(marker.read_text())["frozen_sha256"] == good
+    with pytest.raises(SystemExit, match="started already"):
+        batch_run.holdout(ctx, good)
+    assert calls == [1]
+    # The marker is created exclusively: an attempt that loses the race fails on creation.
+    marker.unlink()
+    real = batch_run.os.open
+
+    def racing(path, flags, *args):
+        if str(path).endswith(batch_run.HOLDOUT_MARKER) and not batch_run.os.path.exists(path):
+            paths.Path(path).write_text("{}")
+        return real(path, flags, *args)
+
+    monkeypatch.setattr(batch_run.os, "open", racing)
+    with pytest.raises(FileExistsError):
+        batch_run.holdout(ctx, good)
+    assert calls == [1]
+
+
+def test_every_pool_worker_is_this_runners_own_function():
+    # A spawned worker imports its function from the main module: the pool must be given
+    # functions this runner defines, never another module's.
+    import ast
+
+    tree = ast.parse((batch_run.HERE / "run.py").read_text())
+    defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    workers = [call.args[1] for call in ast.walk(tree)
+               if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "pool"]
+    assert workers and all(isinstance(w, ast.Name) and w.id in defined for w in workers), [
+        ast.unparse(w) for w in workers]
