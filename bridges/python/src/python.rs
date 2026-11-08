@@ -121,6 +121,18 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
     orders.set_item("cancel_rejected", reply.orders.cancel_rejected)?;
     orders.set_item("fills", reply.orders.fills)?;
     out.set_item("orders", orders)?;
+    let gates = PyDict::new(py);
+    for (name, counts) in [
+        ("limits", reply.gates.limits),
+        ("combined", reply.gates.combined),
+        ("margin", reply.gates.margin),
+    ] {
+        let check = PyDict::new(py);
+        check.set_item("reduced", counts.reduced)?;
+        check.set_item("rejected", counts.rejected)?;
+        gates.set_item(name, check)?;
+    }
+    out.set_item("gates", gates)?;
     let (applied, reason) = match t.action_status {
         ActionStatus::Applied => (true, None),
         ActionStatus::Rejected(reason) => (false, Some(format!("{reason:?}"))),
