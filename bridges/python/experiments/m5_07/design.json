@@ -1,0 +1,244 @@
+{
+ "issue": 111,
+ "design_version": 4,
+ "status": "fixed before any code run: what is reproduced, the checks and their thresholds, the arms, the primary comparison and its rule, seeds and stop rules",
+ "data": "SYNTHETIC. Parameters are the paper's SPX/VIX values (arXiv 2212.10164v1), labelled as such; nothing is calibrated to BTC, which is declared unsupported in this round",
+ "paper": "Rosenbaum and Zhang, Multi-asset market making under the quadratic rough Heston, arXiv 2212.10164v1",
+ "stage_a": {
+  "what": "the paper's control under its Approximation 3.1 (Z and delta frozen, sigma = S0 sqrt(V0)): the exact HJB on an inventory grid against the closed-form asymptotic quadratic value v_hat = -q'Aq - q'B - C(t), and the greedy quoting rule from v_hat",
+  "example_1": {
+   "assets": [
+    "SPX",
+    "VIX future"
+   ],
+   "qrh": {
+    "lambda": 1.7,
+    "eta": 1.5,
+    "a": 0.265,
+    "b": 0.246,
+    "c": 0.0001,
+    "n": 10,
+    "V0": 0.18,
+    "S0": 3000,
+    "mu0": 0
+   },
+   "delta": [
+    1,
+    -0.028
+   ],
+   "delta_source": "the paper's Example 1 parameter list (Section 4), where delta^1 = 1 and delta^2 = -0.028 are given",
+   "D": [
+    0.25,
+    0.05
+   ],
+   "m": [
+    1,
+    20
+   ],
+   "Q": [
+    15,
+    300
+   ],
+   "Lambda_per_s": [
+    1,
+    0.1
+   ],
+   "kappa_j": [
+    0.005,
+    0.005
+   ],
+   "kappa": 0.01,
+   "T_s": 300
+  },
+  "example_2": {
+   "assets": [
+    "SPX 10d K2950",
+    "SPX 25d K3050",
+    "VIX 10d K22",
+    "VIX 25d K18"
+   ],
+   "net_risk_only": true,
+   "delta": [
+    0.533,
+    0.134,
+    -0.014,
+    -0.013
+   ],
+   "delta_source": "the paper's Example 2 parameter list",
+   "D": [
+    0.1,
+    0.1,
+    0.05,
+    0.05
+   ],
+   "m": [
+    2,
+    2,
+    2,
+    2
+   ],
+   "R": 10,
+   "Lambda_per_s": 0.05,
+   "kappa": 1,
+   "T_s": 600
+  },
+  "example_3": {
+   "substitution": "the paper's 6-asset basket lists only four assets; Example 2's four options are used instead, multi-asset (kappa > 0) against uni-asset (kappa = 0). This is not a reproduction of the paper's figure 4.10, and the conclusions say so",
+   "runs_only_if": "checks 1 and 2 pass on examples 1 and 2",
+   "arms": "multi-asset: greedy from v_hat with kappa > 0 and kappa_j = kappa/2 on a joint inventory grid. Uni-asset benchmark, the paper's: kappa = 0, kappa_j = kappa/2, exact HJB per asset, the assets run separately on the same random numbers and their P&L summed",
+   "kappa_grid": [
+    0.0001,
+    0.001,
+    0.01,
+    0.1
+   ],
+   "kappa_j": "kappa/2, the paper's Section 4.3 choice",
+   "T_b_s": 2000,
+   "T_s": 4000,
+   "inventory_bound": "ours, the paper states none for these options: |q_j| <= 15 m_j = 30 per asset, 31 levels, the level count of example 1's SPX",
+   "delta": "frozen at example 2's values; the paper's update of delta every 100 s under the QRH state is not reproduced, and the conclusions say so",
+   "paths_and_interval": "as check_2: 5000 paths, paired percentile bootstrap of (multi - uni) P&L, 2000 replicates, 90 %, seed 1111, at each kappa; mean and standard deviation of each arm reported",
+   "role": "secondary: reported only, no decision rests on it"
+  },
+  "check_1": {
+   "label": "our threshold, not the paper's",
+   "rule": "max |v_hat - v| / |v| <= 5 % over tested cells",
+   "excluded": [
+    "cells with |v| < 1e-3 max|v|",
+    "cells within 2 levels of an inventory bound, reported apart"
+   ],
+   "report": "the share of cells excluded by each rule",
+   "inconclusive_if": "fewer than 50 % of all cells are tested",
+   "refinement": "dt/2 and a grid with the inventory bound doubled (31 against 61 levels) each change v by less than 0.5 % on tested cells; otherwise check 1 is not used",
+   "constant_C": {
+    "order": "first the exclusions (which depend on v only), then C is set on the tested cells only so that max v_hat = max v over them, the paper's normalisation for its figures",
+    "fitted_cell": "cells at the maxima stay in the 5 % test; the fit makes the error zero only where both maxima fall on one cell, and that cell is not removed",
+    "reading": "check 1 validates shape, not level: its pass is labelled 'control validated (shape)'"
+   },
+   "example_2_grid": "r is the exact lattice of multiples of 0.002 on [-10, 10], 10001 levels; refinement doubles R (20001 levels); 'within 2 levels of a bound' is within 2 x max step = 2.132 of +/-R"
+  },
+  "check_2": {
+   "rule": "at each kappa, the paired (approximate - exact) P&L 90 % interval lies wholly within +/- 5 % of |mean exact P&L| at that kappa",
+   "kappa_grid": [
+    0.0001,
+    0.001,
+    0.01,
+    0.03,
+    0.1,
+    0.3,
+    1
+   ],
+   "untestable": "a kappa whose exact mean P&L interval includes 0 is reported, not tested",
+   "inconclusive_if": "fewer than 4 testable kappa",
+   "risk": "the standard deviation of terminal P&L, reported beside",
+   "T_b_s": {
+    "example_1": 150,
+    "example_2": 300
+   },
+   "paths": "the 5 evaluation seeds x 1000 paths = 5000 paths, common random numbers across arms; the design seeds are not used",
+   "interval": "paired percentile bootstrap over paths, 2000 replicates, 90 %, seed 1111; the same method gives the exact mean P&L interval used by 'untestable'",
+   "kappa_j": "example 1 only: kappa_j = kappa/2 at every kappa of the grid, the paper's Section 4.2.1 choice, which gives 0.005 at kappa 0.01; example 2 has no kappa_j"
+  },
+  "inconclusive_effect": "if check 1 or check 2 is inconclusive or fails, the primary comparison still runs and is labelled 'control not validated'; no adopt decision rests on it; if check 1 fails on example 1, stage A stops and is reported",
+  "units": {
+   "rule": "sigma^2 per second = S0^2 V0 / (365 x 86400), sigma = 0.2267; the paper gives V0 per year and intensities per second with no conversion",
+   "sensitivity": "a 252 x 6.5 h year, sigma = 0.524, reported beside and outside the rule"
+  },
+  "alpha": {
+   "rule": "alpha^j = 1/(4 D^j)",
+   "source": "the paper's Example 1; for Example 2 the paper does not state it and the same formula is ours"
+  },
+  "backtest": {
+   "dynamics": "Approximation 3.1 as frozen: one Brownian, dPi = sum over fills of m D/2 + r sigma dW, control held between steps of 0.1 s; T_b = T/2 with the control at horizon T. The paper's QRH-driven backtest is not reproduced in stage A",
+   "arithmetic": "fill revenue in exact Decimal; the sigma dW term is a float",
+   "common_random_numbers": "for each path seed, one numpy default_rng(SeedSequence([seed, path])) draws before the path starts, independent of any control: one standard normal per step for dW and one uniform per asset, side and step; a posted side fills when its uniform < 1 - exp(-Lambda dt); an unposted side discards its uniform. Every arm reads the same arrays"
+  },
+  "hjb_dt_s": {
+   "rule": "the exact HJB is solved by explicit backward Euler at dt = 0.1 s, the backtest's step; check 1's refinement 'dt/2' is 0.05 s"
+  }
+ },
+ "primary_comparison": {
+  "arms": "greedy QRH quoting against the crate's GreeksRiskManager delta-limit gate as the post or hold rule, both with the joint delta",
+  "where": "at the paper's kappa: example 1 kappa 0.01, example 2 kappa 1",
+  "paths": "5 evaluation seeds x 1000 paths = 5000, common random numbers across arms",
+  "interval": "paired percentile bootstrap over paths, 2000 replicates, 90 %, seed 1111",
+  "rule": "QRH 'better' only if the whole interval of paired (QRH - gate) P&L lies above 0, 'worse' if wholly below 0; an interval containing 0 is 'no difference shown' and is not a pass",
+  "gate_limit": {
+   "example_2": "R = 10 in delta units, the paper's net-risk bound",
+   "example_1": "per-asset limits Q = (15, 300) and a portfolio delta limit equal to the largest |delta . q| over the inventory box |q_j| <= Q_j, reached with opposite-sign inventories: 15 x 1 + 300 x 0.028 = 23.4 in delta units, from delta_source",
+   "sensitivity": "x0.5 and x2, one at a time, reported beside and outside the rule"
+  },
+  "gate_table": "a Rust example over the crate's GreeksRiskManager exports the gate's decision for every inventory state of the grid; both arms then run on the same evaluation paths",
+  "secondary": "the other cells of control (greedy, gate) x delta (joint, decoupled: VIX instruments at delta 0), reported as secondary",
+  "gate_table_rule": {
+   "decision": "the arm posts only on OrderDecision::Allowed; Scaled counts as hold since sizes are fixed, a choice that can only make the gate trade less, so the share of Scaled states is reported per table",
+   "breaker": "each state is booked, then reset_circuit_breaker is called before check_order, so the table is the limit test alone; the circuit breaker is path dependent and is not modelled, and the README says so",
+   "example_1_reading": "at x1 the 23.4 limit equals the box maximum, so the gate never binds beyond Q and the primary comparison in example 1 is QRH against 'always quote within Q', not against a delta gate; the conclusions say so. x0.5 is the only place it binds, outside the rule",
+   "tests": "a risk-reducing order at the limit gets the decision check_order gives after the reset; the table is identical when states are visited in reversed order",
+   "scaled_direction": "counting Scaled as hold can only reduce the gate arm's trading, which favours QRH if the gate would have earned from those orders; the conclusions give this direction beside the share"
+  },
+  "secondary_cells": {
+   "example_1": "runnable on the same (q1, q2) grid: the greedy arm uses v_hat computed with delta (1, 0), the gate arm a table with delta (1, 0) and limit 15, the largest |delta . q| over the box under that delta, so that gate never binds beyond Q; all four cells are scored with the joint delta in the sigma dW term, on the same paths, each as a paired interval against (greedy, joint). Reported only",
+   "example_2": "declared not runnable before the run: the state is the net risk r under the joint delta, and an SPX-only risk is not a function of r, so a decoupled rule cannot be evaluated on this grid without a 4-dimensional inventory state that the design does not have. The report says 'not runnable' for this cell"
+  }
+ },
+ "stage_b": {
+  "what": "delta from QRH with OptionStratLib 0.24.2 (optionstratlib-simulation 0.24.1): vanilla Monte Carlo, the VIX and VIX futures and options from the factor state, compared with the paper's delta",
+  "gap": "a delta along the model's Brownian is not an OptionStratLib function; it becomes an OptionStratLib issue and is not implemented here. Until it exists, stage B is reported pending, and the conclusions say so",
+  "stability_gate": "every QRH price at 3 seeds and N in {200, 400, 800}: seeds within 2 standard errors, N 400 and 800 within 1 %; a failing row is marked unstable and not used"
+ },
+ "stage_c": {
+  "gated_on": "stage A passing; not blocked by stage B pending, and while B is pending C makes no quoting or hedging claim",
+  "what": "calibration of QRH (calibrate_quadratic_rough_heston) and of the #96 SVI surface on fixed train strikes and maturities, scored on held-out strikes and maturities and on an unseen-surface scenario with shifted generator parameters",
+  "generators": {
+   "qrh": "the well-specified case, which favours QRH by construction, stated",
+   "heston": "OptionStratLib's heston_walk, not QRH: the fair test"
+  },
+  "report": [
+   "fit RMSE",
+   "spread over 3 seeds and 2 starts",
+   "compute time per fit and per price"
+  ],
+  "claims": "limited to the SPX/VIX parameters"
+ },
+ "not_covered": [
+  "margin-rs stress scenarios",
+  "arbitrage-rs#6 hedging framework"
+ ],
+ "protocol": {
+  "split": "no temporal split: the paths are iid simulations; design seeds and evaluation seeds are fixed apart",
+  "design_seeds": [
+   1,
+   2,
+   3
+  ],
+  "evaluation_seeds": [
+   101,
+   102,
+   103,
+   104,
+   105
+  ],
+  "selection": "no parameter is fitted in stage A and every kappa is reported"
+ },
+ "decision": {
+  "rule": "adopt the greedy QRH control only if example 2's primary comparison at x1 and sigma 0.2267 is 'better' and both check 1 and check 2 on example 2 pass; 'worse', 'no difference shown', or any 'control not validated' label means do not adopt in this round",
+  "example_1": "reported as QRH against 'always quote within Q'; at x1 it is not a test against a delta gate and cannot support adoption",
+  "scope": "the decision covers the control under Approximation 3.1 with the paper's delta on the SPX/VIX parameters only. It is reported with compute cost, fit quality, risk and model limits. No pricing or hedging adoption while stage B is pending; BTC is not evaluable in this round"
+ },
+ "compute": {
+  "stage_a": "minutes on 1 process",
+  "stages_b_c": "1 to 2 h on 1 or 2 processes, slots asked for",
+  "builds": "nice'd and serial while the machine is at its cap"
+ },
+ "seen_before_freeze": [
+  "the paper's text and parameters",
+  "OptionStratLib's QRH documentation"
+ ],
+ "changes": [
+  "before any code run, from review: the wording of example 1's gate limit, now the maximum of |delta . q| over the inventory box; the number is unchanged",
+  "before any code run, from review: units, alpha, the order and reading of C in check 1, example 2's exact lattice, backtest dynamics and common random numbers. When the unit was chosen only the hand estimate of A (annual sigma gives A about 45 against D/2 = 0.125) was computed from the paper's formula; no HJB, check or P&L had been run",
+  "before any code run, from review: the gate table's decision rule (Allowed only, Scaled share reported), the breaker left out by a reset per state, example 1's reading at x1, and two tests",
+  "before any code run on the paper's examples, from review: check 2's paths, seeds and interval; the HJB's base dt; kappa_j = kappa/2 across the kappa grid; an explicit decision rule resting on example 2; Scaled's direction; example 3's arms and its inventory bound; the decoupled cells, with example 2's declared not runnable"
+ ]
+}

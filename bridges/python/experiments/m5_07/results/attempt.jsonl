@@ -1,0 +1,2 @@
+{"kind": "attempt", "frozen_sha256": "48c8ea5aa0602ff54409f812b22907d4d27f2ab3699eb98998e240a8799642fa", "at": "2026-11-08T19:46:44Z", "pid": 89639}
+{"kind": "recovery", "frozen_sha256": "48c8ea5aa0602ff54409f812b22907d4d27f2ab3699eb98998e240a8799642fa", "at": "2026-11-08T19:47:02Z", "pid": 91417, "reason": "the first launch started with no gate tables because a shell error left the table directory empty; it was killed about 15 s after launch, before any result was written or read"}

@@ -41,6 +41,8 @@ class MarketMakingEnv(gym.Env):
         self._hedge_mask = 0
         # The cancel-only action, in the action space of version 4.
         self._cancel = bool(self.bridge_info["cancel_action"])
+        # The lives of an expiring quote, in the action space of version 5.
+        self._lives = len(self.bridge_info["quote_lives_ns"])
         self.observation_space = gym.spaces.Box(
             low=-1.0,
             high=1.0,
@@ -104,6 +106,8 @@ class MarketMakingEnv(gym.Env):
             reply = self._native.step_hedge(*indices)
         elif kind == "cancel":
             reply = self._native.step_cancel()
+        elif kind == "expiring_quote":
+            reply = self._native.step_expiring_quote(*indices)
         else:
             raise ValueError(f"unknown action kind {kind!r}")
         if action is None:
@@ -195,6 +199,10 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
     value is above 0 the first five are not read. Its mask comes from `hedge_mask`, which
     allows no hedge at a flat position or larger than the position, so only 0 is open there.
 
+    With `quote_lives_ns` in the configuration a last value is the quote's life: 0 is no
+    expiry, a plain quote, and `i + 1` is life `i`. Every value is always open, and only a
+    quote reads it.
+
     Requires the mask policy, so a trainer that leaves the mask ends the environment.
     """
 
@@ -205,6 +213,8 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
         dims = [3 if self._cancel else 2, self._offsets, self._offsets, self._sizes, self._sizes]
         if self._hedge:
             dims.append(1 + self._sizes)
+        if self._lives:
+            dims.append(1 + self._lives)
         self.action_space = gym.spaces.MultiDiscrete(dims)
 
     def action_masks(self):
@@ -229,11 +239,13 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
             parts.append(
                 np.concatenate(([True], _bits(self._hedge_mask, self._sizes)))
             )
+        if self._lives:
+            parts.append(np.ones(1 + self._lives, dtype=bool))
         return np.concatenate(parts)
 
     def _decode(self, action):
         values = [int(value) for value in np.asarray(action).ravel()]
-        expected = 6 if self._hedge else 5
+        expected = 5 + int(self._hedge) + int(self._lives > 0)
         if len(values) != expected:
             raise ValueError(f"an action has {expected} values, not {len(values)}")
         if self._hedge and values[5] > 0:
@@ -242,6 +254,8 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
             return "hold", ()
         if self._cancel and values[0] == 2:
             return "cancel", ()
+        if self._lives and values[-1] > 0:
+            return "expiring_quote", (*values[1:5], values[-1] - 1)
         return "quote", tuple(values[1:5])
 
 
@@ -263,14 +277,19 @@ class BoxMarketMakingEnv(MarketMakingEnv):
 
     With `cancel_action` in the configuration the last value above zero asks for a cancel,
     after a hedge and before a quote: every resting or pending order is cancelled and
-    nothing is sent.
+    nothing is sent. It is the value after the hedge's, if any.
+
+    With `quote_lives_ns` in the configuration a last value picks the quote's life, by the
+    same bin rule over `1 + lives` bins: the first bin is no expiry, a plain quote, and bin
+    `i + 1` is life `i`. Only a quote reads it.
     """
 
     def __init__(self, config, rows, expected_spec=None, seed=0):
         if config["invalid_action"] != "reject":
             raise ValueError("the continuous encoding needs the reject policy")
         super().__init__(config, rows, expected_spec, seed)
-        shape = (5 + int(self._hedge) + int(self._cancel),)
+        self._length = 5 + int(self._hedge) + int(self._cancel) + int(self._lives > 0)
+        shape = (self._length,)
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=shape, dtype=np.float32)
 
     @staticmethod
@@ -279,7 +298,7 @@ class BoxMarketMakingEnv(MarketMakingEnv):
 
     def _decode(self, action):
         values = [float(value) for value in np.asarray(action).ravel()]
-        expected = 5 + int(self._hedge) + int(self._cancel)
+        expected = self._length
         if len(values) != expected:
             raise ValueError(f"an action has {expected} values, not {len(values)}")
         for value in values:
@@ -287,16 +306,20 @@ class BoxMarketMakingEnv(MarketMakingEnv):
                 raise ValueError(f"an action value of {value} is not in [-1, 1]")
         if self._hedge and values[5] > 0.0:
             return "hedge", (self._bin(2.0 * values[5] - 1.0, self._sizes),)
-        if self._cancel and values[-1] > 0.0:
+        if self._cancel and values[5 + int(self._hedge)] > 0.0:
             return "cancel", ()
         if values[0] <= 0.0:
             return "hold", ()
-        return "quote", (
+        quote = (
             self._bin(values[1], self._offsets),
             self._bin(values[2], self._offsets),
             self._bin(values[3], self._sizes),
             self._bin(values[4], self._sizes),
         )
+        life = self._bin(values[-1], 1 + self._lives) if self._lives else 0
+        if life > 0:
+            return "expiring_quote", (*quote, life - 1)
+        return "quote", quote
 
 
 class ResidualMarketMakingEnv(MarketMakingEnv):
@@ -315,6 +338,8 @@ class ResidualMarketMakingEnv(MarketMakingEnv):
             raise ValueError("a residual environment takes no hedge actions: drop hedge_actions")
         if config.get("cancel_action", False):
             raise ValueError("a residual environment takes no cancel action: drop cancel_action")
+        if config.get("quote_lives_ns") is not None:
+            raise ValueError("a residual environment takes no quote life: drop quote_lives_ns")
         super().__init__(config, rows, expected_spec, seed)
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 
