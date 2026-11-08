@@ -126,7 +126,7 @@
   "rule": "QRH 'better' only if the whole interval of paired (QRH - gate) P&L lies above 0, 'worse' if wholly below 0; an interval containing 0 is 'no difference shown' and is not a pass",
   "gate_limit": {
    "example_2": "R = 10 in delta units, the paper's net-risk bound",
-   "example_1": "per-asset limits Q = (15, 300) and a portfolio delta limit of |delta . Q| at the bound = 15 x 1 + 300 x 0.028 = 23.4 in delta units, from delta_source",
+   "example_1": "per-asset limits Q = (15, 300) and a portfolio delta limit equal to the largest |delta . q| over the inventory box |q_j| <= Q_j, reached with opposite-sign inventories: 15 x 1 + 300 x 0.028 = 23.4 in delta units, from delta_source",
    "sensitivity": "x0.5 and x2, one at a time, reported beside and outside the rule"
   },
   "gate_table": "a Rust example over the crate's GreeksRiskManager exports the gate's decision for every inventory state of the grid; both arms then run on the same evaluation paths",
@@ -180,5 +180,8 @@
  "seen_before_freeze": [
   "the paper's text and parameters",
   "OptionStratLib's QRH documentation"
+ ],
+ "changes": [
+  "before any code run, from review: the wording of example 1's gate limit, now the maximum of |delta . q| over the inventory box; the number is unchanged"
  ]
 }
