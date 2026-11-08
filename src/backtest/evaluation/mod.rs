@@ -112,7 +112,7 @@ pub use experiment::{
     BootstrapConfig, BootstrapOutcome, Candidate, CandidateKind, CandidateRecord, EvaluationRow,
     Experiment, ExperimentConfig, HoldoutReport, Manifest, Provenance, RegimeLabeller, RowMetrics,
     RowOutcome, Scenario, ScenarioRecord, Selection, SharedPolicy, Splits, ValidatedExperiment,
-    ValidationReport, WindowKind, block_bootstrap,
+    ValidationReport, WindowKind, block_bootstrap, stratified_block_bootstrap,
 };
 
 use crate::Decimal;
