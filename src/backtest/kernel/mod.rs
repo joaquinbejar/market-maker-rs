@@ -21,15 +21,18 @@
 //! - single linear spot instrument on a tick and lot grid;
 //! - the immediate or the queue position fill model, on the lot grid, no
 //!   slippage, quote currency fees (any sign);
-//! - no pretrade policy, or the engine's `LimitsPolicy` (no circuit breaker);
+//! - no pretrade policy, the engine's `LimitsPolicy` (no circuit breaker),
+//!   or, with the balance gate ([`KernelMargin`]), a
+//!   [`MarginAccount`](crate::backtest::MarginAccount) set up as
+//!   [`KernelMargin`] states (`margin` feature);
 //! - the built-in bookkeeping (no external accountant);
 //! - all four latencies and jitter, in quanta of `quantum_ns`
 //!   (`quantum_ns = 1_000_000` matches the engine's milliseconds);
 //! - datasets with non-decreasing timestamps (the kernel rejects others at
 //!   load; the engine clamps them);
 //! - actions `Hold`, `Quote` and `QuoteError` (an engine `None`); the
-//!   one-sided `OneSided` action has no engine counterpart and is outside
-//!   the subset.
+//!   one-sided `OneSided` and the cancel-only `Cancel` actions have no
+//!   engine counterpart and are outside the subset.
 //!
 //! # Ordering
 //!
@@ -131,13 +134,14 @@ pub use adapter::{
 };
 pub use book::{ExecKind, FillRec, Origin, ReportRec};
 pub use config::{
-    CapacityNeed, KernelConfig, KernelFee, KernelFillModel, KernelLatency, MAX_KERNEL_STEPS,
+    CapacityNeed, KernelConfig, KernelFee, KernelFillModel, KernelLatency, KernelMargin,
+    MAX_KERNEL_STEPS,
 };
 pub use data::{DIGEST_FNV1A128, DatasetId, KernelDataset, KernelTick};
 pub use encode::{
     CONFIG_MAGIC, FORMAT_VERSION, STATE_MAGIC, decode, encode, fingerprint, fnv1a128,
 };
-pub use gate::GateVerdict;
+pub use gate::{GateCheck, GateVerdict};
 pub use hedge::{
     CombinedLimits, FundingRate, HEDGE_FORMAT_VERSION, HEDGED_STATE_MAGIC, HedgeCounters,
     HedgeEvent, HedgeFill, HedgeInstrument, HedgeLane, HedgeLaneConfig, HedgeRefusal, HedgeSummary,
@@ -510,6 +514,18 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                     &mut em,
                 )
             }
+            KernelAction::Cancel => self.admit_apply(
+                s,
+                Ok(()),
+                step::Legs {
+                    legs: [None, None],
+                    crossed: false,
+                },
+                combined
+                    .as_mut()
+                    .map(|(check, rejects)| (*check, &mut **rejects)),
+                &mut em,
+            ),
         };
         if !s.status.is_running() {
             return StepOutcome {

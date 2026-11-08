@@ -123,8 +123,9 @@ def test_a_grid_action_is_not_a_residual_and_ends_the_environment():
     env.reset(seed=1)
     with pytest.raises(ValueError, match="4 values"):
         env.step(np.zeros(5))
+    # A hold is allowed (a decision interval holds between decisions); a quote is not.
     with pytest.raises(BridgeFailure, match="grid action"):
-        env._native.step_hold()
+        env._native.step_quote(0, 0, 1, 0)
     with pytest.raises(BridgeFailure, match="closed"):
         env.step(np.zeros(4))
 
@@ -283,3 +284,56 @@ def test_protocol_compares_the_policy_with_its_zero_baseline_on_the_same_window(
     assert baseline[0].attribution["fills"] > 0
     for field in ("spread_capture", "inventory_pnl", "quote_fees", "base_fees", "net_pnl"):
         assert field in baseline[0].attribution
+
+
+def scheduled_config(changes):
+    settings = residual_config()
+    plain = settings["residual"]["baseline"]
+    settings["residual"]["baseline"] = {
+        "kind": "scheduled",
+        "points": [plain, dict(plain, size="2")],
+        "changes": changes,
+    }
+    return settings
+
+
+def test_a_scheduled_baseline_quotes_from_the_point_of_the_row_it_observed():
+    env = env_on(settings=scheduled_config([[50, 1], [120, 0]]))
+    _, info = env.reset(seed=1)
+    zero = np.zeros(4, dtype=np.float32)
+    sizes = {}
+    while True:
+        seen = info["row"]
+        _, _, terminated, truncated, info = env.step(zero)
+        classical = info["residual"]["classical"]
+        if classical["kind"] == "quote":
+            expected = 2 if 50 <= seen < 120 else 1
+            assert classical["bid_lots"] == expected, (seen, classical)
+            sizes[expected] = sizes.get(expected, 0) + 1
+        if terminated or truncated:
+            break
+    env.close()
+    assert sizes.get(1, 0) > 0 and sizes.get(2, 0) > 0
+
+
+def test_a_schedule_without_changes_is_its_first_point():
+    plain, scheduled = env_on(), env_on(settings=scheduled_config([]))
+    plain.reset(seed=4)
+    scheduled.reset(seed=4)
+    zero = np.zeros(4, dtype=np.float32)
+    while True:
+        a = plain.step(zero)
+        b = scheduled.step(zero)
+        assert a[1:4] == b[1:4]
+        assert a[4]["residual"] == b[4]["residual"] and a[4]["net"] == b[4]["net"]
+        if a[2] or a[3]:
+            break
+    assert plain.attribution() == scheduled.attribution()
+    plain.close()
+    scheduled.close()
+
+
+@pytest.mark.parametrize("changes", [[[5, 2]], [[5, 0]], [[5, 1], [5, 0]], [[5, 1], [6, 1]]])
+def test_a_malformed_schedule_is_refused(changes):
+    with pytest.raises(ValueError, match="scheduled baseline"):
+        env_on(settings=scheduled_config(changes))

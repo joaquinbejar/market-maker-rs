@@ -5,7 +5,7 @@ use crate::Decimal;
 use super::account::AgentAccount;
 use super::book::{Arr, Delivery, FillRec, ObsEntry, ReportRec, VenueMsg, VenueOrder};
 use super::data::DatasetId;
-use super::gate::{GateState, GateVerdict};
+use super::gate::{GateCheck, GateState, GateVerdict};
 use super::hedge::HedgeEvent;
 use super::ledger::{AgentView, VenueLedger};
 use super::rng::KernelRng;
@@ -252,6 +252,13 @@ pub enum KernelAction {
         /// Size, in lots.
         lots: u64,
     },
+    /// Cancel every resting or pending order and submit nothing. Each cancel
+    /// takes effect after the cancel latency, as a quote's cancels do: a fill
+    /// before it stands, and a cancel that reaches an order already filled is
+    /// rejected (`CancelRejected`). Admitted whenever a `Hold` is, since an
+    /// open order already holds the venue message its cancel needs. Outside
+    /// the engine-equivalence subset: the engine cancels only to replace.
+    Cancel,
 }
 
 /// What happened to the action.
@@ -328,6 +335,8 @@ pub struct GateRecord {
     pub verdict: GateVerdict,
     /// Submitted lots (0 when refused).
     pub submitted: u64,
+    /// The check that decided.
+    pub check: GateCheck,
 }
 
 /// An event of the run, in event order.

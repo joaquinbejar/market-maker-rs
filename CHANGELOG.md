@@ -8,6 +8,92 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The quote duration comparison of #110 in `bridges/python/experiments/m4_10`, with
+  `ChosenDuration` in the bridge's wrappers: a policy that chooses, with each action, how many
+  rows its quote rests before it decides again. On #103's regimes sampled every 100 ms, under a
+  queue of 1 lot per 750 ms, at submit and cancel latencies of 25, 100 and 500 ms: PPO with a
+  chosen duration, a linear mid forecast and a warm start cloned from Avellaneda-Stoikov,
+  against the same without each, and against no-trade and Avellaneda-Stoikov, with paired
+  block bootstrap intervals on the holdout. The design and four declared versions were
+  committed before the runs they govern, `report.py` before the holdout was read, and
+  `holdout_once.py` reads the holdout once. Synthetic data only; the results are on the issue.
+
+- A second, margin-stress holdout for #105's comparison in `bridges/python/experiments/m4_08`
+  (`stress.py`, `report_stress.py`, `stress_design.json`): the frozen runs on five new days per
+  regime, by #102's seed rule, unshocked and shocked, with every step's account assessed by
+  margin-rs 0.2's `maintenance::assess` under `linear-im/1`. The bridge gains
+  `mm_rl_bridge.maintenance_path`, from margin-rs itself. It does not revise the first
+  holdout's decisions; the design, the helper, the days' digests and the reading rule were
+  committed before it ran. Synthetic data only; nothing here is a safety guarantee.
+
+- The Python bridge configures the kernel's balance gate (#105): `"margin": {"base_deposit":
+  ...}` sets `KernelConfig::margin`, so an RL policy through the bridge cannot get an order
+  beyond its balance executed, and every step's `info["gates"]` counts what the gate cut or
+  refused, by the check that decided (the limits, a hedged kernel's combined limits, or the
+  margin). It is the spot, fully collateralised gate of #283, not a leveraged margin rule. A
+  configuration without it keeps its kernel fingerprint; the specification does not depend
+  on it. Synthetic fixtures only.
+
+- The constrained learning comparison of #105 in `bridges/python/experiments/m4_08`: OmniSafe
+  CPO against PPO with a reward penalty and plain PPO, beside no-trade and Avellaneda-Stoikov,
+  on #102's regimes and shocked copies of their days. Inventory and notional costs are
+  constrained with budgets per step, measured apart from the reward, and a margin proxy is
+  reported; the kernel's limits, derived from the margin rule, stay the final authority for
+  every arm. Paired block bootstrap intervals on the holdout for the daily net and the daily
+  cost. The design was committed before any run, PPOLag was dropped after failing a toy gate,
+  and `report.py` was committed before the holdout was read. Synthetic data only; nothing here
+  is a safety guarantee.
+
+- The decision frequency and policy memory comparison of #103 in
+  `bridges/python/experiments/m4_06`, with `DecisionInterval`, `EmaFeatures` and `history` in the
+  bridge's wrappers and per-step order counts in its replies. On #102's regimes sampled every
+  second, under the queue standard for 1 s rows: mlp, ema, history and lstm PPO policies deciding
+  every 1, 5 and 10 rows, against no-trade, Avellaneda-Stoikov and GLFT, with paired block
+  bootstrap intervals on the holdout at the fee the rule chose and at 0.0002. The design was
+  committed before any run, every change is recorded in it, and `report.py` was committed before
+  the holdout was read. `validation_pick.py` picks the learned arm at one row on validation for
+  later studies, after the freeze and before any holdout read. Synthetic data only; the results
+  are on the issue.
+
+- The robustness study of #108 in `bridges/python/experiments/m5_03`: #102's classical arms and
+  frozen learned policies under bounded perturbations of the queue-reactive flow (market, cancel
+  and limit rates and the reference's move probability), with an adversary that picks the worst
+  point per policy on selection days by the 5 % CVaR of daily loss. They are evaluated on unseen
+  holdout days unperturbed, at the adversary's point, at a fixed stress and under a binding queue,
+  with paired block bootstrap intervals, drawdowns, positions, breaches and the margin
+  requirement. The design and the day digests were committed before any policy ran. Example
+  `qr_days` takes an optional seed offset. Synthetic data only; the results are on the issue.
+- A `scheduled` baseline in the Python bridge's residual configuration: classical points in turn,
+  each change applying from the first decision that has observed its row, for #112's adaptive
+  and labelled arms. Existing baselines are unchanged.
+- A cancel-only action and a quote that expires by itself (#288). `backtest::kernel::KernelAction::Cancel`
+  cancels every resting or pending order and sends nothing: each cancel takes effect after the
+  cancel latency, a fill before it stands, and a cancel that reaches a filled order is rejected.
+  It is admitted whenever a hold is and is outside the engine-equivalence subset.
+  `rl::RlConfig::with_cancel_action` adds `rl::RlAction::Cancel` to the action space as
+  `rl::CancelActions::CancelOnly`, of the new `rl::CANCEL_ACTION_SPACE_VERSION` 4; without it a
+  specification keeps its bytes and identity, and a cancel is outside the space
+  (`rl::ERR_CANCEL_REFUSED` under the reject policy). An environment with a hedge lane refuses
+  it. The Python bridge takes `cancel_action`, drives version 4 only with it, and adds
+  `ExpiringQuote`, which cancels a quote `d` decisions after it, without the policy: the quote
+  rests `d` rows plus the cancel latency less the submission latency; an expiry scheduled in
+  the kernel, exact in venue time, is #297. Synthetic fixtures only.
+- A balance gate for the kernel (feature `kernel`, #283): `KernelConfig::margin` takes a
+  `backtest::kernel::KernelMargin`, and the kernel, and so `rl::RlEnv`, then refuses or reduces
+  an order that `margin-rs`'s risk gate would refuse or reduce in `backtest::MarginAccount`. A
+  buy reserves its notional at its limit price plus its largest fee, `max(fee_rate, 0)` of it,
+  from the initial capital plus the fill cash flows less the fees and the live buys'
+  reservations; a sell reserves its quantity from `base_deposit` plus the venue position less
+  the live sells. The gate runs after `KernelConfig::limits`, in integers, with no new state and
+  no dependency: its reservations are recomputed from the live orders. A refused order is a
+  local reject that the agent receives; its `GateRecord` has `check: GateCheck::Margin`. On
+  synthetic scenarios, with latencies, partial fills and cancels racing fills, it decides order
+  by order as `BacktestEngine` with a `MarginAccount`, with the same reports, fills, ledger and
+  account balances. It is the spot, fully collateralised rule of `MarginAccount`: a
+  derivative's margin requirement (`DerivativeMarginAccount`), maintenance and liquidation
+  (margin-rs#7) are not modelled, and the Python bridge does not configure it yet. A hedged
+  kernel refuses it on either lane. A configuration without it keeps its bytes and its
+  fingerprint.
 - Example `time_travel_queues` (#109), behind `serde`: chronological replay against consistent
   time travel for a market maker at the touch, on queues. On #102's queue-reactive regimes the
   simulator continues from a state that holds the agent's order, so each mode is measured against
@@ -687,6 +773,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `backtest::kernel::KernelAction` gains the variant `Cancel` (#288), so an exhaustive match on
+  it must handle it, and `rl::RlConfig` the public field `cancel_action`, so a struct literal
+  must name it (`RlConfig::new` sets `false`). `rl::ActionSpace` gains `cancel` and
+  `rl::RlAction` `Cancel`; both are `#[non_exhaustive]`.
+- `backtest::kernel::KernelConfig` gains the public field `margin` and `GateRecord` the public
+  field `check` (#283), so a struct literal of `KernelConfig` must name `margin`
+  (`KernelConfig::new` sets `None`). `GateRecord` is `#[non_exhaustive]`, but its `Debug`
+  output, which some callers hash, now prints `check`.
 - `rl::ACTION_SPACE_VERSION` is 2 (#247), so every `rl::SpecId` changes and a checkpoint
   trained under action space 1 is refused by `RlSpec::ensure`. `rl::RlAction` gains `Hedge`,
   `rl::RlConfig` gains `hedge_actions`, and `rl::HedgeActions` gains `MarketableAtTouch`.

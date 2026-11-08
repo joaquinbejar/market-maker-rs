@@ -10,15 +10,18 @@ use market_maker_rs::backtest::evaluation::{
 };
 use market_maker_rs::backtest::kernel::{
     ActionGrid, ActionMask, ActionStatus, AvellanedaQuoter, ERR_KERNEL_MISMATCH,
-    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, GlftCounts, GlftForm, GlftQuoter, KernelConfig,
-    KernelDataset, KernelFillModel, KernelLatency, KernelTick, QuoteSource, quote_error_name,
+    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, EventSink, ExecKind, GateCheck, GateVerdict,
+    GlftCounts, GlftForm, GlftQuoter, KernelConfig, KernelDataset, KernelEvent, KernelFillModel,
+    KernelLatency, KernelMargin, KernelTick, Observation, QuoteSource, SourceQuote,
+    quote_error_name,
 };
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    ERR_ACTION_OFF_GRID, ERR_HEDGE_REFUSED, EpisodeRecorder, FeatureVector, HedgeActions,
-    InvalidActionPolicy, ObservationScales, ResidualBounds, ResidualDecision, ResidualEnv,
-    ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId, TerminalValuation, Transition,
+    CancelActions, ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_HEDGE_REFUSED, EpisodeRecorder,
+    FeatureVector, HedgeActions, InvalidActionPolicy, ObservationScales, ResidualBounds,
+    ResidualDecision, ResidualEnv, ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId,
+    TerminalValuation, Transition,
 };
 use market_maker_rs::strategy::glft::GLFTConfig;
 use serde::Deserialize;
@@ -41,8 +44,21 @@ const STACK_BYTES: usize = 16 * 1024 * 1024;
 /// the bridge has been checked against it.
 pub const BUILT_FOR: (u16, u16, u16, u16) = (1, 2, 1, 1);
 
-fn known_versions(id: &SpecId) -> bool {
-    (id.observation, id.action, id.reward, id.episode) == BUILT_FOR
+/// The action space version this bridge was written for with the cancel action
+/// (`cancel_action`), a literal for the same reason.
+pub const BUILT_FOR_CANCEL_ACTION: u16 = 4;
+
+/// The versions are the ones this bridge was written for, and the action space is the one
+/// the configuration asks for: version [`BUILT_FOR_CANCEL_ACTION`] with `cancel_action`
+/// and only then.
+fn known_versions(id: &SpecId, cancel_action: bool) -> bool {
+    let (observation, action, reward, episode) = BUILT_FOR;
+    let action = if cancel_action {
+        BUILT_FOR_CANCEL_ACTION
+    } else {
+        action
+    };
+    (id.observation, id.action, id.reward, id.episode) == (observation, action, reward, episode)
 }
 
 /// Why an action was not applied, as `info["refused_because"]` reports it; `None` when it
@@ -57,6 +73,7 @@ pub fn refused_because(status: ActionStatus) -> Option<String> {
         ActionStatus::QuoteError(code) => Some(match code {
             ERR_ACTION_OFF_GRID => format!("off grid (code {})", code.0),
             ERR_HEDGE_REFUSED => format!("hedge not available (code {})", code.0),
+            ERR_CANCEL_REFUSED => format!("cancel not available (code {})", code.0),
             ERR_PRICE_OUT_OF_RANGE => {
                 format!("strategy quote price out of range (code {})", code.0)
             }
@@ -153,6 +170,15 @@ pub struct LimitsConfig {
     pub scaling_factor: String,
 }
 
+/// The kernel's balance gate in the configuration ([`KernelMargin`]): the spot, fully
+/// collateralised rule, with the initial capital as the quote balance.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarginConfig {
+    /// Base deposit, on the lot grid; zero or more. Sells draw on it.
+    pub base_deposit: String,
+}
+
 /// The normalizing constants, as decimal strings.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -233,6 +259,16 @@ pub enum BaselineConfig {
         #[serde(default)]
         form: GlftFormConfig,
     },
+    /// Classical strategies in turn: `points[0]` from the start, and from each change on the
+    /// point it names. A change at row `r` applies from the first decision whose observation
+    /// has row `r` or later, which latency may delay, so it never reads a row early.
+    Scheduled {
+        /// The strategies, none of them scheduled.
+        points: Vec<BaselineConfig>,
+        /// `[row, index]` pairs: rows strictly increasing, each index a point other than the
+        /// one in force.
+        changes: Vec<(u64, usize)>,
+    },
 }
 
 /// [`GlftForm`] in the configuration.
@@ -297,6 +333,10 @@ pub struct BridgeConfig {
     pub fill_model: FillConfig,
     /// Hard limits, if any.
     pub limits: Option<LimitsConfig>,
+    /// The kernel's balance gate, if any; it decides after the limits. Absent by default,
+    /// which keeps a configuration's specification and fingerprint.
+    #[serde(default)]
+    pub margin: Option<MarginConfig>,
     /// Bid offsets, in ticks.
     pub bid_offsets: Vec<u16>,
     /// Ask offsets, in ticks; as many as the bid offsets.
@@ -320,6 +360,12 @@ pub struct BridgeConfig {
     /// Off by default, which keeps a configuration's specification and fingerprint.
     #[serde(default)]
     pub hedge_actions: bool,
+    /// Whether the cancel action exists (`RlAction::Cancel`, `CancelActions::CancelOnly`), of
+    /// action space version [`BUILT_FOR_CANCEL_ACTION`]. Off by default, which keeps a
+    /// configuration's specification and fingerprint; a specification with it is refused
+    /// by a configuration without it.
+    #[serde(default)]
+    pub cancel_action: bool,
 }
 
 fn decimal(what: &str, text: &str) -> Result<Decimal, BridgeError> {
@@ -378,6 +424,12 @@ impl BridgeConfig {
             .map_err(|error| BridgeError::Refused(error.to_string()))?;
             kernel = kernel.with_limits(limits);
         }
+        if let Some(margin) = &self.margin {
+            kernel = kernel.with_margin(KernelMargin::new(decimal(
+                "base_deposit",
+                &margin.base_deposit,
+            )?));
+        }
         Ok(kernel)
     }
 
@@ -385,6 +437,12 @@ impl BridgeConfig {
         if self.hedge_actions && self.residual.is_some() {
             return Err(BridgeError::Refused(
                 "hedge_actions with a residual policy: a residual policy takes no hedge action"
+                    .to_string(),
+            ));
+        }
+        if self.cancel_action && self.residual.is_some() {
+            return Err(BridgeError::Refused(
+                "cancel_action with a residual policy: a residual policy takes no cancel action"
                     .to_string(),
             ));
         }
@@ -411,8 +469,13 @@ impl BridgeConfig {
                 decimal("invalid_action_penalty", &self.invalid_action_penalty)?,
             )
             .with_terminal(terminal);
-        Ok(if self.hedge_actions {
+        let config = if self.hedge_actions {
             config.with_hedge_actions()
+        } else {
+            config
+        };
+        Ok(if self.cancel_action {
+            config.with_cancel_action()
         } else {
             config
         })
@@ -432,6 +495,8 @@ pub struct EnvInfo {
     pub sizes: usize,
     /// Whether hedge actions exist, as the specification states.
     pub hedge_actions: bool,
+    /// Whether the cancel action exists, as the specification states.
+    pub cancel_action: bool,
     /// Fingerprint of the kernel's configuration.
     pub kernel_fingerprint: u128,
     /// Digest of the dataset.
@@ -492,6 +557,89 @@ pub struct StepReply {
     pub penalties: Decimal,
     /// How the action came to be, under a residual policy.
     pub decision: Option<ResidualDecision>,
+    /// The venue's order reports during the step, at venue time: an audit, never seen
+    /// by a policy.
+    pub orders: OrderCounts,
+    /// The gate's cuts and refusals during the step, by check: an audit, never seen by a
+    /// policy.
+    pub gates: GateCounts,
+}
+
+/// Counts of the venue's order reports, by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrderCounts {
+    /// Orders accepted and resting.
+    pub accepted: u64,
+    /// Orders rejected, locally or by the venue.
+    pub rejected: u64,
+    /// Orders canceled.
+    pub canceled: u64,
+    /// Cancels that arrived after the order ended.
+    pub cancel_rejected: u64,
+    /// Fills, partial ones included.
+    pub fills: u64,
+}
+
+/// Orders the gate cut or refused, for one of its checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerdictCounts {
+    /// Submitted with fewer lots.
+    pub reduced: u64,
+    /// Refused, an off-lot reduction included.
+    pub rejected: u64,
+}
+
+/// The gate's decisions during a step that did not submit an order as requested, by the
+/// check that decided: an audit, never seen by a policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateCounts {
+    /// [`KernelConfig::limits`].
+    pub limits: VerdictCounts,
+    /// The combined limits of a hedged kernel.
+    pub combined: VerdictCounts,
+    /// The balance gate, [`KernelMargin`].
+    pub margin: VerdictCounts,
+}
+
+/// The episode's records, and the counts of the current step's order reports.
+#[derive(Debug, Default)]
+struct Audit {
+    recorder: EpisodeRecorder,
+    orders: OrderCounts,
+    gates: GateCounts,
+}
+
+impl EventSink for Audit {
+    fn event(&mut self, event: KernelEvent) {
+        if let KernelEvent::Report(report) = &event {
+            let count = match report.kind {
+                ExecKind::Accepted => &mut self.orders.accepted,
+                ExecKind::Rejected => &mut self.orders.rejected,
+                ExecKind::Canceled => &mut self.orders.canceled,
+                ExecKind::CancelRejected => &mut self.orders.cancel_rejected,
+                ExecKind::PartialFill | ExecKind::Fill => &mut self.orders.fills,
+            };
+            *count = count.saturating_add(1);
+        }
+        if let KernelEvent::Gate(gate) = &event {
+            // A check or a verdict this bridge does not know is not counted.
+            let check = match gate.check {
+                GateCheck::Limits => Some(&mut self.gates.limits),
+                GateCheck::Combined => Some(&mut self.gates.combined),
+                GateCheck::Margin => Some(&mut self.gates.margin),
+                _ => None,
+            };
+            let count = check.and_then(|check| match gate.verdict {
+                GateVerdict::Reduced => Some(&mut check.reduced),
+                GateVerdict::ReducedOffLot | GateVerdict::Rejected => Some(&mut check.rejected),
+                _ => None,
+            });
+            if let Some(count) = count {
+                *count = count.saturating_add(1);
+            }
+        }
+        self.recorder.event(event);
+    }
 }
 
 enum Request {
@@ -515,7 +663,7 @@ type State = RlState<ORD, MSG, DLV, OBS>;
 
 /// What the request loop needs from an environment.
 trait Driver {
-    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String>;
+    fn reset(&mut self, seed: u64, audit: &mut Audit) -> Result<State, String>;
     fn observe(&self, state: &State) -> Result<FeatureVector, String>;
     fn mask(&self, state: &State) -> ActionMask;
     fn hedge_mask(&self, state: &State) -> u64;
@@ -523,19 +671,15 @@ trait Driver {
         &mut self,
         state: &mut State,
         action: RlAction,
-        recorder: &mut EpisodeRecorder,
+        audit: &mut Audit,
     ) -> Result<StepReply, String>;
     fn step_residual(
         &mut self,
         state: &mut State,
         proposal: ResidualProposal,
-        recorder: &mut EpisodeRecorder,
+        audit: &mut Audit,
     ) -> Result<StepReply, String>;
-    fn inner_attribution(
-        &self,
-        state: &State,
-        recorder: &EpisodeRecorder,
-    ) -> Result<AttributionReply, String>;
+    fn inner_attribution(&self, state: &State, audit: &Audit) -> Result<AttributionReply, String>;
 }
 
 fn attribution_of<const K: usize, const M: usize>(
@@ -579,8 +723,8 @@ fn attribution_of<const K: usize, const M: usize>(
 }
 
 impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, OBS> {
-    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String> {
-        self.reset_with(seed, recorder).map_err(|e| e.to_string())
+    fn reset(&mut self, seed: u64, audit: &mut Audit) -> Result<State, String> {
+        self.reset_with(seed, audit).map_err(|e| e.to_string())
     }
 
     fn observe(&self, state: &State) -> Result<FeatureVector, String> {
@@ -599,16 +743,20 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
         &mut self,
         state: &mut State,
         action: RlAction,
-        recorder: &mut EpisodeRecorder,
+        audit: &mut Audit,
     ) -> Result<StepReply, String> {
+        audit.orders = OrderCounts::default();
+        audit.gates = GateCounts::default();
         let transition = self
-            .step_with(state, action, recorder)
+            .step_with(state, action, audit)
             .map_err(|e| e.to_string())?;
         Ok(StepReply {
             transition,
             net: state.net(),
             penalties: state.penalties(),
             decision: None,
+            orders: audit.orders,
+            gates: audit.gates,
         })
     }
 
@@ -616,23 +764,19 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
         &mut self,
         _state: &mut State,
         _proposal: ResidualProposal,
-        _recorder: &mut EpisodeRecorder,
+        _audit: &mut Audit,
     ) -> Result<StepReply, String> {
         Err("a residual step on an environment with a grid".to_string())
     }
 
-    fn inner_attribution(
-        &self,
-        state: &State,
-        recorder: &EpisodeRecorder,
-    ) -> Result<AttributionReply, String> {
-        attribution_of(self, state, recorder)
+    fn inner_attribution(&self, state: &State, audit: &Audit) -> Result<AttributionReply, String> {
+        attribution_of(self, state, &audit.recorder)
     }
 }
 
 impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
-    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String> {
-        self.reset_with(seed, recorder).map_err(|e| e.to_string())
+    fn reset(&mut self, seed: u64, audit: &mut Audit) -> Result<State, String> {
+        self.reset_with(seed, audit).map_err(|e| e.to_string())
     }
 
     fn observe(&self, state: &State) -> Result<FeatureVector, String> {
@@ -647,38 +791,56 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
         self.env().hedge_mask(state)
     }
 
+    /// Only a hold: the resting orders stay, and the classical strategy is not asked, so
+    /// a decision interval can hold a residual policy's orders between its decisions.
     fn step(
         &mut self,
-        _state: &mut State,
-        _action: RlAction,
-        _recorder: &mut EpisodeRecorder,
+        state: &mut State,
+        action: RlAction,
+        audit: &mut Audit,
     ) -> Result<StepReply, String> {
-        Err("a grid action on a residual environment".to_string())
+        if action != RlAction::Hold {
+            return Err("a grid action on a residual environment".to_string());
+        }
+        audit.orders = OrderCounts::default();
+        audit.gates = GateCounts::default();
+        let transition = self
+            .env()
+            .step_with(state, RlAction::Hold, audit)
+            .map_err(|e| e.to_string())?;
+        Ok(StepReply {
+            transition,
+            net: state.net(),
+            penalties: state.penalties(),
+            decision: None,
+            orders: audit.orders,
+            gates: audit.gates,
+        })
     }
 
     fn step_residual(
         &mut self,
         state: &mut State,
         proposal: ResidualProposal,
-        recorder: &mut EpisodeRecorder,
+        audit: &mut Audit,
     ) -> Result<StepReply, String> {
+        audit.orders = OrderCounts::default();
+        audit.gates = GateCounts::default();
         let step = self
-            .step_with(state, proposal, recorder)
+            .step_with(state, proposal, audit)
             .map_err(|e| e.to_string())?;
         Ok(StepReply {
             transition: step.transition,
             net: state.net(),
             penalties: state.penalties(),
             decision: Some(step.decision),
+            orders: audit.orders,
+            gates: audit.gates,
         })
     }
 
-    fn inner_attribution(
-        &self,
-        state: &State,
-        recorder: &EpisodeRecorder,
-    ) -> Result<AttributionReply, String> {
-        attribution_of(self.env(), state, recorder)
+    fn inner_attribution(&self, state: &State, audit: &Audit) -> Result<AttributionReply, String> {
+        attribution_of(self.env(), state, &audit.recorder)
     }
 }
 
@@ -688,36 +850,36 @@ fn answer<D: Driver>(
     requests: &mpsc::Receiver<Request>,
     replies: &mpsc::Sender<Reply>,
 ) {
-    let mut episode: Option<(State, EpisodeRecorder)> = None;
+    let mut episode: Option<(State, Audit)> = None;
     let none = || "a step before any reset".to_string();
     for request in requests {
         let reply = match request {
             #[cfg(test)]
             Request::Panic => panic!("a panic asked for by a test"),
             Request::Reset(seed) => {
-                let mut recorder = EpisodeRecorder::default();
-                Reply::Reset(env.reset(seed, &mut recorder).and_then(|fresh| {
+                let mut audit = Audit::default();
+                Reply::Reset(env.reset(seed, &mut audit).and_then(|fresh| {
                     let reply = ResetReply {
                         observation: env.observe(&fresh)?,
                         mask: env.mask(&fresh),
                         hedge_mask: env.hedge_mask(&fresh),
                         done: fresh.is_done(),
                     };
-                    episode = Some((fresh, recorder));
+                    episode = Some((fresh, audit));
                     Ok(reply)
                 }))
             }
             Request::Step(action) => Reply::Step(match episode.as_mut() {
                 None => Err(none()),
-                Some((state, recorder)) => env.step(state, action, recorder),
+                Some((state, audit)) => env.step(state, action, audit),
             }),
             Request::StepResidual(proposal) => Reply::Step(match episode.as_mut() {
                 None => Err(none()),
-                Some((state, recorder)) => env.step_residual(state, proposal, recorder),
+                Some((state, audit)) => env.step_residual(state, proposal, audit),
             }),
             Request::Attribution => Reply::Attribution(match episode.as_ref() {
                 None => Err(none()),
-                Some((state, recorder)) => env.inner_attribution(state, recorder),
+                Some((state, audit)) => env.inner_attribution(state, audit),
             }),
         };
         if replies.send(reply).is_err() {
@@ -750,7 +912,7 @@ fn serve_residual<S: QuoteSource + Clone>(
                 .map_err(refuse)?;
         let spec = env.env().spec();
         let id = spec.id();
-        check_spec(spec, id, expected)?;
+        check_spec(spec, id, expected, false)?;
         let shape = spec.shape();
         let info = EnvInfo {
             spec: id,
@@ -758,6 +920,7 @@ fn serve_residual<S: QuoteSource + Clone>(
             offsets: shape.bid_offsets,
             sizes: shape.sizes,
             hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
+            cancel_action: spec.action.cancel == CancelActions::CancelOnly,
             kernel_fingerprint: env.env().kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,
@@ -780,8 +943,9 @@ fn check_spec(
     spec: &market_maker_rs::rl::RlSpec,
     id: SpecId,
     expected: Option<SpecId>,
+    cancel_action: bool,
 ) -> Result<(), BridgeError> {
-    if !known_versions(&id) {
+    if !known_versions(&id, cancel_action) {
         return Err(BridgeError::Refused(format!("unknown versions in {id:?}")));
     }
     if let Some(expected) = expected {
@@ -806,6 +970,7 @@ fn start_residual(job: Job<'_>, residual: &ResidualConfig) {
     match parsed {
         Ok((size, Baseline::Avellaneda(source))) => serve_residual(job, source, size, bounds),
         Ok((size, Baseline::Glft(source))) => serve_residual(job, source, size, bounds),
+        Ok((size, Baseline::Scheduled(source))) => serve_residual(job, source, size, bounds),
         Err(error) => {
             let _ = job.ready.send(Err(error));
         }
@@ -860,13 +1025,130 @@ fn parse_baseline(baseline: &BaselineConfig, lot_size: &str) -> Result<Baseline,
                 counts: GlftCounts::default(),
             }))
         }
+        BaselineConfig::Scheduled { points, changes } => Ok(Baseline::Scheduled(parse_schedule(
+            points, changes, lot_size,
+        )?)),
     }
+}
+
+/// Parses a schedule, refusing one that is empty, nested, or whose changes are out of order,
+/// name no point, or name the point already in force.
+fn parse_schedule(
+    points: &[BaselineConfig],
+    changes: &[(u64, usize)],
+    lot_size: &str,
+) -> Result<ScheduledQuoter, BridgeError> {
+    let refuse = |why: String| Err(BridgeError::Refused(format!("scheduled baseline: {why}")));
+    if points.is_empty() {
+        return refuse("no points".to_string());
+    }
+    let mut parsed = Vec::with_capacity(points.len());
+    for point in points {
+        match parse_baseline(point, lot_size)? {
+            Baseline::Scheduled(_) => return refuse("a point is itself scheduled".to_string()),
+            plain => parsed.push(plain),
+        }
+    }
+    let mut in_force = 0;
+    let mut last_row = None;
+    for &(row, index) in changes {
+        if last_row.is_some_and(|last| row <= last) {
+            return refuse(format!("change rows are not increasing at row {row}"));
+        }
+        if index >= parsed.len() {
+            return refuse(format!("row {row} names point {index} of {}", parsed.len()));
+        }
+        if index == in_force {
+            return refuse(format!("row {row} names point {index}, already in force"));
+        }
+        last_row = Some(row);
+        in_force = index;
+    }
+    Ok(ScheduledQuoter {
+        points: parsed,
+        changes: changes.to_vec(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum Baseline {
     Avellaneda(AvellanedaQuoter),
     Glft(GlftQuoter),
+    Scheduled(ScheduledQuoter),
+}
+
+impl QuoteSource for Baseline {
+    fn quote(
+        &mut self,
+        obs: &Observation,
+        mid: Decimal,
+        inventory: Decimal,
+    ) -> market_maker_rs::types::error::MMResult<SourceQuote> {
+        match self {
+            Self::Avellaneda(source) => source.quote(obs, mid, inventory),
+            Self::Glft(source) => source.quote(obs, mid, inventory),
+            Self::Scheduled(source) => source.quote(obs, mid, inventory),
+        }
+    }
+
+    fn validate(&self, tick: Decimal, lot: Decimal) -> market_maker_rs::types::error::MMResult<()> {
+        match self {
+            Self::Avellaneda(source) => source.validate(tick, lot),
+            Self::Glft(source) => source.validate(tick, lot),
+            Self::Scheduled(source) => source.validate(tick, lot),
+        }
+    }
+}
+
+/// Classical strategies in turn, by the row the agent last observed. See
+/// [`BaselineConfig::Scheduled`].
+#[derive(Debug, Clone, PartialEq)]
+struct ScheduledQuoter {
+    /// The strategies, none of them scheduled.
+    points: Vec<Baseline>,
+    /// `(row, index)`, rows strictly increasing.
+    changes: Vec<(u64, usize)>,
+}
+
+impl ScheduledQuoter {
+    /// The point in force at an observation: that of the last change at or before its row,
+    /// or the first point before any row or change.
+    fn in_force(&self, obs: &Observation) -> usize {
+        let Some(row) = obs.row else {
+            return 0;
+        };
+        let passed = self.changes.partition_point(|(at, _)| *at <= row);
+        passed
+            .checked_sub(1)
+            .and_then(|last| self.changes.get(last))
+            .map_or(0, |(_, index)| *index)
+    }
+}
+
+impl QuoteSource for ScheduledQuoter {
+    fn quote(
+        &mut self,
+        obs: &Observation,
+        mid: Decimal,
+        inventory: Decimal,
+    ) -> market_maker_rs::types::error::MMResult<SourceQuote> {
+        let index = self.in_force(obs);
+        // Parsing checked every index against the points.
+        self.points
+            .get_mut(index)
+            .ok_or_else(|| {
+                market_maker_rs::types::error::MMError::InvalidConfiguration(format!(
+                    "no point {index}"
+                ))
+            })?
+            .quote(obs, mid, inventory)
+    }
+
+    fn validate(&self, tick: Decimal, lot: Decimal) -> market_maker_rs::types::error::MMResult<()> {
+        self.points
+            .iter()
+            .try_for_each(|point| point.validate(tick, lot))
+    }
 }
 
 /// What a worker thread serves.
@@ -918,7 +1200,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
             RlEnv::new(kernel_config, data, grid, config.rl()?).map_err(refuse)?;
         let spec = env.spec();
         let id = spec.id();
-        check_spec(spec, id, expected)?;
+        check_spec(spec, id, expected, config.cancel_action)?;
         let shape = spec.shape();
         let info = EnvInfo {
             spec: id,
@@ -926,6 +1208,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
             offsets: shape.bid_offsets,
             sizes: shape.sizes,
             hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
+            cancel_action: spec.action.cancel == CancelActions::CancelOnly,
             kernel_fingerprint: env.kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,

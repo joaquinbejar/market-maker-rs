@@ -1,5 +1,6 @@
 //! The extension module: a thin layer of Python values over [`Worker`].
 
+use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 
 use market_maker_rs::Decimal;
@@ -95,6 +96,7 @@ fn action_dict<'py>(py: Python<'py>, action: &KernelAction) -> PyResult<Bound<'p
             out.set_item("price", price)?;
             out.set_item("lots", lots)?;
         }
+        KernelAction::Cancel => out.set_item("kind", "cancel")?,
     }
     Ok(out)
 }
@@ -112,6 +114,25 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
     out.set_item("penalty", exact(t.reward.penalty))?;
     out.set_item("net", exact(reply.net))?;
     out.set_item("penalties", exact(reply.penalties))?;
+    let orders = PyDict::new(py);
+    orders.set_item("accepted", reply.orders.accepted)?;
+    orders.set_item("rejected", reply.orders.rejected)?;
+    orders.set_item("canceled", reply.orders.canceled)?;
+    orders.set_item("cancel_rejected", reply.orders.cancel_rejected)?;
+    orders.set_item("fills", reply.orders.fills)?;
+    out.set_item("orders", orders)?;
+    let gates = PyDict::new(py);
+    for (name, counts) in [
+        ("limits", reply.gates.limits),
+        ("combined", reply.gates.combined),
+        ("margin", reply.gates.margin),
+    ] {
+        let check = PyDict::new(py);
+        check.set_item("reduced", counts.reduced)?;
+        check.set_item("rejected", counts.rejected)?;
+        gates.set_item(name, check)?;
+    }
+    out.set_item("gates", gates)?;
     let (applied, reason) = match t.action_status {
         ActionStatus::Applied => (true, None),
         ActionStatus::Rejected(reason) => (false, Some(format!("{reason:?}"))),
@@ -241,6 +262,7 @@ impl NativeEnv {
         out.set_item("offsets", info.offsets)?;
         out.set_item("sizes", info.sizes)?;
         out.set_item("hedge_actions", info.hedge_actions)?;
+        out.set_item("cancel_action", info.cancel_action)?;
         out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
         out.set_item("dataset_digest", hex(info.dataset_digest))?;
         out.set_item("rows", info.rows)?;
@@ -288,6 +310,11 @@ impl NativeEnv {
     ) -> PyResult<Py<PyDict>> {
         let side = if bid { QuoteSide::Bid } else { QuoteSide::Ask };
         self.take_step(py, RlAction::OneSided { side, offset, size })
+    }
+
+    /// Cancels every resting or pending order and sends nothing.
+    fn step_cancel(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.take_step(py, RlAction::Cancel)
     }
 
     /// Reduces the delivered position with a marketable order at the observed touch, of the
@@ -352,9 +379,47 @@ impl NativeEnv {
     }
 }
 
+/// Each step's account state under `margin-rs`'s `linear-im/1`, as
+/// [`crate::maintenance::maintenance_path`] reads it: `steps` are `(position, mark, net)`
+/// decimal strings, and each result is `(state, maintenance, shortfall)`.
+#[pyfunction]
+fn maintenance_path(
+    capital: &str,
+    scale: u32,
+    steps: Vec<(String, String, String)>,
+) -> PyResult<Vec<(String, String, String)>> {
+    let number = |what: &str, text: &str| {
+        Decimal::from_str(text)
+            .map_err(|error| BridgeFailure::new_err(format!("{what} {text:?}: {error}")))
+    };
+    let inputs = steps
+        .iter()
+        .map(|(position, mark, net)| {
+            Ok(crate::maintenance::StepInput {
+                position: number("position", position)?,
+                mark: number("mark", mark)?,
+                net: number("net", net)?,
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let path = crate::maintenance::maintenance_path(number("capital", capital)?, scale, &inputs)
+        .map_err(BridgeFailure::new_err)?;
+    Ok(path
+        .into_iter()
+        .map(|step| {
+            (
+                crate::maintenance::state_name(step.state).to_string(),
+                step.maintenance.to_string(),
+                step.shortfall.to_string(),
+            )
+        })
+        .collect())
+}
+
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnv>()?;
+    module.add_function(wrap_pyfunction!(maintenance_path, module)?)?;
     module.add("BridgeFailure", py.get_type::<BridgeFailure>())?;
     module.add("RESIDUAL_VERSION", market_maker_rs::rl::RESIDUAL_VERSION)?;
     module.add("BRIDGE_VERSION", env!("CARGO_PKG_VERSION"))?;

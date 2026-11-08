@@ -15,17 +15,19 @@ use market_maker_rs::backtest::evaluation::{
     Direction, EvaluationInput, MetricHorizon, MetricId, MetricUnit, attribute,
 };
 use market_maker_rs::backtest::kernel::{
-    ActionGrid, ActionStatus, FinancialKernel, KernelAction, KernelConfig, KernelDataset,
-    KernelFillModel, KernelLatency, QuoteSide, RejectReason, encode,
+    ActionGrid, ActionStatus, FinancialKernel, GateCheck, GateVerdict, KernelAction, KernelConfig,
+    KernelDataset, KernelEvent, KernelFillModel, KernelLatency, KernelMargin, QuoteSide,
+    RejectReason, encode,
 };
 use market_maker_rs::dec;
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    ACTION_SPACE_VERSION, AsOf, EPISODE_VERSION, ERR_ACTION_OFF_GRID, EpisodeRecorder,
-    FEATURE_COUNT, FeatureHorizon, FeatureId, FeatureUnit, HedgeActions, InvalidActionPolicy,
-    OBSERVATION_SPACE_VERSION, ObservationScales, REWARD_VERSION, RlAction, RlConfig, RlEnv,
-    RlSpec, StateMemory, TerminalValuation,
+    ACTION_SPACE_VERSION, AsOf, CANCEL_ACTION_SPACE_VERSION, CancelActions, EPISODE_VERSION,
+    ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, EpisodeRecorder, FEATURE_COUNT, FeatureHorizon,
+    FeatureId, FeatureUnit, HedgeActions, InvalidActionPolicy, OBSERVATION_SPACE_VERSION,
+    ObservationScales, REWARD_VERSION, RlAction, RlConfig, RlEnv, RlSpec, StateMemory,
+    TerminalValuation,
 };
 use market_maker_rs::types::error::MMError;
 
@@ -1432,7 +1434,7 @@ fn test_spec_fingerprint_covers_every_public_field() {
     let base = spec_of(&long_config(), long_grid(), config());
     let id = base.id();
     type Change = fn(&mut RlSpec);
-    let changes: [(&str, Change); 28] = [
+    let changes: [(&str, Change); 29] = [
         ("observation version", |s| s.observation.version += 1),
         ("feature id", |s| s.observation.features.swap(0, 1)),
         ("feature unit", |s| {
@@ -1464,6 +1466,7 @@ fn test_spec_fingerprint_covers_every_public_field() {
         ("hedge", |s| {
             s.action.hedge = HedgeActions::MarketableAtTouch
         }),
+        ("cancel", |s| s.action.cancel = CancelActions::CancelOnly),
         ("reward version", |s| s.reward.version += 1),
         ("metric", |s| s.reward.metric = MetricId::SpreadCapture),
         ("reward unit", |s| s.reward.unit = MetricUnit::Base),
@@ -1508,4 +1511,132 @@ fn test_spec_ensure_refuses_another_specification() {
     let mut later = id;
     later.reward += 1;
     assert!(spec.ensure(later).is_err());
+}
+
+#[test]
+fn test_the_cancel_action_is_action_space_4_and_its_own_section() {
+    let plain = spec_of(&long_config(), long_grid(), config());
+    let cancel = spec_of(&long_config(), long_grid(), config().with_cancel_action());
+    assert_eq!(plain.action.version, ACTION_SPACE_VERSION);
+    assert_eq!(plain.action.cancel, CancelActions::NotModelled);
+    assert_eq!(cancel.action.version, CANCEL_ACTION_SPACE_VERSION);
+    assert_eq!(cancel.action.cancel, CancelActions::CancelOnly);
+    let (p, c) = (plain.to_bytes(), cancel.to_bytes());
+    assert!(!p.windows(2).any(|w| w == b"CX"));
+    assert!(c.windows(2).any(|w| w == b"CX"));
+    assert!(cancel.ensure(plain.id()).is_err() && plain.ensure(cancel.id()).is_err());
+}
+
+// Rows at 100 / 101, then an ask of 99.5 on row 2: a bid of 2 at 99.5 (offset 1) sent on
+// row 0 fills on row 2 unless it is cancelled at the decision on row 1.
+fn late_cross() -> Vec<MarketTick> {
+    vec![
+        tick(1000, dec!(99.5), dec!(5), dec!(100.5), dec!(5)),
+        tick(2000, dec!(100), dec!(5), dec!(101), dec!(5)),
+        tick(3000, dec!(98.5), dec!(5), dec!(99.5), dec!(5)),
+        tick(4000, dec!(100), dec!(5), dec!(101), dec!(5)),
+    ]
+}
+
+#[test]
+fn test_a_cancel_withdraws_the_resting_quote_and_nothing_fills() {
+    let cfg = long_config();
+    let data = KernelDataset::from_ticks(&late_cross(), &cfg).unwrap();
+    let position = |second: RlAction| {
+        let env: RlEnv<'_, 3, 2> =
+            RlEnv::new(&cfg, &data, long_grid(), config().with_cancel_action()).unwrap();
+        let mut state = env.reset(1).unwrap();
+        env.step(&mut state, quote(1, 2, 1, 0)).unwrap();
+        let t = env.step(&mut state, second).unwrap();
+        assert_eq!(t.action_status, ActionStatus::Applied);
+        while !state.is_done() {
+            env.step(&mut state, RlAction::Hold).unwrap();
+        }
+        state.kernel().venue_position()
+    };
+    assert_eq!(position(RlAction::Hold), dec!(2));
+    assert_eq!(position(RlAction::Cancel), dec!(0));
+}
+
+#[test]
+fn test_without_the_cancel_action_a_cancel_is_outside_the_space() {
+    let cfg = long_config();
+    let data = KernelDataset::from_ticks(&late_cross(), &cfg).unwrap();
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, long_grid(), config()).unwrap();
+    let mut state = env.reset(1).unwrap();
+    env.step(&mut state, quote(1, 2, 1, 0)).unwrap();
+    let before = state;
+    assert!(env.step(&mut state, RlAction::Cancel).is_err());
+    assert_eq!(state, before);
+    let reject = config().with_invalid_action(InvalidActionPolicy::Reject, dec!(1));
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, long_grid(), reject).unwrap();
+    let mut state = env.reset(1).unwrap();
+    env.step(&mut state, quote(1, 2, 1, 0)).unwrap();
+    let t = env.step(&mut state, RlAction::Cancel).unwrap();
+    assert_eq!(
+        t.action_status,
+        ActionStatus::QuoteError(ERR_CANCEL_REFUSED)
+    );
+    assert_eq!(t.reward.penalty, dec!(1));
+    while !state.is_done() {
+        env.step(&mut state, RlAction::Hold).unwrap();
+    }
+    // Refused, so the bid rested and filled.
+    assert_eq!(state.kernel().venue_position(), dec!(2));
+}
+
+// A policy that bids 2 lots at 99.5 on every decision, with a quote balance of 150 and a
+// base deposit of 1 lot, on the long trajectory's rows (row 1 trades down to 99.5). The
+// balance covers one lot at 99.5: the gate cuts the first bid to 1 lot and, once it has
+// filled, refuses every later bid, so the policy never holds more than the balance paid
+// for. The far ask is cut to the base deposit. Without the gate the same policy buys 2.
+#[test]
+fn test_a_policy_cannot_get_an_order_beyond_the_balance_executed() {
+    let run = |margin: Option<KernelMargin>| {
+        let mut cfg = long_config().with_initial_capital(dec!(150));
+        cfg.margin = margin;
+        let data = KernelDataset::from_ticks(&long_ticks(), &cfg).unwrap();
+        let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, long_grid(), config()).unwrap();
+        let mut events: Vec<KernelEvent> = Vec::new();
+        let mut state = env.reset_with(1, &mut events).unwrap();
+        while !state.is_done() {
+            env.step_with(&mut state, quote(1, 2, 1, 1), &mut events)
+                .unwrap();
+        }
+        let summary = env.kernel().venue_summary(state.kernel()).unwrap();
+        (
+            events,
+            summary.position,
+            state.kernel().counters().venue_fills,
+        )
+    };
+    let (events, position, fills) = run(Some(KernelMargin::new(dec!(1))));
+    assert_eq!((position, fills), (dec!(1), 1));
+    let margin: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            KernelEvent::Gate(g) => {
+                assert_eq!(g.check, GateCheck::Margin);
+                Some((g.side, g.verdict, g.submitted))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        margin[..2],
+        [
+            (Action::Buy, GateVerdict::Reduced, 1),
+            (Action::Sell, GateVerdict::Reduced, 1),
+        ]
+    );
+    assert!(
+        margin[2..]
+            .iter()
+            .filter(|g| g.0 == Action::Buy)
+            .all(|g| g.1 == GateVerdict::Rejected),
+        "{margin:?}"
+    );
+    let (events, position, _) = run(None);
+    assert_eq!(position, dec!(2));
+    assert!(!events.iter().any(|e| matches!(e, KernelEvent::Gate(_))));
 }

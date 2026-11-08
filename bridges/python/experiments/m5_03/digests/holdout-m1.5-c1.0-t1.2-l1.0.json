@@ -1,0 +1,313 @@
+{
+  "days": [
+    {
+      "dataset_digest": "d99de487b6b9caaa6141aa2793d70728",
+      "day": 1,
+      "external_digest": "8e6234ca4955d259323119255ab16de4844f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200004,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "94f71cad973a6c6ebdfdd3727c502eb8",
+      "day": 2,
+      "external_digest": "8e6234ca4955d259323119255ab16de4854f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200005,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "8eca90499ac06bc683619b2e84b41e4a",
+      "day": 3,
+      "external_digest": "8e6234ca4955d259323119255ab16de4864f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200006,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "cc675d9997e95521284a558ccaf29ec1",
+      "day": 4,
+      "external_digest": "8e6234ca4955d259323119255ab16de4874f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200007,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "8d88215376a482a06b6d275cf53479ee",
+      "day": 5,
+      "external_digest": "8e6234ca4955d259323119255ab16de4884f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200008,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "3fbb319a9b0e4932028aeb25698d70a5",
+      "day": 6,
+      "external_digest": "8e6234ca4955d259323119255ab16de4894f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200009,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "57a756fb78d6094e2bb79046182814ce",
+      "day": 7,
+      "external_digest": "8e6234ca4955d259323119255ab16de48a4f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200010,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "27a885d5f9834304e933985570de4215",
+      "day": 8,
+      "external_digest": "8e6234ca4955d259323119255ab16de48b4f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200011,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "9bf738cef616eeccabdc228a2e60c765",
+      "day": 9,
+      "external_digest": "8e6234ca4955d259323119255ab16de48c4f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200012,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "008092565265e9c8d182dc016f193ab6",
+      "day": 10,
+      "external_digest": "8e6234ca4955d259323119255ab16de48d4f1200000000001027000000000000",
+      "parameters_fingerprint": "e46db15a2519313259d25549ca34628e",
+      "regime": "calm",
+      "rows": 8640,
+      "seed": 1200013,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "aeb35d8856787e6f06450f2dbb515532",
+      "day": 1,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4c7912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200007,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f2e76c9950171cab0409a1eb74139799",
+      "day": 2,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4c8912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200008,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "96f82dc38e1dd53b68309711286c6f37",
+      "day": 3,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4c9912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200009,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "905f64f9d392446b31cc5eec0cc99cdb",
+      "day": 4,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4ca912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200010,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "a9be2d53ca536fedfedb51f7210f31e2",
+      "day": 5,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4cb912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200011,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "5688340bf0c65f572512a1d2d18badc4",
+      "day": 6,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4cc912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200012,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "14b9d352df4416c5886d40be4d454ebe",
+      "day": 7,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4cd912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200013,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "ac33bd6b787775c02d92d9108062a65f",
+      "day": 8,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4ce912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200014,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "cde2d8b1491a7c5e1e3e89ec906a5977",
+      "day": 9,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4cf912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200015,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "e1572869b7c042297d4e214ba0a199d4",
+      "day": 10,
+      "external_digest": "ae59aa75c80b654ba568c581afd20db4d0912100000000001027000000000000",
+      "parameters_fingerprint": "b40dd2af81c568a54b650bc875aa59ae",
+      "regime": "stressed",
+      "rows": 8640,
+      "seed": 2200016,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "518bfdec4875785585024e11f6991398",
+      "day": 1,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d0ad43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200010,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "1859b232b3c109f3f5023896fa4352cb",
+      "day": 2,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d0bd43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200011,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "c5e867e846c32c4ea3a413aae4c86a45",
+      "day": 3,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d0cd43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200012,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "2a16eaed1a5f74a62ea68baa83ecf37a",
+      "day": 4,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d0dd43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200013,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "7c2a8a10b62b93e33df6d13a687f953a",
+      "day": 5,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d0ed43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200014,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "75054774c60b68c4b8c64988b2ab6a92",
+      "day": 6,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d0fd43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200015,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "807020bf967b47553f34fb9eab2d1db7",
+      "day": 7,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d10d43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200016,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "a421c8257278c190ce816165335e163c",
+      "day": 8,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d11d43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200017,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "0cde02d8d30c9da8347bc84d9e6ecd03",
+      "day": 9,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d12d43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200018,
+      "split": "train"
+    },
+    {
+      "dataset_digest": "e17a27cfe12a49f3bd6ca838b9c8136d",
+      "day": 10,
+      "external_digest": "6d8647b5364bebf2d62b1a8977f3982d13d43000000000001027000000000000",
+      "parameters_fingerprint": "2d98f377891a2bd6f2eb4b36b547866d",
+      "regime": "thin",
+      "rows": 8640,
+      "seed": 3200019,
+      "split": "train"
+    }
+  ],
+  "design_sha256": "56a0463d102ddc40dac7d037d7597d326ced89c1aefc4b6c1eb49f3b36bc7d27",
+  "design_version": 4,
+  "point": {
+    "cancel_rate_multiplier": 1.0,
+    "limit_rate_multiplier": 1.0,
+    "market_rate_multiplier": 1.5,
+    "theta_multiplier": 1.2
+  },
+  "scenario": "holdout-m1.5-c1.0-t1.2-l1.0"
+}
