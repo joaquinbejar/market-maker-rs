@@ -47,6 +47,18 @@ value a third choice, 2, always allowed; the continuous one adds a last value, a
 cancel, read after a hedge and before a quote. The bridge drives version 4 only with the flag,
 so a checkpoint of one space is refused by the other, and a residual environment refuses it.
 
+With `"margin": {"base_deposit": "<lots>"}` (absent by default, which keeps a
+configuration's kernel fingerprint), the kernel runs its balance gate, the library's
+`KernelMargin`, after the hard limits: a buy reserves its notional at its limit price plus its
+largest fee from the initial capital, and a sell its quantity from the base deposit, so an
+order beyond the balance is cut to what it pays for or refused. It is the spot, fully
+collateralised rule (one unit of balance per unit of notional), not a leveraged margin rule.
+The spaces do not change, so a specification does not either; the kernel fingerprint in a
+checkpoint's metadata tells the two apart. Every step's `info["gates"]` counts the orders the
+gate cut (`reduced`) or refused (`rejected`, a cut off the lot grid included) by the check that
+decided: `limits`, `combined` (a hedged kernel's) and `margin`. A hold submits nothing, so the
+gate decides nothing on it.
+
 `ExpiringQuote(env, rows=d)` wraps such an environment so that a quote expires by itself: after
 a quote the environment applied it holds for `d - 1` decisions and cancels at the decision `d`
 rows after the quote, with no decision of the policy, which decides again on the next row. In

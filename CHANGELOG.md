@@ -8,6 +8,32 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A second, margin-stress holdout for #105's comparison in `bridges/python/experiments/m4_08`
+  (`stress.py`, `report_stress.py`, `stress_design.json`): the frozen runs on five new days per
+  regime, by #102's seed rule, unshocked and shocked, with every step's account assessed by
+  margin-rs 0.2's `maintenance::assess` under `linear-im/1`. The bridge gains
+  `mm_rl_bridge.maintenance_path`, from margin-rs itself. It does not revise the first
+  holdout's decisions; the design, the helper, the days' digests and the reading rule were
+  committed before it ran. Synthetic data only; nothing here is a safety guarantee.
+
+- The Python bridge configures the kernel's balance gate (#105): `"margin": {"base_deposit":
+  ...}` sets `KernelConfig::margin`, so an RL policy through the bridge cannot get an order
+  beyond its balance executed, and every step's `info["gates"]` counts what the gate cut or
+  refused, by the check that decided (the limits, a hedged kernel's combined limits, or the
+  margin). It is the spot, fully collateralised gate of #283, not a leveraged margin rule. A
+  configuration without it keeps its kernel fingerprint; the specification does not depend
+  on it. Synthetic fixtures only.
+
+- The constrained learning comparison of #105 in `bridges/python/experiments/m4_08`: OmniSafe
+  CPO against PPO with a reward penalty and plain PPO, beside no-trade and Avellaneda-Stoikov,
+  on #102's regimes and shocked copies of their days. Inventory and notional costs are
+  constrained with budgets per step, measured apart from the reward, and a margin proxy is
+  reported; the kernel's limits, derived from the margin rule, stay the final authority for
+  every arm. Paired block bootstrap intervals on the holdout for the daily net and the daily
+  cost. The design was committed before any run, PPOLag was dropped after failing a toy gate,
+  and `report.py` was committed before the holdout was read. Synthetic data only; nothing here
+  is a safety guarantee.
+
 - The decision frequency and policy memory comparison of #103 in
   `bridges/python/experiments/m4_06`, with `DecisionInterval`, `EmaFeatures` and `history` in the
   bridge's wrappers and per-step order counts in its replies. On #102's regimes sampled every
