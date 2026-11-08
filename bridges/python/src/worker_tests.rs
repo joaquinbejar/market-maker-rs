@@ -1660,3 +1660,432 @@ fn test_worker_counts_a_reduction_off_the_lot_grid_as_refused() {
     assert_eq!(through.gates, tally.counts());
     assert_eq!(through.gates.margin.reduced, 0);
 }
+
+/// The lots the kernel books as fills, by side, independently of the reports the worker
+/// counts.
+#[derive(Default)]
+struct FillTally(FilledLots);
+
+impl EventSink for FillTally {
+    fn event(&mut self, event: KernelEvent) {
+        if let KernelEvent::Fill(fill) = event {
+            match fill.side {
+                Action::Buy => self.0.buy += fill.qty,
+                Action::Sell => self.0.sell += fill.qty,
+                _ => {}
+            }
+        }
+    }
+}
+
+fn crossing_rows(n: u64) -> Vec<KernelTick> {
+    (0..n)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn test_worker_reports_the_lots_filled_in_each_step_by_side() {
+    let rows = crossing_rows(200);
+    let mut bridge = config("close", "reject", 1000);
+    bridge.fill_model = FillConfig::QueuePositionRational {
+        lots: 1,
+        per_ms: 20,
+        min_queue_ms: 0,
+    };
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let mut tally = FillTally::default();
+    let mut state = env.reset_with(9, &mut tally).unwrap();
+    worker.reset(9).unwrap();
+    let action = |step: usize| match step % 3 {
+        0 => quote(0, 0, 1, 1),
+        1 => quote(1, 0, 0, 1),
+        _ => RlAction::Hold,
+    };
+    let (mut step, mut total) = (0, FilledLots::default());
+    while !state.is_done() {
+        tally = FillTally::default();
+        env.step_with(&mut state, action(step), &mut tally).unwrap();
+        let through = worker.step(action(step)).unwrap();
+        assert_eq!(through.filled, tally.0, "step {step}");
+        total.buy += through.filled.buy;
+        total.sell += through.filled.sell;
+        step += 1;
+    }
+    assert!(total.buy > 0 && total.sell > 0, "{total:?}");
+}
+
+#[test]
+fn test_worker_reports_the_lots_filled_on_residual_decisions_and_holds() {
+    let bridge = residual_config(AVELLANEDA);
+    let kernel = bridge.kernel().unwrap();
+    let rows = crossing_rows(120);
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let d = |text: &str| Decimal::from_str(text).unwrap();
+    let source = AvellanedaQuoter {
+        risk_aversion: d("0.1"),
+        volatility: d("0.2"),
+        order_intensity: d("1.5"),
+        session_start_ms: 0,
+        horizon_ms: 100_000,
+        size: d("1"),
+    };
+    let bounds = ResidualBounds {
+        price_ticks: 4,
+        size_lots: 1,
+    };
+    let inside = ResidualProposal {
+        bid_away: 2.0,
+        ask_away: 2.0,
+        bid_size: 1.0,
+        ask_size: 1.0,
+    };
+    let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
+        ResidualEnv::new(&kernel, &data, source, d("1"), bounds, bridge.rl().unwrap()).unwrap();
+    let mut tally = FillTally::default();
+    let mut state = env.reset_with(1, &mut tally).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    worker.reset(1).unwrap();
+    let mut total = FilledLots::default();
+    for step in 0..119 {
+        if state.is_done() {
+            break;
+        }
+        tally = FillTally::default();
+        let through = if step % 3 != 2 {
+            env.step_with(&mut state, inside, &mut tally).unwrap();
+            worker.step_residual(inside).unwrap()
+        } else {
+            env.env()
+                .step_with(&mut state, RlAction::Hold, &mut tally)
+                .unwrap();
+            worker.step(RlAction::Hold).unwrap()
+        };
+        assert_eq!(through.filled, tally.0, "step {step}");
+        total.buy += through.filled.buy;
+        total.sell += through.filled.sell;
+    }
+    assert!(total.buy + total.sell > 0, "{total:?}");
+}
+
+fn grid_bridge() -> BridgeConfig {
+    let mut bridge = config("close", "reject", 1000);
+    bridge.fill_model = FillConfig::QueuePositionRational {
+        lots: 1,
+        per_ms: 20,
+        min_queue_ms: 0,
+    };
+    bridge
+}
+
+fn grid_action(step: usize) -> RlAction {
+    match step % 3 {
+        0 => quote(0, 0, 1, 1),
+        1 => quote(1, 0, 0, 1),
+        _ => RlAction::Hold,
+    }
+}
+
+/// The same rows from `from` on, moved by `shift` ticks.
+fn shifted(rows: &[KernelTick], from: usize, shift: u64) -> Vec<KernelTick> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if i < from {
+                *row
+            } else {
+                KernelTick {
+                    bid: row.bid + shift,
+                    ask: row.ask + shift,
+                    ..*row
+                }
+            }
+        })
+        .collect()
+}
+
+/// Runs `steps` grid steps from a reset with seed 9 and returns every reply.
+fn run_steps(worker: &mut Worker, from: usize, to: usize) -> Vec<StepReply> {
+    (from..to)
+        .map(|step| worker.step(grid_action(step)).unwrap())
+        .collect()
+}
+
+#[test]
+fn test_replacing_with_the_same_rows_changes_nothing() {
+    let rows = crossing_rows(120);
+    let mut plain = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    let mut replaced = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    plain.reset(9).unwrap();
+    replaced.reset(9).unwrap();
+    let a = run_steps(&mut plain, 0, 40);
+    let b = run_steps(&mut replaced, 0, 40);
+    assert_eq!(a, b);
+    let info = replaced.replace_rows(rows).unwrap();
+    assert_eq!(info, replaced.info());
+    assert_eq!(info.dataset_digest, plain.info().dataset_digest);
+    assert_eq!(
+        run_steps(&mut plain, 40, 100),
+        run_steps(&mut replaced, 40, 100)
+    );
+    assert_eq!(
+        plain.attribution().unwrap(),
+        replaced.attribution().unwrap()
+    );
+}
+
+#[test]
+fn test_new_rows_after_the_read_ones_run_as_a_fresh_run_on_them() {
+    let rows = crossing_rows(120);
+    let new_rows = shifted(&rows, 45, 3);
+    let mut replaced = Worker::spawn(grid_bridge(), rows, None).unwrap();
+    replaced.reset(9).unwrap();
+    let before = run_steps(&mut replaced, 0, 40);
+    let read = before.last().unwrap().transition.observation.row.unwrap();
+    assert!(read < 45, "row {read} read");
+    let old_info = replaced.info();
+    let info = replaced.replace_rows(new_rows.clone()).unwrap();
+    // Only the dataset's identity changes.
+    assert_eq!(info.spec, old_info.spec);
+    assert_eq!(info.kernel_fingerprint, old_info.kernel_fingerprint);
+    assert_ne!(info.dataset_digest, old_info.dataset_digest);
+    let after = run_steps(&mut replaced, 40, 110);
+    let mut fresh = Worker::spawn(grid_bridge(), new_rows, None).unwrap();
+    fresh.reset(9).unwrap();
+    assert_eq!(run_steps(&mut fresh, 0, 40), before);
+    assert_eq!(run_steps(&mut fresh, 40, 110), after);
+    assert_eq!(
+        fresh.attribution().unwrap(),
+        replaced.attribution().unwrap()
+    );
+}
+
+#[test]
+fn test_a_refused_replace_leaves_the_episode_as_it_was() {
+    let rows = crossing_rows(120);
+    let mut plain = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    let mut refused = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    assert!(matches!(
+        refused.replace_rows(rows.clone()),
+        Err(BridgeError::Refused(_))
+    ));
+    plain.reset(9).unwrap();
+    refused.reset(9).unwrap();
+    run_steps(&mut plain, 0, 40);
+    run_steps(&mut refused, 0, 40);
+    // A row already read changes.
+    assert!(matches!(
+        refused.replace_rows(shifted(&rows, 5, 1)),
+        Err(BridgeError::Refused(_))
+    ));
+    // Rows the kernel refuses, past the read ones: a price of zero.
+    let mut bad = rows.clone();
+    bad[100].bid = 0;
+    assert!(matches!(
+        refused.replace_rows(bad),
+        Err(BridgeError::Refused(_))
+    ));
+    assert_eq!(refused.info(), plain.info());
+    assert_eq!(
+        run_steps(&mut plain, 40, 100),
+        run_steps(&mut refused, 40, 100)
+    );
+    assert_eq!(plain.attribution().unwrap(), refused.attribution().unwrap());
+}
+
+#[test]
+fn test_a_replace_after_the_episode_ended_is_refused() {
+    let rows = crossing_rows(20);
+    let mut worker = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    worker.reset(9).unwrap();
+    let mut step = 0;
+    loop {
+        let reply = worker.step(grid_action(step)).unwrap();
+        step += 1;
+        if reply.transition.terminated || reply.transition.truncated {
+            break;
+        }
+    }
+    assert!(matches!(
+        worker.replace_rows(rows),
+        Err(BridgeError::Refused(_))
+    ));
+    assert!(worker.attribution().is_ok(), "the episode is still there");
+}
+
+#[test]
+fn test_a_residual_episode_replays_its_proposals_and_holds() {
+    let bridge = residual_config(AVELLANEDA);
+    let rows = crossing_rows(120);
+    let inside = ResidualProposal {
+        bid_away: 2.0,
+        ask_away: 2.0,
+        bid_size: 1.0,
+        ask_size: 1.0,
+    };
+    let act = |worker: &mut Worker, step: usize| {
+        if step % 3 == 2 {
+            worker.step(RlAction::Hold).unwrap()
+        } else {
+            worker.step_residual(inside).unwrap()
+        }
+    };
+    let mut replaced = Worker::spawn(bridge.clone(), rows.clone(), None).unwrap();
+    replaced.reset(1).unwrap();
+    let mut before = Vec::new();
+    for step in 0..10 {
+        before.push(act(&mut replaced, step));
+    }
+    let read = before.last().unwrap().transition.observation.row.unwrap() as usize;
+    let new_rows = shifted(&rows, read + 1, 2);
+    let mut fresh = Worker::spawn(bridge, new_rows.clone(), None).unwrap();
+    fresh.reset(1).unwrap();
+    for (step, reply) in before.iter().enumerate() {
+        assert_eq!(&act(&mut fresh, step), reply, "step {step}");
+    }
+    replaced.replace_rows(new_rows).unwrap();
+    let mut steps = 10;
+    for step in 10.. {
+        let (a, b) = (act(&mut replaced, step), act(&mut fresh, step));
+        assert_eq!(a, b, "step {step}");
+        steps += 1;
+        if a.transition.terminated || a.transition.truncated {
+            break;
+        }
+    }
+    assert!(steps > 10, "{steps} steps");
+    assert_eq!(
+        fresh.attribution().unwrap(),
+        replaced.attribution().unwrap()
+    );
+}
+
+#[test]
+fn test_a_replace_replays_only_the_episode_since_the_last_reset() {
+    let rows = crossing_rows(120);
+    let mut plain = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    let mut replaced = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    for worker in [&mut plain, &mut replaced] {
+        worker.reset(9).unwrap();
+        run_steps(worker, 0, 30);
+        worker.reset(4).unwrap();
+        run_steps(worker, 0, 20);
+    }
+    replaced.replace_rows(rows).unwrap();
+    assert_eq!(
+        run_steps(&mut plain, 20, 90),
+        run_steps(&mut replaced, 20, 90)
+    );
+    assert_eq!(
+        plain.attribution().unwrap(),
+        replaced.attribution().unwrap()
+    );
+}
+
+#[test]
+fn test_each_check_of_a_replace_refuses_on_its_own() {
+    let rows = crossing_rows(120);
+    let refusal = |result: Result<EnvInfo, BridgeError>| match result {
+        Err(BridgeError::Refused(reason)) => reason,
+        other => panic!("{other:?}"),
+    };
+    // A row already observed changes: the rows are refused before any replay.
+    let mut worker = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    worker.reset(9).unwrap();
+    run_steps(&mut worker, 0, 30);
+    assert!(refusal(worker.replace_rows(shifted(&rows, 3, 1))).contains("already read"));
+    // With observations late by more than a row, the kernel has matched the row after the
+    // one observed: changing it keeps the observed rows, and only the replay tells.
+    let mut late = grid_bridge();
+    late.latency = LatencyConfig {
+        quantum_ns: 1_000_000,
+        observation_q: 40,
+        submit_q: 1,
+        cancel_q: 1,
+        ack_q: 1,
+        jitter_q: 0,
+    };
+    let mut plain = Worker::spawn(late.clone(), rows.clone(), None).unwrap();
+    plain.reset(9).unwrap();
+    run_steps(&mut plain, 0, 30);
+    let mut worker = Worker::spawn(late, rows.clone(), None).unwrap();
+    worker.reset(9).unwrap();
+    let observed = run_steps(&mut worker, 0, 30)
+        .last()
+        .unwrap()
+        .transition
+        .observation
+        .row
+        .unwrap() as usize;
+    let reason = refusal(worker.replace_rows(shifted(&rows, observed + 1, 5)));
+    // The replayed steps tell first: a step's fill or reward moved.
+    assert!(reason.contains("replayed step"), "{reason}");
+    // The episode goes on, unchanged, on the old rows.
+    assert_eq!(worker.info(), plain.info());
+    assert_eq!(
+        run_steps(&mut plain, 30, 80),
+        run_steps(&mut worker, 30, 80)
+    );
+    assert_eq!(plain.attribution().unwrap(), worker.attribution().unwrap());
+}
+
+#[test]
+fn test_a_replace_after_a_proposal_with_a_nan_replays_it() {
+    let bridge = residual_config(AVELLANEDA);
+    let rows = crossing_rows(120);
+    let nan = ResidualProposal {
+        bid_away: f64::NAN,
+        ask_away: 0.0,
+        bid_size: 0.0,
+        ask_size: 0.0,
+    };
+    let mut plain = Worker::spawn(bridge.clone(), rows.clone(), None).unwrap();
+    let mut replaced = Worker::spawn(bridge, rows.clone(), None).unwrap();
+    for worker in [&mut plain, &mut replaced] {
+        worker.reset(1).unwrap();
+        let reply = worker.step_residual(nan).unwrap();
+        assert!(
+            reply.decision.is_some(),
+            "the NaN falls back, and is kept in the reply"
+        );
+        worker.step(RlAction::Hold).unwrap();
+    }
+    // The same rows: the replay reaches the step with the NaN.
+    replaced.replace_rows(rows.clone()).unwrap();
+    // A refused replace: the episode is rebuilt and replayed on the old rows, NaN included.
+    assert!(matches!(
+        replaced.replace_rows(shifted(&rows, 0, 1)),
+        Err(BridgeError::Refused(_))
+    ));
+    let mut bad = rows.clone();
+    bad[100].bid = 0;
+    assert!(matches!(
+        replaced.replace_rows(bad),
+        Err(BridgeError::Refused(_))
+    ));
+    for step in 0..20 {
+        assert_eq!(
+            plain.step(RlAction::Hold).unwrap(),
+            replaced.step(RlAction::Hold).unwrap(),
+            "step {step}"
+        );
+    }
+    assert_eq!(
+        plain.attribution().unwrap(),
+        replaced.attribution().unwrap()
+    );
+}

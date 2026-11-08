@@ -8,6 +8,29 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Counting of block-tied events in the queue-reactive estimator (#290):
+  `QrEstimationConfig::zero_waits` with `ZeroWaitPolicy` (`Drop`, the default and the behaviour
+  so far, or `Count`, which counts an event with a zero wait and adds no time, and leaves a size
+  with no time unsupported), set with
+  `QrEstimationConfig::with_zero_waits`; a configuration written without the field reads as
+  `Drop`. `queue_reactive::collapse_blocks` collapses each block's events at a queue into their
+  net change, carrying the wait of a block with none. Touch resets, opt in (#290):
+  `QrParameters::with_resets` takes a rate per first-limit queue size and the law the queue is
+  redrawn from, read with `reset_rates` and `reset_law`; the simulator then ends a touch queue's
+  life without emptying at that rate, reported as the new `QrStep::Reset` and kept in the new
+  `Trajectory::resets`, as `ResetObservation`s. `estimate_parameters_with_resets` estimates
+  them with the other rates, a reset's wait counting as time at its size. Parameters without
+  resets, their exports and fingerprints, and every run from them are unchanged; exported
+  parameters gain `reset_rates` and `reset_law` only when set. Example `qr_estimation`, behind `serde`,
+  holds #290's protocol and its synthetic recovery check on #102's calm regime; example
+  `hyperliquid_validation` gains #290's phase 1 on the capture's training part (counts with and
+  without zero waits, block lengths, how touch-queue lives end, and the drift of each estimator's
+  fit) and phase 3 (each estimator and its constant baseline on #286's windows and the training
+  part's first hours, the choice and stop rule in code before any phase 3 run, and the holdout's verdict).
+  E3, built because phase 1 met its condition, is E1 with touch resets read from the capture
+  (a side's touch at a move of the mid that emptied no touch, its new size from the side's next
+  touch event); its redraw law is the observed new sizes, with the invariant law as a
+  sensitivity row only. `qr_estimation synthetic-e3` checks that E3 recovers known resets.
 - The quote duration comparison of #110 in `bridges/python/experiments/m4_10`, with
   `ChosenDuration` in the bridge's wrappers: a policy that chooses, with each action, how many
   rows its quote rests before it decides again. On #103's regimes sampled every 100 ms, under a
@@ -18,6 +41,22 @@ project follows [Semantic Versioning](https://semver.org/).
   committed before the runs they govern, `report.py` before the holdout was read, and
   `holdout_once.py` reads the holdout once. Synthetic data only; the results are on the issue.
 
+- A market that reacts to the agent (#282), opt in. `QrSimulator::impose_reference_move` moves
+  the reference one tick from outside the simulated flow: it empties the first-limit queue the
+  price moves through, then shifts the queues as when `θ` moves the reference, at the state's
+  clock. `rl::ReactiveQrMarket` holds the rows `qr_market` makes and each row's state;
+  `react` imposes moves after a row and simulates every later row again, leaving that row and
+  the earlier ones unchanged, at most `rl::MAX_REACTION_MOVES` at a time, and returns the
+  first-limit volume the moves emptied (modelled consumption, not a trade). With no reaction its
+  market is `qr_market`'s. The Python bridge gains `ReactiveQrMarket` over one regime's day, and
+  each step's `info["filled_lots"]`, the lots the agent bought and sold during the step.
+  `NativeEnv.replace_rows` (and `replace_rows` on the bridge's environments) replaces the rows
+  under a running episode: the worker rebuilds the environment, resets it with the episode's
+  seed and replays its steps in Rust, after checking that the new rows keep the rows already
+  read; every replayed step must give the reply the episode got, and the replayed state must
+  equal the episode's apart from the dataset's identity
+  (`RlState::same_apart_from_dataset`, `KernelState::same_apart_from_dataset`), with the same
+  observation and masks. A refused replace leaves the episode as it was.
 - A second, margin-stress holdout for #105's comparison in `bridges/python/experiments/m4_08`
   (`stress.py`, `report_stress.py`, `stress_design.json`): the frozen runs on five new days per
   regime, by #102's seed rule, unshocked and shocked, with every step's account assessed by
