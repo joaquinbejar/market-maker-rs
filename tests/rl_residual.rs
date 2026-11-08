@@ -572,6 +572,7 @@ fn test_env_no_output_bypasses_the_limits() {
             }
             KernelAction::OneSided { lots, .. } => assert!(lots <= 10),
             KernelAction::Hold | KernelAction::QuoteError(_) | KernelAction::Cancel => {}
+            other => panic!("the residual composed {other:?}"),
         }
         let position = state.kernel().venue_position().abs();
         assert!(position <= dec!(3), "position {position} at step {step}");

@@ -344,6 +344,7 @@ impl BacktestStrategy for Scripted {
                 ask_size: Decimal::from(ask_lots) * self.lot,
                 timestamp: tick.timestamp,
             }),
+            other => panic!("{other:?} in an engine script"),
         }
     }
 

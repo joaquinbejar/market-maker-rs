@@ -216,8 +216,9 @@ fn hedges_that_reduced(t: &Trajectory) -> u64 {
                 hedge_ids.insert(next_id);
                 next_id += 1;
             }
-            KernelAction::Quote { .. } => next_id += 2,
+            KernelAction::Quote { .. } | KernelAction::ExpiringQuote { .. } => next_id += 2,
             KernelAction::Hold | KernelAction::QuoteError(_) | KernelAction::Cancel => {}
+            other => panic!("an action the golden runs do not take: {other:?}"),
         }
     }
     assert_eq!(next_id, t.last.next_order_id(), "order id derivation");

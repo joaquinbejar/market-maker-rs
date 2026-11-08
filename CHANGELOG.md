@@ -21,6 +21,24 @@ project follows [Semantic Versioning](https://semver.org/).
   - The learned arms use longer durations, unlike #110's, but the classical arm's mean beats them.
   - The pilot curve did not plateau.
 
+- A quote the kernel expires by itself, exact in venue time (#297):
+  `backtest::kernel::KernelAction::ExpiringQuote` with `life_ns`. Each leg is canceled by the
+  venue `life_ns` after its own activation, whatever the latencies and jitter.
+  - The expiry is a venue message, scheduled when the leg activates, in `(time, sequence)`
+    order with the others. No latency is drawn.
+  - A leg fills only on rows strictly inside `(activation, activation + life_ns)`.
+  - An open order still holds at most two venue messages: the expiry takes the activation's
+    once the order is active.
+  - An expiry that beats the agent's cancel leaves the order awaiting that cancel, which the
+    venue rejects, as after a fill. A full fill, or the agent's cancel landing first, removes
+    the expiry.
+  - New events: `KernelEvent::Expired` and, at the end of the data, `KernelEvent::DroppedExpiry`.
+  - The state encoding gains message tags 3 (an expiry) and 4 (an activation with its life). A
+    run without expiring quotes writes neither, so its bytes and fingerprint are unchanged.
+  - The decoder refuses a life of 0, an expiry not naming a resting order, and two expiries for
+    one order.
+  - The RL action and the Python bridge come separately.
+
 - An offline training study for #280 in `bridges/python/experiments/m4_11`, synthetic only:
   - behaviour cloning and a discrete conservative Q-learning trained on simulator logs;
   - `design.json` committed before any run, with `run.py` and `offline.py`;
@@ -845,6 +863,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `backtest::kernel::KernelAction` gains the variant `ExpiringQuote` and is now
+  `#[non_exhaustive]` (#297), so a match on it outside the crate needs a wildcard arm. The
+  decoder's counter bounds widen to what an expiring order can add: `next_msg_seq` to three
+  messages an order, and under the queue position model `stamp_seq` to four stamps an order
+  plus the fills. A state without expiring quotes encodes to the same bytes as before.
 - `backtest::kernel::KernelAction` gains the variant `Cancel` (#288), so an exhaustive match on
   it must handle it, and `rl::RlConfig` the public field `cancel_action`, so a struct literal
   must name it (`RlConfig::new` sets `false`). `rl::ActionSpace` gains `cancel` and
