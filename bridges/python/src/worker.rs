@@ -563,6 +563,17 @@ pub struct StepReply {
     /// The gate's cuts and refusals during the step, by check: an audit, never seen by a
     /// policy.
     pub gates: GateCounts,
+    /// The lots filled during the step, by side (#282): an audit, never seen by a policy.
+    pub filled: FilledLots,
+}
+
+/// Lots filled, by the side of the agent's order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilledLots {
+    /// Lots the agent bought.
+    pub buy: u64,
+    /// Lots the agent sold.
+    pub sell: u64,
 }
 
 /// Counts of the venue's order reports, by kind.
@@ -607,11 +618,23 @@ struct Audit {
     recorder: EpisodeRecorder,
     orders: OrderCounts,
     gates: GateCounts,
+    filled: FilledLots,
 }
 
 impl EventSink for Audit {
     fn event(&mut self, event: KernelEvent) {
         if let KernelEvent::Report(report) = &event {
+            if matches!(report.kind, ExecKind::PartialFill | ExecKind::Fill) {
+                // A side this bridge does not know is not counted.
+                let lots = match report.side {
+                    Action::Buy => Some(&mut self.filled.buy),
+                    Action::Sell => Some(&mut self.filled.sell),
+                    _ => None,
+                };
+                if let Some(lots) = lots {
+                    *lots = lots.saturating_add(report.last);
+                }
+            }
             let count = match report.kind {
                 ExecKind::Accepted => &mut self.orders.accepted,
                 ExecKind::Rejected => &mut self.orders.rejected,
@@ -747,6 +770,7 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
     ) -> Result<StepReply, String> {
         audit.orders = OrderCounts::default();
         audit.gates = GateCounts::default();
+        audit.filled = FilledLots::default();
         let transition = self
             .step_with(state, action, audit)
             .map_err(|e| e.to_string())?;
@@ -757,6 +781,7 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
             decision: None,
             orders: audit.orders,
             gates: audit.gates,
+            filled: audit.filled,
         })
     }
 
@@ -804,6 +829,7 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
         }
         audit.orders = OrderCounts::default();
         audit.gates = GateCounts::default();
+        audit.filled = FilledLots::default();
         let transition = self
             .env()
             .step_with(state, RlAction::Hold, audit)
@@ -815,6 +841,7 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
             decision: None,
             orders: audit.orders,
             gates: audit.gates,
+            filled: audit.filled,
         })
     }
 
@@ -826,6 +853,7 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
     ) -> Result<StepReply, String> {
         audit.orders = OrderCounts::default();
         audit.gates = GateCounts::default();
+        audit.filled = FilledLots::default();
         let step = self
             .step_with(state, proposal, audit)
             .map_err(|e| e.to_string())?;
@@ -836,6 +864,7 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
             decision: Some(step.decision),
             orders: audit.orders,
             gates: audit.gates,
+            filled: audit.filled,
         })
     }
 

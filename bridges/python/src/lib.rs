@@ -6,6 +6,7 @@
 //! module on top; the worker builds and tests without Python.
 
 pub mod maintenance;
+pub mod reactive;
 pub mod worker;
 
 #[cfg(feature = "python")]

@@ -15,8 +15,8 @@ use market_maker_rs::backtest::queue_reactive::{
 };
 use market_maker_rs::dec;
 use market_maker_rs::rl::{
-    EpisodeRecorder, MAX_QR_ROWS, ObservationScales, QrEpisode, RlAction, RlConfig, RlEnv,
-    qr_market,
+    EpisodeRecorder, MAX_QR_ROWS, MAX_REACTION_MOVES, ObservationScales, QrEpisode,
+    ReactiveQrMarket, RlAction, RlConfig, RlEnv, qr_market,
 };
 use market_maker_rs::types::error::MMError;
 
@@ -331,4 +331,103 @@ fn test_env_on_the_market_is_deterministic_and_restores_from_a_snapshot() {
         assert_eq!(&t, expected);
     }
     assert_eq!(restored, a);
+}
+
+#[test]
+fn test_a_reactive_market_without_reactions_is_qr_markets() {
+    let cfg = config();
+    for e in [episode(7), episode(8)] {
+        let plain = qr_market(&params(), &e, &cfg).unwrap();
+        let mut reactive = ReactiveQrMarket::new(&params(), &e, &cfg).unwrap();
+        assert_eq!(reactive.market().unwrap(), plain);
+        reactive.react(50, 0).unwrap();
+        assert_eq!(reactive.market().unwrap(), plain, "no moves change nothing");
+    }
+    // Stopped early: the same rows, reason and length; only the end differs.
+    let limited = QrParameters::new(
+        dec!(0.01),
+        0.6,
+        0.2,
+        vec![dec!(1)],
+        vec![rates()],
+        vec![vec![true, true, true, false, false]],
+        UnsupportedPolicy::Stop,
+    )
+    .unwrap();
+    let plain = qr_market(&limited, &episode(5), &cfg).unwrap();
+    let reactive = ReactiveQrMarket::new(&limited, &episode(5), &cfg)
+        .unwrap()
+        .market()
+        .unwrap();
+    assert_eq!(reactive.dataset, plain.dataset);
+    assert_eq!(reactive.stopped, plain.stopped);
+}
+
+#[test]
+fn test_an_imposed_move_empties_the_touch_it_passes_and_shifts_as_theta_does() {
+    let mut simulator = QrSimulator::new(params(), 3, 100).unwrap();
+    simulator.run(5.0, 5.0).unwrap();
+    let mut state = simulator.state();
+    state.bid = [2, 1, 0, 0, 0];
+    state.ask = [1, 2, 0, 0, 0];
+    let mut up = QrSimulator::from_state(params(), state).unwrap();
+    up.impose_reference_move(true).unwrap();
+    let after = up.state();
+    assert_eq!(after.reference_ticks, state.reference_ticks + 1);
+    // The emptied ask touch becomes the bid's first limit, the bid moves one limit out
+    // (renormalized from size 1 to 2, rounded up: 2 -> 1), and the ask's second limit
+    // comes nearer (2 of size 2 -> 4 of size 1).
+    assert_eq!((after.bid[0], after.bid[1], after.ask[0]), (0, 1, 4));
+    // The move is at the state's clock, its time moves up to it, and every clock restarts.
+    let now = state.clock_seconds.max(state.time_seconds);
+    assert_eq!(after.time_seconds, now);
+    assert_eq!(after.bid_last, [now; 5]);
+    assert_eq!(after.ask_last, [now; 5]);
+    let mut down = QrSimulator::from_state(params(), state).unwrap();
+    down.impose_reference_move(false).unwrap();
+    let after = down.state();
+    assert_eq!(after.reference_ticks, state.reference_ticks - 1);
+    assert_eq!((after.ask[0], after.ask[1], after.bid[0]), (0, 1, 2));
+}
+
+#[test]
+fn test_a_reaction_keeps_the_rows_up_to_it_and_simulates_the_rest_from_the_moved_state() {
+    let cfg = config();
+    let e = episode(7);
+    let original = ReactiveQrMarket::new(&params(), &e, &cfg).unwrap();
+    let mut reacted = original.clone();
+    reacted.react(60, -2).unwrap();
+    assert_eq!(reacted.ticks().len(), original.ticks().len());
+    assert_eq!(reacted.ticks()[..=60], original.ticks()[..=60]);
+    assert_ne!(reacted.ticks()[61..], original.ticks()[61..]);
+    assert_eq!(reacted.states()[..60], original.states()[..60]);
+    // The rest is a direct run from the moved state, with the stored generator state.
+    let mut direct = QrSimulator::from_state(params(), original.states()[60]).unwrap();
+    direct.impose_reference_move(false).unwrap();
+    direct.impose_reference_move(false).unwrap();
+    assert_eq!(reacted.states()[60], direct.state());
+    let seconds = f64::from(e.sample_ms) / 1000.0;
+    for row in 61..reacted.states().len() {
+        direct.run(seconds, seconds).unwrap();
+        assert_eq!(reacted.states()[row], direct.state(), "row {row}");
+    }
+    assert_eq!(
+        reacted.states()[61].reference_ticks,
+        original.states()[60].reference_ticks - 2
+            + (reacted.states()[61].reference_ticks - reacted.states()[60].reference_ticks)
+    );
+    // A second reaction after the same row adds to the first, and the same reactions
+    // give the same market.
+    let mut twice = original.clone();
+    twice.react(60, -1).unwrap();
+    twice.react(60, -1).unwrap();
+    assert_eq!(twice, reacted);
+    let mut again = original.clone();
+    again.react(60, -2).unwrap();
+    assert_eq!(again.market().unwrap(), reacted.market().unwrap());
+    assert!(original.clone().react(200, 1).is_err(), "past the last row");
+    let bound = i64::try_from(MAX_REACTION_MOVES).unwrap();
+    assert!(original.clone().react(60, bound + 1).is_err());
+    assert!(original.clone().react(60, -bound - 1).is_err());
+    assert!(original.clone().react(60, i64::MIN).is_err());
 }

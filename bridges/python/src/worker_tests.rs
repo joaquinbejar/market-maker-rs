@@ -1660,3 +1660,124 @@ fn test_worker_counts_a_reduction_off_the_lot_grid_as_refused() {
     assert_eq!(through.gates, tally.counts());
     assert_eq!(through.gates.margin.reduced, 0);
 }
+
+/// The lots the kernel books as fills, by side, independently of the reports the worker
+/// counts.
+#[derive(Default)]
+struct FillTally(FilledLots);
+
+impl EventSink for FillTally {
+    fn event(&mut self, event: KernelEvent) {
+        if let KernelEvent::Fill(fill) = event {
+            match fill.side {
+                Action::Buy => self.0.buy += fill.qty,
+                Action::Sell => self.0.sell += fill.qty,
+                _ => {}
+            }
+        }
+    }
+}
+
+fn crossing_rows(n: u64) -> Vec<KernelTick> {
+    (0..n)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn test_worker_reports_the_lots_filled_in_each_step_by_side() {
+    let rows = crossing_rows(200);
+    let mut bridge = config("close", "reject", 1000);
+    bridge.fill_model = FillConfig::QueuePositionRational {
+        lots: 1,
+        per_ms: 20,
+        min_queue_ms: 0,
+    };
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let mut tally = FillTally::default();
+    let mut state = env.reset_with(9, &mut tally).unwrap();
+    worker.reset(9).unwrap();
+    let action = |step: usize| match step % 3 {
+        0 => quote(0, 0, 1, 1),
+        1 => quote(1, 0, 0, 1),
+        _ => RlAction::Hold,
+    };
+    let (mut step, mut total) = (0, FilledLots::default());
+    while !state.is_done() {
+        tally = FillTally::default();
+        env.step_with(&mut state, action(step), &mut tally).unwrap();
+        let through = worker.step(action(step)).unwrap();
+        assert_eq!(through.filled, tally.0, "step {step}");
+        total.buy += through.filled.buy;
+        total.sell += through.filled.sell;
+        step += 1;
+    }
+    assert!(total.buy > 0 && total.sell > 0, "{total:?}");
+}
+
+#[test]
+fn test_worker_reports_the_lots_filled_on_residual_decisions_and_holds() {
+    let bridge = residual_config(AVELLANEDA);
+    let kernel = bridge.kernel().unwrap();
+    let rows = crossing_rows(120);
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let d = |text: &str| Decimal::from_str(text).unwrap();
+    let source = AvellanedaQuoter {
+        risk_aversion: d("0.1"),
+        volatility: d("0.2"),
+        order_intensity: d("1.5"),
+        session_start_ms: 0,
+        horizon_ms: 100_000,
+        size: d("1"),
+    };
+    let bounds = ResidualBounds {
+        price_ticks: 4,
+        size_lots: 1,
+    };
+    let inside = ResidualProposal {
+        bid_away: 2.0,
+        ask_away: 2.0,
+        bid_size: 1.0,
+        ask_size: 1.0,
+    };
+    let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
+        ResidualEnv::new(&kernel, &data, source, d("1"), bounds, bridge.rl().unwrap()).unwrap();
+    let mut tally = FillTally::default();
+    let mut state = env.reset_with(1, &mut tally).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    worker.reset(1).unwrap();
+    let mut total = FilledLots::default();
+    for step in 0..119 {
+        if state.is_done() {
+            break;
+        }
+        tally = FillTally::default();
+        let through = if step % 3 != 2 {
+            env.step_with(&mut state, inside, &mut tally).unwrap();
+            worker.step_residual(inside).unwrap()
+        } else {
+            env.env()
+                .step_with(&mut state, RlAction::Hold, &mut tally)
+                .unwrap();
+            worker.step(RlAction::Hold).unwrap()
+        };
+        assert_eq!(through.filled, tally.0, "step {step}");
+        total.buy += through.filled.buy;
+        total.sell += through.filled.sell;
+    }
+    assert!(total.buy + total.sell > 0, "{total:?}");
+}
