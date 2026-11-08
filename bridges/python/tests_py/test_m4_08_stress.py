@@ -62,7 +62,11 @@ def test_a_days_margin_summary_counts_states_entries_and_the_worst_shortfall():
     assert out["steps"] == {"healthy": 2, "reduce_only": 3, "default": 1}
     assert out["not_healthy_share"] == pytest.approx(4 / 6)
     # Only a step out of Healthy is an entry: Healthy to ReduceOnly twice.
-    assert out["entries"] == 2
+    assert out["entries"] == 2 and out["entries_default"] == 1
+    # Healthy straight to Default is one entry and one Default entry; a stay is neither.
+    direct = stress.summary([("default", "1", "3"), ("default", "1", "3"),
+                             ("healthy", "1", "0"), ("default", "1", "1")], [])
+    assert (direct["entries"], direct["entries_default"]) == (2, 2)
     assert out["largest_shortfall"] == "2" and out["max_abs_position"] == "7"
 
 
@@ -71,7 +75,10 @@ def test_the_margin_inputs_are_the_signed_position_the_observed_mid_and_the_net(
     info = {"raw_observation": [None] * 6 + ["-3"], "row": 1, "net": "-2.5"}
     assert stress.margin_inputs(info, rows, Decimal("0.5")) == (
         Decimal("-3"), Decimal("99"), Decimal("-2.5"))
-    flat = {"raw_observation": [None] * 7, "row": None, "net": "0"}
+    # The terminal close of the last step is not an economic result of the day.
+    last = info | {"terminal_close": "-0.5"}
+    assert stress.margin_inputs(last, rows, Decimal("0.5"))[2] == Decimal("-2")
+    flat = {"raw_observation": [None] * 7, "row": None, "net": "0", "terminal_close": None}
     assert stress.margin_inputs(flat, rows, Decimal("0.5"))[:2] == (Decimal(0), Decimal(100))
 
 
@@ -197,7 +204,8 @@ def stress_rows(share, fills=lambda arm: 1, breach=None):
                                          "margin": {"not_healthy_share": value,
                                                     "steps": {"healthy": 1, "reduce_only": 0,
                                                               "default": 0},
-                                                    "entries": 0, "largest_shortfall": "0",
+                                                    "entries": 1, "entries_default": 2,
+                                                    "largest_shortfall": "0",
                                                     "max_abs_position": "0"},
                                          "attribution": {"fills": fills(arm)},
                                          "limit_breach": breach == (arm, seed)}]})
@@ -218,6 +226,8 @@ def test_a_learned_day_is_the_mean_of_its_seeds_and_a_non_trading_arm_is_flagged
     tables, series, plan = reporting.build(stress_rows(
         share, fills=lambda arm: 0 if arm == "ppo_penalized" else 3))
     assert tables["unshocked"]["calm"]["cpo"]["mean_not_healthy_share"] == "0.4"
+    assert tables["unshocked"]["calm"]["cpo"]["entries_per_day"] == "1"
+    assert tables["unshocked"]["calm"]["cpo"]["default_entries_per_day"] == "2"
     assert series["unshocked/pooled/cpo-minus-avellaneda_stoikov"] == ["0.4"] * 4
     item = next(i for i in plan if (i["arm"], i["against"]) == ("cpo", "ppo_penalized"))
     assert not item["against_traded"] and item["arm_traded"]

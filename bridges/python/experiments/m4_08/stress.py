@@ -64,27 +64,35 @@ def new_days(generated, base):
 
 
 def summary(path, positions):
-    """A day's margin reading: steps per state, entries into a non healthy state from a
-    healthy one (where a closeout would start), and the largest shortfall."""
+    """A day's margin reading: steps per state; entries, each step out of Healthy (into
+    ReduceOnly or straight into Default), where a closeout would start; entries into
+    Default from any other state; and the largest shortfall. A recovery to Healthy and a
+    new step out of it is a new entry."""
     counts = dict.fromkeys(STATES, 0)
-    entries, previous, worst = 0, "healthy", Decimal(0)
+    entries = defaults = 0
+    previous, worst = "healthy", Decimal(0)
     for state, _, shortfall in path:
         counts[state] += 1
         entries += previous == "healthy" and state != "healthy"
+        defaults += previous != "default" and state == "default"
         previous = state
         worst = max(worst, Decimal(shortfall))
     steps = len(path)
     return {"steps": counts, "not_healthy_share": (steps - counts["healthy"]) / steps,
-            "entries": entries, "largest_shortfall": str(worst),
+            "entries": entries, "entries_default": defaults, "largest_shortfall": str(worst),
             "max_abs_position": str(max((abs(p) for p in positions), default=Decimal(0)))}
 
 
 def margin_inputs(info, rows, tick):
-    """A step's delivered position (signed), the observed row's mid and the net result."""
+    """A step's delivered position (signed), the observed row's mid and the economic net
+    result: fees included, penalties excluded (the kernel's net never holds them), and the
+    terminal close, which only the last step has, taken out."""
     raw = info["raw_observation"][POSITION]
     position = Decimal(str(raw)) if raw is not None else Decimal(0)
     row = rows[info["row"]] if info["row"] is not None else rows[0]
-    return position, Decimal(row[1] + row[3]) / 2 * tick, Decimal(info["net"])
+    close = info.get("terminal_close")
+    net = Decimal(info["net"]) - (Decimal(str(close)) if close is not None else Decimal(0))
+    return position, Decimal(row[1] + row[3]) / 2 * tick, net
 
 
 def episode(policy, env, rows, seed, design, stress):

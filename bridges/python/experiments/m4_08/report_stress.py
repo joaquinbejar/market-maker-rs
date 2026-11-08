@@ -65,6 +65,7 @@ def summary(rows):
         "mean_not_healthy_share": str(mean(daily(rows, share).values())),
         "steps_per_day": {s: per_day(lambda e, s=s: e["margin"]["steps"][s]) for s in STATES},
         "entries_per_day": per_day(lambda e: e["margin"]["entries"]),
+        "default_entries_per_day": per_day(lambda e: e["margin"]["entries_default"]),
         "largest_shortfall": str(max(Decimal(e["margin"]["largest_shortfall"])
                                      for e in episodes)),
         "max_abs_position": str(max(Decimal(e["margin"]["max_abs_position"])
