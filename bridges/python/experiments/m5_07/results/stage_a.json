@@ -1,0 +1,497 @@
+{
+ "attempts": [
+  {
+   "kind": "attempt",
+   "frozen_sha256": "48c8ea5aa0602ff54409f812b22907d4d27f2ab3699eb98998e240a8799642fa",
+   "at": "2026-11-08T19:46:44Z",
+   "pid": 89639
+  },
+  {
+   "kind": "recovery",
+   "frozen_sha256": "48c8ea5aa0602ff54409f812b22907d4d27f2ab3699eb98998e240a8799642fa",
+   "at": "2026-11-08T19:47:02Z",
+   "pid": 91417,
+   "reason": "the first launch started with no gate tables because a shell error left the table directory empty; it was killed about 15 s after launch, before any result was written or read"
+  }
+ ],
+ "sigma": 0.22664920695581228,
+ "example_1": {
+  "check_1": {
+   "status": "inconclusive",
+   "label": null,
+   "max_relative_error": 0.010926038398020527,
+   "tested_share": 0.6503642039542143,
+   "excluded_share": {
+    "small_v": 0.0,
+    "boundary": 0.34963579604578565
+   },
+   "refinement": {
+    "dt_half": 3.655200475882186e-06,
+    "double_bound": 0.006607476800187427,
+    "under_0_5pct": false
+   }
+  },
+  "check_2": {
+   "status": "fail",
+   "rows": [
+    {
+     "kappa": "0.0001",
+     "exact_mean": 49.33386782880361,
+     "approx_mean": 49.33386782880361,
+     "exact_interval": [
+      48.78786311035155,
+      49.87770963835154
+     ],
+     "paired_interval": [
+      0.0,
+      0.0
+     ],
+     "testable": true,
+     "pass": true,
+     "exact_std": 23.217613517404683,
+     "approx_std": 23.217613517404683
+    },
+    {
+     "kappa": "0.001",
+     "exact_mean": 49.327820080234005,
+     "approx_mean": 49.33386782880361,
+     "exact_interval": [
+      48.78396675115221,
+      49.86115299735103
+     ],
+     "paired_interval": [
+      -0.004718561622741232,
+      0.01589699795002759
+     ],
+     "testable": true,
+     "pass": true,
+     "exact_std": 23.117314893319147,
+     "approx_std": 23.217613517404683
+    },
+    {
+     "kappa": "0.01",
+     "exact_mean": 48.33634714580905,
+     "approx_mean": 47.95082665958213,
+     "exact_interval": [
+      48.030289375516276,
+      48.646756615151176
+     ],
+     "paired_interval": [
+      -0.4497178095006083,
+      -0.3230456751695994
+     ],
+     "testable": true,
+     "pass": true,
+     "exact_std": 13.107414277394772,
+     "approx_std": 11.559425933515435
+    },
+    {
+     "kappa": "0.03",
+     "exact_mean": 47.29295540473784,
+     "approx_mean": 45.88748215419187,
+     "exact_interval": [
+      47.066492920913696,
+      47.51548264170177
+     ],
+     "paired_interval": [
+      -1.4860715413548902,
+      -1.3217416934656303
+     ],
+     "testable": true,
+     "pass": true,
+     "exact_std": 9.526163702632301,
+     "approx_std": 7.604619317726004
+    },
+    {
+     "kappa": "0.1",
+     "exact_mean": 45.00939340654397,
+     "approx_mean": 42.062219167413836,
+     "exact_interval": [
+      44.851141544906646,
+      45.16721809817563
+     ],
+     "paired_interval": [
+      -3.0193845061695854,
+      -2.876617234473366
+     ],
+     "testable": true,
+     "pass": false,
+     "exact_std": 6.864652936034605,
+     "approx_std": 5.268557164541191
+    },
+    {
+     "kappa": "0.3",
+     "exact_mean": 42.05538228702051,
+     "approx_mean": 37.57836065497308,
+     "exact_interval": [
+      41.93095425368608,
+      42.17595097357092
+     ],
+     "paired_interval": [
+      -4.537416869750666,
+      -4.416756025965045
+     ],
+     "testable": true,
+     "pass": false,
+     "exact_std": 5.264756317993666,
+     "approx_std": 4.220998266406449
+    },
+    {
+     "kappa": "1",
+     "exact_mean": 38.28219308032512,
+     "approx_mean": 30.258227128089068,
+     "exact_interval": [
+      38.17693691926254,
+      38.38187179016492
+     ],
+     "paired_interval": [
+      -8.086885337283181,
+      -7.964272540466268
+     ],
+     "testable": true,
+     "pass": false,
+     "exact_std": 4.343475542681256,
+     "approx_std": 3.565101532195282
+    }
+   ]
+  },
+  "primary": {
+   "1": {
+    "qrh_mean": 47.95082665958213,
+    "gate_mean": 49.33386782880361,
+    "paired_interval": [
+     -1.7473693734170321,
+     -0.9902246003274042
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.0,
+    "qrh_std": 11.559425933515435,
+    "gate_std": 23.217613517404683
+   },
+   "0.5": {
+    "qrh_mean": 47.95082665958213,
+    "gate_mean": 48.6580015340569,
+    "paired_interval": [
+     -0.9277070855517229,
+     -0.46997895878059603
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.045785639958376693,
+    "qrh_std": 11.559425933515435,
+    "gate_std": 17.970695359219715
+   },
+   "2": {
+    "qrh_mean": 47.95082665958213,
+    "gate_mean": 49.33386782880361,
+    "paired_interval": [
+     -1.7473693734170321,
+     -0.9902246003274042
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.0,
+    "qrh_std": 11.559425933515435,
+    "gate_std": 23.217613517404683
+   }
+  },
+  "primary_trading_year": {
+   "1": {
+    "qrh_mean": 44.06094005843726,
+    "gate_mean": 48.51816107168262,
+    "paired_interval": [
+     -5.601255983150296,
+     -3.2966234999975486
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.0,
+    "qrh_std": 12.42429705026376,
+    "gate_std": 53.17813402109003
+   },
+   "0.5": {
+    "qrh_mean": 44.06094005843726,
+    "gate_mean": 47.87521892491757,
+    "paired_interval": [
+     -4.665714644887872,
+     -2.965898727411588
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.045785639958376693,
+    "qrh_std": 12.42429705026376,
+    "gate_std": 40.83486761383211
+   },
+   "2": {
+    "qrh_mean": 44.06094005843726,
+    "gate_mean": 48.51816107168262,
+    "paired_interval": [
+     -5.601255983150296,
+     -3.2966234999975486
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.0,
+    "qrh_std": 12.42429705026376,
+    "gate_std": 53.17813402109003
+   }
+  },
+  "secondary": {
+   "scaled_share_gate_decoupled": 0.0,
+   "gate_joint": {
+    "reference_mean": 47.95082665958213,
+    "reference_std": 11.559425933515435,
+    "other_mean": 49.33386782880361,
+    "other_std": 23.217613517404683,
+    "paired_interval": [
+     -1.7473693734170321,
+     -0.9902246003274042
+    ]
+   },
+   "greedy_decoupled": {
+    "reference_mean": 47.95082665958213,
+    "reference_std": 11.559425933515435,
+    "other_mean": 47.99251896049175,
+    "other_std": 12.213260421901046,
+    "paired_interval": [
+     -0.1283920729289382,
+     0.04431828974426504
+    ]
+   },
+   "gate_decoupled": {
+    "reference_mean": 47.95082665958213,
+    "reference_std": 11.559425933515435,
+    "other_mean": 49.33386782880361,
+    "other_std": 23.217613517404683,
+    "paired_interval": [
+     -1.7473693734170321,
+     -0.9902246003274042
+    ]
+   }
+  }
+ },
+ "example_2": {
+  "check_1": {
+   "status": "fail",
+   "label": null,
+   "max_relative_error": 39.99466113692089,
+   "tested_share": 0.7828217178282172,
+   "excluded_share": {
+    "small_v": 0.0037996200379962005,
+    "boundary": 0.21337866213378662
+   },
+   "refinement": {
+    "dt_half": 0.0013214082588769785,
+    "double_bound": 0.0,
+    "under_0_5pct": true
+   }
+  },
+  "check_2": {
+   "status": "fail",
+   "rows": [
+    {
+     "kappa": "0.0001",
+     "exact_mean": 8.98670020959752,
+     "approx_mean": 8.997289383739723,
+     "exact_interval": [
+      8.635165759023204,
+      9.32418331900509
+     ],
+     "paired_interval": [
+      -0.005026510285059154,
+      0.025971537891023973
+     ],
+     "testable": true,
+     "pass": true,
+     "exact_std": 14.905057255659484,
+     "approx_std": 15.143847080764212
+    },
+    {
+     "kappa": "0.001",
+     "exact_mean": 8.87486398328284,
+     "approx_mean": 8.808967950884137,
+     "exact_interval": [
+      8.56879254549637,
+      9.173085193581754
+     ],
+     "paired_interval": [
+      -0.12780735886650163,
+      -0.003946888893706446
+     ],
+     "testable": true,
+     "pass": true,
+     "exact_std": 13.122351166490803,
+     "approx_std": 11.428780839101995
+    },
+    {
+     "kappa": "0.01",
+     "exact_mean": 8.498952445674604,
+     "approx_mean": 8.262315392409045,
+     "exact_interval": [
+      8.33533925644934,
+      8.66498743752166
+     ],
+     "paired_interval": [
+      -0.31495277657019666,
+      -0.15952020161508382
+     ],
+     "testable": true,
+     "pass": true,
+     "exact_std": 7.180428387069105,
+     "approx_std": 5.136371347557145
+    },
+    {
+     "kappa": "0.03",
+     "exact_mean": 8.270658335920244,
+     "approx_mean": 7.904330426423757,
+     "exact_interval": [
+      8.149925354072547,
+      8.39446316011727
+     ],
+     "paired_interval": [
+      -0.4386447926073238,
+      -0.3002025544660014
+     ],
+     "testable": true,
+     "pass": false,
+     "exact_std": 5.2076979396889875,
+     "approx_std": 3.7048436234992597
+    },
+    {
+     "kappa": "0.1",
+     "exact_mean": 7.874744354704063,
+     "approx_mean": 7.420818113067825,
+     "exact_interval": [
+      7.792698534302871,
+      7.959006566884096
+     ],
+     "paired_interval": [
+      -0.5084264990578503,
+      -0.3977885342642902
+     ],
+     "testable": true,
+     "pass": false,
+     "exact_std": 3.66178661651556,
+     "approx_std": 2.82875760170634
+    },
+    {
+     "kappa": "0.3",
+     "exact_mean": 7.30727815329399,
+     "approx_mean": 6.885939994828499,
+     "exact_interval": [
+      7.247397717917718,
+      7.369750084350786
+     ],
+     "paired_interval": [
+      -0.4615429807722925,
+      -0.3830976772830678
+     ],
+     "testable": true,
+     "pass": false,
+     "exact_std": 2.6575168397911413,
+     "approx_std": 2.2367900303579047
+    },
+    {
+     "kappa": "1",
+     "exact_mean": 6.364708132608946,
+     "approx_mean": 6.235425453581498,
+     "exact_interval": [
+      6.321632537664207,
+      6.407220206893492
+     ],
+     "paired_interval": [
+      -0.14974484667059168,
+      -0.10675836883134467
+     ],
+     "testable": true,
+     "pass": true,
+     "exact_std": 1.7962368105598026,
+     "approx_std": 1.7261195406706153
+    }
+   ]
+  },
+  "primary": {
+   "1": {
+    "qrh_mean": 6.235425453581498,
+    "gate_mean": 8.997289383739723,
+    "paired_interval": [
+     -3.0956272657831647,
+     -2.4089705324908413
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.0,
+    "qrh_std": 1.7261195406706153,
+    "gate_std": 15.143847080764212
+   },
+   "0.5": {
+    "qrh_mean": 6.235425453581498,
+    "gate_mean": 8.692821442402101,
+    "paired_interval": [
+     -2.6845478828629163,
+     -2.221386953561406
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.10598940105989402,
+    "qrh_std": 1.7261195406706153,
+    "gate_std": 10.380132005544333
+   },
+   "2": {
+    "qrh_mean": 6.235425453581498,
+    "gate_mean": 8.997289383739723,
+    "paired_interval": [
+     -3.0956272657831647,
+     -2.4089705324908413
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.0,
+    "qrh_std": 1.7261195406706153,
+    "gate_std": 15.143847080764212
+   }
+  },
+  "primary_trading_year": {
+   "1": {
+    "qrh_mean": 5.031858681743931,
+    "gate_mean": 9.075635947109728,
+    "paired_interval": [
+     -4.823730386903228,
+     -3.2318060659504986
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.0,
+    "qrh_std": 2.257912833445132,
+    "gate_std": 34.983636348449764
+   },
+   "0.5": {
+    "qrh_mean": 5.031858681743931,
+    "gate_mean": 8.70027873981918,
+    "paired_interval": [
+     -4.208474499575468,
+     -3.1269808901352527
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.10598940105989402,
+    "qrh_std": 2.257912833445132,
+    "gate_std": 23.954150550335786
+   },
+   "2": {
+    "qrh_mean": 5.031858681743931,
+    "gate_mean": 9.075635947109728,
+    "paired_interval": [
+     -4.823730386903228,
+     -3.2318060659504986
+    ],
+    "verdict": "worse",
+    "scaled_share": 0.0,
+    "qrh_std": 2.257912833445132,
+    "gate_std": 34.983636348449764
+   }
+  },
+  "secondary": {
+   "status": "not runnable: the state is the net risk r under the joint delta, and an SPX-only risk is not a function of r, so a decoupled rule cannot be evaluated on this grid"
+  }
+ },
+ "example_3": {
+  "status": "not run: checks 1 and 2 did not pass on examples 1 and 2"
+ },
+ "decision": {
+  "adopt": false,
+  "example_2_primary": "worse",
+  "example_2_label": "control not validated",
+  "scope": "control under Approximation 3.1 with the paper's delta on SPX/VIX parameters; sigma 0.2267 is our unit choice"
+ }
+}

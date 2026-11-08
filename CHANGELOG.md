@@ -8,6 +8,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Stage A of a bounded options market making study under quadratic rough Heston (#111), on
+  synthetic paths: the control checks do not pass and the greedy rule is worse than the delta
+  gate in mean P&L, so it is not adopted. Experiment only; no public API change.
+
 - The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
   #102's residual SAC retrained with and without a training adversary that, between five
   phases, moves the episode's flow perturbation toward the point where the policy loses most on
