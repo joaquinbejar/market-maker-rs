@@ -1,0 +1,102 @@
+{
+  "issue": 282,
+  "design_version": 1,
+  "data": "synthetic: #102's queue-reactive regimes (a simulator with made-up parameters) and #108's perturbed copies, with rows that react to the agent's fills; no market data",
+  "bounds": "One synthetic simulator with made-up parameters and one model of own impact bound what this study can show. The frozen #102 policies were trained without own impact, so this measures their robustness to it, not an adapted policy. It says nothing about a market's impact.",
+  "reuses": {
+    "design": "experiments/m5_03/design.json",
+    "design_sha256": "89f9d584e69879658f456202e93441d3e9bde8a1a542d842e1a473f1111f2ade",
+    "what": "#108's perturbation grid, fixed stress, execution stress, days and their seeds, adversary, arms, frozen #102 checkpoints and selected classical points, evaluation seed, metrics and intervals, unless stated here"
+  },
+  "environment": {
+    "what_reacts": "the reference price and, through the shifted queues, all later queue-reactive flow (its rates depend on queue sizes)",
+    "what_does_not": "matching, fills, fees, accounting, limits: the kernel is not changed; the agent's resting orders do not join the simulated queues (a stated limit, so that kappa = 0 is exactly the non-reactive replay)",
+    "reaction": {
+      "when": "after the kernel processes the row of a step, from that step's info['filled_lots']",
+      "netting": "n = lots sold - lots bought by the agent during the step, whatever their order or number",
+      "direction": "n > 0 moves the reference up, n < 0 down: against the agent's net position change. A modelling assumption, distinct from the calibration's initiating-order sign",
+      "size": "kappa * |n| simulator ticks: w = floor, plus one more tick if u < the fraction",
+      "rng": "SplitMix64 seeded from fnv1a64(the day's simulator seed as 8 little-endian bytes, then the ASCII bytes 'impact-282'); exactly one u per step with n != 0, drawn even when the fraction is 0; none otherwise; steps in time order",
+      "move": "QrSimulator::impose_reference_move, w times, on the simulator state after the step's row: it empties the first-limit queue the price moves through (modelled volume consumption, not an agent trade, reported apart from the agent's fills), then shifts the queues as theta does, with no theta coin and no redraw; one draw of the outermost queue from the simulator's own generator per move; the state's time moves up to its clock and every queue clock restarts there",
+      "rows": "every later row simulated again from the moved state with the simulator's own generator (ReactiveQrMarket::react); the rows up to the step's row do not change",
+      "replay": "the environment is rebuilt on the new rows, reset with the same seed, and the logged actions are replayed up to the step without querying the policy; the replayed observation, net and penalties at that step must equal the pre-reaction ones, else the run stops"
+    },
+    "identity": "kappa = 0: no reaction, the rows equal qr_days' (#108's digests) and every arm's daily result equals #108's unperturbed holdout row bit for bit; checked before any kappa > 0 run"
+  },
+  "impact_scale": {
+    "kappa0": "per regime, the regime's own impact of one exogenous market order: every market order the simulator draws on the regime's training days 1-14 with #102's seeds (no offset), each weighted equally; response = sign x (reference 10 s after the event - reference just before it), sign +1 for a buy (takes the ask) and -1 for a sell (takes the bid), horizon from the event time; divided by the order's lots (event_sizes[depth], lot 1); orders within 10 s of a day's end left out. kappa0_buy and kappa0_sell are each averaged over their own side's orders; kappa0 = their mean",
+    "measured_by": "cargo run --release --example qr_impact -- experiments/m4_05/design.json",
+    "units": "simulator ticks per lot",
+    "values": null,
+    "stop": "a side-normalized kappa0 that is negative or not finite stops the study, reported; no absolute value, no reversed grid. A kappa0 of 0 for a regime makes kappa 0 there, reported",
+    "grid": "kappa in {0, kappa0, 2 kappa0}, per regime"
+  },
+  "grid": "#108's 24 flow points x the 3 kappa values = 72 points",
+  "fixed_stress": {
+    "flow": "#108's fixed stress",
+    "kappa": "2 kappa0"
+  },
+  "conditions": {
+    "unperturbed": "the holdout days, flow multipliers 1, kappa 0; must equal #108's unperturbed holdout rows",
+    "impact_only": "the holdout days, flow multipliers 1, kappa 2 kappa0",
+    "adversary": "the holdout days at the arm's own selected point of the 72",
+    "fixed_stress": "the holdout days at #108's fixed stress with kappa 2 kappa0",
+    "execution_stress": "#108's execution stress on unperturbed holdout days, kappa 0"
+  },
+  "adversary": {
+    "picks": "for each policy separately, the grid point with the largest 5 % CVaR of the daily net loss over its selection days",
+    "cvar": "the mean loss of the worst ceil(5 % of the days) days, so of the worst 2 of 30",
+    "information": "it sets the parameters before a day and sees nothing of its path; it changes neither matching, accounting nor the limits",
+    "learned_arms": "the five seeds of a learned arm are one policy: its daily net is the mean over its seeds, as in #102"
+  },
+  "arms": {
+    "no_trade": "hold at every decision",
+    "fixed_spread": "#102's selected point per regime (4 ticks, 1 lot)",
+    "avellaneda_stoikov": "#102's selected point per regime, through the residual environment with a zero correction, as #102",
+    "glft": "#102's selected point per regime, in the exact form as #102 evaluated it; its refusals are counted, as #264 states",
+    "maskable_ppo": "#102's frozen set 0, seeds 1 to 5, deterministic",
+    "residual_sac": "#102's frozen set 2, seeds 1 to 5, deterministic"
+  },
+  "days": {
+    "selection": {
+      "per_regime": 10,
+      "seed_offset": 100000,
+      "note": "fresh days: the seed of day d of regime r is 1000003 r + d + the offset, never one of #102's"
+    },
+    "holdout": {
+      "per_regime": 10,
+      "seed_offset": 200000,
+      "note": "never seen by the adversary, by the selection or by #102"
+    }
+  },
+  "evaluation_seed": 101,
+  "metrics": [
+    "daily net and its attribution",
+    "largest and mean absolute position",
+    "max drawdown",
+    "5 % CVaR of the daily net",
+    "limit breaches, gate refusals, residual fallbacks and clips, GLFT refusals",
+    "margin shortfall: margin-rs linear-im/1 maintenance requirement of the day's largest absolute position at the price it was reached, less a declared capital of 250 (10 % of #102's notional limit, made up), floored at 0; measured, not enforced, and the day's equity is not credited",
+    "reactions per day, imposed moves, and the modelled touch volume they consumed, apart from the agent's fills"
+  ],
+  "intervals": {
+    "kind": "paired 90 % stationary block bootstrap (geometric blocks, mean length 2) over holdout days of the daily difference, as #108",
+    "replicates": 2000,
+    "mean_block_days": 2,
+    "seed": 282,
+    "pairs": "each arm under each condition against itself unperturbed, and against no-trade under the same condition"
+  },
+  "reading": "an interval that holds 0 is reported as such; it is never read as equivalence or as an absence of risk. Losses and breaches stay visible in every table",
+  "stop_rules": [
+    "kappa = 0 not reproducing #108's unperturbed holdout rows exactly stops the study, reported.",
+    "A negative or non-finite side-normalized kappa0 stops the study, reported.",
+    "A replay whose observation, net or penalties differ at the reacted step stops the run, reported.",
+    "A step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds."
+  ],
+  "compute": {
+    "estimate": "to be measured on one #102 training day (not a selection or holdout day) first, then sent before any slot is used",
+    "max_parallel_runs": 0,
+    "threads_per_run": 1
+  },
+  "changes": []
+}
