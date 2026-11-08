@@ -10,9 +10,10 @@ use market_maker_rs::backtest::evaluation::{
 };
 use market_maker_rs::backtest::kernel::{
     ActionGrid, ActionMask, ActionStatus, AvellanedaQuoter, ERR_KERNEL_MISMATCH,
-    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, EventSink, ExecKind, GlftCounts, GlftForm,
-    GlftQuoter, KernelConfig, KernelDataset, KernelEvent, KernelFillModel, KernelLatency,
-    KernelTick, Observation, QuoteSource, SourceQuote, quote_error_name,
+    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, EventSink, ExecKind, GateCheck, GateVerdict,
+    GlftCounts, GlftForm, GlftQuoter, KernelConfig, KernelDataset, KernelEvent, KernelFillModel,
+    KernelLatency, KernelMargin, KernelTick, Observation, QuoteSource, SourceQuote,
+    quote_error_name,
 };
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
@@ -169,6 +170,15 @@ pub struct LimitsConfig {
     pub scaling_factor: String,
 }
 
+/// The kernel's balance gate in the configuration ([`KernelMargin`]): the spot, fully
+/// collateralised rule, with the initial capital as the quote balance.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarginConfig {
+    /// Base deposit, on the lot grid; zero or more. Sells draw on it.
+    pub base_deposit: String,
+}
+
 /// The normalizing constants, as decimal strings.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -323,6 +333,10 @@ pub struct BridgeConfig {
     pub fill_model: FillConfig,
     /// Hard limits, if any.
     pub limits: Option<LimitsConfig>,
+    /// The kernel's balance gate, if any; it decides after the limits. Absent by default,
+    /// which keeps a configuration's specification and fingerprint.
+    #[serde(default)]
+    pub margin: Option<MarginConfig>,
     /// Bid offsets, in ticks.
     pub bid_offsets: Vec<u16>,
     /// Ask offsets, in ticks; as many as the bid offsets.
@@ -409,6 +423,12 @@ impl BridgeConfig {
             )
             .map_err(|error| BridgeError::Refused(error.to_string()))?;
             kernel = kernel.with_limits(limits);
+        }
+        if let Some(margin) = &self.margin {
+            kernel = kernel.with_margin(KernelMargin::new(decimal(
+                "base_deposit",
+                &margin.base_deposit,
+            )?));
         }
         Ok(kernel)
     }
@@ -540,6 +560,9 @@ pub struct StepReply {
     /// The venue's order reports during the step, at venue time: an audit, never seen
     /// by a policy.
     pub orders: OrderCounts,
+    /// The gate's cuts and refusals during the step, by check: an audit, never seen by a
+    /// policy.
+    pub gates: GateCounts,
 }
 
 /// Counts of the venue's order reports, by kind.
@@ -557,11 +580,33 @@ pub struct OrderCounts {
     pub fills: u64,
 }
 
+/// Orders the gate cut or refused, for one of its checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerdictCounts {
+    /// Submitted with fewer lots.
+    pub reduced: u64,
+    /// Refused, an off-lot reduction included.
+    pub rejected: u64,
+}
+
+/// The gate's decisions during a step that did not submit an order as requested, by the
+/// check that decided: an audit, never seen by a policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateCounts {
+    /// [`KernelConfig::limits`].
+    pub limits: VerdictCounts,
+    /// The combined limits of a hedged kernel.
+    pub combined: VerdictCounts,
+    /// The balance gate, [`KernelMargin`].
+    pub margin: VerdictCounts,
+}
+
 /// The episode's records, and the counts of the current step's order reports.
 #[derive(Debug, Default)]
 struct Audit {
     recorder: EpisodeRecorder,
     orders: OrderCounts,
+    gates: GateCounts,
 }
 
 impl EventSink for Audit {
@@ -575,6 +620,23 @@ impl EventSink for Audit {
                 ExecKind::PartialFill | ExecKind::Fill => &mut self.orders.fills,
             };
             *count = count.saturating_add(1);
+        }
+        if let KernelEvent::Gate(gate) = &event {
+            // A check or a verdict this bridge does not know is not counted.
+            let check = match gate.check {
+                GateCheck::Limits => Some(&mut self.gates.limits),
+                GateCheck::Combined => Some(&mut self.gates.combined),
+                GateCheck::Margin => Some(&mut self.gates.margin),
+                _ => None,
+            };
+            let count = check.and_then(|check| match gate.verdict {
+                GateVerdict::Reduced => Some(&mut check.reduced),
+                GateVerdict::ReducedOffLot | GateVerdict::Rejected => Some(&mut check.rejected),
+                _ => None,
+            });
+            if let Some(count) = count {
+                *count = count.saturating_add(1);
+            }
         }
         self.recorder.event(event);
     }
@@ -684,6 +746,7 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
         audit: &mut Audit,
     ) -> Result<StepReply, String> {
         audit.orders = OrderCounts::default();
+        audit.gates = GateCounts::default();
         let transition = self
             .step_with(state, action, audit)
             .map_err(|e| e.to_string())?;
@@ -693,6 +756,7 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
             penalties: state.penalties(),
             decision: None,
             orders: audit.orders,
+            gates: audit.gates,
         })
     }
 
@@ -739,6 +803,7 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
             return Err("a grid action on a residual environment".to_string());
         }
         audit.orders = OrderCounts::default();
+        audit.gates = GateCounts::default();
         let transition = self
             .env()
             .step_with(state, RlAction::Hold, audit)
@@ -749,6 +814,7 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
             penalties: state.penalties(),
             decision: None,
             orders: audit.orders,
+            gates: audit.gates,
         })
     }
 
@@ -759,6 +825,7 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
         audit: &mut Audit,
     ) -> Result<StepReply, String> {
         audit.orders = OrderCounts::default();
+        audit.gates = GateCounts::default();
         let step = self
             .step_with(state, proposal, audit)
             .map_err(|e| e.to_string())?;
@@ -768,6 +835,7 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
             penalties: state.penalties(),
             decision: Some(step.decision),
             orders: audit.orders,
+            gates: audit.gates,
         })
     }
 

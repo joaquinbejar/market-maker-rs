@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The Python bridge configures the kernel's balance gate (#105): `"margin": {"base_deposit":
+  ...}` sets `KernelConfig::margin`, so an RL policy through the bridge cannot get an order
+  beyond its balance executed, and every step's `info["gates"]` counts what the gate cut or
+  refused, by the check that decided (the limits, a hedged kernel's combined limits, or the
+  margin). It is the spot, fully collateralised gate of #283, not a leveraged margin rule. A
+  configuration without it keeps its kernel fingerprint; the specification does not depend
+  on it. Synthetic fixtures only.
+
 - The constrained learning comparison of #105 in `bridges/python/experiments/m4_08`: OmniSafe
   CPO against PPO with a reward penalty and plain PPO, beside no-trade and Avellaneda-Stoikov,
   on #102's regimes and shocked copies of their days. Inventory and notional costs are
