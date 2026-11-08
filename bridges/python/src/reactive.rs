@@ -145,16 +145,18 @@ impl ReactiveRows {
     }
 
     /// Imposes `moves` reference moves after row `row`, up for a positive count and down for
-    /// a negative one, and simulates every later row again. No moves change nothing.
+    /// a negative one, and simulates every later row again. No moves change nothing. Returns
+    /// the first-limit volume the moves emptied, as exact text.
     ///
     /// # Errors
     ///
     /// A message for a row past the last, more moves than
     /// `market_maker_rs::rl::MAX_REACTION_MOVES`, or a move the simulator cannot make.
-    pub fn react(&mut self, row: u64, moves: i64) -> Result<(), String> {
+    pub fn react(&mut self, row: u64, moves: i64) -> Result<String, String> {
         let row = usize::try_from(row).map_err(|_| format!("row {row} is out of range"))?;
         self.market
             .react(row, moves)
+            .map(|emptied| emptied.normalize().to_string())
             .map_err(|error| error.to_string())
     }
 

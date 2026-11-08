@@ -97,3 +97,57 @@ def history(env, length):
     if int(length) != length or length < 1:
         raise ValueError(f"a history is a whole number of decisions, not {length}")
     return FlattenObservation(FrameStackObservation(env, int(length), padding_type="zero"))
+
+
+class ChosenDuration(gym.Wrapper):
+    """The policy chooses with each action how many rows its quote rests before it decides
+    again: one more value in `[-1, 1]` at the end of the action, binned onto `choices`.
+
+    The rest of the action goes to the environment; then, as `DecisionInterval` does, the
+    resting orders stay for the chosen number of rows, the reward is the sum over them, and
+    `info` holds `rows` and the chosen `duration`. A cancel takes effect only after the
+    environment's cancel latency, so fills in flight stand. An episode that ends inside a
+    duration ends there.
+    """
+
+    def __init__(self, env, choices=(1, 5, 10, 30)):
+        if not isinstance(env.unwrapped, MarketMakingEnv):
+            raise TypeError("a chosen duration needs a market making environment")
+        if not choices or any(int(c) != c or c < 1 for c in choices):
+            raise ValueError(f"durations are positive whole numbers of rows, not {choices}")
+        base = env.action_space
+        if not isinstance(base, gym.spaces.Box):
+            raise TypeError("a chosen duration extends a Box action")
+        super().__init__(env)
+        self.choices = tuple(int(c) for c in choices)
+        self.action_space = gym.spaces.Box(
+            low=np.concatenate((base.low, [-1.0])).astype(np.float32),
+            high=np.concatenate((base.high, [1.0])).astype(np.float32),
+            dtype=np.float32,
+        )
+
+    def duration_of(self, value):
+        """The choice for a value in `[-1, 1]`: equal bins, the last one closed."""
+        index = int((float(value) + 1.0) / 2.0 * len(self.choices))
+        return self.choices[min(max(index, 0), len(self.choices) - 1)]
+
+    def step(self, action):
+        values = np.asarray(action, dtype=np.float32).ravel()
+        if values.shape[0] != self.action_space.shape[0]:
+            raise ValueError(f"an action has {self.action_space.shape[0]} values")
+        duration = self.duration_of(values[-1])
+        observation, reward, terminated, truncated, info = self.env.step(values[:-1])
+        total = Decimal(info["reward_exact"])
+        orders = {kind: info["orders"][kind] for kind in ORDER_KINDS}
+        rows = 1
+        while rows < duration and not (terminated or truncated):
+            observation, held, terminated, truncated, last = self.env.unwrapped.step_hold()
+            reward += held
+            total += Decimal(last["reward_exact"])
+            for kind in ORDER_KINDS:
+                orders[kind] += last["orders"][kind]
+            for key in ("net", "penalties", "close", "row", "raw_observation"):
+                info[key] = last[key]
+            rows += 1
+        info.update(reward_exact=str(total), orders=orders, rows=rows, duration=duration)
+        return observation, reward, terminated, truncated, info

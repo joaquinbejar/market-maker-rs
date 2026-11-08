@@ -475,8 +475,8 @@ impl ReactiveQrMarket {
     }
 
     /// Imposes `moves` reference moves after row `row` (up when positive) and simulates the
-    /// later rows again.
-    fn react(&mut self, row: u64, moves: i64) -> PyResult<()> {
+    /// later rows again. Returns the first-limit volume the moves emptied, as exact text.
+    fn react(&mut self, row: u64, moves: i64) -> PyResult<String> {
         self.inner.react(row, moves).map_err(BridgeFailure::new_err)
     }
 

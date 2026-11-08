@@ -396,15 +396,19 @@ fn test_a_reaction_keeps_the_rows_up_to_it_and_simulates_the_rest_from_the_moved
     let e = episode(7);
     let original = ReactiveQrMarket::new(&params(), &e, &cfg).unwrap();
     let mut reacted = original.clone();
-    reacted.react(60, -2).unwrap();
+    let emptied = reacted.react(60, -2).unwrap();
     assert_eq!(reacted.ticks().len(), original.ticks().len());
     assert_eq!(reacted.ticks()[..=60], original.ticks()[..=60]);
     assert_ne!(reacted.ticks()[61..], original.ticks()[61..]);
     assert_eq!(reacted.states()[..60], original.states()[..60]);
     // The rest is a direct run from the moved state, with the stored generator state.
     let mut direct = QrSimulator::from_state(params(), original.states()[60]).unwrap();
+    let first = direct.state().bid[0];
     direct.impose_reference_move(false).unwrap();
+    let second = direct.state().bid[0];
     direct.impose_reference_move(false).unwrap();
+    // The first limit's event size is 1: the volume emptied is the two touches passed.
+    assert_eq!(emptied, Decimal::from(first + second));
     assert_eq!(reacted.states()[60], direct.state());
     let seconds = f64::from(e.sample_ms) / 1000.0;
     for row in 61..reacted.states().len() {
@@ -461,4 +465,38 @@ fn test_after_an_imposed_move_waits_run_from_the_move_and_the_generator_is_accou
     let mut same = market.clone();
     same.react(30, 0).unwrap();
     assert_eq!(same.states(), market.states());
+}
+
+#[test]
+fn test_states_on_rows_that_differ_later_are_the_same_apart_from_the_dataset() {
+    let cfg = config().with_fee_rate(dec!(0.001));
+    let original = ReactiveQrMarket::new(&params(), &episode(7), &cfg).unwrap();
+    let mut moved = original.clone();
+    moved.react(120, 2).unwrap();
+    let (a, b) = (original.market().unwrap(), moved.market().unwrap());
+    assert_ne!(a.dataset.id(), b.dataset.id());
+    let grid = ActionGrid::new([1], [1], [1]).unwrap();
+    let env = |data| -> RlEnv<'_, 1, 1> {
+        RlEnv::new(&cfg, data, grid, RlConfig::new(scales(), dec!(1))).unwrap()
+    };
+    let (env_a, env_b) = (env(&a.dataset), env(&b.dataset));
+    let mut state_a = env_a.reset(1).unwrap();
+    let mut state_b = env_b.reset(1).unwrap();
+    let mut diverged = false;
+    for step in 0..199 {
+        let row = env_a.observe(&state_a).unwrap().row.unwrap_or(0);
+        if row < 120 {
+            assert!(state_a.same_apart_from_dataset(&state_b), "step {step}");
+            assert!(state_a.kernel().same_apart_from_dataset(state_b.kernel()));
+            assert_ne!(state_a, state_b, "the dataset's identity differs");
+        } else if !state_a.same_apart_from_dataset(&state_b) {
+            diverged = true;
+        }
+        env_a.step(&mut state_a, action(step)).unwrap();
+        env_b.step(&mut state_b, action(step)).unwrap();
+    }
+    assert!(diverged, "the later rows differ, so the states do");
+    // Different runs on the same rows are not the same.
+    let other = env_a.reset(2).unwrap();
+    assert!(!env_a.reset(1).unwrap().same_apart_from_dataset(&other));
 }

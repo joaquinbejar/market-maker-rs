@@ -1973,3 +1973,71 @@ fn test_a_residual_episode_replays_its_proposals_and_holds() {
         replaced.attribution().unwrap()
     );
 }
+
+#[test]
+fn test_a_replace_replays_only_the_episode_since_the_last_reset() {
+    let rows = crossing_rows(120);
+    let mut plain = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    let mut replaced = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    for worker in [&mut plain, &mut replaced] {
+        worker.reset(9).unwrap();
+        run_steps(worker, 0, 30);
+        worker.reset(4).unwrap();
+        run_steps(worker, 0, 20);
+    }
+    replaced.replace_rows(rows).unwrap();
+    assert_eq!(
+        run_steps(&mut plain, 20, 90),
+        run_steps(&mut replaced, 20, 90)
+    );
+    assert_eq!(
+        plain.attribution().unwrap(),
+        replaced.attribution().unwrap()
+    );
+}
+
+#[test]
+fn test_each_check_of_a_replace_refuses_on_its_own() {
+    let rows = crossing_rows(120);
+    let refusal = |result: Result<EnvInfo, BridgeError>| match result {
+        Err(BridgeError::Refused(reason)) => reason,
+        other => panic!("{other:?}"),
+    };
+    // A row already observed changes: the rows are refused before any replay.
+    let mut worker = Worker::spawn(grid_bridge(), rows.clone(), None).unwrap();
+    worker.reset(9).unwrap();
+    run_steps(&mut worker, 0, 30);
+    assert!(refusal(worker.replace_rows(shifted(&rows, 3, 1))).contains("already read"));
+    // With observations late by more than a row, the kernel has matched the row after the
+    // one observed: changing it keeps the observed rows, and the replay tells.
+    let mut late = grid_bridge();
+    late.latency = LatencyConfig {
+        quantum_ns: 1_000_000,
+        observation_q: 40,
+        submit_q: 1,
+        cancel_q: 1,
+        ack_q: 1,
+        jitter_q: 0,
+    };
+    let mut plain = Worker::spawn(late.clone(), rows.clone(), None).unwrap();
+    plain.reset(9).unwrap();
+    run_steps(&mut plain, 0, 30);
+    let mut worker = Worker::spawn(late, rows.clone(), None).unwrap();
+    worker.reset(9).unwrap();
+    let observed = run_steps(&mut worker, 0, 30)
+        .last()
+        .unwrap()
+        .transition
+        .observation
+        .row
+        .unwrap() as usize;
+    let reason = refusal(worker.replace_rows(shifted(&rows, observed + 1, 5)));
+    assert!(reason.contains("replayed state differs"), "{reason}");
+    // The episode goes on, unchanged, on the old rows.
+    assert_eq!(worker.info(), plain.info());
+    assert_eq!(
+        run_steps(&mut plain, 30, 80),
+        run_steps(&mut worker, 30, 80)
+    );
+    assert_eq!(plain.attribution().unwrap(), worker.attribution().unwrap());
+}
