@@ -8,6 +8,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The HSN study of #107 in `bridges/python/experiments/m5_02`: a learnable mixture-of-exponentials
+  memory against MLP, frame-stack, fixed-EMA, GRU, LSTM and #103's memory arms, in the paper's
+  single-asset setting (part A) and on #103's 1 s protocol over queue-reactive days (B) and
+  Hawkes flow that moves the mid (C, example `hawkes_days`). Designs frozen before each run,
+  one holdout read. HSN helps nowhere: A reproduces the paper's tie and not its power-law gain,
+  and a fixed spread beats every learned arm there; B is no gain and C revise. Synthetic only.
 - A frequent batch auction toy for #289 in `bridges/python/experiments/m5_05_batch`, synthetic
   only and reported apart from the continuous order book. It collects orders for 500 ms, clears
   them at one uniform price, and has submit and cancel delays of 30, 60 or 100 ms. The clearing
