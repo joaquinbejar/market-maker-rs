@@ -242,6 +242,13 @@ fn bootstrap(
             required: config.min_days,
         });
     }
+    let values = finite(series)?;
+    let mean = values.iter().sum::<f64>() / f64::from(days);
+    interval(mean, resampled_means(&values, config, seed), config, days)
+}
+
+/// The values as `f64`, refusing one with no finite `f64`.
+fn finite(series: &[Decimal]) -> EvalResult<Vec<f64>> {
     let mut values = Vec::with_capacity(series.len());
     for value in series {
         match value.to_f64() {
@@ -251,8 +258,16 @@ fn bootstrap(
             }
         }
     }
-    let mean = values.iter().sum::<f64>() / f64::from(days);
-    let mut means = resampled_means(&values, config, seed);
+    Ok(values)
+}
+
+/// The percentile interval of the resampled means, the same tail cut from each side.
+fn interval(
+    mean: f64,
+    mut means: Vec<f64>,
+    config: &BootstrapConfig,
+    days: u32,
+) -> EvalResult<BootstrapOutcome> {
     means.sort_by(f64::total_cmp);
     // The same tail on each side, from integers: (100 - c) R / 200 values.
     let replicates = u64::from(config.replicates);
@@ -276,6 +291,72 @@ fn bootstrap(
         }),
         _ => invalid("the bootstrap has no replicates".to_string()),
     }
+}
+
+/// A stationary block bootstrap of the equally weighted mean of several groups' means: for
+/// example, of regimes, each with its own days.
+///
+/// Each group is resampled on its own, as [`block_bootstrap`] resamples one series, from its
+/// own stream: group `i` (in the order given) is seeded `config.seed + i`, so group 0 keeps
+/// `config.seed` and a single group gives exactly [`block_bootstrap`]'s interval. A replicate's
+/// value is the unweighted mean of the groups' replicate means, whatever their lengths, and
+/// the interval is [`block_bootstrap`]'s percentile cut of those values. Days are never pooled
+/// across groups, and a group's days keep their order. A paired comparison is a group of daily
+/// differences per group, which the caller builds.
+///
+/// The streams are distinct seeds of the same generator: they keep the groups' draws apart
+/// deterministically, which is not a proof of independence. The interval's `days` is the
+/// days of every group together. A group shorter than `config.min_days` gives
+/// [`BootstrapOutcome::Insufficient`] with that group's days.
+///
+/// # Errors
+///
+/// Returns [`EvaluationError::InvalidInput`] for a configuration [`block_bootstrap`] would
+/// refuse, for no group, for a group with no days, for a value with no finite `f64`, and
+/// for a seed that `config.seed + i` would overflow.
+pub fn stratified_block_bootstrap(
+    groups: &[&[Decimal]],
+    config: &BootstrapConfig,
+) -> EvalResult<BootstrapOutcome> {
+    config.validate()?;
+    if groups.is_empty() {
+        return invalid("a stratified bootstrap needs at least one group".to_string());
+    }
+    let mut shortest = u32::MAX;
+    let mut days = 0_u32;
+    for (index, group) in groups.iter().enumerate() {
+        if group.is_empty() {
+            return invalid(format!("group {index} has no days"));
+        }
+        let length = u32::try_from(group.len()).unwrap_or(u32::MAX);
+        shortest = shortest.min(length);
+        days = days.saturating_add(length);
+    }
+    if shortest < config.min_days {
+        return Ok(BootstrapOutcome::Insufficient {
+            days: shortest,
+            required: config.min_days,
+        });
+    }
+    let count = f64::from(u32::try_from(groups.len()).unwrap_or(u32::MAX));
+    let mut pooled = vec![0.0; usize::try_from(config.replicates).unwrap_or(0)];
+    let mut mean = 0.0;
+    for (index, group) in groups.iter().enumerate() {
+        let seed = u64::try_from(index)
+            .ok()
+            .and_then(|i| config.seed.checked_add(i));
+        let Some(seed) = seed else {
+            return invalid(format!("seed {} plus group {index} overflows", config.seed));
+        };
+        let values = finite(group)?;
+        let length = f64::from(u32::try_from(values.len()).unwrap_or(u32::MAX));
+        mean += values.iter().sum::<f64>() / length / count;
+        let means = resampled_means(&values, config, seed);
+        for (total, value) in pooled.iter_mut().zip(means) {
+            *total += value / count;
+        }
+    }
+    interval(mean, pooled, config, days)
 }
 
 /// Who declares a commit and a toolchain. Nothing here verifies them.
