@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A second, margin-stress holdout for #105's comparison in `bridges/python/experiments/m4_08`
+  (`stress.py`, `report_stress.py`, `stress_design.json`): the frozen runs on five new days per
+  regime, by #102's seed rule, unshocked and shocked, with every step's account assessed by
+  margin-rs 0.2's `maintenance::assess` under `linear-im/1`. The bridge gains
+  `mm_rl_bridge.maintenance_path`, from margin-rs itself. It does not revise the first
+  holdout's decisions; the design, the helper, the days' digests and the reading rule were
+  committed before it ran. Synthetic data only; nothing here is a safety guarantee.
+
 - The constrained learning comparison of #105 in `bridges/python/experiments/m4_08`: OmniSafe
   CPO against PPO with a reward penalty and plain PPO, beside no-trade and Avellaneda-Stoikov,
   on #102's regimes and shocked copies of their days. Inventory and notional costs are
