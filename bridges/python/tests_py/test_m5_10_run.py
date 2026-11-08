@@ -73,3 +73,11 @@ def test_claim_recovery_rules(tmp_path):
     r.claim(tmp_path / "m", "a" * 64, journal, "killed", digest)
     with pytest.raises(SystemExit, match="too many"):
         r.claim(tmp_path / "m", "a" * 64, journal, "again", digest)
+
+
+def test_day_configs_one_per_point_and_split(tmp_path):
+    causal = json.loads((pathlib.Path(r.HERE).parent / "m5_02" / "design.json").read_text())["causal"]
+    written = r.write_day_configs(causal, tmp_path)
+    assert len(written) == 2 * 3 * 24
+    sample = json.loads(written[0].read_text())["causal"]
+    assert sample["seed_offset"] == 100000 and sample["days"] == 10

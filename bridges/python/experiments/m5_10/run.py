@@ -142,3 +142,70 @@ def claim(marker_dir, frozen_sha, journal=None, recover=None, journal_prefix_sha
         with os.fdopen(fd, "w") as handle:
             handle.write(json.dumps({"kind": "attempt", "frozen_sha256": frozen_sha}) + "\n")
     return marker
+
+
+def day_path(data_dir, split, setting, point, day):
+    return pathlib.Path(data_dir) / split / setting / point_id(point) / "holdout" / "p" / f"day-{day}.json"
+
+
+def write_day_configs(causal, out, settings=SETTINGS):
+    """One hawkes_days input per split, setting and point; run the example on each."""
+    out = pathlib.Path(out)
+    written = []
+    for split, days in (("selection", SELECTION_DAYS), ("holdout", HOLDOUT_DAYS)):
+        for setting, impact in settings.items():
+            for point in grid.points(impact):
+                path = out / split / setting / f"{point_id(point)}.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                config = grid.day_config(causal, point, "p", days, OFFSETS[split])
+                path.write_text(json.dumps({"causal": config}))
+                written.append(path)
+    return written
+
+
+def _runner():
+    """#107's runner, whose environment, wrappers and checkpoint checks are reused unchanged."""
+    import importlib.util
+
+    path = HERE.parent / "m5_02" / "run_market.py"
+    spec = importlib.util.spec_from_file_location("m5_02_run_market", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _env(rm, job, rows, classical):
+    design, base = rm.load()
+    config = rm.m6.base_config(base, FEE)
+    config["fill_model"] = dict(design["execution"]["fill_model"])
+    arm, setting = job["policy"]["arm"], job["policy"]["setting"]
+    if arm in CLASSICAL:
+        config["residual"] = {"baseline": rm.m6.baseline_config(arm, classical[setting][arm], job["day"]),
+                              "price_ticks": 4, "size_lots": 1, "default_order_size": "1"}
+        return base, rm.DecisionInterval(rm.ResidualMarketMakingEnv(config, rows), rm.EVERY)
+    return base, rm.DecisionInterval(rm.BoxMarketMakingEnv(config, rows), rm.EVERY)
+
+
+def evaluate(job, data_dir, checkpoints, classical, digests):
+    """One day of one policy under #107's execution; the rows are checked against their digest."""
+    rm = _runner()
+    rm.torch.set_num_threads(1)
+    policy = job["policy"]
+    path = day_path(data_dir, job["split"], policy["setting"], job["point"], job["day"])
+    if sha256(path) != digests[str(path.relative_to(data_dir))]:
+        raise SystemExit(f"{path} is not the committed day")
+    rows = [tuple(r) for r in json.loads(path.read_text())]
+    base, env = _env(rm, job, rows, classical)
+    try:
+        if policy["arm"] == "no_trade":
+            model = rm.m6.Constant(rm.m6.HOLD)
+        elif policy["arm"] in CLASSICAL:
+            model = rm.m6.ZeroResidual()
+        else:
+            name = f"{policy['arm']}-{policy['setting']}-seed{policy['seed']}"
+            model = rm.frozen_policy(json.loads((pathlib.Path(checkpoints) / f"{name}.json").read_text()), env)
+        days = [rm.m6.episode(model, env, s, policy["arm"] == "lstm", base)
+                for s in base["evaluation"]["evaluation_seeds"]]
+    finally:
+        env.close()
+    return {"net": float(days[0]["net"]), "episode": days[0]}
