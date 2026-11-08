@@ -49,27 +49,31 @@ By the design the budget stays at 500,000 decisions.
 
 ## Holdout results [simulated]
 
-Holdout days 20 to 24, evaluation seed 101. A learned arm's day is the mean over its five seeds.
-The intervals are 90 % stationary block bootstrap intervals of the paired daily difference
-(2,000 replicates, mean block 2 days, seed 102).
+Holdout days 20 to 24. A learned arm's day is the mean over its five seeds.
+- The intervals are 90 % stationary block bootstrap intervals of the paired daily difference
+  (2,000 replicates, mean block 2 days, seed 102).
+- The design's evaluation seed, 101, is not read by `run.py`: `episode` resets each day with seed
+  0, and a day's flow comes from its day seed. The policies are deterministic, so the evaluation
+  has no other randomness.
 
 **At the chosen fee, 0:**
 
-| latency | Avellaneda-Stoikov | full | no_duration | full − no_duration | duration helps |
+| latency | Avellaneda-Stoikov | full | no_duration | full − no_duration | the rule's verdict |
 |---|---|---|---|---|---|
-| 30 ms | 15.47 | 10.52 | 0.43 | 10.09 (0.42 to 19.41) | **yes** |
-| 60 ms | 15.06 | 8.61 | 0.43 | 8.18 (−0.12 to 16.48) | no |
-| 100 ms | 13.52 | 4.09 | 1.88 | 2.21 (−2.18 to 6.61) | no; full breached its position limit |
+| 30 ms | 15.47 | 10.52 | 0.43 | 10.09 (0.41 to 19.41) | duration helps, weakly; see below |
+| 60 ms | 15.06 | 8.61 | 0.43 | 8.18 (−0.12 to 16.48) | no claim |
+| 100 ms | 13.52 | 4.09 | 1.88 | 2.22 (−2.18 to 6.61) | no claim; full breached its position limit |
 
 The columns are mean daily nets. Against not trading:
 - Avellaneda-Stoikov and full are above it at every latency.
 - no_duration is equivalent to not trading at every latency.
 
 **At the secondary fee, 0.0002**, every trading arm loses and is below not trading. Duration
-does not help at any latency: full − no_duration is −42.82, −24.51 and −17.73 at 30, 60 and
+does not help at any latency: full − no_duration is −42.82, −24.51 and −17.72 at 30, 60 and
 100 ms, each interval below 0.
 
-**Durations.** Unlike #110's order book arms, the full arm uses longer durations:
+**Durations**, as shares of the full arm's decisions. Unlike #110's order book arms, the full arm
+uses longer durations:
 
 | latency | 1 row | 5 rows | 10 rows | 30 rows |
 |---|---|---|---|---|
@@ -77,16 +81,80 @@ does not help at any latency: full − no_duration is −42.82, −24.51 and −
 | 60 ms | 81.2 % | 7.9 % | 6.8 % | 4.0 % |
 | 100 ms | 52.9 % | 17.4 % | 17.2 % | 12.5 % |
 
-**Read with these limits:**
-- The duration effect at 30 ms is one comparison of three at fee 0, with a lower bound near 0
-  (0.42). No multiplicity rule was frozen.
-- At 100 ms two of full's seeds breached the position limit: seed 1 on 5 days, seed 4 on 1. The
-  rule therefore makes no duration claim there.
-- At every latency the classical Avellaneda-Stoikov arm's mean exceeds both learned arms'.
-- Late messages (orders and cancels that acted a batch after the one they were sent for) occur
-  only at 100 ms.
+### How the position was measured, found after the results were known
 
-The design's `not_run` arms (no teacher, no predictor) were left out for compute.
+**At the holdout, the position was read once per step.** `run.py` read the position, its peak and
+the equity behind the drawdown at the end of each step, at commit `d440433`. A step of the full arm
+lasts up to 30 rows, so up to six clearings. For the full arm, the holdout's peak position, breach
+and maximum drawdown are therefore step-end samples, which understate what happened inside a step.
+- Its breach counts at 100 ms (seed 1 on 5 days, seed 4 on 1) are a lower bound.
+- no_duration and Avellaneda-Stoikov decide on every row. A row spans at most one clearing, so
+  their figures are exact.
+- Full's nets stand as measured. But at 100 ms they do not show that its limit held, and at no
+  latency are its drawdowns comparable on risk with the arms read on every row.
+
+Since then, `episode` reads all three at every clearing (`env.marks`), with tests. The holdout
+was not read again.
+
+**Why no breach was possible at 30 or 60 ms.** The rule's verdict at 30 ms needs that no arm
+breached its limit. That condition is established here by the mechanism below and by tests,
+written after the holdout read. It is not measured on the holdout.
+
+In `env.py` at `d440433`:
+- **A replacement lands all at once.** A replacement sent at time `t` cancels every resting
+  order and places its new orders at the same instant, `a = t + delay`.
+- **Only one of them is live at a close.** At a close, an order being cancelled is live only if
+  `a` is at or after the close, and a new order only if `a` is before it. So the old and new
+  orders are never live at the same close.
+- **New orders are sized on a position that is still current when they arrive.** Each order is
+  sized at submission so that it cannot take the position past its limit. Decisions fall on
+  rows, multiples of 100 ms, and closes are multiples of 500 ms. At a delay of 30 or 60 ms no
+  close falls in `(t, a]`, so the position the order was sized on is still the position when it
+  arrives.
+- **Fills and durations add nothing.** Later partial fills only shrink an order, since the
+  clearing never fills an order beyond its lots
+  (`test_fills_balance_respect_each_order_and_keep_price_priority`). A longer duration only
+  skips decisions; it adds no order.
+
+Each side therefore has at most one live order at a close, within the limit.
+
+At 100 ms, `a` is the close itself when the decision is on a batch's last row. The order being
+replaced is still live at that close and can fill there, while the new one, sized before that
+fill, acts at the next close. So the position can pass the limit.
+
+A test drives aggressive random play on six seeds. It finds no breach at 30 or 60 ms at any
+clearing, and a breach at 100 ms, which shows the test can detect one.
+
+**A diagnostic on validation days.** `audit.py` runs the frozen learned checkpoints, verified
+against `frozen.json`, on validation days 15 to 19 at the chosen fee. It reads the position at
+every clearing, at commit `0e67b57`. It reads no holdout day and decides nothing; it could only
+have withdrawn the claim.
+
+| arm | latency | days | breach days | largest position |
+|---|---|---|---|---|
+| full | 30 ms | 25 | 0 | 20 |
+| full | 60 ms | 25 | 0 | 20 |
+| full | 100 ms | 25 | **5** | 21 |
+| no_duration | 30, 60, 100 ms | 25 each | 0 | 20 |
+
+The limit is 20 lots. The audit agrees with the mechanism: no breach at 30 or 60 ms, and
+breaches at 100 ms. `audit.json` sha256 is
+`957fc145326b9f8fd5d36fb7ac8e0a48684d3c584f1110622cfa9eb105e3d6bd`.
+
+**Read with these limits:**
+- The duration effect at 30 ms is a weak result at one latency, simulated. It is one comparison
+  of three at fee 0, with a lower bound of 0.41 on a difference of 10.09. No multiplicity rule was
+  frozen, and its no-breach condition rests on the mechanism above, not on the holdout's
+  measurement.
+- At 100 ms the rule makes no duration claim.
+- At every latency the classical Avellaneda-Stoikov arm's mean exceeds both learned arms'.
+- Late messages (orders and cancels that acted a batch after the one they were sent in) occur
+  only at 100 ms.
+- Not reported:
+  - the design's spread capture against the mark, and the mean absolute position, were not
+    computed by `run.py`;
+  - the largest absolute position is reported only as the peak above;
+  - the design's `not_run` arms (no teacher, no predictor) were left out for compute.
 
 ## Hashes
 
@@ -100,3 +168,4 @@ The design's `not_run` arms (no teacher, no predictor) were left out for compute
 | `frozen.json` | `e015d8feb23ab95a79a02c0b40dd26cc8c2eec66e38f8ed319f6d9c8bdcd586a` |
 | `holdout.json` | `a3f03894bba75985530599db7ffe5eba4514ca2accf46da21ff88fc9adec55ad` |
 | `report.json` | `c82a20bcb2a2565a355876063f36e43e1aac2d5fccac4d0c246c7cf73cae681f` |
+| `audit.json` (validation, diagnostic) | `957fc145326b9f8fd5d36fb7ac8e0a48684d3c584f1110622cfa9eb105e3d6bd` |
