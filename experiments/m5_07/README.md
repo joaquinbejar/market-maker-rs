@@ -91,8 +91,11 @@ sigma 0.2267 per second is our unit choice, since the paper gives no conversion.
 | 1, shape of v_hat against v, at most 5 % | inconclusive: error 1.09 %, but doubling the bound moves v by 0.66 %, over the 0.5 % limit | fail: max relative error 39.99 |
 | 2, paired P&L within 5 % of exact, per kappa | fail: 4 of 7 pass, kappa 0.1, 0.3, 1 fail | fail: 4 of 7 pass, kappa 0.03, 0.1, 0.3 fail |
 
-Check 1 fixes C and so validates shape only. Example 2's error was not diagnosed: the once-only
-run was not repeated, and the error may sit at cells where v is small but above the exclusion.
+Check 1 fixes C and so validates shape only. Example 2's 39.99 is at r = 3.912, where v crosses zero (v = -0.14 there, range -60.5 to 9.9 on
+tested cells), so the relative error is a limit of the rule at that cell. It is not the whole
+story: in a diagnostic after the run, outside the rule and without any path, the same maximum is
+4.85 on cells with |v| at least 1 % of max|v|, and 1.14 at 10 %. The shape does not agree away
+from the crossing either.
 
 Primary comparison, QRH greedy minus the `GreeksRiskManager` gate, 5000 paths, paired 90 % interval:
 
@@ -105,6 +108,9 @@ Primary comparison, QRH greedy minus the `GreeksRiskManager` gate, 5000 paths, p
   the two arms are not at matched risk, and a mean-risk comparison was not the frozen rule.
 - Example 1 at x1 is QRH against "always quote within Q", not against a delta gate, and cannot
   support adoption. Its x0.5 is the only place the gate binds there.
+- Example 2's gate does not bind at x1 either: its x1 and x2 tables are identical, since limit R
+  equals the grid's bound. The comparison on which the decision rests is therefore QRH against
+  "always quote within R", not against a binding delta gate.
 - The x0.5 and x2 gate limits and the 252 x 6.5 h year are all "worse" too, outside the rule.
 - Scaled counts as hold (share 0 at x1 and x2; 4.6 % and 10.6 % at x0.5). That can only reduce
   the gate's trading, which favours QRH if those orders would have earned.
@@ -123,15 +129,15 @@ arbitrage-rs#6 are not covered.
 
 Disclosures:
 
-- This work changed hands between sessions before the run. Version 3 was objected to in review
-  because check 2 had no sample or interval and the decision no rule; version 4 fixed these
-  before any run on the paper's examples, and also fixed the secondary cells.
+- The work was handed over before the run. Design version 3 was objected to because check 2 had no
+  sample or interval and the decision no rule; version 4 fixed these before any run on the
+  paper's examples, and also fixed the secondary cells.
 - The attempt log records two starts. The first had no gate tables, by an operator error, and was
   stopped within seconds with no result written or read; the second used the one recovery allowed.
 - The paper's greedy net-risk formula omits a factor and a coefficient; the derived form
   `2 phi D r delta + D delta^2 m <= D^j/2` is used, from v_hat differences.
   This explicit algebraic form was not written in design version 4, which says "the greedy
-  quoting rule from v_hat"; a reviewer checked it as covered by that text only after the run.
+  quoting rule from v_hat"; it was checked as covered by that text only after the run.
 - The backtest is Approximation 3.1 as frozen: one Brownian and Poisson fills, not the paper's
   QRH-driven simulation. kappa_j = kappa/2 across example 1's grid, as in the paper.
 
