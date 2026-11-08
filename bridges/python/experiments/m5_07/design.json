@@ -1,6 +1,6 @@
 {
  "issue": 111,
- "design_version": 2,
+ "design_version": 3,
  "status": "fixed before any code run: what is reproduced, the checks and their thresholds, the arms, the primary comparison and its rule, seeds and stop rules",
  "data": "SYNTHETIC. Parameters are the paper's SPX/VIX values (arXiv 2212.10164v1), labelled as such; nothing is calibrated to BTC, which is declared unsupported in this round",
  "paper": "Rosenbaum and Zhang, Multi-asset market making under the quadratic rough Heston, arXiv 2212.10164v1",
@@ -149,7 +149,13 @@
    "sensitivity": "x0.5 and x2, one at a time, reported beside and outside the rule"
   },
   "gate_table": "a Rust example over the crate's GreeksRiskManager exports the gate's decision for every inventory state of the grid; both arms then run on the same evaluation paths",
-  "secondary": "the other cells of control (greedy, gate) x delta (joint, decoupled: VIX instruments at delta 0), reported as secondary"
+  "secondary": "the other cells of control (greedy, gate) x delta (joint, decoupled: VIX instruments at delta 0), reported as secondary",
+  "gate_table_rule": {
+   "decision": "the arm posts only on OrderDecision::Allowed; Scaled counts as hold since sizes are fixed, a choice that can only make the gate trade less, so the share of Scaled states is reported per table",
+   "breaker": "each state is booked, then reset_circuit_breaker is called before check_order, so the table is the limit test alone; the circuit breaker is path dependent and is not modelled, and the README says so",
+   "example_1_reading": "at x1 the 23.4 limit equals the box maximum, so the gate never binds beyond Q and the primary comparison in example 1 is QRH against 'always quote within Q', not against a delta gate; the conclusions say so. x0.5 is the only place it binds, outside the rule",
+   "tests": "a risk-reducing order at the limit gets the decision check_order gives after the reset; the table is identical when states are visited in reversed order"
+  }
  },
  "stage_b": {
   "what": "delta from QRH with OptionStratLib 0.24.2 (optionstratlib-simulation 0.24.1): vanilla Monte Carlo, the VIX and VIX futures and options from the factor state, compared with the paper's delta",
@@ -202,6 +208,7 @@
  ],
  "changes": [
   "before any code run, from review: the wording of example 1's gate limit, now the maximum of |delta . q| over the inventory box; the number is unchanged",
-  "before any code run, from review: units, alpha, the order and reading of C in check 1, example 2's exact lattice, backtest dynamics and common random numbers. When the unit was chosen only the hand estimate of A (annual sigma gives A about 45 against D/2 = 0.125) was computed from the paper's formula; no HJB, check or P&L had been run"
+  "before any code run, from review: units, alpha, the order and reading of C in check 1, example 2's exact lattice, backtest dynamics and common random numbers. When the unit was chosen only the hand estimate of A (annual sigma gives A about 45 against D/2 = 0.125) was computed from the paper's formula; no HJB, check or P&L had been run",
+  "before any code run, from review: the gate table's decision rule (Allowed only, Scaled share reported), the breaker left out by a reset per state, example 1's reading at x1, and two tests"
  ]
 }
