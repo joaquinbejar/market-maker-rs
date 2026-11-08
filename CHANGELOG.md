@@ -16,6 +16,48 @@ project follows [Semantic Versioning](https://semver.org/).
   Both arms are evaluated once on fresh holdout days, with paired regime-stratified block
   bootstrap intervals of the CVaR difference recomputed per replicate. The design was committed
   and agreed before any code or run.
+- The HSN study of #107 in `bridges/python/experiments/m5_02`: a learnable mixture-of-exponentials
+  memory against MLP, frame-stack, fixed-EMA, GRU, LSTM and #103's memory arms, in the paper's
+  single-asset setting (part A) and on #103's 1 s protocol over queue-reactive days (B) and
+  Hawkes flow that moves the mid (C, example `hawkes_days`). Designs frozen before each run,
+  one holdout read. HSN helps nowhere: A reproduces the paper's tie and not its power-law gain,
+  and a fixed spread beats every learned arm there; B is no gain and C revise. Synthetic only.
+- A frequent batch auction toy for #289 in `bridges/python/experiments/m5_05_batch`, synthetic
+  only and reported apart from the continuous order book. It collects orders for 500 ms, clears
+  them at one uniform price, and has submit and cancel delays of 30, 60 or 100 ms. The clearing
+  rule, the timing rule and the limits are stated in `fba.py` and checked against hand-computed
+  fixtures.
+  - #110's duration and latency arms ran on it from a design fixed before any run, with the
+    holdout read once behind an exclusive marker.
+  - At the chosen fee of 0, duration control helps only at 30 ms, weakly: the interval's lower
+    bound is 0.41. No claim is made at 60 or 100 ms; at 100 ms a seed also breached the
+    position limit.
+  - The holdout read the full arm's position once per step. Its no-breach condition at 30 ms is
+    therefore established by the toy's mechanism and by tests, after the holdout read, and is
+    confirmed on validation days (`audit.py`). The position, its peak and the drawdown are now
+    read at every clearing.
+  - At 0.0002 every trading arm loses.
+  - The learned arms use longer durations, unlike #110's, but the classical arm's mean beats them.
+  - The pilot curve did not plateau.
+
+- A quote the kernel expires by itself, exact in venue time (#297):
+  `backtest::kernel::KernelAction::ExpiringQuote` with `life_ns`. Each leg is canceled by the
+  venue `life_ns` after its own activation, whatever the latencies and jitter.
+  - The expiry is a venue message, scheduled when the leg activates, in `(time, sequence)`
+    order with the others. No latency is drawn.
+  - A leg fills only on rows strictly inside `(activation, activation + life_ns)`.
+  - An open order still holds at most two venue messages: the expiry takes the activation's
+    once the order is active.
+  - An expiry that beats the agent's cancel leaves the order awaiting that cancel, which the
+    venue rejects, as after a fill. A full fill, or the agent's cancel landing first, removes
+    the expiry.
+  - New events: `KernelEvent::Expired` and, at the end of the data, `KernelEvent::DroppedExpiry`.
+  - The state encoding gains message tags 3 (an expiry) and 4 (an activation with its life). A
+    run without expiring quotes writes neither, so its bytes and fingerprint are unchanged.
+  - The decoder refuses a life of 0, an expiry not naming a resting order, and two expiries for
+    one order.
+  - The RL action and the Python bridge come separately.
+
 - An offline training study for #280 in `bridges/python/experiments/m4_11`, synthetic only:
   - behaviour cloning and a discrete conservative Q-learning trained on simulator logs;
   - `design.json` committed before any run, with `run.py` and `offline.py`;
@@ -802,6 +844,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The kernel's documentation builds under strict rustdoc with `kernel` or `rl` and without
+  `margin`: two links to `backtest::MarginAccount`, an item of the `margin` feature, are plain
+  code now.
 - Example `hyperliquid_validation` (#262) samples the walk-forward's mid at each change of the
   touch, from the replay's tops, instead of only when the mid changed. A touch that stays put
   while its sizes change is a live book, so its mid is a sample; read as a silence, it failed the
@@ -840,6 +885,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `backtest::kernel::KernelAction` gains the variant `ExpiringQuote` and is now
+  `#[non_exhaustive]` (#297), so a match on it outside the crate needs a wildcard arm. The
+  decoder's counter bounds widen to what an expiring order can add: `next_msg_seq` to three
+  messages an order, and under the queue position model `stamp_seq` to four stamps an order
+  plus the fills. A state without expiring quotes encodes to the same bytes as before.
 - `backtest::kernel::KernelAction` gains the variant `Cancel` (#288), so an exhaustive match on
   it must handle it, and `rl::RlConfig` the public field `cancel_action`, so a struct literal
   must name it (`RlConfig::new` sets `false`). `rl::ActionSpace` gains `cancel` and

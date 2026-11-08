@@ -97,6 +97,22 @@ fn action_dict<'py>(py: Python<'py>, action: &KernelAction) -> PyResult<Bound<'p
             out.set_item("lots", lots)?;
         }
         KernelAction::Cancel => out.set_item("kind", "cancel")?,
+        KernelAction::ExpiringQuote {
+            bid,
+            ask,
+            bid_lots,
+            ask_lots,
+            life_ns,
+        } => {
+            out.set_item("kind", "expiring_quote")?;
+            out.set_item("bid", bid)?;
+            out.set_item("ask", ask)?;
+            out.set_item("bid_lots", bid_lots)?;
+            out.set_item("ask_lots", ask_lots)?;
+            out.set_item("life_ns", life_ns.get())?;
+        }
+        // An action this bridge does not know: a later kernel's.
+        _ => out.set_item("kind", "unknown")?,
     }
     Ok(out)
 }

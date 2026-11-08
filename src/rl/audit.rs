@@ -29,7 +29,9 @@ impl EventSink for EpisodeRecorder {
             | KernelEvent::EndOfData { .. }
             | KernelEvent::Halted(_)
             | KernelEvent::Decided(_)
-            | KernelEvent::DroppedMsg { .. } => {}
+            | KernelEvent::DroppedMsg { .. }
+            | KernelEvent::Expired { .. }
+            | KernelEvent::DroppedExpiry { .. } => {}
         }
     }
 
