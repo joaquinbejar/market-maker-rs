@@ -15,7 +15,12 @@
 //! `cargo run --release --example mdqr_qr -- parameters <design.json>` prints the design's
 //! parameters as the simulator holds them: rates, invariant laws, theta and the cap.
 //!
-//! Everything here is synthetic, from made-up parameters.
+//! `cargo run --release --example mdqr_qr -- arms <fits.json> <window.json> <out dir> <w>`
+//! simulates the capture's fitted queue-reactive arms for #106's main study: 10 draws per arm
+//! of the window's 2 h, from the data's book before it, draw `j` at seed `106000 + 100 w + j`.
+//! Its inputs and outputs are REAL DATA fits and simulations of them.
+//!
+//! The other commands are synthetic, from made-up parameters.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,6 +34,10 @@ use market_maker_rs::backtest::queue_reactive::{
 use serde_json::{Value, json};
 
 type Failure = Box<dyn std::error::Error>;
+
+const ARM_LIMITS: usize = 3;
+const WINDOW_SECONDS: f64 = 7200.0;
+const DRAWS: u64 = 10;
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, Failure> {
     value
@@ -180,7 +189,10 @@ fn read_trajectory(path: &Path) -> Result<Trajectory, Failure> {
     let array = |v: &Value, what: &str| -> Result<Vec<Value>, Failure> {
         Ok(v.as_array().ok_or(format!("{what} is not a list"))?.clone())
     };
-    let whole = |v: &Value| v.as_u64().ok_or_else(|| Failure::from("not a whole number"));
+    let whole = |v: &Value| {
+        v.as_u64()
+            .ok_or_else(|| Failure::from("not a whole number"))
+    };
     let queues = |v: &Value| -> Result<[u32; MAX_LIMITS], Failure> {
         let mut out = [0u32; MAX_LIMITS];
         for (slot, q) in out.iter_mut().zip(array(v, "queues")?) {
@@ -417,19 +429,77 @@ fn print_parameters(design: &Value) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The queues of a capture window's last book sample, in the simulator's form, each held to
+/// `cap`, with how many were above it.
+fn start_queues(side: &Value, cap: u32) -> Result<([u32; MAX_LIMITS], u32), Failure> {
+    let mut out = [0; MAX_LIMITS];
+    let mut clamped = 0;
+    let values = side.as_array().ok_or("book side")?;
+    for (slot, value) in out.iter_mut().zip(values.iter().take(ARM_LIMITS)) {
+        let queue = u32::try_from(value.as_u64().ok_or("queue")?)?;
+        clamped += u32::from(queue > cap);
+        *slot = queue.min(cap);
+    }
+    Ok((out, clamped))
+}
+
+/// One draw of a fitted arm from the window's starting book.
+fn draw(params: &QrParameters, sample: &Value, seed: u64) -> Result<(Trajectory, u32), Failure> {
+    let cap = u32::try_from(params.max_queue())?;
+    let (bid, low) = start_queues(sample.get("bid").ok_or("bid")?, cap)?;
+    let (ask, high) = start_queues(sample.get("ask").ok_or("ask")?, cap)?;
+    let mut state = QrSimulator::new(params.clone(), seed, 0)?.state();
+    state.bid = bid;
+    state.ask = ask;
+    let mut simulator = QrSimulator::from_state(params.clone(), state)?;
+    Ok((simulator.run(WINDOW_SECONDS, 1.0)?, low + high))
+}
+
+fn arms(fits: &Value, window: &Path, out: &Path, w: u64) -> Result<(), Failure> {
+    let window: Value = serde_json::from_slice(&fs::read(window)?)?;
+    let sample = window
+        .pointer("/history/last_sample")
+        .ok_or("the window has no starting book")?;
+    fs::create_dir_all(out)?;
+    for arm in ["qr", "qr_count", "qr_constant"] {
+        let serialized = fits
+            .pointer(&format!("/arms/{arm}/parameters/serialized"))
+            .ok_or("no such arm")?;
+        let params: QrParameters = serde_json::from_value(serialized.clone())?;
+        for j in 1..=DRAWS {
+            let (trajectory, clamped) = draw(&params, sample, 106_000 + 100 * w + j)?;
+            let mut value = trajectory_json(&trajectory, ARM_LIMITS)?;
+            value["clamped_start_queues"] = json!(clamped);
+            write(&out.join(format!("{arm}-w{w}-d{j}.json")), &value)?;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Failure> {
     let mut args = std::env::args().skip(1);
-    let command = args.next().ok_or("a command: truth, compare or parameters")?;
+    let command = args
+        .next()
+        .ok_or("a command: truth, compare or parameters")?;
     let design_path = PathBuf::from(args.next().ok_or("the design file")?);
     let design: Value = serde_json::from_slice(&fs::read(&design_path)?)?;
     match command.as_str() {
-        "truth" => truth(&design, &PathBuf::from(args.next().ok_or("the output directory")?)),
+        "truth" => truth(
+            &design,
+            &PathBuf::from(args.next().ok_or("the output directory")?),
+        ),
         "compare" => {
             let data = PathBuf::from(args.next().ok_or("the data trajectory")?);
             let model = PathBuf::from(args.next().ok_or("the model trajectory")?);
             compare(&design, &data, &model)
         }
         "parameters" => print_parameters(&design),
+        "arms" => {
+            let window = PathBuf::from(args.next().ok_or("the window")?);
+            let out = PathBuf::from(args.next().ok_or("the output directory")?);
+            let w = args.next().ok_or("the window number")?.parse()?;
+            arms(&design, &window, &out, w)
+        }
         other => Err(format!("unknown command {other}").into()),
     }
 }
@@ -458,6 +528,12 @@ mod tests {
     }
 
     #[test]
+    fn test_a_starting_book_is_held_to_the_cap_and_counted() {
+        let (queues, clamped) = start_queues(&json!([3, 250, 7, 9]), 200).unwrap();
+        assert_eq!((&queues[..4], clamped), (&[3, 200, 7, 0][..], 1));
+    }
+
+    #[test]
     fn test_a_trajectory_round_trips_and_compares_as_zero_with_itself() {
         let params = parameters(&design()["s0"]["truth"]).unwrap();
         let trajectory = QrSimulator::new(params.clone(), 7, 10_000)
@@ -466,7 +542,11 @@ mod tests {
             .unwrap();
         let dir = std::env::temp_dir().join(format!("mdqr-qr-{}", std::process::id()));
         let path = dir.join("t.trajectory.json");
-        write(&path, &trajectory_json(&trajectory, params.limits()).unwrap()).unwrap();
+        write(
+            &path,
+            &trajectory_json(&trajectory, params.limits()).unwrap(),
+        )
+        .unwrap();
         let read = read_trajectory(&path).unwrap();
         assert_eq!(read.samples, trajectory.samples);
         for (i, (a, b)) in read.events.iter().zip(&trajectory.events).enumerate() {
@@ -493,9 +573,15 @@ mod tests {
         for (recorded, event) in events.iter().zip(&trajectory.events) {
             let seconds = recorded[0].as_f64().unwrap();
             assert_eq!((seconds * 1000.0).floor() as u64, event.timestamp_ms);
-            assert_eq!(recorded[1].as_u64().unwrap(), u64::from(side_code(event.side).unwrap()));
+            assert_eq!(
+                recorded[1].as_u64().unwrap(),
+                u64::from(side_code(event.side).unwrap())
+            );
             assert_eq!(recorded[2].as_u64().unwrap(), u64::from(event.depth));
-            assert_eq!(recorded[3].as_u64().unwrap(), u64::from(kind_code(event.kind).unwrap()));
+            assert_eq!(
+                recorded[3].as_u64().unwrap(),
+                u64::from(kind_code(event.kind).unwrap())
+            );
             let side = if event.side == QrSide::Bid { 4 } else { 5 };
             let depth = usize::from(event.depth);
             assert_eq!(
