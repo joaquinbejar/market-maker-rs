@@ -8,6 +8,19 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A frequent batch auction toy for #289 in `bridges/python/experiments/m5_05_batch`, synthetic
+  only and reported apart from the continuous order book. It collects orders for 500 ms, clears
+  them at one uniform price, and has submit and cancel delays of 30, 60 or 100 ms. The clearing
+  rule, the timing rule and the limits are stated in `fba.py` and checked against hand-computed
+  fixtures.
+  - #110's duration and latency arms ran on it from a design fixed before any run, with the
+    holdout read once behind an exclusive marker.
+  - At the chosen fee of 0, duration control helps only at 30 ms, with a lower bound of 0.42;
+    no claim is made at 60 or 100 ms, where a seed also breached the position limit.
+  - At 0.0002 every trading arm loses.
+  - The learned arms use longer durations, unlike #110's, but the classical arm's mean beats them.
+  - The pilot curve did not plateau.
+
 - An offline training study for #280 in `bridges/python/experiments/m4_11`, synthetic only:
   - behaviour cloning and a discrete conservative Q-learning trained on simulator logs;
   - `design.json` committed before any run, with `run.py` and `offline.py`;
