@@ -1,0 +1,271 @@
+{
+  "issue": 105,
+  "design_version": 1,
+  "data": "synthetic: a queue-reactive simulator with made-up parameters, no market data",
+  "bounds": "One synthetic simulator, made-up parameters and 24 days per regime bound what this comparison can show.",
+  "origin": "The days, digests and splits of #102 (experiments/m4_05, 10 s rows), read from its digests; plus shocked copies of the validation and holdout days, digested in shocks.json before any training.",
+  "base_digests": "experiments/m4_05/digests.json",
+  "splits": {
+    "train": [
+      1,
+      14
+    ],
+    "validation": [
+      15,
+      19
+    ],
+    "holdout": [
+      20,
+      24
+    ]
+  },
+  "holdout_rule": "Holdout rows are generated only to fix their digests here, and are written apart. No run reads them until every checkpoint and configuration is frozen and its hash recorded.",
+  "changes": [
+    "version 1, after the timing pilot and before any training: steps_per_epoch 17280 (two days of 8640 steps) for every arm instead of 2000, because OmniSafe's Lagrange update needs a finished episode in every epoch and PPOLag stopped on a NaN cost at 2000. The toy gate is run again at the same two episodes per epoch (steps_per_epoch 40), under the criterion of toy_gate.json; an algorithm that fails it is not an arm. Pilot timing, 50000 steps on pooled training days: PPO 13.9 and CPO 13.0 minutes per 2M steps. Nothing else was seen.",
+    "version 1, after the re-gate and before any training: PPOLag failed the re-gate at two episodes per epoch (seed 2 cost 5.789, 0.211 from the limit) and is dropped as an arm; CPO passed (cost 5.905 and 6.052, return 6.142 and 6.156) and is the constrained arm.",
+    "version 1, before any training: the refusal metric is named for what the kernel does, order legs rejected (by the hard limits or by admission), beside actions refused; found by the smoke run of the runner.",
+    "version 1, before any run but the pilot and the toy gate: min_queue_ms 0 instead of 5000, the coordinator's corrected standard for 10 s rows (1 lot per 5000 ms, no minimum time in queue), after #103 found that a minimum of 5 s keeps a requoting strategy from ever filling. Check before training, Avellaneda-Stoikov (risk aversion 0.01, intensity 50) on #102's calm validation day 15 at fee 0.0002, deciding every row: queue 729 fills and a net of -26.578075, immediate fill 1095 fills and -35.380959. The queue binds, and the classical arm fills.",
+    "version 1, before any run but the pilot and the toy gate: 2 processes instead of 6, the share of the machine assigned to this study, so every step's estimate but the pilot's and the freeze's is three times the previous (fee rule 90, classical selection 60, training 270, penalty selection 60, holdout 180 minutes). Nothing else changes."
+  ],
+  "shocks": {
+    "what": "an asset shock in the sense of margin-rs Scenario::shock: from 12:00 of the day on, the bid and the ask move by round(mid * shock) ticks of the kernel, the spread and sizes unchanged",
+    "shocks": [
+      "-0.05",
+      "0.05"
+    ],
+    "at_row": 4320,
+    "applied_to": [
+      "validation",
+      "holdout"
+    ],
+    "use": "the stress rows of the evaluation, apart from the unshocked days; never used for training"
+  },
+  "kernel": {
+    "tick_size": "0.005",
+    "lot_size": "1",
+    "max_price": "1000",
+    "max_order_size": "10"
+  },
+  "execution": {
+    "fee_rate": "by the rule of #103 (experiments/m4_06), on #102's training days at this execution; chosen in the fee_rule step and recorded",
+    "fee_candidates": [
+      "0.0002",
+      "0",
+      "-0.0001"
+    ],
+    "secondary_fee_rate": "0.0002",
+    "initial_capital": "125",
+    "terminal": "mark",
+    "limits": {
+      "max_position": "20",
+      "max_notional": "2500",
+      "scaling_factor": "1"
+    },
+    "limits_from_margin": "max_notional = initial capital / maintenance rate = 125 / 0.05 = 2500; the kernel's RiskLimits are the only gate on this path and stay the final authority for every arm (the margin gate is not wired into the kernel: #283)",
+    "fill_model": {
+      "kind": "queue_position_rational",
+      "lots": 1,
+      "per_ms": 5000,
+      "min_queue_ms": 0
+    },
+    "latency": {
+      "quantum_ns": 1000000,
+      "observation_q": 25,
+      "submit_q": 25,
+      "cancel_q": 25,
+      "ack_q": 10,
+      "jitter_q": 10
+    }
+  },
+  "costs": {
+    "c_inventory": "max(0, |q| - 5) / 15 per step, q the delivered position after the step",
+    "c_notional": "|q| * mid / 2500 per step, mid of the observed row",
+    "c_margin": "a declared proxy: the margin-rs rule linear-im/1 maintenance requirement 0.05 * |q| * mid, over equity 125 + net, capped at 1 (equity at or below 0 is 1)",
+    "budgets_per_step_mean_over_an_episode": {
+      "c_inventory": "0.05",
+      "c_notional": "0.2"
+    },
+    "constrained_cost": "c_inventory + c_notional, with a cost limit per episode of (0.05 + 0.2) * steps of the day",
+    "reported": "each cost apart, mean per step per episode, against its budget; c_margin is reported, not constrained"
+  },
+  "action_space": {
+    "encoding": "box",
+    "invalid_action": "reject",
+    "invalid_action_penalty": "0",
+    "grid": {
+      "bid_offsets": [
+        0,
+        1,
+        2,
+        4,
+        8
+      ],
+      "ask_offsets": [
+        0,
+        1,
+        2,
+        4,
+        8
+      ],
+      "sizes": [
+        1,
+        2
+      ]
+    }
+  },
+  "observation_scales": {
+    "spread_ticks": "10",
+    "mid_change_ticks": "10",
+    "row_gap_ms": "20000",
+    "size_lots": "10",
+    "position": "20",
+    "entry_gap": "1"
+  },
+  "arms": {
+    "no_trade": {
+      "kind": "baseline"
+    },
+    "avellaneda_stoikov": {
+      "kind": "classical",
+      "grid": {
+        "risk_aversion": [
+          "0.0001",
+          "0.001",
+          "0.01"
+        ],
+        "order_intensity": [
+          "50",
+          "100",
+          "200"
+        ],
+        "size": [
+          "1"
+        ],
+        "horizon_ms": [
+          86400000
+        ],
+        "volatility": [
+          "from the volatility rule"
+        ]
+      },
+      "selection": "on validation, per regime"
+    },
+    "ppo": {
+      "kind": "learned",
+      "implementation": "OmniSafe 0.5.0 PPO",
+      "reward": "the kernel's reward"
+    },
+    "ppo_penalized": {
+      "kind": "learned",
+      "implementation": "OmniSafe 0.5.0 PPO",
+      "reward": "the kernel's reward minus lambda * (c_inventory + c_notional) per step",
+      "lambda_grid": [
+        "0.1",
+        "1",
+        "10"
+      ],
+      "selection": "on validation: the best mean daily net among the lambdas whose mean cost per step is within the budget; if none is, the lowest cost"
+    },
+    "cpo": {
+      "kind": "learned",
+      "implementation": "OmniSafe 0.5.0 CPO",
+      "config": "defaults, as the toy gate"
+    },
+    "failed_gate": "OmniSafe PPOLag is not an arm: it failed the toy gate with its defaults, and at two episodes per epoch with advantage standardization off (toy_gate.json)"
+  },
+  "algorithm_cfgs": {
+    "steps_per_epoch": 17280,
+    "update_iters": 10,
+    "device": "cpu",
+    "torch_threads": 1,
+    "episodes_per_epoch": 2
+  },
+  "budget_steps": 2000000,
+  "training_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "training_days": "each learned run trains on the pooled training days of every regime; every reset draws one of those days from the run's seed",
+  "evaluation": {
+    "episode": "one UTC day",
+    "evaluation_seeds": [
+      101
+    ],
+    "daily_value": "a day's exact net result; a learned arm's day is the mean over its training seeds",
+    "bootstrap": {
+      "replicates": 2000,
+      "mean_block_days": 2,
+      "confidence_percent": 90,
+      "seed": 102,
+      "min_days": 4
+    },
+    "rows": [
+      "unshocked holdout days",
+      "shocked holdout days, per shock",
+      "the secondary fee row at 0.0002"
+    ]
+  },
+  "metrics": [
+    "mean cost per step against each budget",
+    "episodes over budget (per cost)",
+    "order legs rejected by the kernel (by the hard limits, which refuse legs and not whole actions, or by its admission), and actions refused, by reason",
+    "proposals beyond the limits",
+    "limit breaches (must be 0)",
+    "net and the #102 metrics"
+  ],
+  "decision_rule": {
+    "constrained_better": "for cpo against ppo_penalized, paired 90 % block bootstrap over days: the daily net interval includes or is above 0 and the daily constrained cost interval is below 0, with no breach",
+    "also": "every learned arm against no_trade and against ppo, the same way; nothing here is a safety guarantee"
+  },
+  "venv": {
+    "omnisafe": "experiments/m4_08/omnisafe-lock.txt (Python 3.11.17; MUJOCO_GL=disable; gymnasium-robotics removed); the bridge built at abi3-py311 (#284)"
+  },
+  "compute": {
+    "machine": "Apple M4 Max",
+    "device": "cpu",
+    "threads_per_run": 1,
+    "max_parallel_runs": 2,
+    "shared_with": "#103",
+    "overrun_rule": "a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds"
+  },
+  "steps": [
+    {
+      "name": "pilot",
+      "what": "50000 steps of each OmniSafe algorithm on training days, to time them",
+      "estimate_minutes": 20,
+      "measured": {
+        "PPO_minutes_per_2m": 13.9,
+        "CPO_minutes_per_2m": 13.0,
+        "PPOLag": "stopped at steps_per_epoch 2000 (NaN episode cost)"
+      }
+    },
+    {
+      "name": "fee_rule",
+      "estimate_minutes": 90
+    },
+    {
+      "name": "classical_selection",
+      "estimate_minutes": 60
+    },
+    {
+      "name": "training",
+      "what": "ppo and cpo x 5 seeds, and ppo_penalized x 3 lambdas x 5 seeds",
+      "estimate_minutes": 270
+    },
+    {
+      "name": "penalty_selection",
+      "estimate_minutes": 60
+    },
+    {
+      "name": "freeze",
+      "estimate_minutes": 1
+    },
+    {
+      "name": "holdout",
+      "estimate_minutes": 180
+    }
+  ]
+}

@@ -1,0 +1,118 @@
+{
+  "what": "the gate an external constrained optimizer passes on the toy CMDP of toy_cmdp.py before #105 uses it; fixed before the pending PPOLag configuration runs were read",
+  "pass": "over seeds 1 and 2, every final epoch has |episode cost - 6| <= 0.2 and episode return >= 6.0",
+  "candidates": [
+    {
+      "algorithm": "PPOLag",
+      "steps": 600000,
+      "overrides": {}
+    },
+    {
+      "algorithm": "PPOLag",
+      "steps": 200000,
+      "overrides": {
+        "standardized_rew_adv": false,
+        "standardized_cost_adv": false
+      }
+    },
+    {
+      "algorithm": "CPO",
+      "steps": 200000,
+      "overrides": {}
+    }
+  ],
+  "already_seen": "CPO at 200000 steps, default configuration: return 6.066 and 6.099, cost 5.946 and 6.034 (seeds 1 and 2). PPOLag at 200000 steps, default configuration: return 6.225 and 6.226, cost 7.627 and 7.642 (fails). PPO: cost 7.851 and 7.946.",
+  "rule": "the configuration of each algorithm that passes is the one #105 uses, unchanged; an algorithm with no passing configuration is reported as failing the gate and is not a #105 arm",
+  "results": {
+    "PPOLag, 600000 steps, defaults": {
+      "seed 1": {
+        "return": 6.25,
+        "cost": 7.777
+      },
+      "seed 2": {
+        "return": 6.25,
+        "cost": 7.781
+      },
+      "pass": false
+    },
+    "PPOLag, 200000 steps, standardized_rew_adv false, standardized_cost_adv false": {
+      "seed 1": {
+        "return": 6.109,
+        "cost": 6.085
+      },
+      "seed 2": {
+        "return": 6.102,
+        "cost": 6.001
+      },
+      "pass": true
+    },
+    "CPO, 200000 steps, defaults": {
+      "seed 1": {
+        "return": 6.066,
+        "cost": 5.946
+      },
+      "seed 2": {
+        "return": 6.099,
+        "cost": 6.034
+      },
+      "pass": true
+    }
+  },
+  "used_by_105": {
+    "CPO": {
+      "steps_per_epoch": "two episodes (17280 on the market days)",
+      "update_iters": 10,
+      "rest": "OmniSafe 0.5.0 defaults"
+    }
+  },
+  "note": "OmniSafe's default PPOLag standardizes the reward and the cost advantages apart; when both move with the same action, as here, the multiplier is weighed against 1 rather than against the reward's true slope, and the cost settles above the limit.",
+  "regate": {
+    "why": "the market comparison needs two finished episodes per epoch (steps_per_epoch 17280 for days of 8640 steps); the gate is run again at two episodes per epoch on the toy, steps_per_epoch 40, under the same pass criterion, before its results are read",
+    "candidates": [
+      {
+        "algorithm": "PPOLag",
+        "steps": 200000,
+        "overrides": {
+          "standardized_rew_adv": false,
+          "standardized_cost_adv": false,
+          "steps_per_epoch": 40
+        }
+      },
+      {
+        "algorithm": "CPO",
+        "steps": 200000,
+        "overrides": {
+          "steps_per_epoch": 40
+        }
+      }
+    ],
+    "results": {
+      "PPOLag, standardization off, steps_per_epoch 40": {
+        "seed 1": {
+          "return": 6.161,
+          "cost": 6.149
+        },
+        "seed 2": {
+          "return": 6.118,
+          "cost": 5.789
+        },
+        "pass": false,
+        "why": "seed 2's cost is 0.211 from 6, over the 0.2 of the criterion"
+      },
+      "CPO, steps_per_epoch 40": {
+        "seed 1": {
+          "return": 6.142,
+          "cost": 5.905
+        },
+        "seed 2": {
+          "return": 6.156,
+          "cost": 6.052
+        },
+        "pass": true
+      }
+    }
+  },
+  "not_arms": {
+    "PPOLag": "fails the gate with its default configuration, and with advantage standardization off at two episodes per epoch (it passed that configuration at 100 episodes per epoch, which the market days cannot have)"
+  }
+}
