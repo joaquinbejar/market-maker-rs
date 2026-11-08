@@ -961,18 +961,20 @@ fn validate_state<const ORD: usize, const MSG: usize, const DLV: usize, const OB
             .all(|o| o.state == OrderState::Active),
         "resting order not active",
     )?;
-    // An expiry names a resting order, at most once. With an activation per
-    // pending order (unique ids), a cancel per flagged order (the flags check
-    // below) and this, no order holds more than its two venue messages: an
-    // activation and an expiry never name the same order. That an expiry is
-    // after its order's activation follows at a decision, where every message
-    // due by `now_ns` has run and the order activated by then.
+    // An expiry names a resting order, after its activation, at most once.
+    // With an activation per pending order (unique ids) and a cancel per
+    // flagged order (the flags check below), no order then holds more than its
+    // two venue messages: an activation and an expiry never name the same
+    // order.
     let mut expiring: Vec<u64> = Vec::new();
     for m in msgs {
         if let MsgKind::Expire { id } = m.kind {
             check(
-                s.orders.as_slice().iter().any(|o| o.id == id),
-                "expiry not for a resting order",
+                s.orders
+                    .as_slice()
+                    .iter()
+                    .any(|o| o.id == id && m.eff_ns > o.active_after_ns),
+                "expiry not for a resting order after its activation",
             )?;
             expiring.push(id);
         }

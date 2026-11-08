@@ -589,6 +589,9 @@ fn test_a_state_with_expiries_round_trips_and_resumes_as_the_run_it_left() {
     let k: FinancialKernel<'_> =
         FinancialKernel::new_relaxed(&cfg, &data, false, false, true).unwrap();
     let (end, _) = run(&k, 2, &actions);
+    // The terminal state at the end of the data decodes too.
+    assert_eq!(end.status(), Status::Terminal(TermReason::EndOfData));
+    assert_eq!(decode(&encode(&end), &k).unwrap(), end);
     let mut s = k.reset(2);
     let mut decision = 0;
     let (mut pending, mut resting, mut empty_after, mut awaiting) = (0, 0, 0, 0);
@@ -679,7 +682,26 @@ fn test_decode_refuses_each_inconsistent_expiry() {
             .iter()
             .position(|m| matches!(m.kind, MsgKind::Expire { .. }))
     };
-    let tampers: [(&str, Tamper); 7] = [
+    let tampers: [(&str, Tamper); 8] = [
+        // An activation time no other check bounds: the expiry's time, past the clock, is not
+        // after it.
+        ("an expiry not after its order's activation", |s| {
+            let now = s.now_ns;
+            let Some((id, eff)) = s.msgs.as_slice().iter().find_map(|m| match m.kind {
+                MsgKind::Expire { id } if m.eff_ns > now => Some((id, m.eff_ns)),
+                _ => None,
+            }) else {
+                return false;
+            };
+            s.orders.as_mut_slice().iter_mut().any(|o| {
+                if o.id == id {
+                    o.active_after_ns = eff;
+                    true
+                } else {
+                    false
+                }
+            })
+        }),
         ("a duplicate expiry", |s| {
             let Some(i) = s
                 .msgs
