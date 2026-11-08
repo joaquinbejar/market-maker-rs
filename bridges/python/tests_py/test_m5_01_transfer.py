@@ -37,6 +37,17 @@ def test_the_last_block_holds_the_terminal_mark():
     assert blocks[-1] == 5.0 and sum(blocks[:-1]) == 0.0
 
 
+def test_a_policy_stopped_early_holds_its_net():
+    assert transfer.block_nets([1.0] * 10)[0] == 1.0
+    assert sum(transfer.block_nets([1.0] * 10)[1:]) == 0.0
+
+
+def test_rows_read_the_ten_second_grid_only():
+    one_second = [[(i + 1) * 1000, [1, 0, 0], [1, 0, 0], 1] for i in range(7200)]
+    assert len(transfer.rows_of(one_second, [], [])) == 720
+    assert transfer.rows_of(one_second, [], [])[0][0] == 10_000_000_000
+
+
 def test_only_the_action_version_may_differ():
     assert transfer.spec_matches([1, 1, 1, 1, "a"], (1, 2, 1, 1, "b"))
     assert not transfer.spec_matches([1, 1, 2, 1, "a"], (1, 2, 1, 1, "b"))

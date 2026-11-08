@@ -91,23 +91,32 @@ def table_of(out):
     def draws(prefix, w):
         nonlocal failed, keys
         rows = []
-        for path in sorted(glob.glob(str(out / "holdout" / f"{prefix}-w{w}-d*.json"))):
+        paths = sorted(glob.glob(str(out / "holdout" / f"{prefix}-w{w}-d*.json")))
+        if len(paths) != DRAWS:
+            raise ValueError(f"{prefix} window {w}: {len(paths)} draws, not {DRAWS}")
+        for path in paths:
             row = json.loads(pathlib.Path(path).read_text())
             if row.get("failure"):
                 failed += prefix.startswith("mdqr")
                 continue
             rows.append(row["metrics"])
         keys = keys or list(rows[0])
-        dropped[prefix.split("-")[0]] = dropped.get(prefix.split("-")[0], 0) + sum(
-            int(np.isnan(np.asarray(r[k], float)).sum()) for r in rows for k in keys)
+        arm = prefix.split("-")[0]
+        for k in keys:
+            values = np.asarray([r[k] for r in rows], float)
+            seen = dropped.setdefault(arm, {}).setdefault(k, [0, 0])
+            seen[0] += int(np.isnan(values).sum())
+            seen[1] += values.size
         return {k: np.nanmean([r[k] for r in rows], axis=0) for k in keys}
     for arm in ARMS:
         table[arm] = [draws(arm, w) for w in range(1, WINDOWS + 1)]
     seeds = [[draws(f"mdqr-{s}", w) for w in range(1, WINDOWS + 1)] for s in range(1, SEEDS + 1)]
     table["mdqr"] = [{k: np.nanmean([s[i][k] for s in seeds], axis=0) for k in keys}
                      for i in range(WINDOWS)]
+    shares = {arm: {k: n / total if total else 0.0 for k, (n, total) in metrics.items()}
+              for arm, metrics in dropped.items()}
     return {arm: {k: [windows[i][k].tolist() for i in range(WINDOWS)] for k in keys}
-            for arm, windows in table.items()}, failed, dropped
+            for arm, windows in table.items()}, failed, shares
 
 
 def names_of(transfer, arm):
@@ -122,10 +131,49 @@ def names_of(transfer, arm):
     return out
 
 
+def groups(means, policies):
+    """The three classicals and the mean of each learned family."""
+    out = []
+    for name in ("fixed_spread", "avellaneda_stoikov", "glft"):
+        out.append(means[policies.index(name)])
+    for family in ("maskable_ppo", "sac_residual"):
+        out.append(np.mean([m for p, m in zip(policies, means, strict=True) if p.startswith(family)]))
+    return out
+
+
+def beside(transfer, arrays, policies, data_paths):
+    """What the design reports beside the rule: group tau, tau against the data's own rows, ties,
+    non-filling policies and each generator's row statistics."""
+    out = {}
+    mdqr = None if arrays["mdqr"] is None else arrays["mdqr"].sum(axis=2).mean(axis=1)
+    if mdqr is not None:
+        data = {p: np.sum(transfer[d][p]["blocks"]) for d in data_paths for p in policies}
+        data_means = np.array([np.mean([np.sum(transfer[d][p]["blocks"]) for d in data_paths])
+                               for p in policies]) if data_paths else None
+        for arm in s2.QR_ARMS:
+            if arrays[arm] is not None:
+                other = arrays[arm].sum(axis=2).mean(axis=1)
+                out[f"group_tau/{arm}"] = tau_b(groups(mdqr, policies), groups(other, policies))
+        if data_means is not None:
+            out["tau_against_data"] = tau_b(mdqr, data_means)
+        del data
+    for arm in ARMS + ("mdqr",):
+        rows = [r for w, names in names_of(transfer, arm).items() for r in (transfer[n] for n in names)
+                if "failure" not in r]
+        out[f"zero_fill_policies/{arm}"] = {
+            p: float(np.mean([r[p]["attribution"]["fills"] == 0 for r in rows])) for p in policies}
+        out[f"tied_policies/{arm}"] = None if arrays[arm] is None else int(
+            len(policies) - len(set(np.round(arrays[arm].sum(axis=2).mean(axis=1), 9).tolist())))
+        out[f"rows/{arm}"] = {k: float(np.mean([r["_rows"][k] for r in rows]))
+                              for k in ("volatility_10s", "median_spread", "median_touch_lots")} if rows else None
+    return out
+
+
 def decide(out, transfer_paths):
     transfer = {}
     for path in transfer_paths:
         transfer.update(json.loads(pathlib.Path(path).read_text()))
+    data_paths = sorted(p for p in transfer if "/window-" in p)
     table, failed, dropped = table_of(out)
     arrays = {}
     for arm in ARMS + ("mdqr",):
@@ -140,7 +188,8 @@ def decide(out, transfer_paths):
                 tau[arm] = tau_b(mdqr, arrays[arm].sum(axis=2).mean(axis=1))
                 intervals[arm] = tau_interval(arrays["mdqr"], arrays[arm], rng)
     usable = {k: v for k, v in tau.items() if np.isfinite(v)}
-    result = s2.decide(table, usable if len(usable) == len(s2.QR_ARMS) else None, failed)
+    result = s2.decide(table, usable if len(usable) == len(s2.QR_ARMS) else None, failed, dropped)
+    result["beside"] = beside(transfer, arrays, policies, data_paths)
     result.update(label="REAL DATA: Hyperliquid BTC, December 2025; a reused holdout, exploratory",
                   tau_intervals=intervals, policy_means=policy_means,
                   undefined_values_per_arm=dropped)

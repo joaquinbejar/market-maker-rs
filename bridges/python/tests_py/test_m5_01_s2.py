@@ -99,3 +99,13 @@ def test_scoring_the_qr_arms_refuses_an_unclaimed_holdout(tmp_path):
     import aggregate
     with pytest.raises(SystemExit):
         aggregate.score_qr(tmp_path, tmp_path, tmp_path, 200)
+
+
+def test_no_model_mass_on_a_data_condition_reads_as_tv_one():
+    assert s2._conditional_tv({0: {"a": 1}}, {}) == 1.0
+
+
+def test_a_block_undefined_on_one_arm_is_dropped_on_all():
+    table = {"a": {"m": [[float("nan")] + [1.0] * 11]}, "b": {"m": [[2.0] * 12]}}
+    out = s2.align_undefined(table)
+    assert np.isnan(out["b"]["m"][0][0]) and out["b"]["m"][0][1] == 2.0

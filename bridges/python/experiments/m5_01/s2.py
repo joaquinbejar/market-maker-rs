@@ -91,7 +91,8 @@ def _conditional_tv(data, model):
     out = 0.0
     for key, counts in data.items():
         if sum(model.get(key, {}).values()) == 0:
-            return np.nan
+            out += sum(counts.values()) / total  # no model mass where the data has some: TV 1
+            continue
         out += sum(counts.values()) / total * _tv(counts, model[key])
     return out
 
@@ -177,13 +178,30 @@ def paired(mdqr, other):
     return windows, lost / total
 
 
-def decide(table, tau, failed_draws):
+def align_undefined(table):
+    """A block undefined on any arm is dropped for every arm alike, as S2_undefined says."""
+    out = {arm: {k: [list(w) for w in v] for k, v in metrics.items()}
+           for arm, metrics in table.items()}
+    for metric in next(iter(out.values())):
+        for w in range(len(next(iter(out.values()))[metric])):
+            for b in range(BLOCKS):
+                if any(not np.isfinite(out[arm][metric][w][b]) for arm in out):
+                    for arm in out:
+                        out[arm][metric][w][b] = float("nan")
+    return out
+
+
+def decide(table, tau, failed_draws, undefined=None):
     """The design's S2. `table[arm][metric]` is one list of 12 block values per window; `tau`
     is the tau-b against each QR arm, or None if the transfer did not run."""
     primary, dependencies = {}, {}
+    table = align_undefined(table)
+    undefined = undefined or {}
 
     def read(metric, other):
         windows, lost = paired(table["mdqr"][metric], table[other][metric])
+        lost = max(lost, undefined.get("mdqr", {}).get(metric, 0.0),
+                   undefined.get(other, {}).get(metric, 0.0))
         if lost > 0.25 or any(len(w) == 0 for w in windows):
             return {"undefined_share": lost, "passes": False}
         low, high = interval(windows)
