@@ -489,6 +489,15 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         self.data_id
     }
 
+    /// Whether `other` equals this state in every field but the dataset's identity: the
+    /// same run on rows that differ only where it has not read yet (#282).
+    #[must_use]
+    pub fn same_apart_from_dataset(&self, other: &Self) -> bool {
+        let mut moved = *self;
+        moved.data_id = other.data_id;
+        moved == *other
+    }
+
     /// Fingerprint of the configuration the state belongs to.
     #[must_use]
     pub fn cfg_fingerprint(&self) -> u128 {
