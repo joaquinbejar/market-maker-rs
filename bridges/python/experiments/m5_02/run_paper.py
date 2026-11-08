@@ -5,7 +5,7 @@ From `bridges/python`:
     python experiments/m5_02/run_paper.py widths
     python experiments/m5_02/run_paper.py train <out dir> <commit> <parallel>
     python experiments/m5_02/run_paper.py freeze <out dir>
-    python experiments/m5_02/run_paper.py evaluate <out dir> <frozen sha256>
+    python experiments/m5_02/run_paper.py evaluate <out dir> <frozen sha256> [--recover <reason>]
     python experiments/m5_02/run_paper.py report <out dir>
 
 `widths` checks that the head widths in `design_paper.json` are the ones its parameter target
@@ -34,6 +34,7 @@ from torch.utils.flop_counter import FlopCounterMode
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import attempt  # noqa: E402
 import nets  # noqa: E402
 import paper_env  # noqa: E402
 
@@ -238,7 +239,7 @@ def inference_audit(part, setting, path, observations):
     }
 
 
-def evaluate(out, frozen_sha):
+def evaluate(out, frozen_sha, recover=None):
     torch.set_num_threads(1)
     design, sha = load_design()
     part = design["paper"]
@@ -252,6 +253,12 @@ def evaluate(out, frozen_sha):
     result_path = out / "evaluation.json"
     if result_path.exists():
         raise SystemExit("already evaluated; the evaluation runs once")
+    for job in jobs_of(design):
+        name = name_of(job)
+        if sha256(out / "models" / f"{name}.zip") != frozen["runs"][name]["zip"]:
+            raise SystemExit(f"{name} changed after the freeze")
+    # One attempt per freeze, claimed before any checkpoint is evaluated (attempt.py).
+    attempts = attempt.claim(out / "evaluation.attempt", frozen_sha, recover)
     seeds = list(range(part["evaluation"]["seed_base"], part["evaluation"]["seed_base"] + part["evaluation"]["episodes"]))
     audits = {s["name"]: audit_observations(part, s, part["audit"]["observations"]) for s in part["settings"]}
     rows = []
@@ -286,7 +293,8 @@ def evaluate(out, frozen_sha):
             }
         )
         print(name, f"{rows[-1]['mean_objective']:.5f}", flush=True)
-    result_path.write_text(json.dumps({"frozen_sha256": frozen_sha, "rows": rows}, indent=1))
+    result_path.write_text(json.dumps({"frozen_sha256": frozen_sha, "attempts": attempts,
+                                       "rows": rows}, indent=1))
     print(sha256(result_path))
 
 
@@ -392,7 +400,7 @@ def main():
     elif step == "freeze":
         freeze(sys.argv[2])
     elif step == "evaluate":
-        evaluate(sys.argv[2], sys.argv[3])
+        evaluate(sys.argv[2], sys.argv[3], attempt.recovery_reason(sys.argv))
     elif step == "report":
         report(sys.argv[2])
     else:

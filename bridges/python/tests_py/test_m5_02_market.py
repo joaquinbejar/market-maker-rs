@@ -139,6 +139,8 @@ INTERVAL = lambda mean, lower, upper: {"mean": str(mean), "lower": str(lower), "
         (INTERVAL(1, -1, 3), INTERVAL(2, 1, 3), False, 1, 1, "revise"),
         (INTERVAL(0, -1, 1), INTERVAL(2, 1, 3), False, 1, 1, "no_gain"),
         (INTERVAL(-1, -2, 0), INTERVAL(2, 1, 3), False, 1, 1, "no_gain"),
+        # Above the control but wholly below no-trade is not a gain.
+        (INTERVAL(2, 1, 3), INTERVAL(-2, -3, -1), False, 1, 1, "revise"),
     ],
 )
 def test_the_decision_rule(against, against_none, breach, hsn_dd, control_dd, expected):
@@ -253,3 +255,60 @@ def test_the_window_starts_empty_on_every_day(synthetic_day):
         assert valid[0].sum().item() == 1.0
     finally:
         env.close()
+
+
+def test_an_evaluation_is_claimed_once_per_freeze(tmp_path):
+    attempt = _load("attempt")
+    marker = tmp_path / "holdout.attempt"
+    first = attempt.claim(marker, "abc")
+    assert [r["kind"] for r in first] == ["attempt"] and first[0]["frozen_sha256"] == "abc"
+    # A second attempt, after a crash before the result was written, stops.
+    with pytest.raises(SystemExit, match="already started"):
+        attempt.claim(marker, "abc")
+    # The explicit recovery appends its reason, and the result carries every attempt.
+    again = attempt.claim(marker, "abc", recover="the pool died at job 3")
+    assert [r["kind"] for r in again] == ["attempt", "recovery"]
+    assert again[1]["reason"] == "the pool died at job 3"
+    assert attempt.recovery_reason(["holdout", "x", "--recover", "why"]) == "why"
+    assert attempt.recovery_reason(["holdout", "x"]) is None
+    with pytest.raises(SystemExit):
+        attempt.recovery_reason(["holdout", "--recover"])
+
+
+def test_the_holdout_claims_its_attempt_before_dispatching(tmp_path, monkeypatch):
+    """A failure inside the holdout's pool leaves the marker, so a rerun with the same freeze
+    stops before evaluating anything."""
+    frozen = tmp_path / "market" / "frozen.json"
+    frozen.parent.mkdir(parents=True)
+    frozen.write_text("{}")
+
+    class Ctx:
+        part, out, fee, secondary_fee = "market", tmp_path / "market", "f", "f"
+        design, base = {}, {}
+
+        def runs(self):
+            return []
+
+        def reference_jobs(self, *a):
+            return [{"job": 1}]
+
+        def learned_jobs(self, *a):
+            return []
+
+    monkeypatch.setattr(run_market, "sha256", lambda path: "same")
+    monkeypatch.setattr(run_market.json, "loads", lambda text: {
+        "design_sha256": "same", "validation_sha256": "same", "runs": {}})
+    monkeypatch.setattr(run_market, "days_of", lambda *a: [20])
+    dispatched = []
+
+    def crash(jobs, *a):
+        dispatched.append(len(jobs))
+        raise RuntimeError("the pool died")
+
+    monkeypatch.setattr(run_market.m6, "pool", crash)
+    with pytest.raises(RuntimeError):
+        run_market.holdout(Ctx(), "same", 1)
+    assert dispatched == [1] and (tmp_path / "market" / "holdout.attempt").exists()
+    with pytest.raises(SystemExit, match="already started"):
+        run_market.holdout(Ctx(), "same", 1)
+    assert dispatched == [1]
