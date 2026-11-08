@@ -43,6 +43,9 @@ holdout.
 
 - Training: 25 runs (PPO and CPO with 5 seeds each, the penalized PPO with 3 λ and 5 seeds), none
   stopped, 184 minutes against an estimate of 270.
+- `shocks.py` also writes shocked copies of the validation days, as the design lists them, but
+  no step reads them: the classical and penalty selections run on the unshocked validation
+  days, and only the holdout reads shocked days.
 - The freeze kept the 15 runs of PPO, CPO and the penalized PPO at the chosen λ.
 - The holdout evaluated 765 jobs, every one planned: the 15 runs, no-trade and the selected
   Avellaneda-Stoikov point, each on 5 holdout days of 3 regimes, unshocked and under each of
