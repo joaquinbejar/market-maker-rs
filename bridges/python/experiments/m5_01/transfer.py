@@ -34,8 +34,9 @@ class FailedDraw(ValueError):
 
 def rows_of(samples, references, directions):
     """The pins' rows from 10 s samples [ms, bid, ask, spread] and the signed moves."""
-    samples = [s for s in samples if s[0] > 0 and s[0] % 10_000 == 0]
-    if len(samples) < ROWS or [s[0] for s in samples[:ROWS]] != [(i + 1) * 10_000 for i in range(ROWS)]:
+    samples = [s for s in samples if s[0] % 10_000 == 0][:ROWS]
+    first = 0 if samples and samples[0][0] == 0 else 1  # the capture samples from the start
+    if [s[0] for s in samples] != [(i + first) * 10_000 for i in range(ROWS)]:
         raise FailedDraw(f"{len(samples)} rows on the 10 s grid, not {ROWS}")
     moves = [(r[0], d) for r, d in zip(references, directions, strict=True) if r[1]]
     out, at, signed = [], 0, 0

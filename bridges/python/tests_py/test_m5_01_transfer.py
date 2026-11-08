@@ -52,3 +52,8 @@ def test_only_the_action_version_may_differ():
     assert transfer.spec_matches([1, 1, 1, 1, "a"], (1, 2, 1, 1, "b"))
     assert not transfer.spec_matches([1, 1, 2, 1, "a"], (1, 2, 1, 1, "b"))
     assert not transfer.spec_matches([2, 1, 1, 1, "a"], (1, 2, 1, 1, "b"))
+
+
+def test_the_captures_grid_from_zero_gives_720_rows():
+    from_zero = [[i * 1000, [1, 0, 0], [1, 0, 0], 1] for i in range(7200)]
+    assert len(transfer.rows_of(from_zero, [], [])) == 720
