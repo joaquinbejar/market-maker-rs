@@ -1395,3 +1395,268 @@ fn test_the_cancel_action_with_a_residual_policy_is_refused() {
         Err(BridgeError::Refused(reason)) if reason.contains("cancel_action")
     ));
 }
+
+/// The gate's cuts and refusals of a step, by check, from the kernel's own events.
+#[derive(Default)]
+struct GateTally(Vec<(String, String)>);
+
+impl EventSink for GateTally {
+    fn event(&mut self, event: KernelEvent) {
+        if let KernelEvent::Gate(gate) = event {
+            self.0
+                .push((format!("{:?}", gate.check), format!("{:?}", gate.verdict)));
+        }
+    }
+}
+
+impl GateTally {
+    fn counts(&self) -> GateCounts {
+        let of = |check: &str, verdicts: &[&str]| {
+            self.0
+                .iter()
+                .filter(|(c, v)| c == check && verdicts.contains(&v.as_str()))
+                .count() as u64
+        };
+        let check = |name: &str| VerdictCounts {
+            reduced: of(name, &["Reduced"]),
+            rejected: of(name, &["Rejected", "ReducedOffLot"]),
+        };
+        GateCounts {
+            limits: check("Limits"),
+            combined: check("Combined"),
+            margin: check("Margin"),
+        }
+    }
+}
+
+fn with_margin(base_deposit: Option<&str>) -> BridgeConfig {
+    let mut bridge = config("close", "mask", 100);
+    bridge.initial_capital = "150".to_string();
+    bridge.margin = base_deposit.map(|deposit| MarginConfig {
+        base_deposit: deposit.to_string(),
+    });
+    bridge
+}
+
+// A policy that bids and offers 2 lots on every decision, with a quote balance of 150 and a
+// base deposit of 1 lot, on the long trajectory (row 1 trades down to 99.5): the balance
+// covers one lot. Through the worker, the gate cuts the first bid and ask to 1 lot and
+// refuses the later bids, as the kernel does directly, and the replies count it.
+#[test]
+fn test_worker_margin_gate_cuts_and_refuses_as_the_kernel_and_counts_it() {
+    let run = |deposit: Option<&str>| {
+        let bridge = with_margin(deposit);
+        let kernel = bridge.kernel().unwrap();
+        let data = KernelDataset::from_kernel_ticks(long_rows(), &kernel).unwrap();
+        let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+        let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+            RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+        let mut worker = Worker::spawn(bridge, long_rows(), None).unwrap();
+        let mut tally = GateTally::default();
+        let mut state = env.reset_with(1, &mut tally).unwrap();
+        worker.reset(1).unwrap();
+        let mut total = GateCounts::default();
+        while !state.is_done() {
+            tally = GateTally::default();
+            let direct = env
+                .step_with(&mut state, quote(1, 2, 1, 1), &mut tally)
+                .unwrap();
+            let through = worker.step(quote(1, 2, 1, 1)).unwrap();
+            assert_eq!(through.transition, direct);
+            assert_eq!(through.gates, tally.counts());
+            total.margin.reduced += through.gates.margin.reduced;
+            total.margin.rejected += through.gates.margin.rejected;
+            total.limits.rejected += through.gates.limits.rejected;
+        }
+        (state.kernel().venue_position(), total)
+    };
+    let (position, total) = run(Some("1"));
+    assert_eq!(position, Decimal::ONE);
+    // Each quote is cut until the bid fills, then every bid is refused.
+    assert!(total.margin.reduced >= 2, "{total:?}");
+    assert!(total.margin.rejected >= 1, "{total:?}");
+    assert_eq!(total.limits, VerdictCounts::default());
+    // Without the gate the same policy buys 2, and the gate decides nothing.
+    let (position, total) = run(None);
+    assert_eq!(position, Decimal::TWO);
+    assert_eq!(total, GateCounts::default());
+}
+
+#[test]
+fn test_the_margin_configuration_builds_the_kernel_gate_and_its_own_identity() {
+    let plain = config("close", "mask", 100);
+    assert_eq!(plain.margin, None);
+    assert_eq!(plain.kernel().unwrap().margin, None);
+    let gated = with_margin(Some("1"));
+    assert_eq!(
+        gated.kernel().unwrap().margin,
+        Some(KernelMargin::new(Decimal::ONE))
+    );
+    // From JSON, and absent by default.
+    let mut json: serde_json::Value =
+        serde_json::from_str(&config_text("close", "mask", 100)).unwrap();
+    assert_eq!(
+        BridgeConfig::from_json(&json.to_string()).unwrap().margin,
+        None
+    );
+    json["margin"] = serde_json::json!({"base_deposit": "1"});
+    let parsed = BridgeConfig::from_json(&json.to_string()).unwrap();
+    assert_eq!(parsed.margin, gated.margin);
+    json["margin"] = serde_json::json!({"base_deposit": "1", "leverage": "20"});
+    assert!(BridgeConfig::from_json(&json.to_string()).is_err());
+    // Another kernel, so another kernel fingerprint; the plain one keeps its own. The
+    // spaces are the same, so a specification is too: a checkpoint is told apart by the
+    // kernel fingerprint its metadata records.
+    let id = |bridge: BridgeConfig| Worker::spawn(bridge, long_rows(), None).unwrap().info();
+    let (p, g) = (id(config("close", "mask", 100)), id(with_margin(Some("1"))));
+    assert_ne!(p.kernel_fingerprint, g.kernel_fingerprint);
+    assert_eq!(p.spec, g.spec);
+    assert_eq!(
+        p.kernel_fingerprint,
+        id(config("close", "mask", 100)).kernel_fingerprint
+    );
+    // A deposit off the lot grid is refused before any step.
+    assert!(Worker::spawn(with_margin(Some("0.5")), long_rows(), None).is_err());
+    assert!(Worker::spawn(with_margin(Some("x")), long_rows(), None).is_err());
+}
+
+// The limits decide before the margin, and each is counted under its own check: a position
+// limit of 1 lot cuts the 2 lot quotes there, and the margin never sees them.
+#[test]
+fn test_worker_counts_the_limits_apart_from_the_margin() {
+    let mut bridge = with_margin(Some("1"));
+    bridge.limits = Some(LimitsConfig {
+        max_position: "1".to_string(),
+        max_notional: "100000".to_string(),
+        scaling_factor: "1".to_string(),
+    });
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(long_rows(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 2]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    let mut worker = Worker::spawn(bridge, long_rows(), None).unwrap();
+    let mut tally = GateTally::default();
+    let mut state = env.reset_with(1, &mut tally).unwrap();
+    worker.reset(1).unwrap();
+    let mut limits = 0;
+    while !state.is_done() {
+        tally = GateTally::default();
+        env.step_with(&mut state, quote(1, 2, 1, 1), &mut tally)
+            .unwrap();
+        let through = worker.step(quote(1, 2, 1, 1)).unwrap();
+        assert_eq!(through.gates, tally.counts());
+        limits += through.gates.limits.reduced + through.gates.limits.rejected;
+    }
+    assert!(limits > 0, "the limits cut nothing");
+}
+
+// A residual policy over Avellaneda-Stoikov under the balance gate: two decisions in a row,
+// then a hold, so that each kind of step follows one in which the gate decided.
+#[test]
+fn test_worker_counts_the_gate_on_residual_decisions_and_holds() {
+    let mut bridge = residual_config(AVELLANEDA);
+    bridge.initial_capital = "400".to_string();
+    bridge.margin = Some(MarginConfig {
+        base_deposit: "2".to_string(),
+    });
+    let kernel = bridge.kernel().unwrap();
+    let rows: Vec<KernelTick> = (0..40_u64)
+        .map(|i| {
+            let bid = 190 + (i * 7) % 13;
+            KernelTick {
+                ts_ns: (1000 + i * 25) * 1_000_000,
+                bid,
+                bid_lots: 4,
+                ask: bid + 2,
+                ask_lots: 3,
+            }
+        })
+        .collect();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let d = |text: &str| Decimal::from_str(text).unwrap();
+    let source = AvellanedaQuoter {
+        risk_aversion: d("0.1"),
+        volatility: d("0.2"),
+        order_intensity: d("1.5"),
+        session_start_ms: 0,
+        horizon_ms: 100_000,
+        size: d("1"),
+    };
+    let bounds = ResidualBounds {
+        price_ticks: 4,
+        size_lots: 1,
+    };
+    // The largest size the bounds allow, so the gate has something to cut.
+    let bigger = ResidualProposal {
+        bid_away: 0.0,
+        ask_away: 0.0,
+        bid_size: 1.0,
+        ask_size: 1.0,
+    };
+    let mut env: ResidualEnv<'_, _, ORD, MSG, DLV, OBS> =
+        ResidualEnv::new(&kernel, &data, source, d("1"), bounds, bridge.rl().unwrap()).unwrap();
+    let mut tally = GateTally::default();
+    let mut state = env.reset_with(1, &mut tally).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    worker.reset(1).unwrap();
+    let mut decided = 0;
+    for step in 0..39 {
+        tally = GateTally::default();
+        let through = if step % 3 != 2 {
+            env.step_with(&mut state, bigger, &mut tally).unwrap();
+            worker.step_residual(bigger).unwrap()
+        } else {
+            env.env()
+                .step_with(&mut state, RlAction::Hold, &mut tally)
+                .unwrap();
+            worker.step(RlAction::Hold).unwrap()
+        };
+        assert_eq!(through.gates, tally.counts(), "step {step}");
+        decided += through.gates.margin.reduced + through.gates.margin.rejected;
+    }
+    assert!(decided > 0, "the gate cut nothing");
+}
+
+// Lot 0.5 at a price of 100 and 120 of quote: a bid of 4 lots (2.0) is cut to 1.2, not a
+// whole number of lots, so the gate refuses it whole, and the reply counts it as refused.
+#[test]
+fn test_worker_counts_a_reduction_off_the_lot_grid_as_refused() {
+    let mut bridge = with_margin(Some("0"));
+    bridge.tick_size = "1".to_string();
+    bridge.lot_size = "0.5".to_string();
+    bridge.max_order_size = "5".to_string();
+    bridge.initial_capital = "120".to_string();
+    bridge.sizes = vec![1, 4];
+    let rows: Vec<KernelTick> = (0..3_u64)
+        .map(|i| KernelTick {
+            ts_ns: (1000 + i * 1000) * 1_000_000,
+            bid: 100,
+            bid_lots: 10,
+            ask: 101,
+            ask_lots: 10,
+        })
+        .collect();
+    let kernel = bridge.kernel().unwrap();
+    let data = KernelDataset::from_kernel_ticks(rows.clone(), &kernel).unwrap();
+    let grid = ActionGrid::new([0, 1, 10], [0, 1, 10], [1, 4]).unwrap();
+    let env: RlEnv<'_, 3, 2, ORD, MSG, DLV, OBS> =
+        RlEnv::new(&kernel, &data, grid, bridge.rl().unwrap()).unwrap();
+    let mut worker = Worker::spawn(bridge, rows, None).unwrap();
+    let mut tally = GateTally::default();
+    let mut state = env.reset_with(1, &mut tally).unwrap();
+    worker.reset(1).unwrap();
+    tally = GateTally::default();
+    env.step_with(&mut state, quote(0, 2, 1, 0), &mut tally)
+        .unwrap();
+    let through = worker.step(quote(0, 2, 1, 0)).unwrap();
+    assert!(
+        tally
+            .0
+            .contains(&("Margin".to_string(), "ReducedOffLot".to_string())),
+        "{:?}",
+        tally.0
+    );
+    assert_eq!(through.gates, tally.counts());
+    assert_eq!(through.gates.margin.reduced, 0);
+}
