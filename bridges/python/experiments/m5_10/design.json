@@ -1,6 +1,6 @@
 {
  "issue": 108,
- "design_version": 3,
+ "design_version": 4,
  "status": "fixed before any code or run; part 2 of #108, after PR #295",
  "data": "SYNTHETIC: every result is from made-up Hawkes parameters and says nothing about a market",
  "closed_by_295": {
@@ -59,7 +59,7 @@
   },
   "arms": {
    "no_trade": "hold",
-   "classical": "fixed spread and Avellaneda-Stoikov at #107 part C's points selected on its validation days per setting",
+   "classical": "Avellaneda-Stoikov and GLFT at #107 part C's points selected on its validation days per setting, classical.json (its only classical arms)",
    "learned": "#107 part C's frozen mlp and lstm, seeds 1 to 5, in every setting (validation chose mlp at impact 0 and lstm at the other two as control); HSN and the other arms left out for compute, stated",
    "learned_cut_effect": "if lstm is cut, learned claims are limited to mlp and the comparison with the validation-chosen control at impact_low and impact_high is stated as not available"
   },
@@ -116,7 +116,7 @@
   "multiplicity": "#281 compared A with B on 13 conditions; this makes 14, unadjusted"
  },
  "compute": {
-  "count": "selection = S x P x 10 x 13 policy runs (no_trade, fixed, AS, 5 mlp, 5 lstm); holdout = S x 4 x 30 x 13. With S = 3, P = 24: 9360 + 4680 = 14040 days of 86400 rows",
+  "count": "selection = S x P x 10 x 13 policy runs (no_trade, AS, GLFT, 5 mlp, 5 lstm); holdout = S x 4 x 30 x 13. With S = 3, P = 24: 9360 + 4680 = 14040 days of 86400 rows",
   "ceiling_process_hours": {
    "part_1": 90,
    "part_2": 6
@@ -134,6 +134,7 @@
  "changes": [
   "before any code or run, from review of f583fbc: count formula, pilot at the slowest arm and most active point under load, ceiling raised from 60 to 90 process-hours from that count, cuts from the pilot only, removed points, identifiability estimates, stationary bootstrap named, recovery condition and marker location, part 2 runner, model hashes and estimand, no secondary fee, impact is the flow's and not the agent's",
   "before any code or run, from review of 378e653: seed formulas written as stride x day + offset, and a failing unperturbed point removes its setting; the identifiability formula, absolute tolerance at impact 0, removal rule and stationary bootstrap of the entry above answer the same review",
-  "before any code or run, from a defect found reading the generator: the baselines depend on the queue, so the rate test uses time-averaged open shares and the point-over-unperturbed ratio, with its approximation stated. No ratio or formula value had been computed on any data"
+  "before any code or run, from a defect found reading the generator: the baselines depend on the queue, so the rate test uses time-averaged open shares and the point-over-unperturbed ratio, with its approximation stated. No ratio or formula value had been computed on any data",
+  "before any run, reading #107's classical.json for the runner: #107 part C has no fixed-spread point, its classical arms are Avellaneda-Stoikov and GLFT, so GLFT replaces fixed spread; the policy count stays 13"
  ]
 }
