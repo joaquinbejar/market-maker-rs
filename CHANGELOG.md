@@ -17,7 +17,6 @@ project follows [Semantic Versioning](https://semver.org/).
   panic. It is additive: a new public function, which #280's offline study, first planned as
   scripts only, needs for its pooled intervals.
 
-
 - Counting of block-tied events in the queue-reactive estimator (#290):
   `QrEstimationConfig::zero_waits` with `ZeroWaitPolicy` (`Drop`, the default and the behaviour
   so far, or `Count`, which counts an event with a zero wait and adds no time, and leaves a size
