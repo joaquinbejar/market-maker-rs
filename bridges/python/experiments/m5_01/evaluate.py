@@ -162,7 +162,9 @@ def run_draws(capture, fits, out, set_name, seed):
             try:
                 trajectory = simulate_window(model, window, 106000 + 100 * w + j)
                 row = {"failure": None, "metrics": score(data, trajectory, cap),
-                       "book_10s": trajectory["samples"][9::10]}
+                       "book_10s": trajectory["samples"][9::10],
+                       "references": trajectory["references"],
+                       "directions": trajectory["directions"]}
             except (blocks.BudgetExceeded, ValueError) as error:
                 row = {"failure": str(error)}
             path.write_text(json.dumps(row) + "\n")
