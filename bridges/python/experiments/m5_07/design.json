@@ -1,6 +1,6 @@
 {
  "issue": 111,
- "design_version": 3,
+ "design_version": 4,
  "status": "fixed before any code run: what is reproduced, the checks and their thresholds, the arms, the primary comparison and its rule, seeds and stop rules",
  "data": "SYNTHETIC. Parameters are the paper's SPX/VIX values (arXiv 2212.10164v1), labelled as such; nothing is calibrated to BTC, which is declared unsupported in this round",
  "paper": "Rosenbaum and Zhang, Multi-asset market making under the quadratic rough Heston, arXiv 2212.10164v1",
@@ -84,7 +84,21 @@
   },
   "example_3": {
    "substitution": "the paper's 6-asset basket lists only four assets; Example 2's four options are used instead, multi-asset (kappa > 0) against uni-asset (kappa = 0). This is not a reproduction of the paper's figure 4.10, and the conclusions say so",
-   "runs_only_if": "checks 1 and 2 pass on examples 1 and 2"
+   "runs_only_if": "checks 1 and 2 pass on examples 1 and 2",
+   "arms": "multi-asset: greedy from v_hat with kappa > 0 and kappa_j = kappa/2 on a joint inventory grid. Uni-asset benchmark, the paper's: kappa = 0, kappa_j = kappa/2, exact HJB per asset, the assets run separately on the same random numbers and their P&L summed",
+   "kappa_grid": [
+    0.0001,
+    0.001,
+    0.01,
+    0.1
+   ],
+   "kappa_j": "kappa/2, the paper's Section 4.3 choice",
+   "T_b_s": 2000,
+   "T_s": 4000,
+   "inventory_bound": "ours, the paper states none for these options: |q_j| <= 15 m_j = 30 per asset, 31 levels, the level count of example 1's SPX",
+   "delta": "frozen at example 2's values; the paper's update of delta every 100 s under the QRH state is not reproduced, and the conclusions say so",
+   "paths_and_interval": "as check_2: 5000 paths, paired percentile bootstrap of (multi - uni) P&L, 2000 replicates, 90 %, seed 1111, at each kappa; mean and standard deviation of each arm reported",
+   "role": "secondary: reported only, no decision rests on it"
   },
   "check_1": {
    "label": "our threshold, not the paper's",
@@ -120,7 +134,10 @@
    "T_b_s": {
     "example_1": 150,
     "example_2": 300
-   }
+   },
+   "paths": "the 5 evaluation seeds x 1000 paths = 5000 paths, common random numbers across arms; the design seeds are not used",
+   "interval": "paired percentile bootstrap over paths, 2000 replicates, 90 %, seed 1111; the same method gives the exact mean P&L interval used by 'untestable'",
+   "kappa_j": "example 1 only: kappa_j = kappa/2 at every kappa of the grid, the paper's Section 4.2.1 choice, which gives 0.005 at kappa 0.01; example 2 has no kappa_j"
   },
   "inconclusive_effect": "if check 1 or check 2 is inconclusive or fails, the primary comparison still runs and is labelled 'control not validated'; no adopt decision rests on it; if check 1 fails on example 1, stage A stops and is reported",
   "units": {
@@ -135,6 +152,9 @@
    "dynamics": "Approximation 3.1 as frozen: one Brownian, dPi = sum over fills of m D/2 + r sigma dW, control held between steps of 0.1 s; T_b = T/2 with the control at horizon T. The paper's QRH-driven backtest is not reproduced in stage A",
    "arithmetic": "fill revenue in exact Decimal; the sigma dW term is a float",
    "common_random_numbers": "for each path seed, one numpy default_rng(SeedSequence([seed, path])) draws before the path starts, independent of any control: one standard normal per step for dW and one uniform per asset, side and step; a posted side fills when its uniform < 1 - exp(-Lambda dt); an unposted side discards its uniform. Every arm reads the same arrays"
+  },
+  "hjb_dt_s": {
+   "rule": "the exact HJB is solved by explicit backward Euler at dt = 0.1 s, the backtest's step; check 1's refinement 'dt/2' is 0.05 s"
   }
  },
  "primary_comparison": {
@@ -154,7 +174,12 @@
    "decision": "the arm posts only on OrderDecision::Allowed; Scaled counts as hold since sizes are fixed, a choice that can only make the gate trade less, so the share of Scaled states is reported per table",
    "breaker": "each state is booked, then reset_circuit_breaker is called before check_order, so the table is the limit test alone; the circuit breaker is path dependent and is not modelled, and the README says so",
    "example_1_reading": "at x1 the 23.4 limit equals the box maximum, so the gate never binds beyond Q and the primary comparison in example 1 is QRH against 'always quote within Q', not against a delta gate; the conclusions say so. x0.5 is the only place it binds, outside the rule",
-   "tests": "a risk-reducing order at the limit gets the decision check_order gives after the reset; the table is identical when states are visited in reversed order"
+   "tests": "a risk-reducing order at the limit gets the decision check_order gives after the reset; the table is identical when states are visited in reversed order",
+   "scaled_direction": "counting Scaled as hold can only reduce the gate arm's trading, which favours QRH if the gate would have earned from those orders; the conclusions give this direction beside the share"
+  },
+  "secondary_cells": {
+   "example_1": "runnable on the same (q1, q2) grid: the greedy arm uses v_hat computed with delta (1, 0), the gate arm a table with delta (1, 0) and limit 15, the largest |delta . q| over the box under that delta, so that gate never binds beyond Q; all four cells are scored with the joint delta in the sigma dW term, on the same paths, each as a paired interval against (greedy, joint). Reported only",
+   "example_2": "declared not runnable before the run: the state is the net risk r under the joint delta, and an SPX-only risk is not a function of r, so a decoupled rule cannot be evaluated on this grid without a 4-dimensional inventory state that the design does not have. The report says 'not runnable' for this cell"
   }
  },
  "stage_b": {
@@ -196,7 +221,11 @@
   ],
   "selection": "no parameter is fitted in stage A and every kappa is reported"
  },
- "decision": "adopt or discard on the SPX/VIX reproduction only, with compute cost, fit quality, risk and model limits; BTC is not evaluable in this round",
+ "decision": {
+  "rule": "adopt the greedy QRH control only if example 2's primary comparison at x1 and sigma 0.2267 is 'better' and both check 1 and check 2 on example 2 pass; 'worse', 'no difference shown', or any 'control not validated' label means do not adopt in this round",
+  "example_1": "reported as QRH against 'always quote within Q'; at x1 it is not a test against a delta gate and cannot support adoption",
+  "scope": "the decision covers the control under Approximation 3.1 with the paper's delta on the SPX/VIX parameters only. It is reported with compute cost, fit quality, risk and model limits. No pricing or hedging adoption while stage B is pending; BTC is not evaluable in this round"
+ },
  "compute": {
   "stage_a": "minutes on 1 process",
   "stages_b_c": "1 to 2 h on 1 or 2 processes, slots asked for",
@@ -209,6 +238,7 @@
  "changes": [
   "before any code run, from review: the wording of example 1's gate limit, now the maximum of |delta . q| over the inventory box; the number is unchanged",
   "before any code run, from review: units, alpha, the order and reading of C in check 1, example 2's exact lattice, backtest dynamics and common random numbers. When the unit was chosen only the hand estimate of A (annual sigma gives A about 45 against D/2 = 0.125) was computed from the paper's formula; no HJB, check or P&L had been run",
-  "before any code run, from review: the gate table's decision rule (Allowed only, Scaled share reported), the breaker left out by a reset per state, example 1's reading at x1, and two tests"
+  "before any code run, from review: the gate table's decision rule (Allowed only, Scaled share reported), the breaker left out by a reset per state, example 1's reading at x1, and two tests",
+  "before any code run on the paper's examples, from review: check 2's paths, seeds and interval; the HJB's base dt; kappa_j = kappa/2 across the kappa grid; an explicit decision rule resting on example 2; Scaled's direction; example 3's arms and its inventory bound; the decoupled cells, with example 2's declared not runnable"
  ]
 }
