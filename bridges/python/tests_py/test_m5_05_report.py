@@ -101,9 +101,12 @@ def test_signs_and_the_claim():
     assert result["claim"] == "gain"
     assert result["conditions_evaluated"] == 4
     assert result["count_below_zero"] == 2
+    assert result["count_excluding_zero"] == 2
     worse = analyse(study(a_tail=8.0, b_tail=2.0))
     assert worse["primary"]["tail_at_p_A"]["cvar_averaged"]["point"] == pytest.approx(6.0)
     assert worse["claim"] == "no gain shown"
+    # Intervals wholly above 0 exclude 0 too: the design counts both directions.
+    assert worse["count_below_zero"] == 0 and worse["count_excluding_zero"] == 2
 
 
 def test_the_denominator_is_the_conditions_actually_evaluated():
@@ -111,6 +114,10 @@ def test_the_denominator_is_the_conditions_actually_evaluated():
     assert result["conditions_evaluated"] == 3
     assert "impact" not in result["secondary"]
     assert "3 held-out conditions evaluated" in report.render(result).replace("of the ", "")
+    text = report.render(result, holdout={"impact_run": False, "bounds": "B",
+                                          "resumed": {"journal_before": {"lines": 7, "sha256": "h"},
+                                                      "resume_sha256": "r"}})
+    assert "declared and not run" in text and "resumed once" in text and "7 jobs" in text
 
 
 def test_a_missing_seed_day_fails_its_estimators_and_the_claim():

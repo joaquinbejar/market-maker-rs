@@ -2,7 +2,8 @@
 
 Everything here is synthetic: #102's queue-reactive regimes, a simulator with made-up
 parameters, and #108's perturbed copies of them. The fresh holdout days come from the same
-generator, so a result says nothing about a market.
+generator, so a result says nothing about a market. #102's main execution is in effect an
+immediate fill on 10 s rows (#267), and every conclusion carries that bound.
 
 - `design.json` fixes everything before any code or run:
   - the arms: #102's residual SAC over Avellaneda-Stoikov retrained without (B) and with (A) the
@@ -14,13 +15,15 @@ generator, so a result says nothing about a market.
     holdout days, the estimands, the intervals, the failures and the stop rules.
 
   `from_the_approved_note` lists what changed from the note the maintainer approved, and
-  `changes` will record every later amendment and what had been seen when it was made.
-- `digests/` will hold the day digests of the training points and of every holdout condition's
+  `changes` records later amendments and what had been seen when it was made.
+- `digests/` holds the day digests of the training points and of every holdout condition's
   exogenous rows, committed before any policy runs. The rows are simulated in process by the
   bridge's `ReactiveQrMarket`, whose rows and digest equal `qr_days`'; the `days` step checks
   that #102's training days and #108's selection days come out with their committed digests.
-- `frozen_models.json` will hold the checkpoints' hashes, committed after training and B's
-  check, before any held-out point is evaluated.
+- `frozen_models.json` holds the checkpoints' hashes, written after training and B's check and
+  before any held-out point was evaluated (committed after the selection, unchanged).
+- `amendments.json` records the one amendment after the freeze (the resume), and `resume.py`
+  carries it out.
 - `run.py` runs the `days`, `rate`, `train`, `validate`, `freeze_models`, `selection`, `freeze`
   and `holdout` steps. Selection and validation journal each run, so they resume with fewer
   processes. The holdout marks its attempt before any day is read and never runs twice.
@@ -29,9 +32,10 @@ generator, so a result says nothing about a market.
   reported, its days missing, and never rerun. A run killed from outside is rerun only when
   named, once.
 - The overrun rule is enforced: `train`, `validate`, `selection` and `holdout` read their
-  estimates from `estimates.json` in the output directory, written from the `rate` step before
-  they run, and stop at 1.5 times the estimate, killing only their own workers. What ended stays
-  journaled, and the stop is reported.
+  estimates from `estimates.json` in the output directory. No step writes it: it was written by
+  hand from the `rate` step's timings before training (contents below), and the freeze does not
+  hash it. A step stops at 1.5 times its estimate, killing only its own workers; what ended
+  stays journaled, and the stop is reported.
 - `report.py` writes the holdout's estimands and intervals, every arm's table, the in-sample
   rows, B's check and the training scores and costs.
 
@@ -48,12 +52,20 @@ killed from outside and resumed once, as disclosed below. All 9600 rows are pres
   minus B in CVaR5 loss is +6.39 [-2.94, 13.98] for the seed-averaged arm and +10.02 [-1.62,
   19.19] per seed (90 %). The point estimate says A's tail is larger, and the interval holds 0.
 - **Cost:** unperturbed, A's mean daily net is 3.32 below B's, [-4.45, -2.20].
-- **Secondary:** on none of the 13 held-out conditions evaluated is A's tail interval wholly
-  below B's. On two it is wholly above: m1.0-c1.0-t1.2-l0.7 (+9.13 [5.16, 11.49]) and
-  m1.5-c1.5-t1.0-l0.7 (+28.45 [5.07, 46.52]). No multiplicity correction.
-- **Reference:** retrained B reproduces #102's residual SAC exactly. Its validation daily nets
-  match #102's to every printed digit, and its selection and holdout rows equal the reference's.
-  The reference row adds nothing.
+- **Secondary:** 2 of the 13 held-out conditions evaluated have a seed-averaged tail interval
+  that excludes 0, as the design counts them, and both are wholly above 0 (A worse):
+  m1.0-c1.0-t1.2-l0.7 (+9.13 [5.16, 11.49]) and m1.5-c1.5-t1.0-l0.7 (+28.45 [5.07, 46.52]).
+  None is wholly below 0. No multiplicity correction. Correction, disclosed: the first report
+  (stored as report.md, run before this was found in review) printed only the count wholly below
+  0 ("0 of the 13"); report.py now prints the design's count as well, from the same holdout.json,
+  with no rerun.
+- **Reference:** the reproduction check (mean of B's per-seed validation means within 5.17 of
+  #102's) passed, but it is a weak gate here: B reuses #102's seeds, so it is a replay, and the
+  tolerance assumes independent seeds. The artifacts show more than the gate: B's rows equal
+  the reference's in every recorded field (net, drawdown, positions, fills, peak notional,
+  refusals, fallbacks, clips, breach, peak position and price, dataset digest) on all 75
+  validation, 1800 selection and 2100 holdout seed-days compared. The reference row adds
+  nothing.
 
 Disclosures:
 - **Impact not run.** The impact condition was not run: #282's runner was not on main at the
@@ -104,7 +116,7 @@ Primary claim: **no gain shown**. It needs both tail intervals at p_A and p_B wh
 | held_out:m2.0-c1.5-t1.2-l0.7 | 6.39 [-2.94, 13.98] | 10.02 [-1.62, 19.19] | -4.65 [-7.96, -1.65] |
 | execution_stress | 1.57 [-0.62, 5.10] | 2.65 [1.64, 4.82] | -2.84 [-3.70, -1.96] |
 
-0 of the 13 held-out conditions evaluated have a seed-averaged tail interval wholly below 0; no multiplicity correction.
+2 of the 13 held-out conditions evaluated have a seed-averaged tail interval that excludes 0, as the design counts them; 0 of them wholly below 0 (an improvement of A). No multiplicity correction.
 
 ### Every arm and condition
 
@@ -265,6 +277,11 @@ Adversary's worst training point at each scoring (phases 2 to 5), A only:
 - Holdout attempts: 1 killed from outside, 1 resume (see Disclosures).
 
 ## Pinned files
+
+- estimates.json sha256 `460a5826e95a7e3a492f55dab01343be70b3d72f1533d27141807c05fbf5ac6e`, written by
+  hand from rate.json and not hashed by the freeze: train 9200 s, validate 300 s, selection
+  4050 s, holdout 8900 s (limits 1.5 times), with the basis that every one of the 500 000 steps
+  is a gradient step (an upper bound).
 
 - amendments.json sha256 `409de61e3b25701ea1c395db28b4b52473ccd23d2919491707d4c5b50bb10147`
 - resume.py sha256 `ba13d8e176ad8d3af676238e627481abfafc63f2a8c1120bcf13267119872f8d` (recorded in holdout.resumed and holdout.json)

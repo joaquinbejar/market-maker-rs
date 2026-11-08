@@ -208,6 +208,9 @@ def analyse(rows, chosen, impact_run, indices=None, names=None, in_sample_names=
     secondary = {c: {**tail(c), "mean_net": difference(
         "mean_net", m("adversarial", c), m("baseline", c), indices)} for c in conditions}
     count = sum(below_zero(v["cvar_averaged"]) for v in secondary.values())
+    excluding = sum("failed" not in v["cvar_averaged"]
+                    and not (v["cvar_averaged"]["low"] <= 0.0 <= v["cvar_averaged"]["high"])
+                    for v in secondary.values())
     if in_sample_names is None:
         in_sample_names = grid_names(held_out=False)
     in_sample = {f"in_sample:{n}": tail(f"in_sample:{n}") for n in in_sample_names}
@@ -231,7 +234,8 @@ def analyse(rows, chosen, impact_run, indices=None, names=None, in_sample_names=
     return {"days": len(days), "chosen": {"p_A": p_a, "p_B": p_b,
                                           "p_ref": (chosen.get("reference") or {}).get("point")},
             "primary": primary, "claim": claim, "secondary": secondary,
-            "count_below_zero": count, "conditions_evaluated": len(conditions),
+            "count_below_zero": count, "count_excluding_zero": excluding,
+            "conditions_evaluated": len(conditions),
             "in_sample": in_sample, "table": table}
 
 
@@ -245,11 +249,23 @@ def number(x):
     return "failed" if x is None else f"{x:.2f}"
 
 
-def render(result, validation=None, runs=()):
+def render(result, validation=None, runs=(), holdout=None):
+    holdout = holdout or {}
     lines = ["## #281 holdout (synthetic)", "",
+             holdout.get("bounds", "") , "",
              "Synthetic evidence from the same generator as the training days: these bounded "
              "perturbations of one made-up simulator, not a market. CVaR5 is the mean of the "
              f"worst 2 of {result['days']} daily losses, a coarse tail.", ""]
+    if not holdout.get("impact_run", True):
+        lines += ["The impact condition was declared and not run: #282's runner was not on main "
+                  "at the freeze. Nothing replaces it.", ""]
+    resumed = holdout.get("resumed")
+    if resumed:
+        before = resumed["journal_before"]
+        lines += [f"The holdout was resumed once after its first attempt was killed from outside "
+                  f"with {before['lines']} jobs journaled; those lines were unchanged after the "
+                  f"resume (sha256 {before['sha256']}); resume.py sha256 "
+                  f"{resumed['resume_sha256']}.", ""]
     chosen = result["chosen"]
     lines += [f"Selected held-out points (#108's selection days): p_A {chosen['p_A']}, "
               f"p_B {chosen['p_B']}, reference {chosen['p_ref']}.", ""]
@@ -272,9 +288,10 @@ def render(result, validation=None, runs=()):
     for condition, d in result["secondary"].items():
         lines.append(f"| {condition} | {fmt(d['cvar_averaged'])} | {fmt(d['cvar_per_seed'])} "
                      f"| {fmt(d['mean_net'])} |")
-    lines += ["", f"{result['count_below_zero']} of the {result['conditions_evaluated']} "
-              "held-out conditions evaluated have a seed-averaged tail interval wholly below 0; "
-              "no multiplicity correction.", ""]
+    lines += ["", f"{result['count_excluding_zero']} of the {result['conditions_evaluated']} "
+              "held-out conditions evaluated have a seed-averaged tail interval that excludes 0, "
+              f"as the design counts them; {result['count_below_zero']} of them wholly below 0 "
+              "(an improvement of A). No multiplicity correction.", ""]
     lines += ["### Every arm and condition", "",
               "| condition | arm | seeds | missing seed-days | mean net | CVaR5, averaged "
               "| CVaR5, per seed |", "|---|---|---:|---:|---:|---:|---:|"]
@@ -313,7 +330,7 @@ def main():
     validation = json.loads(validation_path.read_text()) if validation_path.exists() else None
     runs = [json.loads(p.read_text()) for p in sorted((out / "checkpoints").glob("*.json"))]
     result = analyse(holdout["rows"], holdout["chosen"], holdout["impact_run"])
-    print(render(result, validation, runs))
+    print(render(result, validation, runs, holdout))
 
 
 if __name__ == "__main__":
