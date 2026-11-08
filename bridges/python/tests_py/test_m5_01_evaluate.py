@@ -57,3 +57,14 @@ def test_a_reference_move_resets_earlier_events_only():
     assert start == ([1, 2, 3], [4, 5, 6])
     assert events == [(2.0, 0, 0, evaluate.mdqr.NO_KIND), (3.0, 0, 1, 0)]
     assert trades == [(1.0, 1.0), (2.0, -0.5)]
+
+
+def test_the_holdout_is_claimed_once(tmp_path):
+    evaluate.claim_holdout(tmp_path)
+    with pytest.raises(FileExistsError):
+        evaluate.claim_holdout(tmp_path)
+
+
+def test_draws_refuse_an_unclaimed_holdout(tmp_path):
+    with pytest.raises(SystemExit):
+        evaluate.run_draws(tmp_path, tmp_path, tmp_path, "holdout", 1)
