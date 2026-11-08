@@ -17,6 +17,30 @@ project follows [Semantic Versioning](https://semver.org/).
   panic. It is additive: a new public function, which #280's offline study, first planned as
   scripts only, needs for its pooled intervals.
 
+
+- Counting of block-tied events in the queue-reactive estimator (#290):
+  `QrEstimationConfig::zero_waits` with `ZeroWaitPolicy` (`Drop`, the default and the behaviour
+  so far, or `Count`, which counts an event with a zero wait and adds no time, and leaves a size
+  with no time unsupported), set with
+  `QrEstimationConfig::with_zero_waits`; a configuration written without the field reads as
+  `Drop`. `queue_reactive::collapse_blocks` collapses each block's events at a queue into their
+  net change, carrying the wait of a block with none. Touch resets, opt in (#290):
+  `QrParameters::with_resets` takes a rate per first-limit queue size and the law the queue is
+  redrawn from, read with `reset_rates` and `reset_law`; the simulator then ends a touch queue's
+  life without emptying at that rate, reported as the new `QrStep::Reset` and kept in the new
+  `Trajectory::resets`, as `ResetObservation`s. `estimate_parameters_with_resets` estimates
+  them with the other rates, a reset's wait counting as time at its size. Parameters without
+  resets, their exports and fingerprints, and every run from them are unchanged; exported
+  parameters gain `reset_rates` and `reset_law` only when set. Example `qr_estimation`, behind `serde`,
+  holds #290's protocol and its synthetic recovery check on #102's calm regime; example
+  `hyperliquid_validation` gains #290's phase 1 on the capture's training part (counts with and
+  without zero waits, block lengths, how touch-queue lives end, and the drift of each estimator's
+  fit) and phase 3 (each estimator and its constant baseline on #286's windows and the training
+  part's first hours, the choice and stop rule in code before any phase 3 run, and the holdout's verdict).
+  E3, built because phase 1 met its condition, is E1 with touch resets read from the capture
+  (a side's touch at a move of the mid that emptied no touch, its new size from the side's next
+  touch event); its redraw law is the observed new sizes, with the invariant law as a
+  sensitivity row only. `qr_estimation synthetic-e3` checks that E3 recovers known resets.
 - The quote duration comparison of #110 in `bridges/python/experiments/m4_10`, with
   `ChosenDuration` in the bridge's wrappers: a policy that chooses, with each action, how many
   rows its quote rests before it decides again. On #103's regimes sampled every 100 ms, under a
