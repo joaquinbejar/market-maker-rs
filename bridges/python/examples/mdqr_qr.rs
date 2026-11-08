@@ -485,8 +485,15 @@ fn directions_of(
 }
 
 fn arms(fits: &Value, window: &Path, out: &Path, w: u64) -> Result<(), Failure> {
-    let claimed = out.parent().map(|p| p.join("holdout.started").exists());
-    if window.to_string_lossy().contains("/holdout/") && claimed != Some(true) {
+    let in_holdout = window
+        .canonicalize()?
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "holdout");
+    let claimed = out
+        .parent()
+        .is_some_and(|p| p.join("holdout.started").exists());
+    if in_holdout && !claimed {
         return Err("the holdout is not claimed".into());
     }
     let window: Value = serde_json::from_slice(&fs::read(window)?)?;
