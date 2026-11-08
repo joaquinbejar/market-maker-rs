@@ -418,17 +418,70 @@ def run_name(arm, seed):
     return f"{arm}-seed{seed}"
 
 
-def train(ctx, out, commit, rerun=()):
-    """The 10 runs. Each start is journaled; a run with a start and no end was killed, and is
-    rerun only when named, once."""
+class Overrun(RuntimeError):
+    """A step ran past 1.5 times its estimate: it stops, and is reported."""
+
+
+def limit_seconds(out, step):
+    """The design's stop rule: 1.5 times the step's estimate, from `estimates.json` in the
+    output directory, which is written from the rate step before the step runs."""
+    path = pathlib.Path(out) / "estimates.json"
+    if not path.exists():
+        raise ValueError(f"no estimate for {step}: write estimates.json from the rate step first")
+    estimates = json.loads(path.read_text())
+    if step not in estimates:
+        raise ValueError(f"estimates.json has no estimate for {step}")
+    return 1.5 * float(estimates[step])
+
+
+def stop_workers(executor):
+    """Kills this pool's own worker processes, each by its exact pid, and nothing else."""
+    for process in list(getattr(executor, "_processes", {}).values()):
+        if process.is_alive():
+            process.kill()
+    executor.shutdown(wait=True, cancel_futures=True)
+
+
+def outcomes(attempts):
+    """Per run: its starts, and how its last attempt ended. "failed" is an error inside the run
+    (a program or numerical error), "interrupted" a worker killed from outside, "stopped" the
+    overrun rule; a start with no end was killed with the step."""
+    out = {}
+    if pathlib.Path(attempts).exists():
+        for line in pathlib.Path(attempts).read_text().splitlines():
+            entry = json.loads(line)
+            record = out.setdefault(entry["run"], {"starts": 0, "end": None})
+            if "started" in entry:
+                record["starts"] += 1
+                record["end"] = None
+            else:
+                record["end"] = entry
+    return out
+
+
+def rerunnable(name, record, rerun):
+    """A run that was started may run again only when it was killed from outside (no end, or
+    an interrupted worker), when it is named, and once."""
+    if record is None:
+        return True
+    end = record["end"]
+    if end is not None and end["outcome"] in ("failed", "stopped"):
+        raise ValueError(f"{name} ended {end['outcome']}: {end.get('error')}; it is a failed "
+                         "seed, reported, and never rerun")
+    if name not in rerun or record["starts"] > 1:
+        raise ValueError(f"{name} was started before and did not end; it is rerun only when "
+                         "it was killed from outside, named, and once")
+    return True
+
+
+def train(ctx, out, commit, rerun=(), limit=None, worker=None):
+    """The 10 runs. Each start and each end is journaled in train.attempts."""
     out = pathlib.Path(out)
     (out / "checkpoints").mkdir(parents=True, exist_ok=True)
     attempts = out / "train.attempts"
-    started = {}
-    if attempts.exists():
-        for line in attempts.read_text().splitlines():
-            entry = json.loads(line)
-            started[entry["run"]] = started.get(entry["run"], 0) + 1
+    limit = limit_seconds(out, "train") if limit is None else limit
+    worker = worker or train_job
+    known = outcomes(attempts)
     jobs = []
     for arm in TRAINED:
         for seed in ctx.design["arms"]["training_seeds"]:
@@ -436,29 +489,49 @@ def train(ctx, out, commit, rerun=()):
             path = out / "checkpoints" / name
             if path.with_suffix(".json").exists():
                 continue
-            if name in started and (name not in rerun or started[name] > 1):
-                raise ValueError(f"{name} was started before and did not end; it is rerun only "
-                                 "when named, once")
+            rerunnable(name, known.get(name), rerun)
             jobs.append({"run_dir": ctx.run_dir, "arm": arm, "seed": seed, "path": str(path),
                          "commit": commit})
     context = multiprocessing.get_context("spawn")
     results = []
-    with concurrent.futures.ProcessPoolExecutor(ctx.parallel, mp_context=context) as executor, \
-            attempts.open("a") as journal:
+    started = time.perf_counter()
+    executor = concurrent.futures.ProcessPoolExecutor(ctx.parallel, mp_context=context)
+    with attempts.open("a") as journal:
+
+        def end(name, outcome, error=None):
+            journal.write(json.dumps({"run": name, "ended": time.time(), "outcome": outcome,
+                                      "error": error}) + "\n")
+            journal.flush()
+
         futures = {}
         for job in jobs:
             journal.write(json.dumps({"run": pathlib.Path(job["path"]).name,
                                       "started": time.time(), "pid": os.getpid()}) + "\n")
             journal.flush()
-            futures[executor.submit(train_job, job)] = job
-        for future in concurrent.futures.as_completed(futures):
-            name = pathlib.Path(futures[future]["path"]).name
-            try:
-                results.append(future.result())
-                print(f"train: {name} done", file=sys.stderr, flush=True)
-            except Exception as error:  # a failed run is reported, never dropped
-                results.append({"run": name, "failed": f"{type(error).__name__}: {error}"})
-                print(f"train: {name} FAILED: {error}", file=sys.stderr, flush=True)
+            futures[executor.submit(worker, job)] = pathlib.Path(job["path"]).name
+        try:
+            remaining = limit - (time.perf_counter() - started)
+            for future in concurrent.futures.as_completed(futures, timeout=max(remaining, 0)):
+                name = futures[future]
+                try:
+                    results.append(future.result())
+                    end(name, "done")
+                    print(f"train: {name} done", file=sys.stderr, flush=True)
+                except concurrent.futures.process.BrokenProcessPool as error:
+                    end(name, "interrupted", f"{type(error).__name__}: {error}")
+                    results.append({"run": name, "interrupted": str(error)})
+                except Exception as error:  # a failed run is reported, never dropped
+                    end(name, "failed", f"{type(error).__name__}: {error}")
+                    results.append({"run": name, "failed": f"{type(error).__name__}: {error}"})
+                    print(f"train: {name} FAILED: {error}", file=sys.stderr, flush=True)
+        except concurrent.futures.TimeoutError:
+            stop_workers(executor)
+            for future, name in futures.items():
+                if not future.done() or future.cancelled():
+                    end(name, "stopped", f"over 1.5 times the estimate ({limit:.0f} s)")
+            raise Overrun(f"train ran past {limit:.0f} s; the unfinished runs are stopped")
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
     return {"step": "train", "commit": commit, "runs": results}
 
 
@@ -466,24 +539,32 @@ def train(ctx, out, commit, rerun=()):
 
 
 def trained_runs(out):
-    """The trained runs' metadata, A and B, seeds 1 to 5 each."""
+    """The trained runs' metadata, A and B, seeds 1 to 5 each: None for a run that failed in
+    training (a failed seed, kept), and an error for one that never ended."""
+    known = outcomes(pathlib.Path(out) / "train.attempts")
     runs = {}
     for arm in TRAINED:
         found = []
         for seed in (1, 2, 3, 4, 5):
-            path = pathlib.Path(out) / "checkpoints" / f"{run_name(arm, seed)}.json"
-            found.append(json.loads(path.read_text()) if path.exists() else None)
+            name = run_name(arm, seed)
+            path = pathlib.Path(out) / "checkpoints" / f"{name}.json"
+            if path.exists():
+                found.append(json.loads(path.read_text()))
+                continue
+            end = (known.get(name) or {}).get("end")
+            if end is None or end["outcome"] not in ("failed", "stopped"):
+                raise ValueError(f"{name} has no checkpoint and did not finish: train it first")
+            found.append(None)
         runs[arm] = found
     return runs
 
 
 def policies(ctx, out):
-    """Every policy: (arm, seed, metadata), the reference's from #102's frozen runs."""
+    """Every policy: (arm, seed, metadata), the reference's from #102's frozen runs; a failed
+    seed's metadata is None, and its days are missing."""
     out_list = []
     for arm, found in trained_runs(out).items():
         for seed, metadata in zip((1, 2, 3, 4, 5), found, strict=True):
-            if metadata is None:
-                raise ValueError(f"{run_name(arm, seed)} has no checkpoint")
             out_list.append((arm, seed, metadata))
     for metadata in m503.learned_runs(ctx.frozen, ctx.run_dir)["residual_sac"]:
         out_list.append(("reference", metadata["seed"], metadata))
@@ -548,6 +629,11 @@ def run_policy(job):
     split, name, regime, day = job["split"], job["point"], job["regime"], job["day"]
     market, seed = market_for(ctx, split, name, regime, day, split == "holdout")
     metadata = job["metadata"]
+    row = {"condition": job["condition"], "split": split, "point": name, "arm": job["arm"],
+           "seed": job["seed"], "regime": regime, "day": day, "day_seed": seed,
+           "dataset_digest": market.digest()}
+    if metadata is None:
+        return {**row, "net": None, "error": "the seed failed in training"}
     if job.get("frozen_sha256") and sha256(pathlib.Path(metadata["path"]).with_suffix(".zip")) \
             != job["frozen_sha256"]:
         raise ValueError(f"{job['arm']} seed {job['seed']}: the checkpoint changed")
@@ -562,9 +648,6 @@ def run_policy(job):
         if module is None:
             raise ValueError("the impact condition needs #282's runner")
         impact = (module, job["kappa"])
-    row = {"condition": job["condition"], "split": split, "point": name, "arm": job["arm"],
-           "seed": job["seed"], "regime": regime, "day": day, "day_seed": seed,
-           "dataset_digest": market.digest()}
     try:
         result = evaluate(ctx, policy, market, seed, regime, day, job.get("execution"), impact)
     except Exception as error:  # the seed-day is missing, never dropped
@@ -578,10 +661,11 @@ def job_key(job):
     return (job["condition"], job["arm"], job["seed"], job["regime"], job["day"])
 
 
-def pool(jobs, worker, parallel, label, journal):
+def pool(jobs, worker, parallel, label, journal, limit):
     """Runs the jobs, appending each result to `journal` as it ends, and skips the jobs a
     previous run of the same step journaled. A result does not depend on the order or the
-    number of processes."""
+    number of processes. Past `limit` seconds the step stops (the design's overrun rule): its
+    workers are killed, what ended stays journaled, and Overrun is raised."""
     journal = pathlib.Path(journal)
     done_rows = {}
     if journal.exists():
@@ -596,18 +680,27 @@ def pool(jobs, worker, parallel, label, journal):
     started = time.perf_counter()
     print(f"{label}: {len(jobs) - len(todo)} of {len(jobs)} already done; {parallel} processes",
           file=sys.stderr, flush=True)
-    with concurrent.futures.ProcessPoolExecutor(parallel, mp_context=context) as executor, \
-            journal.open("a") as out:
+    executor = concurrent.futures.ProcessPoolExecutor(parallel, mp_context=context)
+    with journal.open("a") as out:
         futures = {executor.submit(worker, job): key for key, job in todo}
-        for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-            row = future.result()
-            key = futures[future]
-            done_rows[key] = row
-            out.write(json.dumps({"key": json.dumps(list(key)), "row": row}) + "\n")
-            out.flush()
-            if done % 50 == 0 or done == len(todo):
-                print(f"{label}: {done}/{len(todo)} after {round(time.perf_counter() - started)} s",
-                      file=sys.stderr, flush=True)
+        try:
+            remaining = max(limit - (time.perf_counter() - started), 0)
+            for done, future in enumerate(
+                    concurrent.futures.as_completed(futures, timeout=remaining), start=1):
+                row = future.result()
+                key = futures[future]
+                done_rows[key] = row
+                out.write(json.dumps({"key": json.dumps(list(key)), "row": row}) + "\n")
+                out.flush()
+                if done % 50 == 0 or done == len(todo):
+                    print(f"{label}: {done}/{len(todo)} after "
+                          f"{round(time.perf_counter() - started)} s", file=sys.stderr, flush=True)
+        except concurrent.futures.TimeoutError:
+            stop_workers(executor)
+            raise Overrun(f"{label} ran past {limit:.0f} s; {len(done_rows)} of {len(jobs)} "
+                          "jobs ended and are journaled") from None
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
     return [done_rows[key] for key in keys]
 
 
@@ -619,7 +712,7 @@ def policy_jobs(ctx, out, condition, split, name, arms=ARMS, frozen_models=None,
             continue
         frozen = None
         if frozen_models is not None:
-            frozen = frozen_models[f"{arm}-seed{seed}"]["checkpoint_sha256"]
+            frozen = frozen_models[f"{arm}-seed{seed}"].get("checkpoint_sha256")
         for regime in ctx.regimes:
             for day in days:
                 job = {"run_dir": ctx.run_dir, "condition": condition, "split": split,
@@ -670,7 +763,8 @@ def reproduction(rows, check):
 
 def validate(ctx, out, commit):
     jobs = policy_jobs(ctx, out, "validation", "validation", unperturbed_name())
-    rows = pool(jobs, run_policy, ctx.parallel, "validate", pathlib.Path(out) / "validate.journal")
+    rows = pool(jobs, run_policy, ctx.parallel, "validate", pathlib.Path(out) / "validate.journal",
+                limit_seconds(out, "validate"))
     report = ctx.header("validate", commit)
     report["rows"] = rows
     report["reproduction"] = reproduction(rows, ctx.design["validation"]["reproduction_check"])
@@ -689,7 +783,8 @@ def freeze_models(ctx, out, commit):
     for arm, found in trained_runs(out).items():
         for seed, metadata in zip((1, 2, 3, 4, 5), found, strict=True):
             if metadata is None:
-                raise ValueError(f"{run_name(arm, seed)} has no checkpoint")
+                models[run_name(arm, seed)] = {"failed": "the seed failed in training"}
+                continue
             path = pathlib.Path(metadata["path"])
             if sha256(path.with_suffix(".zip")) != metadata["checkpoint_sha256"]:
                 raise ValueError(f"{run_name(arm, seed)} changed after training")
@@ -712,6 +807,10 @@ def check_models(ctx, out):
     models = json.loads(FROZEN_MODELS.read_text())["models"]
     for arm, seed, metadata in policies(ctx, out):
         frozen = models[f"{arm}-seed{seed}"]
+        if (metadata is None) != ("failed" in frozen):
+            raise ValueError(f"{arm} seed {seed}: failed or not, it is not as frozen")
+        if metadata is None:
+            continue
         path = pathlib.Path(metadata["path"])
         if sha256(path.with_suffix(".zip")) != frozen["checkpoint_sha256"]:
             raise ValueError(f"{arm} seed {seed}: the checkpoint changed after the freeze")
@@ -749,7 +848,7 @@ def selection(ctx, out, commit):
         jobs += policy_jobs(ctx, out, f"held_out:{name}", "selection", name,
                             frozen_models=models)
     rows = pool(jobs, run_policy, ctx.parallel, "selection",
-                pathlib.Path(out) / "selection.journal")
+                pathlib.Path(out) / "selection.journal", limit_seconds(out, "selection"))
     by_point = {}
     for name, _ in held_out_points(ctx.m5_03):
         scoped = [r for r in rows if r["point"] == name]
@@ -854,6 +953,7 @@ def holdout(ctx, out, commit, frozen_sha256):
         raise ValueError("#282's runner changed after the freeze")
     models = check_models(ctx, out)
     jobs = holdout_jobs(ctx, out, frozen, models)
+    limit = limit_seconds(out, "holdout")
     # Before any day is read: a second or concurrent attempt is refused, and a failed one is
     # never rerun.
     try:
@@ -863,7 +963,7 @@ def holdout(ctx, out, commit, frozen_sha256):
     with os.fdopen(marker, "w") as handle:
         handle.write(json.dumps({"started": time.time(), "pid": os.getpid(),
                                  "frozen_sha256": frozen_sha256}) + "\n")
-    rows = pool(jobs, run_policy, ctx.parallel, "holdout", out / "holdout.journal")
+    rows = pool(jobs, run_policy, ctx.parallel, "holdout", out / "holdout.journal", limit)
     here["frozen_sha256"] = frozen_sha256
     here["chosen"] = frozen["chosen"]
     here["impact_run"] = frozen["impact"] is not None

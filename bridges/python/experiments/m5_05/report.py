@@ -18,6 +18,7 @@ Reads `holdout.json`, `validation.json` and the trained runs' metadata in `<out 
 Everything here is synthetic.
 """
 
+import itertools
 import json
 import math
 import pathlib
@@ -26,8 +27,14 @@ from decimal import Decimal
 
 import numpy as np
 
+HERE = pathlib.Path(__file__).resolve().parent
 REGIMES = ("calm", "stressed", "thin")
 ARMS = ("adversarial", "baseline", "reference")
+SEEDS = (1, 2, 3, 4, 5)
+DAYS_PER_REGIME = 10
+# The registered grid: every arm's five seeds on the 30 holdout days. A seed or a day absent
+# from the rows is missing, never a smaller sample.
+DAYS = [(regime, day) for regime in REGIMES for day in range(1, DAYS_PER_REGIME + 1)]
 SHARE = 0.05
 REPLICATES = 2000
 MEAN_BLOCK = 2.0
@@ -38,16 +45,41 @@ class Missing(Exception):
     """A seed-day an estimator needs is missing."""
 
 
-def days_of(rows):
-    """The holdout days in a fixed order: by regime as REGIMES lists them, then by day."""
-    days = sorted({(r["regime"], r["day"]) for r in rows},
-                  key=lambda k: (REGIMES.index(k[0]), k[1]))
-    return days
+def grid_names(held_out):
+    """#108's points, named as #108 names them: the 12 with the lower limit rate, or the 11
+    perturbed ones with the limit rate unchanged."""
+    m5_03 = json.loads((HERE.parent / "m5_03" / "design.json").read_text())
+    p = m5_03["perturbations"]
+    keys = ("market_rate_multiplier", "cancel_rate_multiplier", "theta_multiplier",
+            "limit_rate_multiplier")
+    names = []
+    for values in itertools.product(*(p[k] for k in keys)):
+        point = dict(zip(keys, values, strict=True))
+        unchanged = point["limit_rate_multiplier"] == 1.0
+        unperturbed = all(v == 1.0 for v in point.values())
+        if (not unchanged) if held_out else (unchanged and not unperturbed):
+            names.append("m{market_rate_multiplier}-c{cancel_rate_multiplier}-"
+                         "t{theta_multiplier}-l{limit_rate_multiplier}".format(**point))
+    return names
 
 
-def matrix(rows, arm, condition, days):
-    """The arm's nets under the condition, a row per seed (in seed order) and a column per day;
-    None where a seed-day is missing."""
+def check_cells(rows):
+    """Refuses a row outside the registered grid, or two rows for one cell."""
+    seen = set()
+    for r in rows:
+        if r["arm"] not in ARMS or r["seed"] not in SEEDS or (r["regime"], r["day"]) not in DAYS:
+            raise ValueError(f"a row outside the registered grid: {r['arm']} seed {r['seed']} "
+                             f"{r['regime']} day {r['day']}")
+        key = (r["condition"], r["arm"], r["seed"], r["regime"], r["day"])
+        if key in seen:
+            raise ValueError(f"two rows for {key}")
+        seen.add(key)
+
+
+def matrix(rows, arm, condition, days=DAYS):
+    """The arm's nets under the condition, a row per registered seed and a column per
+    registered day; None where a seed-day is missing, so an absent seed or day is missing
+    too. None when the arm has no row at all under the condition."""
     cells = {}
     for r in rows:
         if r["arm"] == arm and r["condition"] == condition:
@@ -55,8 +87,7 @@ def matrix(rows, arm, condition, days):
                 None if r["net"] is None else float(Decimal(r["net"])))
     if not cells:
         return None
-    seeds = sorted({s for s, _, _ in cells})
-    return [[cells.get((s, *d)) for d in days] for s in seeds]
+    return [[cells.get((s, *d)) for d in days] for s in SEEDS]
 
 
 def stratified_indices(days, replicates=REPLICATES, mean_block=MEAN_BLOCK, seed=SEED):
@@ -132,18 +163,17 @@ def below_zero(d):
     return "failed" not in d and d["high"] < 0.0
 
 
-def held_out_conditions(rows):
-    """The held-out conditions actually evaluated: the 12 points, the execution stress, and the
-    impact when it ran."""
-    names = sorted({r["condition"] for r in rows if r["condition"].startswith("held_out:")})
-    out = names + ["execution_stress"]
-    if any(r["condition"] == "impact" for r in rows):
-        out.append("impact")
-    return out
+def held_out_conditions(impact_run, names=None):
+    """The held-out conditions the study evaluates: the 12 points, the execution stress, and
+    the impact when #282's runner ran it."""
+    names = grid_names(held_out=True) if names is None else names
+    return [f"held_out:{n}" for n in names] + ["execution_stress"] + (
+        ["impact"] if impact_run else [])
 
 
-def analyse(rows, chosen, indices=None):
-    days = days_of(rows)
+def analyse(rows, chosen, impact_run, indices=None, names=None, in_sample_names=None):
+    check_cells(rows)
+    days = DAYS
     if indices is None:
         indices = stratified_indices(days)
 
@@ -174,19 +204,22 @@ def analyse(rows, chosen, indices=None):
         claim = "gain"
     else:
         claim = "no gain shown"
-    conditions = held_out_conditions(rows)
+    conditions = held_out_conditions(impact_run, names)
     secondary = {c: {**tail(c), "mean_net": difference(
         "mean_net", m("adversarial", c), m("baseline", c), indices)} for c in conditions}
     count = sum(below_zero(v["cvar_averaged"]) for v in secondary.values())
-    in_sample = {c: tail(c) for c in sorted({r["condition"] for r in rows
-                                             if r["condition"].startswith("in_sample:")})}
+    if in_sample_names is None:
+        in_sample_names = grid_names(held_out=False)
+    in_sample = {f"in_sample:{n}": tail(f"in_sample:{n}") for n in in_sample_names}
     every = np.arange(len(days))
     table = {}
     for condition in ["unperturbed", *conditions, *in_sample]:
         for arm in ARMS:
+            if arm == "reference" and condition.startswith("in_sample:"):
+                continue
             x = m(arm, condition)
             if x is None:
-                continue
+                x = [[None] * len(days) for _ in SEEDS]
             missing = sum(v is None for row in x for v in row)
             entry = {"seeds": len(x), "missing": missing}
             for name, f in STATISTICS.items():
@@ -279,7 +312,7 @@ def main():
     validation_path = out / "validation.json"
     validation = json.loads(validation_path.read_text()) if validation_path.exists() else None
     runs = [json.loads(p.read_text()) for p in sorted((out / "checkpoints").glob("*.json"))]
-    result = analyse(holdout["rows"], holdout["chosen"])
+    result = analyse(holdout["rows"], holdout["chosen"], holdout["impact_run"])
     print(render(result, validation, runs))
 
 

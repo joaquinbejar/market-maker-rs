@@ -4,6 +4,7 @@ holdout's guards. Rows are synthetic: #102's simulator and hand-made fakes."""
 import importlib.util
 import json
 import pathlib
+import time
 from decimal import Decimal
 
 import gymnasium as gym
@@ -329,16 +330,93 @@ def test_the_models_freeze_only_after_b_passes(tmp_path, monkeypatch):
         run.check_models(FakeCtx(), tmp_path)
 
 
-def test_the_train_step_reruns_a_killed_run_only_when_named_and_once(tmp_path, monkeypatch):
+def threads(monkeypatch):
+    """Pools on threads, so a test's workers need no pickling; the runner's logic is the same."""
+    import concurrent.futures as cf
+    monkeypatch.setattr(run.concurrent.futures, "ProcessPoolExecutor",
+                        lambda n, mp_context=None: cf.ThreadPoolExecutor(n))
+
+
+def train_worker(fail=None, interrupt=None):
+    def worker(job):
+        name = pathlib.Path(job["path"]).name
+        if name == fail:
+            raise ValueError("loss became NaN")
+        if name == interrupt:
+            raise run.concurrent.futures.process.BrokenProcessPool("a worker was killed")
+        pathlib.Path(job["path"]).with_suffix(".json").write_text(json.dumps({"seed": job["seed"]}))
+        return {"run": name}
+    return worker
+
+
+def test_a_run_that_failed_inside_is_never_rerun_even_when_named(tmp_path, monkeypatch):
+    threads(monkeypatch)
     ctx = FakeCtx()
-    (tmp_path / "train.attempts").write_text(
-        json.dumps({"run": "adversarial-seed2", "started": 0}) + "\n")
-    with pytest.raises(ValueError, match="rerun only when named"):
-        run.train(ctx, tmp_path, "c")
-    (tmp_path / "train.attempts").write_text(
-        "".join(json.dumps({"run": "adversarial-seed2", "started": t}) + "\n" for t in (0, 1)))
-    with pytest.raises(ValueError, match="once"):
-        run.train(ctx, tmp_path, "c", ("adversarial-seed2",))
+    report = run.train(ctx, tmp_path, "c", limit=60, worker=train_worker(fail="adversarial-seed2"))
+    assert {"run": "adversarial-seed2", "failed": "ValueError: loss became NaN"} in report["runs"]
+    record = run.outcomes(tmp_path / "train.attempts")["adversarial-seed2"]
+    assert record["starts"] == 1 and record["end"]["outcome"] == "failed"
+    with pytest.raises(ValueError, match="never rerun"):
+        run.train(ctx, tmp_path, "c", ("adversarial-seed2",), limit=60, worker=train_worker())
+    # It is a failed seed, kept as such; the other runs stand.
+    runs = run.trained_runs(tmp_path)
+    assert runs["adversarial"][1] is None and runs["adversarial"][0] == {"seed": 1}
+
+
+def test_a_killed_run_is_rerun_only_when_named_and_once(tmp_path, monkeypatch):
+    threads(monkeypatch)
+    ctx = FakeCtx()
+    run.train(ctx, tmp_path, "c", limit=60, worker=train_worker(interrupt="baseline-seed4"))
+    assert run.outcomes(tmp_path / "train.attempts")["baseline-seed4"]["end"]["outcome"] \
+        == "interrupted"
+    with pytest.raises(ValueError, match="did not finish"):
+        run.trained_runs(tmp_path)
+    with pytest.raises(ValueError, match="named, and once"):
+        run.train(ctx, tmp_path, "c", limit=60, worker=train_worker())
+    run.train(ctx, tmp_path, "c", ("baseline-seed4",), limit=60,
+              worker=train_worker(interrupt="baseline-seed4"))
+    with pytest.raises(ValueError, match="named, and once"):
+        run.train(ctx, tmp_path, "c", ("baseline-seed4",), limit=60, worker=train_worker())
+    # A start with no end (the step itself was killed) counts as killed too.
+    (tmp_path / "train.attempts").write_text(json.dumps({"run": "baseline-seed4",
+                                                         "started": 0}) + "\n")
+    run.train(ctx, tmp_path, "c", ("baseline-seed4",), limit=60, worker=train_worker())
+    assert run.trained_runs(tmp_path)["baseline"][3] == {"seed": 4}
+
+
+def test_a_step_past_one_and_a_half_times_its_estimate_stops(tmp_path, monkeypatch):
+    threads(monkeypatch)
+    with pytest.raises(ValueError, match="no estimate"):
+        run.limit_seconds(tmp_path, "selection")
+    (tmp_path / "estimates.json").write_text(json.dumps({"selection": 10}))
+    assert run.limit_seconds(tmp_path, "selection") == 15
+    with pytest.raises(ValueError, match="no estimate for holdout"):
+        run.limit_seconds(tmp_path, "holdout")
+
+    def slow(job):
+        if job["day"] > 1:
+            time.sleep(1.0)
+        return {"net": "1"}
+
+    jobs = [{"condition": "c", "arm": "baseline", "seed": 1, "regime": "calm", "day": d}
+            for d in (1, 2, 3)]
+    with pytest.raises(run.Overrun, match="ran past"):
+        run.pool(jobs, slow, 1, "selection", tmp_path / "selection.journal", 0.5)
+    journaled = (tmp_path / "selection.journal").read_text().splitlines()
+    assert len(journaled) == 1
+    ctx = FakeCtx()
+
+    def slow_train(job):
+        time.sleep(1.0)
+        return {}
+
+    with pytest.raises(run.Overrun):
+        run.train(ctx, tmp_path, "c", limit=0.3, worker=slow_train)
+    ends = run.outcomes(tmp_path / "train.attempts")
+    assert {r["end"]["outcome"] for r in ends.values() if r["end"]} == {"stopped"}
+    # A stopped run is a failed seed, never rerun.
+    with pytest.raises(ValueError, match="never rerun"):
+        run.train(ctx, tmp_path, "c", ("adversarial-seed1",), limit=60, worker=train_worker())
 
 
 def frozen_study(tmp_path, monkeypatch):
@@ -356,6 +434,7 @@ def frozen_study(tmp_path, monkeypatch):
               "frozen_models_sha256": run.sha256(tmp_path / "frozen_models.json"),
               "digests_sha256": {"x.json": "y"}}
     (tmp_path / "frozen.json").write_text(json.dumps(frozen))
+    (tmp_path / "estimates.json").write_text(json.dumps({"holdout": 100}))
     monkeypatch.setattr(run, "impact_provenance", lambda ctx: None)
     monkeypatch.setattr(run, "check_models", lambda ctx, out: {})
     monkeypatch.setattr(run, "holdout_jobs", lambda *a: [])
@@ -423,3 +502,25 @@ def test_the_holdout_conditions_and_their_runs(monkeypatch):
     jobs = run.holdout_jobs(ctx, "out", {"impact": None}, models)
     assert "impact" not in {j["condition"] for j in jobs}
     assert len(jobs) == (10 * 25 + 5 * 14) * 30
+
+
+def test_a_failed_seed_is_frozen_as_failed_and_its_days_are_missing(tmp_path, monkeypatch):
+    class Market:
+        def digest(self):
+            return "d"
+
+    monkeypatch.setattr(run, "Context", lambda _: FakeCtx())
+    monkeypatch.setattr(run, "market_for", lambda *a: (Market(), 7))
+    row = run.run_policy({"run_dir": "x", "split": "holdout", "point": "p", "regime": "thin",
+                          "day": 4, "metadata": None, "condition": "unperturbed",
+                          "arm": "adversarial", "seed": 3, "frozen_sha256": None})
+    assert row["net"] is None and row["error"] == "the seed failed in training"
+    monkeypatch.setattr(run, "FROZEN_MODELS", tmp_path / "frozen_models.json")
+    (tmp_path / "frozen_models.json").write_text(json.dumps(
+        {"models": {"adversarial-seed3": {"failed": "the seed failed in training"}}}))
+    monkeypatch.setattr(run, "policies",
+                        lambda ctx, out: [("adversarial", 3, {"path": str(tmp_path / "x")})])
+    with pytest.raises(ValueError, match="not as frozen"):
+        run.check_models(FakeCtx(), tmp_path)
+    monkeypatch.setattr(run, "policies", lambda ctx, out: [("adversarial", 3, None)])
+    assert run.check_models(FakeCtx(), tmp_path)["adversarial-seed3"]["failed"]

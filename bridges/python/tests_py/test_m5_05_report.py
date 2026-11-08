@@ -86,8 +86,12 @@ CHOSEN = {"adversarial": {"point": "p1"}, "baseline": {"point": "p2"},
           "reference": {"point": "p1"}}
 
 
+def analyse(rows, chosen=CHOSEN, impact_run=True):
+    return report.analyse(rows, chosen, impact_run, names=["p1", "p2"], in_sample_names=[])
+
+
 def test_signs_and_the_claim():
-    result = report.analyse(study(a_tail=2.0, b_tail=8.0, a_net=0.5, b_net=1.0), CHOSEN)
+    result = analyse(study(a_tail=2.0, b_tail=8.0, a_net=0.5, b_net=1.0))
     primary = result["primary"]
     # A's tail loss is smaller: negative, an improvement; A earns less: negative, a cost.
     assert primary["tail_at_p_A"]["cvar_averaged"]["point"] == pytest.approx(-6.0)
@@ -97,13 +101,13 @@ def test_signs_and_the_claim():
     assert result["claim"] == "gain"
     assert result["conditions_evaluated"] == 4
     assert result["count_below_zero"] == 2
-    worse = report.analyse(study(a_tail=8.0, b_tail=2.0), CHOSEN)
+    worse = analyse(study(a_tail=8.0, b_tail=2.0))
     assert worse["primary"]["tail_at_p_A"]["cvar_averaged"]["point"] == pytest.approx(6.0)
     assert worse["claim"] == "no gain shown"
 
 
 def test_the_denominator_is_the_conditions_actually_evaluated():
-    result = report.analyse(study(2.0, 8.0, impact=False), CHOSEN)
+    result = analyse(study(2.0, 8.0, impact=False), impact_run=False)
     assert result["conditions_evaluated"] == 3
     assert "impact" not in result["secondary"]
     assert "3 held-out conditions evaluated" in report.render(result).replace("of the ", "")
@@ -111,7 +115,7 @@ def test_the_denominator_is_the_conditions_actually_evaluated():
 
 def test_a_missing_seed_day_fails_its_estimators_and_the_claim():
     rows = study(2.0, 8.0, missing=("baseline", "held_out:p2", 3, 4))
-    result = report.analyse(rows, CHOSEN)
+    result = analyse(rows)
     primary = result["primary"]
     assert "failed" in primary["tail_at_p_B"]["cvar_averaged"]
     assert "failed" in primary["tail_at_p_B"]["cvar_per_seed"]
@@ -124,7 +128,7 @@ def test_a_missing_seed_day_fails_its_estimators_and_the_claim():
     text = report.render(result)
     assert "failed (a seed-day is missing)" in text
     # A failed selection leaves no point, and the claim unavailable.
-    result = report.analyse(study(2.0, 8.0), {**CHOSEN, "baseline": {"point": None}})
+    result = analyse(study(2.0, 8.0), chosen={**CHOSEN, "baseline": {"point": None}})
     assert result["claim"] == "unavailable"
 
 
@@ -156,7 +160,51 @@ def test_the_claim_needs_an_improvement_at_both_selected_points():
         return -9.0 if i % 10 < 2 else 0.5
 
     rows += rows_for("held_out:p2", "adversarial", worse_at_p2)
-    result = report.analyse(rows, CHOSEN)
+    result = analyse(rows)
     assert result["primary"]["tail_at_p_A"]["cvar_averaged"]["high"] < 0
     assert result["primary"]["tail_at_p_B"]["cvar_averaged"]["low"] > 0
     assert result["claim"] == "no gain shown"
+
+
+def test_an_absent_seed_or_day_is_missing_not_a_smaller_sample():
+    rows = study(2.0, 8.0)
+    no_seed = [r for r in rows if not (r["arm"] == "baseline" and r["seed"] == 5
+                                       and r["condition"] == "held_out:p2")]
+    result = analyse(no_seed)
+    assert "failed" in result["primary"]["tail_at_p_B"]["cvar_averaged"]
+    assert result["claim"] == "unavailable"
+    assert result["table"][("held_out:p2", "baseline")]["missing"] == 30
+    no_day = [r for r in rows if not (r["condition"] == "held_out:p1" and r["regime"] == "thin"
+                                      and r["day"] == 10)]
+    result = analyse(no_day)
+    assert "failed" in result["primary"]["tail_at_p_A"]["cvar_averaged"]
+    assert result["claim"] == "unavailable"
+    # A condition with no row at all is missing whole, never left out.
+    no_condition = [r for r in rows if r["condition"] != "execution_stress"]
+    result = analyse(no_condition)
+    assert "failed" in result["secondary"]["execution_stress"]["cvar_averaged"]
+    assert result["conditions_evaluated"] == 4
+    assert result["table"][("execution_stress", "adversarial")]["missing"] == 150
+
+
+def test_rows_outside_the_grid_or_twice_are_refused():
+    rows = study(2.0, 8.0)
+    with pytest.raises(ValueError, match="two rows"):
+        analyse(rows + [dict(rows[0])])
+    with pytest.raises(ValueError, match="outside"):
+        analyse(rows + [{**rows[0], "seed": 6}])
+    with pytest.raises(ValueError, match="outside"):
+        analyse(rows + [{**rows[0], "day": 11}])
+
+
+def test_the_registered_conditions_are_the_runners():
+    spec = importlib.util.spec_from_file_location(
+        "m5_05_run_names", HERE.parent / "experiments" / "m5_05" / "run.py")
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    _, _, m5_03 = run.load()
+    assert report.grid_names(held_out=True) == [n for n, _ in run.held_out_points(m5_03)]
+    assert report.grid_names(held_out=False) == [
+        n for n, _ in run.training_points(m5_03) if n != run.unperturbed_name()]
+    assert len(report.held_out_conditions(True)) == 14
+    assert len(report.held_out_conditions(False)) == 13
