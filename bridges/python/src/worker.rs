@@ -684,11 +684,12 @@ enum Reply {
     Replaced(Result<EnvInfo, String>),
 }
 
-/// A step taken since the last reset, to replay on other rows (#282).
+/// A step taken since the last reset and its reply, to replay on other rows (#282): the
+/// replayed step must give the same reply.
 #[derive(Debug, Clone, Copy)]
 enum Logged {
-    Step(RlAction),
-    Residual(ResidualProposal),
+    Step(RlAction, StepReply),
+    Residual(ResidualProposal, StepReply),
 }
 
 /// What a replay must reach: the episode before the rows were replaced.
@@ -909,6 +910,12 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
     }
 }
 
+/// Equal, or equal down to the bits a `Debug` print shows: a NaN a policy proposed equals
+/// itself, which `PartialEq` on floats does not grant. The print is only made when `==` fails.
+fn same<T: PartialEq + std::fmt::Debug>(a: &T, b: &T) -> bool {
+    a == b || format!("{a:?}") == format!("{b:?}")
+}
+
 /// Replays `resume` on `env`, checks it against what it must reach, and answers the replace
 /// that asked for it. `None` when it reached it (or had nothing to reach), with the episode;
 /// otherwise the rebuild that falls back.
@@ -921,13 +928,22 @@ fn replay<D: Driver>(
     let mut audit = Audit::default();
     let replayed = (|| -> Result<State, String> {
         let mut state = env.reset(resume.seed, &mut audit)?;
-        for step in &resume.log {
-            match step {
-                Logged::Step(action) => env.step(&mut state, *action, &mut audit)?,
-                Logged::Residual(proposal) => {
-                    env.step_residual(&mut state, *proposal, &mut audit)?
+        for (index, step) in resume.log.iter().enumerate() {
+            let (reply, logged) = match step {
+                Logged::Step(action, logged) => {
+                    (env.step(&mut state, *action, &mut audit)?, logged)
                 }
+                Logged::Residual(proposal, logged) => (
+                    env.step_residual(&mut state, *proposal, &mut audit)?,
+                    logged,
+                ),
             };
+            if !same(&reply, logged) {
+                return Err(format!(
+                    "the replayed step {} differs from the episode's",
+                    index + 1
+                ));
+            }
         }
         Ok(state)
     })();
@@ -945,7 +961,9 @@ fn replay<D: Driver>(
                     "the replayed state differs after {} steps",
                     resume.log.len()
                 ))
-            } else if observation.as_ref() != Ok(&expect.observation)
+            } else if !observation
+                .as_ref()
+                .is_ok_and(|observation| same(observation, &expect.observation))
                 || env.mask(state) != expect.mask
                 || env.hedge_mask(state) != expect.hedge_mask
             {
@@ -1026,15 +1044,17 @@ fn answer<D: Driver>(
             }
             Request::Step(action) => Reply::Step(match episode.as_mut() {
                 None => Err(none()),
-                Some((state, audit)) => env.step(state, action, audit).inspect(|_| {
-                    log.push(Logged::Step(action));
+                Some((state, audit)) => env.step(state, action, audit).inspect(|reply| {
+                    log.push(Logged::Step(action, *reply));
                 }),
             }),
             Request::StepResidual(proposal) => Reply::Step(match episode.as_mut() {
                 None => Err(none()),
-                Some((state, audit)) => env.step_residual(state, proposal, audit).inspect(|_| {
-                    log.push(Logged::Residual(proposal));
-                }),
+                Some((state, audit)) => {
+                    env.step_residual(state, proposal, audit).inspect(|reply| {
+                        log.push(Logged::Residual(proposal, *reply));
+                    })
+                }
             }),
             Request::Attribution => Reply::Attribution(match episode.as_ref() {
                 None => Err(none()),
@@ -1681,17 +1701,21 @@ impl Worker {
 
     /// Replaces the rows under the running episode (#282). The worker rebuilds the
     /// environment on `rows`, resets it with the episode's seed and replays the episode's
-    /// steps; the new rows must keep the rows already read, and the replay must reach the
-    /// same state, observation and masks. The digest of the new rows is the info's; the
-    /// specification and the kernel's fingerprint stay. The replayed steps' counts are not
-    /// reported again, and the attribution covers them.
+    /// steps: every replayed step must give the reply the episode got, and the replay must
+    /// reach the same state (apart from the dataset's identity), observation and masks. The
+    /// new rows must also keep every row up to the one last observed. With an observation
+    /// latency longer than a row, the kernel has matched rows past that one; changing them is
+    /// refused by the replay, so a caller that reacts after the observed row is refused then.
+    /// The digest of the new rows is the info's; the specification and the kernel's
+    /// fingerprint stay. The replayed steps' counts are not reported again, and the
+    /// attribution covers them.
     ///
     /// # Errors
     ///
     /// Returns [`BridgeError::Refused`] before any reset, after the episode ended, for rows
-    /// that change what was read, rows the kernel refuses, or a replay that does not reach
-    /// the episode; the episode then goes on, unchanged, on the old rows. Otherwise as
-    /// [`Worker::step`].
+    /// that change what was observed, rows the kernel refuses, or a replay that differs; the
+    /// episode then goes on in the same state on the old rows (after a failed rebuild or
+    /// replay, in an environment rebuilt on them). Otherwise as [`Worker::step`].
     pub fn replace_rows(&mut self, rows: Vec<KernelTick>) -> Result<EnvInfo, BridgeError> {
         match self.call(Request::ReplaceRows(rows))? {
             Reply::Replaced(Ok(info)) => {

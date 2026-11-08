@@ -53,7 +53,8 @@ project follows [Semantic Versioning](https://semver.org/).
   `NativeEnv.replace_rows` (and `replace_rows` on the bridge's environments) replaces the rows
   under a running episode: the worker rebuilds the environment, resets it with the episode's
   seed and replays its steps in Rust, after checking that the new rows keep the rows already
-  read; the replayed state must equal the episode's apart from the dataset's identity
+  read; every replayed step must give the reply the episode got, and the replayed state must
+  equal the episode's apart from the dataset's identity
   (`RlState::same_apart_from_dataset`, `KernelState::same_apart_from_dataset`), with the same
   observation and masks. A refused replace leaves the episode as it was.
 - A second, margin-stress holdout for #105's comparison in `bridges/python/experiments/m4_08`

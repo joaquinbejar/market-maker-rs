@@ -2009,7 +2009,7 @@ fn test_each_check_of_a_replace_refuses_on_its_own() {
     run_steps(&mut worker, 0, 30);
     assert!(refusal(worker.replace_rows(shifted(&rows, 3, 1))).contains("already read"));
     // With observations late by more than a row, the kernel has matched the row after the
-    // one observed: changing it keeps the observed rows, and the replay tells.
+    // one observed: changing it keeps the observed rows, and only the replay tells.
     let mut late = grid_bridge();
     late.latency = LatencyConfig {
         quantum_ns: 1_000_000,
@@ -2032,7 +2032,8 @@ fn test_each_check_of_a_replace_refuses_on_its_own() {
         .row
         .unwrap() as usize;
     let reason = refusal(worker.replace_rows(shifted(&rows, observed + 1, 5)));
-    assert!(reason.contains("replayed state differs"), "{reason}");
+    // The replayed steps tell first: a step's fill or reward moved.
+    assert!(reason.contains("replayed step"), "{reason}");
     // The episode goes on, unchanged, on the old rows.
     assert_eq!(worker.info(), plain.info());
     assert_eq!(
@@ -2040,4 +2041,51 @@ fn test_each_check_of_a_replace_refuses_on_its_own() {
         run_steps(&mut worker, 30, 80)
     );
     assert_eq!(plain.attribution().unwrap(), worker.attribution().unwrap());
+}
+
+#[test]
+fn test_a_replace_after_a_proposal_with_a_nan_replays_it() {
+    let bridge = residual_config(AVELLANEDA);
+    let rows = crossing_rows(120);
+    let nan = ResidualProposal {
+        bid_away: f64::NAN,
+        ask_away: 0.0,
+        bid_size: 0.0,
+        ask_size: 0.0,
+    };
+    let mut plain = Worker::spawn(bridge.clone(), rows.clone(), None).unwrap();
+    let mut replaced = Worker::spawn(bridge, rows.clone(), None).unwrap();
+    for worker in [&mut plain, &mut replaced] {
+        worker.reset(1).unwrap();
+        let reply = worker.step_residual(nan).unwrap();
+        assert!(
+            reply.decision.is_some(),
+            "the NaN falls back, and is kept in the reply"
+        );
+        worker.step(RlAction::Hold).unwrap();
+    }
+    // The same rows: the replay reaches the step with the NaN.
+    replaced.replace_rows(rows.clone()).unwrap();
+    // A refused replace: the episode is rebuilt and replayed on the old rows, NaN included.
+    assert!(matches!(
+        replaced.replace_rows(shifted(&rows, 0, 1)),
+        Err(BridgeError::Refused(_))
+    ));
+    let mut bad = rows.clone();
+    bad[100].bid = 0;
+    assert!(matches!(
+        replaced.replace_rows(bad),
+        Err(BridgeError::Refused(_))
+    ));
+    for step in 0..20 {
+        assert_eq!(
+            plain.step(RlAction::Hold).unwrap(),
+            replaced.step(RlAction::Hold).unwrap(),
+            "step {step}"
+        );
+    }
+    assert_eq!(
+        plain.attribution().unwrap(),
+        replaced.attribution().unwrap()
+    );
 }
