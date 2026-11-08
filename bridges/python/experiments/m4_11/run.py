@@ -498,6 +498,12 @@ def run_train(study, dataset, arm, alpha=None):
     return report
 
 
+def ppo_job(job):
+    """#102's training of one maskable PPO run, from this module: the pool's spawned workers
+    import a worker by its module's name, which the spec-loaded #102 runner does not have."""
+    return base.train_job(job)
+
+
 def run_ppo(study):
     require(study, "gate", "the PPO comparator waits for the queue gate")
     arm = study.m4_05["arms"]["maskable_ppo"]
@@ -509,7 +515,7 @@ def run_ppo(study):
              "data_dir": study.data_dir, "commit": study.commit,
              "path": str(study.out / "checkpoints" / "ppo" / f"maskable_ppo-seed{seed}")}
             for seed in study.design["arms"]["training_seeds"]]
-    rows = pool(jobs, base.train_job, study.parallel, "ppo")
+    rows = pool(jobs, ppo_job, study.parallel, "ppo")
     report = study.header("ppo")
     report["runs"] = rows
     study.write("ppo", report)

@@ -211,3 +211,16 @@ def test_a_failed_or_concurrent_holdout_is_never_run_again(tmp_path, monkeypatch
     with pytest.raises(FileExistsError):
         run.holdout(study, good)
     assert calls == [1]
+
+
+def test_every_pool_worker_is_this_runners_own_function(monkeypatch):
+    # A spawned worker imports its function by module name: the spec-loaded runners of
+    # #102 and #104 have none, so the pool must be given this module's functions.
+    import ast
+    tree = ast.parse((HERE.parent / "experiments" / "m4_11" / "run.py").read_text())
+    defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    workers = [call.args[1] for call in ast.walk(tree)
+               if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "pool"]
+    assert workers and all(isinstance(w, ast.Name) and w.id in defined for w in workers), [
+        ast.unparse(w) for w in workers]
+    assert run.ppo_job.__module__ == run.__name__
