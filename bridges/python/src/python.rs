@@ -101,6 +101,30 @@ fn action_dict<'py>(py: Python<'py>, action: &KernelAction) -> PyResult<Bound<'p
     Ok(out)
 }
 
+fn info_dict<'py>(py: Python<'py>, info: &crate::worker::EnvInfo) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+
+    out.set_item(
+        "spec",
+        (
+            info.spec.observation,
+            info.spec.action,
+            info.spec.reward,
+            info.spec.episode,
+            hex(info.spec.fingerprint),
+        ),
+    )?;
+    out.set_item("features", info.features)?;
+    out.set_item("offsets", info.offsets)?;
+    out.set_item("sizes", info.sizes)?;
+    out.set_item("hedge_actions", info.hedge_actions)?;
+    out.set_item("cancel_action", info.cancel_action)?;
+    out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
+    out.set_item("dataset_digest", hex(info.dataset_digest))?;
+    out.set_item("rows", info.rows)?;
+    Ok(out)
+}
+
 fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyDict>> {
     let t = &reply.transition;
     let out = PyDict::new(py);
@@ -251,26 +275,29 @@ impl NativeEnv {
     /// What this environment is.
     fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let info = self.with_worker(py, |worker| Ok(worker.info()))?;
-        let out = PyDict::new(py);
-        out.set_item(
-            "spec",
-            (
-                info.spec.observation,
-                info.spec.action,
-                info.spec.reward,
-                info.spec.episode,
-                hex(info.spec.fingerprint),
-            ),
-        )?;
-        out.set_item("features", info.features)?;
-        out.set_item("offsets", info.offsets)?;
-        out.set_item("sizes", info.sizes)?;
-        out.set_item("hedge_actions", info.hedge_actions)?;
-        out.set_item("cancel_action", info.cancel_action)?;
-        out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
-        out.set_item("dataset_digest", hex(info.dataset_digest))?;
-        out.set_item("rows", info.rows)?;
-        Ok(out)
+        info_dict(py, &info)
+    }
+
+    /// Replaces the rows under the running episode and replays it on them (#282): the new
+    /// rows must keep the rows already read, and the replay must reach the same episode.
+    /// Returns the new info. A refusal (`ValueError`) leaves the episode as it was.
+    fn replace_rows<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(u64, u64, u64, u64, u64)>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rows: Vec<KernelTick> = rows
+            .into_iter()
+            .map(|(ts_ns, bid, bid_lots, ask, ask_lots)| KernelTick {
+                ts_ns,
+                bid,
+                bid_lots,
+                ask,
+                ask_lots,
+            })
+            .collect();
+        let info = self.with_worker(py, move |worker| worker.replace_rows(rows))?;
+        info_dict(py, &info)
     }
 
     /// Starts an episode.

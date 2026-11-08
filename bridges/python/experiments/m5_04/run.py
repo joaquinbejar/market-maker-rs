@@ -110,11 +110,13 @@ class ReplayMismatch(RuntimeError):
     """A replay that does not reach the pre-reaction step: the run stops."""
 
 
-def reactive_episode(policy, make_env, market, kappa, rng, seed, m4_05):
+def reactive_episode(policy, make_env, market, kappa, rng, seed, m4_05, replay="native"):
     """One evaluated day in rows that react to the agent's fills, with base.episode's result
-    and the reactions. After a reaction the environment is rebuilt on the new rows and the
-    logged actions are replayed without querying the policy; the replay must reach the same
-    observation, net and penalties."""
+    and the reactions. After a reaction the episode is replayed on the new rows without
+    querying the policy, and must reach the same step: by default in the bridge's worker
+    (replace_rows, which checks the whole state, the observation and the masks); with
+    replay="python", by rebuilding the environment and stepping the logged actions here,
+    checking the observation, net and penalties."""
     env = make_env(market.rows())
     log = []
     observation, _ = env.reset(seed=seed)
@@ -135,15 +137,22 @@ def reactive_episode(policy, make_env, market, kappa, rng, seed, m4_05):
                 step_moves = moves_for(kappa, info["filled_lots"], rng)
                 if step_moves:
                     market.react(info["row"], step_moves)
-                    env.close()
-                    env = make_env(market.rows())
-                    again, _ = env.reset(seed=seed)
-                    for logged in log:
-                        again, _, _, _, check = env.step(logged)
-                    if not (np.array_equal(again, observation) and check["net"] == info["net"]
-                            and check["penalties"] == info["penalties"]):
-                        raise ReplayMismatch(f"step {len(log)} after a reaction")
-                    observation = again
+                    if replay == "native":
+                        try:
+                            env.replace_rows(market.rows())
+                        except ValueError as error:
+                            raise ReplayMismatch(f"step {len(log)}: {error}") from error
+                    else:
+                        env.close()
+                        env = make_env(market.rows())
+                        again, _ = env.reset(seed=seed)
+                        for logged in log:
+                            again, _, _, _, check = env.step(logged)
+                        if not (np.array_equal(again, observation)
+                                and check["net"] == info["net"]
+                                and check["penalties"] == info["penalties"]):
+                            raise ReplayMismatch(f"step {len(log)} after a reaction")
+                        observation = again
                     reactions += 1
                     moves += abs(step_moves)
                     replayed += len(log)

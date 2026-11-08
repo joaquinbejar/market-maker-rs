@@ -122,3 +122,41 @@ def test_reactions_replay_to_the_same_step_and_change_the_day():
     again = run.reactive_episode(policy, make_env, short_market(), 2.0, run.impact_rng(1), 101,
                                  M4_05)
     assert again["net"] == reacted["net"], "reproducible"
+
+
+def test_the_native_replay_reaches_what_the_python_one_does():
+    policy, make_env = fixed_spread()
+    native = run.reactive_episode(policy, make_env, short_market(), 2.0, run.impact_rng(1), 101,
+                                  M4_05)
+    python = run.reactive_episode(policy, make_env, short_market(), 2.0, run.impact_rng(1), 101,
+                                  M4_05, replay="python")
+    assert native["reactions"] == python["reactions"] > 0
+    assert native["moves"] == python["moves"]
+    assert native["net"] == python["net"] and native["attribution"] == python["attribution"]
+    assert native["positions"] == python["positions"]
+
+
+def test_replacing_rows_that_change_what_was_read_is_refused_and_changes_nothing():
+    policy, make_env = fixed_spread()
+    market = short_market()
+    rows = market.rows()
+    env = make_env(rows)
+    other = make_env(rows)
+    try:
+        observation, _ = env.reset(seed=101)
+        other.reset(seed=101)
+        for _ in range(30):
+            observation, *_ = env.step([1, 1, 1, 0, 0])
+            other.step([1, 1, 1, 0, 0])
+        changed = [list(r) for r in rows]
+        changed[3][1] += 2
+        with pytest.raises(ValueError):
+            env.replace_rows([tuple(r) for r in changed])
+        assert env.bridge_info == other.bridge_info
+        for _ in range(30):
+            a = env.step([1, 1, 1, 0, 0])
+            b = other.step([1, 1, 1, 0, 0])
+            assert a[4]["net"] == b[4]["net"]
+    finally:
+        env.close()
+        other.close()

@@ -670,6 +670,7 @@ enum Request {
     Step(RlAction),
     StepResidual(ResidualProposal),
     Attribution,
+    ReplaceRows(Vec<KernelTick>),
     #[cfg(test)]
     Panic,
 }
@@ -680,6 +681,41 @@ enum Reply {
     Reset(Result<ResetReply, String>),
     Step(Result<StepReply, String>),
     Attribution(Result<AttributionReply, String>),
+    Replaced(Result<EnvInfo, String>),
+}
+
+/// A step taken since the last reset, to replay on other rows (#282).
+#[derive(Debug, Clone, Copy)]
+enum Logged {
+    Step(RlAction),
+    Residual(ResidualProposal),
+}
+
+/// What a replay must reach: the episode before the rows were replaced.
+#[derive(Debug, Clone, Copy)]
+struct Expect {
+    state: State,
+    observation: FeatureVector,
+    mask: ActionMask,
+    hedge_mask: u64,
+}
+
+/// An episode to rebuild on other rows: its seed and steps, what the replay must reach (none
+/// when the rows are the ones it ran on), and the rows to fall back to if it does not.
+#[derive(Debug, Clone)]
+struct Resume {
+    seed: u64,
+    log: Vec<Logged>,
+    expect: Option<Box<Expect>>,
+    fallback: Option<Vec<KernelTick>>,
+}
+
+/// How a request loop ended.
+enum Answered {
+    /// The requests ended.
+    Closed,
+    /// Rebuild on `rows`, then resume.
+    Rebuild(Vec<KernelTick>, Resume),
 }
 
 type State = RlState<ORD, MSG, DLV, OBS>;
@@ -873,21 +909,109 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
     }
 }
 
-/// Answers requests until the sender goes.
+/// Replays `resume` on `env`, checks it against what it must reach, and answers the replace
+/// that asked for it. `None` when it reached it (or had nothing to reach), with the episode;
+/// otherwise the rebuild that falls back.
+fn replay<D: Driver>(
+    env: &mut D,
+    info: EnvInfo,
+    replies: &mpsc::Sender<Reply>,
+    resume: Resume,
+) -> Result<(State, Audit, Vec<Logged>, u64), Answered> {
+    let mut audit = Audit::default();
+    let replayed = (|| -> Result<State, String> {
+        let mut state = env.reset(resume.seed, &mut audit)?;
+        for step in &resume.log {
+            match step {
+                Logged::Step(action) => env.step(&mut state, *action, &mut audit)?,
+                Logged::Residual(proposal) => {
+                    env.step_residual(&mut state, *proposal, &mut audit)?
+                }
+            };
+        }
+        Ok(state)
+    })();
+    // The replayed steps' counts are not reported.
+    audit.orders = OrderCounts::default();
+    audit.gates = GateCounts::default();
+    audit.filled = FilledLots::default();
+    let reached = match (&replayed, &resume.expect) {
+        (Err(error), _) => Err(format!("the replay failed: {error}")),
+        (Ok(_), None) => Ok(()),
+        (Ok(state), Some(expect)) => {
+            let observation = env.observe(state);
+            if !state.same_apart_from_dataset(&expect.state) {
+                Err(format!(
+                    "the replayed state differs after {} steps",
+                    resume.log.len()
+                ))
+            } else if observation.as_ref() != Ok(&expect.observation)
+                || env.mask(state) != expect.mask
+                || env.hedge_mask(state) != expect.hedge_mask
+            {
+                Err(format!(
+                    "the replayed observation differs after {} steps",
+                    resume.log.len()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    };
+    if resume.expect.is_some() {
+        let reply = reached.as_ref().map(|()| info).map_err(Clone::clone);
+        if replies.send(Reply::Replaced(reply)).is_err() {
+            return Err(Answered::Closed);
+        }
+    }
+    match (reached, replayed) {
+        (Ok(()), Ok(state)) => Ok((state, audit, resume.log, resume.seed)),
+        (_, _) => match resume.fallback {
+            // Back to the rows it ran on, where the replay reaches the same episode.
+            Some(rows) => Err(Answered::Rebuild(
+                rows,
+                Resume {
+                    expect: None,
+                    fallback: None,
+                    ..resume
+                },
+            )),
+            None => Err(Answered::Closed),
+        },
+    }
+}
+
+/// Answers requests until the sender goes or the rows are replaced. `resume` rebuilds an
+/// episode first, on rows that keep what it read.
 fn answer<D: Driver>(
     mut env: D,
+    info: EnvInfo,
+    rows: &[KernelTick],
     requests: &mpsc::Receiver<Request>,
     replies: &mpsc::Sender<Reply>,
-) {
+    resume: Option<Resume>,
+) -> Answered {
     let mut episode: Option<(State, Audit)> = None;
+    let mut log: Vec<Logged> = Vec::new();
+    let mut seed = 0;
+    if let Some(resume) = resume {
+        match replay(&mut env, info, replies, resume) {
+            Ok((state, audit, steps, from)) => {
+                episode = Some((state, audit));
+                log = steps;
+                seed = from;
+            }
+            Err(answered) => return answered,
+        }
+    }
     let none = || "a step before any reset".to_string();
     for request in requests {
         let reply = match request {
             #[cfg(test)]
             Request::Panic => panic!("a panic asked for by a test"),
-            Request::Reset(seed) => {
+            Request::Reset(from) => {
                 let mut audit = Audit::default();
-                Reply::Reset(env.reset(seed, &mut audit).and_then(|fresh| {
+                Reply::Reset(env.reset(from, &mut audit).and_then(|fresh| {
                     let reply = ResetReply {
                         observation: env.observe(&fresh)?,
                         mask: env.mask(&fresh),
@@ -895,26 +1019,69 @@ fn answer<D: Driver>(
                         done: fresh.is_done(),
                     };
                     episode = Some((fresh, audit));
+                    log.clear();
+                    seed = from;
                     Ok(reply)
                 }))
             }
             Request::Step(action) => Reply::Step(match episode.as_mut() {
                 None => Err(none()),
-                Some((state, audit)) => env.step(state, action, audit),
+                Some((state, audit)) => env.step(state, action, audit).inspect(|_| {
+                    log.push(Logged::Step(action));
+                }),
             }),
             Request::StepResidual(proposal) => Reply::Step(match episode.as_mut() {
                 None => Err(none()),
-                Some((state, audit)) => env.step_residual(state, proposal, audit),
+                Some((state, audit)) => env.step_residual(state, proposal, audit).inspect(|_| {
+                    log.push(Logged::Residual(proposal));
+                }),
             }),
             Request::Attribution => Reply::Attribution(match episode.as_ref() {
                 None => Err(none()),
                 Some((state, audit)) => env.inner_attribution(state, audit),
             }),
+            Request::ReplaceRows(new_rows) => match episode.as_ref() {
+                None => Reply::Replaced(Err("a replace before any reset".to_string())),
+                Some((state, _)) if state.is_done() => {
+                    Reply::Replaced(Err("a replace after the episode ended".to_string()))
+                }
+                Some((state, _)) => match env.observe(state) {
+                    Err(error) => Reply::Replaced(Err(error)),
+                    Ok(observation) => {
+                        // The rows it has read, through the row it observed, must not change.
+                        let read = observation
+                            .row
+                            .and_then(|row| usize::try_from(row).ok())
+                            .map_or(0, |row| row.saturating_add(1));
+                        if new_rows.get(..read) != rows.get(..read) {
+                            Reply::Replaced(Err(format!(
+                                "the new rows differ within the {read} rows already read"
+                            )))
+                        } else {
+                            return Answered::Rebuild(
+                                new_rows,
+                                Resume {
+                                    seed,
+                                    log,
+                                    expect: Some(Box::new(Expect {
+                                        state: *state,
+                                        observation,
+                                        mask: env.mask(state),
+                                        hedge_mask: env.hedge_mask(state),
+                                    })),
+                                    fallback: Some(rows.to_vec()),
+                                },
+                            );
+                        }
+                    }
+                },
+            },
         };
         if replies.send(reply).is_err() {
-            return;
+            return Answered::Closed;
         }
     }
+    Answered::Closed
 }
 
 /// Builds a residual environment over `source` and answers requests.
@@ -923,7 +1090,7 @@ fn serve_residual<S: QuoteSource + Clone>(
     source: S,
     default_order_size: Decimal,
     bounds: ResidualBounds,
-) {
+) -> Option<Answered> {
     let Job {
         kernel,
         data,
@@ -932,6 +1099,7 @@ fn serve_residual<S: QuoteSource + Clone>(
         ready,
         requests,
         replies,
+        resume,
     } = job;
     let refuse =
         |error: market_maker_rs::types::error::MMError| BridgeError::Refused(error.to_string());
@@ -957,13 +1125,13 @@ fn serve_residual<S: QuoteSource + Clone>(
         Ok((env, info))
     });
     match built {
-        Ok((env, info)) => {
-            if ready.send(Ok(info)).is_ok() {
-                answer(env, &requests, &replies);
-            }
-        }
+        Ok((env, info)) => ready
+            .send(Ok(info))
+            .is_ok()
+            .then(|| answer(env, info, data.ticks(), requests, replies, resume)),
         Err(error) => {
             let _ = ready.send(Err(error));
+            None
         }
     }
 }
@@ -985,7 +1153,7 @@ fn check_spec(
 }
 
 /// Parses the baseline and serves it.
-fn start_residual(job: Job<'_>, residual: &ResidualConfig) {
+fn start_residual(job: Job<'_>, residual: &ResidualConfig) -> Option<Answered> {
     let bounds = ResidualBounds {
         price_ticks: residual.price_ticks,
         size_lots: residual.size_lots,
@@ -1002,6 +1170,7 @@ fn start_residual(job: Job<'_>, residual: &ResidualConfig) {
         Ok((size, Baseline::Scheduled(source))) => serve_residual(job, source, size, bounds),
         Err(error) => {
             let _ = job.ready.send(Err(error));
+            None
         }
     }
 }
@@ -1187,13 +1356,15 @@ struct Job<'a> {
     config: &'a BridgeConfig,
     expected: Option<SpecId>,
     ready: mpsc::Sender<Result<EnvInfo, BridgeError>>,
-    requests: mpsc::Receiver<Request>,
-    replies: mpsc::Sender<Reply>,
+    requests: &'a mpsc::Receiver<Request>,
+    replies: &'a mpsc::Sender<Reply>,
+    /// An episode to rebuild on these rows first.
+    resume: Option<Resume>,
 }
 
 /// Builds the environment and answers requests. The environment borrows the data here,
 /// and goes before the data does.
-fn serve<const K: usize, const M: usize>(job: Job<'_>) {
+fn serve<const K: usize, const M: usize>(job: Job<'_>) -> Option<Answered> {
     let Job {
         kernel: kernel_config,
         data,
@@ -1202,6 +1373,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
         ready,
         requests,
         replies,
+        resume,
     } = job;
     let built = (|| {
         let array = |what: &str, len: usize| {
@@ -1244,19 +1416,19 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) {
         };
         Ok((env, info))
     })();
-    let env = match built {
+    let (env, info) = match built {
         Ok((env, info)) => {
             if ready.send(Ok(info)).is_err() {
-                return;
+                return None;
             }
-            env
+            (env, info)
         }
         Err(error) => {
             let _ = ready.send(Err(error));
-            return;
+            return None;
         }
     };
-    answer(env, &requests, &replies);
+    Some(answer(env, info, data.ticks(), requests, replies, resume))
 }
 
 macro_rules! dispatch {
@@ -1267,6 +1439,7 @@ macro_rules! dispatch {
                 let _ = $job.ready.send(Err(BridgeError::Refused(format!(
                     "a grid of {offsets} offsets and {sizes} sizes is not built in"
                 ))));
+                None
             }
         }
     };
@@ -1324,40 +1497,93 @@ impl Worker {
             .stack_size(STACK_BYTES)
             .spawn(move || {
                 let _guard = guard;
-                let prepared = config.kernel().and_then(|kernel| {
-                    KernelDataset::from_kernel_ticks(rows, &kernel)
-                        .map(|data| (kernel, data))
-                        .map_err(|error| BridgeError::Refused(error.to_string()))
-                });
-                let (kernel, data) = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                        return;
+                // The first build answers the caller of spawn; a rebuild after a replace
+                // answers through the request loop, so its readiness goes nowhere.
+                let mut ready = Some(ready_tx);
+                let mut rows = rows;
+                let mut resume: Option<Resume> = None;
+                loop {
+                    let (sender, rebuilt) = match ready.take() {
+                        Some(sender) => (sender, None),
+                        None => {
+                            let (sender, receiver) = mpsc::channel();
+                            (sender, Some(receiver))
+                        }
+                    };
+                    let attempt = resume.take();
+                    let prepared = config.kernel().and_then(|kernel| {
+                        KernelDataset::from_kernel_ticks(rows.clone(), &kernel)
+                            .map(|data| (kernel, data))
+                            .map_err(|error| BridgeError::Refused(error.to_string()))
+                    });
+                    let answered = match prepared {
+                        Err(error) => {
+                            let _ = sender.send(Err(error));
+                            None
+                        }
+                        Ok((kernel, data)) => {
+                            let job = Job {
+                                kernel: &kernel,
+                                data: &data,
+                                config: &config,
+                                expected,
+                                ready: sender,
+                                requests: &request_rx,
+                                replies: &reply_tx,
+                                resume: attempt.clone(),
+                            };
+                            if let Some(residual) = &config.residual {
+                                start_residual(job, residual)
+                            } else {
+                                dispatch!(
+                                    job;
+                                    (1, 1, 2, 3, 4),
+                                    (2, 1, 2, 3, 4),
+                                    (3, 1, 2, 3, 4),
+                                    (4, 1, 2, 3, 4),
+                                    (5, 1, 2, 3, 4),
+                                    (8, 1, 2, 3, 4),
+                                )
+                            }
+                        }
+                    };
+                    match (answered, rebuilt) {
+                        (Some(Answered::Rebuild(next, next_resume)), _) => {
+                            rows = next;
+                            resume = Some(next_resume);
+                        }
+                        // The first build failed: spawn reports it.
+                        (None, None) | (Some(Answered::Closed), _) => return,
+                        // A rebuild on the new rows failed before any replay: answer the
+                        // replace, and go back to the rows the episode ran on.
+                        (None, Some(receiver)) => {
+                            let error = match receiver.try_recv() {
+                                Ok(Err(error)) => error.to_string(),
+                                _ => "the environment could not be rebuilt".to_string(),
+                            };
+                            let Some(Resume {
+                                seed,
+                                log,
+                                expect: Some(_),
+                                fallback: Some(previous),
+                            }) = attempt
+                            else {
+                                // Rebuilding the rows the episode ran on cannot fail.
+                                return;
+                            };
+                            if reply_tx.send(Reply::Replaced(Err(error))).is_err() {
+                                return;
+                            }
+                            rows = previous;
+                            resume = Some(Resume {
+                                seed,
+                                log,
+                                expect: None,
+                                fallback: None,
+                            });
+                        }
                     }
-                };
-                let job = Job {
-                    kernel: &kernel,
-                    data: &data,
-                    config: &config,
-                    expected,
-                    ready: ready_tx,
-                    requests: request_rx,
-                    replies: reply_tx,
-                };
-                if let Some(residual) = &config.residual {
-                    start_residual(job, residual);
-                    return;
                 }
-                dispatch!(
-                    job;
-                    (1, 1, 2, 3, 4),
-                    (2, 1, 2, 3, 4),
-                    (3, 1, 2, 3, 4),
-                    (4, 1, 2, 3, 4),
-                    (5, 1, 2, 3, 4),
-                    (8, 1, 2, 3, 4),
-                );
             })
             .map_err(|error| BridgeError::Refused(format!("no worker thread: {error}")))?;
         let ready = ready_rx.recv();
@@ -1396,7 +1622,7 @@ impl Worker {
             Reply::Reset(Err(reason))
             | Reply::Step(Err(reason))
             | Reply::Attribution(Err(reason)) => Err(self.fail(reason)),
-            Reply::Step(Ok(_)) | Reply::Attribution(Ok(_)) => {
+            Reply::Step(Ok(_)) | Reply::Attribution(Ok(_)) | Reply::Replaced(_) => {
                 Err(self.fail("the wrong reply to a reset".to_string()))
             }
         }
@@ -1435,7 +1661,7 @@ impl Worker {
             Reply::Reset(Err(reason))
             | Reply::Step(Err(reason))
             | Reply::Attribution(Err(reason)) => Err(self.fail(reason)),
-            Reply::Reset(Ok(_)) | Reply::Step(Ok(_)) => {
+            Reply::Reset(Ok(_)) | Reply::Step(Ok(_)) | Reply::Replaced(_) => {
                 Err(self.fail("the wrong reply to an attribution".to_string()))
             }
         }
@@ -1447,8 +1673,37 @@ impl Worker {
             Reply::Reset(Err(reason))
             | Reply::Step(Err(reason))
             | Reply::Attribution(Err(reason)) => Err(self.fail(reason)),
-            Reply::Reset(Ok(_)) | Reply::Attribution(Ok(_)) => {
+            Reply::Reset(Ok(_)) | Reply::Attribution(Ok(_)) | Reply::Replaced(_) => {
                 Err(self.fail("the wrong reply to a step".to_string()))
+            }
+        }
+    }
+
+    /// Replaces the rows under the running episode (#282). The worker rebuilds the
+    /// environment on `rows`, resets it with the episode's seed and replays the episode's
+    /// steps; the new rows must keep the rows already read, and the replay must reach the
+    /// same state, observation and masks. The digest of the new rows is the info's; the
+    /// specification and the kernel's fingerprint stay. The replayed steps' counts are not
+    /// reported again, and the attribution covers them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Refused`] before any reset, after the episode ended, for rows
+    /// that change what was read, rows the kernel refuses, or a replay that does not reach
+    /// the episode; the episode then goes on, unchanged, on the old rows. Otherwise as
+    /// [`Worker::step`].
+    pub fn replace_rows(&mut self, rows: Vec<KernelTick>) -> Result<EnvInfo, BridgeError> {
+        match self.call(Request::ReplaceRows(rows))? {
+            Reply::Replaced(Ok(info)) => {
+                self.info = info;
+                Ok(info)
+            }
+            Reply::Replaced(Err(reason)) => Err(BridgeError::Refused(reason)),
+            Reply::Reset(Err(reason))
+            | Reply::Step(Err(reason))
+            | Reply::Attribution(Err(reason)) => Err(self.fail(reason)),
+            Reply::Reset(Ok(_)) | Reply::Step(Ok(_)) | Reply::Attribution(Ok(_)) => {
+                Err(self.fail("the wrong reply to a replace".to_string()))
             }
         }
     }

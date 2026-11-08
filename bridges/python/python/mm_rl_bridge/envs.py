@@ -159,6 +159,12 @@ class MarketMakingEnv(gym.Env):
         """The episode's components in the evaluation's definitions, reconciled with the reward."""
         return self._native.attribution()
 
+    def replace_rows(self, rows):
+        """Replaces the rows under the running episode and replays it on them (#282). The new
+        rows must keep the rows already read; a ValueError leaves the episode as it was."""
+        self._native.replace_rows([tuple(row) for row in rows])
+        self.bridge_info = dict(self._native.info())
+
     def close(self):
         self._native.close()
 
