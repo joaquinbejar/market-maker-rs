@@ -126,18 +126,20 @@ def markouts(env):
 
 
 def episode(policy, env):
-    """One day: `policy(env, obs)` gives the action. The day's metrics, money as text."""
+    """One day: `policy(env, obs)` gives the action. The day's metrics, money as text.
+
+    The position, its peak and the equity behind the drawdown are read at every clearing,
+    where they change, not once per step: a step of several rows spans several closes."""
     obs, _ = env.reset(seed=0)
-    equity, durations, decisions = [], {}, 0
-    peak_position = 0
+    durations, decisions = {}, 0
     while True:
         obs, _, terminated, _, info = env.step(policy(env, obs))
         decisions += 1
-        equity.append(Decimal(info["net"]))
         durations[info["duration"]] = durations.get(info["duration"], 0) + 1
-        peak_position = max(peak_position, abs(env.position))
         if terminated:
             break
+    peak_position = max((abs(position) for _, position, _ in env.marks), default=0)
+    equity = [mark for _, _, mark in env.marks] + [Decimal(info["net"])]
     hours = Decimal(env.rows * env.row_ms) / Decimal(3_600_000)
     return {"net": info["net"], "fees": str(env.fees), "fills": len(env.fills),
             "fills_per_hour": str(Decimal(len(env.fills)) / hours), "decisions": decisions,

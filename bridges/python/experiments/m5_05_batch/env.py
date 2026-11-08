@@ -156,6 +156,9 @@ class BatchEnv(gym.Env):
         self.fees = Decimal(0)
         self.fills = []
         self.batches = []
+        # At each close: the position and the marked equity after the clearing, where both
+        # change; a step of several rows spans several closes.
+        self.marks = []
         self.late = {"orders": 0, "cancels": 0}
         self.net = Decimal(0)
         return self._observe(), self._info()
@@ -253,6 +256,7 @@ class BatchEnv(gym.Env):
             self.reference = out.price
         self.last_volume, self.last_imbalance = out.volume, out.imbalance
         self.batches.append((close, out.price, out.volume))
+        self.marks.append((close, self.position, self._mark()))
 
     def _advance_row(self):
         """Ends the current row: clears the batch if the row's end is a close."""

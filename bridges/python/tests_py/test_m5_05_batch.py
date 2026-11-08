@@ -365,3 +365,90 @@ def test_every_pool_worker_is_this_runners_own_function():
                if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "pool"]
     assert workers and all(isinstance(w, ast.Name) and w.id in defined for w in workers), [
         ast.unparse(w) for w in workers]
+
+
+def _scripted(actions):
+    """A policy that takes `actions[row]` at the decision on that row, and holds otherwise."""
+    def policy(env, obs):
+        return actions.get(env.row, HOLD)
+    return policy
+
+
+# A bid and an ask at one tick from the signal, one lot each, resting 30 rows.
+LONG_QUOTE = np.asarray([1.0, -1.0, -1.0, -1.0, -1.0, 1.0], dtype=np.float32)
+
+
+def test_a_step_of_several_closes_is_measured_at_each_clearing():
+    # At 100 ms the bid sent on row 4 arrives at the 500 ms close, so it acts in the next batch,
+    # while the bid sent on row 3 is still live at 500 ms: both fill, and the position reaches
+    # 2 against a limit of 1. The ask of the long quote brings it back to 1 at 1500 ms, inside
+    # the same step, so a position read only at the step's end would see 1 and no breach.
+    background = [(450, -1, 9_999, 1), (950, -1, 9_999, 1), (1_450, 1, 10_001, 1)]
+    env = _env(100, background, rows=35)
+    env.max_position = 1
+    out = batch_run.episode(_scripted({3: QUOTE, 4: LONG_QUOTE}), env)
+    assert [(close, side) for close, side, _, _ in env.fills] == [(500, 1), (1000, 1), (1500, -1)]
+    assert env.position == 1
+    assert out["peak_position"] == 2 and out["breach"] is True
+    # The drawdown reads the equity at each close too: one per batch, then the day's end.
+    assert len(env.marks) == 7
+    worst = batch_run.drawdown([mark for _, _, mark in env.marks] + [Decimal(out["net"])])
+    assert Decimal(out["max_drawdown"]) == worst
+
+
+def _aggressive_peaks(latency):
+    """Per seed, the peak position and the breach of a policy that quotes one tick away at
+    the largest size on every row it decides, for a random duration, against a limit of 2."""
+    rng = np.random.default_rng(latency)
+    out = []
+    for seed in range(6):
+        env = batch_env.BatchEnv(seed=seed, rows=600, latency_ms=latency, fee_rate="0")
+        env.max_position = 2
+        actions = {row: np.asarray([1.0, -1.0, -1.0, 1.0, 1.0, rng.uniform(-1, 1)],
+                                   dtype=np.float32) for row in range(600)}
+        day = batch_run.episode(_scripted(actions), env)
+        assert len(env.fills) > 15
+        out.append((day["peak_position"], day["breach"]))
+    return out
+
+
+def test_below_a_row_of_delay_no_quote_takes_the_position_past_its_limit():
+    # A replacement's cancel and its new orders arrive together, before the close, and each
+    # order is sized on the position at its submission: at most one order a side is live at a
+    # close, so the limit holds at every clearing whatever the durations.
+    for latency in (30, 60):
+        assert all(peak <= 2 and not breach for peak, breach in _aggressive_peaks(latency))
+    # At a delay of one row a bid sent on a batch's last row arrives at the close and acts in
+    # the next batch while the previous bid is still live: the same play breaches.
+    assert any(breach for _, breach in _aggressive_peaks(100))
+
+
+def test_the_drawdown_reads_a_dip_inside_a_long_step():
+    # One long quote: its bid fills at 9999 at 500 ms; the background then clears at 9990 at
+    # 1000 ms and at 10000 at 1500 ms. The mark falls 9 ticks and recovers inside the step,
+    # which a drawdown over the steps' ends would miss.
+    background = [(450, -1, 9_999, 1), (950, 1, 9_990, 1), (960, -1, 9_990, 1),
+                  (1_450, 1, 10_000, 1), (1_460, -1, 10_000, 1)]
+    env = _env(30, background, rows=35)
+    out = batch_run.episode(_scripted({0: LONG_QUOTE}), env)
+    assert [(close, side) for close, side, _, _ in env.fills] == [(500, 1)]
+    assert Decimal(out["max_drawdown"]) == Decimal(9) * env.tick
+
+
+def test_the_audit_counts_breach_days_and_the_largest_position_per_arm_and_latency():
+    import sys as _sys
+
+    _sys.modules.pop("run", None)
+    audit_spec = importlib.util.spec_from_file_location(
+        "m5_05_batch_audit", HERE.parent / "experiments" / "m5_05_batch" / "audit.py")
+    audit = importlib.util.module_from_spec(audit_spec)
+    audit_spec.loader.exec_module(audit)
+    rows = [{"arm": "full", "latency": 30, "breach": False, "peak_position": 20},
+            {"arm": "full", "latency": 30, "breach": True, "peak_position": 21},
+            {"arm": "full", "latency": 100, "breach": False, "peak_position": 19},
+            {"arm": "no_duration", "latency": 30, "breach": False, "peak_position": 20}]
+    assert audit.summarise(rows) == {
+        "full/100ms": {"days": 1, "breach_days": 0, "peak_position": 19},
+        "full/30ms": {"days": 2, "breach_days": 1, "peak_position": 21},
+        "no_duration/30ms": {"days": 1, "breach_days": 0, "peak_position": 20},
+    }
