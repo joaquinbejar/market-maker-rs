@@ -1155,35 +1155,59 @@ struct Line290 {
     baseline: bool,
     /// The comparison and the model's mean touch queue.
     outcome: Result<(DiscrepancyReport, f64), String>,
+    /// Touch resets in the model's run, and the smallest touch queue its samples show.
+    run_resets: usize,
+    run_min_touch: Option<u32>,
+    /// For a model with touch resets: the sizes with a positive reset rate, and the largest.
+    reset_sizes: Option<(usize, usize)>,
+}
+
+/// The sizes with a positive reset rate, and the largest, if `params` has resets.
+fn reset_sizes(params: &QrParameters) -> Option<(usize, usize)> {
+    params.reset_rates().map(|rates| {
+        let positive: Vec<usize> = (0..rates.len()).filter(|n| rates[*n] > 0.0).collect();
+        (positive.len(), positive.last().copied().unwrap_or(0))
+    })
 }
 
 /// Each fit and its constant baseline against the window's data, from seed
 /// [`qr_290::QR_SEED`], with the data's mean touch queue.
 fn compare_290(data: &Trajectory, fits: &[Fit290Input], window: TimeWindow) -> (f64, Vec<Line290>) {
     let seconds = (window.end_ms - window.start_ms) as f64 / 1e3;
-    let run = |model: &QrParameters| -> Result<(DiscrepancyReport, f64), String> {
+    type Run = (DiscrepancyReport, f64, usize, Option<u32>);
+    let run = |model: &QrParameters| -> Result<Run, String> {
         let run = QrSimulator::new(model.clone(), qr_290::QR_SEED, 0)
             .and_then(|mut s| s.run(seconds, BOOK_SAMPLE_MS as f64 / 1e3))
             .map_err(|e| e.to_string())?;
         let report =
             compare_trajectories(data, &run, model, FLOW_INTERVAL_MS).map_err(|e| e.to_string())?;
-        Ok((report, mean_touch(&run.samples)))
+        let min_touch = run.samples.iter().map(|s| s.bid[0].min(s.ask[0])).min();
+        Ok((
+            report,
+            mean_touch(&run.samples),
+            run.resets.len(),
+            min_touch,
+        ))
     };
     let mut lines = Vec::new();
     for (estimator, fit) in fits {
         for baseline in [false, true] {
-            let outcome = match fit {
+            let model = match fit {
                 Err(error) => Err(format!("no fit: {error}")),
-                Ok(params) if baseline => params
-                    .constant_baseline()
-                    .map_err(|e| e.to_string())
-                    .and_then(|model| run(&model)),
-                Ok(params) => run(params),
+                Ok(params) if baseline => params.constant_baseline().map_err(|e| e.to_string()),
+                Ok(params) => Ok(params.clone()),
             };
+            let reset_sizes = model.as_ref().ok().and_then(reset_sizes);
+            let outcome = model.and_then(|model| run(&model));
+            let run_resets = outcome.as_ref().map_or(0, |(_, _, n, _)| *n);
+            let run_min_touch = outcome.as_ref().ok().and_then(|(_, _, _, m)| *m);
             lines.push(Line290 {
                 estimator,
                 baseline,
-                outcome,
+                outcome: outcome.map(|(report, mean, _, _)| (report, mean)),
+                run_resets,
+                run_min_touch,
+                reset_sizes,
             });
         }
     }
@@ -2934,7 +2958,7 @@ fn section_290_book(report: &mut Report, collect: &Collect) {
                     report,
                     "    {label}: queue size TV by limit [{}]; spread TV {:.3}; wait KS by limit \
                      [{}]; flow relative error L/C/M [{}]; mean touch queue {mean:.2} ({}); \
-                     model {} events, stopped {:?}",
+                     model {} events, stopped {:?}{}",
                     list(&r.queue_size),
                     r.spread,
                     list(&r.waiting_law),
@@ -2945,7 +2969,17 @@ fn section_290_book(report: &mut Report, collect: &Collect) {
                         "transient"
                     },
                     r.model_events,
-                    r.model_stopped
+                    r.model_stopped,
+                    match line.reset_sizes {
+                        Some((sizes, largest)) => format!(
+                            "; reset rate positive at {sizes} sizes, the largest {largest}; \
+                             {} resets in the run, whose smallest touch queue is {}",
+                            line.run_resets,
+                            line.run_min_touch
+                                .map_or("-".to_string(), |m| m.to_string())
+                        ),
+                        None => String::new(),
+                    }
                 ),
                 Err(error) => say!(report, "    {label}: not evaluable: {error}"),
             }
@@ -3428,6 +3462,9 @@ mod tests {
             estimator,
             baseline,
             outcome: Ok((report, mean)),
+            run_resets: 0,
+            run_min_touch: None,
+            reset_sizes: None,
         }
     }
 
@@ -3466,6 +3503,39 @@ mod tests {
             "no stationary fit, so no holdout"
         );
         assert!(stationary_290(99.99) && !stationary_290(100.0));
+    }
+
+    #[test]
+    fn test_290_reset_sizes_are_the_positive_rates_and_the_largest() {
+        let rates: Vec<f64> = (0..=QR_MAX_QUEUE as usize)
+            .map(|n| if n == 3 || n == 40 { 0.5 } else { 0.0 })
+            .collect();
+        let law: Vec<f64> = (0..rates.len())
+            .map(|n| if n == 1 { 1.0 } else { 0.0 })
+            .collect();
+        let table: Vec<(f64, f64, f64)> = (0..rates.len())
+            .map(|n| {
+                let last = n + 1 == rates.len();
+                (
+                    if last { 0.0 } else { 1.0 },
+                    if n == 0 { 0.0 } else { 1.0 },
+                    0.0,
+                )
+            })
+            .collect();
+        let params = QrParameters::new(
+            dec!(1),
+            1.0,
+            0.0,
+            vec![dec!(1)],
+            vec![table],
+            vec![vec![true; rates.len()]],
+            UnsupportedPolicy::NearestSupported,
+        )
+        .unwrap();
+        assert_eq!(reset_sizes(&params), None);
+        let with = params.with_resets(rates, law).unwrap();
+        assert_eq!(reset_sizes(&with), Some((2, 40)));
     }
 
     #[test]

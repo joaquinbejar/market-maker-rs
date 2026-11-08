@@ -2142,3 +2142,36 @@ fn test_resets_export_and_older_exports_read_without_them() {
         );
     }
 }
+
+#[test]
+fn test_resets_at_sizes_a_run_never_visits_leave_it_unchanged() {
+    // The capture's case: resets are seen at small touch sizes, while a transient fit's run
+    // lives near the cap. Here the cap is out of reach and the resets sit only there.
+    let mut table = table(1.0);
+    table[CAP - 1].0 = 0.0;
+    let reachable = QrParameters::new(
+        dec!(0.01),
+        0.6,
+        0.2,
+        vec![dec!(1), dec!(1)],
+        vec![table.clone(), table],
+        vec![vec![true; CAP + 1]; 2],
+        UnsupportedPolicy::Stop,
+    )
+    .unwrap();
+    assert_eq!(reachable.invariant(0).unwrap()[CAP], 0.0);
+    let mut rates = vec![0.0; CAP + 1];
+    rates[CAP] = 5.0;
+    let with = reachable.clone().with_resets(rates, reset_law()).unwrap();
+    assert_ne!(with.fingerprint(), reachable.fingerprint());
+    let run = |p: QrParameters| {
+        QrSimulator::new(p, 17, 100)
+            .unwrap()
+            .run(5_000.0, 1.0)
+            .unwrap()
+    };
+    let (plain, reset) = (run(reachable), run(with));
+    assert!(reset.resets.is_empty());
+    assert_eq!(plain.events, reset.events);
+    assert_eq!(plain.samples, reset.samples);
+}
