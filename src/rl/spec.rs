@@ -25,6 +25,9 @@ pub const CANCEL_ACTION_SPACE_VERSION: u16 = 4;
 pub const EXPIRY_ACTION_SPACE_VERSION: u16 = 5;
 /// The most quote lives an action space can offer.
 pub const MAX_QUOTE_LIVES: usize = 8;
+/// The longest quote life, in nanoseconds: 2^62, about 146 years, so that an activation time
+/// plus a life does not overflow the kernel's clock.
+pub const MAX_QUOTE_LIFE_NS: u64 = 1 << 62;
 /// Version of the reward with a hedge lane: version 1's, with the hedge lane's ledger in the
 /// net result.
 pub const HEDGED_REWARD_VERSION: u16 = 2;
@@ -568,7 +571,8 @@ impl CancelActions {
 }
 
 /// The lives a quote can be sent with, in nanoseconds of venue time: 1 to
-/// [`MAX_QUOTE_LIVES`] values, strictly increasing and not zero.
+/// [`MAX_QUOTE_LIVES`] values, strictly increasing, not zero and at most
+/// [`MAX_QUOTE_LIFE_NS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuoteLives {
     values: [u64; MAX_QUOTE_LIVES],
@@ -581,7 +585,7 @@ impl QuoteLives {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for no lives, more than
-    /// [`MAX_QUOTE_LIVES`], a zero, or values that do not strictly increase.
+    /// [`MAX_QUOTE_LIVES`], a zero, a life above [`MAX_QUOTE_LIFE_NS`], or values that do not strictly increase.
     pub fn new(lives: &[u64]) -> MMResult<Self> {
         let refuse = |why: &str| {
             Err(MMError::InvalidConfiguration(format!(
@@ -593,6 +597,9 @@ impl QuoteLives {
         }
         if lives.contains(&0) {
             return refuse("must not be zero");
+        }
+        if lives.iter().any(|life| *life > MAX_QUOTE_LIFE_NS) {
+            return refuse("must be at most 2^62 ns");
         }
         if lives.iter().zip(lives.iter().skip(1)).any(|(a, b)| a >= b) {
             return refuse("must strictly increase");

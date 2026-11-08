@@ -188,7 +188,8 @@ pub use spec::{
     CrossHedgeSpace, EPISODE_VERSION, EXPIRY_ACTION_SPACE_VERSION, EpisodeSpec, FEATURE_COUNT,
     FeatureHorizon, FeatureId, FeatureSpec, FeatureUnit, HEDGE_FEATURE_COUNT,
     HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION,
-    HedgeActions, HedgeScales, InvalidActionPolicy, MAX_QUOTE_LIVES, OBSERVATION_SPACE_VERSION,
-    ObservationScales, ObservationSpace, QuoteExpiry, QuoteLives, REWARD_VERSION, RewardKind,
-    RewardMark, RewardSpec, RlSpec, SpaceShape, SpecId, StateMemory, TerminalValuation,
+    HedgeActions, HedgeScales, InvalidActionPolicy, MAX_QUOTE_LIFE_NS, MAX_QUOTE_LIVES,
+    OBSERVATION_SPACE_VERSION, ObservationScales, ObservationSpace, QuoteExpiry, QuoteLives,
+    REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec, SpaceShape, SpecId, StateMemory,
+    TerminalValuation,
 };

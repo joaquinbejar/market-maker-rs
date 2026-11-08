@@ -16,6 +16,10 @@ project follows [Semantic Versioning](https://semver.org/).
   (`ERR_EXPIRY_REFUSED`). A hedge lane and a residual policy refuse lives at construction. The
   Python bridge takes `quote_lives_ns`; the maskable and continuous encodings gain a last
   dimension whose first choice is no expiry, so a policy can still leave a quote resting.
+- Stage A of a bounded options market making study under quadratic rough Heston (#111), on
+  synthetic paths: the control checks do not pass and the greedy rule is worse in mean P&L than
+  always quoting within the bounds, where the delta gate does not bind, so it is not adopted. Experiment only; no public API change.
+
 - The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
   #102's residual SAC retrained with and without a training adversary that, between five
   phases, moves the episode's flow perturbation toward the point where the policy loses most on
