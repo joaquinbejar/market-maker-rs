@@ -25,6 +25,17 @@ with the steps `fee_rule`, `classical_selection`, `training`, `freeze` and `hold
 design, which selects no learned arm. It picks the learned arm at one row on the validation
 days by #103's rule, for the studies that build on #103, and checks every frozen hash first.
 
+How the fee rule read its points, found in review after the holdout was read. A candidate is
+a point of the grid with the volatility of its regime, so the rule compared each regime's
+points over that regime's 14 training days, and one profitable regime was enough: a calm point
+had a mean daily net of 0.378 at -0.0001, which the rule chose. Read pooled, each point's
+parameters over all 42 training days with the volatility per regime, the best point is below 0
+at every fee (-0.683 at -0.0001, -1.919 at 0, -4.391 at 0.0002), and the rule would have chosen
+0.0002 with no profitable classical arm. The design does not say which; the run used the first
+reading. Both rows are in the holdout and the report in full: under the first reading the
+primary row is -0.0001 and 0.0002 the secondary, under the pooled one the primary row is 0.0002.
+These figures are from the training rows of `fee_rule.json` alone.
+
 How the report reads the classical comparator: per fee and scope, it compares each learned arm
 with the better of Avellaneda-Stoikov and GLFT by their mean daily net on the holdout days of
 that scope. That is the stronger of the two after the fact, so it is the harder comparator for a
