@@ -8,6 +8,17 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- An offline training study for #280 in `bridges/python/experiments/m4_11`, synthetic only:
+  - behaviour cloning and a discrete conservative Q-learning trained on simulator logs;
+  - `design.json` committed before any run, with `run.py` and `offline.py`;
+  - a holdout that is read once, guarded by an exclusive marker;
+  - `sanity_diagnosis.py`.
+
+  The study stopped at its pre-registered BC sanity rule. BC agreed with the logged behaviour's
+  action on 81 to 82 % of the validation decisions, against the 90 % the rule requires. BC fails
+  to clone the behaviour's regime-dependent choice from an observation without the regime.
+  The holdout was not read.
+
 - `backtest::evaluation::stratified_block_bootstrap` (#280): a stationary block bootstrap of the
   equally weighted mean of several groups' means, for example of regimes. Each group is
   resampled on its own stream, group `i` seeded `seed + i`, so a single group gives exactly
