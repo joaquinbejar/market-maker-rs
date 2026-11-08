@@ -97,7 +97,8 @@ story: in a diagnostic after the run, outside the rule and without any path, the
 4.85 on cells with |v| at least 1 % of max|v|, and 1.14 at 10 %. The shape does not agree away
 from the crossing either.
 
-Primary comparison, QRH greedy minus the `GreeksRiskManager` gate, 5000 paths, paired 90 % interval:
+Primary comparison, QRH greedy minus the `GreeksRiskManager` gate, 5000 paths, paired 90 % interval.
+Both rows carry the label "control not validated", since no example passed checks 1 and 2:
 
 | | Mean QRH | Mean gate | Interval | Std QRH | Std gate | Verdict |
 |---|---|---|---|---|---|---|
