@@ -1,0 +1,741 @@
+{
+  "days": [
+    {
+      "dataset_digest": "6b547ed3293e4e717cc1eefc2cfc1e3b",
+      "day": 1,
+      "market_order_lots": [
+        230350,
+        229786
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000013,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "dcd7d4563d60e2b85ec5abbc35db66ec",
+      "day": 1,
+      "market_order_lots": [
+        71758,
+        71742
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000013,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "80ac6163bdce6cbb3a5d7eab19e15f7a",
+      "day": 2,
+      "market_order_lots": [
+        230266,
+        230888
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000014,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "3ac6931f14958ac29601097a43629cd1",
+      "day": 2,
+      "market_order_lots": [
+        71942,
+        72713
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000014,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "4d9e0a2f637ef2718f59221e30584910",
+      "day": 3,
+      "market_order_lots": [
+        222060,
+        222310
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000015,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "bb9d3c84b0a1a616f4ec74f309829678",
+      "day": 3,
+      "market_order_lots": [
+        69225,
+        68676
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000015,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "04acdd3a552d324d77bd8efb09893124",
+      "day": 4,
+      "market_order_lots": [
+        230950,
+        230818
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000016,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "334102450eae1ca4231cb79e8210c826",
+      "day": 4,
+      "market_order_lots": [
+        72289,
+        72526
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000016,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "605e7318aaadef521e19b3fb1ceb86da",
+      "day": 5,
+      "market_order_lots": [
+        230372,
+        229821
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000017,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "9ab2738d34ed99bcb4747523c4eb01c6",
+      "day": 5,
+      "market_order_lots": [
+        73132,
+        72264
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000017,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "53b1177a34d86103c9321d9e83f425d7",
+      "day": 6,
+      "market_order_lots": [
+        231278,
+        231172
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000018,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "27d37f51d4b12cca572bb15e27fd47f2",
+      "day": 6,
+      "market_order_lots": [
+        71982,
+        71642
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000018,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "9dd92f7eba8d82b53fd9bbe4da9f6db0",
+      "day": 7,
+      "market_order_lots": [
+        222975,
+        223804
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000019,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "b453f393eb8431163e34202fb3b36215",
+      "day": 7,
+      "market_order_lots": [
+        68706,
+        68726
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000019,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f083c301ed8e7cd5a75bf64a0a4fa3ea",
+      "day": 8,
+      "market_order_lots": [
+        230441,
+        230300
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000020,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "6d3fd1b1880098d3258e2a535c752042",
+      "day": 8,
+      "market_order_lots": [
+        72291,
+        71800
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000020,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "d4b1872f8bfc5773cefa8938096bfc80",
+      "day": 9,
+      "market_order_lots": [
+        231504,
+        230536
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000021,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "360dc5d54f3eccca289418d4097ad668",
+      "day": 9,
+      "market_order_lots": [
+        71783,
+        71813
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000021,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "dff91297953a03afbebc1b1a97104925",
+      "day": 10,
+      "market_order_lots": [
+        230787,
+        230607
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000022,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "305fa313255a25b98354db0b888e24b9",
+      "day": 10,
+      "market_order_lots": [
+        72244,
+        72277
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000022,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "45f6bb2bac140dc811c6e8d98ea90e3c",
+      "day": 11,
+      "market_order_lots": [
+        222093,
+        223906
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000023,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "c7a3526bde9894a380d61e6e0839efee",
+      "day": 11,
+      "market_order_lots": [
+        69364,
+        69129
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000023,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "eee776870ddc7f7580c23846d6938162",
+      "day": 12,
+      "market_order_lots": [
+        231208,
+        230462
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000024,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "8d9d340379f01e00e7e278b554101764",
+      "day": 12,
+      "market_order_lots": [
+        73221,
+        71647
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000024,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "cb3490a6670118721b8b410925f91e3f",
+      "day": 13,
+      "market_order_lots": [
+        230821,
+        230301
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000025,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "568735216266359a72d6e54ddff42f35",
+      "day": 13,
+      "market_order_lots": [
+        72404,
+        71782
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000025,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "b0382e5a1e730d3b30912845b6e2c2dc",
+      "day": 14,
+      "market_order_lots": [
+        230778,
+        230952
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000026,
+      "simulator": "s1",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "f7079252ef10315f3b2ec7fd175f5892",
+      "day": 14,
+      "market_order_lots": [
+        71670,
+        71828
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000026,
+      "simulator": "s2",
+      "split": "train"
+    },
+    {
+      "dataset_digest": "eee3151cb43e4c7073cb174b5f198025",
+      "day": 15,
+      "market_order_lots": [
+        230189,
+        230228
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000027,
+      "simulator": "s1",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "084f1bc38f78ba2c6c2982428ca3f706",
+      "day": 15,
+      "market_order_lots": [
+        72234,
+        72102
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000027,
+      "simulator": "s2",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "dd6a0e45d85032ca8598c81f2ea56922",
+      "day": 16,
+      "market_order_lots": [
+        231047,
+        230873
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000028,
+      "simulator": "s1",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "92751f11e988efa5d68c769d5640039f",
+      "day": 16,
+      "market_order_lots": [
+        72364,
+        71634
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000028,
+      "simulator": "s2",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "7e1016557de00196e8877f2230b5aace",
+      "day": 17,
+      "market_order_lots": [
+        283160,
+        281611
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "stressed": 14400
+      },
+      "seed": 4000029,
+      "simulator": "s1",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "21b27eb6a5c5a34e33effd1f8d12db98",
+      "day": 17,
+      "market_order_lots": [
+        82062,
+        77894
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "stressed": 14400
+      },
+      "seed": 4000029,
+      "simulator": "s2",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "d735f595b5a86f6a3c22bd5291872b8e",
+      "day": 18,
+      "market_order_lots": [
+        222443,
+        222632
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000030,
+      "simulator": "s1",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "4518f65de9d561bfd85683d1f5659816",
+      "day": 18,
+      "market_order_lots": [
+        67866,
+        68898
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000030,
+      "simulator": "s2",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "d4d98a7acd086c54bcb73b2d05ea86c3",
+      "day": 19,
+      "market_order_lots": [
+        230524,
+        231291
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000031,
+      "simulator": "s1",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "111839d13865f951ae823e1289867acd",
+      "day": 19,
+      "market_order_lots": [
+        72523,
+        70915
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000031,
+      "simulator": "s2",
+      "split": "validation"
+    },
+    {
+      "dataset_digest": "6f2ceee4a055f98b196e98e636d43822",
+      "day": 20,
+      "market_order_lots": [
+        229778,
+        230398
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000032,
+      "simulator": "s1",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "6ff870fcf50b8f6a9f0ff860489330df",
+      "day": 20,
+      "market_order_lots": [
+        72315,
+        71699
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000032,
+      "simulator": "s2",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "2cc578f6c7aba11c058754e535b4b5a1",
+      "day": 21,
+      "market_order_lots": [
+        230438,
+        228957
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000033,
+      "simulator": "s1",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "aef6a833589acee86d344eeb443d0994",
+      "day": 21,
+      "market_order_lots": [
+        71393,
+        71817
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000033,
+      "simulator": "s2",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "276592c8d59c5b6c32dcd5fd535aeba2",
+      "day": 22,
+      "market_order_lots": [
+        281822,
+        282811
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "stressed": 14400
+      },
+      "seed": 4000034,
+      "simulator": "s1",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "d62ebb4f0181fada022072eec27bfadd",
+      "day": 22,
+      "market_order_lots": [
+        83148,
+        78762
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "stressed": 14400
+      },
+      "seed": 4000034,
+      "simulator": "s2",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "dd4ef0bb92ec583f6dc055c2f89f0037",
+      "day": 23,
+      "market_order_lots": [
+        222717,
+        223197
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000035,
+      "simulator": "s1",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "280127c28de9e34159c37c48171f559c",
+      "day": 23,
+      "market_order_lots": [
+        69195,
+        68318
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 72000,
+        "thin": 14400
+      },
+      "seed": 4000035,
+      "simulator": "s2",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "ad5d95e145017fe2c9d8c8bdc365b645",
+      "day": 24,
+      "market_order_lots": [
+        230397,
+        229901
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000036,
+      "simulator": "s1",
+      "split": "holdout"
+    },
+    {
+      "dataset_digest": "6d475e34fea68e2ff414f4b3a2c2d960",
+      "day": 24,
+      "market_order_lots": [
+        72035,
+        71233
+      ],
+      "rows": 86400,
+      "seconds_per_regime": {
+        "calm": 86400
+      },
+      "seed": 4000036,
+      "simulator": "s2",
+      "split": "holdout"
+    }
+  ],
+  "design_version": 1,
+  "issue": 112,
+  "seed": "1000003 * 4 + day, for both simulators"
+}
