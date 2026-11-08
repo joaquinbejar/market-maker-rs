@@ -1260,9 +1260,17 @@ fn hawkes_arms(collect: &Collect) -> Fallible<(Value, Value)> {
         };
     let scores_json = serde_json::to_value(&scores)?;
     let Some(decay) = best.and_then(|i| scores.get(i)).map(|s| s.decay) else {
+        // Why each candidate gave no parameters, as the fit itself records it.
+        let causes = DECAYS
+            .iter()
+            .map(|d| match fit_hawkes(train, &hawkes_config(vec![*d])) {
+                Ok(record) => format!("{d}: {:?}", record.fit),
+                Err(e) => format!("{d}: {e}"),
+            })
+            .collect::<Vec<_>>();
         return Ok((
             poisson,
-            json!({ "status": "failed", "reason": "no candidate decay fitted", "decay_scores": scores_json }),
+            json!({ "status": "failed", "reason": "no candidate decay fitted", "decay_scores": scores_json, "causes": causes }),
         ));
     };
     let hawkes = match fit_hawkes(train, &hawkes_config(vec![decay])) {
