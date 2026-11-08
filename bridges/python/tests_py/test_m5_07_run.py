@@ -56,8 +56,9 @@ def test_decide_rests_on_example_2_only():
     result = {"example_2": {"check_1": ok, "check_2": ok, "primary": {"1": {"verdict": "better"}}}}
     assert r.decide(result)["adopt"]
     result["example_2"]["check_2"] = {"status": "inconclusive"}
-    assert r.decide(result) == {"adopt": False, "example_2_primary": "better",
-                                "example_2_label": "control not validated"}
+    decision = r.decide(result)
+    assert not decision["adopt"] and decision["example_2_label"] == "control not validated"
+    assert "unit choice" in decision["scope"]
     result["example_2"].update(check_2=ok, primary={"1": {"verdict": "no difference shown"}})
     assert not r.decide(result)["adopt"]
 

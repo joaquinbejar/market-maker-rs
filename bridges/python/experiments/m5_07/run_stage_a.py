@@ -261,7 +261,8 @@ def decide(result):
     verdict = result["example_2"]["primary"]["1"]["verdict"]
     validated = checks_passed(result, "example_2")
     return {"adopt": validated and verdict == "better", "example_2_primary": verdict,
-            "example_2_label": None if validated else "control not validated"}
+            "example_2_label": None if validated else "control not validated",
+            "scope": "control under Approximation 3.1 with the paper's delta on SPX/VIX parameters; sigma 0.2267 is our unit choice"}
 
 
 def _attempt():

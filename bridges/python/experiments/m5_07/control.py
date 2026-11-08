@@ -95,6 +95,8 @@ def solve_hjb(problem, horizon, dt, keep_policy_until=0.0):
     The policy array has one row per step of length dt from t = 0 up to keep_policy_until; bit i
     says move i is posted, and only where it stays on the grid.
     """
+    if dt * sum(mv.lam for mv in problem.moves) >= 0.5:
+        raise ValueError("explicit Euler needs dt times the total intensity well below 1")
     steps = int(round(horizon / dt))
     keep = int(round(keep_policy_until / dt))
     n_axes = len(problem.shape)

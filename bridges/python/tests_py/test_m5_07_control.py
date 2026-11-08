@@ -5,6 +5,7 @@ import sys
 from decimal import Decimal as D
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "experiments" / "m5_07"))
 import control as c  # noqa: E402
@@ -121,3 +122,9 @@ def test_backtest_no_quote_has_no_fills():
     n, u = c.draw_path(1, 0, 100, len(p.moves))
     counts, noise, _ = c.backtest(p, never, n[None], u[None], 0.1, 0.3)
     assert counts.sum() == 0 and noise[0] == 0
+
+
+def test_solve_hjb_refuses_an_unstable_step():
+    problem = c.net_risk_problem([D("0.5")], [D("0.1")], [D("2")], D("1"), [10.0], D("1"), 0.2)
+    with pytest.raises(ValueError, match="explicit Euler"):
+        c.solve_hjb(problem, 1.0, 0.1)
