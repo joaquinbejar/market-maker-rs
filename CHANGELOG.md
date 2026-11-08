@@ -794,6 +794,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The kernel's documentation builds under strict rustdoc with `kernel` or `rl` and without
+  `margin`: two links to `backtest::MarginAccount`, an item of the `margin` feature, are plain
+  code now.
 - Example `hyperliquid_validation` (#262) samples the walk-forward's mid at each change of the
   touch, from the replay's tops, instead of only when the mid changed. A touch that stays put
   while its sizes change is a live book, so its mid is a sample; read as a silence, it failed the

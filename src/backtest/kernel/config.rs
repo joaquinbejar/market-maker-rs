@@ -192,7 +192,7 @@ pub(super) enum ValidFill {
 }
 
 /// A balance gate on the kernel's own ledger, as `margin_rs::risk::RiskGate`
-/// decides for a spot instrument in [`crate::backtest::MarginAccount`]
+/// decides for a spot instrument in `backtest::MarginAccount`
 /// (`margin` feature): fully collateralised, with no leverage.
 ///
 /// - A buy reserves its notional at its limit price plus its largest fee,
