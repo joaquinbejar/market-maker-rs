@@ -134,6 +134,11 @@ name = "consistent_time_travel"
 test = true
 
 [[example]]
+name = "mdqr_capture"
+required-features = ["serde"]
+test = true
+
+[[example]]
 name = "qr_estimation"
 required-features = ["serde"]
 test = true
