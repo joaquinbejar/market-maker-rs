@@ -26,7 +26,7 @@ immediate fill on 10 s rows (#267), and every conclusion carries that bound.
   carries it out.
 - `run.py` runs the `days`, `rate`, `train`, `validate`, `freeze_models`, `selection`, `freeze`
   and `holdout` steps. Selection and validation journal each run, so they resume with fewer
-  processes. The holdout marks its attempt before any day is read and never runs twice.
+  processes. The holdout marks its attempt before any day is read; a second plain run is refused, and the one resume after an external kill is resume.py's, recorded in amendments.json.
 - `train.attempts` journals every training run's start and end. A run that failed inside
   (a program or numerical error) or was stopped by the overrun rule is a failed seed: kept,
   reported, its days missing, and never rerun. A run killed from outside is rerun only when
