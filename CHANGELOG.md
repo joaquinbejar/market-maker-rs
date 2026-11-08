@@ -8,6 +8,17 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- An offline training study for #280 in `bridges/python/experiments/m4_11`, synthetic only:
+  - behaviour cloning and a discrete conservative Q-learning trained on simulator logs;
+  - `design.json` committed before any run, with `run.py` and `offline.py`;
+  - a holdout that is read once, guarded by an exclusive marker;
+  - `sanity_diagnosis.py`.
+
+  The study stopped at its pre-registered BC sanity rule. BC agreed with the logged behaviour's
+  action on 81 to 82 % of the validation decisions, against the 90 % the rule requires. BC fails
+  to clone the behaviour's regime-dependent choice from an observation without the regime.
+  The holdout was not read.
+
 - Counting of block-tied events in the queue-reactive estimator (#290):
   `QrEstimationConfig::zero_waits` with `ZeroWaitPolicy` (`Drop`, the default and the behaviour
   so far, or `Count`, which counts an event with a zero wait and adds no time, and leaves a size
