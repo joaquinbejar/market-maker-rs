@@ -619,6 +619,8 @@ struct History {
     last_sample: Option<BookSample>,
     observations: Vec<ObservationRow>,
     references: Vec<ReferenceObservation>,
+    /// The sign of each mid move, in the order of `references`: 1 up, -1 down.
+    reference_directions: Vec<i8>,
     trades: Vec<TradeRow>,
 }
 
@@ -632,6 +634,8 @@ struct WindowFile {
     observations: Vec<ObservationRow>,
     samples: Vec<BookSample>,
     references: Vec<ReferenceObservation>,
+    /// The sign of each mid move, in the order of `references`: 1 up, -1 down.
+    reference_directions: Vec<i8>,
     trades: Vec<TradeRow>,
     history: History,
 }
@@ -657,6 +661,7 @@ impl WindowData {
                 observations: Vec::new(),
                 samples: Vec::new(),
                 references: Vec::new(),
+                reference_directions: Vec::new(),
                 trades: Vec::new(),
                 history: History {
                     start_ms: window.start_ms - HISTORY_MS,
@@ -715,6 +720,8 @@ struct Collect {
     segments_seen: u64,
     hawkes_error: Option<String>,
     windows: Vec<WindowData>,
+    /// The last mid seen in the epoch, to sign the next move.
+    last_price: Option<Decimal>,
 }
 
 impl Collect {
@@ -748,6 +755,7 @@ impl Collect {
             segments_seen: 0,
             hawkes_error: None,
             windows,
+            last_price: None,
         }
     }
 
@@ -758,6 +766,19 @@ impl Collect {
     /// Takes one hour's output; the time read to, in milliseconds, if any.
     fn take(&mut self, output: &ReplayOutput, out_dir: &Path) -> Fallible<Option<u64>> {
         let epoch = self.epoch;
+        for price in output.prices.iter().filter(|p| p.epoch == epoch) {
+            let ms = price.time.timestamp_ns / NS_PER_MS;
+            let previous = self.last_price.replace(price.value.price);
+            let Some(previous) = previous else { continue };
+            let direction = if price.value.price > previous { 1 } else { -1 };
+            for w in &mut self.windows {
+                if w.inside(ms) {
+                    w.file.reference_directions.push(direction);
+                } else if w.before(ms) {
+                    w.file.history.reference_directions.push(direction);
+                }
+            }
+        }
         for reference in output.references.iter().filter(|r| r.epoch == epoch) {
             let ms = reference.time.timestamp_ns / NS_PER_MS;
             if self.protocol.part(ms) == Some(Part::Train) {
@@ -1021,6 +1042,11 @@ impl Collect {
                     .map(|s| s.value);
             }
             w.file.event_sizes.clone_from(&sizes);
+            if w.file.reference_directions.len() != w.file.references.len()
+                || w.file.history.reference_directions.len() != w.file.history.references.len()
+            {
+                return Err("a mid move without its direction".into());
+            }
             number_blocks(&mut w.file.observations);
             number_blocks(&mut w.file.history.observations);
             let dir = out_dir.join(w.file.set);
@@ -1045,9 +1071,11 @@ impl Collect {
             w.file.observations = Vec::new();
             w.file.samples = Vec::new();
             w.file.references = Vec::new();
+            w.file.reference_directions = Vec::new();
             w.file.trades = Vec::new();
             w.file.history.observations = Vec::new();
             w.file.history.references = Vec::new();
+            w.file.history.reference_directions = Vec::new();
             w.file.history.trades = Vec::new();
         }
         Ok(())
