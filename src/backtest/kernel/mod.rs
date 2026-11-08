@@ -23,7 +23,7 @@
 //!   slippage, quote currency fees (any sign);
 //! - no pretrade policy, the engine's `LimitsPolicy` (no circuit breaker),
 //!   or, with the balance gate ([`KernelMargin`]), a
-//!   [`MarginAccount`](crate::backtest::MarginAccount) set up as
+//!   `backtest::MarginAccount` set up as
 //!   [`KernelMargin`] states (`margin` feature);
 //! - the built-in bookkeeping (no external accountant);
 //! - all four latencies and jitter, in quanta of `quantum_ns`
