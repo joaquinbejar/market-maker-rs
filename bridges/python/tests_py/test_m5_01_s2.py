@@ -65,3 +65,11 @@ def test_a_failed_draw_or_a_low_tau_or_no_win_discards():
     assert s2.decide(table(True), {"qr": 0.9, "qr_count": 0.8}, 1)["decision"] == "discard"
     assert s2.decide(table(True), {"qr": 0.5, "qr_count": 0.8}, 0)["decision"] == "discard"
     assert s2.decide(table(False), {"qr": 0.9, "qr_count": 0.8}, 0)["decision"] == "discard"
+
+
+def test_tau_b_handles_ties_and_order():
+    import aggregate
+    assert aggregate.tau_b([1, 2, 3], [1, 2, 3]) == pytest.approx(1.0)
+    assert aggregate.tau_b([1, 2, 3], [3, 2, 1]) == pytest.approx(-1.0)
+    assert aggregate.tau_b([1, 1, 2], [1, 1, 2]) == pytest.approx(1.0)
+    assert np.isnan(aggregate.tau_b([1, 1], [1, 2]))
