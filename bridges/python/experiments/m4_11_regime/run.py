@@ -63,6 +63,9 @@ SHARED_CODE = (("m4_11", "offline.py"), ("m4_11", "run.py"), ("m4_07", "run.py")
 PRIMARY, SECONDARY = "standard_eps30", "standard_eps10"
 BLOCK, REPLICATES, BOOTSTRAP_SEED = 2.0, 2000, 309
 THRESHOLD = 0.9
+OVERRUN = 1.5
+PPO_PILOT_STEPS = 2048
+OFFLINE_DAY_FACTOR = 3.0  # A network evaluated at every decision, over a rule; the pilot is a bound.
 
 
 def load():
@@ -439,8 +442,39 @@ def rule_policy(name):
     return {"kind": "rule", "name": name}
 
 
-def pool(jobs, worker, study, label):
-    return prior.pool(jobs, worker, study.parallel, label)
+def overran(elapsed, estimate):
+    """The design's compute rule: more than 50 % over the estimate."""
+    return elapsed > OVERRUN * estimate
+
+
+def job_seconds(study, kind):
+    """A job's estimated seconds, from the pilot's budget.json."""
+    budget = study.read("budget")
+    design = study.design
+    if kind == "rule_day":
+        return budget["rule_day_seconds"]
+    if kind == "log_day":
+        return budget["log_day_seconds"]
+    if kind == "ppo":
+        return budget["ppo_seconds_per_step"] * study.m4_05["arms"]["maskable_ppo"]["budget_steps"]
+    if kind == "offline_day":
+        return budget["offline_day_seconds"]
+    return budget[kind]["seconds_per_gradient_step"] * design["arms"][kind]["settings"]["gradient_steps"]
+
+
+def pool(jobs, worker, study, label, kind, enforce=True):
+    """The jobs in parallel. A step over the compute rule writes what it knows and stops, except
+    the holdout, which is read once and records the overrun in its report instead."""
+    started = time.perf_counter()
+    rows = prior.pool(jobs, worker, study.parallel, label)
+    elapsed = time.perf_counter() - started
+    estimate = job_seconds(study, kind) * len(jobs) / study.parallel
+    if overran(elapsed, estimate):
+        name = label.replace(" ", "-")
+        study.write(f"overrun-{name}", {"step": label, "seconds": elapsed, "estimate": estimate})
+        if enforce:
+            raise RuntimeError(f"{label} overran its estimate: {elapsed:.0f} s against {estimate:.0f} s")
+    return rows
 
 
 def pilot(study):
@@ -464,6 +498,17 @@ def pilot(study):
         full = study.design["arms"][arm]["settings"]["gradient_steps"]
         out[arm] = {"seconds_per_gradient_step": round(per, 5),
                     "estimate_minutes_per_run": round(per * full / 60, 1)}
+    started = time.perf_counter()
+    run_job(study.job(regime, day, "train", "standard", "as_grid", rule_policy("as_grid")))
+    out["rule_day_seconds"] = round(time.perf_counter() - started, 1)
+    out["offline_day_seconds"] = round(out["rule_day_seconds"] * OFFLINE_DAY_FACTOR, 1)
+    arm = study.m4_05["arms"]["maskable_ppo"]
+    started = time.perf_counter()
+    ppo_job({"arm": "pilot", "with_regime": True, "seed": 1, "steps": PPO_PILOT_STEPS,
+             "hyperparameters": arm["hyperparameter_sets"][0], "config": study.config("standard"),
+             "regimes": [regime], "days": [day], "data_dir": study.data_dir, "commit": study.commit,
+             "path": str(study.out / "pilot" / "ppo")})
+    out["ppo_seconds_per_step"] = round((time.perf_counter() - started) / PPO_PILOT_STEPS, 6)
     report = study.header("pilot")
     report.update(out)
     return study.write("budget", report)
@@ -477,7 +522,7 @@ def gate(study):
     first = study.days("validation")[0]
     repeats = [study.job(regime, first, "validation", "standard", "fixed_spread_4",
                          rule_policy("fixed_spread_4")) for regime in study.regimes]
-    rows = pool(jobs + repeats, run_job, study, "gate")
+    rows = pool(jobs + repeats, run_job, study, "gate", "rule_day")
     runs, again = rows[:len(jobs)], rows[len(jobs):]
     summary = prior.gate_summary(runs)
     reference = {(r["regime"], r["day"]): r["net"] for r in runs
@@ -505,7 +550,7 @@ def run_logs(study, dataset, split):
                       path=str(study.out / "logs" / dataset / split / regime / f"day-{day}" / f"seed{seed}.npz"))
             for regime in study.regimes for day in study.days(split) for seed in seeds]
     report = study.header(f"logs {dataset} {split}")
-    report["logs"] = pool(jobs, log_job, study, f"logs {dataset} {split}")
+    report["logs"] = pool(jobs, log_job, study, f"logs {dataset} {split}", "log_day")
     return study.write(f"logs-{dataset}-{split}", report)
 
 
@@ -557,7 +602,7 @@ def run_train(study, dataset, arm, alpha=None):
              "commit": study.commit,
              "path": str(study.out / "checkpoints" / dataset / f"{tag}-seed{seed}.pt")}
             for seed in study.design["arms"]["training_seeds"]]
-    rows = pool(jobs, train_job, study, f"train {dataset} {tag}")
+    rows = pool(jobs, train_job, study, f"train {dataset} {tag}", arm)
     report = study.header(f"train {dataset} {tag}")
     report.update({"runs": rows, "reward_scale": scale,
                    "stop": not all(r["finished"] for r in rows)})
@@ -600,7 +645,7 @@ def run_ppo(study, variant):
              "commit": study.commit, "path": str(study.out / "checkpoints" / name / f"seed{seed}")}
             for seed in study.design["arms"]["training_seeds"]]
     report = study.header(name)
-    report["runs"] = pool(jobs, ppo_job, study, name)
+    report["runs"] = pool(jobs, ppo_job, study, name, "ppo")
     return study.write(name, report)
 
 
@@ -618,7 +663,7 @@ def select(study):
                                   {"kind": "offline", "metadata": run}, seed_of_arm=run["seed"],
                                   epsilon=study.epsilon(PRIMARY), edges=edges)
                         for regime in study.regimes for day in study.days("validation"))
-    rows = pool(jobs, run_job, study, "select")
+    rows = pool(jobs, run_job, study, "select", "offline_day")
     for row in rows:
         row.pop("support_raw", None)
         row.pop("support_bins", None)
@@ -754,7 +799,7 @@ def holdout(study, frozen_sha256):
     with os.fdopen(descriptor, "w") as marker:
         marker.write(json.dumps({"commit": study.commit, "frozen_sha256": frozen_sha256,
                                  "attempt": study.out.name, "jobs": len(jobs), "at": time.time()}))
-    rows = pool(jobs, run_job, study, "holdout")
+    rows = pool(jobs, run_job, study, "holdout", "offline_day", enforce=False)
     for job, row in zip(jobs, rows, strict=True):
         row["dataset"] = job.get("dataset")
     support = support_report(study, rows)
