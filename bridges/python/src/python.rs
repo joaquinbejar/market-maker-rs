@@ -1,5 +1,6 @@
 //! The extension module: a thin layer of Python values over [`Worker`].
 
+use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 
 use market_maker_rs::Decimal;
@@ -95,7 +96,32 @@ fn action_dict<'py>(py: Python<'py>, action: &KernelAction) -> PyResult<Bound<'p
             out.set_item("price", price)?;
             out.set_item("lots", lots)?;
         }
+        KernelAction::Cancel => out.set_item("kind", "cancel")?,
     }
+    Ok(out)
+}
+
+fn info_dict<'py>(py: Python<'py>, info: &crate::worker::EnvInfo) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+
+    out.set_item(
+        "spec",
+        (
+            info.spec.observation,
+            info.spec.action,
+            info.spec.reward,
+            info.spec.episode,
+            hex(info.spec.fingerprint),
+        ),
+    )?;
+    out.set_item("features", info.features)?;
+    out.set_item("offsets", info.offsets)?;
+    out.set_item("sizes", info.sizes)?;
+    out.set_item("hedge_actions", info.hedge_actions)?;
+    out.set_item("cancel_action", info.cancel_action)?;
+    out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
+    out.set_item("dataset_digest", hex(info.dataset_digest))?;
+    out.set_item("rows", info.rows)?;
     Ok(out)
 }
 
@@ -112,6 +138,29 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
     out.set_item("penalty", exact(t.reward.penalty))?;
     out.set_item("net", exact(reply.net))?;
     out.set_item("penalties", exact(reply.penalties))?;
+    let orders = PyDict::new(py);
+    orders.set_item("accepted", reply.orders.accepted)?;
+    orders.set_item("rejected", reply.orders.rejected)?;
+    orders.set_item("canceled", reply.orders.canceled)?;
+    orders.set_item("cancel_rejected", reply.orders.cancel_rejected)?;
+    orders.set_item("fills", reply.orders.fills)?;
+    out.set_item("orders", orders)?;
+    let gates = PyDict::new(py);
+    for (name, counts) in [
+        ("limits", reply.gates.limits),
+        ("combined", reply.gates.combined),
+        ("margin", reply.gates.margin),
+    ] {
+        let check = PyDict::new(py);
+        check.set_item("reduced", counts.reduced)?;
+        check.set_item("rejected", counts.rejected)?;
+        gates.set_item(name, check)?;
+    }
+    out.set_item("gates", gates)?;
+    let filled = PyDict::new(py);
+    filled.set_item("buy", reply.filled.buy)?;
+    filled.set_item("sell", reply.filled.sell)?;
+    out.set_item("filled_lots", filled)?;
     let (applied, reason) = match t.action_status {
         ActionStatus::Applied => (true, None),
         ActionStatus::Rejected(reason) => (false, Some(format!("{reason:?}"))),
@@ -226,25 +275,29 @@ impl NativeEnv {
     /// What this environment is.
     fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let info = self.with_worker(py, |worker| Ok(worker.info()))?;
-        let out = PyDict::new(py);
-        out.set_item(
-            "spec",
-            (
-                info.spec.observation,
-                info.spec.action,
-                info.spec.reward,
-                info.spec.episode,
-                hex(info.spec.fingerprint),
-            ),
-        )?;
-        out.set_item("features", info.features)?;
-        out.set_item("offsets", info.offsets)?;
-        out.set_item("sizes", info.sizes)?;
-        out.set_item("hedge_actions", info.hedge_actions)?;
-        out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
-        out.set_item("dataset_digest", hex(info.dataset_digest))?;
-        out.set_item("rows", info.rows)?;
-        Ok(out)
+        info_dict(py, &info)
+    }
+
+    /// Replaces the rows under the running episode and replays it on them (#282): the new
+    /// rows must keep the rows already read, and the replay must reach the same episode.
+    /// Returns the new info. A refusal (`ValueError`) leaves the episode as it was.
+    fn replace_rows<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(u64, u64, u64, u64, u64)>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let rows: Vec<KernelTick> = rows
+            .into_iter()
+            .map(|(ts_ns, bid, bid_lots, ask, ask_lots)| KernelTick {
+                ts_ns,
+                bid,
+                bid_lots,
+                ask,
+                ask_lots,
+            })
+            .collect();
+        let info = self.with_worker(py, move |worker| worker.replace_rows(rows))?;
+        info_dict(py, &info)
     }
 
     /// Starts an episode.
@@ -288,6 +341,11 @@ impl NativeEnv {
     ) -> PyResult<Py<PyDict>> {
         let side = if bid { QuoteSide::Bid } else { QuoteSide::Ask };
         self.take_step(py, RlAction::OneSided { side, offset, size })
+    }
+
+    /// Cancels every resting or pending order and sends nothing.
+    fn step_cancel(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.take_step(py, RlAction::Cancel)
     }
 
     /// Reduces the delivered position with a marketable order at the observed touch, of the
@@ -352,9 +410,87 @@ impl NativeEnv {
     }
 }
 
+/// Each step's account state under `margin-rs`'s `linear-im/1`, as
+/// [`crate::maintenance::maintenance_path`] reads it: `steps` are `(position, mark, net)`
+/// decimal strings, and each result is `(state, maintenance, shortfall)`.
+#[pyfunction]
+fn maintenance_path(
+    capital: &str,
+    scale: u32,
+    steps: Vec<(String, String, String)>,
+) -> PyResult<Vec<(String, String, String)>> {
+    let number = |what: &str, text: &str| {
+        Decimal::from_str(text)
+            .map_err(|error| BridgeFailure::new_err(format!("{what} {text:?}: {error}")))
+    };
+    let inputs = steps
+        .iter()
+        .map(|(position, mark, net)| {
+            Ok(crate::maintenance::StepInput {
+                position: number("position", position)?,
+                mark: number("mark", mark)?,
+                net: number("net", net)?,
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let path = crate::maintenance::maintenance_path(number("capital", capital)?, scale, &inputs)
+        .map_err(BridgeFailure::new_err)?;
+    Ok(path
+        .into_iter()
+        .map(|step| {
+            (
+                crate::maintenance::state_name(step.state).to_string(),
+                step.maintenance.to_string(),
+                step.shortfall.to_string(),
+            )
+        })
+        .collect())
+}
+
+/// One regime's day of queue-reactive rows that react to the agent's fills (#282): the rows
+/// `qr_days` writes, regenerated after each reaction from the reacted state.
+#[pyclass(module = "mm_rl_bridge._native")]
+struct ReactiveQrMarket {
+    inner: crate::reactive::ReactiveRows,
+}
+
+#[pymethods]
+impl ReactiveQrMarket {
+    /// `regime`, `kernel` and `episode` as JSON in #102's design's form.
+    #[new]
+    fn new(regime: &str, kernel: &str, episode: &str) -> PyResult<Self> {
+        crate::reactive::ReactiveRows::new(regime, kernel, episode)
+            .map(|inner| Self { inner })
+            .map_err(BridgeFailure::new_err)
+    }
+
+    /// The rows, `[ts_ns, bid, bid_lots, ask, ask_lots]` in the kernel's ticks and lots.
+    fn rows(&self) -> PyResult<Vec<[u64; 5]>> {
+        self.inner.rows().map_err(BridgeFailure::new_err)
+    }
+
+    /// The digest the bridge reports for these rows, as hex.
+    fn digest(&self) -> PyResult<String> {
+        self.inner.digest().map(hex).map_err(BridgeFailure::new_err)
+    }
+
+    /// Imposes `moves` reference moves after row `row` (up when positive) and simulates the
+    /// later rows again. Returns the first-limit volume the moves emptied, as exact text.
+    fn react(&mut self, row: u64, moves: i64) -> PyResult<String> {
+        self.inner.react(row, moves).map_err(BridgeFailure::new_err)
+    }
+
+    /// Why the simulator stopped before the last row, if it did.
+    fn stopped(&self) -> Option<String> {
+        self.inner.stopped()
+    }
+}
+
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnv>()?;
+    module.add_class::<ReactiveQrMarket>()?;
+    module.add_function(wrap_pyfunction!(maintenance_path, module)?)?;
     module.add("BridgeFailure", py.get_type::<BridgeFailure>())?;
     module.add("RESIDUAL_VERSION", market_maker_rs::rl::RESIDUAL_VERSION)?;
     module.add("BRIDGE_VERSION", env!("CARGO_PKG_VERSION"))?;

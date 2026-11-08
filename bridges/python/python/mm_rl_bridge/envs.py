@@ -39,6 +39,8 @@ class MarketMakingEnv(gym.Env):
         # one bit per size.
         self._hedge = bool(self.bridge_info["hedge_actions"])
         self._hedge_mask = 0
+        # The cancel-only action, in the action space of version 4.
+        self._cancel = bool(self.bridge_info["cancel_action"])
         self.observation_space = gym.spaces.Box(
             low=-1.0,
             high=1.0,
@@ -85,14 +87,27 @@ class MarketMakingEnv(gym.Env):
 
     def step(self, action):
         kind, indices = self._decode(action)
+        return self.act(kind, indices, action)
+
+    def act(self, kind, indices=(), action=None):
+        """Takes the decoded action `(kind, indices)`: what `step` does after decoding.
+
+        A wrapper that acts for the policy (`ExpiringQuote`) uses it, with `action` the
+        policy's own action for the record, if any.
+        """
+        indices = tuple(indices)
         if kind == "hold":
             reply = self._native.step_hold()
         elif kind == "quote":
             reply = self._native.step_quote(*indices)
         elif kind == "hedge":
             reply = self._native.step_hedge(*indices)
+        elif kind == "cancel":
+            reply = self._native.step_cancel()
         else:
             raise ValueError(f"unknown action kind {kind!r}")
+        if action is None:
+            action = [kind, *indices]
         extra = {
             "decoded_action": {"kind": kind, "indices": list(indices)},
             "applied_action": (
@@ -102,6 +117,14 @@ class MarketMakingEnv(gym.Env):
             ),
         }
         return self._transition(reply, action, extra)
+
+    def step_hold(self):
+        """A hold, whatever the encoding: the resting orders stay and nothing is sent."""
+        reply = self._native.step_hold()
+        hold = {"kind": "hold", "indices": []}
+        return self._transition(
+            reply, None, {"decoded_action": hold, "applied_action": hold}
+        )
 
     def _transition(self, reply, action, extra):
         self._mask = reply["mask"]
@@ -117,6 +140,9 @@ class MarketMakingEnv(gym.Env):
             "net": reply["net"],
             "penalties": reply["penalties"],
             "close": reply["close"],
+            "orders": dict(reply["orders"]),
+            "gates": {check: dict(counts) for check, counts in reply["gates"].items()},
+            "filled_lots": dict(reply["filled_lots"]),
             "row": observed["row"],
             "raw_observation": observed["raw"],
             **extra,
@@ -132,6 +158,12 @@ class MarketMakingEnv(gym.Env):
     def attribution(self):
         """The episode's components in the evaluation's definitions, reconciled with the reward."""
         return self._native.attribution()
+
+    def replace_rows(self, rows):
+        """Replaces the rows under the running episode and replays it on them (#282). The new
+        rows must keep the rows already read; a ValueError leaves the episode as it was."""
+        self._native.replace_rows([tuple(row) for row in rows])
+        self.bridge_info = dict(self._native.info())
 
     def close(self):
         self._native.close()
@@ -153,6 +185,9 @@ def _bits(mask, count):
 class MaskableMarketMakingEnv(MarketMakingEnv):
     """A discrete encoding for maskable PPO: `(hold or quote, bid, ask, bid size, ask size)`.
 
+    With `cancel_action` in the configuration the first value has a third choice, 2, the
+    cancel: every resting or pending order is cancelled and nothing is sent.
+
     With `hedge_actions` in the configuration a sixth value is the hedge: 0 is no hedge, and
     `i + 1` hedges with the grid's size `i`. A hedge reduces the delivered position with a
     marketable order at the observed touch, on the side that reduces it, as the kernel's
@@ -167,7 +202,7 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
         if config["invalid_action"] != "mask":
             raise ValueError("the maskable encoding needs the mask policy")
         super().__init__(config, rows, expected_spec, seed)
-        dims = [2, self._offsets, self._offsets, self._sizes, self._sizes]
+        dims = [3 if self._cancel else 2, self._offsets, self._offsets, self._sizes, self._sizes]
         if self._hedge:
             dims.append(1 + self._sizes)
         self.action_space = gym.spaces.MultiDiscrete(dims)
@@ -184,7 +219,9 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
         ask = _bits(mask["ask"], self._offsets)
         size = _bits(mask["size"], self._sizes)
         quote = bool(mask["quote_ok"]) and bid.any() and ask.any() and size.any()
-        parts = [np.asarray([True, quote], dtype=bool)]
+        # A cancel is allowed whenever a hold is.
+        kinds = [True, quote, True] if self._cancel else [True, quote]
+        parts = [np.asarray(kinds, dtype=bool)]
         for part in (bid, ask, size, size):
             parts.append(part if part.any() else np.ones_like(part))
         if self._hedge:
@@ -203,6 +240,8 @@ class MaskableMarketMakingEnv(MarketMakingEnv):
             return "hedge", (values[5] - 1,)
         if values[0] == 0:
             return "hold", ()
+        if self._cancel and values[0] == 2:
+            return "cancel", ()
         return "quote", tuple(values[1:5])
 
 
@@ -221,13 +260,17 @@ class BoxMarketMakingEnv(MarketMakingEnv):
     sizes, `v` of 0.5 or more is the largest. A hedge reduces the delivered position on the side
     that reduces it; one outside `hedge_mask` (a flat position, or a size above the position) is
     a charged hold, as anything outside the mask is.
+
+    With `cancel_action` in the configuration the last value above zero asks for a cancel,
+    after a hedge and before a quote: every resting or pending order is cancelled and
+    nothing is sent.
     """
 
     def __init__(self, config, rows, expected_spec=None, seed=0):
         if config["invalid_action"] != "reject":
             raise ValueError("the continuous encoding needs the reject policy")
         super().__init__(config, rows, expected_spec, seed)
-        shape = (6,) if self._hedge else (5,)
+        shape = (5 + int(self._hedge) + int(self._cancel),)
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=shape, dtype=np.float32)
 
     @staticmethod
@@ -236,7 +279,7 @@ class BoxMarketMakingEnv(MarketMakingEnv):
 
     def _decode(self, action):
         values = [float(value) for value in np.asarray(action).ravel()]
-        expected = 6 if self._hedge else 5
+        expected = 5 + int(self._hedge) + int(self._cancel)
         if len(values) != expected:
             raise ValueError(f"an action has {expected} values, not {len(values)}")
         for value in values:
@@ -244,6 +287,8 @@ class BoxMarketMakingEnv(MarketMakingEnv):
                 raise ValueError(f"an action value of {value} is not in [-1, 1]")
         if self._hedge and values[5] > 0.0:
             return "hedge", (self._bin(2.0 * values[5] - 1.0, self._sizes),)
+        if self._cancel and values[-1] > 0.0:
+            return "cancel", ()
         if values[0] <= 0.0:
             return "hold", ()
         return "quote", (
@@ -268,6 +313,8 @@ class ResidualMarketMakingEnv(MarketMakingEnv):
             raise ValueError("a residual environment needs a residual configuration")
         if config.get("hedge_actions", False):
             raise ValueError("a residual environment takes no hedge actions: drop hedge_actions")
+        if config.get("cancel_action", False):
+            raise ValueError("a residual environment takes no cancel action: drop cancel_action")
         super().__init__(config, rows, expected_spec, seed)
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 

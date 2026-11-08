@@ -15,8 +15,8 @@ use market_maker_rs::backtest::queue_reactive::{
 };
 use market_maker_rs::dec;
 use market_maker_rs::rl::{
-    EpisodeRecorder, MAX_QR_ROWS, ObservationScales, QrEpisode, RlAction, RlConfig, RlEnv,
-    qr_market,
+    EpisodeRecorder, MAX_QR_ROWS, MAX_REACTION_MOVES, ObservationScales, QrEpisode,
+    ReactiveQrMarket, RlAction, RlConfig, RlEnv, qr_market,
 };
 use market_maker_rs::types::error::MMError;
 
@@ -331,4 +331,172 @@ fn test_env_on_the_market_is_deterministic_and_restores_from_a_snapshot() {
         assert_eq!(&t, expected);
     }
     assert_eq!(restored, a);
+}
+
+#[test]
+fn test_a_reactive_market_without_reactions_is_qr_markets() {
+    let cfg = config();
+    for e in [episode(7), episode(8)] {
+        let plain = qr_market(&params(), &e, &cfg).unwrap();
+        let mut reactive = ReactiveQrMarket::new(&params(), &e, &cfg).unwrap();
+        assert_eq!(reactive.market().unwrap(), plain);
+        reactive.react(50, 0).unwrap();
+        assert_eq!(reactive.market().unwrap(), plain, "no moves change nothing");
+    }
+    // Stopped early: the same rows, reason and length; only the end differs.
+    let limited = QrParameters::new(
+        dec!(0.01),
+        0.6,
+        0.2,
+        vec![dec!(1)],
+        vec![rates()],
+        vec![vec![true, true, true, false, false]],
+        UnsupportedPolicy::Stop,
+    )
+    .unwrap();
+    let plain = qr_market(&limited, &episode(5), &cfg).unwrap();
+    let reactive = ReactiveQrMarket::new(&limited, &episode(5), &cfg)
+        .unwrap()
+        .market()
+        .unwrap();
+    assert_eq!(reactive.dataset, plain.dataset);
+    assert_eq!(reactive.stopped, plain.stopped);
+}
+
+#[test]
+fn test_an_imposed_move_empties_the_touch_it_passes_and_shifts_as_theta_does() {
+    let mut simulator = QrSimulator::new(params(), 3, 100).unwrap();
+    simulator.run(5.0, 5.0).unwrap();
+    let mut state = simulator.state();
+    state.bid = [2, 1, 0, 0, 0];
+    state.ask = [1, 2, 0, 0, 0];
+    let mut up = QrSimulator::from_state(params(), state).unwrap();
+    up.impose_reference_move(true).unwrap();
+    let after = up.state();
+    assert_eq!(after.reference_ticks, state.reference_ticks + 1);
+    // The emptied ask touch becomes the bid's first limit, the bid moves one limit out
+    // (renormalized from size 1 to 2, rounded up: 2 -> 1), and the ask's second limit
+    // comes nearer (2 of size 2 -> 4 of size 1).
+    assert_eq!((after.bid[0], after.bid[1], after.ask[0]), (0, 1, 4));
+    // The move is at the state's clock, its time moves up to it, and every clock restarts.
+    let now = state.clock_seconds.max(state.time_seconds);
+    assert_eq!(after.time_seconds, now);
+    assert_eq!(after.bid_last, [now; 5]);
+    assert_eq!(after.ask_last, [now; 5]);
+    let mut down = QrSimulator::from_state(params(), state).unwrap();
+    down.impose_reference_move(false).unwrap();
+    let after = down.state();
+    assert_eq!(after.reference_ticks, state.reference_ticks - 1);
+    assert_eq!((after.ask[0], after.ask[1], after.bid[0]), (0, 1, 2));
+}
+
+#[test]
+fn test_a_reaction_keeps_the_rows_up_to_it_and_simulates_the_rest_from_the_moved_state() {
+    let cfg = config();
+    let e = episode(7);
+    let original = ReactiveQrMarket::new(&params(), &e, &cfg).unwrap();
+    let mut reacted = original.clone();
+    let emptied = reacted.react(60, -2).unwrap();
+    assert_eq!(reacted.ticks().len(), original.ticks().len());
+    assert_eq!(reacted.ticks()[..=60], original.ticks()[..=60]);
+    assert_ne!(reacted.ticks()[61..], original.ticks()[61..]);
+    assert_eq!(reacted.states()[..60], original.states()[..60]);
+    // The rest is a direct run from the moved state, with the stored generator state.
+    let mut direct = QrSimulator::from_state(params(), original.states()[60]).unwrap();
+    let first = direct.state().bid[0];
+    direct.impose_reference_move(false).unwrap();
+    let second = direct.state().bid[0];
+    direct.impose_reference_move(false).unwrap();
+    // The first limit's event size is 1: the volume emptied is the two touches passed.
+    assert_eq!(emptied, Decimal::from(first + second));
+    assert_eq!(reacted.states()[60], direct.state());
+    let seconds = f64::from(e.sample_ms) / 1000.0;
+    for row in 61..reacted.states().len() {
+        direct.run(seconds, seconds).unwrap();
+        assert_eq!(reacted.states()[row], direct.state(), "row {row}");
+    }
+    assert_eq!(
+        reacted.states()[61].reference_ticks,
+        original.states()[60].reference_ticks - 2
+            + (reacted.states()[61].reference_ticks - reacted.states()[60].reference_ticks)
+    );
+    // A second reaction after the same row adds to the first, and the same reactions
+    // give the same market.
+    let mut twice = original.clone();
+    twice.react(60, -1).unwrap();
+    twice.react(60, -1).unwrap();
+    assert_eq!(twice, reacted);
+    let mut again = original.clone();
+    again.react(60, -2).unwrap();
+    assert_eq!(again.market().unwrap(), reacted.market().unwrap());
+    assert!(original.clone().react(200, 1).is_err(), "past the last row");
+    let bound = i64::try_from(MAX_REACTION_MOVES).unwrap();
+    assert!(original.clone().react(60, bound + 1).is_err());
+    assert!(original.clone().react(60, -bound - 1).is_err());
+    assert!(original.clone().react(60, i64::MIN).is_err());
+}
+
+#[test]
+fn test_after_an_imposed_move_waits_run_from_the_move_and_the_generator_is_accounted() {
+    let mut simulator = QrSimulator::new(params(), 11, 100).unwrap();
+    simulator.run(5.0, 5.0).unwrap();
+    let state = simulator.state();
+    let mut moved = QrSimulator::from_state(params(), state).unwrap();
+    moved.impose_reference_move(true).unwrap();
+    let at = moved.state();
+    // One outer queue is drawn from the simulator's own generator, the same way each time.
+    assert_ne!(at.rng_state, state.rng_state);
+    let mut twice = QrSimulator::from_state(params(), state).unwrap();
+    twice.impose_reference_move(true).unwrap();
+    assert_eq!(twice.state(), at);
+    // The first event after the move waits from the move, not from the queue's last event
+    // before it: the clocks restarted there, as after a move of θ.
+    let move_time = at.clock_seconds;
+    match moved.step().unwrap() {
+        QrStep::Event { observation, .. } => {
+            let now = moved.state().time_seconds;
+            assert!((observation.waiting_seconds - (now - move_time)).abs() < 1e-12);
+        }
+        other => panic!("{other:?}"),
+    }
+    // No move leaves the state, the generator included, as it was.
+    let cfg = config();
+    let market = ReactiveQrMarket::new(&params(), &episode(11), &cfg).unwrap();
+    let mut same = market.clone();
+    same.react(30, 0).unwrap();
+    assert_eq!(same.states(), market.states());
+}
+
+#[test]
+fn test_states_on_rows_that_differ_later_are_the_same_apart_from_the_dataset() {
+    let cfg = config().with_fee_rate(dec!(0.001));
+    let original = ReactiveQrMarket::new(&params(), &episode(7), &cfg).unwrap();
+    let mut moved = original.clone();
+    moved.react(120, 2).unwrap();
+    let (a, b) = (original.market().unwrap(), moved.market().unwrap());
+    assert_ne!(a.dataset.id(), b.dataset.id());
+    let grid = ActionGrid::new([1], [1], [1]).unwrap();
+    let env = |data| -> RlEnv<'_, 1, 1> {
+        RlEnv::new(&cfg, data, grid, RlConfig::new(scales(), dec!(1))).unwrap()
+    };
+    let (env_a, env_b) = (env(&a.dataset), env(&b.dataset));
+    let mut state_a = env_a.reset(1).unwrap();
+    let mut state_b = env_b.reset(1).unwrap();
+    let mut diverged = false;
+    for step in 0..199 {
+        let row = env_a.observe(&state_a).unwrap().row.unwrap_or(0);
+        if row < 120 {
+            assert!(state_a.same_apart_from_dataset(&state_b), "step {step}");
+            assert!(state_a.kernel().same_apart_from_dataset(state_b.kernel()));
+            assert_ne!(state_a, state_b, "the dataset's identity differs");
+        } else if !state_a.same_apart_from_dataset(&state_b) {
+            diverged = true;
+        }
+        env_a.step(&mut state_a, action(step)).unwrap();
+        env_b.step(&mut state_b, action(step)).unwrap();
+    }
+    assert!(diverged, "the later rows differ, so the states do");
+    // Different runs on the same rows are not the same.
+    let other = env_a.reset(2).unwrap();
+    assert!(!env_a.reset(1).unwrap().same_apart_from_dataset(&other));
 }
