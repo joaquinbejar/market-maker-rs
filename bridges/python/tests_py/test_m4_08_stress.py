@@ -16,6 +16,10 @@ from mm_rl_bridge import BoxMarketMakingEnv, maintenance_path
 HERE = pathlib.Path(__file__).resolve().parent
 EXPERIMENT = HERE.parent / "experiments" / "m4_08"
 sys.path.insert(0, str(EXPERIMENT))
+# The experiments' runners share module names (run, report): another study's, imported by an
+# earlier test, must not stand in for this one's.
+for name in ("run", "report", "shocks", "costs"):
+    sys.modules.pop(name, None)
 
 
 def load(name, file):
