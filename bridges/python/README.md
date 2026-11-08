@@ -59,6 +59,13 @@ gate cut (`reduced`) or refused (`rejected`, a cut off the lot grid included) by
 decided: `limits`, `combined` (a hedged kernel's) and `margin`. A hold submits nothing, so the
 gate decides nothing on it.
 
+`ChosenDuration(env, choices=(1, 5, 10, 30))` wraps a Box environment so that the policy
+chooses, with each action, how many rows its quote rests before it decides again: one more value
+in `[-1, 1]` at the end of the action, binned onto `choices`. Between decisions the resting
+orders stay and nothing is sent; the reward is the sum over the rows, and `info` holds `rows`
+and the chosen `duration`. `DecisionInterval(env, every)` is the same with a fixed interval.
+A cancel takes effect after the cancel latency, so fills in flight stand.
+
 `ExpiringQuote(env, rows=d)` wraps such an environment so that a quote expires by itself: after
 a quote the environment applied it holds for `d - 1` decisions and cancels at the decision `d`
 rows after the quote, with no decision of the policy, which decides again on the next row. In
