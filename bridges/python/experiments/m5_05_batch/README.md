@@ -147,6 +147,9 @@ breaches at 100 ms. `audit.json` sha256 is
   frozen, and its no-breach condition rests on the mechanism above, not on the holdout's
   measurement.
 - At 100 ms the rule makes no duration claim.
+- 30 and 60 ms are close to one treatment. Decisions sit on 100 ms rows, so at either delay an
+  order lands in the batch it was sent in, before its close. The two differ only in where it
+  lands among the background orders of that batch.
 - At every latency the classical Avellaneda-Stoikov arm's mean exceeds both learned arms'.
 - Late messages (orders and cancels that acted a batch after the one they were sent in) occur
   only at 100 ms.
