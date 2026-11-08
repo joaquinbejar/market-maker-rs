@@ -1,6 +1,6 @@
 {
   "issue": 309,
-  "design_version": 2,
+  "design_version": 3,
   "data": "synthetic: #102's queue-reactive simulator and regimes, with made-up parameters, on new days generated for this study; no market data. The logs are generated here by #104's behaviours; their rewards are the simulator's consequences, not observed ones",
   "bounds": "One synthetic simulator whose rows do not react to orders, made-up parameters and 24 days per regime bound what this study can show. Every value is labelled [observed] (read from a log) or [simulated] (an interactive run in the same simulator); nothing here is an off-policy estimate.",
   "motivation": "A new experiment motivated by a validation result of #280, not a confirmatory continuation of it. #280's stop stays as the result of its registered design.",
@@ -55,8 +55,9 @@
       "limit": "The ceiling without the regime holds for that key only. A network sees the other features too, which may reveal the regime partly, so this ceiling is not a bound on BC.",
       "label_tested": "The action tested is the logs' target_code of as_grid, as_grid's greedy action coded after grid.canonical, never the logged epsilon-greedy action, on which the rule would fail by construction.",
       "key_values": "Position and steps left are the raw exact values as_grid reads, recovered exactly from the log, and the mask is compared exactly, element by element.",
-      "reading": "An exact-key ceiling of 1.0 with the regime does not imply that BC reaches 90 %: as_grid's rounding boundaries move with steps left, and about 39 % of #280's misses where both quote were within one offset step. So a BC failure here does not refute aliasing, and a BC pass does not by itself prove aliasing caused #280's stop. Agreement per regime is reported beside the pooled rule."
-    }
+      "reading": "An exact-key ceiling of 1.0 with the regime does not imply that BC reaches 90 %: as_grid's rounding boundaries move with steps left, and about 39 % of #280's misses where both quote were within one offset step. So a BC failure here does not refute aliasing, and a BC pass does not by itself prove aliasing caused #280's stop. Agreement per regime is reported beside the pooled rule. The conclusions say so: a run that reaches 90 % changed the input and the days, and does not by itself prove the aliasing reading."
+    },
+    "input_precision": "The audit also states whether position and steps left reach the network unclipped and precise enough: on the training logs it reports the observation columns' ranges and whether each distinct raw value of position and steps left maps to a distinct float32 input. It is reported beside BC's agreement and decides nothing, since 90 % could fail on scaling alone."
   },
   "executions": {
     "standard": {
@@ -186,7 +187,7 @@
       ]
     ],
     "intervals": "paired: the difference of the two arms' daily values day by day; Politis and Romano's stationary bootstrap over days with mean block 2 days, 2000 replicates, seed 309, 90 % percentile interval; per regime over its 5 days, and pooled by resampling each regime's days independently and averaging the regimes' means with equal weight",
-    "claims": "Comparison-specific only. No offline arm is called better or worse than another arm unless the paired 90 % interval excludes zero. An offline arm is called better than an interactive one only against maskable_ppo_regime. No claim about any market or about an estimated regime. Logged data, simulated consequences and interactive results are kept apart in every table. The equal-information comparison covers information only: CQL chooses among three alphas on validation, while maskable_ppo_regime uses set 0, chosen on #102's days under #102's main execution, untuned here with the extra input and the standard execution, and this asymmetry is stated beside every such comparison. Only the pooled interval carries a claim; the per-regime intervals (5 days, mean block 2) are descriptive. The seven comparisons have no multiplicity correction, which is stated with them."
+    "claims": "Comparison-specific only. No offline arm is called better or worse than another arm unless the paired 90 % interval excludes zero. An offline arm is called better than an interactive one only against maskable_ppo_regime. No claim about any market or about an estimated regime. Logged data, simulated consequences and interactive results are kept apart in every table. The equal-information comparison covers information only: CQL chooses among three alphas on validation, while maskable_ppo_regime uses set 0, chosen on #102's days under #102's main execution, untuned here with the extra input and the standard execution, and this asymmetry is stated beside every such comparison. Only the pooled interval carries a claim; the per-regime intervals (5 days, mean block 2) are descriptive. The intervals are unadjusted: the seven comparisons have no multiplicity correction, which is stated with them."
   },
   "support": {
     "propensity": "#280's: at every decision of each trained arm's holdout run, the behaviour's exact probability of the arm's action; the shares at 0 and under 0.0001, which are zero by construction and are reported to show it",
@@ -202,7 +203,7 @@
     "Queue gate, before any log: on the validation days at environment seed 101, as_grid under the standard execution must have more than 0 fills over the days and a mean daily net different from its mean daily net under immediate fill. Otherwise stop and report.",
     "Determinism: the gate's standard runs of fixed_spread_4 on the first validation day of each regime are run twice and must be equal exactly.",
     "Aliasing: the rule in audit_of_280.aliasing.",
-    "BC sanity, threshold 90 %, before any choice of alpha or freeze: on each dataset's validation logs, the BC arm of every seed must choose as_grid's action on at least 90 % of the logged decisions; agreement per regime is reported beside it and decides nothing. standard_eps30 is checked first and CQL is not trained until it passes. If standard_eps30 fails the whole study stops and reports, as #280 did. If only standard_eps10 fails, the secondary dataset stops, is reported as failed and leaves the freeze and the holdout, and the primary continues.",
+    "BC sanity, threshold 90 %, before any choice of alpha or freeze: on each dataset's validation logs, the BC arm of every seed must choose as_grid's action on at least 90 % of the logged decisions; agreement per regime is reported beside it and decides nothing. The order is: BC on standard_eps30 and its check, then BC on standard_eps10 and its check, and only then CQL on any dataset and the choice of alpha. If standard_eps30 fails the whole study stops and reports, as #280 did. If only standard_eps10 fails, the secondary dataset stops, is reported as failed and leaves the freeze and the holdout, and the primary continues.",
     "CQL: a loss that is not finite stops the run, and it is reported; nothing is tuned beyond the alpha grid.",
     "Compute: a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds."
   ],
@@ -214,6 +215,7 @@
   },
   "holdout_rule": "The holdout days are read once, after the freeze has recorded the hashes of the design, the digests, the budget file, the code, the chosen alpha, every log and every checkpoint; the runner refuses it before, and the exclusive marker of attempts.layout, created before the first holdout day is read, is kept on failure, so it is not run again in this or any other attempt.",
   "changes": [
-    "version 2, before any data or run exists: after a design review, the holdout marker moves to the attempts root and rules out a second attempt once the holdout started; the aliasing label and key are named; the BC rule's scope across datasets is stated; the reading of the ceiling, the tuning asymmetry, the width of the intervals and the budget file are stated."
+    "version 2, before any data or run exists: after a design review, the holdout marker moves to the attempts root and rules out a second attempt once the holdout started; the aliasing label and key are named; the BC rule's scope across datasets is stated; the reading of the ceiling, the tuning asymmetry, the width of the intervals and the budget file are stated.",
+    "version 3, before any data or run exists: after a second design review, BC on both datasets is checked before any CQL training; the audit reports the input's range and precision; the conclusions' limit and the unadjusted intervals are stated."
   ]
 }
