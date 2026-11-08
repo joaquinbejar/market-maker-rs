@@ -22,6 +22,9 @@ def load(name, file):
 
 report = load("m4_10_report", "report.py")
 sys.path.insert(0, str(EXPERIMENT))
+# The experiments' runners share the module name run: another study's, imported by an
+# earlier test, must not stand in for this one's.
+sys.modules.pop("run", None)
 once = load("m4_10_holdout_once", "holdout_once.py")
 
 LATENCIES = ("25", "500")
