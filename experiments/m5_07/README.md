@@ -130,6 +130,8 @@ Disclosures:
   stopped within seconds with no result written or read; the second used the one recovery allowed.
 - The paper's greedy net-risk formula omits a factor and a coefficient; the derived form
   `2 phi D r delta + D delta^2 m <= D^j/2` is used, from v_hat differences.
+  This explicit algebraic form was not written in design version 4, which says "the greedy
+  quoting rule from v_hat"; a reviewer checked it as covered by that text only after the run.
 - The backtest is Approximation 3.1 as frozen: one Brownian and Poisson fills, not the paper's
   QRH-driven simulation. kappa_j = kappa/2 across example 1's grid, as in the paper.
 
