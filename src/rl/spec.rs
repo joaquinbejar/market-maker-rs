@@ -594,11 +594,13 @@ impl QuoteLives {
         if lives.contains(&0) {
             return refuse("must not be zero");
         }
-        if lives.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if lives.iter().zip(lives.iter().skip(1)).any(|(a, b)| a >= b) {
             return refuse("must strictly increase");
         }
         let mut values = [0; MAX_QUOTE_LIVES];
-        values[..lives.len()].copy_from_slice(lives);
+        for (slot, life) in values.iter_mut().zip(lives) {
+            *slot = *life;
+        }
         Ok(Self {
             values,
             len: lives.len(),
@@ -608,7 +610,7 @@ impl QuoteLives {
     /// The lives, in nanoseconds.
     #[must_use]
     pub fn as_slice(&self) -> &[u64] {
-        &self.values[..self.len]
+        self.values.get(..self.len).unwrap_or(&[])
     }
 }
 

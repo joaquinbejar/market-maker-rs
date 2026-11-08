@@ -19,10 +19,9 @@ use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
     CancelActions, ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_EXPIRY_REFUSED, ERR_HEDGE_REFUSED,
-    EpisodeRecorder, QuoteExpiry, QuoteLives,
-    FeatureVector, HedgeActions, InvalidActionPolicy, ObservationScales, ResidualBounds,
-    ResidualDecision, ResidualEnv, ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId,
-    TerminalValuation, Transition,
+    EpisodeRecorder, FeatureVector, HedgeActions, InvalidActionPolicy, ObservationScales,
+    QuoteExpiry, QuoteLives, ResidualBounds, ResidualDecision, ResidualEnv, ResidualProposal,
+    RlAction, RlConfig, RlEnv, RlState, SpecId, TerminalValuation, Transition,
 };
 use market_maker_rs::strategy::glft::GLFTConfig;
 use serde::Deserialize;

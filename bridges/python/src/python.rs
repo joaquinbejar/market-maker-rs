@@ -137,7 +137,8 @@ fn info_dict<'py>(py: Python<'py>, info: &crate::worker::EnvInfo) -> PyResult<Bo
     out.set_item("cancel_action", info.cancel_action)?;
     out.set_item(
         "quote_lives_ns",
-        info.quote_lives.map_or(Vec::new(), |lives| lives.as_slice().to_vec()),
+        info.quote_lives
+            .map_or(Vec::new(), |lives| lives.as_slice().to_vec()),
     )?;
     out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
     out.set_item("dataset_digest", hex(info.dataset_digest))?;
