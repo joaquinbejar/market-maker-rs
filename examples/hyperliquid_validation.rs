@@ -947,6 +947,9 @@ struct Phase290 {
     /// On the training part, per limit and kind: the summed size change in event sizes and
     /// the events.
     size_change: [[(f64, u64); 3]; LIMITS as usize],
+    /// Per UTC day, over every part: resets made, sides left out for want of a seen touch, and
+    /// mid moves seen.
+    resets_by_day: std::collections::BTreeMap<u64, [u64; 3]>,
 }
 
 impl Phase290 {
@@ -1071,10 +1074,16 @@ impl Phase290 {
                 }
             }
             let both = matches!(self.mid, Some(Some(_))) && event.mid.is_some();
+            let day = self
+                .resets_by_day
+                .entry(event.time_ns / NS_PER_MS / DAY_MS)
+                .or_default();
+            day[2] += u64::from(self.mid.is_some());
             if both && !ends.contains(&0) {
                 for side in 0..2 {
                     match (self.touch.get(side), self.touch_ns.get(side)) {
                         (Some(Some(Touch::Level(level))), Some(Some(at))) => {
+                            day[0] += 1;
                             if counting {
                                 self.resets_made += 1;
                             }
@@ -1089,6 +1098,7 @@ impl Phase290 {
                             }
                         }
                         _ => {
+                            day[1] += 1;
                             if counting {
                                 self.resets_skipped += 1;
                             }
@@ -2720,6 +2730,17 @@ fn section_290(report: &mut Report, collect: &Collect) {
         collect.strides.queue,
         p.resets.iter().filter(|r| r.queue_after.is_some()).count()
     );
+    say!(
+        report,
+        "    Per UTC day, every part: mid moves, resets made, sides left out: {}",
+        p.resets_by_day
+            .iter()
+            .map(|(day, [made, skipped, moves])| {
+                format!("{} {moves} {made} {skipped}", &utc(day * DAY_MS)[..10])
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
     if !matches!(collect.sizes.as_ref().map(|s| &s.queue.sizes), Some(Ok(_))) {
         say!(report, "(4): no event sizes.");
         return;
@@ -2838,7 +2859,8 @@ fn section_290(report: &mut Report, collect: &Collect) {
 fn section_290_book(report: &mut Report, collect: &Collect) {
     say!(
         report,
-        "\n== #290 phase 3: E0, E1 and E2 against the data, each with its constant baseline =="
+        "\n== #290 phase 3: E0 to E3, and E3 inv as a sensitivity row, against the data, each \
+         with its constant baseline =="
     );
     say!(
         report,
@@ -2859,6 +2881,7 @@ fn section_290_book(report: &mut Report, collect: &Collect) {
             .collect::<Vec<_>>()
             .join(" ")
     };
+    let resets = collect.phase_290.sorted_resets();
     for window in &collect.book_windows {
         let name = match window.kind {
             WindowKind::Train => "training window, training fits, in sample".to_string(),
@@ -2866,6 +2889,26 @@ fn section_290_book(report: &mut Report, collect: &Collect) {
             WindowKind::Day(_) => "day, own fits, in sample".to_string(),
         };
         say!(report, "{name}: {}", window_text(&window.window));
+        let fit_window = match window.kind {
+            WindowKind::Train | WindowKind::Holdout => collect.protocol.queue_train(),
+            WindowKind::Day(day) => day,
+        };
+        let inside: Vec<&ResetObservation> = resets
+            .iter()
+            .filter(|r| fit_window.start_ms <= r.timestamp_ms && r.timestamp_ms < fit_window.end_ms)
+            .collect();
+        say!(
+            report,
+            "    E3's fit window {} holds {} kept resets, {} at a size from 1 to the cap, {} with \
+             a new size",
+            window_text(&fit_window),
+            inside.len(),
+            inside
+                .iter()
+                .filter(|r| (1..=qr_290::MAX_QUEUE).contains(&r.queue_before))
+                .count(),
+            inside.iter().filter(|r| r.queue_after.is_some()).count()
+        );
         let lines = match &window.result_290 {
             None => {
                 say!(report, "    not reached: the stretch ended before it");
@@ -3306,6 +3349,8 @@ mod tests {
         assert_eq!((p.resets_made, p.resets_skipped), (3, 1));
         let sorted = p.sorted_resets();
         assert!(sorted.is_sorted_by_key(|r| r.timestamp_ms));
+        // By day, on every part: 5 moves, 5 resets made, 3 sides unseen.
+        assert_eq!(p.resets_by_day.get(&0), Some(&[5, 3, 5]));
         // From a one sided book, no reset.
         let mut q = Phase290::default();
         at(&mut q, touch(0, 100, Some(0), Some(4)), true);
