@@ -31,6 +31,16 @@ project follows [Semantic Versioning](https://semver.org/).
   (a side's touch at a move of the mid that emptied no touch, its new size from the side's next
   touch event); its redraw law is the observed new sizes, with the invariant law as a
   sensitivity row only. `qr_estimation synthetic-e3` checks that E3 recovers known resets.
+- The quote duration comparison of #110 in `bridges/python/experiments/m4_10`, with
+  `ChosenDuration` in the bridge's wrappers: a policy that chooses, with each action, how many
+  rows its quote rests before it decides again. On #103's regimes sampled every 100 ms, under a
+  queue of 1 lot per 750 ms, at submit and cancel latencies of 25, 100 and 500 ms: PPO with a
+  chosen duration, a linear mid forecast and a warm start cloned from Avellaneda-Stoikov,
+  against the same without each, and against no-trade and Avellaneda-Stoikov, with paired
+  block bootstrap intervals on the holdout. The design and four declared versions were
+  committed before the runs they govern, `report.py` before the holdout was read, and
+  `holdout_once.py` reads the holdout once. Synthetic data only; the results are on the issue.
+
 - A second, margin-stress holdout for #105's comparison in `bridges/python/experiments/m4_08`
   (`stress.py`, `report_stress.py`, `stress_design.json`): the frozen runs on five new days per
   regime, by #102's seed rule, unshocked and shocked, with every step's account assessed by
