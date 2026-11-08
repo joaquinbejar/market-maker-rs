@@ -231,3 +231,7 @@ harness = false
 name = "option_pricing"
 harness = false
 required-features = ["chain"]
+
+[[example]]
+name = "qrh_gate_table"
+required-features = ["options"]
