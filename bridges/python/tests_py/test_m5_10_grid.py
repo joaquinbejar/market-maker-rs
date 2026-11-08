@@ -52,3 +52,15 @@ def test_slope_and_impact_rule():
     assert abs(g.slope(0.25 * x + 3, x) - 0.25) < 1e-12
     assert g.impact_passes(0.26, 0.25) and not g.impact_passes(0.30, 0.25)
     assert g.impact_passes(0.02, 0.0) and not g.impact_passes(0.03, 0.0)
+
+
+def test_day_config_scales_only_the_point_and_leaves_the_input():
+    causal = json.loads((ROOT / "m5_02" / "design.json").read_text())["causal"]
+    before = json.dumps(causal)
+    out = g.day_config(causal, g.fixed_stress(0.0), "p", 10, 100000)
+    assert json.dumps(causal) == before
+    assert np.allclose([out["flow"]["rates"]["market"], out["flow"]["rates"]["limit"]], [0.6, 1.05])
+    assert out["flow"]["rates"]["cancel_per_lot"] == 0.05
+    assert np.isclose(out["flow"]["weights"][0][2][2], 0.36)
+    assert out["settings"] == [{"name": "p", "impact_ticks": 0.25}]
+    assert out["seed_offset"] == 100000 and out["splits"]["holdout"] == [1, 10]

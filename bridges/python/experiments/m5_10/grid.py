@@ -4,6 +4,7 @@ SYNTHETIC. No day is generated here: the rules take statistics a caller measured
 """
 
 import itertools
+import json
 
 import numpy as np
 
@@ -67,3 +68,17 @@ def impact_passes(estimate, impact_ticks):
     if impact_ticks == 0:
         return abs(estimate) <= ZERO_IMPACT_SLOPE
     return abs(estimate / impact_ticks - 1) <= TOLERANCE
+
+
+def day_config(causal, point, name, days, offset):
+    """The `causal` section hawkes_days reads for one point: one setting, every day in `holdout`."""
+    out = json.loads(json.dumps(causal))
+    flow = out["flow"]
+    flow["rates"]["market"] *= point["market"]
+    flow["rates"]["limit"] *= point["limit"]
+    flow["weights"] = (np.asarray(flow["weights"], float) * point["branching"]).tolist()
+    out["settings"] = [{"name": name, "impact_ticks": point["impact"]}]
+    out["days"] = days
+    out["splits"] = {"train": [days + 1, days + 1], "validation": [days + 2, days + 2], "holdout": [1, days]}
+    out["seed_offset"] = offset
+    return out
