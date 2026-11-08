@@ -150,7 +150,7 @@ def decide(out, transfer_paths):
 
 def main():
     if sys.argv[1] == "score-qr":
-        fits = json.loads((pathlib.Path(sys.argv[3]).parent / "fits.json").read_text())
+        fits = json.loads((pathlib.Path(sys.argv[2]) / "fits.json").read_text())
         caps = {fits["arms"][arm]["parameters"]["cap"] for arm in ARMS}
         if len(caps) != 1:
             raise SystemExit("the QR arms differ in their cap")
