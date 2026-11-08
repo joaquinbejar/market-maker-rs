@@ -26,7 +26,8 @@ class DecisionInterval(gym.Wrapper):
 
     The reward is the sum over the rows the decision covers, and `info` holds the exact sum
     (`reward_exact`), the last row's net result, the order reports summed over those rows
-    and the number of rows (`rows`). An episode that ends between decisions ends there.
+    and the number of rows (`rows`). The gate's cuts and refusals (`gates`) are the decided
+    step's: a hold submits nothing, so the gate decides nothing on the rows held. An episode that ends between decisions ends there.
     """
 
     def __init__(self, env, every):
