@@ -159,6 +159,8 @@ def run_draws(capture, fits, out, set_name, seed):
         for j in range(1, DRAWS + 1):
             path = out / set_name / f"mdqr-{seed}-w{w}-d{j}.json"
             path.parent.mkdir(parents=True, exist_ok=True)
+            if set_name == "holdout" and path.exists():
+                raise SystemExit(f"{path} exists: the holdout runs once")
             try:
                 trajectory = simulate_window(model, window, 106000 + 100 * w + j)
                 row = {"failure": None, "metrics": score(data, trajectory, cap),

@@ -73,3 +73,29 @@ def test_tau_b_handles_ties_and_order():
     assert aggregate.tau_b([1, 2, 3], [3, 2, 1]) == pytest.approx(-1.0)
     assert aggregate.tau_b([1, 1, 2], [1, 1, 2]) == pytest.approx(1.0)
     assert np.isnan(aggregate.tau_b([1, 1], [1, 2]))
+
+
+def names(arm, windows=3, draws=10):
+    return {f"/x/{arm}-w{w}-d{j}.json": {} for w in range(1, windows + 1) for j in range(1, draws + 1)}
+
+
+def test_a_qr_arm_matches_only_its_own_files():
+    import aggregate
+    transfer = {**names("qr"), **names("qr_count"), **names("qr_constant")}
+    picked = aggregate.names_of(transfer, "qr")
+    assert all(len(v) == 10 for v in picked.values())
+    assert not any("count" in p or "constant" in p for v in picked.values() for p in v)
+
+
+def test_a_missing_draw_stops():
+    import aggregate
+    transfer = names("qr")
+    del transfer["/x/qr-w1-d1.json"]
+    with pytest.raises(ValueError):
+        aggregate.names_of(transfer, "qr")
+
+
+def test_scoring_the_qr_arms_refuses_an_unclaimed_holdout(tmp_path):
+    import aggregate
+    with pytest.raises(SystemExit):
+        aggregate.score_qr(tmp_path, tmp_path, tmp_path, 200)

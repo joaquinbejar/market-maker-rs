@@ -485,6 +485,10 @@ fn directions_of(
 }
 
 fn arms(fits: &Value, window: &Path, out: &Path, w: u64) -> Result<(), Failure> {
+    let claimed = out.parent().map(|p| p.join("holdout.started").exists());
+    if window.to_string_lossy().contains("/holdout/") && claimed != Some(true) {
+        return Err("the holdout is not claimed".into());
+    }
     let window: Value = serde_json::from_slice(&fs::read(window)?)?;
     let sample = window
         .pointer("/history/last_sample")
