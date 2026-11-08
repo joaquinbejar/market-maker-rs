@@ -51,6 +51,12 @@ holdout.
   Avellaneda-Stoikov point, each on 5 holdout days of 3 regimes, unshocked and under each of
   the two shocks (15 x 45 + 2 x 45). The fee rule chose 0.0002, the secondary fee, so there is
   no separate secondary row.
+- Found in review after the holdout: the run (925928b) checked each checkpoint's hash at the
+  freeze and the holdout but not its OmniSafe `config.json`, which sets the actor and the
+  observation normalizer and whose hash training recorded. The runner now checks both before
+  any policy loads, at the freeze, the holdout and every evaluation. For this run, every one of
+  the 25 configurations still matches the hash training recorded, and none was written after
+  training (the last at 23:21 on 7 November; the freeze and the holdout came after).
 - The holdout took 6 minutes against an estimate of 180. The estimates of the evaluation steps
   were set before any evaluation was timed, as 60 minutes on 6 processes scaled by 3 for 2;
   an evaluated day is 8640 steps, and a job took about 0.9 seconds on the holdout (0.23 for

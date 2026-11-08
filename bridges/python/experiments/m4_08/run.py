@@ -142,7 +142,11 @@ class Learned:
     """An OmniSafe policy as saved: its actor and observation normalizer; it acts on the
     actor's mean."""
 
-    def __init__(self, run_dir, model):
+    def __init__(self, run_dir, model, config_sha256=None):
+        # The configuration sets the actor and the normalizer: it must be the one trained.
+        if config_sha256 is not None and \
+                sha256(pathlib.Path(run_dir) / "config.json") != config_sha256:
+            raise ValueError(f"{run_dir}/config.json changed after training")
         from omnisafe.common.normalizer import Normalizer
         from omnisafe.models.actor import ActorBuilder
         import gymnasium
@@ -233,7 +237,8 @@ def evaluate_job(job):
     try:
         kind = job["policy"]["kind"]
         policy = (Constant(HOLD) if kind == "hold" else ZeroResidual() if kind == "zero_residual"
-                  else Learned(job["policy"]["run_dir"], job["policy"]["model"]))
+                  else Learned(job["policy"]["run_dir"], job["policy"]["model"],
+                               job["policy"]["config_sha256"]))
         days = [episode(policy, env, rows, seed, design)
                 for seed in design["evaluation"]["evaluation_seeds"]]
     finally:
@@ -355,7 +360,8 @@ class Context:
     def learned_jobs(self, runs, fee, split, days, shocks=(None,)):
         return [self.job(m["arm"], fee, split, regime, day, shock,
                          f"seed{m['seed']}" + (f"-penalty{m['penalty']}" if m["penalty"] else ""),
-                         {"kind": "learned", "run_dir": m["run_dir"], "model": m["model"]},
+                         {"kind": "learned", "run_dir": m["run_dir"], "model": m["model"],
+                          "config_sha256": m["config_sha256"]},
                          penalty=m["penalty"])
                 for m in runs for shock in shocks for regime in self.regimes for day in days]
 
@@ -451,11 +457,19 @@ def penalty_selection(ctx):
 STEPS = ("fee_rule", "classical_selection", "training", "penalty_selection")
 
 
+def check_run(m, when):
+    """A trained run's checkpoint and configuration, against the hashes training recorded."""
+    run_dir = pathlib.Path(m["run_dir"])
+    if sha256(run_dir / "torch_save" / m["model"]) != m["checkpoint_sha256"]:
+        raise ValueError(f"{m['run_dir']} changed after {when}")
+    if sha256(run_dir / "config.json") != m["config_sha256"]:
+        raise ValueError(f"{m['run_dir']}/config.json changed after {when}")
+
+
 def freeze(ctx):
     reports = {name: ctx.read(name) for name in STEPS}
     for m in reports["training"]["runs"]:
-        if sha256(pathlib.Path(m["run_dir"]) / "torch_save" / m["model"]) != m["checkpoint_sha256"]:
-            raise ValueError(f"{m['run_dir']} changed after training")
+        check_run(m, "training")
     chosen = reports["penalty_selection"]["selected"]
     runs = [m for m in reports["training"]["runs"]
             if m["arm"] != "ppo_penalized" or m["penalty"] == chosen]
@@ -483,8 +497,7 @@ def holdout(ctx, frozen_sha256):
         if frozen[f"{name}_sha256"] != sha256(ctx.out / f"{name}.json"):
             raise ValueError(f"{name}.json changed after the freeze")
     for m in frozen["runs"]:
-        if sha256(pathlib.Path(m["run_dir"]) / "torch_save" / m["model"]) != m["checkpoint_sha256"]:
-            raise ValueError(f"{m['run_dir']} changed after the freeze")
+        check_run(m, "the freeze")
     report = ctx.header("holdout")
     report["frozen_sha256"] = frozen_sha256
     started = time.perf_counter()
