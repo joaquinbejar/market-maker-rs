@@ -18,6 +18,14 @@ project follows [Semantic Versioning](https://semver.org/).
   committed before the runs they govern, `report.py` before the holdout was read, and
   `holdout_once.py` reads the holdout once. Synthetic data only; the results are on the issue.
 
+- A market that reacts to the agent (#282), opt in. `QrSimulator::impose_reference_move` moves
+  the reference one tick from outside the simulated flow: it empties the first-limit queue the
+  price moves through, then shifts the queues as when `θ` moves the reference, at the state's
+  clock. `rl::ReactiveQrMarket` holds the rows `qr_market` makes and each row's state;
+  `react` imposes moves after a row and simulates every later row again, leaving that row and
+  the earlier ones unchanged, at most `rl::MAX_REACTION_MOVES` at a time. With no reaction its
+  market is `qr_market`'s. The Python bridge gains `ReactiveQrMarket` over one regime's day, and
+  each step's `info["filled_lots"]`, the lots the agent bought and sold during the step.
 - A second, margin-stress holdout for #105's comparison in `bridges/python/experiments/m4_08`
   (`stress.py`, `report_stress.py`, `stress_design.json`): the frozen runs on five new days per
   regime, by #102's seed rule, unshocked and shocked, with every step's account assessed by

@@ -142,6 +142,7 @@ class MarketMakingEnv(gym.Env):
             "close": reply["close"],
             "orders": dict(reply["orders"]),
             "gates": {check: dict(counts) for check, counts in reply["gates"].items()},
+            "filled_lots": dict(reply["filled_lots"]),
             "row": observed["row"],
             "raw_observation": observed["raw"],
             **extra,
