@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Quotes that expire at the venue as an RL action (#297). `RlConfig::with_quote_lives` takes
+  up to 8 strictly increasing lives in nanoseconds and adds `RlAction::ExpiringQuote`, of action
+  space version 5 (`EXPIRY_ACTION_SPACE_VERSION`), with an `EX` section in the fingerprint only
+  when lives are set: a configuration without them keeps its identity. Without lives the action
+  is outside the mask and, under the reject policy, a recorded error of code 204
+  (`ERR_EXPIRY_REFUSED`). A hedge lane and a residual policy refuse lives at construction. The
+  Python bridge takes `quote_lives_ns`; the maskable and continuous encodings gain a last
+  dimension whose first choice is no expiry, so a policy can still leave a quote resting.
 - The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
   #102's residual SAC retrained with and without a training adversary that, between five
   phases, moves the episode's flow perturbation toward the point where the policy loses most on
@@ -894,6 +902,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `rl::RlConfig` gains the public field `quote_lives` (#297), so a struct literal must name it
+  (`RlConfig::new` sets `None`). `rl::ActionSpace` gains `expiry` and `rl::RlAction`
+  `ExpiringQuote`; both are `#[non_exhaustive]`.
 - `backtest::kernel::KernelAction` gains the variant `ExpiringQuote` and is now
   `#[non_exhaustive]` (#297), so a match on it outside the crate needs a wildcard arm. The
   decoder's counter bounds widen to what an expiring order can add: `next_msg_seq` to three

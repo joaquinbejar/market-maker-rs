@@ -35,6 +35,8 @@ class ExpiringQuote(gym.Wrapper):
             raise TypeError("ExpiringQuote wraps a MarketMakingEnv directly")
         if not env.bridge_info["cancel_action"]:
             raise ValueError("an expiring quote needs cancel_action in the configuration")
+        if env.bridge_info["quote_lives_ns"]:
+            raise ValueError("drop quote_lives_ns: its quotes already expire at the venue")
         if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
             raise ValueError(f"rows must be a positive integer, got {rows!r}")
         super().__init__(env)

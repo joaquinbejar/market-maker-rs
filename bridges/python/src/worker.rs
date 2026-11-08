@@ -18,7 +18,8 @@ use market_maker_rs::backtest::kernel::{
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
-    CancelActions, ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_HEDGE_REFUSED, EpisodeRecorder,
+    CancelActions, ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_EXPIRY_REFUSED, ERR_HEDGE_REFUSED,
+    EpisodeRecorder, QuoteExpiry, QuoteLives,
     FeatureVector, HedgeActions, InvalidActionPolicy, ObservationScales, ResidualBounds,
     ResidualDecision, ResidualEnv, ResidualProposal, RlAction, RlConfig, RlEnv, RlState, SpecId,
     TerminalValuation, Transition,
@@ -48,12 +49,18 @@ pub const BUILT_FOR: (u16, u16, u16, u16) = (1, 2, 1, 1);
 /// (`cancel_action`), a literal for the same reason.
 pub const BUILT_FOR_CANCEL_ACTION: u16 = 4;
 
+/// The action space version this bridge was written for with quote lives (`quote_lives_ns`),
+/// with or without the cancel action, a literal for the same reason.
+pub const BUILT_FOR_EXPIRY_ACTION: u16 = 5;
+
 /// The versions are the ones this bridge was written for, and the action space is the one
 /// the configuration asks for: version [`BUILT_FOR_CANCEL_ACTION`] with `cancel_action`
-/// and only then.
-fn known_versions(id: &SpecId, cancel_action: bool) -> bool {
+/// and no lives, [`BUILT_FOR_EXPIRY_ACTION`] with `quote_lives_ns`.
+fn known_versions(id: &SpecId, cancel_action: bool, quote_lives: bool) -> bool {
     let (observation, action, reward, episode) = BUILT_FOR;
-    let action = if cancel_action {
+    let action = if quote_lives {
+        BUILT_FOR_EXPIRY_ACTION
+    } else if cancel_action {
         BUILT_FOR_CANCEL_ACTION
     } else {
         action
@@ -74,6 +81,7 @@ pub fn refused_because(status: ActionStatus) -> Option<String> {
             ERR_ACTION_OFF_GRID => format!("off grid (code {})", code.0),
             ERR_HEDGE_REFUSED => format!("hedge not available (code {})", code.0),
             ERR_CANCEL_REFUSED => format!("cancel not available (code {})", code.0),
+            ERR_EXPIRY_REFUSED => format!("expiring quote not available (code {})", code.0),
             ERR_PRICE_OUT_OF_RANGE => {
                 format!("strategy quote price out of range (code {})", code.0)
             }
@@ -366,6 +374,11 @@ pub struct BridgeConfig {
     /// by a configuration without it.
     #[serde(default)]
     pub cancel_action: bool,
+    /// The lives of an expiring quote, in nanoseconds, of action space version
+    /// [`BUILT_FOR_EXPIRY_ACTION`]. Absent by default, which keeps a configuration's
+    /// specification and fingerprint.
+    #[serde(default)]
+    pub quote_lives_ns: Option<Vec<u64>>,
 }
 
 fn decimal(what: &str, text: &str) -> Result<Decimal, BridgeError> {
@@ -446,6 +459,12 @@ impl BridgeConfig {
                     .to_string(),
             ));
         }
+        if self.quote_lives_ns.is_some() && self.residual.is_some() {
+            return Err(BridgeError::Refused(
+                "quote_lives_ns with a residual policy: a residual policy takes no quote life"
+                    .to_string(),
+            ));
+        }
         let s = &self.scales;
         let scales = ObservationScales {
             spread_ticks: decimal("spread_ticks", &s.spread_ticks)?,
@@ -474,10 +493,16 @@ impl BridgeConfig {
         } else {
             config
         };
-        Ok(if self.cancel_action {
+        let config = if self.cancel_action {
             config.with_cancel_action()
         } else {
             config
+        };
+        Ok(match &self.quote_lives_ns {
+            Some(lives) => config.with_quote_lives(
+                QuoteLives::new(lives).map_err(|error| BridgeError::Refused(error.to_string()))?,
+            ),
+            None => config,
         })
     }
 }
@@ -497,6 +522,8 @@ pub struct EnvInfo {
     pub hedge_actions: bool,
     /// Whether the cancel action exists, as the specification states.
     pub cancel_action: bool,
+    /// The lives of an expiring quote, as the specification states.
+    pub quote_lives: Option<QuoteLives>,
     /// Fingerprint of the kernel's configuration.
     pub kernel_fingerprint: u128,
     /// Digest of the dataset.
@@ -1129,7 +1156,7 @@ fn serve_residual<S: QuoteSource + Clone>(
                 .map_err(refuse)?;
         let spec = env.env().spec();
         let id = spec.id();
-        check_spec(spec, id, expected, false)?;
+        check_spec(spec, id, expected, false, false)?;
         let shape = spec.shape();
         let info = EnvInfo {
             spec: id,
@@ -1138,6 +1165,7 @@ fn serve_residual<S: QuoteSource + Clone>(
             sizes: shape.sizes,
             hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
             cancel_action: spec.action.cancel == CancelActions::CancelOnly,
+            quote_lives: quote_lives_of(&spec.action.expiry),
             kernel_fingerprint: env.env().kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,
@@ -1156,13 +1184,22 @@ fn serve_residual<S: QuoteSource + Clone>(
     }
 }
 
+/// The lives a specification states, which it checked when it was built.
+fn quote_lives_of(expiry: &QuoteExpiry) -> Option<QuoteLives> {
+    match expiry {
+        QuoteExpiry::Lives(lives) => QuoteLives::new(lives).ok(),
+        _ => None,
+    }
+}
+
 fn check_spec(
     spec: &market_maker_rs::rl::RlSpec,
     id: SpecId,
     expected: Option<SpecId>,
     cancel_action: bool,
+    quote_lives: bool,
 ) -> Result<(), BridgeError> {
-    if !known_versions(&id, cancel_action) {
+    if !known_versions(&id, cancel_action, quote_lives) {
         return Err(BridgeError::Refused(format!("unknown versions in {id:?}")));
     }
     if let Some(expected) = expected {
@@ -1421,7 +1458,13 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) -> Option<Answered> {
             RlEnv::new(kernel_config, data, grid, config.rl()?).map_err(refuse)?;
         let spec = env.spec();
         let id = spec.id();
-        check_spec(spec, id, expected, config.cancel_action)?;
+        check_spec(
+            spec,
+            id,
+            expected,
+            config.cancel_action,
+            config.quote_lives_ns.is_some(),
+        )?;
         let shape = spec.shape();
         let info = EnvInfo {
             spec: id,
@@ -1430,6 +1473,7 @@ fn serve<const K: usize, const M: usize>(job: Job<'_>) -> Option<Answered> {
             sizes: shape.sizes,
             hedge_actions: spec.action.hedge == HedgeActions::MarketableAtTouch,
             cancel_action: spec.action.cancel == CancelActions::CancelOnly,
+            quote_lives: quote_lives_of(&spec.action.expiry),
             kernel_fingerprint: env.kernel().config_fingerprint(),
             dataset_digest: data.id().digest,
             rows: data.id().len,

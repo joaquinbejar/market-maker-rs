@@ -20,6 +20,11 @@ pub const HEDGED_ACTION_SPACE_VERSION: u16 = 3;
 /// Version of the action space with the cancel-only action: version 2's actions, and
 /// [`CancelActions::CancelOnly`].
 pub const CANCEL_ACTION_SPACE_VERSION: u16 = 4;
+/// Version of the action space with quotes that expire at the venue: [`QuoteExpiry::Lives`],
+/// with or without the cancel-only action.
+pub const EXPIRY_ACTION_SPACE_VERSION: u16 = 5;
+/// The most quote lives an action space can offer.
+pub const MAX_QUOTE_LIVES: usize = 8;
 /// Version of the reward with a hedge lane: version 1's, with the hedge lane's ledger in the
 /// net result.
 pub const HEDGED_REWARD_VERSION: u16 = 2;
@@ -562,6 +567,65 @@ impl CancelActions {
     }
 }
 
+/// The lives a quote can be sent with, in nanoseconds of venue time: 1 to
+/// [`MAX_QUOTE_LIVES`] values, strictly increasing and not zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuoteLives {
+    values: [u64; MAX_QUOTE_LIVES],
+    len: usize,
+}
+
+impl QuoteLives {
+    /// Checks and keeps `lives`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] for no lives, more than
+    /// [`MAX_QUOTE_LIVES`], a zero, or values that do not strictly increase.
+    pub fn new(lives: &[u64]) -> MMResult<Self> {
+        let refuse = |why: &str| {
+            Err(MMError::InvalidConfiguration(format!(
+                "quote lives {why}, got {lives:?}"
+            )))
+        };
+        if lives.is_empty() || lives.len() > MAX_QUOTE_LIVES {
+            return refuse("must be 1 to 8 values");
+        }
+        if lives.contains(&0) {
+            return refuse("must not be zero");
+        }
+        if lives.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return refuse("must strictly increase");
+        }
+        let mut values = [0; MAX_QUOTE_LIVES];
+        values[..lives.len()].copy_from_slice(lives);
+        Ok(Self {
+            values,
+            len: lives.len(),
+        })
+    }
+
+    /// The lives, in nanoseconds.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u64] {
+        &self.values[..self.len]
+    }
+}
+
+/// Whether a quote can expire by itself at the venue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum QuoteExpiry {
+    /// No: a quote rests until it fills, is replaced or is cancelled.
+    NotModelled,
+    /// [`RlAction::ExpiringQuote`](crate::rl::RlAction::ExpiringQuote), with these lives in
+    /// nanoseconds. A leg rests its life from its own activation: it fills only on rows
+    /// strictly inside `(activation, activation + life)`, and a replaced leg's expiry does
+    /// not touch its replacement. [`RlAction::Quote`](crate::rl::RlAction::Quote) still
+    /// rests with no expiry.
+    Lives(Vec<u64>),
+}
+
 /// A hedge in a second instrument, the hedge lane of
 /// [`HedgedKernel`](crate::backtest::kernel::HedgedKernel): an immediate-or-cancel order at
 /// the hedge instrument's observed touch, on the side that reduces the net exposure of
@@ -592,7 +656,8 @@ pub struct CrossHedgeSpace {
 #[non_exhaustive]
 pub struct ActionSpace {
     /// [`ACTION_SPACE_VERSION`], [`HEDGED_ACTION_SPACE_VERSION`] with a hedge lane, or
-    /// [`CANCEL_ACTION_SPACE_VERSION`] with the cancel-only action.
+    /// [`CANCEL_ACTION_SPACE_VERSION`] with the cancel-only action, or
+    /// [`EXPIRY_ACTION_SPACE_VERSION`] with quote lives.
     pub version: u16,
     /// Value of one tick, in quote per base.
     pub tick_size: Decimal,
@@ -616,6 +681,8 @@ pub struct ActionSpace {
     pub cross_hedge: Option<CrossHedgeSpace>,
     /// Which cancel actions exist.
     pub cancel: CancelActions,
+    /// Whether a quote can expire by itself.
+    pub expiry: QuoteExpiry,
 }
 
 /// The one kind of reward of this version.
@@ -847,6 +914,14 @@ impl RlSpec {
         if a.cancel != CancelActions::NotModelled {
             out.extend_from_slice(b"CX");
             put_u16(&mut out, a.cancel.code());
+        }
+        // Likewise for quote lives.
+        if let QuoteExpiry::Lives(lives) = &a.expiry {
+            out.extend_from_slice(b"EX");
+            put_len(&mut out, lives.len());
+            for life in lives {
+                put_u64(&mut out, *life);
+            }
         }
         let r = &self.reward;
         put_u16(&mut out, r.version);

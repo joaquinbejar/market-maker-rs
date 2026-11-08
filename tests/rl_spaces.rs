@@ -24,10 +24,11 @@ use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
 use market_maker_rs::rl::{
     ACTION_SPACE_VERSION, AsOf, CANCEL_ACTION_SPACE_VERSION, CancelActions, EPISODE_VERSION,
-    ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, EpisodeRecorder, FEATURE_COUNT, FeatureHorizon,
-    FeatureId, FeatureUnit, HedgeActions, InvalidActionPolicy, OBSERVATION_SPACE_VERSION,
-    ObservationScales, REWARD_VERSION, RlAction, RlConfig, RlEnv, RlSpec, StateMemory,
-    TerminalValuation,
+    ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_CROSS_HEDGE_REFUSED, ERR_EXPIRY_REFUSED,
+    ERR_HEDGE_REFUSED, EXPIRY_ACTION_SPACE_VERSION, EpisodeRecorder, FEATURE_COUNT, FeatureHorizon,
+    FeatureId, FeatureUnit, HedgeActions, InvalidActionPolicy, MAX_QUOTE_LIVES,
+    OBSERVATION_SPACE_VERSION, ObservationScales, QuoteExpiry, QuoteLives, REWARD_VERSION,
+    RlAction, RlConfig, RlEnv, RlSpec, StateMemory, TerminalValuation,
 };
 use market_maker_rs::types::error::MMError;
 
@@ -1639,4 +1640,196 @@ fn test_a_policy_cannot_get_an_order_beyond_the_balance_executed() {
     let (events, position, _) = run(None);
     assert_eq!(position, dec!(2));
     assert!(!events.iter().any(|e| matches!(e, KernelEvent::Gate(_))));
+}
+
+const MS: u64 = 1_000_000;
+
+fn expiring(life: usize) -> RlAction {
+    RlAction::ExpiringQuote {
+        bid: 1,
+        ask: 2,
+        bid_size: 1,
+        ask_size: 0,
+        life,
+    }
+}
+
+fn lives(values: &[u64]) -> QuoteLives {
+    QuoteLives::new(values).unwrap()
+}
+
+#[test]
+fn test_quote_lives_refuse_no_value() {
+    assert!(QuoteLives::new(&[]).is_err());
+}
+
+#[test]
+fn test_quote_lives_refuse_zero() {
+    assert!(QuoteLives::new(&[0, 5]).is_err());
+}
+
+#[test]
+fn test_quote_lives_refuse_duplicates() {
+    assert!(QuoteLives::new(&[5, 5]).is_err());
+}
+
+#[test]
+fn test_quote_lives_refuse_a_decrease() {
+    assert!(QuoteLives::new(&[5, 3]).is_err());
+}
+
+#[test]
+fn test_quote_lives_refuse_more_than_the_maximum() {
+    let most: Vec<u64> = (1..=MAX_QUOTE_LIVES as u64).collect();
+    assert_eq!(QuoteLives::new(&most).unwrap().as_slice(), most);
+    let more: Vec<u64> = (1..=MAX_QUOTE_LIVES as u64 + 1).collect();
+    assert!(QuoteLives::new(&more).is_err());
+}
+
+#[test]
+fn test_expiry_error_code_is_204_and_unique() {
+    assert_eq!(ERR_EXPIRY_REFUSED.0, 204);
+    for other in [
+        ERR_ACTION_OFF_GRID,
+        ERR_HEDGE_REFUSED,
+        ERR_CROSS_HEDGE_REFUSED,
+        ERR_CANCEL_REFUSED,
+    ] {
+        assert_ne!(ERR_EXPIRY_REFUSED, other);
+    }
+}
+
+#[test]
+fn test_quote_lives_are_action_space_5_and_their_own_section() {
+    let cfg = long_config();
+    let plain = spec_of(&cfg, long_grid(), config());
+    let cancel = spec_of(&cfg, long_grid(), config().with_cancel_action());
+    let alone = spec_of(&cfg, long_grid(), config().with_quote_lives(lives(&[5, 9])));
+    let both = spec_of(
+        &cfg,
+        long_grid(),
+        config()
+            .with_cancel_action()
+            .with_quote_lives(lives(&[5, 9])),
+    );
+    let other = spec_of(
+        &cfg,
+        long_grid(),
+        config().with_quote_lives(lives(&[5, 10])),
+    );
+    assert_eq!(plain.action.version, ACTION_SPACE_VERSION);
+    assert_eq!(cancel.action.version, CANCEL_ACTION_SPACE_VERSION);
+    assert_eq!(plain.action.expiry, QuoteExpiry::NotModelled);
+    assert_eq!(alone.action.version, EXPIRY_ACTION_SPACE_VERSION);
+    assert_eq!(both.action.version, EXPIRY_ACTION_SPACE_VERSION);
+    assert_eq!(alone.action.expiry, QuoteExpiry::Lives(vec![5, 9]));
+    assert_ne!(alone.id(), both.id());
+    assert_ne!(alone.id().fingerprint, both.id().fingerprint);
+    assert_ne!(alone.id().fingerprint, other.id().fingerprint);
+    assert!(!plain.to_bytes().windows(2).any(|w| w == b"EX"));
+    assert!(!cancel.to_bytes().windows(2).any(|w| w == b"EX"));
+    assert!(alone.to_bytes().windows(2).any(|w| w == b"EX"));
+    // Without lives the identity is the one written before lives existed: the same bytes as
+    // a specification carrying them, less the section and with the older version.
+    let mut expected = alone.to_bytes();
+    let at = expected.windows(2).position(|w| w == b"EX").unwrap();
+    let section = 2 + 8 + 2 * 8;
+    let removed: Vec<u8> = expected.drain(at..at + section).collect();
+    assert_eq!(&removed[..2], b"EX");
+    let version = EXPIRY_ACTION_SPACE_VERSION.to_le_bytes();
+    let older = ACTION_SPACE_VERSION.to_le_bytes();
+    let plain_bytes = plain.to_bytes();
+    assert_eq!(expected.len(), plain_bytes.len());
+    let differing: Vec<usize> = (0..expected.len())
+        .filter(|i| expected[*i] != plain_bytes[*i])
+        .collect();
+    assert_eq!(differing.len(), 1, "only the action version differs");
+    assert_eq!(expected[differing[0]], version[0]);
+    assert_eq!(plain_bytes[differing[0]], older[0]);
+}
+
+fn position_with(lives_ns: &[u64], first: RlAction, second: RlAction) -> Decimal {
+    let cfg = long_config();
+    let data = KernelDataset::from_ticks(&late_cross(), &cfg).unwrap();
+    let rl = config().with_quote_lives(lives(lives_ns));
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, long_grid(), rl).unwrap();
+    let mut state = env.reset(1).unwrap();
+    assert_eq!(
+        env.step(&mut state, first).unwrap().action_status,
+        ActionStatus::Applied
+    );
+    env.step(&mut state, second).unwrap();
+    while !state.is_done() {
+        env.step(&mut state, RlAction::Hold).unwrap();
+    }
+    state.kernel().venue_position()
+}
+
+#[test]
+fn test_an_expiring_quote_is_gone_exactly_at_its_life() {
+    // Sent and active at row 0 (1000 ms); the crossing row is at 3000 ms.
+    let at_row = 2000 * MS;
+    assert_eq!(
+        position_with(&[at_row], expiring(0), RlAction::Hold),
+        dec!(0)
+    );
+    assert_eq!(
+        position_with(&[at_row + 1], expiring(0), RlAction::Hold),
+        dec!(2)
+    );
+}
+
+#[test]
+fn test_a_replaced_quote_does_not_expire_its_replacement() {
+    // The first quote would expire at 2500 ms; its replacement, sent at 2000 ms, still rests
+    // at the crossing row of 3000 ms.
+    assert_eq!(
+        position_with(&[1500 * MS], expiring(0), quote(1, 2, 1, 0)),
+        dec!(2)
+    );
+    assert_eq!(
+        position_with(&[1500 * MS, 1500 * MS + 1], expiring(0), expiring(1)),
+        dec!(2)
+    );
+}
+
+#[test]
+fn test_without_lives_an_expiring_quote_is_outside_the_space() {
+    let cfg = long_config();
+    let data = KernelDataset::from_ticks(&late_cross(), &cfg).unwrap();
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, long_grid(), config()).unwrap();
+    let mut state = env.reset(1).unwrap();
+    assert!(env.step(&mut state, expiring(0)).is_err());
+    let reject = config().with_invalid_action(InvalidActionPolicy::Reject, dec!(1));
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, long_grid(), reject).unwrap();
+    let mut state = env.reset(1).unwrap();
+    assert_eq!(
+        env.step(&mut state, expiring(0)).unwrap().action_status,
+        ActionStatus::QuoteError(ERR_EXPIRY_REFUSED)
+    );
+}
+
+#[test]
+fn test_a_life_out_of_range_is_off_the_grid() {
+    let cfg = long_config();
+    let data = KernelDataset::from_ticks(&late_cross(), &cfg).unwrap();
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(
+        &cfg,
+        &data,
+        long_grid(),
+        config().with_quote_lives(lives(&[MS])),
+    )
+    .unwrap();
+    let mut state = env.reset(1).unwrap();
+    assert!(env.step(&mut state, expiring(1)).is_err());
+    let reject = config()
+        .with_quote_lives(lives(&[MS]))
+        .with_invalid_action(InvalidActionPolicy::Reject, dec!(1));
+    let env: RlEnv<'_, 3, 2> = RlEnv::new(&cfg, &data, long_grid(), reject).unwrap();
+    let mut state = env.reset(1).unwrap();
+    let t = env.step(&mut state, expiring(1)).unwrap();
+    assert_eq!(
+        t.action_status,
+        ActionStatus::QuoteError(ERR_ACTION_OFF_GRID)
+    );
 }
