@@ -19,7 +19,7 @@ HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
 import control as c  # noqa: E402
 
-DESIGN_SHA256 = "be16a4564c207e9d55df3f4144bb774d1bee96f25b8c389ebb0a889b0e09bf16"
+DESIGN_SHA256 = "48c8ea5aa0602ff54409f812b22907d4d27f2ab3699eb98998e240a8799642fa"
 MAX_RECOVERIES = 1
 DT = 0.1
 SEEDS = (101, 102, 103, 104, 105)
@@ -33,6 +33,10 @@ EXAMPLES = {
                   "kappa": "1"},
 }
 KAPPAS = ("0.0001", "0.001", "0.01", "0.03", "0.1", "0.3", "1")
+EXAMPLE_3 = {"kappas": ("0.0001", "0.001", "0.01", "0.1"), "levels": 15, "T": 4000.0, "Tb": 2000.0}
+DECOUPLED_DELTA = ["1", "0"]
+NOT_RUNNABLE = ("not runnable: the state is the net risk r under the joint delta, and an SPX-only risk "
+                "is not a function of r, so a decoupled rule cannot be evaluated on this grid")
 
 
 def decimals(values):
@@ -54,9 +58,9 @@ def alphas(name):
     return [1 / (4 * float(x)) for x in EXAMPLES[name]["d"]]
 
 
-def v_hat(name, problem, kappa, sigma, v0=0.18):
+def v_hat(name, problem, kappa, sigma, v0=0.18, delta=None):
     ex, kappa = EXAMPLES[name], float(kappa)
-    delta, m = [float(x) for x in ex["delta"]], [float(x) for x in ex["m"]]
+    delta, m = [float(x) for x in (delta or ex["delta"])], [float(x) for x in ex["m"]]
     if name == "example_2":
         return -c.net_risk_coefficient(delta, m, ex["lam"], alphas(name), kappa, sigma) * problem.risk**2
     a, b = c.asymptotic_ab(delta, m, ex["lam"], ex["lam"], alphas(name), [kappa / 2] * 2, kappa, sigma, v0)
@@ -108,8 +112,8 @@ def check_1(name, sigma):
             "refinement": {"dt_half": change_dt, "double_bound": change_q, "under_0_5pct": refined}}
 
 
-def draws(name, problem, seed):
-    steps = int(round(EXAMPLES[name]["Tb"] / DT))
+def draws(horizon, problem, seed):
+    steps = int(round(horizon / DT))
     pairs = [c.draw_path(seed, path, steps, len(problem.moves)) for path in range(PATHS)]
     return np.stack([x[0] for x in pairs]), np.stack([x[1] for x in pairs])
 
@@ -117,7 +121,7 @@ def draws(name, problem, seed):
 def run_arm(name, problem, policy, seeds, sigma):
     out = []
     for seed in seeds:
-        normals, uniforms = draws(name, problem, seed)
+        normals, uniforms = draws(EXAMPLES[name]["Tb"], problem, seed)
         counts, noise, _ = c.backtest(problem, policy, normals, uniforms, DT, sigma)
         out += c.path_pnl(problem, counts, noise)
     return np.array([float(x) for x in out])
@@ -178,6 +182,88 @@ def primary(name, sigma, tables, seeds=SEEDS):
     return out
 
 
+def paired(reference, other):
+    """The paired (reference - other) P&L interval and each arm's mean and standard deviation."""
+    return {"reference_mean": float(reference.mean()), "reference_std": float(reference.std()),
+            "other_mean": float(other.mean()), "other_std": float(other.std()),
+            "paired_interval": bootstrap(reference - other)}
+
+
+def decoupled_example_1(sigma, tables, seeds=SEEDS):
+    """Example 1's other cells, each scored with the joint delta, against (greedy, joint). Secondary."""
+    ex = EXAMPLES["example_1"]
+    joint = build("example_1", ex["kappa"], sigma)
+    reference = run_arm("example_1", joint, greedy("example_1", joint, ex["kappa"], sigma), seeds, sigma)
+    gate, _ = load_gate(pathlib.Path(tables) / "example_1_1.txt", joint.shape)
+    decoupled_gate, scaled = load_gate(pathlib.Path(tables) / "example_1_decoupled_1.txt", joint.shape)
+    decoupled_value = v_hat("example_1", joint, ex["kappa"], sigma, delta=DECOUPLED_DELTA)
+    policies = {"gate_joint": gate, "greedy_decoupled": c.greedy_from_v_hat(joint, decoupled_value)[None],
+                "gate_decoupled": decoupled_gate}
+    return {"scaled_share_gate_decoupled": scaled,
+            **{cell: paired(reference, run_arm("example_1", joint, policy, seeds, sigma))
+               for cell, policy in policies.items()}}
+
+
+def example_3_arms(kappa, sigma):
+    """(joint inventory problem for the multi-asset arm, one problem per asset with kappa = 0)."""
+    ex = EXAMPLES["example_2"]
+    delta, d, m = decimals(ex["delta"]), decimals(ex["d"]), decimals(ex["m"])
+    n, half = len(delta), D(kappa) / 2
+    multi = c.inventory_problem(delta, d, m, [EXAMPLE_3["levels"]] * n, ex["lam"], [half] * n, D(kappa), sigma)
+    uni = [c.inventory_problem([delta[j]], [d[j]], [m[j]], [EXAMPLE_3["levels"]], [ex["lam"][j]], [half], D(0), sigma)
+           for j in range(n)]
+    return multi, uni
+
+
+def multi_asset_policy(problem, kappa, sigma):
+    ex = EXAMPLES["example_2"]
+    delta, m = [float(x) for x in ex["delta"]], [float(x) for x in ex["m"]]
+    a, b = c.asymptotic_ab(delta, m, ex["lam"], ex["lam"], alphas("example_2"), [float(kappa) / 2] * len(m),
+                           float(kappa), sigma, 0.18)
+    half = [(n - 1) // 2 for n in problem.shape]
+    axes = [m[j] * np.arange(-half[j], half[j] + 1) for j in range(len(m))]
+    return c.greedy_from_v_hat(problem, c.v_hat_inventory(problem, a, b, axes))[None]
+
+
+def run_uni(problems, policies, normals, uniforms, sigma):
+    """Each asset alone on its own two uniforms and the shared dW; the P&L is summed per path."""
+    total = None
+    for j, (problem, policy) in enumerate(zip(problems, policies)):
+        counts, noise, _ = c.backtest(problem, policy, normals, uniforms[:, :, [2 * j, 2 * j + 1]], DT, sigma)
+        pnl = np.array([float(x) for x in c.path_pnl(problem, counts, noise)])
+        total = pnl if total is None else total + pnl
+    return total
+
+
+def example_3(sigma, seeds=SEEDS):
+    """Multi-asset greedy against the uni-asset benchmark, delta frozen. Secondary."""
+    rows = []
+    for kappa in EXAMPLE_3["kappas"]:
+        multi, uni = example_3_arms(kappa, sigma)
+        policy = multi_asset_policy(multi, kappa, sigma)
+        exact = [c.solve_hjb(p, EXAMPLE_3["T"], DT, keep_policy_until=EXAMPLE_3["Tb"])[1] for p in uni]
+        multi_pnl, uni_pnl = [], []
+        for seed in seeds:
+            normals, uniforms = draws(EXAMPLE_3["Tb"], multi, seed)
+            counts, noise, _ = c.backtest(multi, policy, normals, uniforms, DT, sigma)
+            multi_pnl += [float(x) for x in c.path_pnl(multi, counts, noise)]
+            uni_pnl += list(run_uni(uni, exact, normals, uniforms, sigma))
+        rows.append({"kappa": kappa, **paired(np.array(multi_pnl), np.array(uni_pnl))})
+    return {"status": "run", "rows": rows}
+
+
+def checks_passed(result, name):
+    return result[name]["check_1"]["status"] == "pass" and result[name]["check_2"]["status"] == "pass"
+
+
+def decide(result):
+    """The design's rule: only example 2's primary at x1, with both its checks passing, can adopt."""
+    verdict = result["example_2"]["primary"]["1"]["verdict"]
+    validated = checks_passed(result, "example_2")
+    return {"adopt": validated and verdict == "better", "example_2_primary": verdict,
+            "example_2_label": None if validated else "control not validated"}
+
+
 def _attempt():
     spec = importlib.util.spec_from_file_location("attempt", HERE.parent / "m5_02" / "attempt.py")
     module = importlib.util.module_from_spec(spec)
@@ -190,10 +276,14 @@ def claim(out, recover):
     digest = hashlib.sha256((HERE / "design.json").read_bytes()).hexdigest()
     if digest != DESIGN_SHA256:
         raise SystemExit(f"design.json does not match the freeze: {digest}")
-    attempts = _attempt().claim(pathlib.Path(out) / "attempt.jsonl", digest, recover)
-    if sum(a["kind"] == "recovery" for a in attempts) > MAX_RECOVERIES:
-        raise SystemExit("too many recoveries")
-    return attempts
+    marker = pathlib.Path(out) / "attempt.jsonl"
+    if marker.exists():
+        earlier = [json.loads(line) for line in marker.read_text().splitlines() if line.strip()]
+        if any(a["frozen_sha256"] != digest for a in earlier):
+            raise SystemExit("an earlier attempt ran under another frozen_sha256")
+        if recover and sum(a["kind"] == "recovery" for a in earlier) >= MAX_RECOVERIES:
+            raise SystemExit("too many recoveries")
+    return _attempt().claim(marker, digest, recover)
 
 
 def evaluate(out, tables, recover=None):
@@ -211,6 +301,11 @@ def evaluate(out, tables, recover=None):
             result[name]["check_2"] = check_2(name, sigma)
             result[name]["primary"] = primary(name, sigma, tables)
             result[name]["primary_trading_year"] = primary(name, slow, tables)
+        result["example_1"]["secondary"] = decoupled_example_1(sigma, tables)
+        result["example_2"]["secondary"] = {"status": NOT_RUNNABLE}
+        result["example_3"] = (example_3(sigma) if all(checks_passed(result, n) for n in EXAMPLES)
+                               else {"status": "not run: checks 1 and 2 did not pass on examples 1 and 2"})
+        result["decision"] = decide(result)
     (pathlib.Path(out) / "stage_a.json").write_text(json.dumps(result, indent=1))
     return result
 

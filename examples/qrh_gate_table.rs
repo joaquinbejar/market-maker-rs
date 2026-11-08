@@ -14,6 +14,7 @@ use std::io::Write;
 use std::str::FromStr;
 
 const LATTICE: Decimal = dec!(0.002);
+const JOINT_SECOND_DELTA: Decimal = dec!(-0.028);
 
 struct Asset {
     delta: Decimal,
@@ -65,14 +66,14 @@ fn decide(
     (allowed, scaled)
 }
 
-fn example_1(limit: Decimal, reversed: bool) -> Vec<(u16, u16)> {
+fn example_1(limit: Decimal, second_delta: Decimal, reversed: bool) -> Vec<(u16, u16)> {
     let assets = [
         Asset {
             delta: dec!(1),
             size: dec!(1),
         },
         Asset {
-            delta: dec!(-0.028),
+            delta: second_delta,
             size: dec!(20),
         },
     ];
@@ -132,7 +133,8 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let scale = Decimal::from_str(&args[2]).expect("scale is a decimal");
     let table = match args[1].as_str() {
-        "example_1" => example_1(dec!(23.4) * scale, false),
+        "example_1" => example_1(dec!(23.4) * scale, JOINT_SECOND_DELTA, false),
+        "example_1_decoupled" => example_1(dec!(15) * scale, dec!(0), false),
         "example_2" => example_2(dec!(10) * scale, false),
         other => panic!("unknown example {other}"),
     };
@@ -150,7 +152,10 @@ mod tests {
     #[test]
     fn the_table_does_not_depend_on_the_visiting_order() {
         assert_eq!(example_2(dec!(5), false), example_2(dec!(5), true));
-        assert_eq!(example_1(dec!(11.7), false), example_1(dec!(11.7), true));
+        assert_eq!(
+            example_1(dec!(11.7), JOINT_SECOND_DELTA, false),
+            example_1(dec!(11.7), JOINT_SECOND_DELTA, true)
+        );
     }
 
     #[test]
@@ -172,7 +177,14 @@ mod tests {
 
     #[test]
     fn at_scale_one_example_1_posts_every_move_on_the_grid() {
-        let table = example_1(dec!(23.4), false);
+        let table = example_1(dec!(23.4), JOINT_SECOND_DELTA, false);
+        assert_eq!(table[480], (0b1111, 0));
+        assert!(table.iter().all(|&(_, scaled)| scaled == 0));
+    }
+
+    #[test]
+    fn the_decoupled_table_never_binds_beyond_the_box() {
+        let table = example_1(dec!(15), dec!(0), false);
         assert_eq!(table[480], (0b1111, 0));
         assert!(table.iter().all(|&(_, scaled)| scaled == 0));
     }

@@ -51,6 +51,42 @@ def test_example_2_grid_matches_the_rust_table_size():
     assert r.build("example_1", "0.01", 0.2267).shape == (31, 31)
 
 
+def test_decide_rests_on_example_2_only():
+    ok = {"status": "pass"}
+    result = {"example_2": {"check_1": ok, "check_2": ok, "primary": {"1": {"verdict": "better"}}}}
+    assert r.decide(result)["adopt"]
+    result["example_2"]["check_2"] = {"status": "inconclusive"}
+    assert r.decide(result) == {"adopt": False, "example_2_primary": "better",
+                                "example_2_label": "control not validated"}
+    result["example_2"].update(check_2=ok, primary={"1": {"verdict": "no difference shown"}})
+    assert not r.decide(result)["adopt"]
+
+
+def test_example_3_uni_arms_sum_to_the_shared_noise():
+    multi, uni = r.example_3_arms("0.01", 0.2267)
+    assert multi.shape == (31,) * 4 and len(multi.moves) == 8 and all(u.shape == (31,) for u in uni)
+    assert all((u.penalty[15] == 0) and u.moves[0].lam == 0.05 for u in uni)
+    steps, paths = 200, 8
+    normals, uniforms = np.random.default_rng(1).standard_normal((paths, steps)), np.random.default_rng(2).random((paths, steps, 8))
+    always = [np.full((1, 31), 3, np.uint8) for _ in uni]
+    total = r.run_uni(uni, always, normals, uniforms, 0.2267)
+    alone = sum(np.array([float(x) for x in r.c.path_pnl(p, *r.c.backtest(p, a, normals, uniforms[:, :, [2 * j, 2 * j + 1]], r.DT, 0.2267)[:2])])
+                for j, (p, a) in enumerate(zip(uni, always)))
+    assert total == pytest.approx(alone)
+
+
+def test_multi_asset_policy_posts_at_flat_inventory():
+    multi, _ = r.example_3_arms("0.01", 0.2267)
+    policy = r.multi_asset_policy(multi, "0.01", 0.2267)
+    assert policy.shape == (1, 31, 31, 31, 31) and policy[0, 15, 15, 15, 15] == 255
+
+
+def test_decoupled_v_hat_ignores_the_second_asset():
+    p = r.build("example_1", "0.01", 0.2267)
+    v = r.v_hat("example_1", p, "0.01", 0.2267, delta=r.DECOUPLED_DELTA)
+    assert v[15, 0] == pytest.approx(v[15, 15], abs=1e-9)
+
+
 def test_claim_refuses_an_altered_design(tmp_path, monkeypatch):
     monkeypatch.setattr(r, "DESIGN_SHA256", "0" * 64)
     with pytest.raises(SystemExit, match="freeze"):
@@ -67,6 +103,15 @@ def test_marker_is_written_before_any_evaluation(tmp_path, monkeypatch):
         r.evaluate(tmp_path, tmp_path)
     with pytest.raises(SystemExit, match="already started"):
         r.evaluate(tmp_path, tmp_path)
+
+
+def test_a_recovery_under_another_freeze_is_refused(tmp_path):
+    marker = tmp_path / "attempt.jsonl"
+    marker.write_text(json.dumps({"kind": "attempt", "frozen_sha256": "0" * 64}) + "\n")
+    before = marker.read_text()
+    with pytest.raises(SystemExit, match="another frozen_sha256"):
+        r.claim(tmp_path, "crash")
+    assert marker.read_text() == before
 
 
 def test_recoveries_are_bounded(tmp_path, monkeypatch):
