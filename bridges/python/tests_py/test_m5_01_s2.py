@@ -109,3 +109,30 @@ def test_a_block_undefined_on_one_arm_is_dropped_on_all():
     table = {"a": {"m": [[float("nan")] + [1.0] * 11]}, "b": {"m": [[2.0] * 12]}}
     out = s2.align_undefined(table)
     assert np.isnan(out["b"]["m"][0][0]) and out["b"]["m"][0][1] == 2.0
+
+
+def test_decide_runs_end_to_end_on_evaluate_shaped_files(tmp_path):
+    import json
+    import aggregate
+    names = ["fixed_spread", "avellaneda_stoikov", "glft"] + [f"maskable_ppo-{i}" for i in range(1, 6)] + [
+        f"sac_residual_avellaneda_stoikov-{i}" for i in range(1, 6)]
+    def row():
+        return {**{n: {"blocks": [float(i)] * 12, "attribution": {"fills": 1}} for i, n in enumerate(names)},
+                "_rows": {"volatility_10s": 1.0, "median_spread": 2.0, "median_touch_lots": 3.0}}
+    metrics = {m: [0.1] * 12 for m in [f"queue_tv_{i}" for i in range(3)] + list(s2.METRICS)}
+    (tmp_path / "holdout").mkdir()
+    transfer = {"_regime": "calm"}
+    prefixes = ["qr", "qr_count", "qr_constant"] + [f"mdqr-{s}" for s in range(1, 6)]
+    for prefix in prefixes:
+        for w in range(1, 4):
+            for j in range(1, 11):
+                name = f"{prefix}-w{w}-d{j}.json"
+                (tmp_path / "holdout" / name).write_text(json.dumps({"failure": None, "metrics": metrics}))
+                transfer[f"/x/{name}"] = row()
+    path = tmp_path / "transfer.json"
+    path.write_text(json.dumps(transfer))
+    result = aggregate.decide(tmp_path, "calm", [path])
+    assert result["regime"] == "calm" and "decision" in result and (tmp_path / "s2-calm.json").exists()
+    assert result["tau"]["qr"] == pytest.approx(1.0)
+    with pytest.raises(ValueError):
+        aggregate.decide(tmp_path, "stressed", [path])

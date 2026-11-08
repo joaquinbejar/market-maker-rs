@@ -56,4 +56,6 @@ def test_only_the_action_version_may_differ():
 
 def test_the_captures_grid_from_zero_gives_720_rows():
     from_zero = [[i * 1000, [1, 0, 0], [1, 0, 0], 1] for i in range(7200)]
-    assert len(transfer.rows_of(from_zero, [], [])) == 720
+    assert len(transfer.rows_of(from_zero, [], [], 0)) == 720
+    with pytest.raises(transfer.FailedDraw):
+        transfer.rows_of(from_zero, [], [])

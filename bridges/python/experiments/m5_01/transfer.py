@@ -32,10 +32,10 @@ class FailedDraw(ValueError):
     """Rows the pins do not allow: a failed draw, never repaired."""
 
 
-def rows_of(samples, references, directions):
-    """The pins' rows from 10 s samples [ms, bid, ask, spread] and the signed moves."""
+def rows_of(samples, references, directions, first=1):
+    """The pins' rows from samples [ms, bid, ask, spread] and the signed moves. `first` is the
+    grid's first multiple of 10 s: 0 for the capture, 1 for a generator."""
     samples = [s for s in samples if s[0] % 10_000 == 0][:ROWS]
-    first = 0 if samples and samples[0][0] == 0 else 1  # the capture samples from the start
     if [s[0] for s in samples] != [(i + first) * 10_000 for i in range(ROWS)]:
         raise FailedDraw(f"{len(samples)} rows on the 10 s grid, not {ROWS}")
     moves = [(r[0], d) for r, d in zip(references, directions, strict=True) if r[1]]
@@ -60,6 +60,8 @@ def block_nets(cumulative):
     """Net per 60 rows from the cumulative net after each of the 719 steps a 720 row episode
     has (a step moves from one row to the next); the last block ends at the episode's last
     value, which holds the terminal mark."""
+    if not cumulative:
+        raise FailedDraw("an episode with no step")
     cumulative = list(cumulative) + [cumulative[-1]] * (ROWS - 1 - len(cumulative))
     ends = [cumulative[(k + 1) * BLOCK_ROWS - 2] for k in range(ROWS // BLOCK_ROWS)]
     return [float(b - a) for a, b in zip([0.0] + ends[:-1], ends, strict=True)]
@@ -228,12 +230,12 @@ def consistency(frozen_dir, rows_dir):
 def inputs_of(path):
     value = json.loads(pathlib.Path(path).read_text())
     if "book_10s" in value:
-        return value["book_10s"], value["references"], value["directions"]
+        return value["book_10s"], value["references"], value["directions"], 1
     if "reference_directions" in value and "limits" in value:
-        return value["samples"], value["references"], value["reference_directions"]
+        return value["samples"], value["references"], value["reference_directions"], 1
     if "window" in value:
         trajectory = s2.from_window(value)
-        return trajectory["samples"], trajectory["references"], trajectory["directions"]
+        return trajectory["samples"], trajectory["references"], trajectory["directions"], 0
     raise ValueError(f"{path} is not a draw")
 
 
@@ -242,7 +244,7 @@ def main():
     regime = sys.argv[4]
     if regime not in REGIMES:
         raise SystemExit(f"unknown regime {regime}")
-    results = {}
+    results = {"_regime": regime}
     for path in sys.argv[5:]:
         try:
             results[path] = evaluate(frozen_dir, rows_of(*inputs_of(path)), regime)

@@ -1,9 +1,9 @@
 """Assembles #106's S2 from the holdout's draws and transfer runs, and applies the rule. REAL DATA.
 
     python experiments/m5_01/aggregate.py score-qr <capture> <arms dir> <out dir>
-    python experiments/m5_01/aggregate.py decide <out dir> <transfer json>...
+    python experiments/m5_01/aggregate.py decide <out dir> <regime> <transfer json>...
 
-`score-qr` scores the fitted arms' draws against the data; `decide` writes `s2.json`.
+`score-qr` scores the fitted arms' draws against the data; `decide` writes `s2-<regime>.json`; only calm carries the decision.
 """
 
 import glob
@@ -52,7 +52,10 @@ def tau_interval(a, b, rng, replicates=s2.REPLICATES):
 def nets(transfer, names):
     """policies x windows x blocks, the mean over the draws of each key in `transfer`, or None
     if a draw failed. `names` maps a window (1 to 3) to its result rows."""
-    policies = sorted(next(iter(transfer[names[1][0]].values())) and transfer[names[1][0]])
+    policies = sorted(p for p in next(r for r in transfer.values() if "failure" not in r)
+                      if p != "_rows")
+    if len(policies) != 13:
+        raise ValueError(f"{len(policies)} policies, not 13")
     out = np.empty((len(policies), WINDOWS, s2.BLOCKS))
     for w in range(1, WINDOWS + 1):
         rows = [transfer[n] for n in names[w]]
@@ -147,7 +150,6 @@ def beside(transfer, arrays, policies, data_paths):
     out = {}
     mdqr = None if arrays["mdqr"] is None else arrays["mdqr"].sum(axis=2).mean(axis=1)
     if mdqr is not None:
-        data = {p: np.sum(transfer[d][p]["blocks"]) for d in data_paths for p in policies}
         data_means = np.array([np.mean([np.sum(transfer[d][p]["blocks"]) for d in data_paths])
                                for p in policies]) if data_paths else None
         for arm in s2.QR_ARMS:
@@ -156,7 +158,6 @@ def beside(transfer, arrays, policies, data_paths):
                 out[f"group_tau/{arm}"] = tau_b(groups(mdqr, policies), groups(other, policies))
         if data_means is not None:
             out["tau_against_data"] = tau_b(mdqr, data_means)
-        del data
     for arm in ARMS + ("mdqr",):
         rows = [r for w, names in names_of(transfer, arm).items() for r in (transfer[n] for n in names)
                 if "failure" not in r]
@@ -169,10 +170,14 @@ def beside(transfer, arrays, policies, data_paths):
     return out
 
 
-def decide(out, transfer_paths):
+def decide(out, regime, transfer_paths):
+    """S2 at one regime's transfer. Only calm's file carries the rule's decision."""
     transfer = {}
     for path in transfer_paths:
-        transfer.update(json.loads(pathlib.Path(path).read_text()))
+        value = json.loads(pathlib.Path(path).read_text())
+        if value.pop("_regime") != regime:
+            raise ValueError(f"{path} is not a {regime} transfer")
+        transfer.update(value)
     data_paths = sorted(p for p in transfer if "/window-" in p)
     table, failed, dropped = table_of(out)
     arrays = {}
@@ -193,7 +198,10 @@ def decide(out, transfer_paths):
     result.update(label="REAL DATA: Hyperliquid BTC, December 2025; a reused holdout, exploratory",
                   tau_intervals=intervals, policy_means=policy_means,
                   undefined_values_per_arm=dropped)
-    (out / "s2.json").write_text(json.dumps(result, indent=1) + "\n")
+    if regime != "calm":
+        result["reading_only"] = result.pop("decision")
+    result["regime"] = regime
+    (out / f"s2-{regime}.json").write_text(json.dumps(result, indent=1) + "\n")
     return result
 
 
@@ -206,7 +214,7 @@ def main():
         score_qr(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]),
                  caps.pop())
     else:
-        print(decide(pathlib.Path(sys.argv[2]), sys.argv[3:])["decision"])
+        print(decide(pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4:]))
 
 
 if __name__ == "__main__":
