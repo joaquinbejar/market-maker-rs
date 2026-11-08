@@ -1,6 +1,6 @@
 {
  "issue": 108,
- "design_version": 1,
+ "design_version": 2,
  "status": "fixed before any code or run; part 2 of #108, after PR #295",
  "data": "SYNTHETIC: every result is from made-up Hawkes parameters and says nothing about a market",
  "closed_by_295": {
@@ -40,30 +40,38 @@
    },
    "grid": "product in the listed order, 24 points per setting, the unperturbed point first; ties take the first in grid order",
    "plausibility": "bounds are #108's ranges; branching_scale multiplies every weight and each point must keep the branching matrix's spectral radius below 1, checked and recorded by code before any day is generated; a failing point is removed and reported",
-   "identifiability": "on the selection days of each point, with no policy: realised market-order rate over the unperturbed rate within 10 % of the multiplier implied, and the regression slope of mid change on signed market orders within 10 % of impact_ticks; a failing point is reported and removed before freeze"
+   "identifiability": {
+    "rate": "market orders per row over the point's 10 selection days, against the stationary rate implied by the point's parameters through (I - K)^-1 mu; |ratio - 1| <= 0.10",
+    "impact": "OLS slope of per-row mid change on the row's signed market orders; for impact_ticks > 0, |slope / impact_ticks - 1| <= 0.10; at impact 0, |slope| <= 0.025 ticks, 10 % of the smallest non-zero impact",
+    "when": "before freeze, with no policy; a failing point is reported and removed"
+   },
+   "removed_points": "a point failing the spectral or identifiability check is removed before freeze. If it is the fixed stress, or the impact-only point, that condition is reported as not run, with no substitute. If the unperturbed point fails, that whole setting is reported as not run, since every comparison in it needs that point"
   },
   "fixed_stress": "market 2, limit 0.7, branching 1.2, next higher impact",
   "adversary": {
    "picks": "for each policy (the seeds of a learned arm being one policy), the point with the largest mean daily loss over its selection days; a tail statistic is not used since 10 days do not resolve one",
    "information": "parameters set before a day; sees nothing of its path; changes neither matching, accounting nor limits",
-   "used_on": "selection days only; the holdout is not used by it"
+   "used_on": "selection days only; the holdout is not used by it",
+   "comparability": "the mean-loss rule differs from #295's CVaR rule, so the two parts' adversary results are not comparable",
+   "selection_noise": "24 candidates pick up selection noise: the selected point's selection-day and holdout loss are reported side by side"
   },
   "arms": {
    "no_trade": "hold",
    "classical": "fixed spread and Avellaneda-Stoikov at #107 part C's points selected on its validation days per setting",
-   "learned": "#107 part C's frozen mlp and lstm, seeds 1 to 5, in every setting (validation chose mlp at impact 0 and lstm at the other two as control); HSN and the other arms left out for compute, stated"
+   "learned": "#107 part C's frozen mlp and lstm, seeds 1 to 5, in every setting (validation chose mlp at impact 0 and lstm at the other two as control); HSN and the other arms left out for compute, stated",
+   "learned_cut_effect": "if lstm is cut, learned claims are limited to mlp and the comparison with the validation-chosen control at impact_low and impact_high is stated as not available"
   },
   "no_training": "learned arms are loaded and verified by sha256 against #107's manifest and evaluated deterministically; this study trains nothing",
-  "execution": "#107 part C's: queue_position_rational, 1 lot per 500 ms, no minimum time; same fees (-0.0001, secondary 0.0002), limits, latency for every arm",
+  "execution": "#107 part C's: queue_position_rational, 1 lot per 500 ms, no minimum time; fee -0.0001 and the same limits and latency for every arm; #107's secondary fee 0.0002 is not run in this study",
   "days": {
    "selection": {
     "count": 10,
     "per_point": true,
-    "seed": "1000003 + day + 100000"
+    "seed": "1000003 x day + 100000, day 1 to 10"
    },
    "holdout": {
     "count": 30,
-    "seed": "1000003 + day + 300000, never used by #107"
+    "seed": "1000003 x day + 300000, day 1 to 30; #107's days used 1000003 + day, so no seed is reused"
    },
    "digests": "committed before any policy runs"
   },
@@ -83,14 +91,15 @@
   ],
   "margin_shortfall": "not measured: this simulator has no declared capital and none is made up; margin-rs#7 gives a requirement, not a capital",
   "intervals": {
-   "kind": "paired 90 % moving block bootstrap over holdout days of the daily difference",
+   "kind": "paired 90 % stationary block bootstrap over holdout days of the daily difference",
    "replicates": 2000,
    "mean_block_days": 2,
    "seed": 108,
    "pairs": "each arm stressed against itself unperturbed, and against no-trade under the same condition"
   },
   "reading": "descriptive, per arm and setting. A loss is reported as a loss; an interval containing 0 is 'no difference shown', never equivalence or robustness; no adopt decision",
-  "once": "the holdout runs once from a frozen manifest, behind an O_EXCL marker claimed before any day is read, with a frozen_sha256 check and at most 1 recorded recovery"
+  "once": "the holdout runs once from a frozen manifest, behind an O_EXCL marker claimed before any day is read, at the fixed path /Users/joaquin/tmp/worktrees/market-maker-rs/m5_10_markers/, outside the output directory, with a frozen_sha256 check. One recovery at most, only after an external kill, resumed from the journal with the journal prefix's hash checked, as #281",
+  "impact_meaning": "impact here is the market orders' impact on the mid in the generator's rows; the agent's own fills do not move the mid, unlike #282's reactive episode, and no conclusion about own impact is drawn"
  },
  "part_2_281_impact": {
   "what": "#281's condition declared and not run: its A and B frozen models (10 models, seeds 1 to 5) at kappa = 2 kappa0 per regime through #282's reactive runner",
@@ -98,15 +107,21 @@
   "gated_on": "#282's runner merged on main; otherwise reported not run, nothing replaces it",
   "disclosure": "those base days were already read for #281's other 13 conditions, so this is a one-off added condition; it has no bearing on #281's decision and is reported apart",
   "intervals": "#281's paired stratified stationary block bootstrap, 2000 replicates, seed 281",
-  "once": "one attempt, as part 1"
+  "once": "one attempt, same marker directory and recovery condition as part 1",
+  "runner": "#282's runner as merged on main; its merge commit is written into part 2's manifest before any day runs. Today it exists only on branch feature/282-reactive-impact (2f3a8a3); if not merged, not run",
+  "models": "checked against the hashes in experiments/m5_05/frozen_models.json",
+  "estimand": "#281's D_tail and D_net at impact; no primary claim",
+  "multiplicity": "#281 compared A with B on 13 conditions; this makes 14, unadjusted"
  },
  "compute": {
+  "count": "selection = S x P x 10 x 13 policy runs (no_trade, fixed, AS, 5 mlp, 5 lstm); holdout = S x 4 x 30 x 13. With S = 3, P = 24: 9360 + 4680 = 14040 days of 86400 rows",
   "ceiling_process_hours": {
-   "part_1": 60,
+   "part_1": 90,
    "part_2": 6
   },
-  "pilot": "before selection: 2 days per arm at one impact setting on design seeds outside every split; per-day cost measured",
-  "stop_rule": "if the pilot projects over the ceiling, stop and report before selection and cut in this order: drop impact_low, then lstm; no seed cut. During a step, stop at 1.5 x its pilot-based estimate or at the ceiling, and report",
+  "ceiling_note": "at 15 s a day the count is 58.5 process-hours, and #282 ran 1.5x to 2x its unloaded rate on a contended machine",
+  "pilot": "before selection, under the machine's load at the time: 2 days per arm, on design seeds outside every split, at the slowest arm (lstm) and the most active point (market 2, limit 0.7, branching 1.2, highest impact) as well as unperturbed; its output file is hashed in the freeze",
+  "stop_rule": "cuts are decided from pilot cost alone, before any selection day runs, in this order: drop impact_low, then lstm; no seed is cut. During a step, stop at 1.5 x its pilot-based estimate or at the ceiling and report; a mid-step stop never triggers a cut after results exist",
   "slots": "none until assigned, not before #282 ends"
  },
  "seen_before_freeze": [
@@ -114,5 +129,8 @@
   "#295's and #281's PR text and designs",
   "no day of this study has been generated"
  ],
- "changes": []
+ "changes": [
+  "before any code or run, from review of f583fbc: count formula, pilot at the slowest arm and most active point under load, ceiling raised from 60 to 90 process-hours from that count, cuts from the pilot only, removed points, identifiability estimates, stationary bootstrap named, recovery condition and marker location, part 2 runner, model hashes and estimand, no secondary fee, impact is the flow's and not the agent's",
+  "before any code or run, from review of 378e653: seed formulas written as stride x day + offset, and a failing unperturbed point removes its setting; the identifiability formula, absolute tolerance at impact 0, removal rule and stationary bootstrap of the entry above answer the same review"
+ ]
 }
