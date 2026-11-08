@@ -1,0 +1,118 @@
+{
+ "issue": 108,
+ "design_version": 1,
+ "status": "fixed before any code or run; part 2 of #108, after PR #295",
+ "data": "SYNTHETIC: every result is from made-up Hawkes parameters and says nothing about a market",
+ "closed_by_295": {
+  "done": "bounded flow perturbations of #102's queue-reactive regimes, fixed stress, grid adversary, selection apart from a holdout read once, classical and learned arms, inventory, drawdown, CVaR",
+  "not_done": [
+   "Hawkes flow, which the issue names (#91)",
+   "flow and impact together on a simulator whose market orders move the mid",
+   "margin shortfall against a real capital: #295 used a made-up capital of 250"
+  ],
+  "elsewhere": "#282 (m5_04) frozen #102 arms under own impact; #281 (m5_05) adversarial training",
+  "closes_108": "the part 2 PR closes #108 only if part 1 reports every declared arm and condition and part 2 ran or is declared not run with its reason; margin shortfall is stated as not measured, so the PR must say whether that scope item is waived by the coordinator"
+ },
+ "part_1_hawkes": {
+  "simulator": "experiments/m5_02/design.json causal section, examples/hawkes_days.rs; base rates, decays, weights, diffusion, spread and kernel unchanged; made-up",
+  "impact_settings": {
+   "impact_0": 0.0,
+   "impact_low": 0.25,
+   "impact_high": 1.0
+  },
+  "perturbations": {
+   "market_rate": [
+    1,
+    1.5,
+    2
+   ],
+   "limit_rate": [
+    1,
+    0.7
+   ],
+   "branching_scale": [
+    1,
+    1.2
+   ],
+   "impact_step": {
+    "rule": "the policy's own setting or the next higher: 0 to 0.25, 0.25 to 1, 1 to 2",
+    "note": "two values per setting"
+   },
+   "grid": "product in the listed order, 24 points per setting, the unperturbed point first; ties take the first in grid order",
+   "plausibility": "bounds are #108's ranges; branching_scale multiplies every weight and each point must keep the branching matrix's spectral radius below 1, checked and recorded by code before any day is generated; a failing point is removed and reported",
+   "identifiability": "on the selection days of each point, with no policy: realised market-order rate over the unperturbed rate within 10 % of the multiplier implied, and the regression slope of mid change on signed market orders within 10 % of impact_ticks; a failing point is reported and removed before freeze"
+  },
+  "fixed_stress": "market 2, limit 0.7, branching 1.2, next higher impact",
+  "adversary": {
+   "picks": "for each policy (the seeds of a learned arm being one policy), the point with the largest mean daily loss over its selection days; a tail statistic is not used since 10 days do not resolve one",
+   "information": "parameters set before a day; sees nothing of its path; changes neither matching, accounting nor limits",
+   "used_on": "selection days only; the holdout is not used by it"
+  },
+  "arms": {
+   "no_trade": "hold",
+   "classical": "fixed spread and Avellaneda-Stoikov at #107 part C's points selected on its validation days per setting",
+   "learned": "#107 part C's frozen mlp and lstm, seeds 1 to 5, in every setting (validation chose mlp at impact 0 and lstm at the other two as control); HSN and the other arms left out for compute, stated"
+  },
+  "no_training": "learned arms are loaded and verified by sha256 against #107's manifest and evaluated deterministically; this study trains nothing",
+  "execution": "#107 part C's: queue_position_rational, 1 lot per 500 ms, no minimum time; same fees (-0.0001, secondary 0.0002), limits, latency for every arm",
+  "days": {
+   "selection": {
+    "count": 10,
+    "per_point": true,
+    "seed": "1000003 + day + 100000"
+   },
+   "holdout": {
+    "count": 30,
+    "seed": "1000003 + day + 300000, never used by #107"
+   },
+   "digests": "committed before any policy runs"
+  },
+  "conditions": [
+   "unperturbed",
+   "fixed_stress",
+   "adversary at the policy's own selected point",
+   "impact only (next higher impact, flow unperturbed)"
+  ],
+  "metrics": [
+   "daily net and attribution",
+   "largest and mean absolute position",
+   "max drawdown",
+   "5 % CVaR of daily net (worst 2 of 30)",
+   "limit breaches and refusals",
+   "margin-rs maintenance requirement at the day's peak position, reported as a requirement"
+  ],
+  "margin_shortfall": "not measured: this simulator has no declared capital and none is made up; margin-rs#7 gives a requirement, not a capital",
+  "intervals": {
+   "kind": "paired 90 % moving block bootstrap over holdout days of the daily difference",
+   "replicates": 2000,
+   "mean_block_days": 2,
+   "seed": 108,
+   "pairs": "each arm stressed against itself unperturbed, and against no-trade under the same condition"
+  },
+  "reading": "descriptive, per arm and setting. A loss is reported as a loss; an interval containing 0 is 'no difference shown', never equivalence or robustness; no adopt decision",
+  "once": "the holdout runs once from a frozen manifest, behind an O_EXCL marker claimed before any day is read, with a frozen_sha256 check and at most 1 recorded recovery"
+ },
+ "part_2_281_impact": {
+  "what": "#281's condition declared and not run: its A and B frozen models (10 models, seeds 1 to 5) at kappa = 2 kappa0 per regime through #282's reactive runner",
+  "days": "#281's 30 holdout days, seed offset 300000, and its train-only kappa0",
+  "gated_on": "#282's runner merged on main; otherwise reported not run, nothing replaces it",
+  "disclosure": "those base days were already read for #281's other 13 conditions, so this is a one-off added condition; it has no bearing on #281's decision and is reported apart",
+  "intervals": "#281's paired stratified stationary block bootstrap, 2000 replicates, seed 281",
+  "once": "one attempt, as part 1"
+ },
+ "compute": {
+  "ceiling_process_hours": {
+   "part_1": 60,
+   "part_2": 6
+  },
+  "pilot": "before selection: 2 days per arm at one impact setting on design seeds outside every split; per-day cost measured",
+  "stop_rule": "if the pilot projects over the ceiling, stop and report before selection and cut in this order: drop impact_low, then lstm; no seed cut. During a step, stop at 1.5 x its pilot-based estimate or at the ceiling, and report",
+  "slots": "none until assigned, not before #282 ends"
+ },
+ "seen_before_freeze": [
+  "#107 part C's design and README tables",
+  "#295's and #281's PR text and designs",
+  "no day of this study has been generated"
+ ],
+ "changes": []
+}
