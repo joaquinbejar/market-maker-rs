@@ -1,0 +1,116 @@
+{
+  "issue": 280,
+  "design_version": 1,
+  "data": "synthetic: #102's queue-reactive days (a simulator with made-up parameters), no market data. The logs are generated here by #104's behaviours; their rewards are the simulator's consequences, not observed ones",
+  "bounds": "One synthetic simulator whose rows do not react to orders, made-up parameters and 24 days per regime bound what this study can show. Every value is labelled [observed] (read from a log) or [simulated] (an interactive run in the same simulator); nothing here is an off-policy estimate.",
+  "disclosure": "#102 and #104 have evaluated their arms on the holdout days 20 to 24 under #102's execution, and their values there are known (as_grid -111.59, fixed spread 4 -138.93, maskable PPO about 0 a day). The primary comparison runs under a different execution, where nothing has been evaluated; the secondary one on #104's logs runs under #102's, where those values are known.",
+  "reuses": {
+    "m4_05_design_sha256": "4f4950626599941906019ff6a4a3e4e95b85f364d4d1d0ea066d301b7a25f221",
+    "m4_05_digests_sha256": "e1f0c3bd60e8c5fe21b44843b340dc3ab6b3ae72ba5105fb0cc21b4d7f042462",
+    "m4_05_frozen_manifest_sha256": "9de757b5bf76274882306c9a9c3d9257389deca64d24074948d1a95646c19458",
+    "m4_07_design_sha256": "732ed2822d35219a79a68cb53cc0a218df3c4a6063662e1c2a6e278ab1407eb0",
+    "m4_07_frozen_manifest_sha256": "4d3c8725afdc653ddb6d320d0962af123340ba9c049d736785e8807297482b2e",
+    "what": "#102's regimes, days, splits, kernel, fees, limits, latency, maskable grid, selected classical points and maskable PPO recipe; #104's behaviours (as_grid, epsilon-greedy), their code and, for the secondary comparison only, its frozen training and validation logs"
+  },
+  "splits": {
+    "train": "days 1 to 14: the logs every offline arm trains on, and the PPO comparator's training days",
+    "validation": "days 15 to 19: the queue gate, the logs of the BC sanity rule, and the choice of CQL's alpha by interactive runs",
+    "holdout": "days 20 to 24: the interactive evaluation, once, after the freeze. No log is generated on them"
+  },
+  "executions": {
+    "standard": {
+      "what": "the queue standard for 10 s rows; the primary comparison",
+      "fill_model": {"kind": "queue_position_rational", "lots": 1, "per_ms": 5000, "min_queue_ms": 0},
+      "latency": "#102's main latency"
+    },
+    "immediate_reference": {
+      "what": "the queue gate's reference only",
+      "fill_model": {"kind": "immediate"},
+      "latency": "#102's main latency"
+    },
+    "m4_05_main": {
+      "what": "#102's main execution, under which #104's logs were made; the secondary comparison. It is immediate fill in effect: #102's immediate fill ablation equals it on every holdout row",
+      "fill_model": "#102's main: queue position at 1 lot per ms, min_queue_ms 5000",
+      "latency": "#102's main latency"
+    },
+    "common": "#102's fee 0.0002, limits (20 lots, 2500 notional), terminal mark, the maskable grid with masking, and its observation scales"
+  },
+  "datasets": {
+    "standard_eps30": {
+      "role": "primary",
+      "execution": "standard",
+      "behaviour": "#104's as_grid_eps30, generated here on train and validation days, behaviour seeds 1 to 5"
+    },
+    "standard_eps10": {
+      "role": "secondary: the same arms at a less exploratory behaviour",
+      "execution": "standard",
+      "behaviour": "#104's as_grid_eps10, generated here as above"
+    },
+    "m4_07_eps30": {
+      "role": "secondary: #104's frozen logs as they are",
+      "execution": "m4_05_main",
+      "behaviour": "#104's as_grid_eps30 logs, train and validation, behaviour seeds 1 to 5, read only after their sha256 match #104's frozen manifest"
+    }
+  },
+  "behaviours": "#104's design: as_grid at #102's selected Avellaneda-Stoikov point of the regime, projected on the grid, mixed epsilon-uniformly (with probability epsilon a hold with probability 1/2, otherwise a quote uniform over the quotes the mask allows). Its code is #104's (experiments/m4_07/run.py: Grid, Behaviour, AsGrid); the logs keep observation, mask, action code, propensity and the exact reward per decision",
+  "arms": {
+    "bc": {
+      "what": "behaviour cloning: an MLP classifier over the 101 joint actions, a softmax over the allowed actions only, cross-entropy on the logged action; evaluated as the deterministic argmax over the allowed actions",
+      "settings": {"hidden": [256, 256], "learning_rate": 0.0003, "batch_size": 256, "gradient_steps": 50000}
+    },
+    "cql": {
+      "what": "discrete conservative Q-learning: double DQN's target with a target network, a Huber temporal difference loss, plus alpha times (logsumexp over the allowed actions of Q(s, a) minus Q(s, a_logged)); no bootstrap after a day's last decision; evaluated as the deterministic argmax of Q over the allowed actions",
+      "settings": {"hidden": [256, 256], "learning_rate": 0.0001, "batch_size": 256, "gradient_steps": 200000, "gamma": 0.99, "target_period": 2000},
+      "alpha_choices": [0.1, 1.0, 10.0],
+      "alpha_rule": "on the primary dataset: the alpha with the largest mean daily net over the validation days of every regime and the five training seeds, from interactive runs at environment seed 101 under the standard execution [simulated]; a tie to the smaller alpha. The secondary datasets use that alpha and choose nothing. This is a choice with the simulator, as #102 chose its points on validation, and is declared as such"
+    },
+    "reward_scale": "each dataset's rewards are divided by the standard deviation of its per-decision rewards over its training logs, computed before training",
+    "implementation": "experiments/m4_11/offline.py, on torch, which the bridge's training already uses; no new dependency",
+    "training_seeds": [1, 2, 3, 4, 5],
+    "threads_per_run": 1
+  },
+  "comparators": {
+    "no_trade": "hold at every decision",
+    "fixed_spread_4": "#102's selected fixed spread: offsets 4 and 4 ticks, size 1 lot",
+    "as_grid": "the behaviours' greedy rule, deterministic",
+    "maskable_ppo": {
+      "primary": "#102's maskable PPO recipe (set 0's hyperparameters, its budget of 2,000,000 steps, the pooled training days of every regime), retrained here under the standard execution, seeds 1 to 5, evaluated deterministically as #102 did",
+      "secondary_m4_07": "#102's frozen maskable PPO, set 0, seeds 1 to 5, under #102's main execution, loaded as #104 loads it"
+    }
+  },
+  "evaluation": {
+    "days": "holdout days 20 to 24 of each regime",
+    "environment_seed": 101,
+    "daily_value": "a day's exact net result at environment seed 101 [simulated]; for an arm with training seeds, the mean over its five seeds is the arm's daily value, and each seed is also reported",
+    "metrics": ["net", "fills", "largest absolute position", "gate refusals", "peak notional", "time beyond 5 lots", "limit breaches"],
+    "comparisons": [
+      ["cql", "maskable_ppo"],
+      ["bc", "maskable_ppo"],
+      ["cql", "bc"],
+      ["cql", "as_grid"],
+      ["bc", "as_grid"],
+      ["cql", "no_trade"]
+    ],
+    "intervals": "paired: the difference of the two arms' daily values day by day; Politis and Romano's stationary bootstrap over days with mean block 2 days, 2000 replicates, seed 280, 90 % percentile interval; per regime over its 5 days, and pooled by resampling each regime's days independently and averaging",
+    "claims": "no offline arm is called better or worse than another arm unless the paired 90 % interval excludes zero; no claim about any market"
+  },
+  "support": {
+    "propensity": "at every decision of each trained arm's holdout run, the behaviour's exact probability of the arm's action (as_grid's action at that state, mixed epsilon-uniformly); reported as the shares at 0 and under 0.0001. Every action the mask allows has a probability of at least epsilon / 2 / 100 under these behaviours, so these shares are zero by construction and are reported to show it",
+    "state_action": "the share of each trained arm's holdout decisions whose (state bin, action) pair the dataset's training logs hold 0 times, and fewer than 10 times. The state bin is #104's (spread, absolute mid change, imbalance by the training logs' quintiles) crossed with the signed position in lots (at most -6, -5 to -1, 0, 1 to 5, at least 6)",
+    "label": "[observed] for the training counts; it says where an arm acts outside what its logs hold, not how well"
+  },
+  "stop_rules": [
+    "Logs: a log whose sha256 differs from its record (here, or in #104's frozen manifest for the secondary dataset) stops the step that reads it.",
+    "Queue gate, before any log of the standard execution: on the validation days at environment seed 101, as_grid under the standard execution must have more than 0 fills over the days and a mean daily net different from its mean daily net under immediate fill on the same days. Otherwise stop and report; fixed_spread_4 is reported beside it.",
+    "Determinism: the gate's standard runs of fixed_spread_4 on the first validation day of each regime are run twice and must be equal exactly. For the secondary dataset, fixed_spread_4 on the validation days under #102's main execution must equal #102's validation values exactly, as in #104.",
+    "BC sanity: on each dataset's validation logs, the BC arm of every seed must choose as_grid's action (the logs' target code of as_grid) on at least 90 % of the logged decisions. Otherwise stop: the pipeline is broken.",
+    "CQL: a loss that is not finite stops the run, and it is reported; nothing is tuned beyond the alpha grid.",
+    "Compute: a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds."
+  ],
+  "compute": {
+    "max_parallel_runs": 4,
+    "estimates": "set by the pilot step before any other step: the time per gradient step of BC and CQL on the secondary dataset's training logs, and the time per log and per evaluation step on training day 1",
+    "when": "after the compute of #103, #105 and #110"
+  },
+  "holdout_rule": "the holdout is run once, after the freeze has recorded the hashes of the design, the code, the chosen alpha, every log and every checkpoint; the runner refuses it before"
+}

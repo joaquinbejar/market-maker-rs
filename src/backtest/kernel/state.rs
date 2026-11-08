@@ -1,11 +1,13 @@
 //! Kernel state, phases, outcomes, reasons and events.
 
 use crate::Decimal;
+use core::num::NonZeroU64;
 
 use super::account::AgentAccount;
 use super::book::{Arr, Delivery, FillRec, ObsEntry, ReportRec, VenueMsg, VenueOrder};
 use super::data::DatasetId;
-use super::gate::{GateState, GateVerdict};
+use super::gate::{GateCheck, GateState, GateVerdict};
+use super::hedge::HedgeEvent;
 use super::ledger::{AgentView, VenueLedger};
 use super::rng::KernelRng;
 use crate::execution::Action;
@@ -192,7 +194,9 @@ impl KernelEvent {
             | Self::EndOfData { .. }
             | Self::Halted(_)
             | Self::Decided(_)
-            | Self::DroppedMsg { .. } => false,
+            | Self::DroppedMsg { .. }
+            | Self::Expired { .. }
+            | Self::DroppedExpiry { .. } => false,
         }
     }
 }
@@ -220,6 +224,7 @@ pub enum QuoteSide {
 
 /// One decision of the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KernelAction {
     /// Leave the resting orders in place.
     Hold,
@@ -250,6 +255,37 @@ pub enum KernelAction {
         price: u64,
         /// Size, in lots.
         lots: u64,
+    },
+    /// Cancel every resting or pending order and submit nothing. Each cancel
+    /// takes effect after the cancel latency, as a quote's cancels do: a fill
+    /// before it stands, and a cancel that reaches an order already filled is
+    /// rejected (`CancelRejected`). Admitted whenever a `Hold` is, since an
+    /// open order already holds the venue message its cancel needs. Outside
+    /// the engine-equivalence subset: the engine cancels only to replace.
+    Cancel,
+    /// A [`KernelAction::Quote`] whose legs the venue cancels by itself
+    /// `life_ns` of venue time after each leg's own activation, whatever the
+    /// latencies and their jitter: an expiry the kernel schedules when the
+    /// leg activates, in the venue queue, in `(time, sequence)` order with
+    /// every other message. As for any order, a row at the activation time
+    /// does not fill it; a row at or after the expiry finds it gone, since
+    /// venue messages run before matching at equal times. So it fills only on
+    /// rows strictly inside `(activation, activation + life_ns)`. A replacing
+    /// quote's or a cancel's message and the expiry share the two venue
+    /// messages an open order reserves: the activation's, which the expiry
+    /// takes once the order is active, and the cancel's. Admission is a
+    /// `Quote`'s. Outside the engine-equivalence subset.
+    ExpiringQuote {
+        /// Bid, in ticks.
+        bid: u64,
+        /// Ask, in ticks.
+        ask: u64,
+        /// Bid size, in lots.
+        bid_lots: u64,
+        /// Ask size, in lots.
+        ask_lots: u64,
+        /// Venue time each leg rests from its activation, in nanoseconds.
+        life_ns: NonZeroU64,
     },
 }
 
@@ -288,7 +324,8 @@ pub struct Counters {
     pub rejected: [u64; 8],
     /// Halts (at most one).
     pub halts: u64,
-    /// Venue messages dropped at the end of the data.
+    /// Venue messages dropped at the end of the data: activations, cancels
+    /// and expiries.
     pub eof_dropped_msgs: u64,
     /// Observations dropped at the end of the data.
     pub eof_dropped_obs: u64,
@@ -327,6 +364,8 @@ pub struct GateRecord {
     pub verdict: GateVerdict,
     /// Submitted lots (0 when refused).
     pub submitted: u64,
+    /// The check that decided.
+    pub check: GateCheck,
 }
 
 /// An event of the run, in event order.
@@ -375,6 +414,20 @@ pub enum KernelEvent {
         /// True for a cancel, false for an activation.
         cancel: bool,
     },
+    /// The venue canceled an order of a [`KernelAction::ExpiringQuote`] at its
+    /// expiry; its `Canceled` report follows.
+    Expired {
+        /// The order.
+        order_id: u64,
+        /// Venue time of the expiry, in nanoseconds.
+        at_ns: u64,
+    },
+    /// An expiry still pending at the end of the data, dropped with the
+    /// order's other venue messages.
+    DroppedExpiry {
+        /// The order.
+        order_id: u64,
+    },
 }
 
 /// Receiver of [`KernelEvent`]s. Implementations should not allocate per
@@ -390,6 +443,11 @@ pub trait EventSink {
     /// fill, observation push, action, end of data). A diagnostic for
     /// checking the queue bounds; ignored by default.
     fn queues(&mut self, _lengths: QueueLengths) {}
+
+    /// The hedge lane's money events (#266): its rows, fills and funding
+    /// payments, in the lane's own order. Ignored by default, so a sink of the
+    /// quoted lane alone is unchanged; a wrapping sink must forward it.
+    fn hedge(&mut self, _event: HedgeEvent) {}
 }
 
 /// A sink that ignores every event.
@@ -472,6 +530,15 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
     #[must_use]
     pub fn data_id(&self) -> DatasetId {
         self.data_id
+    }
+
+    /// Whether `other` equals this state in every field but the dataset's identity: the
+    /// same run on rows that differ only where it has not read yet (#282).
+    #[must_use]
+    pub fn same_apart_from_dataset(&self, other: &Self) -> bool {
+        let mut moved = *self;
+        moved.data_id = other.data_id;
+        moved == *other
     }
 
     /// Fingerprint of the configuration the state belongs to.

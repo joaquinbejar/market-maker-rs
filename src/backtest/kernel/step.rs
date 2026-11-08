@@ -8,6 +8,7 @@
 
 use crate::Decimal;
 use crate::types::action::Dir;
+use core::num::NonZeroU64;
 
 use super::account;
 use super::book::{
@@ -17,7 +18,7 @@ use super::book::{
 use super::config::{ValidFill, ValidatedConfig};
 use super::data::{KernelDataset, KernelTick, NS_PER_MS};
 use super::encode::insert_by_id;
-use super::gate::{self, GateVerdict};
+use super::gate::{self, Balances, GateCheck, GateVerdict, MarginTerms};
 use super::grid::{half_units_decimal, scaled_decimal};
 use super::state::{
     ActionStatus, EventSink, GateRecord, HaltReason, KernelEvent, KernelState, Phase, QueueLengths,
@@ -25,6 +26,10 @@ use super::state::{
 };
 
 type Halt = HaltReason;
+
+/// The combined limits of a hedged kernel, with the counter of the orders
+/// they refuse; `None` for a kernel alone.
+pub(super) type Combined<'a> = Option<(&'a super::hedge::CombinedCheck, &'a mut u64)>;
 
 /// Counts the agent-facing events forwarded to the caller's sink.
 ///
@@ -57,6 +62,10 @@ impl<E: EventSink> EventSink for Em<'_, E> {
             }
         }
         self.sink.event(event);
+    }
+
+    fn hedge(&mut self, event: super::hedge::HedgeEvent) {
+        self.sink.hedge(event);
     }
 
     fn queues(&mut self, lengths: QueueLengths) {
@@ -212,11 +221,28 @@ fn apply_next_msg<
     s: &mut St<ORD, MSG, DLV, OBS>,
     em: &mut E,
 ) -> Result<(), Halt> {
+    // The expiry's time, and room for its sequence number, are checked
+    // before the message is taken: a halt leaves it in the queue, and an
+    // active order never lacks the expiry its quote asked for.
+    let expiry = match s.msgs.first().map(|m| m.kind) {
+        Some(MsgKind::Activate {
+            order,
+            life: Some(life),
+        }) if order.price > 0 && order.qty > 0 => {
+            let at = order
+                .active_after_ns
+                .checked_add(life.get())
+                .ok_or(Halt::TimeOverflow)?;
+            s.next_msg_seq.checked_add(1).ok_or(Halt::CounterOverflow)?;
+            Some(at)
+        }
+        _ => None,
+    };
     let Some(msg) = s.msgs.pop_front() else {
         return Ok(());
     };
     match msg.kind {
-        MsgKind::Activate(mut order) => {
+        MsgKind::Activate { mut order, .. } => {
             let valid = order.price > 0 && order.qty > 0;
             let (ts, seq) = stamp(s)?;
             let report = if valid {
@@ -240,12 +266,76 @@ fn apply_next_msg<
             queue_delivery(cfg, s, report, None, em)?;
             if valid {
                 s.orders.push(order).map_err(|_| Halt::CounterOverflow)?;
+                // The expiry takes the venue message the activation held.
+                if let Some(at) = expiry {
+                    schedule(s, at, MsgKind::Expire { id: order.id })?;
+                }
             } else if order.cancel_inflight {
                 insert_by_id(&mut s.awaiting, order).map_err(|_| Halt::CounterOverflow)?;
             }
             Ok(())
         }
         MsgKind::Cancel { id } => apply_cancel(cfg, s, id, em),
+        MsgKind::Expire { id } => apply_expire(cfg, s, id, em),
+    }
+}
+
+/// The venue's cancel of a resting order at its expiry. An order with the
+/// agent's cancel in flight then awaits it, which the venue rejects as for a
+/// fill before a cancel.
+fn apply_expire<
+    const ORD: usize,
+    const MSG: usize,
+    const DLV: usize,
+    const OBS: usize,
+    E: EventSink,
+>(
+    cfg: &ValidatedConfig,
+    s: &mut St<ORD, MSG, DLV, OBS>,
+    id: u64,
+    em: &mut E,
+) -> Result<(), Halt> {
+    let Some(index) = s.orders.position(|o| o.id == id && !o.state.is_terminal()) else {
+        return Ok(());
+    };
+    let (ts, seq) = stamp(s)?;
+    let Some(mut order) = s.orders.remove(index) else {
+        return Ok(());
+    };
+    order.state = OrderState::Canceled;
+    s.gate
+        .release(order.side, order.remaining())
+        .ok_or(Halt::CounterOverflow)?;
+    em.event(KernelEvent::Expired {
+        order_id: id,
+        at_ns: s.now_ns,
+    });
+    let report = status_report(
+        ts,
+        seq,
+        &order,
+        ExecKind::Canceled,
+        Origin::Venue,
+        order.cancel_inflight,
+    );
+    queue_delivery(cfg, s, report, None, em)?;
+    if order.cancel_inflight {
+        insert_by_id(&mut s.awaiting, order).map_err(|_| Halt::CounterOverflow)?;
+    }
+    Ok(())
+}
+
+/// Removes the pending expiry of order `id`, if any: an order that ended
+/// otherwise keeps no venue message for its expiry.
+fn remove_expiry<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+    s: &mut St<ORD, MSG, DLV, OBS>,
+    id: u64,
+) {
+    if let Some(index) = s
+        .msgs
+        .position(|m| matches!(m.kind, MsgKind::Expire { id: target } if target == id))
+    {
+        let _ = s.msgs.remove(index);
     }
 }
 
@@ -269,16 +359,17 @@ fn apply_cancel<
         s.gate
             .release(order.side, order.remaining())
             .ok_or(Halt::CounterOverflow)?;
+        remove_expiry(s, id);
         let report = status_report(ts, seq, &order, ExecKind::Canceled, Origin::Venue, false);
         return queue_delivery(cfg, s, report, None, em);
     }
     let pending = s.msgs.position(|m| match m.kind {
-        MsgKind::Activate(order) => order.id == id,
-        MsgKind::Cancel { .. } => false,
+        MsgKind::Activate { order, .. } => order.id == id,
+        MsgKind::Cancel { .. } | MsgKind::Expire { .. } => false,
     });
     if let Some(index) = pending {
         if let Some(VenueMsg {
-            kind: MsgKind::Activate(mut order),
+            kind: MsgKind::Activate { mut order, .. },
             ..
         }) = s.msgs.remove(index)
         {
@@ -585,6 +676,7 @@ fn match_row<
             continue;
         }
         let _ = s.orders.remove(index);
+        remove_expiry(s, order.id);
         if order.cancel_inflight {
             insert_by_id(&mut s.awaiting, order).map_err(|_| Halt::CounterOverflow)?;
         }
@@ -731,11 +823,17 @@ fn end_of_data<
     let dropped_msgs = u64::try_from(s.msgs.len()).map_err(|_| Halt::CounterOverflow)?;
     let dropped_obs = u64::try_from(s.observed.len()).map_err(|_| Halt::CounterOverflow)?;
     for msg in s.msgs.as_slice() {
-        let (order_id, cancel) = match msg.kind {
-            MsgKind::Activate(order) => (order.id, false),
-            MsgKind::Cancel { id } => (id, true),
-        };
-        em.event(KernelEvent::DroppedMsg { order_id, cancel });
+        em.event(match msg.kind {
+            MsgKind::Activate { order, .. } => KernelEvent::DroppedMsg {
+                order_id: order.id,
+                cancel: false,
+            },
+            MsgKind::Cancel { id } => KernelEvent::DroppedMsg {
+                order_id: id,
+                cancel: true,
+            },
+            MsgKind::Expire { id } => KernelEvent::DroppedExpiry { order_id: id },
+        });
     }
     s.msgs.clear();
     s.observed.clear();
@@ -904,6 +1002,9 @@ pub(super) fn capacity_ok<const ORD: usize, const MSG: usize, const DLV: usize>(
 pub(super) struct Legs {
     pub(super) legs: [Option<(Dir, u64, u64)>; 2],
     pub(super) crossed: bool,
+    /// The venue time each leg rests from its activation, for an expiring
+    /// quote.
+    pub(super) life: Option<NonZeroU64>,
 }
 
 /// What the transaction may change, saved before it runs. Every change is
@@ -986,11 +1087,12 @@ pub(super) fn apply_quote<
     cfg: &ValidatedConfig,
     s: &mut St<ORD, MSG, DLV, OBS>,
     legs: Legs,
+    combined: Combined<'_>,
     em: &mut E,
 ) -> Result<(), Halt> {
     let undo = Undo::save(s);
     let mut buf = Buf::new();
-    let mut result = quote_transaction(cfg, s, legs, &mut buf);
+    let mut result = quote_transaction(cfg, s, legs, combined, &mut buf);
     if result.is_ok() && buf.full {
         result = Err(Halt::CounterOverflow);
     }
@@ -1019,8 +1121,8 @@ fn next_target<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: 
         .filter(|o| !o.state.is_terminal() && !o.cancel_inflight)
         .map(|o| o.id);
     let pending = s.msgs.as_slice().iter().filter_map(|m| match m.kind {
-        MsgKind::Activate(order) if !order.cancel_inflight => Some(order.id),
-        MsgKind::Activate(_) | MsgKind::Cancel { .. } => None,
+        MsgKind::Activate { order, .. } if !order.cancel_inflight => Some(order.id),
+        MsgKind::Activate { .. } | MsgKind::Cancel { .. } | MsgKind::Expire { .. } => None,
     });
     resting.chain(pending).filter(|id| above(*id)).min()
 }
@@ -1036,7 +1138,7 @@ fn set_cancel<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: u
         }
     }
     for msg in s.msgs.as_mut_slice() {
-        if let MsgKind::Activate(order) = &mut msg.kind
+        if let MsgKind::Activate { order, .. } = &mut msg.kind
             && order.id == id
         {
             order.cancel_inflight = inflight;
@@ -1054,6 +1156,7 @@ pub(super) fn quote_transaction<
     cfg: &ValidatedConfig,
     t: &mut St<ORD, MSG, DLV, OBS>,
     legs: Legs,
+    mut combined: Combined<'_>,
     em: &mut E,
 ) -> Result<(), Halt> {
     let now = t.now_ns;
@@ -1074,20 +1177,76 @@ pub(super) fn quote_transaction<
         account::open(&mut t.account, id).map_err(|_| Halt::CounterOverflow)?;
         let mut refused = crossed;
         let mut size = lots;
+        let mut record = None;
         if !refused && let Some(limits) = &cfg.limits {
             let decision = gate::check(limits, &t.gate, &cfg.tick, &cfg.lot, dir, price, lots)
                 .map_err(|_| Halt::GateNumeric)?;
-            em.event(KernelEvent::Gate(GateRecord {
+            record = Some(GateRecord {
                 order_id: id,
                 side: dir.into(),
                 requested: lots,
                 verdict: decision.verdict,
                 submitted: decision.submitted,
-            }));
+                check: GateCheck::Limits,
+            });
             match decision.verdict {
                 GateVerdict::Accepted | GateVerdict::Reduced => size = decision.submitted,
-                GateVerdict::ReducedOffLot | GateVerdict::Rejected => refused = true,
+                GateVerdict::ReducedOffLot | GateVerdict::Rejected => {
+                    refused = true;
+                }
             }
+        }
+        // The balance gate binds after the limits, on what they approved:
+        // their record is emitted first, then its own.
+        if !refused && let Some(margin) = &cfg.margin {
+            if let Some(record) = record.take() {
+                em.event(KernelEvent::Gate(record));
+            }
+            let terms = MarginTerms {
+                tick: &cfg.tick,
+                lot: &cfg.lot,
+                fee_scale: cfg.fee_scale().ok_or(Halt::GateNumeric)?,
+                fee_num: margin.fee_num,
+            };
+            let balances = balances(cfg, t, &terms).ok_or(Halt::GateNumeric)?;
+            let decision =
+                gate::margin_check(&terms, &balances, dir, price, size).ok_or(Halt::GateNumeric)?;
+            record = Some(GateRecord {
+                order_id: id,
+                side: dir.into(),
+                requested: size,
+                verdict: decision.verdict,
+                submitted: decision.submitted,
+                check: GateCheck::Margin,
+            });
+            match decision.verdict {
+                GateVerdict::Accepted | GateVerdict::Reduced => size = decision.submitted,
+                GateVerdict::ReducedOffLot | GateVerdict::Rejected => {
+                    refused = true;
+                }
+            }
+        }
+        // The combined limits of a hedged kernel bind after the instrument's
+        // own, on what it would submit; without them nothing here changes.
+        if !refused && let Some((check, rejects)) = combined.as_mut() {
+            let admitted = check
+                .admits_quoted(&t.gate, &cfg.tick, &cfg.lot, dir, price, size)
+                .ok_or(Halt::GateNumeric)?;
+            if !admitted {
+                refused = true;
+                bump(rejects)?;
+                record = Some(GateRecord {
+                    order_id: id,
+                    side: dir.into(),
+                    requested: lots,
+                    verdict: GateVerdict::Rejected,
+                    submitted: 0,
+                    check: GateCheck::Combined,
+                });
+            }
+        }
+        if let Some(record) = record {
+            em.event(KernelEvent::Gate(record));
         }
         let order = VenueOrder {
             id,
@@ -1111,13 +1270,53 @@ pub(super) fn quote_transaction<
         schedule(
             t,
             eff,
-            MsgKind::Activate(VenueOrder {
-                active_after_ns: eff,
-                ..order
-            }),
+            MsgKind::Activate {
+                order: VenueOrder {
+                    active_after_ns: eff,
+                    ..order
+                },
+                life: legs.life,
+            },
         )?;
     }
     Ok(())
+}
+
+/// The balances of the balance gate: the quote balance (initial capital,
+/// fill cash flows and fees) less the reservations of the live buys (resting
+/// or in flight to the venue, as the gate's live lots), and the base deposit
+/// plus the venue position less the live sells.
+fn balances<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>(
+    cfg: &ValidatedConfig,
+    t: &St<ORD, MSG, DLV, OBS>,
+    terms: &MarginTerms<'_>,
+) -> Option<Balances> {
+    let margin = cfg.margin.as_ref()?;
+    let activations = t.msgs.as_slice().iter().filter_map(|m| match &m.kind {
+        MsgKind::Activate { order, .. } => Some(order),
+        MsgKind::Cancel { .. } | MsgKind::Expire { .. } => None,
+    });
+    let reserved = t
+        .orders
+        .as_slice()
+        .iter()
+        .chain(activations)
+        .filter(|o| o.side == Dir::Buy)
+        .try_fold(0i128, |sum, o| {
+            sum.checked_add(terms.buy_reservation_u(o.price, o.remaining())?)
+        })?;
+    let quote_free_u = cfg
+        .c0_u
+        .checked_add(t.venue.cash_u)?
+        .checked_sub(t.venue.fixed_fees_u)?
+        .checked_sub(reserved)?;
+    let base_free_lots = i128::from(margin.base_lots)
+        .checked_add(i128::from(t.gate.venue_pos_lots))?
+        .checked_sub(i128::from(t.gate.live_sell_lots))?;
+    Some(Balances {
+        quote_free_u,
+        base_free_lots,
+    })
 }
 
 /// Records the outcome of an action in the counters.

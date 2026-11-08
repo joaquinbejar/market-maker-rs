@@ -7,7 +7,7 @@ From `bridges/python`, with `<part>` either `market` (B, the 1 s queue-reactive 
     python experiments/m5_02/run_market.py train <part> <data dir> <out dir> <commit> <parallel>
     python experiments/m5_02/run_market.py select <part> <data dir> <out dir> <commit> <parallel>
     python experiments/m5_02/run_market.py freeze <part> <out dir>
-    python experiments/m5_02/run_market.py holdout <part> <data dir> <out dir> <commit> <frozen sha256> <parallel>
+    python experiments/m5_02/run_market.py holdout <part> <data dir> <out dir> <commit> <frozen sha256> <parallel> [--recover <reason>]
     python experiments/m5_02/run_market.py report <part> <data dir> <out dir> <intervals binary>
 
 Everything #103 fixes is taken from its runner (`experiments/m4_06/run.py`) and its wrappers
@@ -46,6 +46,7 @@ from mm_rl_bridge.wrappers import DecisionInterval, EmaFeatures, history
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import attempt  # noqa: E402
 import nets  # noqa: E402
 import window  # noqa: E402
 
@@ -428,7 +429,7 @@ def freeze(ctx):
     print(ctx.write("frozen", frozen))
 
 
-def holdout(ctx, frozen_sha, parallel):
+def holdout(ctx, frozen_sha, parallel, recover=None):
     if sha256(ctx.out / "frozen.json") != frozen_sha:
         raise SystemExit("the frozen manifest differs")
     frozen = json.loads((ctx.out / "frozen.json").read_text())
@@ -450,16 +451,23 @@ def holdout(ctx, frozen_sha, parallel):
     jobs = []
     for fee in dict.fromkeys([ctx.fee, ctx.secondary_fee]):
         jobs += ctx.reference_jobs(fee, "holdout", days) + ctx.learned_jobs(runs, fee, "holdout", days)
+    # One attempt per freeze, claimed before any job is dispatched (attempt.py).
+    attempts = attempt.claim(ctx.out / "holdout.attempt", frozen_sha, recover)
     rows = m6.pool(jobs, evaluate_job, parallel, f"holdout {ctx.part}")
     print(ctx.write("holdout", {**ctx.header("holdout"), "frozen_sha256": frozen_sha,
-                                "secondary_fee": ctx.secondary_fee, "rows": rows}))
+                                "secondary_fee": ctx.secondary_fee, "attempts": attempts,
+                                "rows": rows}))
 
 
 def decide(against, against_none, breach, hsn_drawdown, control_drawdown, factor):
-    """The design's decision rule, from the intervals and the risk checks."""
+    """The design's decision rule, from the intervals and the risk checks. HSN helps only when
+    it is above no-trade as well: an interval wholly below no-trade is not "not equivalent to not
+    trading" in the rule's sense (a latent gap found in review, after the holdout; no decision
+    of #107 changes)."""
     equivalent = Decimal(against_none["lower"]) <= 0 <= Decimal(against_none["upper"])
+    above_none = Decimal(against_none["lower"]) > 0
     dd_ok = hsn_drawdown <= factor * control_drawdown
-    if Decimal(against["lower"]) > 0 and not breach and dd_ok and not equivalent:
+    if Decimal(against["lower"]) > 0 and not breach and dd_ok and above_none:
         decision = "hsn_helps"
     elif Decimal(against["mean"]) > 0:
         decision = "revise"
@@ -600,7 +608,8 @@ def main():
     elif step == "freeze":
         freeze(Context(part, None, sys.argv[3], None))
     elif step == "holdout":
-        holdout(Context(part, sys.argv[3], sys.argv[4], sys.argv[5]), sys.argv[6], int(sys.argv[7]))
+        holdout(Context(part, sys.argv[3], sys.argv[4], sys.argv[5]), sys.argv[6], int(sys.argv[7]),
+                attempt.recovery_reason(sys.argv))
     elif step == "report":
         report(Context(part, sys.argv[3], sys.argv[4], None), sys.argv[5])
     else:

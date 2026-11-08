@@ -571,7 +571,8 @@ fn test_env_no_output_bypasses_the_limits() {
                 largest_size = largest_size.max(bid_lots).max(ask_lots);
             }
             KernelAction::OneSided { lots, .. } => assert!(lots <= 10),
-            KernelAction::Hold | KernelAction::QuoteError(_) => {}
+            KernelAction::Hold | KernelAction::QuoteError(_) | KernelAction::Cancel => {}
+            other => panic!("the residual composed {other:?}"),
         }
         let position = state.kernel().venue_position().abs();
         assert!(position <= dec!(3), "position {position} at step {step}");

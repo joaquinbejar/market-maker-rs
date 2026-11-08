@@ -136,6 +136,11 @@ new holdout read:
 - The frozen alarm files are now selected by name, so a tagged sensitivity run's files no
   longer enter `freeze` or `holdout`.
 
+- **Once-only holdout.** `run.py holdout` refuses a second run only when `holdout.json` exists,
+  so a failure before it was written would have allowed a second evaluation with the same
+  freeze (unlike #107's later attempt marker). This session's command log shows exactly one
+  holdout attempt: 2026-11-07, 21:13Z to 21:46Z, rc 0, `holdout.json` written once.
+
 ## Not run
 
 - **S3**, #106's neural simulator: not adopted by the freeze.

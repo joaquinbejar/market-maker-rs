@@ -188,7 +188,8 @@ pub fn compose(
         ask_lots: ask_more,
     };
     let composed = match classical {
-        KernelAction::Hold | KernelAction::QuoteError(_) => {
+        // A cancel has no quote to move.
+        KernelAction::Hold | KernelAction::QuoteError(_) | KernelAction::Cancel => {
             return fallback(
                 classical,
                 proposal,
@@ -196,7 +197,9 @@ pub fn compose(
                 ResidualFallback::NoClassicalQuote,
             );
         }
-        KernelAction::Quote { .. } | KernelAction::OneSided { .. }
+        KernelAction::Quote { .. }
+        | KernelAction::ExpiringQuote { .. }
+        | KernelAction::OneSided { .. }
             if delta == ResidualDelta::default() =>
         {
             classical
@@ -225,6 +228,36 @@ pub fn compose(
                 ask: new_ask,
                 bid_lots: moved(bid_lots, bid_more, max_lots, &mut clips.size),
                 ask_lots: moved(ask_lots, ask_more, max_lots, &mut clips.size),
+            }
+        }
+        // A classical source that quotes with an expiry keeps it: the
+        // residual moves the prices and sizes only.
+        KernelAction::ExpiringQuote {
+            bid,
+            ask,
+            bid_lots,
+            ask_lots,
+            life_ns,
+        } => {
+            if bid >= ask {
+                return fallback(classical, proposal, clips, ResidualFallback::Crossed);
+            }
+            let new_bid = moved(
+                bid,
+                bid_away.saturating_neg(),
+                max_price_ticks,
+                &mut clips.price,
+            );
+            let new_ask = moved(ask, ask_away, max_price_ticks, &mut clips.price);
+            if new_bid >= new_ask {
+                return fallback(classical, proposal, clips, ResidualFallback::Crossed);
+            }
+            KernelAction::ExpiringQuote {
+                bid: new_bid,
+                ask: new_ask,
+                bid_lots: moved(bid_lots, bid_more, max_lots, &mut clips.size),
+                ask_lots: moved(ask_lots, ask_more, max_lots, &mut clips.size),
+                life_ns,
             }
         }
         KernelAction::OneSided { side, price, lots } => {

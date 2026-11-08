@@ -33,6 +33,7 @@ use crate::Decimal;
 use crate::types::action::Dir;
 use crate::types::error::{MMError, MMResult};
 
+use core::num::NonZeroU64;
 use std::collections::BTreeMap;
 
 use super::FinancialKernel;
@@ -154,13 +155,13 @@ fn err(message: impl Into<String>) -> MMError {
 }
 
 /// Little endian reader that never panics.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+pub(super) struct Reader<'a> {
+    pub(super) bytes: &'a [u8],
+    pub(super) pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> MMResult<&'a [u8]> {
+    pub(super) fn take(&mut self, n: usize) -> MMResult<&'a [u8]> {
         let end = self
             .pos
             .checked_add(n)
@@ -172,45 +173,45 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(slice)
     }
-    fn arr<const N: usize>(&mut self) -> MMResult<[u8; N]> {
+    pub(super) fn arr<const N: usize>(&mut self) -> MMResult<[u8; N]> {
         <[u8; N]>::try_from(self.take(N)?).map_err(|_| err("short read"))
     }
-    fn u8(&mut self) -> MMResult<u8> {
+    pub(super) fn u8(&mut self) -> MMResult<u8> {
         Ok(u8::from_le_bytes(self.arr()?))
     }
-    fn bool(&mut self) -> MMResult<bool> {
+    pub(super) fn bool(&mut self) -> MMResult<bool> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
             v => Err(err(format!("invalid bool {v}"))),
         }
     }
-    fn u16(&mut self) -> MMResult<u16> {
+    pub(super) fn u16(&mut self) -> MMResult<u16> {
         Ok(u16::from_le_bytes(self.arr()?))
     }
-    fn u32(&mut self) -> MMResult<u32> {
+    pub(super) fn u32(&mut self) -> MMResult<u32> {
         Ok(u32::from_le_bytes(self.arr()?))
     }
-    fn u64(&mut self) -> MMResult<u64> {
+    pub(super) fn u64(&mut self) -> MMResult<u64> {
         Ok(u64::from_le_bytes(self.arr()?))
     }
-    fn i64(&mut self) -> MMResult<i64> {
+    pub(super) fn i64(&mut self) -> MMResult<i64> {
         Ok(i64::from_le_bytes(self.arr()?))
     }
-    fn u128(&mut self) -> MMResult<u128> {
+    pub(super) fn u128(&mut self) -> MMResult<u128> {
         Ok(u128::from_le_bytes(self.arr()?))
     }
-    fn i128(&mut self) -> MMResult<i128> {
+    pub(super) fn i128(&mut self) -> MMResult<i128> {
         Ok(i128::from_le_bytes(self.arr()?))
     }
-    fn option_u64(&mut self) -> MMResult<Option<u64>> {
+    pub(super) fn option_u64(&mut self) -> MMResult<Option<u64>> {
         Ok(if self.bool()? {
             Some(self.u64()?)
         } else {
             None
         })
     }
-    fn decimal(&mut self) -> MMResult<Decimal> {
+    pub(super) fn decimal(&mut self) -> MMResult<Decimal> {
         let mantissa = self.i128()?;
         let scale = self.u8()?;
         if scale > 28 || mantissa.unsigned_abs() >= (1u128 << 96) {
@@ -221,7 +222,7 @@ impl<'a> Reader<'a> {
         Decimal::try_from_i128_with_scale(mantissa, u32::from(scale))
             .map_err(|e| err(e.to_string()))
     }
-    fn dir(&mut self) -> MMResult<Dir> {
+    pub(super) fn dir(&mut self) -> MMResult<Dir> {
         let code = self.u8()?;
         dir_from_code(code).ok_or_else(|| err(format!("invalid side {code}")))
     }
@@ -473,14 +474,28 @@ pub fn encode<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: u
     write_collection(&mut w, &s.msgs, |w, m| {
         w.u64(m.eff_ns);
         w.u64(m.seq);
+        // Tags 3 and 4 only appear in runs with expiring quotes: a run
+        // without them keeps the bytes of tags 1 and 2.
         match &m.kind {
-            MsgKind::Activate(order) => {
+            MsgKind::Activate { order, life: None } => {
                 w.u8(1);
                 write_order(w, order);
             }
             MsgKind::Cancel { id } => {
                 w.u8(2);
                 w.u64(*id);
+            }
+            MsgKind::Expire { id } => {
+                w.u8(3);
+                w.u64(*id);
+            }
+            MsgKind::Activate {
+                order,
+                life: Some(life),
+            } => {
+                w.u8(4);
+                write_order(w, order);
+                w.u64(life.get());
             }
         }
     });
@@ -629,8 +644,21 @@ pub fn decode<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: u
         let eff_ns = r.u64()?;
         let seq = r.u64()?;
         let kind = match r.u8()? {
-            1 => MsgKind::Activate(read_order(r)?),
+            1 => MsgKind::Activate {
+                order: read_order(r)?,
+                life: None,
+            },
             2 => MsgKind::Cancel { id: r.u64()? },
+            3 => MsgKind::Expire { id: r.u64()? },
+            4 => {
+                let order = read_order(r)?;
+                let life = NonZeroU64::new(r.u64()?)
+                    .ok_or_else(|| err("expiring activation with a life of 0".to_string()))?;
+                MsgKind::Activate {
+                    order,
+                    life: Some(life),
+                }
+            }
             tag => return Err(err(format!("invalid message tag {tag}"))),
         };
         Ok(VenueMsg { eff_ns, seq, kind })
@@ -905,19 +933,19 @@ fn validate_state<const ORD: usize, const MSG: usize, const DLV: usize, const OB
     let activations: Vec<VenueOrder> = msgs
         .iter()
         .filter_map(|m| match m.kind {
-            MsgKind::Activate(order) => Some(order),
-            MsgKind::Cancel { .. } => None,
+            MsgKind::Activate { order, .. } => Some(order),
+            MsgKind::Cancel { .. } | MsgKind::Expire { .. } => None,
         })
         .collect();
     let cancels: Vec<u64> = msgs
         .iter()
         .filter_map(|m| match m.kind {
             MsgKind::Cancel { id } => Some(id),
-            MsgKind::Activate(_) => None,
+            MsgKind::Activate { .. } | MsgKind::Expire { .. } => None,
         })
         .collect();
     for m in msgs {
-        if let MsgKind::Activate(order) = m.kind {
+        if let MsgKind::Activate { order, .. } = m.kind {
             check(
                 order.state == OrderState::Submitted
                     && order.active_after_ns == m.eff_ns
@@ -933,9 +961,37 @@ fn validate_state<const ORD: usize, const MSG: usize, const DLV: usize, const OB
             .all(|o| o.state == OrderState::Active),
         "resting order not active",
     )?;
+    // An expiry names a resting order, after its activation, at most once.
+    // With an activation per pending order (unique ids) and a cancel per
+    // flagged order (the flags check below), no order then holds more than its
+    // two venue messages: an activation and an expiry never name the same
+    // order.
+    let mut expiring: Vec<u64> = Vec::new();
+    for m in msgs {
+        if let MsgKind::Expire { id } = m.kind {
+            check(
+                s.orders
+                    .as_slice()
+                    .iter()
+                    .any(|o| o.id == id && m.eff_ns > o.active_after_ns),
+                "expiry not for a resting order after its activation",
+            )?;
+            expiring.push(id);
+        }
+    }
+    expiring.sort_unstable();
+    check(
+        strictly_increasing(expiring.iter().copied()),
+        "duplicate expiry",
+    )?;
+    // An expired order with a cancel in flight awaits it, as a filled one.
     check(
         s.awaiting.as_slice().iter().all(|o| {
-            o.cancel_inflight && matches!(o.state, OrderState::Filled | OrderState::Rejected)
+            o.cancel_inflight
+                && matches!(
+                    o.state,
+                    OrderState::Filled | OrderState::Rejected | OrderState::Canceled
+                )
         }),
         "awaiting order not terminal with a cancel in flight",
     )?;
@@ -1355,9 +1411,12 @@ fn check_report_chains<const ORD: usize, const MSG: usize, const DLV: usize, con
 ///   a venue order at most an activation, a cancel outcome and one per fill,
 ///   so `created + local_rejects + venue_fills <= stamp_seq`, and
 ///   `stamp_seq <= 4 * created` for the immediate model, with its one fill per
-///   order, or `3 * created + venue_fills` for the queue position model;
-/// - messages: an activation per order not rejected locally and at most one
-///   cancel per order, so `next_msg_seq <= 2 * created - local_rejects`;
+///   order, or `4 * created + venue_fills` for the queue position model (an
+///   expiring order can take an expiry's cancel and then the agent's
+///   rejected cancel);
+/// - messages: an activation per order not rejected locally, at most one
+///   cancel and at most one expiry per order, so
+///   `next_msg_seq <= 3 * created - local_rejects`;
 /// - `local_rejects + venue_fills <= created * fills per order` (one for the
 ///   immediate model, the largest order for the queue position model, since a
 ///   fill books at least one lot), `quote_errors` equals the
@@ -1391,13 +1450,13 @@ fn validate_counters<const ORD: usize, const MSG: usize, const DLV: usize, const
             && wide(s.stamp_seq)
                 <= match cfg.fill {
                     ValidFill::Immediate => wide(created) * 4,
-                    ValidFill::QueuePosition { .. } => wide(created) * 3 + wide(c.venue_fills),
+                    ValidFill::QueuePosition { .. } => wide(created) * 4 + wide(c.venue_fills),
                 },
         "stamp_seq outside its call-site bounds",
     )?;
     check(
-        wide(s.next_msg_seq) + wide(c.local_rejects) <= wide(created) * 2,
-        "next_msg_seq beyond two messages per order",
+        wide(s.next_msg_seq) + wide(c.local_rejects) <= wide(created) * 3,
+        "next_msg_seq beyond three messages per order",
     )?;
     check(
         wide(c.local_rejects) + wide(c.venue_fills)
@@ -1439,11 +1498,12 @@ fn validate_counters<const ORD: usize, const MSG: usize, const DLV: usize, const
         .ns(lat.observation_q)
         .ok_or_else(|| err("delay overflows"))?;
     let now = wide(s.now_ns);
+    // An expiry is the order's own life after its activation, not a delay;
+    // its time is checked against its order's activation.
     check(
-        s.msgs
-            .as_slice()
-            .iter()
-            .all(|m| wide(m.eff_ns) <= now + wide(venue_delay)),
+        s.msgs.as_slice().iter().all(|m| {
+            matches!(m.kind, MsgKind::Expire { .. }) || wide(m.eff_ns) <= now + wide(venue_delay)
+        }),
         "venue message beyond the largest delay",
     )?;
     check(

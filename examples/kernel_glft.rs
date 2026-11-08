@@ -66,7 +66,9 @@ fn main() -> MMResult<()> {
         match action {
             KernelAction::Quote { .. } | KernelAction::OneSided { .. } => quotes += 1,
             KernelAction::QuoteError(_) => errors += 1,
-            KernelAction::Hold => {}
+            KernelAction::Hold | KernelAction::Cancel => {}
+            // The adapter quotes without an expiry.
+            _ => {}
         }
         kernel.step(&mut s, action);
     }

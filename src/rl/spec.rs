@@ -11,6 +11,20 @@ pub const OBSERVATION_SPACE_VERSION: u16 = 1;
 pub const ACTION_SPACE_VERSION: u16 = 2;
 /// Version of the reward. Raised when its definition changes.
 pub const REWARD_VERSION: u16 = 1;
+/// Version of the observation space with a hedge lane: the features of version 1, then
+/// [`FeatureId::HEDGE`].
+pub const HEDGED_OBSERVATION_SPACE_VERSION: u16 = 2;
+/// Version of the action space with a hedge lane: version 2's actions, and
+/// [`CrossHedgeSpace`].
+pub const HEDGED_ACTION_SPACE_VERSION: u16 = 3;
+/// Version of the action space with the cancel-only action: version 2's actions, and
+/// [`CancelActions::CancelOnly`].
+pub const CANCEL_ACTION_SPACE_VERSION: u16 = 4;
+/// Version of the reward with a hedge lane: version 1's, with the hedge lane's ledger in the
+/// net result.
+pub const HEDGED_REWARD_VERSION: u16 = 2;
+/// Number of hedge features of the observation space with a hedge lane.
+pub const HEDGE_FEATURE_COUNT: usize = 5;
 /// Version of the episode rules. Raised when an end of episode changes meaning.
 pub const EPISODE_VERSION: u16 = 1;
 
@@ -47,6 +61,18 @@ pub enum FeatureId {
     AwaitingCancel,
     /// `max_steps` minus the decisions taken.
     StepsLeft,
+    /// `ask - bid` of the hedge row the agent sees, in hedge ticks.
+    HedgeSpread,
+    /// The hedge row's mid minus the observed quoted mid, both in quote per base of their
+    /// own instrument.
+    HedgeBasis,
+    /// The decision's time minus the hedge row's time: how stale it is.
+    HedgeRowAge,
+    /// The hedge position from delivered reports, times the multiplier: base units of the
+    /// quoted instrument.
+    HedgePosition,
+    /// 1 while a hedge is in flight, from its submission to its report, and 0 otherwise.
+    HedgeInFlight,
 }
 
 impl FeatureId {
@@ -65,7 +91,16 @@ impl FeatureId {
         Self::StepsLeft,
     ];
 
-    /// Position in the vector.
+    /// The hedge features, after [`FeatureId::ALL`], in the order of the hedge vector.
+    pub const HEDGE: [Self; HEDGE_FEATURE_COUNT] = [
+        Self::HedgeSpread,
+        Self::HedgeBasis,
+        Self::HedgeRowAge,
+        Self::HedgePosition,
+        Self::HedgeInFlight,
+    ];
+
+    /// Position in the vector; the hedge features count on after [`FeatureId::ALL`].
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
@@ -80,6 +115,11 @@ impl FeatureId {
             Self::OpenOrders => 8,
             Self::AwaitingCancel => 9,
             Self::StepsLeft => 10,
+            Self::HedgeSpread => 11,
+            Self::HedgeBasis => 12,
+            Self::HedgeRowAge => 13,
+            Self::HedgePosition => 14,
+            Self::HedgeInFlight => 15,
         }
     }
 }
@@ -243,14 +283,100 @@ impl ObservationScales {
     }
 }
 
+/// The constants that normalize the hedge features. Each is positive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HedgeScales {
+    /// Divisor of [`FeatureId::HedgeSpread`], in hedge ticks.
+    pub spread_ticks: Decimal,
+    /// Divisor of [`FeatureId::HedgeBasis`], in quote per base.
+    pub basis: Decimal,
+    /// Divisor of [`FeatureId::HedgeRowAge`], in milliseconds.
+    pub row_age_ms: Decimal,
+    /// Divisor of [`FeatureId::HedgePosition`], in base units.
+    pub position: Decimal,
+}
+
+impl HedgeScales {
+    pub(super) fn validate(&self) -> MMResult<()> {
+        for (name, value) in [
+            ("spread_ticks", self.spread_ticks),
+            ("basis", self.basis),
+            ("row_age_ms", self.row_age_ms),
+            ("position", self.position),
+        ] {
+            if value <= Decimal::ZERO {
+                return Err(MMError::InvalidConfiguration(format!(
+                    "hedge scale {name} must be positive, got {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn features(&self) -> Vec<FeatureSpec> {
+        let spec = |id, unit, as_of, horizon, divisor| FeatureSpec {
+            id,
+            unit,
+            as_of,
+            horizon,
+            memory: StateMemory::None,
+            divisor,
+        };
+        use AsOf as A;
+        use FeatureHorizon as H;
+        use FeatureId as F;
+        use FeatureUnit as U;
+        vec![
+            spec(
+                F::HedgeSpread,
+                U::Ticks,
+                A::ObservedRow,
+                H::Instant,
+                self.spread_ticks,
+            ),
+            spec(
+                F::HedgeBasis,
+                U::QuotePerBase,
+                A::ObservedRow,
+                H::Instant,
+                self.basis,
+            ),
+            spec(
+                F::HedgeRowAge,
+                U::Milliseconds,
+                A::ObservedRow,
+                H::Instant,
+                self.row_age_ms,
+            ),
+            spec(
+                F::HedgePosition,
+                U::Base,
+                A::DeliveredReports,
+                H::EpisodeSoFar,
+                self.position,
+            ),
+            spec(
+                F::HedgeInFlight,
+                U::Count,
+                A::AgentAccount,
+                H::Instant,
+                Decimal::ONE,
+            ),
+        ]
+    }
+}
+
 /// The observation space.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ObservationSpace {
-    /// [`OBSERVATION_SPACE_VERSION`].
+    /// [`OBSERVATION_SPACE_VERSION`], or [`HEDGED_OBSERVATION_SPACE_VERSION`] with a hedge
+    /// lane.
     pub version: u16,
     /// The features, in the order of the vector.
     pub features: [FeatureSpec; FEATURE_COUNT],
+    /// The hedge features, in the order of [`FeatureId::HEDGE`]; empty with no hedge lane.
+    pub hedge_features: Vec<FeatureSpec>,
 }
 
 impl ObservationSpace {
@@ -360,6 +486,7 @@ impl ObservationSpace {
                     max_steps,
                 ),
             ],
+            hedge_features: Vec::new(),
         }
     }
 }
@@ -412,11 +539,60 @@ impl HedgeActions {
     }
 }
 
+/// Which cancel actions exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CancelActions {
+    /// None: a policy withdraws its quotes only by replacing them.
+    NotModelled,
+    /// [`RlAction::Cancel`](crate::rl::RlAction::Cancel): cancel every resting or pending
+    /// order and send nothing. Each cancel takes effect after the kernel's cancel latency,
+    /// so a fill before it stands, and a cancel that reaches an order already filled is
+    /// rejected. A quote sent at a decision and cancelled `d` decisions later, one per row,
+    /// rests `d` rows plus the cancel latency less the submission latency.
+    CancelOnly,
+}
+
+impl CancelActions {
+    const fn code(self) -> u16 {
+        match self {
+            Self::NotModelled => 1,
+            Self::CancelOnly => 2,
+        }
+    }
+}
+
+/// A hedge in a second instrument, the hedge lane of
+/// [`HedgedKernel`](crate::backtest::kernel::HedgedKernel): an immediate-or-cancel order at
+/// the hedge instrument's observed touch, on the side that reduces the net exposure of
+/// both lanes' delivered positions, of a size from [`CrossHedgeSpace::sizes_lots`] that
+/// never takes that exposure past zero. The quoted lane holds. One is in flight at a
+/// time, from its submission to its report.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct CrossHedgeSpace {
+    /// The hedge instrument's tick, in quote per its unit.
+    pub tick_size: Decimal,
+    /// The hedge instrument's lot.
+    pub lot_size: Decimal,
+    /// Its largest order size.
+    pub max_order_size: Decimal,
+    /// Quoted base units per unit of the hedge's quantity.
+    pub multiplier: Decimal,
+    /// 1 for spot, 2 for a linear perpetual.
+    pub instrument: u16,
+    /// Oldest hedge row a hedge may trade on, in nanoseconds.
+    pub max_staleness_ns: u64,
+    /// Hedge sizes, in hedge lots.
+    pub sizes_lots: Vec<u64>,
+}
+
 /// The action space.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ActionSpace {
-    /// [`ACTION_SPACE_VERSION`].
+    /// [`ACTION_SPACE_VERSION`], [`HEDGED_ACTION_SPACE_VERSION`] with a hedge lane, or
+    /// [`CANCEL_ACTION_SPACE_VERSION`] with the cancel-only action.
     pub version: u16,
     /// Value of one tick, in quote per base.
     pub tick_size: Decimal,
@@ -434,8 +610,12 @@ pub struct ActionSpace {
     pub sizes_lots: Vec<u64>,
     /// What happens outside the mask.
     pub invalid_action: InvalidActionPolicy,
-    /// Which hedge actions exist.
+    /// Which hedge actions in the quoted instrument exist.
     pub hedge: HedgeActions,
+    /// The hedge in a second instrument, with a hedge lane.
+    pub cross_hedge: Option<CrossHedgeSpace>,
+    /// Which cancel actions exist.
+    pub cancel: CancelActions,
 }
 
 /// The one kind of reward of this version.
@@ -475,7 +655,8 @@ impl RewardMark {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct RewardSpec {
-    /// [`REWARD_VERSION`].
+    /// [`REWARD_VERSION`], or [`HEDGED_REWARD_VERSION`] with a hedge lane, whose cash,
+    /// fees, funding and position at its last mid join the net result.
     pub version: u16,
     /// What it measures.
     pub kind: RewardKind,
@@ -536,6 +717,10 @@ pub struct SpaceShape {
     pub ask_offsets: usize,
     /// Sizes, and bits of the mask's `size`.
     pub sizes: usize,
+    /// Hedge features; zero with no hedge lane.
+    pub hedge_features: usize,
+    /// Hedge sizes, and bits of the cross hedge mask; zero with no hedge lane.
+    pub hedge_sizes: usize,
 }
 
 /// The identity of a specification.
@@ -611,6 +796,18 @@ impl RlSpec {
             put_u16(&mut out, feature.memory.code());
             put_decimal(&mut out, feature.divisor);
         }
+        if !o.hedge_features.is_empty() {
+            out.extend_from_slice(b"HF");
+            put_len(&mut out, o.hedge_features.len());
+            for feature in &o.hedge_features {
+                put_len(&mut out, feature.id.index());
+                put_u16(&mut out, feature.unit.code());
+                put_u16(&mut out, feature.as_of.code());
+                put_u16(&mut out, feature.horizon.code());
+                put_u16(&mut out, feature.memory.code());
+                put_decimal(&mut out, feature.divisor);
+            }
+        }
         let a = &self.action;
         put_u16(&mut out, a.version);
         put_decimal(&mut out, a.tick_size);
@@ -631,6 +828,26 @@ impl RlSpec {
         }
         put_u16(&mut out, a.invalid_action.code());
         put_u16(&mut out, a.hedge.code());
+        // A section that a specification without a hedge lane does not write, so its bytes
+        // and identity stay as they were.
+        if let Some(c) = &a.cross_hedge {
+            out.extend_from_slice(b"XH");
+            put_decimal(&mut out, c.tick_size);
+            put_decimal(&mut out, c.lot_size);
+            put_decimal(&mut out, c.max_order_size);
+            put_decimal(&mut out, c.multiplier);
+            put_u16(&mut out, c.instrument);
+            put_u64(&mut out, c.max_staleness_ns);
+            put_len(&mut out, c.sizes_lots.len());
+            for size in &c.sizes_lots {
+                put_u64(&mut out, *size);
+            }
+        }
+        // As the hedge lane's: a specification without the cancel action does not write it.
+        if a.cancel != CancelActions::NotModelled {
+            out.extend_from_slice(b"CX");
+            put_u16(&mut out, a.cancel.code());
+        }
         let r = &self.reward;
         put_u16(&mut out, r.version);
         put_u16(&mut out, r.kind.code());
@@ -673,6 +890,12 @@ impl RlSpec {
             bid_offsets: self.action.bid_offsets_ticks.len(),
             ask_offsets: self.action.ask_offsets_ticks.len(),
             sizes: self.action.sizes_lots.len(),
+            hedge_features: self.observation.hedge_features.len(),
+            hedge_sizes: self
+                .action
+                .cross_hedge
+                .as_ref()
+                .map_or(0, |c| c.sizes_lots.len()),
         }
     }
 

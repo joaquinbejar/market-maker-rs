@@ -182,7 +182,7 @@ fn test_kernel_capacity_reject_leaves_queues_unchanged() {
         .msgs
         .as_slice()
         .iter()
-        .filter(|m| matches!(m.kind, book::MsgKind::Activate(o) if o.cancel_inflight))
+        .filter(|m| matches!(m.kind, book::MsgKind::Activate { order: o, .. } if o.cancel_inflight))
         .count();
     assert!(pending > 0);
     let mut a = s;
@@ -527,8 +527,8 @@ fn test_kernel_decode_rejects_each_unreachable_state() {
                 s.next_order_id - 1 + s.counters.local_rejects + s.counters.venue_fills - 1;
             true
         }),
-        ("next_msg_seq beyond two per order", |s, _| {
-            s.next_msg_seq = 2 * s.next_order_id + 1;
+        ("next_msg_seq beyond three per order", |s, _| {
+            s.next_msg_seq = 3 * s.next_order_id + 1;
             true
         }),
         ("next_order_id beyond two per step", |s, _| {
@@ -595,11 +595,11 @@ fn test_kernel_decode_rejects_each_unreachable_state() {
         }),
         ("activation quantity 0", |s, _| {
             s.msgs.as_mut_slice().iter_mut().any(|m| match &mut m.kind {
-                book::MsgKind::Activate(o) => {
+                book::MsgKind::Activate { order: o, .. } => {
                     o.qty = 0;
                     true
                 }
-                book::MsgKind::Cancel { .. } => false,
+                book::MsgKind::Cancel { .. } | book::MsgKind::Expire { .. } => false,
             })
         }),
         ("awaiting price above P", |s, k| {
@@ -930,21 +930,30 @@ fn test_kernel_transaction_undo_restores_the_state_exactly() {
                 step::Legs {
                     legs: [Some((Dir::Buy, 99, 2)), Some((Dir::Sell, 101, 3))],
                     crossed: false,
+                    life: None,
                 },
                 step::Legs {
                     legs: [Some((Dir::Buy, 101, 1)), Some((Dir::Sell, 99, 1))],
                     crossed: true,
+                    life: None,
                 },
                 step::Legs {
                     legs: [Some((Dir::Sell, 102, 4)), None],
                     crossed: false,
+                    life: None,
+                },
+                // An expiring quote's transaction rolls back as exactly.
+                step::Legs {
+                    legs: [Some((Dir::Buy, 99, 2)), Some((Dir::Sell, 101, 3))],
+                    crossed: false,
+                    life: core::num::NonZeroU64::new(7),
                 },
             ];
             for legs in all_legs {
                 let mut s = s0;
                 let undo = step::Undo::save(&s);
                 let mut sink = Vec::new();
-                step::quote_transaction(&k.cfg, &mut s, legs, &mut sink).unwrap();
+                step::quote_transaction(&k.cfg, &mut s, legs, None, &mut sink).unwrap();
                 if s != s0 {
                     changed += 1;
                 }
@@ -1736,9 +1745,9 @@ fn test_decode_stamp_bound_depends_on_the_fill_model() {
     // Under the queue model the fills can exceed the orders.
     assert!(s.counters().venue_fills > created);
     assert_eq!(decode(&encode(&s), &k).unwrap(), s);
-    // Beyond three per order and one per fill.
+    // Beyond four per order and one per fill.
     let mut t = s;
-    t.stamp_seq = 3 * created + s.counters().venue_fills + 1;
+    t.stamp_seq = 4 * created + s.counters().venue_fills + 1;
     refused(&k, &t, "stamp_seq");
 }
 
@@ -1933,4 +1942,92 @@ fn test_queue_model_rational_validation_refuses_zero_lots_or_period() {
     assert!(refused(0, 0));
     assert!(!refused(1, 1));
     assert!(!refused(1, 10_000));
+}
+
+#[test]
+fn test_a_cancel_on_an_empty_book_changes_nothing_but_the_decision() {
+    let cfg = config(KernelLatency::zero(MS));
+    let rows = (0..4).map(|i| tick(1_000 + i, 14, 16)).collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    let (mut a, mut b) = (k.reset(1), k.reset(1));
+    assert_eq!(
+        k.step(&mut a, KernelAction::Cancel).applied,
+        ActionStatus::Applied
+    );
+    k.step(&mut b, KernelAction::Hold);
+    assert_eq!(encode(&a), encode(&b));
+}
+
+#[test]
+fn test_a_cancel_is_admitted_at_full_capacity_and_closes_every_open_order() {
+    // ORD = 6: after three quotes the account is full and a fourth quote is refused, but a
+    // cancel is not: it needs no slot, and every open order is closed by the end.
+    let latency = KernelLatency::zero(MS).with_delays(0, 50, 100, 0);
+    let mut cfg = config(latency);
+    cfg.max_steps = 1_000;
+    let rows = (0..400).map(|i| tick(1_000 + i, 14, 16)).collect();
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k: FinancialKernel<'_, 6, 64, 64, 16> =
+        FinancialKernel::new_relaxed(&cfg, &data, false, false, true).unwrap();
+    let mut events = Vec::new();
+    let mut s = k.reset_with(3, &mut events);
+    for _ in 0..3 {
+        k.step_with(&mut s, quote(10, 20), &mut events);
+    }
+    assert_eq!(
+        k.step(&mut s.clone(), quote(10, 20)).applied,
+        ActionStatus::Rejected(RejectReason::CapacityOrders)
+    );
+    assert_eq!(
+        k.step_with(&mut s, KernelAction::Cancel, &mut events)
+            .applied,
+        ActionStatus::Applied
+    );
+    while s.phase() == Phase::AwaitDecision {
+        k.step_with(&mut s, KernelAction::Hold, &mut events);
+    }
+    assert_eq!(s.account.len(), 0);
+    let cancelled = reports(&events, false)
+        .iter()
+        .filter(|r| r.kind == ExecKind::Canceled)
+        .count();
+    assert_eq!(cancelled, 6);
+}
+
+#[test]
+fn test_a_fill_before_the_cancel_arrives_stands_and_the_late_cancel_is_rejected() {
+    // The cancel is sent on row 1 and arrives 2 ms later, on row 3; row 2's ask of 15
+    // fills the bid of 15 before it, so the bid's cancel is rejected and the ask's lands.
+    let latency = KernelLatency::zero(MS).with_delays(0, 0, 2, 0);
+    let cfg = config(latency);
+    let rows = vec![
+        tick(1_000, 14, 16),
+        tick(1_001, 14, 16),
+        tick(1_002, 13, 15),
+        tick(1_003, 14, 16),
+        tick(1_004, 14, 16),
+    ];
+    let data = KernelDataset::from_kernel_ticks(rows, &cfg).unwrap();
+    let k: FinancialKernel<'_> = FinancialKernel::new(&cfg, &data).unwrap();
+    let mut events = Vec::new();
+    let mut s = k.reset_with(1, &mut events);
+    k.step_with(&mut s, quote(15, 30), &mut events);
+    k.step_with(&mut s, KernelAction::Cancel, &mut events);
+    while s.phase() == Phase::AwaitDecision {
+        k.step_with(&mut s, KernelAction::Hold, &mut events);
+    }
+    let kinds: Vec<_> = reports(&events, false)
+        .iter()
+        .filter(|r| r.kind != ExecKind::Accepted)
+        .map(|r| (r.side, r.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (Action::Buy, ExecKind::Fill),
+            (Action::Buy, ExecKind::CancelRejected),
+            (Action::Sell, ExecKind::Canceled),
+        ]
+    );
 }

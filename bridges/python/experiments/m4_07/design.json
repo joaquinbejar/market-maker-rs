@@ -1,0 +1,179 @@
+{
+  "issue": 104,
+  "design_version": 3,
+  "data": "synthetic: #102's queue-reactive days (a simulator with made-up parameters), no market data. The Hyperliquid capture enters only through a state coverage diagnostic: it holds no orders of our own, so no action, behaviour policy or propensity",
+  "bounds": "One synthetic simulator whose rows do not react to orders, made-up parameters and 24 days per regime bound what this study can show. Every value is labelled [observed] (read from a log), [estimated] (an off-policy estimate under its stated assumption) or [simulated] (an interactive run of the target in the same simulator).",
+  "disclosure": "#102 has already evaluated its arms on these holdout days (days 20 to 24). No estimator, threshold or choice of this study reads a holdout log before this study's freeze.",
+  "reuses": {
+    "design": "experiments/m4_05/design.json",
+    "design_sha256": "4f4950626599941906019ff6a4a3e4e95b85f364d4d1d0ea066d301b7a25f221",
+    "digests": "experiments/m4_05/digests.json",
+    "digests_sha256": "e1f0c3bd60e8c5fe21b44843b340dc3ab6b3ae72ba5105fb0cc21b4d7f042462",
+    "frozen_manifest_sha256": "9de757b5bf76274882306c9a9c3d9257389deca64d24074948d1a95646c19458",
+    "what": "the regimes, days, splits, kernel, main execution (fees, limits, queue model, latency), the maskable grid, the selected classical points and the frozen maskable PPO runs of #102"
+  },
+  "splits": {
+    "train": "days 1 to 14: fit of the direct method and of any counted propensity",
+    "validation": "days 15 to 19: choice of the estimator settings below, and the stop rule",
+    "holdout": "days 20 to 24: the go or no-go, read once after this study's freeze"
+  },
+  "log": {
+    "row": [
+      "regime",
+      "day",
+      "behaviour",
+      "behaviour_seed",
+      "step",
+      "observation",
+      "mask",
+      "action",
+      "propensity",
+      "reward",
+      "terminated",
+      "truncated",
+      "refused_because"
+    ],
+    "propensity": "the behaviour's probability of the logged joint action given the observation and the mask, computed by the behaviour itself",
+    "reward": "the environment's exact reward per decision, as a float for the estimators; the exact daily net is kept beside it"
+  },
+  "action_space": "#102's maskable grid: hold, or a quote of bid offset x ask offset x bid size x ask size over offsets [0, 1, 2, 4, 8] ticks from the observed mid and sizes [1, 2] lots, each restricted by the mask. A joint action is one of these, so a probability is over joint actions",
+  "behaviours": {
+    "as_grid_eps30": {
+      "greedy": "as_grid",
+      "epsilon": 0.3,
+      "explore": "with probability epsilon: a hold with probability 1/2, otherwise a quote drawn uniformly over the quotes the mask allows",
+      "propensity": "recorded"
+    },
+    "as_grid_eps10": {
+      "greedy": "as_grid",
+      "epsilon": 0.1,
+      "explore": "as as_grid_eps30",
+      "propensity": "recorded"
+    },
+    "as_grid_eps30_counted": {
+      "log_of": "as_grid_eps30",
+      "propensity": "dropped from the log, and counted from the training logs over the states binned as below; the control for unrecorded probabilities"
+    }
+  },
+  "as_grid": {
+    "rule": "Avellaneda-Stoikov at #102's selected point of the regime (risk aversion 0.01, order intensity 50, the regime's volatility from the training days, horizon one day), with the time left taken as steps left x 10 s and the inventory as the delivered position: the reservation price and the half spread give a bid and an ask distance from the mid in ticks, each rounded to the nearest grid offset (the smaller one on a tie, and 0 below 0), size 1 lot on each side; a hold when the mask allows no such quote",
+    "note": "a projection of Avellaneda-Stoikov on the grid, not #102's continuous Avellaneda-Stoikov arm",
+    "time": "elapsed = (rows per day - steps left) x 10 s from the day's start; years of 365 days"
+  },
+  "targets": {
+    "no_trade": "hold at every decision",
+    "fixed_spread_4": "#102's selected fixed spread: offsets 4 and 4 ticks, size 1 lot",
+    "as_grid": "the behaviours' greedy rule, deterministic",
+    "maskable_ppo": "#102's frozen maskable PPO, set 0, seeds 1 to 5, deterministic as #102 evaluated it (the most likely value of each dimension under the mask); each seed is a target"
+  },
+  "out_of_support_by_construction": {
+    "residual_sac": "a deterministic continuous correction of a continuous quote: it has no probability against a discrete behaviour",
+    "avellaneda_stoikov_continuous": "a continuous price, not a grid action",
+    "glft_continuous": "as above"
+  },
+  "seeds": {
+    "behaviour_seeds": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "environment_seed": "the behaviour seed, given to reset",
+    "truth_seeds": [
+      101
+    ]
+  },
+  "truth": "each target run interactively on the same days, with the same execution, environment seed 101 as #102's evaluation, labelled [simulated]. The rows do not react to orders, so it is exact for this simulator and says nothing about a market's reaction. It is never an input to a choice, a threshold or the decision",
+  "estimand": "a target's mean daily net over the days of a split, from its own interactive run",
+  "estimators": {
+    "pdwis": "per-decision weighted importance sampling over a day, the ratio products from the day's first decision, self-normalized per decision across the days and behaviour seeds",
+    "pdwis_window": "the same with each ratio product over the last w decisions only, which assumes that an action's effect on the reward fades after w decisions; w from window_choices",
+    "dm": "the direct method: a ridge regression of the per-decision reward on features of (observation, action), fitted on training logs, summed over the logged states with the target's action; it assumes the target reaches the logged states, which a policy that changes the position does not",
+    "dr": "per-decision doubly robust: the sum over decisions of the weighted mean, across trajectories, of (reward - model(s, logged action)), plus the weighted mean of model(s, target action) under the weight before that decision's own ratio; weights normalized at each decision",
+    "weights": "ratios of a deterministic target are 1 / propensity where it took the logged action and 0 elsewhere; their products are held as logs"
+  },
+  "estimator_settings": {
+    "window_choices": [
+      1,
+      10,
+      100
+    ],
+    "ridge_alpha_choices": [
+      0.1,
+      1.0,
+      10.0
+    ],
+    "choice_rule": "on validation logs, per behaviour and target: the window with the largest effective sample among those whose effective sample is at least the threshold, and otherwise the shortest (a tie to the shorter); per logged behaviour, the ridge alpha with the lowest squared error of the per-decision reward on validation logs. Neither reads a target's truth"
+  },
+  "diagnostics": {
+    "effective_sample": "per target: at each decision, (sum of weights)^2 / sum of squared weights across the trajectories present, as a share of them (0 where every weight is zero), averaged over decisions",
+    "max_weight": "the largest share any one trajectory holds of the weights at any one decision",
+    "low_propensity": "the share of the target's actions, over the logged decisions, whose behaviour propensity is under 0.0001",
+    "zero_propensity": "the count of logged decisions where the target's action has propensity 0 under the behaviour",
+    "cross_check": "whether the 90 % intervals of the chosen importance estimator and of dr overlap"
+  },
+  "decision_rule": {
+    "per": "target x behaviour, on the holdout logs",
+    "reasons": {
+      "no_recorded_propensity": "the behaviour's log has no recorded propensity",
+      "out_of_support": "zero_propensity > 0, or the target is out of support by construction",
+      "low_effective_sample": "effective_sample < 0.05, or not measured",
+      "heavy_weights": "max_weight > 0.05",
+      "estimators_disagree": "cross_check is false",
+      "no_cross_check": "cross_check could not be computed, and no other reason holds"
+    },
+    "go": "no reason holds. A go says only that these checks found nothing against reading the estimates for that target on that log; it does not say they are right, or that the target is good",
+    "real_data": "no-go for learning or evaluating a policy offline from the capture: it holds no orders of our own, hence no action, behaviour policy or propensity. Its rewards could only be simulated consequences"
+  },
+  "intervals": {
+    "kind": "90 % moving block bootstrap over days of the per-day estimator terms, as #102",
+    "replicates": 2000,
+    "mean_block_days": 2,
+    "seed": 104,
+    "note": "statistical only; a counted propensity is held fixed"
+  },
+  "stop_rules": [
+    "Consistency, before any estimate: this study's interactive runs of fixed_spread_4 and of each frozen PPO seed, on validation days at environment seed 101, must equal #102's validation daily nets exactly. Otherwise stop and report.",
+    "On validation: if no target other than as_grid has an effective sample of at least 0.05 under as_grid_eps30, stop, report the no-go with its diagnostics, and do not open the holdout logs.",
+    "Compute: a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds."
+  ],
+  "coverage": {
+    "what": "the share of the capture's decisions whose binned state falls in a bin the synthetic training logs reach, and the share of the synthetic logs' decisions in bins the capture reaches",
+    "bins": "spread in ticks (1, 2, 3 to 4, 5 to 8, more), the absolute mid change in ticks since the previous decision (0, 1, 2 to 4, more), the imbalance in quintiles of the synthetic training logs",
+    "capture": "#257's replay of the Hyperliquid capture, BTC December 2025, the longest warm stretch, rows sampled every 10 s as #102's days; the coordinator runs it and sends the counts, as the capture stays off this repository",
+    "label": "[observed] for the capture's states; it says where a simulator-trained policy would act outside the states it saw, not how well"
+  },
+  "compute": {
+    "estimate": "logs: 72 days x 2 behaviours x 5 seeds x 8640 decisions, about 6.2M environment steps; truth: 72 days x 8 targets x 1 seed, about 5M steps. To be measured on one day before the full run",
+    "threads_per_run": 1,
+    "max_parallel_runs": 4
+  },
+  "follow_up": "offline policy training (behaviour cloning, a conservative offline method) is #280, not this study",
+  "changes": [
+    {
+      "version": 2,
+      "seen": "nothing: no log, estimate or interactive run of this study existed; only a probe of the step rate with a rule on training day 1 of calm",
+      "what": [
+        "effective_sample and max_weight are defined per decision, where the estimators normalize, instead of over every decision pooled: weights over thousands of decisions are only defined up to a scale at each decision",
+        "weights are held as logs, so a product over a day stays finite",
+        "the doubly robust estimator is written out (the weight before a decision's own ratio carries the model's value of the target's action)",
+        "the consistency stop rule also compares each frozen PPO seed with #102's validation values",
+        "as_grid's time elapsed is (rows per day - steps left) x the sample interval, and its year has 365 days, as #102's volatility rule",
+        "#102's frozen runs were trained at action space version 1, before hedge actions (#247) made it 2 with hedges off unchanged; they are loaded across that one difference, with the kernel fingerprint and the configuration still checked equal, and the consistency step must reproduce #102's validation values"
+      ]
+    },
+    {
+      "version": 3,
+      "seen": "training and validation logs and interactive runs were being written; no log, estimate or interactive value had been read by any analysis",
+      "what": [
+        "the window is chosen per behaviour and target, by the same rule, since the effective sample is a target's",
+        "the direct method's features: an intercept, the observation as the policy sees it, the action (quote, bid and ask offset over 8 ticks, bid and ask size over 2 lots), and the quote, the offset difference and the quote times the position, and the quote times the spread",
+        "the ridge alpha is chosen per logged behaviour; the counted control uses the epsilon 0.3 logs and their direct method",
+        "a counted propensity is the share of the training logs' decisions in the state's bin that took the action; a bin or action never seen counts 0",
+        "the intervals of the direct method are reported too, as a third estimator that the decision does not read",
+        "coverage: the capture's states are read as the policy would see them at each declared tick (0.1 and 1), with #102's scales, so the coverage is reported per declared tick"
+      ]
+    }
+  ]
+}

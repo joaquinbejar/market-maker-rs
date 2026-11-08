@@ -46,6 +46,16 @@
 //!
 //! A duration, as a waiting time or an order's life, comes from two times. It takes the weaker
 //! evidence of the two.
+//!
+//! # The book on a time grid
+//!
+//! [`ReplayConfig::with_book_samples`] asks for the book at each time of a grid, as the queue
+//! reactive simulator samples its own: a sample shows the book after every diff before its time.
+//! The diffs of a block share one inferred time, so a sample never shows a block half applied. A
+//! sample is taken when the first diff at or after its time arrives, so a reset, which a silence
+//! shows only when it ends, leaves no sample of the forgotten book across the silence: the grid
+//! starts again after the diff that follows it. [`book_samples`] converts them into the model's
+//! [`BookSample`] once the event sizes are known.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -56,7 +66,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use super::queue_reactive::{
-    QrEventKind, QrSide, QueueObservation, ReferenceObservation, SizedEvent,
+    BookSample, MAX_LIMITS, QrEventKind, QrSide, QueueObservation, ReferenceObservation, SizedEvent,
 };
 use crate::Decimal;
 use crate::analytics::micro_price::TopOfBook;
@@ -777,6 +787,8 @@ pub struct Coverage {
     pub resets_on_trades: u64,
     /// Orders resting at a reset, whose lives were cut there and reached no exposure.
     pub orders_cut_by_reset: u64,
+    /// Grid times of the book's sampling with no two sided touch, so no sample.
+    pub book_samples_without_touch: u64,
 }
 
 /// Settings of a replay.
@@ -793,6 +805,9 @@ pub struct ReplayConfig {
     /// The silence that resets the replay, in nanoseconds: more than this between two diffs or
     /// two trades. `u64::MAX` never resets, and carries the book over any gap.
     pub reset_gap_ns: u64,
+    /// The book's sampling grid, in nanoseconds, from [`ReplayConfig::with_book_samples`]. `None`,
+    /// the default, takes no samples.
+    pub book_sample_ns: Option<u64>,
 }
 
 impl ReplayConfig {
@@ -812,8 +827,51 @@ impl ReplayConfig {
             limits,
             warmup_ns,
             reset_gap_ns,
+            book_sample_ns: None,
         })
     }
+
+    /// Samples the book every `interval_ms`, at the multiples of it since the Unix epoch, into
+    /// [`ReplayOutput::book`]. See the [module documentation](self#the-book-on-a-time-grid).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] for an interval of zero, or more limits than a
+    /// [`BookSample`] holds.
+    pub fn with_book_samples(self, interval_ms: u64) -> MMResult<Self> {
+        if interval_ms == 0 || usize::from(self.limits) > MAX_LIMITS {
+            return Err(MMError::InvalidConfiguration(format!(
+                "book samples every {interval_ms} ms over {} limits",
+                self.limits
+            )));
+        }
+        let interval_ns = interval_ms.checked_mul(NANOS_PER_MS).ok_or_else(|| {
+            MMError::InvalidConfiguration(format!("book samples every {interval_ms} ms"))
+        })?;
+        Ok(Self {
+            book_sample_ns: Some(interval_ns),
+            ..self
+        })
+    }
+}
+
+/// The visible book at a time of the sampling grid, by limit from the mid, in units of the asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BookLevels {
+    /// The grid time, in milliseconds.
+    pub timestamp_ms: u64,
+    /// The size resting at each limit of the bid, nearest first, by [`BookEvent::depth`]'s rule.
+    /// Limits past [`ReplayConfig::limits`] are zero.
+    pub bid: [Decimal; MAX_LIMITS],
+    /// The same for the ask.
+    pub ask: [Decimal; MAX_LIMITS],
+    /// The best bid.
+    pub best_bid: Decimal,
+    /// The best ask.
+    pub best_ask: Decimal,
+    /// Whether the warm-up had passed at the grid time.
+    pub warmth: Warmth,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -890,6 +948,10 @@ pub struct ReplayOutput {
     /// Each order's life, for every order on the book and not a quoter's: its distance from
     /// the mid when it opened, its time at risk and its fills.
     pub exposures: Vec<Inferred<QuoteExposure>>,
+    /// The book at each time of the grid [`ReplayConfig::with_book_samples`] asks for, with a
+    /// two sided touch. Its time is the grid's; its evidence is the weaker of the diffs on
+    /// either side of it.
+    pub book: Vec<Inferred<BookLevels>>,
 }
 
 /// Rebuilds the visible book of one coin from its streams, hour after hour. See the
@@ -911,6 +973,9 @@ pub struct Replay {
     inherited_in_block: bool,
     grid_scaled: u128,
     coverage: Coverage,
+    next_sample_ns: Option<u64>,
+    sample_epoch: u64,
+    last_applied: Option<InferredTime>,
 }
 
 fn gcd(mut a: u128, mut b: u128) -> u128 {
@@ -942,6 +1007,9 @@ impl Replay {
             inherited_in_block: false,
             grid_scaled: 0,
             coverage: Coverage::default(),
+            next_sample_ns: None,
+            sample_epoch: 0,
+            last_applied: None,
         }
     }
 
@@ -1309,13 +1377,97 @@ impl Replay {
             );
             self.note_diff(time.timestamp_ns);
             self.inherited_in_block = time.evidence == TimeEvidence::Inherited;
+            self.sample_book(time, &mut output)?;
             self.apply(diff, time, &index, &mut output)?;
+            self.last_applied = Some(time);
             self.after_event(time, &mut output)?;
         }
         self.check_trades(trades, &mut next_trade, None, &mut output);
         self.coverage.resting_at_end = count(self.orders.len());
         self.coverage.price_grid = self.grid();
         Ok(output)
+    }
+
+    /// Samples the book at every grid time up to `time`, the time of the diff about to apply, so
+    /// each sample shows the diffs before its time. After a reset, or at the first diff, the grid
+    /// starts after `time`.
+    fn sample_book(&mut self, time: InferredTime, output: &mut ReplayOutput) -> MMResult<()> {
+        let Some(interval) = self.config.book_sample_ns else {
+            return Ok(());
+        };
+        let now = time.timestamp_ns;
+        let after = |at: u64| {
+            at.checked_div(interval)
+                .and_then(|n| n.checked_add(1))
+                .and_then(|n| n.checked_mul(interval))
+        };
+        let mut next = match self.next_sample_ns {
+            Some(next) if self.sample_epoch == self.epoch => next,
+            _ => {
+                self.sample_epoch = self.epoch;
+                self.next_sample_ns = after(now);
+                return Ok(());
+            }
+        };
+        while next <= now {
+            let at = InferredTime {
+                timestamp_ns: next,
+                evidence: time.evidence,
+            };
+            let at = self.last_applied.map_or(at, |last| at.weakest(last));
+            match self.levels(next)? {
+                Some(levels) => output.book.push(Inferred {
+                    value: levels,
+                    time: at,
+                    epoch: self.epoch,
+                }),
+                None => {
+                    self.coverage.book_samples_without_touch =
+                        self.coverage.book_samples_without_touch.saturating_add(1);
+                }
+            }
+            let Some(following) = next.checked_add(interval) else {
+                self.next_sample_ns = None;
+                return Ok(());
+            };
+            next = following;
+        }
+        self.next_sample_ns = Some(next);
+        Ok(())
+    }
+
+    /// The book by limit from the mid, if the touch is two sided.
+    fn levels(&self, at_ns: u64) -> MMResult<Option<BookLevels>> {
+        let (Some((best_bid, best_ask)), Some(mid)) = (self.touch(), self.mid()?) else {
+            return Ok(None);
+        };
+        Ok(Some(BookLevels {
+            timestamp_ms: at_ns / NANOS_PER_MS,
+            bid: self.side_levels(self.bids.iter().rev(), mid)?,
+            ask: self.side_levels(self.asks.iter(), mid)?,
+            best_bid,
+            best_ask,
+            warmth: self.warmth(at_ns),
+        }))
+    }
+
+    /// One side's sizes by limit, from prices given from the touch outwards.
+    fn side_levels<'a>(
+        &self,
+        prices: impl Iterator<Item = (&'a Decimal, &'a Decimal)>,
+        mid: Decimal,
+    ) -> MMResult<[Decimal; MAX_LIMITS]> {
+        let mut queues = [Decimal::ZERO; MAX_LIMITS];
+        for (price, size) in prices {
+            // Prices run away from the mid, so the first past the limits ends the side.
+            let Some(depth) = self.depth(*price, mid)? else {
+                break;
+            };
+            if let Some(queue) = queues.get_mut(usize::from(depth)) {
+                *queue = checked(queue.checked_add(*size), "a queue")?;
+            }
+        }
+        Ok(queues)
     }
 
     fn joined_time(
@@ -1567,6 +1719,66 @@ fn kind_of(cause: EventCause) -> Option<QrEventKind> {
 fn in_event_sizes(level: Decimal, event_size: Decimal) -> MMResult<u32> {
     let units = checked(level.checked_div(event_size), "a queue")?.round();
     u32::try_from(units).map_err(|_| MMError::NumericalError(format!("a queue of {units}")))
+}
+
+/// Converts the replay's book samples into the queue reactive model's, warm ones only, for a data
+/// [`Trajectory`](super::queue_reactive::Trajectory). Each limit's size is counted in units of
+/// its event size from `estimate_event_sizes`, to the nearest, as [`queue_observations`] counts a
+/// queue; limits with no event size must be empty. The spread is the touch's width in `tick`s,
+/// rounded up. The model counts an empty first limit as a tick of spread, and the replay's limits
+/// count from the mid, so a touch two ticks wide has both sides at limit 0 here and a spread of
+/// 2, which the model reaches only with an empty first limit.
+///
+/// # Errors
+///
+/// Returns [`MMError::InvalidConfiguration`] for an event size or a tick that is not positive,
+/// and for a limit with size and no event size, and [`MMError::NumericalError`] for a queue or a
+/// spread too large to count.
+pub fn book_samples(
+    book: &[Inferred<BookLevels>],
+    event_sizes: &[Decimal],
+    tick: Decimal,
+) -> MMResult<Vec<Inferred<BookSample>>> {
+    if tick <= Decimal::ZERO || event_sizes.iter().any(|size| *size <= Decimal::ZERO) {
+        return Err(MMError::InvalidConfiguration(
+            "event sizes and the tick must be positive".to_string(),
+        ));
+    }
+    let units = |levels: &[Decimal; MAX_LIMITS]| -> MMResult<[u32; MAX_LIMITS]> {
+        let mut queues = [0u32; MAX_LIMITS];
+        for (depth, (level, queue)) in levels.iter().zip(&mut queues).enumerate() {
+            match event_sizes.get(depth) {
+                Some(size) => *queue = in_event_sizes(*level, *size)?,
+                None if level.is_zero() => {}
+                None => {
+                    return Err(MMError::InvalidConfiguration(format!(
+                        "no event size for limit {depth}"
+                    )));
+                }
+            }
+        }
+        Ok(queues)
+    };
+    book.iter()
+        .filter(|sample| sample.value.warmth == Warmth::Warm)
+        .map(|sample| {
+            let levels = &sample.value;
+            let width = checked(levels.best_ask.checked_sub(levels.best_bid), "a spread")?;
+            let ticks = checked(width.checked_div(tick), "a spread")?.ceil();
+            let spread_ticks = u32::try_from(ticks)
+                .map_err(|_| MMError::NumericalError(format!("a spread of {ticks} ticks")))?;
+            Ok(Inferred {
+                value: BookSample {
+                    timestamp_ms: levels.timestamp_ms,
+                    bid: units(&levels.bid)?,
+                    ask: units(&levels.ask)?,
+                    spread_ticks,
+                },
+                time: sample.time,
+                epoch: sample.epoch,
+            })
+        })
+        .collect()
 }
 
 /// Converts events into the queue reactive model's observations, with `event_sizes` per limit

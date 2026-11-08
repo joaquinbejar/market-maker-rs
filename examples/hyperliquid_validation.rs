@@ -32,8 +32,14 @@
 //!   the Hawkes kernel, by `select_decay` on training and validation only; the test at the end
 //!   of this file checks that a holdout it never reads cannot change it. Every horizon, window
 //!   length, fee and latency is reported, and none is picked.
-//! - **No randomness.** Nothing draws a random number: the thinning below is by count. So there
-//!   is no seed to fix.
+//! - **One seed.** The thinning below is by count, so it draws nothing. The only random numbers
+//!   are the queue-reactive model's runs of #90 (b), (c) and (d), all from [`QR_SEED`].
+//! - **The book's windows for #90 (b), (c) and (d).** The data's book, sampled every
+//!   [`BOOK_SAMPLE_MS`], and its queue events are compared with the model's on windows of
+//!   [`BOOK_WINDOW_MS`] from their start: the holdout's first hours against the training fit,
+//!   out of sample, and each whole UTC day's first hours against that day's own fit, in sample, as
+//!   a per-day diagnostic. Each model is run for the window's length, and so is its constant
+//!   intensity baseline.
 //! - **Fees and funding** are in no file of the capture. The fees are the declared grid
 //!   [`FEE_RATES`], not the venue's schedule. Funding is not applied, as the simulator has no
 //!   input for it.
@@ -67,8 +73,13 @@
 //! - The sized events of the size window only, at most an hour of them.
 //! - Market events of the holdout, one file at a time: the part of the holdout in each file is
 //!   simulated on its own, from a flat inventory, and only the totals are kept.
+//! - The book's windows, whole: about 2 million queue events an hour of 24 bytes and a sample a
+//!   second, so about 100 MB per window of [`BOOK_WINDOW_MS`], two at most at a time (a day's
+//!   until its end, and the holdout's), and as much again for a model run. A window is compared
+//!   once what its fit needs has been read, and then dropped.
 //!
-//! So a month needs about 0.5 GB kept beside the hour being read. The report ends with what was
+//! So a month needs about 0.5 GB kept beside the hour being read, and about 0.4 GB more at
+//! most for the book's windows. The report ends with what was
 //! kept, counted. Thinning by count, independently of what happened, leaves a rate per second of
 //! exposure or of waiting where it was in expectation, and drops evidence: it widens the error of
 //! each estimate.
@@ -90,13 +101,16 @@ use market_maker_rs::backtest::hawkes::{
     score_flow, select_decay,
 };
 use market_maker_rs::backtest::hyperliquid::{
-    BookEvent, Coverage, RepeatFilter, Replay, ReplayConfig, ReplayOutput, Warmth,
-    decode_order_statuses_after, hawkes_segments, queue_observations, read_book_diffs_after,
-    read_trades_after, sized_events,
+    BookEvent, Coverage, EventCause, RepeatFilter, Replay, ReplayConfig, ReplayOutput, Warmth,
+    book_samples, decode_order_statuses_after, hawkes_segments, queue_observations,
+    read_book_diffs_after, read_trades_after, sized_events,
 };
 use market_maker_rs::backtest::queue_reactive::{
-    EventSizeRecord, QrEstimationConfig, QrEventKind, QrFit, QrSide, QueueObservation,
-    ReferenceObservation, SizedEvent, UnsupportedPolicy, estimate_event_sizes, estimate_parameters,
+    BookSample, DiscrepancyReport, EventSizeRecord, QrEstimationConfig, QrEventKind, QrFailure,
+    QrFit, QrParameters, QrRecord, QrSide, QrSimulator, QueueObservation, ReferenceObservation,
+    ResetObservation, SizedEvent, Trajectory, UnsupportedPolicy, ZeroWaitPolicy, collapse_blocks,
+    compare_trajectories, estimate_event_sizes, estimate_parameters,
+    estimate_parameters_with_resets,
 };
 use market_maker_rs::dec;
 use market_maker_rs::risk::RiskLimits;
@@ -109,7 +123,10 @@ use market_maker_rs::strategy::walk_forward::{
     calibrate_window, chronological_splits, walk_forward,
 };
 use market_maker_rs::types::error::MMResult;
-use rust_decimal::prelude::FromStr;
+use rust_decimal::prelude::{FromStr, ToPrimitive};
+
+#[path = "support/qr_290.rs"]
+mod qr_290;
 
 const NS_PER_MS: u64 = 1_000_000;
 const SECOND_MS: u64 = 1_000;
@@ -206,6 +223,16 @@ const QR_MIN_EVENTS: u64 = 30;
 const QR_MIN_REFERENCE_MOVES: u64 = 30;
 /// Queue sizes of the first limit whose rates each day's estimate prints.
 const QR_DAY_SIZES: [usize; 5] = [1, 2, 5, 10, 20];
+/// Length of each window the book is compared on, from its start: the holdout's first hours for
+/// (b) and (c), and each whole UTC day's first hours for (d). A window's events are kept whole,
+/// about two million an hour, so it is bounded.
+const BOOK_WINDOW_MS: u64 = 2 * HOUR_MS;
+/// The book's sampling grid, in the data and in the model.
+const BOOK_SAMPLE_MS: u64 = SECOND_MS;
+/// Interval the flow law counts events in.
+const FLOW_INTERVAL_MS: u64 = SECOND_MS;
+/// Seed of every model run, the only randomness here.
+const QR_SEED: u64 = 263;
 
 // #91, Poisson, queue-reactive and Hawkes flow on the first limit.
 
@@ -577,6 +604,161 @@ fn within_cap(segment: &HawkesSegment, cap: u32) -> bool {
     true
 }
 
+/// What a comparison window's fit is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowKind {
+    /// In sample, for #290's choice: the training fit, against the first hours of the training
+    /// part after the size window.
+    Train,
+    /// Out of sample: the training fit, against the holdout's first hours.
+    Holdout,
+    /// In sample: that day's own fit, against its first hours.
+    Day(TimeWindow),
+}
+
+/// A window the book is compared on, for #90 (b), (c) and (d).
+#[derive(Debug)]
+struct BookWindow {
+    kind: WindowKind,
+    window: TimeWindow,
+    /// When everything its fit needs has been read.
+    due_ms: u64,
+    samples: Vec<BookSample>,
+    events: Vec<QueueObservation>,
+    samples_without_sizes: u64,
+    error: Option<String>,
+    /// Samples and events compared, once done.
+    data: (u64, u64),
+    result: Option<Vec<String>>,
+    /// #290's phase 3, once done: the data's mean touch queue and each estimator's lines, or
+    /// why it was not run.
+    result_290: Option<Result<(f64, Vec<Line290>), String>>,
+}
+
+impl BookWindow {
+    fn new(kind: WindowKind, start_ms: u64, limit_ms: u64, due_ms: u64) -> Self {
+        Self {
+            kind,
+            window: TimeWindow {
+                start_ms,
+                end_ms: (start_ms + BOOK_WINDOW_MS).min(limit_ms),
+            },
+            due_ms,
+            samples: Vec::new(),
+            events: Vec::new(),
+            samples_without_sizes: 0,
+            error: None,
+            data: (0, 0),
+            result: None,
+            result_290: None,
+        }
+    }
+
+    /// The training part's first hours, the holdout's, then each whole UTC day's.
+    fn all(protocol: &Protocol) -> Vec<Self> {
+        let train = protocol.queue_train();
+        let holdout = protocol.holdout();
+        let mut windows = vec![
+            Self::new(
+                WindowKind::Train,
+                train.start_ms,
+                train.end_ms,
+                train.end_ms,
+            ),
+            Self::new(
+                WindowKind::Holdout,
+                holdout.start_ms,
+                holdout.end_ms,
+                (holdout.start_ms + BOOK_WINDOW_MS).min(holdout.end_ms),
+            ),
+        ];
+        for day in protocol.days() {
+            windows.push(Self::new(
+                WindowKind::Day(day),
+                day.start_ms,
+                day.end_ms,
+                day.end_ms,
+            ));
+        }
+        windows
+    }
+
+    fn holds(&self, ms: u64) -> bool {
+        self.window.start_ms <= ms && ms < self.window.end_ms
+    }
+}
+
+fn qr_config(tick: Decimal) -> QrEstimationConfig {
+    QrEstimationConfig::new(
+        tick,
+        LIMITS,
+        QR_MAX_QUEUE,
+        QR_MIN_EVENTS,
+        QR_MIN_REFERENCE_MOVES,
+        UnsupportedPolicy::NearestSupported,
+    )
+}
+
+/// The data of one window against `params` and its constant intensity baseline, each run for
+/// the window's length from seed [`QR_SEED`] and sampled on the same grid.
+fn compare_window(
+    samples: Vec<BookSample>,
+    events: Vec<QueueObservation>,
+    params: &QrParameters,
+    window: TimeWindow,
+) -> Vec<String> {
+    let mut data = Trajectory::default();
+    data.samples = samples;
+    data.events = events;
+    let seconds = (window.end_ms - window.start_ms) as f64 / 1e3;
+    let mut lines = Vec::new();
+    let baseline = params.constant_baseline();
+    for (name, model) in [("fit", Ok(params.clone())), ("constant", baseline)] {
+        let line = model
+            .and_then(|model| {
+                let run = QrSimulator::new(model.clone(), QR_SEED, 0)?
+                    .run(seconds, BOOK_SAMPLE_MS as f64 / 1e3)?;
+                compare_trajectories(&data, &run, &model, FLOW_INTERVAL_MS)
+            })
+            .map_or_else(
+                |error| format!("{name}: not evaluable: {error}"),
+                |report| format!("{name}: {}", discrepancy_text(&report)),
+            );
+        lines.push(line);
+    }
+    lines
+}
+
+fn discrepancy_text(r: &DiscrepancyReport) -> String {
+    let list = |values: &[f64]| {
+        values
+            .iter()
+            .map(|v| format!("{v:.3}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!(
+        "queue size TV by limit [{}]; spread TV {:.3}; mean wait relative error by limit [{}]; \
+         wait KS by limit [{}]; flow relative error L/C/M [{}]; flow law TV L/C/M [{}]; state \
+         coverage {:.4}; data {} samples, {} events ({} without a positive wait); model {} \
+         samples, {} events ({} without), stopped {:?}",
+        list(&r.queue_size),
+        r.spread,
+        list(&r.waiting_time),
+        list(&r.waiting_law),
+        list(&r.flow),
+        list(&r.flow_law),
+        r.coverage,
+        r.data_samples,
+        r.data_events,
+        r.data_invalid_waiting,
+        r.model_samples,
+        r.model_events,
+        r.model_invalid_waiting,
+        r.model_stopped
+    )
+}
+
 /// Keeps the last item of each bucket of the clock.
 fn keep_last<T>(kept: &mut Vec<T>, item: T, time: impl Fn(&T) -> u64) {
     let bucket = time(&item) / SAMPLE_MS;
@@ -679,6 +861,438 @@ struct Sizes {
     hawkes: EventSizeRecord,
 }
 
+/// What a touch queue's life ended with, at a move of the mid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Touch {
+    /// No event at the touch since the last move, or one whose effect is unknown.
+    Unobserved,
+    /// The size left by the last event at the touch since the last move.
+    Level(Decimal),
+}
+
+/// A book event as #290's phase 1 reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TouchEvent {
+    time_ns: u64,
+    mid: Option<Decimal>,
+    /// The side, for a warm event at the touch.
+    side: Option<usize>,
+    /// What it left at its level; `None` for an unknown cause.
+    level_after: Option<Decimal>,
+    /// What its level held before it.
+    level_before: Decimal,
+}
+
+impl TouchEvent {
+    fn of(event: &BookEvent) -> Self {
+        let at_touch = event.warmth == Warmth::Warm && event.depth == Some(0);
+        Self {
+            time_ns: event.time.timestamp_ns,
+            mid: event.mid_before,
+            side: at_touch.then(|| side_index(event.side)),
+            level_after: match event.cause {
+                EventCause::Limit => Some(event.level_before + event.size),
+                EventCause::Cancel | EventCause::Fill => Some(event.level_before - event.size),
+                _ => None,
+            },
+            level_before: event.level_before,
+        }
+    }
+}
+
+fn side_index(side: QrSide) -> usize {
+    usize::from(side != QrSide::Bid)
+}
+
+/// #290's phase 1: what the training part shows about the drift of the queue model's fit. One
+/// estimator's input is every observation, the other's every observation with each block
+/// collapsed per queue; each is kept one in the queue stride, as the observations of #90 are.
+/// A block that straddles two hour files is collapsed as two.
+#[derive(Debug, Default)]
+struct Phase290 {
+    /// Per limit and kind (limit, cancel, market): with a positive wait, with a zero wait.
+    counts: [[[u64; 2]; 3]; LIMITS as usize],
+    /// Observations with a negative or not finite wait.
+    invalid_waits: u64,
+    all: Vec<QueueObservation>,
+    all_seen: u64,
+    collapsed: Vec<QueueObservation>,
+    collapsed_seen: u64,
+    /// Touch-queue lives at a move: emptied, moved while not empty, unobserved.
+    lives: [u64; 3],
+    touch: [Option<Touch>; 2],
+    mid: Option<Option<Decimal>>,
+    /// Block length histogram over [`qr_290::BLOCK_GAP_BOUNDS_MS`], with one bin above.
+    gaps: [u64; qr_290::BLOCK_GAP_BOUNDS_MS.len() + 1],
+    gap_total_ns: u128,
+    blocks: u64,
+    block_events: u64,
+    multi_event_blocks: u64,
+    last_time_ns: Option<u64>,
+    events_in_block: u64,
+    /// Phase 3's choice on the training window, or why there is none.
+    choice: Option<Result<&'static str, String>>,
+    /// E3's touch resets, from every part, one in the queue stride; out of time order until
+    /// sorted for a fit.
+    resets: Vec<ResetObservation>,
+    resets_seen: u64,
+    /// On the training part: resets made, and sides at a move with no emptied touch that
+    /// gave none, for want of a seen touch.
+    resets_made: u64,
+    resets_skipped: u64,
+    /// A reset per side waiting for its new touch's size.
+    pending: [Option<ResetObservation>; 2],
+    /// Time of each side's last touch event in the current life.
+    touch_ns: [Option<u64>; 2],
+    /// On the training part, per limit and kind: the summed size change in event sizes and
+    /// the events.
+    size_change: [[(f64, u64); 3]; LIMITS as usize],
+    /// Per UTC day, over every part: resets made, sides left out for want of a seen touch, and
+    /// mid moves seen.
+    resets_by_day: std::collections::BTreeMap<u64, [u64; 3]>,
+}
+
+impl Phase290 {
+    fn take_counts(&mut self, observations: &[QueueObservation]) {
+        for o in observations {
+            let kind = match o.kind {
+                QrEventKind::Limit => 0,
+                QrEventKind::Cancel => 1,
+                _ => 2,
+            };
+            let zero = if o.waiting_seconds > 0.0 {
+                0
+            } else if o.waiting_seconds == 0.0 {
+                1
+            } else {
+                self.invalid_waits += 1;
+                continue;
+            };
+            if let Some(cell) = self
+                .counts
+                .get_mut(usize::from(o.depth))
+                .and_then(|c| c.get_mut(kind))
+                .and_then(|c| c.get_mut(zero))
+            {
+                *cell += 1;
+            }
+        }
+    }
+
+    /// Keeps the estimators' inputs, from every part, one in `stride`.
+    fn take_lists(&mut self, observations: &[QueueObservation], stride: u64) {
+        for o in observations {
+            if keep_one_in(&mut self.all_seen, stride) {
+                self.all.push(*o);
+            }
+        }
+        for o in collapse_blocks(observations) {
+            if keep_one_in(&mut self.collapsed_seen, stride) {
+                self.collapsed.push(o);
+            }
+        }
+    }
+
+    /// Reads the book's events: on the training part (`counting`) for phase 1's counts, and on
+    /// every part for E3's resets, in units of `touch_size` and kept one in `stride`.
+    fn take_book<'a>(
+        &mut self,
+        events: impl Iterator<Item = &'a BookEvent>,
+        counting: bool,
+        sizes: &[Decimal],
+        stride: u64,
+    ) {
+        for event in events {
+            if counting
+                && event.warmth == Warmth::Warm
+                && let Some(depth) = event.depth
+                && let (Some(size), Some(row)) = (
+                    sizes.get(usize::from(depth)),
+                    self.size_change.get_mut(usize::from(depth)),
+                )
+            {
+                let kind = match event.cause {
+                    EventCause::Limit => Some(0),
+                    EventCause::Cancel => Some(1),
+                    EventCause::Fill => Some(2),
+                    _ => None,
+                };
+                if let Some(cell) = kind.and_then(|k| row.get_mut(k))
+                    && let Some(units) = (event.size / *size).to_f64()
+                {
+                    cell.0 += units;
+                    cell.1 += 1;
+                }
+            }
+            let touch_size = sizes.first().copied().unwrap_or(Decimal::ONE);
+            self.take_touch(TouchEvent::of(event), counting, touch_size, stride);
+        }
+    }
+
+    fn keep_reset(&mut self, reset: ResetObservation, stride: u64) {
+        if keep_one_in(&mut self.resets_seen, stride) {
+            self.resets.push(reset);
+        }
+    }
+
+    fn take_touch(&mut self, event: TouchEvent, counting: bool, touch_size: Decimal, stride: u64) {
+        let units = |level: Decimal| (level / touch_size).round().to_u32().unwrap_or(u32::MAX);
+        if counting {
+            if self.last_time_ns != Some(event.time_ns) {
+                if let Some(last) = self.last_time_ns {
+                    let gap = event.time_ns.saturating_sub(last);
+                    let ms = gap / NS_PER_MS;
+                    let bin = qr_290::BLOCK_GAP_BOUNDS_MS.partition_point(|&bound| bound <= ms);
+                    if let Some(cell) = self.gaps.get_mut(bin) {
+                        *cell += 1;
+                    }
+                    self.gap_total_ns += u128::from(gap);
+                    self.blocks += 1;
+                    self.multi_event_blocks += u64::from(self.events_in_block > 1);
+                }
+                self.last_time_ns = Some(event.time_ns);
+                self.events_in_block = 0;
+            }
+            self.events_in_block += 1;
+            self.block_events += 1;
+        }
+        if self.mid != Some(event.mid) {
+            let ends = self.touch.map(|touch| match touch {
+                Some(Touch::Level(level)) if level <= Decimal::ZERO => 0,
+                Some(Touch::Level(_)) => 1,
+                _ => 2,
+            });
+            if counting && self.mid.is_some() {
+                for end in ends {
+                    self.lives[end] += 1;
+                }
+            }
+            // A reset still waiting for its new size ends with none.
+            for side in 0..2 {
+                if let Some(reset) = self.pending.get_mut(side).and_then(Option::take) {
+                    self.keep_reset(reset, stride);
+                }
+            }
+            let both = matches!(self.mid, Some(Some(_))) && event.mid.is_some();
+            let day = self
+                .resets_by_day
+                .entry(event.time_ns / NS_PER_MS / DAY_MS)
+                .or_default();
+            day[2] += u64::from(self.mid.is_some());
+            if both && !ends.contains(&0) {
+                for side in 0..2 {
+                    match (self.touch.get(side), self.touch_ns.get(side)) {
+                        (Some(Some(Touch::Level(level))), Some(Some(at))) => {
+                            day[0] += 1;
+                            if counting {
+                                self.resets_made += 1;
+                            }
+                            if let Some(slot) = self.pending.get_mut(side) {
+                                *slot = Some(ResetObservation {
+                                    timestamp_ms: event.time_ns / NS_PER_MS,
+                                    side: if side == 0 { QrSide::Bid } else { QrSide::Ask },
+                                    queue_before: units(*level),
+                                    waiting_seconds: event.time_ns.saturating_sub(*at) as f64 / 1e9,
+                                    queue_after: None,
+                                });
+                            }
+                        }
+                        _ => {
+                            day[1] += 1;
+                            if counting {
+                                self.resets_skipped += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            self.mid = Some(event.mid);
+            self.touch = [None; 2];
+            self.touch_ns = [None; 2];
+        }
+        if let Some(side) = event.side {
+            if let Some(mut reset) = self.pending.get_mut(side).and_then(Option::take) {
+                reset.queue_after = Some(units(event.level_before));
+                self.keep_reset(reset, stride);
+            }
+            if let Some(touch) = self.touch.get_mut(side) {
+                *touch = Some(event.level_after.map_or(Touch::Unobserved, Touch::Level));
+            }
+            if let Some(at) = self.touch_ns.get_mut(side) {
+                *at = Some(event.time_ns);
+            }
+        }
+    }
+
+    /// E3's resets in time order.
+    fn sorted_resets(&self) -> Vec<ResetObservation> {
+        let mut resets = self.resets.clone();
+        resets.sort_by_key(|r| r.timestamp_ms);
+        resets
+    }
+
+    /// The share of lives that ended by a move while not empty, among those whose end is known.
+    fn exit_by_move_share(&self) -> Option<f64> {
+        let known = self.lives[0] + self.lives[1];
+        (known > 0).then(|| self.lives[1] as f64 / known as f64)
+    }
+}
+
+/// An estimator's name and its fit, or why there is none.
+type Fit290Input = (&'static str, Result<QrParameters, String>);
+
+/// #290's estimators, in the order a tie is broken, then E3's sensitivity row, which is
+/// reported and never chosen.
+const ESTIMATORS_290: [&str; 5] = ["E0", "E1", "E2", "E3", "E3 inv"];
+
+/// The estimators phase 3 chooses among.
+const CHOSEN_AMONG_290: [&str; 4] = ["E0", "E1", "E2", "E3"];
+
+/// One run of #290's phase 3: an estimator's fit or its constant baseline against a window.
+#[derive(Debug)]
+struct Line290 {
+    estimator: &'static str,
+    baseline: bool,
+    /// The comparison and the model's mean touch queue.
+    outcome: Result<(DiscrepancyReport, f64), String>,
+    /// Touch resets in the model's run, and the smallest touch queue its samples show.
+    run_resets: usize,
+    run_min_touch: Option<u32>,
+    /// For a model with touch resets: the sizes with a positive reset rate, and the largest.
+    reset_sizes: Option<(usize, usize)>,
+}
+
+/// The sizes with a positive reset rate, and the largest, if `params` has resets.
+fn reset_sizes(params: &QrParameters) -> Option<(usize, usize)> {
+    params.reset_rates().map(|rates| {
+        let positive: Vec<usize> = (0..rates.len()).filter(|n| rates[*n] > 0.0).collect();
+        (positive.len(), positive.last().copied().unwrap_or(0))
+    })
+}
+
+/// Each fit and its constant baseline against the window's data, from seed
+/// [`qr_290::QR_SEED`], with the data's mean touch queue.
+fn compare_290(data: &Trajectory, fits: &[Fit290Input], window: TimeWindow) -> (f64, Vec<Line290>) {
+    let seconds = (window.end_ms - window.start_ms) as f64 / 1e3;
+    type Run = (DiscrepancyReport, f64, usize, Option<u32>);
+    let run = |model: &QrParameters| -> Result<Run, String> {
+        let run = QrSimulator::new(model.clone(), qr_290::QR_SEED, 0)
+            .and_then(|mut s| s.run(seconds, BOOK_SAMPLE_MS as f64 / 1e3))
+            .map_err(|e| e.to_string())?;
+        let report =
+            compare_trajectories(data, &run, model, FLOW_INTERVAL_MS).map_err(|e| e.to_string())?;
+        let min_touch = run.samples.iter().map(|s| s.bid[0].min(s.ask[0])).min();
+        Ok((
+            report,
+            mean_touch(&run.samples),
+            run.resets.len(),
+            min_touch,
+        ))
+    };
+    let mut lines = Vec::new();
+    for (estimator, fit) in fits {
+        for baseline in [false, true] {
+            let model = match fit {
+                Err(error) => Err(format!("no fit: {error}")),
+                Ok(params) if baseline => params.constant_baseline().map_err(|e| e.to_string()),
+                Ok(params) => Ok(params.clone()),
+            };
+            let reset_sizes = model.as_ref().ok().and_then(reset_sizes);
+            let outcome = model.and_then(|model| run(&model));
+            let run_resets = outcome.as_ref().map_or(0, |(_, _, n, _)| *n);
+            let run_min_touch = outcome.as_ref().ok().and_then(|(_, _, _, m)| *m);
+            lines.push(Line290 {
+                estimator,
+                baseline,
+                outcome: outcome.map(|(report, mean, _, _)| (report, mean)),
+                run_resets,
+                run_min_touch,
+                reset_sizes,
+            });
+        }
+    }
+    (mean_touch(&data.samples), lines)
+}
+
+/// Whether a model's mean touch queue stays under #290's stationary share of the cap.
+fn stationary_290(mean_touch_queue: f64) -> bool {
+    !qr_290::reaches(mean_touch_queue, qr_290::STATIONARY_SHARE_OF_CAP)
+}
+
+/// Phase 3's choice on the training window: among the stationary fits, the lowest queue size
+/// total variation at limit 0, the first on a tie; none when no fit is stationary.
+fn choose_290(lines: &[Line290]) -> Result<&'static str, String> {
+    let mut best: Option<(&'static str, f64)> = None;
+    for line in lines
+        .iter()
+        .filter(|l| !l.baseline && CHOSEN_AMONG_290.contains(&l.estimator))
+    {
+        let Ok((report, mean)) = &line.outcome else {
+            continue;
+        };
+        let Some(tv) = report.queue_size.first().copied() else {
+            continue;
+        };
+        if stationary_290(*mean) && best.is_none_or(|(_, b)| tv < b) {
+            best = Some((line.estimator, tv));
+        }
+    }
+    best.map(|(name, _)| name)
+        .ok_or_else(|| "no estimator is stationary on the training window".to_string())
+}
+
+/// Whether `estimator`'s fit beats its constant baseline on queue size at every limit.
+fn beats_baseline_290(lines: &[Line290], estimator: &str) -> Option<bool> {
+    let tv = |baseline: bool| {
+        lines
+            .iter()
+            .find(|l| l.estimator == estimator && l.baseline == baseline)
+            .and_then(|l| l.outcome.as_ref().ok())
+            .map(|(report, _)| report.queue_size.clone())
+    };
+    let (fit, constant) = (tv(false)?, tv(true)?);
+    (fit.len() == constant.len() && !fit.is_empty())
+        .then(|| fit.iter().zip(&constant).all(|(f, c)| f < c))
+}
+
+/// One estimator's training fit for #290: the drift at the first limit and how its run behaves.
+struct Fit290 {
+    name: &'static str,
+    events: u64,
+    excluded: u64,
+    params: Result<QrParameters, String>,
+}
+
+impl Fit290 {
+    /// The mean touch queue, both sides, over a 2 h run from seed [`qr_290::QR_SEED`], with
+    /// how the run ended.
+    fn run_mean_touch(&self) -> Result<(f64, Option<String>), String> {
+        let params = self.params.as_ref().map_err(Clone::clone)?;
+        let run = QrSimulator::new(params.clone(), qr_290::QR_SEED, 0)
+            .and_then(|mut s| s.run(qr_290::WINDOW_SECONDS, BOOK_SAMPLE_MS as f64 / 1e3))
+            .map_err(|e| e.to_string())?;
+        Ok((
+            mean_touch(&run.samples),
+            run.stopped.map(|s| format!("{s:?}")),
+        ))
+    }
+}
+
+fn mean_touch(samples: &[BookSample]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let total: f64 = samples
+        .iter()
+        .map(|s| f64::from(s.bid[0]) + f64::from(s.ask[0]))
+        .sum();
+    total / (2.0 * samples.len() as f64)
+}
+
+fn invariant_mean(law: &[f64]) -> f64 {
+    law.iter().enumerate().map(|(n, p)| n as f64 * p).sum()
+}
+
 /// What the second pass keeps.
 struct Collect {
     protocol: Protocol,
@@ -707,6 +1321,9 @@ struct Collect {
     train_record: Option<Result<CalibrationRecord, String>>,
     sim: Vec<SimCell>,
     sim_note: Option<String>,
+    book_windows: Vec<BookWindow>,
+    qr_train: Option<Result<QrParameters, String>>,
+    phase_290: Phase290,
 }
 
 impl Collect {
@@ -752,6 +1369,9 @@ impl Collect {
             train_record: None,
             sim,
             sim_note: None,
+            book_windows: BookWindow::all(&protocol),
+            qr_train: None,
+            phase_290: Phase290::default(),
         }
     }
 
@@ -799,6 +1419,7 @@ impl Collect {
             }
         }
         self.take_events(&output.events);
+        self.take_book(output);
         let holdout: Vec<MarketEvent> = output
             .market_events
             .iter()
@@ -808,9 +1429,207 @@ impl Collect {
         if !holdout.is_empty() {
             self.simulate_hour(&holdout);
         }
-        output.events.last().is_some_and(|last| {
-            last.epoch > self.epoch || last.time.timestamp_ns / NS_PER_MS >= self.protocol.end_ms
-        })
+        let read_to_ms = output.events.last().map(|last| {
+            if last.epoch > self.epoch {
+                u64::MAX
+            } else {
+                last.time.timestamp_ns / NS_PER_MS
+            }
+        });
+        if let Some(read_to_ms) = read_to_ms {
+            self.compare_due(read_to_ms);
+        }
+        read_to_ms.is_some_and(|ms| ms >= self.protocol.end_ms)
+    }
+
+    /// Keeps the book samples inside a comparison window, in the model's units.
+    fn take_book(&mut self, output: &ReplayOutput) {
+        let event_sizes = match &self.sizes {
+            Some(sizes) => sizes.queue.sizes.as_ref().ok(),
+            None => None,
+        };
+        for window in &mut self.book_windows {
+            if window.result.is_some() {
+                continue;
+            }
+            let inside: Vec<_> = output
+                .book
+                .iter()
+                .filter(|s| s.epoch == self.epoch && window.holds(s.value.timestamp_ms))
+                .cloned()
+                .collect();
+            if inside.is_empty() {
+                continue;
+            }
+            let Some(event_sizes) = event_sizes else {
+                window.samples_without_sizes += inside.len() as u64;
+                continue;
+            };
+            match book_samples(&inside, event_sizes, self.tick) {
+                Ok(samples) => window.samples.extend(samples.into_iter().map(|s| s.value)),
+                Err(error) => window.error = Some(format!("book_samples: {error}")),
+            }
+        }
+    }
+
+    /// The queue-reactive fit on training, once training has been read.
+    fn qr_train(&mut self) -> Result<QrParameters, String> {
+        if self.qr_train.is_none() {
+            let fit = self.qr_fit(&self.protocol.queue_train());
+            self.qr_train = Some(fit);
+        }
+        self.qr_train
+            .clone()
+            .unwrap_or_else(|| Err("not fitted".to_string()))
+    }
+
+    /// The queue-reactive fit on the observations kept inside `window`.
+    fn qr_fit(&self, window: &TimeWindow) -> Result<QrParameters, String> {
+        let Some(Ok(event_sizes)) = self.sizes.as_ref().map(|s| &s.queue.sizes) else {
+            return Err("no event sizes".to_string());
+        };
+        let record = estimate_parameters(
+            &self.queue,
+            &self.references,
+            event_sizes,
+            window,
+            &qr_config(self.tick),
+            &self.dataset,
+        )
+        .map_err(|error| format!("estimate_parameters: {error}"))?;
+        match record.fit {
+            QrFit::Calibrated(params) => Ok(params),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
+    /// Compares every window whose fit can be made once the data has been read to `read_to_ms`,
+    /// and drops its data.
+    fn compare_due(&mut self, read_to_ms: u64) {
+        for index in 0..self.book_windows.len() {
+            let window = &self.book_windows[index];
+            if window.result.is_some() || read_to_ms < window.due_ms {
+                continue;
+            }
+            let kind = window.kind;
+            let fit = match kind {
+                WindowKind::Train | WindowKind::Holdout => self.qr_train(),
+                WindowKind::Day(day) => self.qr_fit(&day),
+            };
+            let fits_290 = self.fits_290(kind);
+            let window = &mut self.book_windows[index];
+            let samples = std::mem::take(&mut window.samples);
+            let events = std::mem::take(&mut window.events);
+            window.data = (samples.len() as u64, events.len() as u64);
+            let mut data = Trajectory::default();
+            data.samples = samples;
+            data.events = events;
+            window.result_290 = Some(match (&window.error, fits_290) {
+                (Some(error), _) => Err(format!("not evaluable: {error}")),
+                (None, Err(reason)) => Err(reason),
+                (None, Ok(fits)) => Ok(compare_290(&data, &fits, window.window)),
+            });
+            window.result = Some(match (&window.error, fit) {
+                (Some(error), _) => vec![format!("not evaluable: {error}")],
+                (None, Err(error)) => vec![format!("not evaluable: no fit: {error}")],
+                (None, Ok(params)) => {
+                    compare_window(data.samples, data.events, &params, window.window)
+                }
+            });
+            if kind == WindowKind::Train {
+                let choice = match &window.result_290 {
+                    Some(Ok((_, lines))) => choose_290(lines),
+                    Some(Err(reason)) => Err(reason.clone()),
+                    None => Err("not compared".to_string()),
+                };
+                self.phase_290.choice = Some(choice);
+            }
+        }
+    }
+
+    /// #290's training fit of `estimator` on the observations kept inside `window`.
+    fn fit_290(
+        &self,
+        estimator: &'static str,
+        window: &TimeWindow,
+    ) -> Result<QrParameters, String> {
+        let record = self.record_290(estimator, window)?;
+        match record.fit {
+            QrFit::Calibrated(params) => Ok(params),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
+    /// #290's record of `estimator` on the observations kept inside `window`. E3 is E1 with
+    /// the touch resets; "E3 inv", a sensitivity row only, is E3 redrawing from the first
+    /// limit's invariant law instead of the observed new sizes.
+    fn record_290(&self, estimator: &'static str, window: &TimeWindow) -> Result<QrRecord, String> {
+        let Some(Ok(event_sizes)) = self.sizes.as_ref().map(|s| &s.queue.sizes) else {
+            return Err("no event sizes".to_string());
+        };
+        let config = |zero_waits| qr_config(self.tick).with_zero_waits(zero_waits);
+        let plain = |events: &[QueueObservation], zero_waits| {
+            estimate_parameters(
+                events,
+                &self.references,
+                event_sizes,
+                window,
+                &config(zero_waits),
+                &self.dataset,
+            )
+        };
+        let record = match estimator {
+            "E0" => plain(&self.queue, ZeroWaitPolicy::Drop),
+            "E1" => plain(&self.phase_290.all, ZeroWaitPolicy::Count),
+            "E2" => plain(&self.phase_290.collapsed, ZeroWaitPolicy::Count),
+            _ => estimate_parameters_with_resets(
+                &self.phase_290.all,
+                &self.phase_290.sorted_resets(),
+                &self.references,
+                event_sizes,
+                window,
+                &config(ZeroWaitPolicy::Count),
+                &self.dataset,
+            ),
+        }
+        .map_err(|error| format!("estimate_parameters: {error}"))?;
+        if estimator != "E3 inv" {
+            return Ok(record);
+        }
+        let mut record = record;
+        record.fit = match std::mem::replace(
+            &mut record.fit,
+            QrFit::Insufficient(QrFailure::InvalidEstimate),
+        ) {
+            QrFit::Calibrated(params) => {
+                let rates = params.reset_rates().unwrap_or_default().to_vec();
+                let law = params.invariant(0).unwrap_or_default().to_vec();
+                params.with_resets(rates, law).map_or(
+                    QrFit::Insufficient(QrFailure::InvalidEstimate),
+                    QrFit::Calibrated,
+                )
+            }
+            other => other,
+        };
+        Ok(record)
+    }
+
+    /// The fits #290's phase 3 compares on a window of `kind`, or why it does not: the
+    /// holdout is compared only once the training window has chosen an estimator.
+    fn fits_290(&self, kind: WindowKind) -> Result<Vec<Fit290Input>, String> {
+        let window = match kind {
+            WindowKind::Train => self.protocol.queue_train(),
+            WindowKind::Holdout => match &self.phase_290.choice {
+                Some(Ok(_)) => self.protocol.queue_train(),
+                Some(Err(reason)) => return Err(format!("not run, stop rule: {reason}")),
+                None => return Err("not run: the training window was not compared".to_string()),
+            },
+            WindowKind::Day(day) => day,
+        };
+        Ok(ESTIMATORS_290
+            .iter()
+            .map(|name| (*name, self.fit_290(name, &window)))
+            .collect())
     }
 
     fn take_events(&mut self, all: &[BookEvent]) {
@@ -880,6 +1699,27 @@ impl Collect {
                     self.queue_left_out[1] += conversion.unknown_cause;
                     self.queue_left_out[2] += conversion.no_depth;
                     self.queue_left_out[3] += conversion.zero_waits;
+                    for observation in &conversion.observations {
+                        let at = observation.value.timestamp_ms;
+                        for window in &mut self.book_windows {
+                            if window.result.is_none() && window.holds(at) {
+                                window.events.push(observation.value);
+                            }
+                        }
+                    }
+                    let values: Vec<QueueObservation> =
+                        conversion.observations.iter().map(|o| o.value).collect();
+                    let counting = part == Part::Train;
+                    if counting {
+                        self.phase_290.take_counts(&values);
+                    }
+                    self.phase_290.take_book(
+                        events.iter().filter(|e| e.epoch == self.epoch),
+                        counting,
+                        event_sizes,
+                        self.strides.queue,
+                    );
+                    self.phase_290.take_lists(&values, self.strides.queue);
                     for observation in conversion.observations {
                         if observation.value.waiting_seconds > 0.0
                             && keep_one_in(&mut self.queue_seen, self.strides.queue)
@@ -1085,7 +1925,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(out_dir)?;
     let tick = Decimal::from_str(tick)?;
     let minutes: u64 = warmup.parse()?;
-    let config = ReplayConfig::new(tick, LIMITS, minutes * 60 * 1_000_000_000, RESET_GAP_NS)?;
+    let config = ReplayConfig::new(tick, LIMITS, minutes * 60 * 1_000_000_000, RESET_GAP_NS)?
+        .with_book_samples(BOOK_SAMPLE_MS)?;
     let mut report = Report::default();
     say!(
         report,
@@ -1200,6 +2041,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if collect.sizes.is_none() && collect.queue_error.is_none() {
         collect.close_sizes();
     }
+    collect.compare_due(u64::MAX);
     if collect.unsorted_hours > 0 {
         say!(
             report,
@@ -1212,6 +2054,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     section_88(&mut report, &collect);
     section_89(&mut report, &collect);
     section_90(&mut report, &collect, &days);
+    section_90_book(&mut report, &collect);
+    section_290(&mut report, &collect);
+    section_290_book(&mut report, &collect);
     section_91(&mut report, &collect);
     section_rest(&mut report);
     section_kept(&mut report, &collect);
@@ -1248,7 +2093,8 @@ fn print_config(report: &mut Report, coin: &str, tick: Decimal, minutes: u64, st
     );
     say!(
         report,
-        "Randomness: none; thinning is by count or by clock, so there is no seed."
+        "Randomness: thinning is by count or by clock; the queue-reactive model runs of #90 (b), \
+         (c) and (d) use seed {QR_SEED}."
     );
     say!(
         report,
@@ -1287,7 +2133,12 @@ fn print_config(report: &mut Report, coin: &str, tick: Decimal, minutes: u64, st
         report,
         "#90: queue cap {QR_MAX_QUEUE} event sizes, at least {QR_MIN_EVENTS} events per size, \
          {QR_MIN_REFERENCE_MOVES} mid moves; nearest supported size where unsupported; per day \
-         the rates of sizes {QR_DAY_SIZES:?} of the first limit."
+         the rates of sizes {QR_DAY_SIZES:?} of the first limit. (b), (c), (d): the book sampled \
+         every {BOOK_SAMPLE_MS} ms on windows of {} min from their start (the holdout's, against \
+         the training fit; each whole UTC day's, against its own fit), the model and its \
+         constant intensity baseline run for as long on the same grid, events counted per \
+         {FLOW_INTERVAL_MS} ms for the flow law.",
+        BOOK_WINDOW_MS / 60_000
     );
     say!(
         report,
@@ -1802,6 +2653,358 @@ fn section_90(report: &mut Report, collect: &Collect, days: &[TimeWindow]) {
     }
 }
 
+/// #290 phase 1: on the training part, the counts by type with and without a zero wait, the
+/// capture's block lengths, how touch-queue lives end, and the drift of E0, E1 and E2's fits.
+fn section_290(report: &mut Report, collect: &Collect) {
+    let p = &collect.phase_290;
+    say!(
+        report,
+        "\n== #290 phase 1: why the queue-reactive fit is transient (training part {}) ==",
+        window_text(&collect.protocol.queue_train())
+    );
+    say!(
+        report,
+        "API: backtest::queue_reactive::{{ZeroWaitPolicy, collapse_blocks, estimate_parameters}}. \
+         E0 is #90's fit (zero waits left out); E1 counts every observation, a zero wait adding \
+         no time; E2 collapses each block per queue into its net change, then counts as E1. Each \
+         is kept one in {} observations. A touch-queue life is a side's limit 0 between two mid \
+         moves; it ended emptied if the last event at it left nothing, moved if it left a size.",
+        collect.strides.queue
+    );
+    say!(
+        report,
+        "(1) Observations by limit and type: with a positive wait / with a zero wait (zero share); \
+         {} with an invalid wait.",
+        p.invalid_waits
+    );
+    for (depth, kinds) in p.counts.iter().enumerate() {
+        let cells: Vec<String> = ["limit", "cancel", "market"]
+            .iter()
+            .zip(kinds)
+            .map(|(name, [positive, zero])| {
+                let share = *zero as f64 / (*positive + *zero).max(1) as f64;
+                format!("{name} {positive} / {zero} ({share:.3})")
+            })
+            .collect();
+        say!(report, "    limit {}: {}", depth + 1, cells.join("; "));
+    }
+    say!(
+        report,
+        "    Mean size change per warm event, in event sizes (descriptive): {}",
+        p.size_change
+            .iter()
+            .enumerate()
+            .map(|(depth, kinds)| {
+                let cells: Vec<String> = ["limit", "cancel", "market"]
+                    .iter()
+                    .zip(kinds)
+                    .map(|(name, (sum, n))| format!("{name} {:.3}", sum / (*n).max(1) as f64))
+                    .collect();
+                format!("limit {}: {}", depth + 1, cells.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let mean_gap_ms = p.gap_total_ns as f64 / p.blocks.max(1) as f64 / NS_PER_MS as f64;
+    let bins: Vec<String> = p
+        .gaps
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let label = match (
+                i.checked_sub(1)
+                    .and_then(|j| qr_290::BLOCK_GAP_BOUNDS_MS.get(j)),
+                qr_290::BLOCK_GAP_BOUNDS_MS.get(i),
+            ) {
+                (None, Some(hi)) => format!("<{hi}"),
+                (Some(lo), Some(hi)) => format!("{lo}-{hi}"),
+                (Some(lo), None) => format!(">={lo}"),
+                (None, None) => "-".to_string(),
+            };
+            format!("{label} ms: {n}")
+        })
+        .collect();
+    say!(
+        report,
+        "(2) Blocks (distinct event times): {} gaps, mean {mean_gap_ms:.1} ms, {:.2} events per \
+         block, {:.3} of blocks with more than one event. Gaps: {}",
+        p.blocks,
+        p.block_events as f64 / (p.blocks + 1) as f64,
+        p.multi_event_blocks as f64 / p.blocks.max(1) as f64,
+        bins.join("; ")
+    );
+    let share = p.exit_by_move_share();
+    say!(
+        report,
+        "(3) Touch-queue lives at a mid move, both sides: emptied {}, moved while not empty {}, \
+         unobserved {}; share moved among the known {}",
+        p.lives[0],
+        p.lives[1],
+        p.lives[2],
+        share.map_or("-".to_string(), |s| format!("{s:.3}"))
+    );
+    say!(
+        report,
+        "    E3's touch resets on the training part: {} at a move with no emptied touch, {} \
+         sides with no touch seen since the last move left out; {} kept from every part, one \
+         in {}, {} of them with the new touch's size.",
+        p.resets_made,
+        p.resets_skipped,
+        p.resets.len(),
+        collect.strides.queue,
+        p.resets.iter().filter(|r| r.queue_after.is_some()).count()
+    );
+    say!(
+        report,
+        "    Per UTC day, every part: mid moves, resets made, sides left out: {}",
+        p.resets_by_day
+            .iter()
+            .map(|(day, [made, skipped, moves])| {
+                format!("{} {moves} {made} {skipped}", &utc(day * DAY_MS)[..10])
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    if !matches!(collect.sizes.as_ref().map(|s| &s.queue.sizes), Some(Ok(_))) {
+        say!(report, "(4): no event sizes.");
+        return;
+    }
+    let window = collect.protocol.queue_train();
+    let fits: Vec<Fit290> = ESTIMATORS_290
+        .iter()
+        .map(|name| match collect.record_290(name, &window) {
+            Ok(record) => Fit290 {
+                name,
+                events: record.events,
+                excluded: record.excluded_events,
+                params: match record.fit {
+                    QrFit::Calibrated(params) => Ok(params),
+                    other => Err(format!("{other:?}")),
+                },
+            },
+            Err(error) => Fit290 {
+                name,
+                events: 0,
+                excluded: 0,
+                params: Err(error),
+            },
+        })
+        .collect();
+    say!(
+        report,
+        "(4) Training fits; drift = limit - cancel - market per second at limit 1, at sizes \
+         {QR_DAY_SIZES:?}; mean touch queue under the invariant law at limit 1 and over a {} s \
+         run from seed {}:",
+        qr_290::WINDOW_SECONDS,
+        qr_290::QR_SEED
+    );
+    let mut transient = Vec::new();
+    for f in &fits {
+        let params = match &f.params {
+            Ok(params) => params,
+            Err(error) => {
+                say!(
+                    report,
+                    "    {}: {} events used, {} excluded; no fit: {error}",
+                    f.name,
+                    f.events,
+                    f.excluded
+                );
+                transient.push((f.name, None));
+                continue;
+            }
+        };
+        let rates = params.rates(0).unwrap_or_default();
+        let supported: Vec<usize> = (0..rates.len())
+            .filter(|n| params.is_supported(0, *n))
+            .collect();
+        let rising = supported
+            .iter()
+            .filter(|n| rates.get(**n).is_some_and(|(l, c, m)| l - c - m > 0.0))
+            .count();
+        let drifts: Vec<String> = QR_DAY_SIZES
+            .iter()
+            .map(|n| match rates.get(*n) {
+                Some((l, c, m)) if params.is_supported(0, *n) => format!("{n}: {:+.3}", l - c - m),
+                _ => format!("{n}: -"),
+            })
+            .collect();
+        let invariant = params.invariant(0).map_or(f64::NAN, invariant_mean);
+        let run = f.run_mean_touch();
+        let run_text = match &run {
+            Ok((mean, None)) => format!("{mean:.1}"),
+            Ok((mean, Some(stop))) => format!("{mean:.1} (stopped: {stop})"),
+            Err(error) => format!("not evaluable: {error}"),
+        };
+        say!(
+            report,
+            "    {}: {} events used, {} excluded; θ {:.4}; drift {}; rising at {rising} of {} \
+             supported sizes; invariant mean {invariant:.1}; run mean {run_text}",
+            f.name,
+            f.events,
+            f.excluded,
+            params.theta(),
+            drifts.join(", "),
+            supported.len()
+        );
+        transient.push((
+            f.name,
+            run.ok()
+                .map(|(mean, _)| qr_290::reaches(mean, qr_290::E3_TRANSIENT_SHARE_OF_CAP)),
+        ));
+    }
+    let transient_of = |name| {
+        transient
+            .iter()
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, t)| *t)
+    };
+    let moves = share.map(|s| s >= qr_290::E3_MIN_EXIT_BY_MOVE_SHARE);
+    let both = transient_of("E1")
+        .zip(transient_of("E2"))
+        .map(|(a, b)| a && b);
+    say!(report, "(5) {}.", qr_290::E3_CONDITION);
+    say!(
+        report,
+        "    Exits by move reach {}: {}; E1 and E2 transient: {}. E3 {}.",
+        qr_290::E3_MIN_EXIT_BY_MOVE_SHARE,
+        moves.map_or("unknown".to_string(), |m| m.to_string()),
+        both.map_or("unknown".to_string(), |b| b.to_string()),
+        match moves.zip(both) {
+            Some((true, true)) => "is built",
+            Some(_) => "is not built",
+            None => "cannot be decided",
+        }
+    );
+}
+
+/// #290's phase 3: each estimator and its constant baseline against #286's windows and the
+/// training window, the choice on the training window, and the holdout's verdict.
+fn section_290_book(report: &mut Report, collect: &Collect) {
+    say!(
+        report,
+        "\n== #290 phase 3: E0 to E3, and E3 inv as a sensitivity row, against the data, each \
+         with its constant baseline =="
+    );
+    say!(
+        report,
+        "Windows as #90 (b) to (d), plus the training part's first hours. #286 already read the \
+         holdout window. Stationary: the model's mean touch queue stays under {} of the cap of \
+         {}. Choice, fixed before any run: among the stationary fits on the training window, the \
+         lowest queue size TV at limit 1, the first of E0, E1, E2 on a tie. Stop rule: no \
+         stationary fit, no holdout. Success: the chosen fit's queue size TV below its constant \
+         baseline's at every limit on the holdout. Model runs from seed {}.",
+        qr_290::STATIONARY_SHARE_OF_CAP,
+        qr_290::MAX_QUEUE,
+        qr_290::QR_SEED
+    );
+    let list = |values: &[f64]| {
+        values
+            .iter()
+            .map(|v| format!("{v:.3}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let resets = collect.phase_290.sorted_resets();
+    for window in &collect.book_windows {
+        let name = match window.kind {
+            WindowKind::Train => "training window, training fits, in sample".to_string(),
+            WindowKind::Holdout => "holdout, training fits, out of sample".to_string(),
+            WindowKind::Day(_) => "day, own fits, in sample".to_string(),
+        };
+        say!(report, "{name}: {}", window_text(&window.window));
+        let fit_window = match window.kind {
+            WindowKind::Train | WindowKind::Holdout => collect.protocol.queue_train(),
+            WindowKind::Day(day) => day,
+        };
+        let inside: Vec<&ResetObservation> = resets
+            .iter()
+            .filter(|r| fit_window.start_ms <= r.timestamp_ms && r.timestamp_ms < fit_window.end_ms)
+            .collect();
+        say!(
+            report,
+            "    E3's fit window {} holds {} kept resets, {} at a size from 1 to the cap, {} with \
+             a new size",
+            window_text(&fit_window),
+            inside.len(),
+            inside
+                .iter()
+                .filter(|r| (1..=qr_290::MAX_QUEUE).contains(&r.queue_before))
+                .count(),
+            inside.iter().filter(|r| r.queue_after.is_some()).count()
+        );
+        let lines = match &window.result_290 {
+            None => {
+                say!(report, "    not reached: the stretch ended before it");
+                continue;
+            }
+            Some(Err(reason)) => {
+                say!(report, "    {reason}");
+                continue;
+            }
+            Some(Ok((data_mean, lines))) => {
+                say!(report, "    data mean touch queue {data_mean:.2}");
+                lines
+            }
+        };
+        for line in lines {
+            let label = if line.baseline {
+                format!("{} constant", line.estimator)
+            } else {
+                line.estimator.to_string()
+            };
+            match &line.outcome {
+                Ok((r, mean)) => say!(
+                    report,
+                    "    {label}: queue size TV by limit [{}]; spread TV {:.3}; wait KS by limit \
+                     [{}]; flow relative error L/C/M [{}]; mean touch queue {mean:.2} ({}); \
+                     model {} events, stopped {:?}{}",
+                    list(&r.queue_size),
+                    r.spread,
+                    list(&r.waiting_law),
+                    list(&r.flow),
+                    if stationary_290(*mean) {
+                        "stationary"
+                    } else {
+                        "transient"
+                    },
+                    r.model_events,
+                    r.model_stopped,
+                    match line.reset_sizes {
+                        Some((sizes, largest)) => format!(
+                            "; reset rate positive at {sizes} sizes, the largest {largest}; \
+                             {} resets in the run, whose smallest touch queue is {}",
+                            line.run_resets,
+                            line.run_min_touch
+                                .map_or("-".to_string(), |m| m.to_string())
+                        ),
+                        None => String::new(),
+                    }
+                ),
+                Err(error) => say!(report, "    {label}: not evaluable: {error}"),
+            }
+        }
+        match window.kind {
+            WindowKind::Train => match &collect.phase_290.choice {
+                Some(Ok(chosen)) => say!(report, "    chosen: {chosen}"),
+                Some(Err(reason)) => say!(report, "    no choice: {reason}"),
+                None => say!(report, "    no choice made"),
+            },
+            WindowKind::Holdout => {
+                if let Some(Ok(chosen)) = &collect.phase_290.choice {
+                    let verdict = match beats_baseline_290(lines, chosen) {
+                        Some(true) => "success: below its constant baseline at every limit",
+                        Some(false) => "no success: not below its constant baseline at every limit",
+                        None => "not evaluable",
+                    };
+                    say!(report, "    {chosen} (chosen): {verdict}");
+                }
+            }
+            WindowKind::Day(_) => {}
+        }
+    }
+}
+
 fn flow_line(name: &str, params: &HawkesParameters, holdout: &[HawkesSegment]) -> String {
     match score_flow(holdout, params) {
         Ok(fit) => format!(
@@ -1975,13 +3178,57 @@ fn section_rest(report: &mut Report) {
         report,
         "#91 (b) Wu et al. as a replication: a different instrument and different data."
     );
-    say!(report, "\n== Not done ==");
+}
+
+fn section_90_book(report: &mut Report, collect: &Collect) {
     say!(
         report,
-        "#90 (b) distribution comparison and (c) out-of-sample discrepancies with \
-         compare_trajectories: it needs a data Trajectory of BookSample, which the replay does \
-         not expose."
+        "\n== #90 (b) queue size, spread, waiting time and flow laws against the data and a \
+         constant intensity baseline, (c) out-of-sample discrepancies and state coverage, (d) \
+         discrepancies per day =="
     );
+    say!(
+        report,
+        "API: hyperliquid::{{ReplayConfig::with_book_samples, book_samples, \
+         queue_observations}} for the data, backtest::queue_reactive::{{QrSimulator::run, \
+         QrParameters::constant_baseline, compare_trajectories}}. A sample shows the book after \
+         every diff before its time, its limits counted from the mid as the depths are, in event \
+         sizes; the spread is the touch's width in ticks. Events of one block share a time, so \
+         most data waits are zero: compare_trajectories leaves them out of the waiting times and \
+         counts them, and they stay in the flow. The model's limits count from a reference half \
+         a tick off the grid, so a touch two ticks wide is a spread of 2 here with both first \
+         limits filled, which the model shows only with one empty."
+    );
+    for window in &collect.book_windows {
+        let name = match window.kind {
+            WindowKind::Train => "(290) training window, training fit, in sample",
+            WindowKind::Holdout => "(b), (c) holdout, training fit, out of sample",
+            WindowKind::Day(_) => "(d) day, own fit, in sample",
+        };
+        say!(
+            report,
+            "{name}: {}; {} samples and {} events compared{}",
+            window_text(&window.window),
+            window.data.0,
+            window.data.1,
+            if window.samples_without_sizes > 0 {
+                format!(
+                    "; {} samples before the event sizes were known, left out",
+                    window.samples_without_sizes
+                )
+            } else {
+                String::new()
+            }
+        );
+        match &window.result {
+            Some(lines) => {
+                for line in lines {
+                    say!(report, "    {line}");
+                }
+            }
+            None => say!(report, "    not reached: the stretch ended before it"),
+        }
+    }
 }
 
 fn section_kept(report: &mut Report, collect: &Collect) {
@@ -2032,8 +3279,311 @@ fn section_kept(report: &mut Report, collect: &Collect) {
 mod tests {
     use super::*;
     use market_maker_rs::backtest::hawkes::HawkesEvent;
+    use market_maker_rs::backtest::hyperliquid::{
+        BookDiff, ORDER_STATUS_RECORD_BYTES, OrderStatusRecord, STATUS_OPEN, decode_order_status,
+        parse_book_diff,
+    };
 
     const START: u64 = 1_764_583_200_000;
+
+    fn touch(time_ms: u64, mid: i64, side: Option<usize>, level: Option<i64>) -> TouchEvent {
+        TouchEvent {
+            time_ns: time_ms * NS_PER_MS,
+            mid: Some(Decimal::from(mid)),
+            side,
+            level_after: level.map(Decimal::from),
+            level_before: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_290_touch_lives_end_emptied_moved_or_unobserved() {
+        let mut p = Phase290::default();
+        p.take_touch(touch(0, 100, Some(0), Some(0)), true, Decimal::ONE, 1);
+        p.take_touch(touch(0, 100, Some(1), Some(5)), true, Decimal::ONE, 1);
+        assert_eq!(p.lives, [0, 0, 0], "the first mid closes nothing");
+        p.take_touch(touch(1, 101, None, Some(3)), true, Decimal::ONE, 1);
+        assert_eq!(p.lives, [1, 1, 0]);
+        p.take_touch(touch(2, 101, Some(0), None), true, Decimal::ONE, 1);
+        p.take_touch(touch(3, 102, None, None), true, Decimal::ONE, 1);
+        assert_eq!(
+            p.lives,
+            [1, 1, 2],
+            "an unknown cause and a quiet side are unobserved"
+        );
+        p.take_touch(touch(4, 102, Some(1), Some(-1)), true, Decimal::ONE, 1);
+        p.take_touch(touch(5, 101, None, None), true, Decimal::ONE, 1);
+        assert_eq!(p.lives, [2, 1, 3]);
+        assert_eq!(p.exit_by_move_share(), Some(1.0 / 3.0));
+        assert_eq!(Phase290::default().exit_by_move_share(), None);
+    }
+
+    #[test]
+    fn test_290_a_move_that_empties_no_touch_resets_each_seen_side() {
+        let mut p = Phase290::default();
+        let at = |p: &mut Phase290, e: TouchEvent, counting| {
+            p.take_touch(e, counting, Decimal::from(2), 1);
+        };
+        at(&mut p, touch(0, 100, Some(0), Some(10)), true);
+        at(&mut p, touch(1, 100, Some(1), Some(6)), true);
+        // The move: both touches left a size, so both reset, their sizes in units of 2.
+        at(&mut p, touch(3, 101, None, None), true);
+        assert_eq!(p.resets_made, 2);
+        assert!(p.resets.is_empty(), "each waits for its new size");
+        // The bid's next touch event gives its new size, from the level before it.
+        let next = TouchEvent {
+            level_before: Decimal::from(14),
+            ..touch(4, 101, Some(0), Some(16))
+        };
+        at(&mut p, next, true);
+        assert_eq!(
+            p.resets,
+            vec![ResetObservation {
+                timestamp_ms: 3,
+                side: QrSide::Bid,
+                queue_before: 5,
+                waiting_seconds: 0.003,
+                queue_after: Some(7),
+            }]
+        );
+        // The next move ends the ask's wait with no new size, and resets the bid again.
+        at(&mut p, touch(6, 100, None, None), true);
+        assert_eq!(p.resets.len(), 2);
+        assert_eq!(
+            p.resets[1],
+            ResetObservation {
+                timestamp_ms: 3,
+                side: QrSide::Ask,
+                queue_before: 3,
+                waiting_seconds: 0.002,
+                queue_after: None,
+            }
+        );
+        assert_eq!(
+            (p.resets_made, p.resets_skipped),
+            (3, 1),
+            "the ask was not seen"
+        );
+        // A move that empties a touch resets nothing.
+        at(&mut p, touch(7, 100, Some(1), Some(0)), true);
+        at(&mut p, touch(8, 100, Some(0), Some(4)), true);
+        at(&mut p, touch(9, 99, None, None), true);
+        assert_eq!((p.resets_made, p.resets_skipped), (3, 1));
+        assert_eq!(
+            p.resets.len(),
+            3,
+            "the bid's reset took its new size at its next touch event"
+        );
+        // Off the training part, resets are kept but not counted.
+        at(&mut p, touch(10, 99, Some(0), Some(4)), false);
+        at(&mut p, touch(10, 99, Some(1), Some(4)), false);
+        at(&mut p, touch(11, 100, None, None), false);
+        at(&mut p, touch(12, 101, None, None), false);
+        assert_eq!(p.resets.len(), 5);
+        assert_eq!((p.resets_made, p.resets_skipped), (3, 1));
+        let sorted = p.sorted_resets();
+        assert!(sorted.is_sorted_by_key(|r| r.timestamp_ms));
+        // By day, on every part: 5 moves, 5 resets made, 3 sides unseen.
+        assert_eq!(p.resets_by_day.get(&0), Some(&[5, 3, 5]));
+        // From a one sided book, no reset.
+        let mut q = Phase290::default();
+        at(&mut q, touch(0, 100, Some(0), Some(4)), true);
+        at(
+            &mut q,
+            TouchEvent {
+                mid: None,
+                ..touch(1, 0, None, None)
+            },
+            true,
+        );
+        assert_eq!(q.resets_made + q.resets_skipped, 0);
+    }
+
+    #[test]
+    fn test_290_blocks_are_distinct_times_and_their_gaps_fall_in_bins() {
+        let mut p = Phase290::default();
+        for ms in [0, 0, 5, 5, 2_000] {
+            p.take_touch(touch(ms, 100, None, None), true, Decimal::ONE, 1);
+        }
+        assert_eq!((p.blocks, p.block_events, p.multi_event_blocks), (2, 5, 2));
+        let mut want = [0; qr_290::BLOCK_GAP_BOUNDS_MS.len() + 1];
+        want[1] = 1;
+        want[7] = 1;
+        assert_eq!(p.gaps, want);
+        assert_eq!(p.gap_total_ns, 2_000 * u128::from(NS_PER_MS));
+    }
+
+    #[test]
+    fn test_290_queue_counts_split_zero_waits_and_collapse_per_block() {
+        let event = |depth, kind, queue_before, waiting_seconds| QueueObservation {
+            timestamp_ms: 1,
+            side: QrSide::Bid,
+            depth,
+            kind,
+            queue_before,
+            waiting_seconds,
+        };
+        let events = [
+            event(0, QrEventKind::Limit, 1, 1.0),
+            event(0, QrEventKind::Cancel, 2, 0.0),
+            event(0, QrEventKind::Market, 1, 0.0),
+            event(1, QrEventKind::Market, 3, 2.0),
+            event(1, QrEventKind::Limit, 2, -1.0),
+        ];
+        let mut p = Phase290::default();
+        p.take_counts(&events);
+        p.take_lists(&events, 1);
+        assert_eq!(p.counts[0], [[1, 0], [0, 1], [0, 1]]);
+        assert_eq!(p.counts[1], [[0, 0], [0, 0], [1, 0]]);
+        assert_eq!(p.invalid_waits, 1);
+        assert_eq!(p.all, events.to_vec());
+        assert_eq!(
+            p.collapsed,
+            vec![
+                event(0, QrEventKind::Market, 1, 1.0),
+                event(1, QrEventKind::Market, 3, 2.0),
+                event(1, QrEventKind::Limit, 2, -1.0),
+            ]
+        );
+        let mut thin = Phase290::default();
+        thin.take_lists(&events, 2);
+        assert_eq!(thin.all.len(), 3);
+    }
+
+    fn line(estimator: &'static str, baseline: bool, tv: &[f64], mean: f64) -> Line290 {
+        let report: DiscrepancyReport = serde_json::from_value(serde_json::json!({
+            "queue_size": tv, "spread": 0.0, "waiting_time": [0.0], "waiting_law": [0.0],
+            "flow": [0.0, 0.0, 0.0], "flow_law": [0.0, 0.0, 0.0], "coverage": 1.0,
+            "data_samples": 1, "data_events": 1, "model_samples": 1, "model_events": 1,
+            "model_stopped": null, "data_invalid_waiting": 0, "model_invalid_waiting": 0
+        }))
+        .unwrap();
+        Line290 {
+            estimator,
+            baseline,
+            outcome: Ok((report, mean)),
+            run_resets: 0,
+            run_min_touch: None,
+            reset_sizes: None,
+        }
+    }
+
+    #[test]
+    fn test_290_choice_takes_the_lowest_first_limit_tv_among_stationary_fits() {
+        let lines = [
+            line("E0", false, &[0.2, 0.1], 150.0),
+            line("E0", true, &[0.0, 0.0], 1.0),
+            line("E1", false, &[0.4, 0.1], 20.0),
+            line("E2", false, &[0.3, 0.9], 99.9),
+        ];
+        assert_eq!(
+            choose_290(&lines),
+            Ok("E2"),
+            "E0 is transient, baselines never count"
+        );
+        let tie = [
+            line("E1", false, &[0.3], 1.0),
+            line("E2", false, &[0.3], 1.0),
+        ];
+        assert_eq!(choose_290(&tie), Ok("E1"), "the first on a tie");
+        let sensitivity = [
+            line("E3 inv", false, &[0.0], 1.0),
+            line("E3", false, &[0.5], 1.0),
+        ];
+        assert_eq!(
+            choose_290(&sensitivity),
+            Ok("E3"),
+            "a sensitivity row is never chosen"
+        );
+        let mut failed = line("E2", false, &[0.0], 1.0);
+        failed.outcome = Err("no fit".to_string());
+        let none = [line("E0", false, &[0.1], 100.0), failed];
+        assert!(
+            choose_290(&none).is_err(),
+            "no stationary fit, so no holdout"
+        );
+        assert!(stationary_290(99.99) && !stationary_290(100.0));
+    }
+
+    #[test]
+    fn test_290_reset_sizes_are_the_positive_rates_and_the_largest() {
+        let rates: Vec<f64> = (0..=QR_MAX_QUEUE as usize)
+            .map(|n| if n == 3 || n == 40 { 0.5 } else { 0.0 })
+            .collect();
+        let law: Vec<f64> = (0..rates.len())
+            .map(|n| if n == 1 { 1.0 } else { 0.0 })
+            .collect();
+        let table: Vec<(f64, f64, f64)> = (0..rates.len())
+            .map(|n| {
+                let last = n + 1 == rates.len();
+                (
+                    if last { 0.0 } else { 1.0 },
+                    if n == 0 { 0.0 } else { 1.0 },
+                    0.0,
+                )
+            })
+            .collect();
+        let params = QrParameters::new(
+            dec!(1),
+            1.0,
+            0.0,
+            vec![dec!(1)],
+            vec![table],
+            vec![vec![true; rates.len()]],
+            UnsupportedPolicy::NearestSupported,
+        )
+        .unwrap();
+        assert_eq!(reset_sizes(&params), None);
+        let with = params.with_resets(rates, law).unwrap();
+        assert_eq!(reset_sizes(&with), Some((2, 40)));
+    }
+
+    #[test]
+    fn test_290_success_needs_every_limit_below_its_own_baseline() {
+        let lines = [
+            line("E1", false, &[0.2, 0.3], 1.0),
+            line("E1", true, &[0.25, 0.35], 1.0),
+            line("E2", false, &[0.2, 0.4], 1.0),
+            line("E2", true, &[0.25, 0.4], 1.0),
+        ];
+        assert_eq!(beats_baseline_290(&lines, "E1"), Some(true));
+        assert_eq!(
+            beats_baseline_290(&lines, "E2"),
+            Some(false),
+            "a tie is not below"
+        );
+        assert_eq!(beats_baseline_290(&lines, "E0"), None);
+        let short = [
+            line("E1", false, &[0.1], 1.0),
+            line("E1", true, &[0.2, 0.2], 1.0),
+        ];
+        assert_eq!(beats_baseline_290(&short, "E1"), None);
+    }
+
+    #[test]
+    fn test_290_protocol_matches_this_example() {
+        assert_eq!(qr_290::MAX_QUEUE, QR_MAX_QUEUE);
+        assert_eq!(qr_290::QR_SEED, QR_SEED);
+        assert_eq!(qr_290::WINDOW_SECONDS, BOOK_WINDOW_MS as f64 / 1e3);
+        assert!(qr_290::reaches(100.0, 0.5));
+        assert!(!qr_290::reaches(99.9, 0.5));
+        let samples = [
+            BookSample {
+                timestamp_ms: 0,
+                bid: [2, 0, 0, 0, 0],
+                ask: [4, 0, 0, 0, 0],
+                spread_ticks: 1,
+            },
+            BookSample {
+                timestamp_ms: 1,
+                bid: [0, 0, 0, 0, 0],
+                ask: [2, 0, 0, 0, 0],
+                spread_ticks: 1,
+            },
+        ];
+        assert_eq!(mean_touch(&samples), 2.0);
+        assert_eq!(mean_touch(&[]), 0.0);
+    }
 
     #[test]
     fn test_split_is_chronological_disjoint_and_covers_the_stretch() {
@@ -2119,6 +3669,231 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn test_book_windows_are_declared_and_compared_once_their_fit_can_be_made() {
+        // Starts at 20:00 UTC, so the stretch holds whole days and the holdout starts mid-day.
+        let start = 1_764_619_200_000;
+        let end = start + 5 * DAY_MS;
+        let protocol = Protocol::new(start, end).unwrap();
+        let mut collect = Collect::new(
+            protocol,
+            0,
+            dec!(1),
+            "synthetic".to_string(),
+            Strides::for_hours(1),
+        );
+        let holdout = protocol.holdout();
+        let days = protocol.days();
+        assert_eq!(collect.book_windows.len(), 2 + days.len());
+        let train = &collect.book_windows[0];
+        assert_eq!(train.kind, WindowKind::Train);
+        assert_eq!(train.window.start_ms, protocol.queue_train().start_ms);
+        assert_eq!(
+            train.window.end_ms,
+            protocol.queue_train().start_ms + BOOK_WINDOW_MS
+        );
+        assert_eq!(
+            train.due_ms, protocol.train_end_ms,
+            "the training fit needs training"
+        );
+        let first = &collect.book_windows[1];
+        assert_eq!(first.kind, WindowKind::Holdout);
+        assert_eq!(first.window.start_ms, holdout.start_ms);
+        assert_eq!(first.window.end_ms, holdout.start_ms + BOOK_WINDOW_MS);
+        assert_eq!(first.due_ms, first.window.end_ms);
+        for (window, day) in collect.book_windows[2..].iter().zip(&days) {
+            assert_eq!(window.kind, WindowKind::Day(*day));
+            assert_eq!(window.window.start_ms, day.start_ms);
+            assert_eq!(window.window.end_ms, day.start_ms + BOOK_WINDOW_MS);
+            assert_eq!(
+                window.due_ms, day.end_ms,
+                "a day's own fit needs the whole day"
+            );
+            assert!(window.holds(day.start_ms));
+            assert!(!window.holds(day.start_ms + BOOK_WINDOW_MS));
+            assert!(!window.holds(day.start_ms - 1));
+        }
+        // A short holdout bounds its window.
+        let short = Protocol::new(START, START + 4 * HOUR_MS).unwrap();
+        let windows = BookWindow::all(&short);
+        assert_eq!(windows[1].window.end_ms, short.end_ms);
+        assert_eq!(windows[1].due_ms, short.end_ms);
+
+        // Nothing is compared before its time; then each once, and its data is dropped.
+        let sample = BookSample {
+            timestamp_ms: holdout.start_ms,
+            bid: [1; 5],
+            ask: [1; 5],
+            spread_ticks: 1,
+        };
+        for window in &mut collect.book_windows {
+            window.samples.push(sample);
+        }
+        collect.compare_due(holdout.start_ms + BOOK_WINDOW_MS - 1);
+        let day_due = days[0].end_ms;
+        assert!(day_due < holdout.start_ms);
+        assert!(collect.book_windows[1].result.is_none());
+        assert_eq!(collect.book_windows[1].samples.len(), 1);
+        assert!(collect.book_windows[0].result.is_some());
+        assert!(collect.book_windows[2].result.is_some());
+        // With no fit, nothing is stationary on the training window, so #290 stops there.
+        assert!(matches!(collect.phase_290.choice, Some(Err(_))));
+        collect.compare_due(holdout.start_ms + BOOK_WINDOW_MS);
+        let window = &collect.book_windows[1];
+        assert!(window.samples.is_empty());
+        assert_eq!(window.data, (1, 0));
+        assert_eq!(
+            window.result,
+            Some(vec!["not evaluable: no fit: no event sizes".to_string()])
+        );
+        assert!(matches!(
+            &window.result_290,
+            Some(Err(reason)) if reason.starts_with("not run, stop rule")
+        ));
+        let read = holdout.start_ms + BOOK_WINDOW_MS;
+        for window in &collect.book_windows {
+            assert_eq!(window.result.is_some(), window.due_ms <= read);
+        }
+        assert!(collect.book_windows.iter().any(|w| w.result.is_none()));
+        collect.compare_due(u64::MAX);
+        assert!(collect.book_windows.iter().all(|w| w.result.is_some()));
+    }
+
+    /// An order status record, by the schema's offsets, with two decimals.
+    fn status(
+        ns: u64,
+        id: u8,
+        is_ask: bool,
+        cents: u32,
+        size_cents: u32,
+        oid: u64,
+    ) -> OrderStatusRecord {
+        let fixed = |value: u32| (2u32 << 29) | value;
+        let mut bytes = vec![0u8; ORDER_STATUS_RECORD_BYTES];
+        bytes[0..8].copy_from_slice(&ns.to_le_bytes());
+        bytes[13] = id;
+        bytes[14] = u8::from(is_ask);
+        bytes[15..19].copy_from_slice(&fixed(cents).to_le_bytes());
+        bytes[19..23].copy_from_slice(&fixed(size_cents).to_le_bytes());
+        bytes[23..31].copy_from_slice(&oid.to_le_bytes());
+        decode_order_status(&bytes).unwrap()
+    }
+
+    fn diff(oid: u64, side: &str, price: &str, size: &str) -> BookDiff {
+        let line = format!(
+            r#"{{"user":"0x1","oid":{oid},"coin":"BTC","side":"{side}","px":"{price}","raw_book_diff":{{"new":{{"sz":"{size}"}}}}}}"#
+        );
+        parse_book_diff(&line).unwrap().1
+    }
+
+    #[test]
+    fn test_a_book_window_keeps_the_events_and_samples_inside_it_only() {
+        let protocol = Protocol::new(START, START + 10 * HOUR_MS).unwrap();
+        let mut collect = Collect::new(
+            protocol,
+            0,
+            dec!(1),
+            "synthetic".to_string(),
+            Strides::for_hours(1),
+        );
+        let sized: Vec<SizedEvent> = (0..MIN_SIZED_EVENTS)
+            .flat_map(|i| {
+                (0..3u8).map(move |depth| SizedEvent {
+                    timestamp_ms: START + i * SECOND_MS,
+                    depth,
+                    size: dec!(1),
+                })
+            })
+            .collect();
+        let sizes = |limits| {
+            estimate_event_sizes(&sized, &protocol.sizes(), limits, MIN_SIZED_EVENTS).unwrap()
+        };
+        collect.sizes = Some(Sizes {
+            queue: sizes(LIMITS),
+            hawkes: sizes(1),
+        });
+        // A two sided book 10 s before the holdout, then one bid a second for 5 s from its start.
+        let h = protocol.holdout().start_ms * NS_PER_MS;
+        let ns = |seconds: i64| h.checked_add_signed(seconds * 1_000_000_000).unwrap();
+        let mut statuses = vec![
+            status(ns(-10), STATUS_OPEN, false, 10_000, 200, 1),
+            status(ns(-9), STATUS_OPEN, true, 10_100, 300, 2),
+            status(ns(-8), STATUS_OPEN, true, 10_200, 100, 3),
+        ];
+        // The third is an observation, at limit 1, before the window.
+        let mut diffs = vec![
+            diff(1, "B", "100", "2"),
+            diff(2, "A", "101", "3"),
+            diff(3, "A", "102", "1"),
+        ];
+        for (i, at) in (0..5).enumerate() {
+            let oid = 10 + i as u64;
+            statuses.push(status(ns(at), STATUS_OPEN, false, 10_000, 100, oid));
+            diffs.push(diff(oid, "B", "100", "1"));
+        }
+        let config = ReplayConfig::new(dec!(1), LIMITS, 0, RESET_GAP_NS)
+            .unwrap()
+            .with_book_samples(BOOK_SAMPLE_MS)
+            .unwrap();
+        let mut replay = Replay::new(config);
+        let output = replay.ingest(&statuses, &diffs, &[]).unwrap();
+        assert!(
+            output
+                .book
+                .iter()
+                .any(|s| s.value.timestamp_ms < protocol.holdout().start_ms)
+        );
+        collect.take(&output);
+        let window = &collect.book_windows[1];
+        assert_eq!(window.kind, WindowKind::Holdout);
+        // The five bids at the touch, and none of the opening's diffs before the window.
+        assert_eq!(window.events.len(), 5);
+        assert!(window.events.iter().all(|e| window.holds(e.timestamp_ms)));
+        // The grid times from the holdout's start to the last diff: 0 to 4 s, each showing the
+        // bids before it.
+        let bids: Vec<u32> = window.samples.iter().map(|s| s.bid[0]).collect();
+        assert_eq!(bids, vec![2, 3, 4, 5, 6]);
+        assert!(
+            window
+                .samples
+                .iter()
+                .all(|s| s.ask[0] == 3 && s.ask[1] == 1)
+        );
+        assert_eq!(window.samples_without_sizes, 0);
+        assert!(window.result.is_none());
+        // #290 counts the training part only, and keeps its estimators' inputs from every part.
+        let counted = |c: &Collect| c.phase_290.counts.iter().flatten().flatten().sum::<u64>();
+        assert_eq!(counted(&collect), 0);
+        assert!(!collect.phase_290.all.is_empty());
+        let first_hour = output.events.clone();
+
+        // An hour that reads past the window's end compares it and drops its data. Its diff ends
+        // a silence that resets the replay, so no sample spans that silence.
+        let past = ns(i64::try_from(BOOK_WINDOW_MS / SECOND_MS).unwrap() + 1);
+        let output = replay
+            .ingest(
+                &[status(past, STATUS_OPEN, false, 10_000, 100, 20)],
+                &[diff(20, "B", "100", "1")],
+                &[],
+            )
+            .unwrap();
+        collect.take(&output);
+        let window = &collect.book_windows[1];
+        assert!(window.result.is_some());
+        assert!(window.samples.is_empty() && window.events.is_empty());
+        assert_eq!(window.data, (5, 5));
+        collect.convert(Part::Train, &first_hour);
+        assert!(counted(&collect) > 0);
+        assert!(
+            collect
+                .phase_290
+                .size_change
+                .iter()
+                .flatten()
+                .any(|(_, n)| *n > 0)
+        );
     }
 
     #[test]
