@@ -8,6 +8,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
+  #102's residual SAC retrained with and without a training adversary that, between five
+  phases, moves the episode's flow perturbation toward the point where the policy loses most on
+  scoring days. The adversary trains on #108's 12 points with the limit rate unchanged; the 12
+  points with a lower limit rate, #108's execution stress and #282's own impact are held out.
+  Both arms are evaluated once on fresh holdout days, with paired regime-stratified block
+  bootstrap intervals of the CVaR difference recomputed per replicate. The design was committed
+  and agreed before any code or run. No gain shown: at the selected held-out point the
+  adversarially trained policy's tail loss is not smaller, and it costs about 3.3 a day
+  unperturbed. The holdout was resumed once after an attempt killed from outside, as disclosed.
 - The regime adaptation and transfer study of #112 in `bridges/python/experiments/m5_08`, with
   examples `regime_days` (synthetic days that change regime at fixed times, on the
   queue-reactive and the Hawkes simulators) and `regime_alarm` (a causal volatility and VPIN
