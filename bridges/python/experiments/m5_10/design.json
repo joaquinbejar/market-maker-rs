@@ -1,6 +1,6 @@
 {
  "issue": 108,
- "design_version": 2,
+ "design_version": 3,
  "status": "fixed before any code or run; part 2 of #108, after PR #295",
  "data": "SYNTHETIC: every result is from made-up Hawkes parameters and says nothing about a market",
  "closed_by_295": {
@@ -39,11 +39,13 @@
     "note": "two values per setting"
    },
    "grid": "product in the listed order, 24 points per setting, the unperturbed point first; ties take the first in grid order",
-   "plausibility": "bounds are #108's ranges; branching_scale multiplies every weight and each point must keep the branching matrix's spectral radius below 1, checked and recorded by code before any day is generated; a failing point is removed and reported",
+   "plausibility": "bounds are #108's ranges; branching_scale multiplies every weight and each point must keep the spectral radius of Sum_u alpha_u, the matrix HawkesParameters::new checks, below 1, checked and recorded by code before any day is generated; a failing point is removed and reported",
    "identifiability": {
-    "rate": "market orders per row over the point's 10 selection days, against the stationary rate implied by the point's parameters through (I - K)^-1 mu; |ratio - 1| <= 0.10",
+    "rate": "the market entry of (I - K)^-1 mu, K = Sum_u alpha_u with cross-excitation, mu = (limit x P(q < cap), cancel x E[q], market x P(q > 0)), each average time-weighted over the point's selection days. Tested: realised market orders per row at the point over the unperturbed point, against the same ratio of the formula; |ratio / ratio_formula - 1| <= 0.10",
     "impact": "OLS slope of per-row mid change on the row's signed market orders; for impact_ticks > 0, |slope / impact_ticks - 1| <= 0.10; at impact 0, |slope| <= 0.025 ticks, 10 % of the smallest non-zero impact",
-    "when": "before freeze, with no policy; a failing point is reported and removed"
+    "when": "before freeze, with no policy; a failing point is reported and removed",
+    "rate_reading": "mu uses realised queue statistics, so the test checks the branching response given the realised queue, not the closed-loop rate. The crate masks the whole intensity at an empty queue and at the cap, so excited events are suppressed there and (I - K)^-1 overstates the response: a known approximation. Empty-queue and cap shares are reported per point. The 10 % is unmeasured and fixed before any ratio is computed, and a removal under it may reflect this approximation",
+    "unperturbed": "the rate check at the unperturbed point is true by construction (ratio 1 = 1) and carries no evidence; its impact slope is the only live test there"
    },
    "removed_points": "a point failing the spectral or identifiability check is removed before freeze. If it is the fixed stress, or the impact-only point, that condition is reported as not run, with no substitute. If the unperturbed point fails, that whole setting is reported as not run, since every comparison in it needs that point"
   },
@@ -131,6 +133,7 @@
  ],
  "changes": [
   "before any code or run, from review of f583fbc: count formula, pilot at the slowest arm and most active point under load, ceiling raised from 60 to 90 process-hours from that count, cuts from the pilot only, removed points, identifiability estimates, stationary bootstrap named, recovery condition and marker location, part 2 runner, model hashes and estimand, no secondary fee, impact is the flow's and not the agent's",
-  "before any code or run, from review of 378e653: seed formulas written as stride x day + offset, and a failing unperturbed point removes its setting; the identifiability formula, absolute tolerance at impact 0, removal rule and stationary bootstrap of the entry above answer the same review"
+  "before any code or run, from review of 378e653: seed formulas written as stride x day + offset, and a failing unperturbed point removes its setting; the identifiability formula, absolute tolerance at impact 0, removal rule and stationary bootstrap of the entry above answer the same review",
+  "before any code or run, from a defect found reading the generator: the baselines depend on the queue, so the rate test uses time-averaged open shares and the point-over-unperturbed ratio, with its approximation stated. No ratio or formula value had been computed on any data"
  ]
 }
