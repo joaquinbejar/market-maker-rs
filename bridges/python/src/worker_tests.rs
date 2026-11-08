@@ -2009,7 +2009,7 @@ fn test_each_check_of_a_replace_refuses_on_its_own() {
     run_steps(&mut worker, 0, 30);
     assert!(refusal(worker.replace_rows(shifted(&rows, 3, 1))).contains("already read"));
     // With observations late by more than a row, the kernel has matched the row after the
-    // one observed: changing it keeps the observed rows, and the replay tells.
+    // one observed: changing it keeps the observed rows, and only the replay tells.
     let mut late = grid_bridge();
     late.latency = LatencyConfig {
         quantum_ns: 1_000_000,
@@ -2032,7 +2032,8 @@ fn test_each_check_of_a_replace_refuses_on_its_own() {
         .row
         .unwrap() as usize;
     let reason = refusal(worker.replace_rows(shifted(&rows, observed + 1, 5)));
-    assert!(reason.contains("replayed state differs"), "{reason}");
+    // The replayed steps tell first: a step's fill or reward moved.
+    assert!(reason.contains("replayed step"), "{reason}");
     // The episode goes on, unchanged, on the old rows.
     assert_eq!(worker.info(), plain.info());
     assert_eq!(
