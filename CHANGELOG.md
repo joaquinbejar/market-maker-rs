@@ -8,6 +8,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A frequent batch auction toy for #289 in `bridges/python/experiments/m5_05_batch`, synthetic
+  only and reported apart from the continuous order book. It collects orders for 500 ms, clears
+  them at one uniform price, and has submit and cancel delays of 30, 60 or 100 ms. The clearing
+  rule, the timing rule and the limits are stated in `fba.py` and checked against hand-computed
+  fixtures.
+  - #110's duration and latency arms ran on it from a design fixed before any run, with the
+    holdout read once behind an exclusive marker.
+  - At the chosen fee of 0, duration control helps only at 30 ms, weakly: the interval's lower
+    bound is 0.41. No claim is made at 60 or 100 ms; at 100 ms a seed also breached the
+    position limit.
+  - The holdout read the full arm's position once per step. Its no-breach condition at 30 ms is
+    therefore established by the toy's mechanism and by tests, after the holdout read, and is
+    confirmed on validation days (`audit.py`). The position, its peak and the drawdown are now
+    read at every clearing.
+  - At 0.0002 every trading arm loses.
+  - The learned arms use longer durations, unlike #110's, but the classical arm's mean beats them.
+  - The pilot curve did not plateau.
+
 - A quote the kernel expires by itself, exact in venue time (#297):
   `backtest::kernel::KernelAction::ExpiringQuote` with `life_ns`. Each leg is canceled by the
   venue `life_ns` after its own activation, whatever the latencies and jitter.
