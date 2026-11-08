@@ -207,11 +207,12 @@
    "disclosed": "#286 already compared QR and its constant baseline with the data on #263's holdout book window, and #290 read the training part; MDQR's fit and every MDQR figure are new, but the holdout is not unseen for the QR arms"
   },
   "arms": {
-   "qr": "#90's estimate on queue_train, as #263 fits it (ZeroWaitPolicy Drop, the default); #290 found it transient, so S1's cap rule is read for it too and reported",
-   "qr_constant": "its constant baseline (#286), the only stationary QR model on this window per #290",
+   "qr": "#90's estimate on queue_train, as #263 fits it (ZeroWaitPolicy Drop, the default; #290's E0). #290 found it transient on this epoch: its simulated mean touch queue over the training part's first 2 h is 199.9 event sizes against the cap of 200, the data's 24.5; S1's cap rule is read for it too and reported",
+   "qr_constant": "the constant baseline of the Drop fit (#286), the only stationary QR model on this window per #290 (mean touch queue 58.7)",
    "hawkes": "fit_hawkes on queue_train's first-limit segments, the decay chosen on validation from [0.1, 1, 10, 100] as #263 does",
    "poisson": "fit_poisson on the same segments",
-   "mdqr": "MDQR-small at K = 3: the QR book's mechanics (theta, theta_reinit and the invariant laws estimated on the mdqr_train windows), an intensity network MLP 128-64 tanh, a size network MLP 128-64 tanh over sizes 1 to 64 event sizes (64 meaning 64 or more), 5 training seeds"
+   "mdqr": "MDQR-small at K = 3: the QR book's mechanics (theta, theta_reinit and the invariant laws estimated on the mdqr_train windows), an intensity network MLP 128-64 tanh, a size network MLP 128-64 tanh over sizes 1 to 64 event sizes (64 meaning 64 or more), 5 training seeds",
+   "qr_count": "the same estimate with ZeroWaitPolicy::Count (#290's E1), which counts the block-tied events #90 drops; #290 found it transient too (mean touch queue 132.7, drift positive at 132 of 201 sizes), so neither QR arm is stationary here and the comparison says so"
   },
   "clock": {
    "blocks": "events at one timestamp form a block (80 to 89 % of waits are zero on the capture, #290: 54.9 events a block); the network's total intensity is the block rate, and a block's events are a sequence: after each event the state updates and the network chooses the next event or an end-of-block token, so no event is dropped",
@@ -228,7 +229,7 @@
   },
   "stop_rules": {
    "S1": "on validation, MDQR is discarded if it produces a NaN or more than 1 % of its events at the cap in 24 simulated hours; reported with the failure mode",
-   "S2": "adopted only if on the holdout its queue size TV beats both QR and the constant baseline at every limit with intervals excluding zero, no dependency metric is worse than QR's interval, and the transfer tau against QR is at least 0.6; else discarded with the evidence"
+   "S2": "adopted only if on the holdout its queue size TV beats both QR arms (Drop and Count) and the constant baseline at every limit with intervals excluding zero, no dependency metric is worse than the better QR arm's interval, and the transfer tau against each QR arm is at least 0.6; else discarded with the evidence"
   },
   "compute": "extraction and replay at 0 job slots, one process; MDQR training 5 seeds on 2 slots once granted (bus 62495), announced on the bus; an estimate from a timing pilot of one seed on one training window, recorded in changes before the other fits"
  },
@@ -237,6 +238,7 @@
  },
  "changes": [
   "2026-11-08, design version 1 committed after one timing pilot and before any other S0 run: training seed 1 fitted on all 4 training windows (1309561 events) in 23 s on 1 thread, rather than one seed on one window as the compute line says; its fit was seen (log-likelihood per event by epoch, theta 0.604, theta_reinit 0.196, cap 4) and nothing else, no simulation and no comparison. The estimate: fit about 25 s a seed, so S0 needs no job slot.",
-  "2026-11-08, version 2, before any read of the capture: the main study fixed (data, members and manifest check, epoch, split, windows, arms, block clock, state, fit, metrics, transfer, stop rules). Seen before it: #263's and #290's published figures on this epoch (zero waits, block lengths, QR's transience), #286's holdout comparison of QR, and S0's own results; no capture file has been read by this window."
+  "2026-11-08, version 2, before any read of the capture: the main study fixed (data, members and manifest check, epoch, split, windows, arms, block clock, state, fit, metrics, transfer, stop rules). Seen before it: #263's and #290's published figures on this epoch (zero waits, block lengths, QR's transience), #286's holdout comparison of QR, and S0's own results; no capture file has been read by this window.",
+  "2026-11-08, version 2 amended before any read of the capture, at the coordinator's request (bus 62915): a second QR arm, E1 (ZeroWaitPolicy::Count), since #90's Drop fit alone is a strawman on this capture; #290's figures cited for both; S2 reads against both QR arms. Nothing else changed."
  ]
 }
