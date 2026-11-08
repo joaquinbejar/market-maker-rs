@@ -37,14 +37,23 @@
       "tau": 0.02,
       "other": "Stable-Baselines3 SAC defaults, as #102"
     },
-    "training_seeds": [1, 2, 3, 4, 5],
+    "training_seeds": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
     "budget_steps": 500000
   },
   "grid": {
     "points": "#108's 24 points: market {1, 1.5, 2} x cancel {1, 1.5} x theta {1, 1.2} x limit {1, 0.7}, in #108's order (itertools.product over market, cancel, theta, limit, in that order)",
     "training_points": "the 12 points with limit 1.0, the unperturbed point among them",
     "held_out_points": "the 12 points with limit 0.7; they include #108's fixed stress and #108's choice for #102's residual SAC (m2.0-c1.5-t1.2-l0.7)",
-    "held_out_other": ["#108's execution stress", "#282's own price impact at 2 kappa0"],
+    "held_out_other": [
+      "#108's execution stress",
+      "#282's own price impact at 2 kappa0"
+    ],
     "tie_rule": "on a tie, the first point in grid order"
   },
   "training": {
@@ -79,7 +88,13 @@
       "statistic": "the mean over B's 5 seeds of each seed's mean daily net over the 15 validation days",
       "reference": {
         "source": "#102's selection.json, residual SAC set 2, main execution, evaluation seed 101, at commit 8a625b04063d4f37448ec3807ee140571a859daa",
-        "per_seed_mean_daily_net": {"1": -29.9000, "2": -32.5691, "3": -23.1025, "4": -26.7296, "5": -23.5096},
+        "per_seed_mean_daily_net": {
+          "1": -29.9,
+          "2": -32.5691,
+          "3": -23.1025,
+          "4": -26.7296,
+          "5": -23.5096
+        },
         "mean": -27.1621,
         "sample_sd": 4.0847
       },
@@ -100,7 +115,7 @@
       "seed_offset": 300000,
       "count": 30,
       "seed": "the seed of day d of regime r is 1000003 r + d + 300000, r from 1 (calm, stressed, thin), d from 1 to 10; never one of #102's, #108's or #282's",
-      "digests": "written by qr_days for every condition's rows before any policy runs, and committed",
+      "digests": "written by qr_days before any policy runs, and committed, for every condition's exogenous rows: the unperturbed rows, the 12 held-out points' and the 11 in-sample points'. The impact condition's rows react to each policy's fills, so only its base rows (the unperturbed digests), kappa per regime, the reaction generator's seeds and #282's runner commit are fixed beforehand; the digest of every reacted day is recorded per policy and seed during the holdout, after the fact",
       "weighting": "each regime's 10 days weigh equally, so the 30 days weigh equally"
     },
     "conditions": {
@@ -124,7 +139,7 @@
       "tail_at_p_B": "D_tail(p_B), the same at B's own selected point",
       "envelope": "E = CVaR5(A, p_A) - CVaR5(B, p_B): a comparison of two selected risk envelopes, each arm at its own worst selected point; not a same-scenario treatment effect, and labelled so"
     },
-    "secondary": "D_tail at every other held-out point, at the execution stress and at the impact condition; D_net under each condition; the same with per-seed CVaR. No multiplicity correction; the count of conditions whose interval excludes 0 is reported out of the 14 held-out conditions"
+    "secondary": "D_tail at every other held-out point, at the execution stress and at the impact condition; D_net under each condition; the same with per-seed CVaR. No multiplicity correction; the count of conditions whose interval excludes 0 is reported out of the held-out conditions actually evaluated: 14, or 13 when the impact condition is not run, stated"
   },
   "intervals": {
     "kind": "paired, regime-stratified stationary block bootstrap over holdout days",
@@ -135,14 +150,14 @@
     "seed": 281
   },
   "reading": [
-    "A tail gain is read at a condition only where D_tail's 90 % interval lies wholly below 0. The claim of the study needs it at both p_A and p_B; E is reported beside them and does not carry the claim alone.",
+    "A tail gain is read at a condition only where D_tail's 90 % interval lies wholly below 0. The study's primary claim needs it at both p_A and p_B; if either D_tail(p_A) or D_tail(p_B) is unavailable (a failed estimator) the primary claim is reported as unavailable, whatever the other shows. E is reported beside them and never carries the claim alone.",
     "An interval that holds 0 is reported as such; it is never read as robustness, equivalence or an absence of risk.",
     "The fresh holdout is synthetic evidence from the same generator, not a claim of robustness in a market."
   ],
   "failures": {
     "training": "a run that stops with an error is a failed seed. It is rerun once, with the same job, only when the process was killed from outside (out of memory, a reboot), and that is disclosed; never because of its results. A run whose weights or losses go non-finite is kept as it is and evaluated",
     "evaluation": "a policy whose proposals are non-finite is evaluated as it acts: the environment treats them as any invalid proposal, and the fallbacks are counted. An episode that errors, or a non-finite daily net, leaves that seed's day missing",
-    "missing": "a missing seed-day is never dropped from a mean, a CVaR or a bootstrap. Any estimator that would need it is reported as failed, with no number, and so is any difference built on it; per-seed results of the other seeds are still shown, labelled. If no primary estimator remains, the study reports failure rather than a gain",
+    "missing": "a missing seed-day is never dropped from a mean, a CVaR or a bootstrap. Any estimator that would need it is reported as failed, with no number, and so is any difference built on it; per-seed results of the other seeds are still shown, labelled. If D_tail(p_A) or D_tail(p_B) fails, the primary claim is unavailable (see reading); the study never reports a gain without both",
     "reported": "every failed, rerun or diverged run, with its log"
   },
   "stop_rules": [
@@ -150,15 +165,42 @@
     "A step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds."
   ],
   "steps": [
-    {"name": "days", "what": "the digests of the training points' days and of every holdout condition's rows, committed before any policy runs"},
-    {"name": "rate", "what": "one A run's first 10000 steps and one scoring pass, timed, to fix the estimate"},
-    {"name": "train", "what": "10 runs: A and B, seeds 1 to 5"},
-    {"name": "validate", "what": "the reproduction check, and the validation table"},
-    {"name": "freeze_models", "what": "checkpoint hashes, committed"},
-    {"name": "selection", "what": "the held-out points on #108's selection days, and p_A, p_B, p_ref"},
-    {"name": "freeze", "what": "the hashes of the design, the code, the digests, frozen_models.json and selection.json"},
-    {"name": "holdout", "what": "once, from the frozen manifest's sha256"},
-    {"name": "report", "what": "the estimands, intervals, training curves and costs"}
+    {
+      "name": "days",
+      "what": "the digests of the training points' days and of every holdout condition's exogenous rows, committed before any policy runs; for the impact condition, its base rows and provenance only (see holdout.days.digests)"
+    },
+    {
+      "name": "rate",
+      "what": "one A run's first 10000 steps and one scoring pass, timed, to fix the estimate"
+    },
+    {
+      "name": "train",
+      "what": "10 runs: A and B, seeds 1 to 5"
+    },
+    {
+      "name": "validate",
+      "what": "the reproduction check, and the validation table"
+    },
+    {
+      "name": "freeze_models",
+      "what": "checkpoint hashes, committed"
+    },
+    {
+      "name": "selection",
+      "what": "the held-out points on #108's selection days, and p_A, p_B, p_ref"
+    },
+    {
+      "name": "freeze",
+      "what": "the hashes of the design, the code, the digests, frozen_models.json and selection.json"
+    },
+    {
+      "name": "holdout",
+      "what": "once, from the frozen manifest's sha256"
+    },
+    {
+      "name": "report",
+      "what": "the estimands, intervals, training curves and costs"
+    }
   ],
   "compute": {
     "machine": "Apple M4 Max",
