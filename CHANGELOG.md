@@ -23,7 +23,8 @@ project follows [Semantic Versioning](https://semver.org/).
   price moves through, then shifts the queues as when `θ` moves the reference, at the state's
   clock. `rl::ReactiveQrMarket` holds the rows `qr_market` makes and each row's state;
   `react` imposes moves after a row and simulates every later row again, leaving that row and
-  the earlier ones unchanged, at most `rl::MAX_REACTION_MOVES` at a time. With no reaction its
+  the earlier ones unchanged, at most `rl::MAX_REACTION_MOVES` at a time, and returns the
+  first-limit volume the moves emptied (modelled consumption, not a trade). With no reaction its
   market is `qr_market`'s. The Python bridge gains `ReactiveQrMarket` over one regime's day, and
   each step's `info["filled_lots"]`, the lots the agent bought and sold during the step.
   `NativeEnv.replace_rows` (and `replace_rows` on the bridge's environments) replaces the rows

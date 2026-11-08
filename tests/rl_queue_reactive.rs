@@ -396,15 +396,19 @@ fn test_a_reaction_keeps_the_rows_up_to_it_and_simulates_the_rest_from_the_moved
     let e = episode(7);
     let original = ReactiveQrMarket::new(&params(), &e, &cfg).unwrap();
     let mut reacted = original.clone();
-    reacted.react(60, -2).unwrap();
+    let emptied = reacted.react(60, -2).unwrap();
     assert_eq!(reacted.ticks().len(), original.ticks().len());
     assert_eq!(reacted.ticks()[..=60], original.ticks()[..=60]);
     assert_ne!(reacted.ticks()[61..], original.ticks()[61..]);
     assert_eq!(reacted.states()[..60], original.states()[..60]);
     // The rest is a direct run from the moved state, with the stored generator state.
     let mut direct = QrSimulator::from_state(params(), original.states()[60]).unwrap();
+    let first = direct.state().bid[0];
     direct.impose_reference_move(false).unwrap();
+    let second = direct.state().bid[0];
     direct.impose_reference_move(false).unwrap();
+    // The first limit's event size is 1: the volume emptied is the two touches passed.
+    assert_eq!(emptied, Decimal::from(first + second));
     assert_eq!(reacted.states()[60], direct.state());
     let seconds = f64::from(e.sample_ms) / 1000.0;
     for row in 61..reacted.states().len() {

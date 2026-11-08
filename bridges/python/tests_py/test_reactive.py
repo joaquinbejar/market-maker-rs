@@ -38,9 +38,9 @@ def test_a_design_day_has_qr_days_digest():
 def test_a_reaction_keeps_the_rows_up_to_it():
     day = market(regime=1, day=3, rows=500)
     before = day.rows()
-    day.react(50, 0)
+    assert day.react(50, 0) == "0"
     assert day.rows() == before
-    day.react(50, -2)
+    assert float(day.react(50, -2)) >= 0
     after = day.rows()
     assert after[:51] == before[:51] and after[51:] != before[51:]
     again = market(regime=1, day=3, rows=500)

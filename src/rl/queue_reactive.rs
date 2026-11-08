@@ -256,13 +256,15 @@ impl ReactiveQrMarket {
     /// for a negative one, each through [`QrSimulator::impose_reference_move`] on the state
     /// the next row is simulated from, then simulates every later row again from it. Row
     /// `row` itself and the rows before it do not change; a second reaction after the same
-    /// row adds to the first. No moves change nothing.
+    /// row adds to the first. No moves change nothing. Returns the volume the moves emptied
+    /// from the first limit's queues they passed through, in the event sizes' unit: modelled
+    /// consumption, not a trade of the agent.
     ///
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a row past the market's last or more
     /// than [`MAX_REACTION_MOVES`] moves, and the simulator's errors.
-    pub fn react(&mut self, row: usize, moves: i64) -> MMResult<()> {
+    pub fn react(&mut self, row: usize, moves: i64) -> MMResult<Decimal> {
         if moves.unsigned_abs() > MAX_REACTION_MOVES {
             return Err(MMError::InvalidConfiguration(format!(
                 "{moves} moves, above the {MAX_REACTION_MOVES} a reaction imposes"
@@ -275,7 +277,7 @@ impl ReactiveQrMarket {
             ))
         })?;
         if moves == 0 {
-            return Ok(());
+            return Ok(Decimal::ZERO);
         }
         let timestamp_ms = self
             .ticks
@@ -283,7 +285,24 @@ impl ReactiveQrMarket {
             .map(|tick| tick.timestamp)
             .ok_or_else(|| MMError::InvalidConfiguration(format!("row {row} has no time")))?;
         let mut simulator = QrSimulator::from_state(self.params.clone(), state)?;
+        let size = self
+            .params
+            .event_sizes()
+            .first()
+            .copied()
+            .ok_or_else(|| MMError::InvalidConfiguration("no event size".to_string()))?;
+        let mut emptied = Decimal::ZERO;
         for _ in 0..moves.unsigned_abs() {
+            let touch = simulator.state();
+            let queue = if moves > 0 {
+                touch.ask[0]
+            } else {
+                touch.bid[0]
+            };
+            emptied = Decimal::from(queue)
+                .checked_mul(size)
+                .and_then(|volume| emptied.checked_add(volume))
+                .ok_or_else(|| MMError::NumericalError("emptied volume".to_string()))?;
             simulator.impose_reference_move(moves > 0)?;
         }
         let next = row.saturating_add(1);
@@ -293,7 +312,8 @@ impl ReactiveQrMarket {
             *slot = simulator.state();
         }
         self.stopped = None;
-        self.extend(simulator, timestamp_ms)
+        self.extend(simulator, timestamp_ms)?;
+        Ok(emptied)
     }
 
     /// The rows, as [`MarketTick`]s.
