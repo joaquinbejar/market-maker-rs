@@ -1,0 +1,220 @@
+{
+  "issue": 281,
+  "design_version": 1,
+  "data": "synthetic: #102's queue-reactive regimes (a simulator with made-up parameters) and #108's perturbed copies of them, no market data",
+  "bounds": "One synthetic simulator with made-up parameters bounds what this study can show. The fresh holdout days come from the same generator as the training days, so a result here says how a policy trained against this adversary behaves under these bounded perturbations of this simulator, and nothing about a market. #102's main execution is in effect an immediate fill on 10 s rows (#267), and the conclusions carry that bound.",
+  "reuses": {
+    "m4_05": {
+      "design": "experiments/m4_05/design.json",
+      "design_sha256": "4f4950626599941906019ff6a4a3e4e95b85f364d4d1d0ea066d301b7a25f221",
+      "frozen_manifest_sha256": "9de757b5bf76274882306c9a9c3d9257389deca64d24074948d1a95646c19458",
+      "what": "the regimes, the kernel, the main execution (fees, limits, queue model, latency), the training and validation days, the selected Avellaneda-Stoikov point per regime that the residual corrects, the residual's bounds, and the frozen residual SAC runs of set 2, seeds 1 to 5 (the reference arm)"
+    },
+    "m5_03": {
+      "design": "experiments/m5_03/design.json",
+      "design_sha256": "89f9d584e69879658f456202e93441d3e9bde8a1a542d842e1a473f1111f2ade",
+      "what": "the 24 point perturbation grid and how a point multiplies the rate tables and theta, the execution stress, the selection days (seed offset 100000) and their committed digests"
+    },
+    "m5_04": {
+      "what": "#282's reaction rule, its reactive episode and its train-only kappa0 per regime; the impact condition runs only through #282's runner as merged on main",
+      "kappa0_measurement": {
+        "commit": "f0f71275436b2cc49b62a30f4d4baff83be716bf",
+        "stdout_sha256": "5db240fbc959d070c789fb44c5e1bd541d5abbfa9dc8669a7a3640e4ce9ba16e",
+        "source": "every market order the simulator draws on each regime's training days 1-14 with #102's seeds; no validation, selection or holdout day"
+      }
+    }
+  },
+  "arms": {
+    "baseline_B": "#102's residual SAC over Avellaneda-Stoikov, set 2, retrained under this study's code with no adversary",
+    "adversarial_A": "the same, with the training adversary choosing each episode's perturbation",
+    "reference": "#102's frozen set 2 seeds 1 to 5, loaded as #108 loaded them; reported with no claim attached",
+    "same_for_A_and_B": "code, hyperparameters, training seeds, training days, the day drawn at each reset, the 5 x 100000 step schedule, environment steps and gradient steps. The only difference is the rows an episode runs on.",
+    "hyperparameters": {
+      "learning_rate": 0.0003,
+      "batch_size": 256,
+      "buffer_size": 200000,
+      "learning_starts": 5000,
+      "tau": 0.02,
+      "other": "Stable-Baselines3 SAC defaults, as #102"
+    },
+    "training_seeds": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "budget_steps": 500000
+  },
+  "grid": {
+    "points": "#108's 24 points: market {1, 1.5, 2} x cancel {1, 1.5} x theta {1, 1.2} x limit {1, 0.7}, in #108's order (itertools.product over market, cancel, theta, limit, in that order)",
+    "training_points": "the 12 points with limit 1.0, the unperturbed point among them",
+    "held_out_points": "the 12 points with limit 0.7; they include #108's fixed stress and #108's choice for #102's residual SAC (m2.0-c1.5-t1.2-l0.7)",
+    "held_out_other": [
+      "#108's execution stress",
+      "#282's own price impact at 2 kappa0"
+    ],
+    "tie_rule": "on a tie, the first point in grid order"
+  },
+  "training": {
+    "days": "#102's training days 1-14 of every regime, pooled; at a point, the same days simulated with #102's seeds (no offset) under the point's multipliers",
+    "day_draw": "as #102: every reset draws one training day from the run's seed, with the same generator for A and B, so both arms see the same sequence of days",
+    "point_draw": "A only: at every reset, after the day is drawn, the episode's point is drawn from the current phase's mixture by numpy.random.default_rng([281, training_seed, phase]), a generator apart from the day draw. B draws no point and runs the day unperturbed",
+    "phases": {
+      "count": 5,
+      "steps_each": 100000,
+      "how": "one SAC object per run, model.learn(100000, reset_num_timesteps=False) five times, for A and B alike. The replay buffer, the optimisers, the entropy coefficient and its optimiser, the target networks and the step count carry across phases; learning_starts (5000) counts once, from the first step; nothing is reset or reinitialised at a boundary. An episode running at a boundary finishes on its point; the new mixture applies from the next reset"
+    },
+    "mixture": {
+      "phase_1": "uniform over the 12 training points, the unperturbed point included, each 1/12",
+      "phases_2_to_5": "w is the worst training point by the score of the policy as it stands at the end of the previous phase. w has probability 0.50; each of the other 11 has 0.25 / 11; the unperturbed point has another 0.25. So the unperturbed point has 0.25 + 0.25 / 11 when it is not w, and 0.75 when it is. The extra weight on unperturbed days is intended: it keeps nominal days in training and bounds the cost of robustness",
+      "own_adversary": "each A seed is scored and gets its own w; no seed sees another's score"
+    },
+    "score": {
+      "what": "before phases 2 to 5, the current policy, deterministic, evaluation seed 101, run on each of the 12 training points over 6 scoring days",
+      "scoring_days": "training days 1 and 8 of each regime (calm, stressed, thin)",
+      "statistic": "the largest daily loss (loss = -net) of the 6 days. With 6 days the 5 % CVaR of the worst ceil(0.05 x 6) = 1 day is this worst day, and it is reported under that name, not as a resolved 5 % tail",
+      "B": "B is scored at the same boundaries, on the same points and days, for its training curve only; the score never reaches B's training",
+      "isolation": "scoring runs in separate environments; it takes no step from the training environment, its generators or the replay buffer"
+    },
+    "logged": "per run and phase: the score of every training point, w, the mixture, the points drawn, every episode's day, point, return and length, losses and entropy coefficient as SB3 logs them, and wall clock",
+    "budget": "500000 environment steps and the same gradient steps per run for A and B. Scoring episodes are evaluation and are counted and timed apart, never inside the budget",
+    "checkpoint": "the policy after the fifth phase (500000 steps). There is no checkpoint or model selection: no intermediate checkpoint is a candidate, for either arm, so A and B have the same single opportunity"
+  },
+  "validation": {
+    "days": "#102's validation days 15-19 of every regime, unperturbed, deterministic, evaluation seed 101",
+    "use": "the reproduction check below, and a descriptive table of A, B and the reference; no choice is made on it",
+    "reproduction_check": {
+      "statistic": "the mean over B's 5 seeds of each seed's mean daily net over the 15 validation days",
+      "reference": {
+        "source": "#102's selection.json, residual SAC set 2, main execution, evaluation seed 101, at commit 8a625b04063d4f37448ec3807ee140571a859daa",
+        "per_seed_mean_daily_net": {
+          "1": -29.9,
+          "2": -32.5691,
+          "3": -23.1025,
+          "4": -26.7296,
+          "5": -23.5096
+        },
+        "mean": -27.1621,
+        "sample_sd": 4.0847
+      },
+      "tolerance": "|statistic - reference mean| <= 2 x 4.0847 x sqrt(2 / 5) = 5.1668, two standard errors of a difference of two 5-seed means at the reference's seed spread",
+      "on_failure": "stop and report; no selection, no freeze, no holdout"
+    }
+  },
+  "freeze_models": "after training and before any selection run, the sha256 of every checkpoint and its metadata is recorded and committed in frozen_models.json; selection and holdout refuse a checkpoint whose hash differs. No arm returns to training, and no seed is added, dropped or chosen after this point",
+  "selection": {
+    "days": "#108's selection days, 10 per regime (seed offset 100000), 30 in all, with #108's committed digests; never #102's or this study's holdout days",
+    "runs": "A, B and the reference, every seed, deterministic, evaluation seed 101, at each of the 12 held-out points",
+    "choice": "per arm, the held-out point with the largest 5 % CVaR of the seed-averaged arm's daily loss over the 30 days (the mean of the worst ceil(0.05 x 30) = 2 losses), #108's rule; first in grid order on a tie. p_A, p_B and p_ref",
+    "frozen": "the choices are written to selection.json and frozen, with its sha256, before the holdout"
+  },
+  "holdout": {
+    "days": {
+      "per_regime": 10,
+      "seed_offset": 300000,
+      "count": 30,
+      "seed": "the seed of day d of regime r is 1000003 r + d + 300000, r from 1 (calm, stressed, thin), d from 1 to 10; never one of #102's, #108's or #282's",
+      "digests": "written by qr_days before any policy runs, and committed, for every condition's exogenous rows: the unperturbed rows, the 12 held-out points' and the 11 in-sample points'. The impact condition's rows react to each policy's fills, so only its base rows (the unperturbed digests), kappa per regime, the reaction generator's seeds and #282's runner commit are fixed beforehand; the digest of every reacted day is recorded per policy and seed during the holdout, after the fact",
+      "weighting": "each regime's 10 days weigh equally, so the 30 days weigh equally"
+    },
+    "conditions": {
+      "unperturbed": "multipliers 1",
+      "held_out_points": "each of the 12 limit-0.7 points; p_A, p_B and p_ref are among them",
+      "execution_stress": "unperturbed rows under #108's execution_stress (queue_position_rational, 1 lot per 5000 ms, min_queue_ms 0)",
+      "impact": "unperturbed rows, reacting to the agent through #282's reactive episode at kappa = 2 kappa0 per regime; its reaction generator is seeded from the holdout day's seed, so it is fresh too. If #282's runner is not on main when this study freezes, the condition is reported as not run and nothing replaces it",
+      "in_sample": "each of the 11 perturbed training points, for A and B only, reported as in-sample adversary results that support no claim"
+    },
+    "runs": "A and B, every seed, every condition; the reference at every condition except in_sample; deterministic, evaluation seed 101",
+    "once": "the holdout runs once, from the frozen manifest. A marker created with O_EXCL before any day is read records the attempt; a failed or concurrent attempt is never rerun, and is reported"
+  },
+  "estimands": {
+    "loss": "loss = -net, per day. A positive loss is a loss",
+    "seed_averaged_arm": "an arm's day is the mean of its 5 seeds' nets that day, as #102 and #108. Its CVaR is the tail of that averaged arm, not of a deployed seed",
+    "cvar": "CVaR5(X, c) = the mean of the ceil(0.05 x n) largest daily losses of X under condition c over the n = 30 holdout days, so the worst 2 days. It is a coarse tail statistic, and it is named as such",
+    "per_seed": "CVaR5 of each seed's own daily losses, and their mean over the 5 seeds: the expected tail of a single deployed seed. Reported for every arm and condition beside the seed-averaged one",
+    "primary": {
+      "cost": "D_net = mean daily net(A) - mean daily net(B), unperturbed. D_net < 0 is a cost of robustness",
+      "tail_at_p_A": "D_tail(p_A) = CVaR5(A, p_A) - CVaR5(B, p_A). D_tail < 0 means A's tail loss is smaller: an improvement",
+      "tail_at_p_B": "D_tail(p_B), the same at B's own selected point",
+      "envelope": "E = CVaR5(A, p_A) - CVaR5(B, p_B): a comparison of two selected risk envelopes, each arm at its own worst selected point; not a same-scenario treatment effect, and labelled so"
+    },
+    "secondary": "D_tail at every other held-out point, at the execution stress and at the impact condition; D_net under each condition; the same with per-seed CVaR. No multiplicity correction; the count of conditions whose interval excludes 0 is reported out of the held-out conditions actually evaluated: 14, or 13 when the impact condition is not run, stated"
+  },
+  "intervals": {
+    "kind": "paired, regime-stratified stationary block bootstrap over holdout days",
+    "replicate": "for each regime separately, a stationary bootstrap index sequence of length 10 over that regime's 10 days (geometric blocks of mean length 2, wrapping within the regime, never into another regime); the 30 resampled day indices are shared by A, B, every seed and every condition. On them each arm's statistic is recomputed (CVaR5 from the resampled days, or the mean), and the replicate's difference is the difference of those statistics. Pointwise daily differences are never bootstrapped and called a CVaR difference",
+    "replicates": 2000,
+    "confidence_percent": 90,
+    "quantiles": "5 % and 95 % of the replicates",
+    "seed": 281
+  },
+  "reading": [
+    "A tail gain is read at a condition only where D_tail's 90 % interval lies wholly below 0. The study's primary claim needs it at both p_A and p_B; if either D_tail(p_A) or D_tail(p_B) is unavailable (a failed estimator) the primary claim is reported as unavailable, whatever the other shows. E is reported beside them and never carries the claim alone.",
+    "An interval that holds 0 is reported as such; it is never read as robustness, equivalence or an absence of risk.",
+    "The fresh holdout is synthetic evidence from the same generator, not a claim of robustness in a market."
+  ],
+  "failures": {
+    "training": "a run that stops with an error is a failed seed. It is rerun once, with the same job, only when the process was killed from outside (out of memory, a reboot), and that is disclosed; never because of its results. A run whose weights or losses go non-finite is kept as it is and evaluated",
+    "evaluation": "a policy whose proposals are non-finite is evaluated as it acts: the environment treats them as any invalid proposal, and the fallbacks are counted. An episode that errors, or a non-finite daily net, leaves that seed's day missing",
+    "missing": "a missing seed-day is never dropped from a mean, a CVaR or a bootstrap. Any estimator that would need it is reported as failed, with no number, and so is any difference built on it; per-seed results of the other seeds are still shown, labelled. If D_tail(p_A) or D_tail(p_B) fails, the primary claim is unavailable (see reading); the study never reports a gain without both",
+    "reported": "every failed, rerun or diverged run, with its log"
+  },
+  "stop_rules": [
+    "B fails the reproduction check: stop and report.",
+    "A step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds."
+  ],
+  "steps": [
+    {
+      "name": "days",
+      "what": "the digests of the training points' days and of every holdout condition's exogenous rows, committed before any policy runs; for the impact condition, its base rows and provenance only (see holdout.days.digests)"
+    },
+    {
+      "name": "rate",
+      "what": "one A run's first 10000 steps and one scoring pass, timed, to fix the estimate"
+    },
+    {
+      "name": "train",
+      "what": "10 runs: A and B, seeds 1 to 5"
+    },
+    {
+      "name": "validate",
+      "what": "the reproduction check, and the validation table"
+    },
+    {
+      "name": "freeze_models",
+      "what": "checkpoint hashes, committed"
+    },
+    {
+      "name": "selection",
+      "what": "the held-out points on #108's selection days, and p_A, p_B, p_ref"
+    },
+    {
+      "name": "freeze",
+      "what": "the hashes of the design, the code, the digests, frozen_models.json and selection.json"
+    },
+    {
+      "name": "holdout",
+      "what": "once, from the frozen manifest's sha256"
+    },
+    {
+      "name": "report",
+      "what": "the estimands, intervals, training curves and costs"
+    }
+  ],
+  "compute": {
+    "machine": "Apple M4 Max",
+    "device": "cpu",
+    "threads_per_run": 1,
+    "max_parallel_runs": 4,
+    "estimate": "to be measured by the rate step; training: 10 runs x 500000 steps; scoring: 2 arms x 5 seeds x 4 boundaries x 12 points x 6 days; selection: 15 policies x 12 points x 30 days; holdout: (10 x 26 + 5 x 15) x 30 episodes",
+    "starts": "after #282's selection frees its slots, and on the maintainer's go"
+  },
+  "from_the_approved_note": [
+    "Model selection on validation days at the training points is dropped: the final checkpoint is the policy for both arms, so there is no candidate schedule to choose from.",
+    "The training adversary's score is named the worst daily loss of its 6 days, which is what the 5 % CVaR is on 6 days.",
+    "Per-seed CVaR is reported beside the seed-averaged arm's; the bootstrap is stratified by regime and recomputes each arm's CVaR per replicate.",
+    "The reproduction check has a numeric tolerance, and failures have a rule."
+  ],
+  "changes": []
+}

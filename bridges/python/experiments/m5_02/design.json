@@ -1,0 +1,298 @@
+{
+ "issue": 107,
+ "parts": "B and C",
+ "design_version": 2,
+ "status": "frozen before any training run of parts B and C",
+ "data": "synthetic everywhere; nothing here is market data",
+ "protocol": "#103's (experiments/m4_06/design.json, pinned below): its data for B, execution, fee rule and secondary fee, Box encoding with the reject policy, hyperparameter set, budget, training seeds, evaluation seed and bootstrap; one decision per row only",
+ "pins": {
+  "m4_06_design": "9a1d1423d1f0e70eca9dd169d03cf85dca1b81ae7bd81516098cd1654165af2a",
+  "m4_06_digests": "79c88f3329213048ceb88d001dbfd4d05d7faba74e3d9b60c29fe6b3d9a81e12",
+  "m4_06_commit": "283d4d47d3f60859b4519a1f5f0571833a4289b1"
+ },
+ "fee": {
+  "value": "-0.0001",
+  "source": "#103's fee_rule.json at design version 2 (283d4d4): the largest candidate at which its Avellaneda-Stoikov point has a positive mean daily net on training days",
+  "fee_rule_sha256": "cf3e2a3ab445cead9a7674dc4b39384233353f0851f6e6fbef60fc8ba3f5b26a",
+  "secondary": "0.0002, #103's fixed secondary row, on the holdout"
+ },
+ "market": {
+  "data": "synthetic: #103's 1 s queue-reactive days (3 regimes x 24), whose holdout #103 reads before this part's freeze; one policy per arm on the pooled training days, as #103"
+ },
+ "causal": {
+  "data": "synthetic: Hawkes market orders from examples/hawkes_days.rs moving the mid by a linear impact plus a diffusion of 1 tick per row, a one-tick spread; made-up parameters; 1 s rows as #103",
+  "kernel": {
+   "tick_size": "0.005",
+   "lot_size": "1",
+   "max_price": "1000",
+   "max_order_size": "10"
+  },
+  "flow": {
+   "rows_per_day": 86400,
+   "sample_ms": 1000,
+   "seconds_per_row": 1,
+   "queue_cap": 20,
+   "initial_queue": 10,
+   "rates": {
+    "limit": 1.5,
+    "cancel_per_lot": 0.05,
+    "market": 0.3
+   },
+   "decays": [
+    1.0,
+    0.1
+   ],
+   "weights": [
+    [
+     [
+      0.1,
+      0.05,
+      0.1
+     ],
+     [
+      0.05,
+      0.1,
+      0.05
+     ],
+     [
+      0.02,
+      0.02,
+      0.3
+     ]
+    ],
+    [
+     [
+      0.05,
+      0.02,
+      0.05
+     ],
+     [
+      0.02,
+      0.05,
+      0.02
+     ],
+     [
+      0.01,
+      0.01,
+      0.25
+     ]
+    ]
+   ],
+   "diffusion_ticks": 1.0,
+   "reference_ticks": 10000,
+   "spread_ticks": 1
+  },
+  "settings": [
+   {
+    "name": "impact_0",
+    "impact_ticks": 0.0
+   },
+   {
+    "name": "impact_low",
+    "impact_ticks": 0.25
+   },
+   {
+    "name": "impact_high",
+    "impact_ticks": 1.0
+   }
+  ],
+  "days": 24,
+  "splits": {
+   "train": [
+    1,
+    14
+   ],
+   "validation": [
+    15,
+    19
+   ],
+   "holdout": [
+    20,
+    24
+   ]
+  },
+  "seed": "1000003 + day for the day's flow (buy side 2 x seed, sell side 2 x seed + 1) and diffusion, the same in every setting",
+  "note": "one policy per arm and impact setting, on that setting's training days",
+  "changes": [
+   "before any training, after the queue check of training day 1: with a two-tick spread and a diffusion of 0.5 tick per row, the touch almost never crossed a quote, and Avellaneda-Stoikov filled 0 times at impact 0 and 0.25 even under immediate fill. The touch is now floor(mid) and one tick above it, and the diffusion 1 tick per row; the digests are regenerated."
+  ]
+ },
+ "window": {
+  "buffer": 32,
+  "market_features": [
+   "spread",
+   "mid_change",
+   "row_gap",
+   "bid_size",
+   "ask_size",
+   "imbalance"
+  ],
+  "agent_features": [
+   "position",
+   "entry_gap",
+   "open_orders",
+   "awaiting_cancel",
+   "steps_left"
+  ],
+  "rule": "each market feature's normalized value and its presence flag are channels; ages are in decisions; the agent's values and flags are scalars; the windowed arms also see the current observation's market channels as they are"
+ },
+ "arms": {
+  "mlp": {
+   "from": "#103, verbatim"
+  },
+  "ema": {
+   "from": "#103, verbatim"
+  },
+  "history": {
+   "from": "#103, verbatim"
+  },
+  "lstm": {
+   "from": "#103, verbatim"
+  },
+  "gru_window": {
+   "extractor": "recurrent",
+   "cell": "gru",
+   "embed": 8,
+   "hidden": 16,
+   "with_current": true
+  },
+  "hsn": {
+   "extractor": "hsn",
+   "alphas": [
+    0.2,
+    0.4
+   ],
+   "betas": [
+    0.346574,
+    0.086643
+   ],
+   "floor": 0.0001,
+   "with_current": true,
+   "note": "decays initialized at half-lives of 2 and 8 decisions, two of #103's EMA half-lives, and learned"
+  }
+ },
+ "parameters": {
+  "target": 11659,
+  "tolerance": 0.1,
+  "min_width": 8,
+  "max_width": 160,
+  "rule": "the windowed arms' policy and value MLPs have two hidden layers of the width whose trainable count is nearest #103's mlp; #103's arms keep their own and every count is reported"
+ },
+ "widths": {
+  "gru_window": 53,
+  "hsn": 55
+ },
+ "references": {
+  "points": {
+   "calm": {
+    "avellaneda_stoikov": {
+     "horizon_ms": 86400000,
+     "order_intensity": "50",
+     "risk_aversion": "0.0001",
+     "size": "1",
+     "volatility": "39.4970"
+    },
+    "glft": {
+     "intensity_scale_a": "1.5",
+     "max_inventory_lots": 5,
+     "min_spread": "0.005",
+     "order_intensity_k": "50",
+     "risk_aversion": "0.001",
+     "terminal_time": 86400000,
+     "volatility": "39.4970"
+    }
+   },
+   "stressed": {
+    "avellaneda_stoikov": {
+     "horizon_ms": 86400000,
+     "order_intensity": "50",
+     "risk_aversion": "0.01",
+     "size": "1",
+     "volatility": "63.4123"
+    },
+    "glft": {
+     "intensity_scale_a": "1.5",
+     "max_inventory_lots": 5,
+     "min_spread": "0.005",
+     "order_intensity_k": "50",
+     "risk_aversion": "0.001",
+     "terminal_time": 86400000,
+     "volatility": "63.4123"
+    }
+   },
+   "thin": {
+    "avellaneda_stoikov": {
+     "horizon_ms": 86400000,
+     "order_intensity": "50",
+     "risk_aversion": "0.01",
+     "size": "1",
+     "volatility": "71.0162"
+    },
+    "glft": {
+     "intensity_scale_a": "1.5",
+     "max_inventory_lots": 5,
+     "min_spread": "0.005",
+     "order_intensity_k": "50",
+     "risk_aversion": "0.001",
+     "terminal_time": 86400000,
+     "volatility": "71.0162"
+    }
+   }
+  },
+  "rule": "no-trade, and Avellaneda-Stoikov and GLFT as zero residuals. B: the points #103's classical selection chose at one decision per row, per regime, pinned here. C: the step classical selects per impact setting on C's validation days, at the fee, by #103's rule over #103's grids, with the volatility from C's training days; its file is hashed into the freeze",
+  "classical_selection_sha256": "902d4ca583db5af851a4ac8777894f639033306740cdd18e6b7ea48728e5402b"
+ },
+ "decision_rule": {
+  "against": "the best non-HSN learned arm by mean daily net on validation, chosen before the holdout",
+  "interval": "#103's 90 % block bootstrap over days on the paired daily difference, a learned arm's day being the mean over its seeds",
+  "hsn_helps": "the lower bound is above 0, HSN has no limit breach, its mean max drawdown is at most drawdown_factor times the control's, and its interval against no-trade excludes 0",
+  "revise": "the point estimate is above 0",
+  "no_gain": "otherwise",
+  "drawdown_factor": "1.2",
+  "applied": "B per regime and pooled, C per impact setting; at the chosen fee, and at #103's secondary 0.0002 beside it"
+ },
+ "audit": {
+  "observations": 10000,
+  "timed": 10000,
+  "rule": "a fixed set from the first validation day of the first group under a hold; two loads of every frozen checkpoint must give identical actions"
+ },
+ "compute": {
+  "machine": "Apple M4 Max",
+  "device": "cpu",
+  "threads_per_run": 1,
+  "estimate_job_minutes": {
+   "per_seed_market": {
+    "mlp": 6.6,
+    "ema": 7,
+    "history": 8,
+    "lstm": 40,
+    "gru_window": 18,
+    "hsn": 8
+   },
+   "market_training": 440,
+   "causal_training": 1320,
+   "evaluation_each_part": 120
+  },
+  "parallel": "as the shared cap allows, agreed on the bus",
+  "overrun_rule": "a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds",
+  "cut_rule": "if compute forces a cut, C drops to impact 0 and 1.0 and one Hawkes decay before any seed is cut, and the design states it"
+ },
+ "seen_before_freeze": [
+  "With an earlier draft at 10 s rows: one generation of the Hawkes days, and the mid range, the change of the mid per row and the touch sizes of training day 1 of each impact setting. No holdout or validation row was read.",
+  "Timing probes on 5000 synthetic rows (a random walk of the touch, not the design's data): 8192 PPO decisions of mlp, gru_window and hsn, timed and not evaluated (198, 534 and 246 microseconds a decision).",
+  "Smoke tests of every arm on 300 synthetic rows.",
+  "The queue check (check_queue.py) on training day 1 of every group of B and C: Avellaneda-Stoikov's fills and nets over #103's grid at 0.0002, under the design's fill model and under immediate fill (check_queue-market.json 7b6cf33f, check_queue-causal.json 84fee4e9).",
+  "#103's fee rule and classical selection results at fee -0.0001 as #103 reported them: training-day and validation means of its classical arms. No learned result of #103."
+ ],
+ "execution": {
+  "fill_model": {
+   "kind": "queue_position_rational",
+   "lots": 1,
+   "per_ms": 500,
+   "min_queue_ms": 0
+  },
+  "rule": "the standard set for every study on 1 s rows on 2026-11-07: one lot per 500 ms and no minimum time in queue. At one lot per 1000 ms an order requoted every 1 s row is 975 ms in queue at the next row and clears nothing; at 500 ms it clears one lot, and the touch ahead still binds. #103 adopts the same in its design version 2, and this part keeps whatever #103's base_config gives only if it equals this",
+  "check": "before any training, check_queue.py shows that Avellaneda-Stoikov fills on training days of every group and that its net differs from immediate fill"
+ },
+ "holdout_order": "#103 reads the shared holdout days of part B before this part's freeze; this part's report says so, and its author does not look at #103's holdout results before this part's holdout run"
+}

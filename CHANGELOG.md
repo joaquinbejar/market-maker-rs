@@ -8,6 +8,29 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
+  #102's residual SAC retrained with and without a training adversary that, between five
+  phases, moves the episode's flow perturbation toward the point where the policy loses most on
+  scoring days. The adversary trains on #108's 12 points with the limit rate unchanged; the 12
+  points with a lower limit rate, #108's execution stress and #282's own impact are held out.
+  Both arms are evaluated once on fresh holdout days, with paired regime-stratified block
+  bootstrap intervals of the CVaR difference recomputed per replicate. The design was committed
+  and agreed before any code or run. No gain shown: at the selected held-out point the
+  adversarially trained policy's tail loss is not smaller, and it costs about 3.3 a day
+  unperturbed. The holdout was resumed once after an attempt killed from outside, as disclosed.
+- The regime adaptation and transfer study of #112 in `bridges/python/experiments/m5_08`, with
+  examples `regime_days` (synthetic days that change regime at fixed times, on the
+  queue-reactive and the Hawkes simulators) and `regime_alarm` (a causal volatility and VPIN
+  detector). Fixed, detector-adaptive, coordinate-search oracle and learned arms, with and
+  without the detector, under data shift, execution change and simulator error, on #103's
+  protocol, frozen before the single holdout. The result is a no-go on every group; the
+  detector raises tens of false alarms a calm day. Synthetic data only; no real-data claim.
+- The HSN study of #107 in `bridges/python/experiments/m5_02`: a learnable mixture-of-exponentials
+  memory against MLP, frame-stack, fixed-EMA, GRU, LSTM and #103's memory arms, in the paper's
+  single-asset setting (part A) and on #103's 1 s protocol over queue-reactive days (B) and
+  Hawkes flow that moves the mid (C, example `hawkes_days`). Designs frozen before each run,
+  one holdout read. HSN helps nowhere: A reproduces the paper's tie and not its power-law gain,
+  and a fixed spread beats every learned arm there; B is no gain and C revise. Synthetic only.
 - A frequent batch auction toy for #289 in `bridges/python/experiments/m5_05_batch`, synthetic
   only and reported apart from the continuous order book. It collects orders for 500 ms, clears
   them at one uniform price, and has submit and cancel delays of 30, 60 or 100 ms. The clearing
