@@ -161,6 +161,54 @@ def evaluate(frozen_dir, rows):
     return out
 
 
+def consistency(frozen_dir, rows_dir):
+    """One checkpoint per family at #102's own execution must give #102's recorded calm
+    validation value exactly (design pins.consistency). Raises on any mismatch."""
+    run = _m4_05()
+    frozen_dir, rows_dir = pathlib.Path(frozen_dir), pathlib.Path(rows_dir)
+    manifest = json.loads((frozen_dir / "frozen.json").read_text())
+    selection = frozen_dir / "selection.json"
+    if run.sha256(selection) != manifest["selection_sha256"]:
+        raise ValueError("selection.json is not the frozen one")
+    recorded = {(r["arm"], r["candidate"], r["day"]): r["daily_value"]
+                for r in json.loads(selection.read_text())["learned_validation"]
+                if r["regime"] == REGIME and r["variant"] == "main"}
+    design, _ = run.load_design()
+    out = []
+    for arm, chosen_set in SELECTED.items():
+        metadata = next(r for r in manifest["runs"] if r["arm"] == arm and r["seed"] == 1
+                        and r["set"] == chosen_set and r["variant"] == "main" and r["penalty"] is None)
+        days = sorted(d for a, c, d in recorded if a == arm and c == f"set{chosen_set}-seed1")
+        if not days:
+            raise ValueError(f"no recorded validation value for {arm}")
+        masked = arm == "maskable_ppo"
+        for day in days:
+            config = copy.deepcopy(metadata["configs"][REGIME])
+            if not masked:
+                config["residual"]["baseline"]["session_start_ms"] = (day - 1) * run.DAY_MS
+            rows = [tuple(r) for r in json.loads(
+                (rows_dir / "validation" / REGIME / f"day-{day}.json").read_text())]
+            make = run.MaskableMarketMakingEnv if masked else run.ResidualMarketMakingEnv
+            env = make(config, rows)
+            try:
+                if env.bridge_info["kernel_fingerprint"] != metadata["kernel_fingerprint"]:
+                    raise ValueError(f"{arm}: another kernel fingerprint")
+                zipped = frozen_dir / "checkpoints" / f"{pathlib.Path(metadata['path']).name}.zip"
+                if run.sha256(zipped) != metadata["checkpoint_sha256"]:
+                    raise ValueError("a checkpoint changed")
+                model_class = run.MaskablePPO if masked else run.SAC
+                model = model_class.load(zipped, device="cpu")
+                model.policy.set_training_mode(False)
+                value = run.episode(model, env, EVALUATION_SEED, design)["net"]
+            finally:
+                env.close()
+            expected = recorded[(arm, f"set{chosen_set}-seed1", day)]
+            out.append({"arm": arm, "day": day, "recorded": expected, "value": value})
+            if run.Decimal(value) != run.Decimal(expected):
+                raise ValueError(f"inconsistent: {out[-1]}")
+    return out
+
+
 def inputs_of(path):
     value = json.loads(pathlib.Path(path).read_text())
     if "book_10s" in value:
