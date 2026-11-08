@@ -15,7 +15,9 @@ project follows [Semantic Versioning](https://semver.org/).
   points with a lower limit rate, #108's execution stress and #282's own impact are held out.
   Both arms are evaluated once on fresh holdout days, with paired regime-stratified block
   bootstrap intervals of the CVaR difference recomputed per replicate. The design was committed
-  and agreed before any code or run.
+  and agreed before any code or run. No gain shown: at the selected held-out point the
+  adversarially trained policy's tail loss is not smaller, and it costs about 3.3 a day
+  unperturbed. The holdout was resumed once after an attempt killed from outside, as disclosed.
 - The HSN study of #107 in `bridges/python/experiments/m5_02`: a learnable mixture-of-exponentials
   memory against MLP, frame-stack, fixed-EMA, GRU, LSTM and #103's memory arms, in the paper's
   single-asset setting (part A) and on #103's 1 s protocol over queue-reactive days (B) and

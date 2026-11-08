@@ -37,3 +37,38 @@ generator, so a result says nothing about a market.
 
 The impact condition runs only through #282's runner on main; without it, it is reported as not
 run and nothing replaces it.
+
+## Results (SYNTHETIC)
+
+The holdout ran once from frozen.json `4c8ca714...`, on 30 fresh days. Its first attempt was
+killed from outside and resumed once, as disclosed below. All 9600 rows are present.
+
+- **Primary claim: no gain shown.** Both arms' worst held-out point on the selection days is
+  m2.0-c1.5-t1.2-l0.7, so the tail contrast at p_A, at p_B and the envelope are one number. A
+  minus B in CVaR5 loss is +6.39 [-2.94, 13.98] for the seed-averaged arm and +10.02 [-1.62,
+  19.19] per seed (90 %). The point estimate says A's tail is larger, and the interval holds 0.
+- **Cost:** unperturbed, A's mean daily net is 3.32 below B's, [-4.45, -2.20].
+- **Secondary:** on none of the 13 held-out conditions evaluated is A's tail interval wholly
+  below B's. On two it is wholly above: m1.0-c1.0-t1.2-l0.7 (+9.13 [5.16, 11.49]) and
+  m1.5-c1.5-t1.0-l0.7 (+28.45 [5.07, 46.52]). No multiplicity correction.
+- **Reference:** retrained B reproduces #102's residual SAC exactly. Its validation daily nets
+  match #102's to every printed digit, and its selection and holdout rows equal the reference's.
+  The reference row adds nothing.
+
+Disclosures:
+- **Impact not run.** The impact condition was not run: #282's runner was not on main at the
+  freeze, so 13 held-out conditions, not 14. #108's learned criterion on impact stays open.
+- **frozen_models.json timing.** The file was written at 11:37:07Z, before the selection, and
+  the selection checked every checkpoint against it. It was committed after the selection,
+  unchanged.
+- **Resumed once.** The first holdout attempt (12:02:57Z) was killed at about 12:13:40Z, 627 s
+  in, with 2236 of 9600 jobs journaled, when the terminal session that started it ended.
+  - The transcript of that session has no entry between about 12:05Z and 12:36Z, so the exact
+    session exit time is not known.
+  - It was resumed once by resume.py (amendments.json), detached, with run.py and design.json
+    as frozen. Its marker records the journal's hash before the resume; the first 2236 lines
+    were unchanged after it.
+  - That nothing was read in between rests on the author's command log: a line count and a parse
+    only. It is not provable.
+  - "Same binary" rests on the native extension's mtime (08:14Z, before the first attempt): the
+    first attempt recorded no hashes. The resume recorded them.
