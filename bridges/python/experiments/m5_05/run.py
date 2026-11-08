@@ -496,9 +496,11 @@ def train(ctx, out, commit, rerun=(), limit=None, worker=None):
     results = []
     started = time.perf_counter()
     executor = concurrent.futures.ProcessPoolExecutor(ctx.parallel, mp_context=context)
+    ended = set()
     with attempts.open("a") as journal:
 
         def end(name, outcome, error=None):
+            ended.add(name)
             journal.write(json.dumps({"run": name, "ended": time.time(), "outcome": outcome,
                                       "error": error}) + "\n")
             journal.flush()
@@ -525,10 +527,12 @@ def train(ctx, out, commit, rerun=(), limit=None, worker=None):
                     results.append({"run": name, "failed": f"{type(error).__name__}: {error}"})
                     print(f"train: {name} FAILED: {error}", file=sys.stderr, flush=True)
         except concurrent.futures.TimeoutError:
-            stop_workers(executor)
-            for future, name in futures.items():
-                if not future.done() or future.cancelled():
+            # Every run without a journaled end is stopped, before the kill: a killed worker's
+            # future then reads as done with BrokenProcessPool, which is not its outcome.
+            for name in futures.values():
+                if name not in ended:
                     end(name, "stopped", f"over 1.5 times the estimate ({limit:.0f} s)")
+            stop_workers(executor)
             raise Overrun(f"train ran past {limit:.0f} s; the unfinished runs are stopped")
         finally:
             executor.shutdown(wait=True, cancel_futures=True)

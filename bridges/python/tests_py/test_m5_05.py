@@ -524,3 +524,22 @@ def test_a_failed_seed_is_frozen_as_failed_and_its_days_are_missing(tmp_path, mo
         run.check_models(FakeCtx(), tmp_path)
     monkeypatch.setattr(run, "policies", lambda ctx, out: [("adversarial", 3, None)])
     assert run.check_models(FakeCtx(), tmp_path)["adversarial-seed3"]["failed"]
+
+
+def test_an_overrun_in_a_real_process_pool_stops_every_unfinished_run(tmp_path):
+    """Spawned workers, killed at the limit: every run without an end is journaled stopped,
+    never left rerunnable."""
+    import m5_05_workers
+
+    ctx = FakeCtx()
+    ctx.parallel = 2
+    started = time.perf_counter()
+    with pytest.raises(run.Overrun):
+        run.train(ctx, tmp_path, "c", limit=3, worker=m5_05_workers.sleeping)
+    assert time.perf_counter() - started < 20
+    ends = run.outcomes(tmp_path / "train.attempts")
+    assert len(ends) == 10
+    assert {r["end"]["outcome"] for r in ends.values()} == {"stopped"}
+    for name in ends:
+        with pytest.raises(ValueError, match="never rerun"):
+            run.rerunnable(name, ends[name], (name,))
