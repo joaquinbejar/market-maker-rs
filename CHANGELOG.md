@@ -26,6 +26,12 @@ project follows [Semantic Versioning](https://semver.org/).
   the earlier ones unchanged, at most `rl::MAX_REACTION_MOVES` at a time. With no reaction its
   market is `qr_market`'s. The Python bridge gains `ReactiveQrMarket` over one regime's day, and
   each step's `info["filled_lots"]`, the lots the agent bought and sold during the step.
+  `NativeEnv.replace_rows` (and `replace_rows` on the bridge's environments) replaces the rows
+  under a running episode: the worker rebuilds the environment, resets it with the episode's
+  seed and replays its steps in Rust, after checking that the new rows keep the rows already
+  read; the replayed state must equal the episode's apart from the dataset's identity
+  (`RlState::same_apart_from_dataset`, `KernelState::same_apart_from_dataset`), with the same
+  observation and masks. A refused replace leaves the episode as it was.
 - A second, margin-stress holdout for #105's comparison in `bridges/python/experiments/m4_08`
   (`stress.py`, `report_stress.py`, `stress_design.json`): the frozen runs on five new days per
   regime, by #102's seed rule, unshocked and shocked, with every step's account assessed by

@@ -74,3 +74,43 @@ def test_each_step_reports_the_lots_filled_by_side():
         total = {side: total[side] + filled[side] for side in total}
         done = terminated or truncated
     assert total["buy"] > 0 and total["sell"] > 0, total
+
+
+def test_replacing_rows_replays_as_a_fresh_run_on_them():
+    """The worker's replay against the plain path: a fresh environment on the new rows,
+    stepped with the same actions from the start."""
+    grid = DESIGN["arms"]["maskable_ppo"]["grid"]
+    cfg = {**config(), "tick_size": DESIGN["kernel"]["tick_size"],
+           "lot_size": DESIGN["kernel"]["lot_size"], "bid_offsets": grid["bid_offsets"],
+           "ask_offsets": grid["ask_offsets"], "sizes": grid["sizes"], "max_steps": 400}
+    day = market(regime=0, day=2, rows=400)
+    action = [1, 1, 1, 0, 0]
+    env = MaskableMarketMakingEnv(cfg, [tuple(r) for r in day.rows()])
+    replaced = 0
+    try:
+        env.reset(seed=3)
+        steps = 0
+        done = False
+        while not done:
+            _, _, terminated, truncated, info = env.step(action)
+            steps += 1
+            done = terminated or truncated
+            if not done and info["filled_lots"]["sell"] != info["filled_lots"]["buy"] and replaced < 20:
+                up = info["filled_lots"]["sell"] > info["filled_lots"]["buy"]
+                day.react(info["row"], 1 if up else -1)
+                digest = env.bridge_info["dataset_digest"]
+                env.replace_rows(day.rows())
+                assert env.bridge_info["dataset_digest"] != digest
+                replaced += 1
+        final = env.attribution()
+    finally:
+        env.close()
+    assert replaced > 0
+    fresh = MaskableMarketMakingEnv(cfg, [tuple(r) for r in day.rows()])
+    try:
+        fresh.reset(seed=3)
+        for _ in range(steps):
+            *_, info = fresh.step(action)
+        assert fresh.attribution() == final
+    finally:
+        fresh.close()

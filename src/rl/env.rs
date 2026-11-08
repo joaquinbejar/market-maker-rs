@@ -257,6 +257,15 @@ impl<const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
         &self.kernel
     }
 
+    /// Whether `other` equals this state in every field but its kernel's dataset identity,
+    /// as [`KernelState::same_apart_from_dataset`] (#282).
+    #[must_use]
+    pub fn same_apart_from_dataset(&self, other: &Self) -> bool {
+        let mut moved = *self;
+        moved.kernel = other.kernel;
+        moved == *other && self.kernel.same_apart_from_dataset(&other.kernel)
+    }
+
     /// Returns true once no more steps can be taken.
     #[must_use]
     pub fn is_done(&self) -> bool {
