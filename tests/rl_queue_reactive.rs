@@ -431,3 +431,34 @@ fn test_a_reaction_keeps_the_rows_up_to_it_and_simulates_the_rest_from_the_moved
     assert!(original.clone().react(60, -bound - 1).is_err());
     assert!(original.clone().react(60, i64::MIN).is_err());
 }
+
+#[test]
+fn test_after_an_imposed_move_waits_run_from_the_move_and_the_generator_is_accounted() {
+    let mut simulator = QrSimulator::new(params(), 11, 100).unwrap();
+    simulator.run(5.0, 5.0).unwrap();
+    let state = simulator.state();
+    let mut moved = QrSimulator::from_state(params(), state).unwrap();
+    moved.impose_reference_move(true).unwrap();
+    let at = moved.state();
+    // One outer queue is drawn from the simulator's own generator, the same way each time.
+    assert_ne!(at.rng_state, state.rng_state);
+    let mut twice = QrSimulator::from_state(params(), state).unwrap();
+    twice.impose_reference_move(true).unwrap();
+    assert_eq!(twice.state(), at);
+    // The first event after the move waits from the move, not from the queue's last event
+    // before it: the clocks restarted there, as after a move of θ.
+    let move_time = at.clock_seconds;
+    match moved.step().unwrap() {
+        QrStep::Event { observation, .. } => {
+            let now = moved.state().time_seconds;
+            assert!((observation.waiting_seconds - (now - move_time)).abs() < 1e-12);
+        }
+        other => panic!("{other:?}"),
+    }
+    // No move leaves the state, the generator included, as it was.
+    let cfg = config();
+    let market = ReactiveQrMarket::new(&params(), &episode(11), &cfg).unwrap();
+    let mut same = market.clone();
+    same.react(30, 0).unwrap();
+    assert_eq!(same.states(), market.states());
+}
