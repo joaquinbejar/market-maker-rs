@@ -11,7 +11,7 @@
    "margin shortfall against a real capital: #295 used a made-up capital of 250"
   ],
   "elsewhere": "#282 (m5_04) frozen #102 arms under own impact; #281 (m5_05) adversarial training",
-  "closes_108": "the part 2 PR closes #108 only if part 1 reports every declared arm and condition and part 2 ran or is declared not run with its reason; margin shortfall is stated as not measured, so the PR must say whether that scope item is waived by the coordinator"
+  "closes_108": "the part 2 PR closes #108 only if part 1 reports every declared arm and condition and part 2 ran or is declared not run with its reason; margin shortfall is stated as not measured, so the PR must say whether that scope item is waived"
  },
  "part_1_hawkes": {
   "simulator": "experiments/m5_02/design.json causal section, examples/hawkes_days.rs; base rates, decays, weights, diffusion, spread and kernel unchanged; made-up",
