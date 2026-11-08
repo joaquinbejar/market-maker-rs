@@ -1,6 +1,6 @@
 {
   "issue": 282,
-  "design_version": 1,
+  "design_version": 2,
   "data": "synthetic: #102's queue-reactive regimes (a simulator with made-up parameters) and #108's perturbed copies, with rows that react to the agent's fills; no market data",
   "bounds": "One synthetic simulator with made-up parameters and one model of own impact bound what this study can show. The frozen #102 policies were trained without own impact, so this measures their robustness to it, not an adapted policy. It says nothing about a market's impact.",
   "reuses": {
@@ -27,9 +27,32 @@
     "kappa0": "per regime, the regime's own impact of one exogenous market order: every market order the simulator draws on the regime's training days 1-14 with #102's seeds (no offset), each weighted equally; response = sign x (reference 10 s after the event - reference just before it), sign +1 for a buy (takes the ask) and -1 for a sell (takes the bid), horizon from the event time; divided by the order's lots (event_sizes[depth], lot 1); orders within 10 s of a day's end left out. kappa0_buy and kappa0_sell are each averaged over their own side's orders; kappa0 = their mean",
     "measured_by": "cargo run --release --example qr_impact -- experiments/m4_05/design.json",
     "units": "simulator ticks per lot",
-    "values": null,
+    "values": {
+      "calm": {
+        "kappa0": 0.08360187543428829,
+        "kappa0_buy": 0.08096923042690604,
+        "kappa0_sell": 0.08623452044167056,
+        "orders": 4312377
+      },
+      "stressed": {
+        "kappa0": 0.09824853959581778,
+        "kappa0_buy": 0.11146385980487673,
+        "kappa0_sell": 0.08503321938675883,
+        "orders": 10200899
+      },
+      "thin": {
+        "kappa0": 0.20948804113320008,
+        "kappa0_buy": 0.208375570160395,
+        "kappa0_sell": 0.2106005121060051,
+        "orders": 3402904
+      }
+    },
     "stop": "a side-normalized kappa0 that is negative or not finite stops the study, reported; no absolute value, no reversed grid. A kappa0 of 0 for a regime makes kappa 0 there, reported",
-    "grid": "kappa in {0, kappa0, 2 kappa0}, per regime"
+    "grid": "kappa in {0, kappa0, 2 kappa0}, per regime",
+    "measurement": {
+      "commit": "f0f71275436b2cc49b62a30f4d4baff83be716bf",
+      "stdout_sha256": "5db240fbc959d070c789fb44c5e1bd541d5abbfa9dc8669a7a3640e4ce9ba16e"
+    }
   },
   "grid": "#108's 24 flow points x the 3 kappa values = 72 points",
   "fixed_stress": {
@@ -98,5 +121,13 @@
     "max_parallel_runs": 0,
     "threads_per_run": 1
   },
-  "changes": []
+  "changes": [
+    {
+      "version": 2,
+      "seen": "kappa0 measured on #102's training days (synthetic); no policy had run",
+      "what": [
+        "kappa0's values recorded; every side positive and finite, so no stop rule fired"
+      ]
+    }
+  ]
 }
