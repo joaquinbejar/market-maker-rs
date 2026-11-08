@@ -17,6 +17,7 @@ import json
 import multiprocessing
 import os
 import pathlib
+import subprocess
 import sys
 import time
 
@@ -50,6 +51,28 @@ def repair_journal(path):
     if torn or not text.endswith("\n") and text:
         path.write_text("".join(line + "\n" for line in complete))
     return len(complete), torn
+
+
+def environment():
+    """What the run executes beside run.py: the bridge's native extension, the bridge's
+    Cargo.lock and the Python packages, by hash, with the extension's build time."""
+    import mm_rl_bridge._native as native
+
+    extension = pathlib.Path(native.__file__)
+    freeze = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True,
+                            text=True, check=False).stdout
+    if not freeze.strip():
+        freeze = subprocess.run(["uv", "pip", "freeze", "--python", sys.executable],
+                                capture_output=True, text=True, check=False).stdout
+    lock = HERE.parent.parent / "Cargo.lock"
+    return {"extension_sha256": sha256(extension), "extension_mtime": extension.stat().st_mtime,
+            "cargo_lock_sha256": sha256(lock) if lock.exists() else None,
+            "packages_sha256": hashlib.sha256(freeze.encode()).hexdigest()}
+
+
+def prefix_sha256(path, nbytes):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read(nbytes)).hexdigest()
 
 
 def first_attempt_seconds(out):
@@ -91,19 +114,27 @@ def resume(ctx, out, commit, frozen_sha256):
     except FileExistsError as error:
         raise ValueError("the holdout was resumed already: no further resume") from error
     complete, torn = repair_journal(out / "holdout.journal")
+    journal = out / "holdout.journal"
+    before = {"lines": complete, "bytes": journal.stat().st_size,
+              "sha256": sha256(journal)}
     with os.fdopen(marker, "w") as handle:
         handle.write(json.dumps({"started": time.time(), "pid": os.getpid(),
                                  "frozen_sha256": frozen_sha256, "first_attempt": first,
                                  "resume_sha256": sha256(__file__),
-                                 "journaled_before": complete, "torn_line_dropped": torn,
+                                 "run_sha256": sha256(HERE / "run.py"),
+                                 "journal_before": before, "torn_line_dropped": torn,
+                                 "environment": environment(),
                                  "limit_seconds": limit}) + "\n")
-    rows = run.pool(jobs, run.run_policy, ctx.parallel, "holdout resume",
-                    out / "holdout.journal", limit)
+    rows = run.pool(jobs, run.run_policy, ctx.parallel, "holdout resume", journal, limit)
+    # The first attempt's lines are untouched: the journal only grew after them.
+    if prefix_sha256(journal, before["bytes"]) != before["sha256"]:
+        raise ValueError("the first attempt's journal lines changed during the resume")
     here["frozen_sha256"] = frozen_sha256
     here["chosen"] = frozen["chosen"]
     here["impact_run"] = frozen["impact"] is not None
-    here["resumed"] = {"journaled_before": complete, "torn_line_dropped": torn,
-                       "resume_sha256": sha256(__file__)}
+    here["resumed"] = {"journal_before": before, "torn_line_dropped": torn,
+                       "first_lines_unchanged": True, "resume_sha256": sha256(__file__),
+                       "environment": environment()}
     here["rows"] = rows
     ctx.write(out, "holdout", here)
     return here

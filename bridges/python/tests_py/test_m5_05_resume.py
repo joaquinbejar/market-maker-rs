@@ -77,11 +77,13 @@ def test_the_resume_runs_once_after_a_first_attempt_and_marks_itself_first(tmp_p
     report = resume.resume(Ctx(), tmp_path, "c", sha)
     marker, limit, journal = seen[0]
     assert marker["first_attempt"]["frozen_sha256"] == sha
-    assert marker["journaled_before"] == 1 and marker["torn_line_dropped"]
+    assert marker["journal_before"]["lines"] == 1 and marker["torn_line_dropped"]
+    assert marker["environment"]["extension_sha256"]
     # The overrun rule spans both attempts: 150 s less the first attempt's 30 s.
     assert limit == pytest.approx(120, abs=1)
     assert journal == line(1) + "\n"
-    assert report["resumed"]["journaled_before"] == 1
+    assert report["resumed"]["journal_before"]["lines"] == 1
+    assert report["resumed"]["first_lines_unchanged"]
     (tmp_path / "holdout.json").unlink()
     with pytest.raises(ValueError, match="resumed already"):
         resume.resume(Ctx(), tmp_path, "c", sha)
@@ -115,3 +117,25 @@ def test_run_py_is_the_frozen_code():
     assert resume.sha256(STUDY / "run.py") == \
         "82afd334a00905f120597a6329df1e25e6a01b7f5fb7ead1017f337eabe1878a"
     assert "run" in sys.modules
+
+
+def test_a_run_cut_mid_way_and_resumed_equals_an_uninterrupted_one(tmp_path):
+    """Real spawned pools: the first is stopped part way (its workers killed), the resume runs
+    with another process count, and the rows equal an uninterrupted run's byte for byte; the
+    first attempt's journal lines are untouched."""
+    import m5_05_workers
+
+    jobs = [{"condition": c, "arm": a, "seed": s, "regime": "calm", "day": d}
+            for c in ("unperturbed", "held_out:p") for a in ("adversarial", "baseline")
+            for s in (1, 2) for d in range(1, 11)]
+    whole = run.pool(jobs, m5_05_workers.deterministic, 2, "whole", tmp_path / "whole.journal",
+                     600)
+    cut = tmp_path / "cut.journal"
+    with pytest.raises(run.Overrun):
+        run.pool(jobs, m5_05_workers.deterministic, 1, "first", cut, 1.5)
+    complete, _ = resume.repair_journal(cut)
+    assert 0 < complete < len(jobs)
+    size, digest = cut.stat().st_size, resume.sha256(cut)
+    resumed = run.pool(jobs, m5_05_workers.deterministic, 3, "resume", cut, 600)
+    assert json.dumps(resumed, sort_keys=True) == json.dumps(whole, sort_keys=True)
+    assert resume.prefix_sha256(cut, size) == digest
