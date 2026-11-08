@@ -2,9 +2,12 @@
 fills. The design is design.json, fixed before any run.
 
     python experiments/m5_04/run.py rate <#102 run dir> <out dir> <commit>
+    python experiments/m5_04/run.py check <#102 run dir> <out dir> <commit>
 
 `rate` times one #102 training day (calm, day 1: neither a selection nor a holdout day) per arm
-at kappa 0 and at 2 kappa0, with the reactions it makes, before any slot is asked for.
+at kappa 0 and at 2 kappa0, with the reactions it makes, before any slot is asked for. `check`
+runs that day at 2 kappa0 with the worker's replay and with the Python one, per arm, and
+requires the same reactions, moves, net, attribution and positions.
 
 Synthetic data only.
 """
@@ -242,10 +245,49 @@ def rate(run_dir, out_dir, commit):
     return report
 
 
+def check(run_dir, out_dir, commit):
+    torch.set_num_threads(1)
+    design = json.loads((HERE / "design.json").read_text())
+    m4_05 = json.loads((HERE.parent / "m4_05" / "design.json").read_text())
+    frozen = json.loads((pathlib.Path(run_dir) / "frozen.json").read_text())
+    runs = m503.learned_runs(frozen, run_dir)
+    regime = m4_05["simulator"]["regimes"][0]
+    day, seed = 1, SEED_STRIDE + 1
+    kappa = 2 * design["impact_scale"]["values"][regime["name"]]["kappa0"]
+    out = {}
+    for arm in m503.ARMS:
+        rows = day_market(regime, m4_05, seed, day).rows()
+        policy, make_env = arm_policy(arm, regime["name"], day, rows, frozen, runs, m4_05)
+        results = {}
+        for path in ("native", "python"):
+            started = time.perf_counter()
+            result = reactive_episode(policy, make_env, day_market(regime, m4_05, seed, day),
+                                      kappa, impact_rng(seed), design["evaluation_seed"], m4_05,
+                                      replay=path)
+            results[path] = (round(time.perf_counter() - started, 2), result)
+        (native_s, native), (python_s, python) = results["native"], results["python"]
+        same = all(native[k] == python[k] for k in
+                   ("reactions", "moves", "net", "attribution", "positions", "steps"))
+        out[arm] = {"same": same, "reactions": native["reactions"], "moves": native["moves"],
+                    "net": native["net"], "seconds_native": native_s,
+                    "seconds_python": python_s}
+        print(arm, out[arm], file=sys.stderr, flush=True)
+        if not same:
+            raise SystemExit(f"{arm}: the replays differ")
+    report = {"step": "check", "commit": commit, "regime": regime["name"], "day": day,
+              "seed": seed, "kappa": kappa, "arms": out, "versions": base.versions()}
+    pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+    (pathlib.Path(out_dir) / "check.json").write_text(json.dumps(report, indent=2))
+    return report
+
+
 def main():
     step = sys.argv[1]
     if step == "rate":
         report = rate(*sys.argv[2:5])
+        print(json.dumps(report["arms"], indent=2))
+    elif step == "check":
+        report = check(*sys.argv[2:5])
         print(json.dumps(report["arms"], indent=2))
     else:
         raise SystemExit(f"unknown step {step!r}")
