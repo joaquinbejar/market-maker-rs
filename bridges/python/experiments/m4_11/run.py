@@ -25,6 +25,7 @@ import hashlib
 import importlib.util
 import json
 import multiprocessing
+import os
 import pathlib
 import sys
 import time
@@ -633,17 +634,8 @@ def freeze(study):
     return report
 
 
-def holdout(study, frozen_sha256):
-    frozen_path = study.out / "frozen.json"
-    if not frozen_path.exists() or sha256(frozen_path) != frozen_sha256:
-        raise PermissionError("the holdout runs only against the frozen manifest named")
-    frozen = json.loads(frozen_path.read_text())
-    for path, digest in {**frozen["checkpoints"], **frozen["logs"]}.items():
-        if sha256(path) != digest:
-            raise ValueError(f"{path} changed after the freeze")
-    for name, digest in frozen["reports"].items():
-        if sha256(study.out / name) != digest:
-            raise ValueError(f"{name} changed after the freeze")
+def holdout_jobs(study, frozen):
+    """Every arm of the design on the holdout days, as the frozen manifest names them."""
     jobs = []
     days = study.days("holdout")
     for comparison, execution, datasets in (("primary", "standard", ["standard_eps30", "standard_eps10"]),
@@ -675,6 +667,40 @@ def holdout(study, frozen_sha256):
                                 offline_policy(run), seed_of_arm=run["seed"],
                                 comparison=comparison, dataset=dataset,
                                 epsilon=study.epsilon_of(dataset), edges=edges))
+    return jobs
+
+
+HOLDOUT_MARKER = "holdout.started"
+
+
+def holdout(study, frozen_sha256):
+    frozen_path = study.out / "frozen.json"
+    if not frozen_path.exists() or sha256(frozen_path) != frozen_sha256:
+        raise PermissionError("the holdout runs only against the frozen manifest named")
+    if (study.out / "holdout.json").exists():
+        raise PermissionError("the holdout was evaluated already")
+    if (study.out / HOLDOUT_MARKER).exists():
+        raise PermissionError("the holdout was started already; a failed or concurrent attempt "
+                              "is not run again, and recovery is by hand")
+    frozen = json.loads(frozen_path.read_text())
+    if frozen["design_sha256"] != sha256(HERE / "design.json"):
+        raise ValueError("design.json changed after the freeze")
+    for name, digest in frozen["code_sha256"].items():
+        if sha256(HERE / name) != digest:
+            raise ValueError(f"{name} changed after the freeze")
+    for path, digest in {**frozen["checkpoints"], **frozen["logs"]}.items():
+        if sha256(path) != digest:
+            raise ValueError(f"{path} changed after the freeze")
+    for name, digest in frozen["reports"].items():
+        if sha256(study.out / name) != digest:
+            raise ValueError(f"{name} changed after the freeze")
+    jobs = holdout_jobs(study, frozen)
+    # Before any job reads a holdout day: created only if absent, so a concurrent attempt
+    # fails here, and kept if the evaluation fails, so it is never run again on its own.
+    descriptor = os.open(study.out / HOLDOUT_MARKER, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    with os.fdopen(descriptor, "w") as marker:
+        marker.write(json.dumps({"commit": study.commit, "frozen_sha256": frozen_sha256,
+                                 "jobs": len(jobs), "at": time.time()}))
     rows = pool(jobs, run_job, study.parallel, "holdout")
     for job, row in zip(jobs, rows, strict=True):
         row["comparison"] = job["comparison"]

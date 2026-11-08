@@ -132,3 +132,82 @@ def test_mean_by_averages_each_arms_daily_nets():
     rows = [{"arm": "a", "net": "1"}, {"arm": "a", "net": "2"}, {"arm": "b", "net": "-1"}]
     means = run.mean_by(rows, "arm")
     assert str(means["a"]) == "1.5" and str(means["b"]) == "-1"
+
+
+class Frozen:
+    """What the holdout reads of a study: its output directory and commit."""
+
+    def __init__(self, out):
+        self.out, self.commit, self.parallel = pathlib.Path(out), "c0ffee", 1
+
+
+def frozen_study(tmp_path):
+    checkpoint = tmp_path / "bc-seed1.pt"
+    checkpoint.write_bytes(b"weights")
+    (tmp_path / "gate.json").write_text("{}")
+    manifest = {"design_sha256": run.sha256(run.HERE / "design.json"),
+                "code_sha256": {name: run.sha256(run.HERE / name) for name in run.CODE},
+                "checkpoints": {str(checkpoint): run.sha256(checkpoint)}, "logs": {},
+                "reports": {"gate.json": run.sha256(tmp_path / "gate.json")}, "tags": {}}
+    (tmp_path / "frozen.json").write_text(json.dumps(manifest))
+    return Frozen(tmp_path), run.sha256(tmp_path / "frozen.json"), checkpoint
+
+
+def test_the_holdout_runs_once_against_its_manifest_and_unchanged_design_and_code(
+        tmp_path, monkeypatch):
+    study, good, checkpoint = frozen_study(tmp_path)
+    jobs = [{"comparison": "primary", "dataset": None}]
+    monkeypatch.setattr(run, "holdout_jobs", lambda study, frozen: list(jobs))
+    monkeypatch.setattr(run, "pool", lambda jobs, worker, parallel, label: [{} for _ in jobs])
+    monkeypatch.setattr(run, "support_report", lambda study, rows: {})
+    study.header = lambda step: {"step": step}
+    study.write = lambda name, report: (study.out / f"{name}.json").write_text(json.dumps(report))
+    with pytest.raises(PermissionError, match="frozen manifest named"):
+        run.holdout(study, "0" * 64)
+    manifest = json.loads((tmp_path / "frozen.json").read_text())
+    for key, changed in (("design_sha256", "0" * 64),
+                         ("code_sha256", {**manifest["code_sha256"], "run.py": "0" * 64})):
+        (tmp_path / "frozen.json").write_text(json.dumps(manifest | {key: changed}))
+        with pytest.raises(ValueError, match="changed after the freeze"):
+            run.holdout(study, run.sha256(tmp_path / "frozen.json"))
+        assert not (tmp_path / run.HOLDOUT_MARKER).exists()
+    (tmp_path / "frozen.json").write_text(json.dumps(manifest))
+    report = run.holdout(study, good)
+    assert report["frozen_sha256"] == good and (tmp_path / run.HOLDOUT_MARKER).exists()
+    with pytest.raises(PermissionError, match="evaluated already"):
+        run.holdout(study, good)
+    (tmp_path / "holdout.json").unlink()
+    # The marker stays: with the result gone, the holdout is still not read again.
+    with pytest.raises(PermissionError, match="started already"):
+        run.holdout(study, good)
+
+
+def test_a_failed_or_concurrent_holdout_is_never_run_again(tmp_path, monkeypatch):
+    study, good, _ = frozen_study(tmp_path)
+    calls = []
+    monkeypatch.setattr(run, "holdout_jobs", lambda study, frozen: [{"comparison": "primary"}])
+
+    def failing(jobs, worker, parallel, label):
+        calls.append(len(jobs))
+        raise RuntimeError("a worker failed after reading days")
+
+    monkeypatch.setattr(run, "pool", failing)
+    with pytest.raises(RuntimeError, match="worker failed"):
+        run.holdout(study, good)
+    assert (tmp_path / run.HOLDOUT_MARKER).exists() and not (tmp_path / "holdout.json").exists()
+    with pytest.raises(PermissionError, match="started already"):
+        run.holdout(study, good)
+    assert calls == [1]
+    # The marker is created exclusively: an attempt that loses the race fails on creation.
+    (tmp_path / run.HOLDOUT_MARKER).unlink()
+    real = run.os.open
+
+    def racing(path, flags, *args):
+        if str(path).endswith(run.HOLDOUT_MARKER) and not run.os.path.exists(path):
+            pathlib.Path(path).write_text("{}")
+        return real(path, flags, *args)
+
+    monkeypatch.setattr(run.os, "open", racing)
+    with pytest.raises(FileExistsError):
+        run.holdout(study, good)
+    assert calls == [1]
