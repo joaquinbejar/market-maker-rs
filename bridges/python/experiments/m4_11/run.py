@@ -626,7 +626,12 @@ def freeze(study):
             for run in trained_runs(study, dataset, tag):
                 checkpoints[run["path"]] = sha256(run["path"])
     for run in study.read("ppo")["runs"]:
-        checkpoints[run["path"]] = run["checkpoint_sha256"]
+        # #102's training saves the model at its path with stable-baselines3's ".zip" and hashes
+        # that file: the manifest names the file the holdout loads and checks.
+        path = pathlib.Path(run["path"]).with_suffix(".zip")
+        if sha256(path) != run["checkpoint_sha256"]:
+            raise ValueError(f"{path} is not the PPO checkpoint its record names")
+        checkpoints[str(path)] = run["checkpoint_sha256"]
     logs = {}
     for dataset in ("standard_eps30", "standard_eps10", "m4_07_eps30"):
         for split in ("train", "validation"):

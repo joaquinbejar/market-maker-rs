@@ -224,3 +224,66 @@ def test_every_pool_worker_is_this_runners_own_function(monkeypatch):
     assert workers and all(isinstance(w, ast.Name) and w.id in defined for w in workers), [
         ast.unparse(w) for w in workers]
     assert run.ppo_job.__module__ == run.__name__
+
+
+class Freezing(Frozen):
+    """A study up to the freeze: every checked report, trained run and log on disk."""
+
+    def __init__(self, out):
+        super().__init__(out)
+        self.files = {}
+
+    def header(self, step):
+        return {"step": step, "design_sha256": run.sha256(run.HERE / "design.json"),
+                "code_sha256": {name: run.sha256(run.HERE / name) for name in run.CODE}}
+
+    def read(self, name):
+        return json.loads((self.out / f"{name}.json").read_text())
+
+    def write(self, name, report):
+        (self.out / f"{name}.json").write_text(json.dumps(report))
+
+    def logs(self, dataset, split):
+        path = self.out / f"log-{dataset}-{split}.npz"
+        path.write_bytes(b"log")
+        return [{"path": str(path), "sha256": run.sha256(path)}]
+
+
+def freezing_study(tmp_path):
+    study = Freezing(tmp_path)
+    for name in ("gate", "sanity-standard_eps30", "sanity-standard_eps10", "sanity-m4_07_eps30",
+                 "consistency"):
+        study.write(name, {"stop": False})
+    study.write("select", {"alpha": 1.0, "stop": False})
+    for dataset in ("standard_eps30", "standard_eps10", "m4_07_eps30"):
+        for tag in ("bc", "cql-alpha1.0"):
+            weights = tmp_path / f"{dataset}-{tag}.pt"
+            weights.write_bytes(f"{dataset}{tag}".encode())
+            study.write(f"train-{dataset}-{tag}", {"runs": [{"path": str(weights)}]})
+    # #102's train_job saves `<path>.zip` and records the hash of that file under `path`.
+    ppo = tmp_path / "checkpoints" / "ppo" / "maskable_ppo-seed1"
+    ppo.parent.mkdir(parents=True)
+    ppo.with_suffix(".zip").write_bytes(b"ppo weights")
+    study.write("ppo", {"runs": [{"path": str(ppo),
+                                  "checkpoint_sha256": run.sha256(ppo.with_suffix(".zip"))}]})
+    return study, ppo
+
+
+def test_a_frozen_study_passes_the_holdouts_checks_with_its_ppo_checkpoints(tmp_path, monkeypatch):
+    study, ppo = freezing_study(tmp_path)
+    frozen = run.freeze(study)
+    assert str(ppo.with_suffix(".zip")) in frozen["checkpoints"]
+    assert str(ppo) not in frozen["checkpoints"]
+    monkeypatch.setattr(run, "holdout_jobs", lambda study, frozen: [{"comparison": "primary"}])
+    monkeypatch.setattr(run, "pool", lambda jobs, worker, parallel, label: [{} for _ in jobs])
+    monkeypatch.setattr(run, "support_report", lambda study, rows: {})
+    report = run.holdout(study, run.sha256(tmp_path / "frozen.json"))
+    assert report["frozen_sha256"] == run.sha256(tmp_path / "frozen.json")
+
+
+def test_the_freeze_refuses_a_ppo_checkpoint_unlike_its_record(tmp_path):
+    study, ppo = freezing_study(tmp_path)
+    ppo.with_suffix(".zip").write_bytes(b"other weights")
+    with pytest.raises(ValueError, match="not the PPO checkpoint"):
+        run.freeze(study)
+    assert not (tmp_path / "frozen.json").exists()
