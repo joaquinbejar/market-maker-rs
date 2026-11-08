@@ -1099,6 +1099,35 @@ impl QrSimulator {
         })
     }
 
+    /// Moves the reference one tick up or down from outside the simulated flow (#282), as a
+    /// trade's permanent impact. The first limit's queue on the side the price moves through
+    /// is emptied first, then the queues shift as when `θ` moves the reference after that
+    /// queue empties, with no `θ` coin and no redraw. The move is imposed at the state's
+    /// clock: the state's time moves up to it, which leaves the law of the next event
+    /// unchanged since waits are exponential, and every queue's clock restarts there. The
+    /// shift draws the outermost queue from the simulator's own generator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::NumericalError`] on a failed conversion or a reference price
+    /// that overflows.
+    pub fn impose_reference_move(&mut self, up: bool) -> MMResult<()> {
+        let through = if up { QrSide::Ask } else { QrSide::Bid };
+        self.set_queue(through, 0, 0)?;
+        self.shift(up)?;
+        self.state.reference_ticks = if up {
+            self.state.reference_ticks.checked_add(1)
+        } else {
+            self.state.reference_ticks.checked_sub(1)
+        }
+        .or_overflow("reference price")?;
+        let now = self.state.clock_seconds.max(self.state.time_seconds);
+        self.state.time_seconds = now;
+        self.state.bid_last = [now; MAX_LIMITS];
+        self.state.ask_last = [now; MAX_LIMITS];
+        Ok(())
+    }
+
     /// Whether a mid move moves the reference, and its effects.
     /// Redraws the first limit's queue on `side` from its invariant law at `now`.
     fn reset(&mut self, side: QrSide, now: f64) -> MMResult<QrStep> {

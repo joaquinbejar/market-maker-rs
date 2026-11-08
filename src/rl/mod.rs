@@ -176,7 +176,9 @@ pub use env::{
     RlConfig, RlEnv, RlState, StepReward, TerminalClose, Transition,
 };
 pub use features::{FeatureVector, HedgeFeatureVector};
-pub use queue_reactive::{MAX_QR_ROWS, QrEpisode, QrMarket, qr_market};
+pub use queue_reactive::{
+    MAX_QR_ROWS, MAX_REACTION_MOVES, QrEpisode, QrMarket, ReactiveQrMarket, qr_market,
+};
 pub use residual::{
     RESIDUAL_VERSION, ResidualBounds, ResidualClips, ResidualDecision, ResidualDelta, ResidualEnv,
     ResidualFallback, ResidualProposal, ResidualStep, compose,
