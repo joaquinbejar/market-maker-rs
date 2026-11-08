@@ -189,6 +189,10 @@ def test_the_stress_holdout_runs_every_frozen_arm_on_the_new_days_once(tmp_path,
     with pytest.raises(ValueError, match="evaluated already"):
         stress.holdout(Ctx(), tmp_path, out, good)
     (out / "stress_holdout.json").unlink()
+    # The marker of the read stays: even with the result gone, it is not read again.
+    with pytest.raises(ValueError, match="started already"):
+        stress.holdout(Ctx(), tmp_path, out, good)
+    (out / "stress_holdout.started").unlink()
     (run_dir / "config.json").write_text('{"changed": 1}')
     with pytest.raises(ValueError, match="config.json changed"):
         stress.holdout(Ctx(), tmp_path, out, good)
@@ -275,3 +279,43 @@ def test_the_report_refuses_a_stress_holdout_of_another_manifest_or_design(tmp_p
     (out / "stress_holdout.json").write_text(json.dumps(base | {"stress_design_sha256": "0"}))
     with pytest.raises(ValueError, match="stress_design.json is not"):
         reporting.checked(tmp_path, out)
+
+
+def test_a_failed_or_concurrent_stress_holdout_is_never_run_again(tmp_path, monkeypatch):
+    good, _ = frozen(tmp_path)
+    calls = []
+
+    def failing(jobs, worker, parallel, label):
+        calls.append(len(jobs))
+        raise RuntimeError("a worker failed after reading days")
+
+    monkeypatch.setattr(run, "pool", failing)
+    out = tmp_path / "stress"
+    with pytest.raises(RuntimeError, match="worker failed"):
+        stress.holdout(Ctx(), tmp_path, out, good)
+    assert (out / "stress_holdout.started").exists()
+    assert not (out / "stress_holdout.json").exists()
+    with pytest.raises(ValueError, match="started already"):
+        stress.holdout(Ctx(), tmp_path, out, good)
+    assert len(calls) == 1
+    # A concurrent attempt finds the marker another one created, and stops before any job.
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "stress_holdout.started").write_text("{}")
+    with pytest.raises(ValueError, match="started already"):
+        stress.holdout(Ctx(), tmp_path, other, good)
+    assert len(calls) == 1
+    # The marker is created exclusively: an attempt that loses the race fails on creation.
+    racing = tmp_path / "racing"
+    real_exists = pathlib.Path.exists
+
+    def late(self):
+        if self.name == "stress_holdout.started" and not real_exists(self):
+            self.write_text("{}")
+            return False
+        return real_exists(self)
+
+    monkeypatch.setattr(pathlib.Path, "exists", late)
+    with pytest.raises(FileExistsError):
+        stress.holdout(Ctx(), tmp_path, racing, good)
+    assert len(calls) == 1

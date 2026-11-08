@@ -162,8 +162,12 @@ def holdout(ctx, run_out, stress_out, frozen_sha256):
         raise ValueError("the frozen manifest is not the one given")
     stress_out.mkdir(parents=True, exist_ok=True)
     target = stress_out / "stress_holdout.json"
+    marker = stress_out / "stress_holdout.started"
     if target.exists():
         raise ValueError("the margin-stress holdout was evaluated already")
+    if marker.exists():
+        raise ValueError("the margin-stress holdout was started already; a failed or "
+                         "concurrent attempt is not run again, and recovery is by hand")
     frozen = json.loads(path.read_text())
     for key, name in (("design_sha256", "design.json"), ("shocks_sha256", "shocks.json"),
                       ("lock_sha256", "omnisafe-lock.txt")):
@@ -177,6 +181,11 @@ def holdout(ctx, run_out, stress_out, frozen_sha256):
     fee = frozen["fee"]
     jobs = ctx.classical_jobs(fee, SPLIT, days, shocks, frozen["classical_selected"])
     jobs += ctx.learned_jobs(frozen["runs"], fee, SPLIT, days, shocks)
+    # Before any job reads a holdout day: created only if absent, so a concurrent attempt
+    # fails here, and kept if the evaluation fails, so it is never run again on its own.
+    with open(marker, "x") as out:
+        out.write(json.dumps({"commit": ctx.commit, "frozen_sha256": frozen_sha256,
+                              "jobs": len(jobs), "at": time.time()}))
     started = time.perf_counter()
     report = {"step": "stress_holdout", "commit": ctx.commit, "frozen_sha256": frozen_sha256,
               "stress_design_sha256": run.sha256(STRESS_DESIGN),
