@@ -44,7 +44,10 @@ pub(super) fn on_delivery<const ORD: usize>(account: &mut AgentAccount<ORD>, rep
         return;
     };
     let close = match report.kind {
-        ExecKind::Canceled | ExecKind::CancelRejected => true,
+        // An expiry that beat the agent's cancel leaves the order awaiting
+        // that cancel's outcome, as a fill before it does.
+        ExecKind::Canceled => !report.cancel_pending,
+        ExecKind::CancelRejected => true,
         ExecKind::Rejected => match report.origin {
             Origin::Local => true,
             Origin::Venue => !report.cancel_pending,
@@ -54,8 +57,10 @@ pub(super) fn on_delivery<const ORD: usize>(account: &mut AgentAccount<ORD>, rep
     };
     if close {
         let _ = account.remove(index);
-    } else if matches!(report.kind, ExecKind::Fill | ExecKind::Rejected)
-        && let Some(open) = account.get_mut(index)
+    } else if matches!(
+        report.kind,
+        ExecKind::Fill | ExecKind::Rejected | ExecKind::Canceled
+    ) && let Some(open) = account.get_mut(index)
     {
         open.awaiting_cancel_outcome = true;
     }

@@ -2,6 +2,7 @@
 
 use crate::execution::Action;
 use crate::types::action::Dir;
+use core::num::NonZeroU64;
 
 /// A value used to fill unused container slots.
 pub(super) trait Blank: Copy {
@@ -205,8 +206,19 @@ impl Blank for VenueOrder {
 /// A venue message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MsgKind {
-    Activate(VenueOrder),
-    Cancel { id: u64 },
+    /// An order reaching the venue; with a life, the venue schedules its
+    /// expiry when it activates.
+    Activate {
+        order: VenueOrder,
+        life: Option<NonZeroU64>,
+    },
+    Cancel {
+        id: u64,
+    },
+    /// The venue's own cancel of a resting order at its expiry.
+    Expire {
+        id: u64,
+    },
 }
 
 /// A venue message keyed by `(eff_ns, seq)`.

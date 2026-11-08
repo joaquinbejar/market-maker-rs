@@ -23,7 +23,7 @@
 //!   slippage, quote currency fees (any sign);
 //! - no pretrade policy, the engine's `LimitsPolicy` (no circuit breaker),
 //!   or, with the balance gate ([`KernelMargin`]), a
-//!   [`MarginAccount`](crate::backtest::MarginAccount) set up as
+//!   `backtest::MarginAccount` set up as
 //!   [`KernelMargin`] states (`margin` feature);
 //! - the built-in bookkeeping (no external accountant);
 //! - all four latencies and jitter, in quanta of `quantum_ns`
@@ -126,6 +126,8 @@ mod step;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_expiry;
 
 pub use adapter::{
     AvellanedaQuoter, ERR_KERNEL_MISMATCH, ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE,
@@ -490,6 +492,29 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                         Some((Dir::Sell, ask, ask_lots)),
                     ],
                     crossed: bid >= ask,
+                    life: None,
+                },
+                combined
+                    .as_mut()
+                    .map(|(check, rejects)| (*check, &mut **rejects)),
+                &mut em,
+            ),
+            KernelAction::ExpiringQuote {
+                bid,
+                ask,
+                bid_lots,
+                ask_lots,
+                life_ns,
+            } => self.admit_apply(
+                s,
+                step::admit(&self.cfg, s, bid, ask, bid_lots, ask_lots),
+                step::Legs {
+                    legs: [
+                        Some((Dir::Buy, bid, bid_lots)),
+                        Some((Dir::Sell, ask, ask_lots)),
+                    ],
+                    crossed: bid >= ask,
+                    life: Some(life_ns),
                 },
                 combined
                     .as_mut()
@@ -507,6 +532,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                     step::Legs {
                         legs: [Some((dir, price, lots)), None],
                         crossed: false,
+                        life: None,
                     },
                     combined
                         .as_mut()
@@ -520,6 +546,7 @@ impl<'d, const ORD: usize, const MSG: usize, const DLV: usize, const OBS: usize>
                 step::Legs {
                     legs: [None, None],
                     crossed: false,
+                    life: None,
                 },
                 combined
                     .as_mut()

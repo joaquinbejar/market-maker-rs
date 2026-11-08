@@ -1,0 +1,177 @@
+{
+ "issue": 289,
+ "design_version": 1,
+ "status": "fixed before any run: the toy, the arms, the budget, the plateau criterion and the decision rule",
+ "data": "SYNTHETIC: a batch auction toy (fba.py, env.py) with a made-up background flow; reported in its own section, never beside the continuous order book's numbers, whose execution rules differ",
+ "reported_apart": "no result here is compared with #110 or any order book result as if they shared execution rules",
+ "toy": {
+  "clearing": "the price that maximises the matched volume, ties to the smallest imbalance, then the price nearest the reference (last clearing price), then the lower price; price priority, the marginal level pro rata by size rounded down to lots, the remainder by arrival; no trade keeps the reference",
+  "timing": "a message sent at t with delay d acts in the batch whose close is strictly after t + d; arriving exactly at a close puts it in the next batch; submit and cancel share the delay",
+  "limits": [
+   "one instrument",
+   "no queue priority inside a batch",
+   "no hidden orders",
+   "no self-trade prevention (the agent's quotes never cross each other: both are priced away from the signal)",
+   "background orders expire at their batch's clearing; the agent's rest",
+   "one fee rate on executed notional",
+   "no observation delay",
+   "the mark is the last clearing price"
+  ],
+  "row_ms": 100,
+  "batch_ms": 500,
+  "rows_per_day": 72000,
+  "tick": "0.01",
+  "max_position_lots": 20,
+  "flow": {
+   "reference_ticks": 10000,
+   "fundamental_sd": 0.3,
+   "signal_sd": 1.0,
+   "limit_rate": 3.0,
+   "limit_depth_p": 0.5,
+   "limit_lots": 3,
+   "informed_rate": 0.4,
+   "informed_share": 0.7,
+   "noise_rate": 0.2,
+   "noise_reach": 5,
+   "market_lots": 2
+  },
+  "flow_note": "made-up per-row parameters, chosen only so that a classical quote trades; env.Flow's defaults",
+  "action": "Box [-1, 1]: quote or hold, bid and ask offsets on (0, 1, 2, 4, 8) (an offset o quotes o + 1 ticks from the signal), sizes (1, 2), and with duration a sixth value binned on (1, 5, 10, 30) rows",
+  "observation": "rows left to the close, signal minus reference, last batch volume and imbalance, live orders, has quote, own bid and ask against the reference, position; plus the predictor's value for the arms with it"
+ },
+ "days": 24,
+ "splits": {
+  "train": [
+   1,
+   14
+  ],
+  "validation": [
+   15,
+   19
+  ],
+  "holdout": [
+   20,
+   24
+  ]
+ },
+ "day_seed": "2890000 + day",
+ "latencies_ms": [
+  30,
+  60,
+  100
+ ],
+ "arms": {
+  "full": {
+   "kind": "learned",
+   "duration": true,
+   "predictor": true,
+   "teacher": true
+  },
+  "no_duration": {
+   "kind": "learned",
+   "duration": false,
+   "predictor": true,
+   "teacher": true,
+   "note": "a fixed duration of 1 row"
+  },
+  "avellaneda_stoikov": {
+   "kind": "classical",
+   "grid": {
+    "risk_aversion": [
+     "0.0001",
+     "0.001",
+     "0.01"
+    ],
+    "order_intensity": [
+     "50",
+     "100",
+     "200"
+    ]
+   },
+   "horizon_rows": 72000,
+   "volatility": "the population sd of the clearing price change per row, in price units, over the training days without the agent",
+   "selection": "per latency, on validation, the highest mean daily net at the fee, ties by the point's text"
+  },
+  "no_trade": {
+   "kind": "baseline"
+  }
+ },
+ "not_run": {
+  "no_teacher": "for compute",
+  "no_predictor": "for compute"
+ },
+ "predictor": "#110's: a linear forecast of the reference's change over the next 5 rows from the 4 market features and a constant, fitted by least squares on every row of the training days without the agent, then fixed",
+ "teacher": "#110's: behaviour cloning of the Avellaneda-Stoikov point the fee rule picks at that latency (the training-day best at the chosen fee), on 100000 decisions of the training days: the policy's mean action fitted by mean squared error (Adam, learning rate 0.001, batch 256, 10 epochs), then PPO from those weights",
+ "fee": {
+  "rule": "#110's: the largest of 0.0002, 0 and -0.0001 at which the training-day best Avellaneda-Stoikov point has a positive mean daily net at 30 ms; 0.0002 if none",
+  "secondary": "0.0002"
+ },
+ "algorithm": "PPO (stable-baselines3 2.9.2), MlpPolicy",
+ "hyperparameters": {
+  "learning_rate": 0.0003,
+  "n_steps": 2048,
+  "batch_size": 256,
+  "n_epochs": 5,
+  "ent_coef": 0.0,
+  "note": "#103's set, by value"
+ },
+ "budget_decisions": 500000,
+ "training_seeds": [
+  1,
+  2,
+  3,
+  4,
+  5
+ ],
+ "evaluation_seed": 101,
+ "pilot": {
+  "run": "full at 60 ms, seed 0 (not a training seed), on the training days, the budget of 500000 decisions",
+  "curve": "every 50000 decisions, the deterministic policy's mean daily net on training days 1 and 2",
+  "plateau": "plateaued when the mean of the last three points (400000, 450000, 500000) is within 10 % of max(|mean of the three before (250000, 300000, 350000)|, 1) of that mean",
+  "rule": "the budget stays at 500000 whatever the curve shows; a curve that has not plateaued is said so in the report"
+ },
+ "check_before_training": "Avellaneda-Stoikov at risk aversion 0.001 and intensity 100, on training day 1, at 30 and 100 ms: it fills a nonzero number of times at each, and its net at 100 ms differs from its net at 30 ms (the delay binds); recorded before any training",
+ "evaluation": {
+  "holdout": "every arm on holdout days 20 to 24 at each latency, at the fee and at the secondary fee beside it; a learned arm's day is the mean over its seeds",
+  "bootstrap": {
+   "replicates": 2000,
+   "mean_block_days": 2,
+   "confidence_percent": 90,
+   "seed": 102,
+   "min_days": 4
+  }
+ },
+ "metrics": [
+  "net, fees, spread capture against the mark",
+  "fills per hour",
+  "markout of fills at 1, 5 and 30 s against the reference",
+  "mean and largest absolute position",
+  "max drawdown",
+  "durations chosen",
+  "late messages: orders and cancels that acted a batch after the one they were sent in"
+ ],
+ "decision_rule": {
+  "duration": "full against no_duration at each latency: the 90 % block bootstrap interval of the paired daily net difference; duration helps at a latency when the lower bound is above 0 and no arm breached its position limit",
+  "no_trade": "every arm against no_trade; one whose interval includes 0 is reported as equivalent to not trading",
+  "apart": "batch-only results, in their own section"
+ },
+ "compute": {
+  "jobs": "2 learned arms x 3 latencies x 5 seeds = 30, plus the pilot",
+  "estimate": "15 to 25 min a job, 8 to 12 job-hours under the shared cap, after #107 B/C and #112",
+  "overrun_rule": "a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds"
+ },
+ "seen_before_freeze": [
+  "the fixtures of fba.py and env.py",
+  "one full day (seed 1) of the default flow at 60 ms, for the environment's speed: Avellaneda-Stoikov at risk aversion 0.0001, intensity 50 and sigma 0.003 filled 1164 times for a net of -6.93 at fee 0; hold, 0"
+ ],
+ "teacher_fit": {
+  "decisions": 100000,
+  "learning_rate": 0.001,
+  "batch_size": 256,
+  "epochs": 10
+ },
+ "changes": [
+  "before any run: the teacher's fit as a structured entry (teacher_fit), the same numbers as the text of teacher",
+  "before any run, in the runner only: the freeze records the sha256 of run.py, env.py and fba.py and the holdout refuses changed code; the holdout creates an exclusive marker before any holdout day is read, keeps it if the evaluation fails, and refuses to start while it exists, so the holdout is read once"
+ ]
+}
