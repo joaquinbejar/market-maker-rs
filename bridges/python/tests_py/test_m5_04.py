@@ -160,3 +160,45 @@ def test_replacing_rows_that_change_what_was_read_is_refused_and_changes_nothing
     finally:
         env.close()
         other.close()
+
+
+def test_the_grid_is_108s_24_flow_points_times_three_kappas():
+    points = run.grid_points()
+    assert len(points) == 72 and len({p[0] for p in points}) == 72
+    assert {p[3] for p in points} == {0, 1, 2}
+    assert points[0][0] == f"{run.unit_flow()}-k0"
+
+
+def test_each_day_has_108s_seed_and_rows():
+    flows = dict(run.m503.points(run.M5_03_DESIGN))
+    for flow in (run.unit_flow(), run.m503.point_name(run.M5_03_DESIGN["fixed_stress"])):
+        for split in ("selection", "holdout"):
+            records = run.m503.digests_of(f"{split}-{flow}")
+            for (regime, day), record in list(records.items())[:3]:
+                regime_dict, seed = run.regime_day(M4_05, flows[flow], split, regime, day)
+                assert seed == record["seed"]
+    regime_dict, seed = run.regime_day(M4_05, flows[run.unit_flow()], "selection", "thin", 2)
+    market = run.day_market(regime_dict, M4_05, seed, 2)
+    record = run.m503.digests_of(f"selection-{run.unit_flow()}")[("thin", 2)]
+    assert market.digest() == record["dataset_digest"]
+
+
+def test_the_identity_check_names_every_row_that_differs_or_is_missing():
+    row = {"scenario": "selection-x", "arm": "glft", "seed": None, "regime": "calm", "day": 1,
+           **{f: "1" for f in run.FIELDS_108}}
+    theirs = {"rows": [dict(row)]}
+    assert run.identity([row], theirs) == []
+    changed = {**row, "max_drawdown": "2"}
+    assert run.identity([changed], theirs) == [("selection-x", "glft", None, "calm", 1)]
+    missing = {**row, "day": 2}
+    assert run.identity([missing], theirs) == [("selection-x", "glft", None, "calm", 2)]
+    extra = {**row, "reactions": 5, "emptied": "3"}
+    assert run.identity([extra], theirs) == [], "only #108's fields are compared"
+
+
+def test_job_keys_are_unique_across_the_selection():
+    runs = {"maskable_ppo": [{"seed": s} for s in range(1, 6)],
+            "residual_sac": [{"seed": s} for s in range(1, 6)]}
+    jobs = run.jobs_for(run.grid_points(), "selection", [1, 2], runs, {})
+    assert len(jobs) == 72 * 3 * 2 * 14
+    assert len({run.job_key(j) for j in jobs}) == len(jobs)
