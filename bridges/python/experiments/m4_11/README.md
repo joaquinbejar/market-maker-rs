@@ -71,15 +71,18 @@ checkpoints, each checked against its recorded sha256, and finds no fault in the
   (seed 1: calm 0.70, stressed 0.84; seed 2: calm 0.61, stressed 0.90).
 - About 39 % of the misses where both quote are within one offset step of as_grid's quote.
 
-The reading is that the pooled observation does not determine as_grid's choice. #102's
+The likely reading is that the pooled observation does not determine as_grid's choice; the
+difference between regimes is consistent with this, but does not by itself prove it. #102's
 as_grid takes its point and its volatility per regime. The observation has no regime or
 volatility feature: the 11 row features (spread, mid change, row gap, the two sizes,
 imbalance, position, entry gap, open orders, orders awaiting a cancel, steps left) and their
 presence flags. A single classifier over the three regimes' logs therefore compromises
-between them. So offline BC from these pooled logs cannot clone a regime-dependent behaviour
-policy whose observation lacks the regime. By the design's rule, a BC that is not as_grid's
+between them. On this reading, offline BC from these pooled logs cannot clone a
+regime-dependent behaviour policy whose observation lacks the regime. By the design's rule, a BC that is not as_grid's
 clone means the pipeline cannot answer the question, and the study stops without changing the
 design after seeing the data.
 
-A study that gives the offline arms the regime, or as_grid's per-regime inputs, needs a fresh
-design and its own holdout policy; it is left to a follow-up issue.
+A study that gives the offline arms the regime, or as_grid's per-regime inputs, would be a
+new experiment motivated by this validation result, not a continuation of this design: a
+fresh design and its own holdout policy, left to #309. This stop stays as the result of the
+registered design.
