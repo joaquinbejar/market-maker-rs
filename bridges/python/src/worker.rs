@@ -910,6 +910,12 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
     }
 }
 
+/// Equal, or equal down to the bits a `Debug` print shows: a NaN a policy proposed equals
+/// itself, which `PartialEq` on floats does not grant. The print is only made when `==` fails.
+fn same<T: PartialEq + std::fmt::Debug>(a: &T, b: &T) -> bool {
+    a == b || format!("{a:?}") == format!("{b:?}")
+}
+
 /// Replays `resume` on `env`, checks it against what it must reach, and answers the replace
 /// that asked for it. `None` when it reached it (or had nothing to reach), with the episode;
 /// otherwise the rebuild that falls back.
@@ -932,7 +938,7 @@ fn replay<D: Driver>(
                     logged,
                 ),
             };
-            if reply != *logged {
+            if !same(&reply, logged) {
                 return Err(format!(
                     "the replayed step {} differs from the episode's",
                     index + 1
@@ -955,7 +961,9 @@ fn replay<D: Driver>(
                     "the replayed state differs after {} steps",
                     resume.log.len()
                 ))
-            } else if observation.as_ref() != Ok(&expect.observation)
+            } else if !observation
+                .as_ref()
+                .is_ok_and(|observation| same(observation, &expect.observation))
                 || env.mask(state) != expect.mask
                 || env.hedge_mask(state) != expect.hedge_mask
             {
