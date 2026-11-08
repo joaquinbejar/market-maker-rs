@@ -26,7 +26,7 @@ use market_maker_rs::rl::{
     ACTION_SPACE_VERSION, AsOf, CANCEL_ACTION_SPACE_VERSION, CancelActions, EPISODE_VERSION,
     ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_CROSS_HEDGE_REFUSED, ERR_EXPIRY_REFUSED,
     ERR_HEDGE_REFUSED, EXPIRY_ACTION_SPACE_VERSION, EpisodeRecorder, FEATURE_COUNT, FeatureHorizon,
-    FeatureId, FeatureUnit, HedgeActions, InvalidActionPolicy, MAX_QUOTE_LIVES,
+    FeatureId, FeatureUnit, HedgeActions, InvalidActionPolicy, MAX_QUOTE_LIFE_NS, MAX_QUOTE_LIVES,
     OBSERVATION_SPACE_VERSION, ObservationScales, QuoteExpiry, QuoteLives, REWARD_VERSION,
     RlAction, RlConfig, RlEnv, RlSpec, StateMemory, TerminalValuation,
 };
@@ -1666,6 +1666,12 @@ fn test_quote_lives_refuse_no_value() {
 #[test]
 fn test_quote_lives_refuse_zero() {
     assert!(QuoteLives::new(&[0, 5]).is_err());
+}
+
+#[test]
+fn test_quote_lives_refuse_a_life_above_the_longest() {
+    assert!(QuoteLives::new(&[MAX_QUOTE_LIFE_NS]).is_ok());
+    assert!(QuoteLives::new(&[MAX_QUOTE_LIFE_NS + 1]).is_err());
 }
 
 #[test]

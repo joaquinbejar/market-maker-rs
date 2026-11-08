@@ -96,6 +96,19 @@ def test_the_box_reads_the_cancel_before_the_life():
     env.close()
 
 
+def test_the_box_reads_hedge_cancel_and_life_at_their_own_places():
+    cfg = living([MS], policy="reject", cancel=True)
+    cfg["hedge_actions"] = True
+    env = BoxMarketMakingEnv(cfg, LONG_ROWS)
+    assert env.action_space.shape == (8,)
+    quote = [1.0, -1.0, -1.0, -1.0, -1.0]
+    assert env._decode([*quote, 1.0, 1.0, 1.0])[0] == "hedge"
+    assert env._decode([*quote, -1.0, 1.0, 1.0]) == ("cancel", ())
+    assert env._decode([*quote, -1.0, -1.0, 1.0]) == ("expiring_quote", (0, 0, 0, 0, 0))
+    assert env._decode([*quote, -1.0, -1.0, -1.0]) == ("quote", (0, 0, 0, 0))
+    env.close()
+
+
 def test_expiry_is_exact_at_the_life_after_activation():
     assert filled([2000 * MS], [[*BID, 1]]) == 0
     assert filled([2000 * MS + 1], [[*BID, 1]]) == 1
