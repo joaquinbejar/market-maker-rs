@@ -1,6 +1,7 @@
 //! Kernel state, phases, outcomes, reasons and events.
 
 use crate::Decimal;
+use core::num::NonZeroU64;
 
 use super::account::AgentAccount;
 use super::book::{Arr, Delivery, FillRec, ObsEntry, ReportRec, VenueMsg, VenueOrder};
@@ -193,7 +194,9 @@ impl KernelEvent {
             | Self::EndOfData { .. }
             | Self::Halted(_)
             | Self::Decided(_)
-            | Self::DroppedMsg { .. } => false,
+            | Self::DroppedMsg { .. }
+            | Self::Expired { .. }
+            | Self::DroppedExpiry { .. } => false,
         }
     }
 }
@@ -221,6 +224,7 @@ pub enum QuoteSide {
 
 /// One decision of the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KernelAction {
     /// Leave the resting orders in place.
     Hold,
@@ -259,6 +263,30 @@ pub enum KernelAction {
     /// open order already holds the venue message its cancel needs. Outside
     /// the engine-equivalence subset: the engine cancels only to replace.
     Cancel,
+    /// A [`KernelAction::Quote`] whose legs the venue cancels by itself
+    /// `life_ns` of venue time after each leg's own activation, whatever the
+    /// latencies and their jitter: an expiry the kernel schedules when the
+    /// leg activates, in the venue queue, in `(time, sequence)` order with
+    /// every other message. As for any order, a row at the activation time
+    /// does not fill it; a row at or after the expiry finds it gone, since
+    /// venue messages run before matching at equal times. So it fills only on
+    /// rows strictly inside `(activation, activation + life_ns)`. A replacing
+    /// quote's or a cancel's message and the expiry share the two venue
+    /// messages an open order reserves: the activation's, which the expiry
+    /// takes once the order is active, and the cancel's. Admission is a
+    /// `Quote`'s. Outside the engine-equivalence subset.
+    ExpiringQuote {
+        /// Bid, in ticks.
+        bid: u64,
+        /// Ask, in ticks.
+        ask: u64,
+        /// Bid size, in lots.
+        bid_lots: u64,
+        /// Ask size, in lots.
+        ask_lots: u64,
+        /// Venue time each leg rests from its activation, in nanoseconds.
+        life_ns: NonZeroU64,
+    },
 }
 
 /// What happened to the action.
@@ -296,7 +324,8 @@ pub struct Counters {
     pub rejected: [u64; 8],
     /// Halts (at most one).
     pub halts: u64,
-    /// Venue messages dropped at the end of the data.
+    /// Venue messages dropped at the end of the data: activations, cancels
+    /// and expiries.
     pub eof_dropped_msgs: u64,
     /// Observations dropped at the end of the data.
     pub eof_dropped_obs: u64,
@@ -384,6 +413,20 @@ pub enum KernelEvent {
         order_id: u64,
         /// True for a cancel, false for an activation.
         cancel: bool,
+    },
+    /// The venue canceled an order of a [`KernelAction::ExpiringQuote`] at its
+    /// expiry; its `Canceled` report follows.
+    Expired {
+        /// The order.
+        order_id: u64,
+        /// Venue time of the expiry, in nanoseconds.
+        at_ns: u64,
+    },
+    /// An expiry still pending at the end of the data, dropped with the
+    /// order's other venue messages.
+    DroppedExpiry {
+        /// The order.
+        order_id: u64,
     },
 }
 

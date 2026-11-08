@@ -182,7 +182,7 @@ fn test_kernel_capacity_reject_leaves_queues_unchanged() {
         .msgs
         .as_slice()
         .iter()
-        .filter(|m| matches!(m.kind, book::MsgKind::Activate(o) if o.cancel_inflight))
+        .filter(|m| matches!(m.kind, book::MsgKind::Activate { order: o, .. } if o.cancel_inflight))
         .count();
     assert!(pending > 0);
     let mut a = s;
@@ -527,8 +527,8 @@ fn test_kernel_decode_rejects_each_unreachable_state() {
                 s.next_order_id - 1 + s.counters.local_rejects + s.counters.venue_fills - 1;
             true
         }),
-        ("next_msg_seq beyond two per order", |s, _| {
-            s.next_msg_seq = 2 * s.next_order_id + 1;
+        ("next_msg_seq beyond three per order", |s, _| {
+            s.next_msg_seq = 3 * s.next_order_id + 1;
             true
         }),
         ("next_order_id beyond two per step", |s, _| {
@@ -595,11 +595,11 @@ fn test_kernel_decode_rejects_each_unreachable_state() {
         }),
         ("activation quantity 0", |s, _| {
             s.msgs.as_mut_slice().iter_mut().any(|m| match &mut m.kind {
-                book::MsgKind::Activate(o) => {
+                book::MsgKind::Activate { order: o, .. } => {
                     o.qty = 0;
                     true
                 }
-                book::MsgKind::Cancel { .. } => false,
+                book::MsgKind::Cancel { .. } | book::MsgKind::Expire { .. } => false,
             })
         }),
         ("awaiting price above P", |s, k| {
@@ -930,14 +930,23 @@ fn test_kernel_transaction_undo_restores_the_state_exactly() {
                 step::Legs {
                     legs: [Some((Dir::Buy, 99, 2)), Some((Dir::Sell, 101, 3))],
                     crossed: false,
+                    life: None,
                 },
                 step::Legs {
                     legs: [Some((Dir::Buy, 101, 1)), Some((Dir::Sell, 99, 1))],
                     crossed: true,
+                    life: None,
                 },
                 step::Legs {
                     legs: [Some((Dir::Sell, 102, 4)), None],
                     crossed: false,
+                    life: None,
+                },
+                // An expiring quote's transaction rolls back as exactly.
+                step::Legs {
+                    legs: [Some((Dir::Buy, 99, 2)), Some((Dir::Sell, 101, 3))],
+                    crossed: false,
+                    life: core::num::NonZeroU64::new(7),
                 },
             ];
             for legs in all_legs {
@@ -1736,9 +1745,9 @@ fn test_decode_stamp_bound_depends_on_the_fill_model() {
     // Under the queue model the fills can exceed the orders.
     assert!(s.counters().venue_fills > created);
     assert_eq!(decode(&encode(&s), &k).unwrap(), s);
-    // Beyond three per order and one per fill.
+    // Beyond four per order and one per fill.
     let mut t = s;
-    t.stamp_seq = 3 * created + s.counters().venue_fills + 1;
+    t.stamp_seq = 4 * created + s.counters().venue_fills + 1;
     refused(&k, &t, "stamp_seq");
 }
 
