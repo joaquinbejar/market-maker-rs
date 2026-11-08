@@ -8,6 +8,17 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The decision frequency and policy memory comparison of #103 in
+  `bridges/python/experiments/m4_06`, with `DecisionInterval`, `EmaFeatures` and `history` in the
+  bridge's wrappers and per-step order counts in its replies. On #102's regimes sampled every
+  second, under the queue standard for 1 s rows: mlp, ema, history and lstm PPO policies deciding
+  every 1, 5 and 10 rows, against no-trade, Avellaneda-Stoikov and GLFT, with paired block
+  bootstrap intervals on the holdout at the fee the rule chose and at 0.0002. The design was
+  committed before any run, every change is recorded in it, and `report.py` was committed before
+  the holdout was read. `validation_pick.py` picks the learned arm at one row on validation for
+  later studies, after the freeze and before any holdout read. Synthetic data only; the results
+  are on the issue.
+
 - The robustness study of #108 in `bridges/python/experiments/m5_03`: #102's classical arms and
   frozen learned policies under bounded perturbations of the queue-reactive flow (market, cancel
   and limit rates and the reference's move probability), with an adversary that picks the worst

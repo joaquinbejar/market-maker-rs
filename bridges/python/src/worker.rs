@@ -10,9 +10,9 @@ use market_maker_rs::backtest::evaluation::{
 };
 use market_maker_rs::backtest::kernel::{
     ActionGrid, ActionMask, ActionStatus, AvellanedaQuoter, ERR_KERNEL_MISMATCH,
-    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, GlftCounts, GlftForm, GlftQuoter, KernelConfig,
-    KernelDataset, KernelFillModel, KernelLatency, KernelTick, Observation, QuoteSource,
-    SourceQuote, quote_error_name,
+    ERR_PRICE_OUT_OF_RANGE, ERR_SIZE_OUT_OF_RANGE, EventSink, ExecKind, GlftCounts, GlftForm,
+    GlftQuoter, KernelConfig, KernelDataset, KernelEvent, KernelFillModel, KernelLatency,
+    KernelTick, Observation, QuoteSource, SourceQuote, quote_error_name,
 };
 use market_maker_rs::execution::Action;
 use market_maker_rs::risk::RiskLimits;
@@ -537,6 +537,47 @@ pub struct StepReply {
     pub penalties: Decimal,
     /// How the action came to be, under a residual policy.
     pub decision: Option<ResidualDecision>,
+    /// The venue's order reports during the step, at venue time: an audit, never seen
+    /// by a policy.
+    pub orders: OrderCounts,
+}
+
+/// Counts of the venue's order reports, by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrderCounts {
+    /// Orders accepted and resting.
+    pub accepted: u64,
+    /// Orders rejected, locally or by the venue.
+    pub rejected: u64,
+    /// Orders canceled.
+    pub canceled: u64,
+    /// Cancels that arrived after the order ended.
+    pub cancel_rejected: u64,
+    /// Fills, partial ones included.
+    pub fills: u64,
+}
+
+/// The episode's records, and the counts of the current step's order reports.
+#[derive(Debug, Default)]
+struct Audit {
+    recorder: EpisodeRecorder,
+    orders: OrderCounts,
+}
+
+impl EventSink for Audit {
+    fn event(&mut self, event: KernelEvent) {
+        if let KernelEvent::Report(report) = &event {
+            let count = match report.kind {
+                ExecKind::Accepted => &mut self.orders.accepted,
+                ExecKind::Rejected => &mut self.orders.rejected,
+                ExecKind::Canceled => &mut self.orders.canceled,
+                ExecKind::CancelRejected => &mut self.orders.cancel_rejected,
+                ExecKind::PartialFill | ExecKind::Fill => &mut self.orders.fills,
+            };
+            *count = count.saturating_add(1);
+        }
+        self.recorder.event(event);
+    }
 }
 
 enum Request {
@@ -560,7 +601,7 @@ type State = RlState<ORD, MSG, DLV, OBS>;
 
 /// What the request loop needs from an environment.
 trait Driver {
-    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String>;
+    fn reset(&mut self, seed: u64, audit: &mut Audit) -> Result<State, String>;
     fn observe(&self, state: &State) -> Result<FeatureVector, String>;
     fn mask(&self, state: &State) -> ActionMask;
     fn hedge_mask(&self, state: &State) -> u64;
@@ -568,19 +609,15 @@ trait Driver {
         &mut self,
         state: &mut State,
         action: RlAction,
-        recorder: &mut EpisodeRecorder,
+        audit: &mut Audit,
     ) -> Result<StepReply, String>;
     fn step_residual(
         &mut self,
         state: &mut State,
         proposal: ResidualProposal,
-        recorder: &mut EpisodeRecorder,
+        audit: &mut Audit,
     ) -> Result<StepReply, String>;
-    fn inner_attribution(
-        &self,
-        state: &State,
-        recorder: &EpisodeRecorder,
-    ) -> Result<AttributionReply, String>;
+    fn inner_attribution(&self, state: &State, audit: &Audit) -> Result<AttributionReply, String>;
 }
 
 fn attribution_of<const K: usize, const M: usize>(
@@ -624,8 +661,8 @@ fn attribution_of<const K: usize, const M: usize>(
 }
 
 impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, OBS> {
-    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String> {
-        self.reset_with(seed, recorder).map_err(|e| e.to_string())
+    fn reset(&mut self, seed: u64, audit: &mut Audit) -> Result<State, String> {
+        self.reset_with(seed, audit).map_err(|e| e.to_string())
     }
 
     fn observe(&self, state: &State) -> Result<FeatureVector, String> {
@@ -644,16 +681,18 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
         &mut self,
         state: &mut State,
         action: RlAction,
-        recorder: &mut EpisodeRecorder,
+        audit: &mut Audit,
     ) -> Result<StepReply, String> {
+        audit.orders = OrderCounts::default();
         let transition = self
-            .step_with(state, action, recorder)
+            .step_with(state, action, audit)
             .map_err(|e| e.to_string())?;
         Ok(StepReply {
             transition,
             net: state.net(),
             penalties: state.penalties(),
             decision: None,
+            orders: audit.orders,
         })
     }
 
@@ -661,23 +700,19 @@ impl<const K: usize, const M: usize> Driver for RlEnv<'_, K, M, ORD, MSG, DLV, O
         &mut self,
         _state: &mut State,
         _proposal: ResidualProposal,
-        _recorder: &mut EpisodeRecorder,
+        _audit: &mut Audit,
     ) -> Result<StepReply, String> {
         Err("a residual step on an environment with a grid".to_string())
     }
 
-    fn inner_attribution(
-        &self,
-        state: &State,
-        recorder: &EpisodeRecorder,
-    ) -> Result<AttributionReply, String> {
-        attribution_of(self, state, recorder)
+    fn inner_attribution(&self, state: &State, audit: &Audit) -> Result<AttributionReply, String> {
+        attribution_of(self, state, &audit.recorder)
     }
 }
 
 impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
-    fn reset(&mut self, seed: u64, recorder: &mut EpisodeRecorder) -> Result<State, String> {
-        self.reset_with(seed, recorder).map_err(|e| e.to_string())
+    fn reset(&mut self, seed: u64, audit: &mut Audit) -> Result<State, String> {
+        self.reset_with(seed, audit).map_err(|e| e.to_string())
     }
 
     fn observe(&self, state: &State) -> Result<FeatureVector, String> {
@@ -692,38 +727,52 @@ impl<S: QuoteSource + Clone> Driver for ResidualEnv<'_, S, ORD, MSG, DLV, OBS> {
         self.env().hedge_mask(state)
     }
 
+    /// Only a hold: the resting orders stay, and the classical strategy is not asked, so
+    /// a decision interval can hold a residual policy's orders between its decisions.
     fn step(
         &mut self,
-        _state: &mut State,
-        _action: RlAction,
-        _recorder: &mut EpisodeRecorder,
+        state: &mut State,
+        action: RlAction,
+        audit: &mut Audit,
     ) -> Result<StepReply, String> {
-        Err("a grid action on a residual environment".to_string())
+        if action != RlAction::Hold {
+            return Err("a grid action on a residual environment".to_string());
+        }
+        audit.orders = OrderCounts::default();
+        let transition = self
+            .env()
+            .step_with(state, RlAction::Hold, audit)
+            .map_err(|e| e.to_string())?;
+        Ok(StepReply {
+            transition,
+            net: state.net(),
+            penalties: state.penalties(),
+            decision: None,
+            orders: audit.orders,
+        })
     }
 
     fn step_residual(
         &mut self,
         state: &mut State,
         proposal: ResidualProposal,
-        recorder: &mut EpisodeRecorder,
+        audit: &mut Audit,
     ) -> Result<StepReply, String> {
+        audit.orders = OrderCounts::default();
         let step = self
-            .step_with(state, proposal, recorder)
+            .step_with(state, proposal, audit)
             .map_err(|e| e.to_string())?;
         Ok(StepReply {
             transition: step.transition,
             net: state.net(),
             penalties: state.penalties(),
             decision: Some(step.decision),
+            orders: audit.orders,
         })
     }
 
-    fn inner_attribution(
-        &self,
-        state: &State,
-        recorder: &EpisodeRecorder,
-    ) -> Result<AttributionReply, String> {
-        attribution_of(self.env(), state, recorder)
+    fn inner_attribution(&self, state: &State, audit: &Audit) -> Result<AttributionReply, String> {
+        attribution_of(self.env(), state, &audit.recorder)
     }
 }
 
@@ -733,36 +782,36 @@ fn answer<D: Driver>(
     requests: &mpsc::Receiver<Request>,
     replies: &mpsc::Sender<Reply>,
 ) {
-    let mut episode: Option<(State, EpisodeRecorder)> = None;
+    let mut episode: Option<(State, Audit)> = None;
     let none = || "a step before any reset".to_string();
     for request in requests {
         let reply = match request {
             #[cfg(test)]
             Request::Panic => panic!("a panic asked for by a test"),
             Request::Reset(seed) => {
-                let mut recorder = EpisodeRecorder::default();
-                Reply::Reset(env.reset(seed, &mut recorder).and_then(|fresh| {
+                let mut audit = Audit::default();
+                Reply::Reset(env.reset(seed, &mut audit).and_then(|fresh| {
                     let reply = ResetReply {
                         observation: env.observe(&fresh)?,
                         mask: env.mask(&fresh),
                         hedge_mask: env.hedge_mask(&fresh),
                         done: fresh.is_done(),
                     };
-                    episode = Some((fresh, recorder));
+                    episode = Some((fresh, audit));
                     Ok(reply)
                 }))
             }
             Request::Step(action) => Reply::Step(match episode.as_mut() {
                 None => Err(none()),
-                Some((state, recorder)) => env.step(state, action, recorder),
+                Some((state, audit)) => env.step(state, action, audit),
             }),
             Request::StepResidual(proposal) => Reply::Step(match episode.as_mut() {
                 None => Err(none()),
-                Some((state, recorder)) => env.step_residual(state, proposal, recorder),
+                Some((state, audit)) => env.step_residual(state, proposal, audit),
             }),
             Request::Attribution => Reply::Attribution(match episode.as_ref() {
                 None => Err(none()),
-                Some((state, recorder)) => env.inner_attribution(state, recorder),
+                Some((state, audit)) => env.inner_attribution(state, audit),
             }),
         };
         if replies.send(reply).is_err() {
