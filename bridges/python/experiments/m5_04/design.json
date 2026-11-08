@@ -1,6 +1,6 @@
 {
   "issue": 282,
-  "design_version": 3,
+  "design_version": 4,
   "data": "synthetic: #102's queue-reactive regimes (a simulator with made-up parameters) and #108's perturbed copies, with rows that react to the agent's fills; no market data",
   "bounds": "One synthetic simulator with made-up parameters and one model of own impact bound what this study can show. The frozen #102 policies were trained without own impact, so this measures their robustness to it, not an adapted policy. It says nothing about a market's impact.",
   "reuses": {
@@ -54,7 +54,7 @@
       "stdout_sha256": "5db240fbc959d070c789fb44c5e1bd541d5abbfa9dc8669a7a3640e4ce9ba16e"
     }
   },
-  "grid": "#108's 24 flow points x the 3 kappa values = 72 points",
+  "grid": "#108's 24 flow points x kappa in {0, 2 kappa0} = 48 points (version 4; 72 with kappa0 before)",
   "fixed_stress": {
     "flow": "#108's fixed stress",
     "kappa": "2 kappa0"
@@ -139,6 +139,17 @@
         "the replay runs in the bridge's worker; the Python replay is kept as a check and agreed on the measured day",
         "the impact's consumption metric is the first-limit volume the moves emptied",
         "compute: measured rate and 4 processes when assigned"
+      ]
+    },
+    {
+      "version": 4,
+      "seen": "the kappa = 0 phase (10080 runs, identity with #108's selection rows held) and part of the kappa > 0 phase, stopped at 10:15:29Z on 2026-11-08 by its overrun rule: the projection on a contended machine (load average about 14, not only this study's) was 102 to 105 process-hours against 1.5 x 65 = 97.5. Journal counts from keys only, no kappa > 0 value read: k1 1260, k2 1099. Spent 14.26 process-hours (kappa 0: 4185 s x 4; kappa > 0: 8652 s x 4)",
+      "what": [
+        "kappa0 (index 1) leaves the grid: the adversary's grid is 24 flow points x {0, 2 kappa0} = 48. Every holdout impact condition is at 2 kappa0, so the adversary searches the impact levels the holdout tests. The 1260 k1 rows stay in the journal, unread and unused.",
+        "Direction: a maximum over 48 points can only be less severe than over 72, and if the tail loss is not monotone in kappa the worst point could lie at kappa0. The adversary's result is a claim over {0, 2 kappa0} only.",
+        "97.5 process-hours is the hard ceiling for the whole study: budget.json in the output directory records the spent process-seconds; the kappa > 0 selection stops at the ceiling less 9 process-hours kept for the holdout, and the holdout at the ceiling. Reaching it stops the step, reported; no fallback to another grid after anything is seen.",
+        "The holdout records its attempt with O_EXCL before any job, and is never run twice.",
+        "Every run is started detached from the terminal session (nohup, its own session)."
       ]
     }
   ],

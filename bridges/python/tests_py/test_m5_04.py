@@ -162,10 +162,12 @@ def test_replacing_rows_that_change_what_was_read_is_refused_and_changes_nothing
         other.close()
 
 
-def test_the_grid_is_108s_24_flow_points_times_three_kappas():
+def test_the_grid_is_108s_24_flow_points_times_kappa_0_and_2_kappa0():
+    """Design version 4: kappa0 left the grid; no k1 point, job or key remains."""
     points = run.grid_points()
-    assert len(points) == 72 and len({p[0] for p in points}) == 72
-    assert {p[3] for p in points} == {0, 1, 2}
+    assert len(points) == 48 and len({p[0] for p in points}) == 48
+    assert {p[3] for p in points} == {0, 2}
+    assert not any(p[0].endswith("-k1") for p in points)
     assert points[0][0] == f"{run.unit_flow()}-k0"
 
 
@@ -200,5 +202,52 @@ def test_job_keys_are_unique_across_the_selection():
     runs = {"maskable_ppo": [{"seed": s} for s in range(1, 6)],
             "residual_sac": [{"seed": s} for s in range(1, 6)]}
     jobs = run.jobs_for(run.grid_points(), "selection", [1, 2], runs, {})
-    assert len(jobs) == 72 * 3 * 2 * 14
+    assert len(jobs) == 48 * 3 * 2 * 14
     assert len({run.job_key(j) for j in jobs}) == len(jobs)
+    assert not any(j["kappa_index"] == 1 or "-k1" in j["point"] for j in jobs)
+    assert not any("-k1" in str(run.job_key(j)) for j in jobs)
+
+
+def test_the_ceiling_keeps_the_holdouts_reserve_and_stops_at_975(tmp_path):
+    with pytest.raises(ValueError, match="no budget.json"):
+        run.limit_for(tmp_path, 4, 9.0)
+    (tmp_path / "budget.json").write_text(json.dumps({"spent_process_seconds": 51348}))
+    assert run.limit_for(tmp_path, 4, 9.0) == pytest.approx(((97.5 - 9) * 3600 - 51348) / 4)
+    run.charge(tmp_path, "x", 1000, 4)
+    assert run.spent(tmp_path) == 55348
+    (tmp_path / "budget.json").write_text(json.dumps({"spent_process_seconds": 97.5 * 3600}))
+    with pytest.raises(run.Overrun):
+        run.limit_for(tmp_path, 4, 0.0)
+
+
+def test_the_holdout_marks_its_attempt_before_any_job_and_runs_once(tmp_path, monkeypatch):
+    (tmp_path / "selection.json").write_text("{}")
+    (tmp_path / "budget.json").write_text(json.dumps({"spent_process_seconds": 0}))
+    frozen = {"design_sha256": "d", "code_sha256": "c", "chosen": {},
+              "selection_sha256": run.sha256(tmp_path / "selection.json")}
+    (tmp_path / "frozen.json").write_text(json.dumps(frozen))
+    monkeypatch.setattr(run.m503, "check_frozen_digests", lambda *a: None)
+    monkeypatch.setattr(run, "jobs_for", lambda *a, **k: [])
+    seen = []
+
+    def pool(*a, **k):
+        seen.append((tmp_path / "holdout.started").exists())
+        raise RuntimeError("a day failed")
+
+    monkeypatch.setattr(run, "pool", pool)
+
+    class Study:
+        out, parallel, runs = tmp_path, 4, {}
+
+        def header(self, step):
+            return {"design_sha256": "d", "code_sha256": "c"}
+
+        def common(self):
+            return {}
+
+    sha = run.sha256(tmp_path / "frozen.json")
+    with pytest.raises(RuntimeError):
+        run.holdout(Study(), sha)
+    assert seen == [True]
+    with pytest.raises(ValueError, match="attempted already"):
+        run.holdout(Study(), sha)

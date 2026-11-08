@@ -18,6 +18,7 @@ Synthetic data only.
 import importlib.util
 import json
 import math
+import os
 import pathlib
 import sys
 import time
@@ -300,7 +301,41 @@ def check(run_dir, out_dir, commit):
 # The study.
 
 M5_03_DESIGN = json.loads((M5_03 / "design.json").read_text())
-KAPPA_INDICES = (0, 1, 2)
+# Design version 4: kappa0 (index 1) left the grid after the overrun stop; every holdout impact
+# condition is at 2 kappa0. The k1 rows already journaled are never used.
+KAPPA_INDICES = (0, 2)
+CEILING_PROCESS_HOURS = 97.5
+HOLDOUT_RESERVE_PROCESS_HOURS = 9.0
+
+
+class Overrun(RuntimeError):
+    """The study's process-hour ceiling was reached: the step stops, and is reported."""
+
+
+def spent(out):
+    """Process-seconds spent so far, from budget.json in the output directory."""
+    path = pathlib.Path(out) / "budget.json"
+    return json.loads(path.read_text())["spent_process_seconds"] if path.exists() else None
+
+
+def charge(out, label, seconds, parallel):
+    path = pathlib.Path(out) / "budget.json"
+    budget = json.loads(path.read_text())
+    budget["spent_process_seconds"] += seconds * parallel
+    budget.setdefault("log", []).append({"step": label, "wall_seconds": round(seconds, 1),
+                                         "processes": parallel})
+    path.write_text(json.dumps(budget, indent=2) + "\n")
+
+
+def limit_for(out, parallel, reserve_hours):
+    """Wall seconds left before the ceiling, keeping `reserve_hours` for later steps."""
+    used = spent(out)
+    if used is None:
+        raise ValueError("no budget.json: the spent process-seconds must be recorded first")
+    left = (CEILING_PROCESS_HOURS - reserve_hours) * 3600 - used
+    if left <= 0:
+        raise Overrun(f"the ceiling of {CEILING_PROCESS_HOURS} process-hours is reached")
+    return left / parallel
 FIELDS_108 = ("net", "max_drawdown", "max_abs_position", "mean_abs_position", "peak_notional",
               "refusals", "residual_fallbacks", "residual_clipped", "limit_breach",
               "peak_position", "peak_position_price")
@@ -400,8 +435,10 @@ def job_key(job):
             job["regime"], job["day"])
 
 
-def pool(jobs, parallel, label, journal):
-    """As #108's: each result is journaled as it ends, and a resumed step skips those."""
+def pool(jobs, parallel, label, journal, limit=None, out=None):
+    """As #108's: each result is journaled as it ends, and a resumed step skips those. Past
+    `limit` wall seconds the workers are killed (by their own pids), what ended stays
+    journaled, and Overrun is raised; the wall time is charged to budget.json in `out`."""
     import concurrent.futures
     import multiprocessing
     journal = pathlib.Path(journal)
@@ -416,18 +453,33 @@ def pool(jobs, parallel, label, journal):
     print(f"{label}: {len(jobs) - len(todo)} of {len(jobs)} already done; {parallel} processes",
           file=sys.stderr, flush=True)
     context = multiprocessing.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(parallel, mp_context=context) as executor, \
-            journal.open("a") as out:
-        futures = {executor.submit(run_job, job): key for key, job in todo}
-        for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-            row = future.result()
-            key = futures[future]
-            done_rows[key] = row
-            out.write(json.dumps({"key": json.dumps(list(key)), "row": row}) + "\n")
-            out.flush()
-            if done % 50 == 0 or done == len(todo):
-                print(f"{label}: {done}/{len(todo)} after {round(time.perf_counter() - started)} s",
-                      file=sys.stderr, flush=True)
+    executor = concurrent.futures.ProcessPoolExecutor(parallel, mp_context=context)
+    try:
+        with journal.open("a") as written:
+            futures = {executor.submit(run_job, job): key for key, job in todo}
+            timeout = None if limit is None else max(limit, 0)
+            try:
+                for done, future in enumerate(
+                        concurrent.futures.as_completed(futures, timeout=timeout), start=1):
+                    row = future.result()
+                    key = futures[future]
+                    done_rows[key] = row
+                    written.write(json.dumps({"key": json.dumps(list(key)), "row": row}) + "\n")
+                    written.flush()
+                    if done % 50 == 0 or done == len(todo):
+                        print(f"{label}: {done}/{len(todo)} after "
+                              f"{round(time.perf_counter() - started)} s", file=sys.stderr,
+                              flush=True)
+            except concurrent.futures.TimeoutError:
+                for process in list(getattr(executor, "_processes", {}).values()):
+                    if process.is_alive():
+                        process.kill()
+                raise Overrun(f"{label} reached the process-hour ceiling after "
+                              f"{round(time.perf_counter() - started)} s") from None
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        if out is not None and todo:
+            charge(out, label, time.perf_counter() - started, parallel)
     return [done_rows[key] for key in keys]
 
 
@@ -493,8 +545,9 @@ def selection(study, selection_108_path):
         study.write("identity_failure", report)
         raise SystemExit(f"stop: kappa 0 differs from #108 in {len(wrong)} rows")
     rest = [p for p in points if p[3] != 0]
+    limit = limit_for(study.out, study.parallel, HOLDOUT_RESERVE_PROCESS_HOURS)
     rows += pool(jobs_for(rest, "selection", days, study.runs, study.common()), study.parallel,
-                 "selection kappa > 0", study.out / "selection.journal")
+                 "selection kappa > 0", study.out / "selection.journal", limit, study.out)
     by_point = {}
     for name, *_ in points:
         scoped = m503.daily([r for r in rows if r["point"] == name])
@@ -550,7 +603,16 @@ def holdout(study, frozen_sha256):
         jobs += [j for j in jobs_for([by_name[choice["point"]]], "holdout", days, study.runs,
                                      study.common(), {"condition": "adversary"})
                  if j["arm"] == arm]
-    rows = pool(jobs, study.parallel, "holdout", study.out / "holdout.journal")
+    limit = limit_for(study.out, study.parallel, 0.0)
+    # Before any holdout day is read: a second or concurrent attempt is refused.
+    try:
+        marker = os.open(study.out / "holdout.started", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as error:
+        raise ValueError("the holdout was attempted already") from error
+    with os.fdopen(marker, "w") as handle:
+        handle.write(json.dumps({"started": time.time(), "pid": os.getpid(),
+                                 "frozen_sha256": frozen_sha256}) + "\n")
+    rows = pool(jobs, study.parallel, "holdout", study.out / "holdout.journal", limit, study.out)
     here["frozen_sha256"] = frozen_sha256
     here["rows"] = rows
     study.write("holdout", here)
