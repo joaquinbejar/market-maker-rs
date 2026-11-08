@@ -26,7 +26,7 @@ project follows [Semantic Versioning](https://semver.org/).
   `hyperliquid_validation` gains #290's phase 1 on the capture's training part (counts with and
   without zero waits, block lengths, how touch-queue lives end, and the drift of each estimator's
   fit) and phase 3 (each estimator and its constant baseline on #286's windows and the training
-  part's first hours, the choice and stop rule fixed before any run, and the holdout's verdict).
+  part's first hours, the choice and stop rule in code before any phase 3 run, and the holdout's verdict).
   E3, built because phase 1 met its condition, is E1 with touch resets read from the capture
   (a side's touch at a move of the mid that emptied no touch, its new size from the side's next
   touch event); its redraw law is the observed new sizes, with the invariant law as a
