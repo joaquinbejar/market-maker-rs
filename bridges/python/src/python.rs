@@ -1,5 +1,6 @@
 //! The extension module: a thin layer of Python values over [`Worker`].
 
+use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 
 use market_maker_rs::Decimal;
@@ -120,6 +121,18 @@ fn step_dict<'py>(py: Python<'py>, reply: &StepReply) -> PyResult<Bound<'py, PyD
     orders.set_item("cancel_rejected", reply.orders.cancel_rejected)?;
     orders.set_item("fills", reply.orders.fills)?;
     out.set_item("orders", orders)?;
+    let gates = PyDict::new(py);
+    for (name, counts) in [
+        ("limits", reply.gates.limits),
+        ("combined", reply.gates.combined),
+        ("margin", reply.gates.margin),
+    ] {
+        let check = PyDict::new(py);
+        check.set_item("reduced", counts.reduced)?;
+        check.set_item("rejected", counts.rejected)?;
+        gates.set_item(name, check)?;
+    }
+    out.set_item("gates", gates)?;
     let (applied, reason) = match t.action_status {
         ActionStatus::Applied => (true, None),
         ActionStatus::Rejected(reason) => (false, Some(format!("{reason:?}"))),
@@ -366,9 +379,47 @@ impl NativeEnv {
     }
 }
 
+/// Each step's account state under `margin-rs`'s `linear-im/1`, as
+/// [`crate::maintenance::maintenance_path`] reads it: `steps` are `(position, mark, net)`
+/// decimal strings, and each result is `(state, maintenance, shortfall)`.
+#[pyfunction]
+fn maintenance_path(
+    capital: &str,
+    scale: u32,
+    steps: Vec<(String, String, String)>,
+) -> PyResult<Vec<(String, String, String)>> {
+    let number = |what: &str, text: &str| {
+        Decimal::from_str(text)
+            .map_err(|error| BridgeFailure::new_err(format!("{what} {text:?}: {error}")))
+    };
+    let inputs = steps
+        .iter()
+        .map(|(position, mark, net)| {
+            Ok(crate::maintenance::StepInput {
+                position: number("position", position)?,
+                mark: number("mark", mark)?,
+                net: number("net", net)?,
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let path = crate::maintenance::maintenance_path(number("capital", capital)?, scale, &inputs)
+        .map_err(BridgeFailure::new_err)?;
+    Ok(path
+        .into_iter()
+        .map(|step| {
+            (
+                crate::maintenance::state_name(step.state).to_string(),
+                step.maintenance.to_string(),
+                step.shortfall.to_string(),
+            )
+        })
+        .collect())
+}
+
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnv>()?;
+    module.add_function(wrap_pyfunction!(maintenance_path, module)?)?;
     module.add("BridgeFailure", py.get_type::<BridgeFailure>())?;
     module.add("RESIDUAL_VERSION", market_maker_rs::rl::RESIDUAL_VERSION)?;
     module.add("BRIDGE_VERSION", env!("CARGO_PKG_VERSION"))?;

@@ -1,6 +1,6 @@
 """A Python bridge for an external RL trainer over the market-maker-rs RL spaces."""
 
-from ._native import BridgeFailure, NativeEnv
+from ._native import BridgeFailure, NativeEnv, maintenance_path
 from .envs import (
     BoxMarketMakingEnv,
     MarketMakingEnv,
@@ -17,4 +17,5 @@ __all__ = [
     "MaskableMarketMakingEnv",
     "NativeEnv",
     "ResidualMarketMakingEnv",
+    "maintenance_path",
 ]
