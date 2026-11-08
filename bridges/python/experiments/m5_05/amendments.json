@@ -1,0 +1,14 @@
+{
+  "note": "Amendments made after the freeze. design.json stays as frozen (frozen.json holds its hash), so they are recorded here.",
+  "changes": [
+    {
+      "version": 2,
+      "when": "2026-11-08, after the freeze (frozen.json 4c8ca714) and after the first holdout attempt was killed",
+      "seen": "no holdout value: the first attempt (12:02:57Z) was killed from outside at about 12:13:40Z, 627 s in, when the terminal session that had started it ended; 2236 of 9600 jobs were journaled, and only their count and their parsing were checked, no value printed",
+      "what": [
+        "One resume of the holdout, by experiments/m5_05/resume.py, which imports run.py unchanged (its frozen hash holds) and reuses its checks, jobs and pool. It runs only when the first attempt's marker exists, its report does not, and no resume was made; it records its own start with O_EXCL, naming the first attempt and its own hash, before any job; it drops a torn last journal line and runs only the jobs the journal does not hold. The overrun limit spans both attempts. A second death stops the study, reported, with no further resume.",
+        "Every run from here is started detached from the terminal session (nohup, its own session)."
+      ]
+    }
+  ]
+}
