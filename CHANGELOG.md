@@ -18,6 +18,13 @@ project follows [Semantic Versioning](https://semver.org/).
   and agreed before any code or run. No gain shown: at the selected held-out point the
   adversarially trained policy's tail loss is not smaller, and it costs about 3.3 a day
   unperturbed. The holdout was resumed once after an attempt killed from outside, as disclosed.
+- The regime adaptation and transfer study of #112 in `bridges/python/experiments/m5_08`, with
+  examples `regime_days` (synthetic days that change regime at fixed times, on the
+  queue-reactive and the Hawkes simulators) and `regime_alarm` (a causal volatility and VPIN
+  detector). Fixed, detector-adaptive, coordinate-search oracle and learned arms, with and
+  without the detector, under data shift, execution change and simulator error, on #103's
+  protocol, frozen before the single holdout. The result is a no-go on every group; the
+  detector raises tens of false alarms a calm day. Synthetic data only; no real-data claim.
 - The HSN study of #107 in `bridges/python/experiments/m5_02`: a learnable mixture-of-exponentials
   memory against MLP, frame-stack, fixed-EMA, GRU, LSTM and #103's memory arms, in the paper's
   single-asset setting (part A) and on #103's 1 s protocol over queue-reactive days (B) and
