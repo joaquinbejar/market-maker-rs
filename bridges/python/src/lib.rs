@@ -5,6 +5,7 @@
 //! Requests and replies go over `std` channels. The feature `python` adds the extension
 //! module on top; the worker builds and tests without Python.
 
+pub mod maintenance;
 pub mod worker;
 
 #[cfg(feature = "python")]

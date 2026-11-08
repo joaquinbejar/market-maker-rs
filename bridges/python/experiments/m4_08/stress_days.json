@@ -1,0 +1,229 @@
+{
+  "issue": 105,
+  "design_version": 1,
+  "what": "the days of #105's second, margin-stress holdout: #102's regimes and seed rule, days 25 to 29, generated with days 1 to 24 so that those reproduce #102's digests",
+  "data": "synthetic: a queue-reactive simulator with made-up parameters, no market data",
+  "days": 29,
+  "splits": {
+    "train": [
+      1,
+      14
+    ],
+    "validation": [
+      15,
+      19
+    ],
+    "holdout": [
+      20,
+      29
+    ]
+  },
+  "kernel": {
+    "tick_size": "0.005",
+    "lot_size": "1",
+    "max_price": "1000",
+    "max_order_size": "10"
+  },
+  "simulator": {
+    "kind": "queue_reactive",
+    "sample_ms": 10000,
+    "rows_per_day": 8640,
+    "reference_ticks": 10000,
+    "regimes": [
+      {
+        "name": "calm",
+        "tick_size": "0.01",
+        "theta": 0.6,
+        "theta_reinit": 0.2,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              4.0,
+              0.0,
+              0.0
+            ],
+            [
+              4.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              2.0,
+              1.0
+            ],
+            [
+              2.0,
+              3.0,
+              1.0
+            ],
+            [
+              0.0,
+              4.0,
+              1.0
+            ]
+          ],
+          [
+            [
+              4.0,
+              0.0,
+              0.0
+            ],
+            [
+              4.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              2.0,
+              1.0
+            ],
+            [
+              2.0,
+              3.0,
+              1.0
+            ],
+            [
+              0.0,
+              4.0,
+              1.0
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      },
+      {
+        "name": "stressed",
+        "tick_size": "0.01",
+        "theta": 0.7,
+        "theta_reinit": 0.3,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              6.0,
+              0.0,
+              0.0
+            ],
+            [
+              6.0,
+              2.0,
+              2.5
+            ],
+            [
+              5.0,
+              3.0,
+              2.5
+            ],
+            [
+              4.0,
+              4.0,
+              2.5
+            ],
+            [
+              0.0,
+              5.0,
+              2.5
+            ]
+          ],
+          [
+            [
+              6.0,
+              0.0,
+              0.0
+            ],
+            [
+              6.0,
+              2.0,
+              2.5
+            ],
+            [
+              5.0,
+              3.0,
+              2.5
+            ],
+            [
+              4.0,
+              4.0,
+              2.5
+            ],
+            [
+              0.0,
+              5.0,
+              2.5
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      },
+      {
+        "name": "thin",
+        "tick_size": "0.01",
+        "theta": 0.8,
+        "theta_reinit": 0.4,
+        "event_sizes": [
+          "1",
+          "2"
+        ],
+        "rates": [
+          [
+            [
+              2.0,
+              0.0,
+              0.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ],
+            [
+              1.0,
+              2.0,
+              1.0
+            ],
+            [
+              0.0,
+              2.0,
+              1.0
+            ]
+          ],
+          [
+            [
+              2.0,
+              0.0,
+              0.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ],
+            [
+              1.0,
+              2.0,
+              1.0
+            ],
+            [
+              0.0,
+              2.0,
+              1.0
+            ]
+          ]
+        ],
+        "policy": "nearest_supported"
+      }
+    ],
+    "regime_note": "The simulator's rates are the same on both sides, so a skewed flow is not available; the third regime is a thin book instead.",
+    "seed": "1000003 * regime_number + day, regime_number from 1 in the order above, day from 1",
+    "start_ms": "(day - 1) * 86400000, so each day is one UTC day"
+  }
+}

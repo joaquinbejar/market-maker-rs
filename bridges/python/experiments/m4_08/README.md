@@ -67,6 +67,27 @@ holdout.
 The results are withheld here on purpose, as #103's are: another study's holdout is pending.
 They come from `report.json`, whose hash the pull request commits to.
 
+## The second, margin-stress holdout
+
+`stress_design.json` fixes, before it runs, a second holdout that reads the frozen runs under
+margin-rs's maintenance rule; it does not revise the first holdout's decisions. Its days are
+days 25 to 29 of #102's regimes, by the same seed rule (`stress_days.json`): generated with days
+1 to 24, which reproduce #102's digests, and recorded in `stress_digests.json`, with their
+shocked copies in `stress_shocks.json`. The frozen runs, no-trade and the selected
+Avellaneda-Stoikov points run on them at the frozen fee, unshocked and under each shock, and
+after each step the account (one linear perpetual position on 125 of collateral) is assessed
+by `margin_rs::maintenance::assess` under `linear-im/1`, from the previous step's state
+(`bridges/python/src/maintenance.rs`, `mm_rl_bridge.maintenance_path`). A state is recorded,
+never acted on. `report_stress.py` reads the share of steps not Healthy per day, with the
+entries into ReduceOnly or Default (where a closeout would start), the largest shortfall, and
+the positions and fills beside them; an arm with no fill is Healthy by construction, and a
+comparison against it is flagged as trading against not trading.
+
+    python experiments/m4_08/stress.py days <qr_days output for stress_days.json>
+    python experiments/m4_08/stress.py shocks <stress data dir> <shocks dir>
+    python experiments/m4_08/stress.py holdout <stress data dir> <shocks dir> <out dir> <stress out dir> <commit> <frozen sha256>
+    python experiments/m4_08/report_stress.py <out dir> <stress out dir> target/release/examples/m4_05_intervals
+
 ## Bounds
 
 The comparisons are many: three rows, three regimes and pooled, three kinds; each is a 90 %
