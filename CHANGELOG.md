@@ -8,6 +8,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
+  #102's residual SAC retrained with and without a training adversary that, between five
+  phases, moves the episode's flow perturbation toward the point where the policy loses most on
+  scoring days. The adversary trains on #108's 12 points with the limit rate unchanged; the 12
+  points with a lower limit rate, #108's execution stress and #282's own impact are held out.
+  Both arms are evaluated once on fresh holdout days, with paired regime-stratified block
+  bootstrap intervals of the CVaR difference recomputed per replicate. The design was committed
+  and agreed before any code or run.
 - An offline training study for #280 in `bridges/python/experiments/m4_11`, synthetic only:
   - behaviour cloning and a discrete conservative Q-learning trained on simulator logs;
   - `design.json` committed before any run, with `run.py` and `offline.py`;

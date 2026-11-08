@@ -208,7 +208,7 @@
     "threads_per_run": 1,
     "max_parallel_runs": 4,
     "estimate": "to be measured by the rate step; training: 10 runs x 500000 steps; scoring: 2 arms x 5 seeds x 4 boundaries x 12 points x 6 days; selection: 15 policies x 12 points x 30 days; holdout: (10 x 26 + 5 x 15) x 30 episodes",
-    "starts": "after #282's selection frees its slots, and on the coordinator's go"
+    "starts": "after #282's selection frees its slots, and on the maintainer's go"
   },
   "from_the_approved_note": [
     "Model selection on validation days at the training points is dropped: the final checkpoint is the policy for both arms, so there is no candidate schedule to choose from.",
