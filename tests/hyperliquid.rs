@@ -7,9 +7,9 @@ use market_maker_rs::Decimal;
 use market_maker_rs::analytics::order_flow::TradeSide;
 use market_maker_rs::backtest::hyperliquid::{
     BookChange, BookDiff, CaptureTrade, EventCause, ORDER_STATUS_RECORD_BYTES, OrderStatusRecord,
-    Replay, ReplayConfig, STATUS_FILLED, STATUS_OPEN, TimeEvidence, Warmth, decode_fixed,
-    decode_order_status, decode_order_statuses, hawkes_segments, parse_book_diff, parse_time_ns,
-    queue_observations, read_book_diffs, read_trades, sized_events,
+    Replay, ReplayConfig, STATUS_FILLED, STATUS_OPEN, TimeEvidence, Warmth, book_samples,
+    decode_fixed, decode_order_status, decode_order_statuses, hawkes_segments, parse_book_diff,
+    parse_time_ns, queue_observations, read_book_diffs, read_trades, sized_events,
 };
 use market_maker_rs::backtest::hyperliquid::{
     RepeatFilter, decode_order_statuses_after, read_book_diffs_after, read_trades_after,
@@ -2046,4 +2046,340 @@ fn test_hours_that_overlap_step_back_unless_read_through_one_filter_per_stream()
     assert_eq!(filtered.coverage().time_steps_back, 0);
     assert_eq!(filtered.coverage().duplicate_new, 0);
     assert_eq!(filtered.coverage().diffs, 3);
+}
+
+// The book on a time grid (#263).
+
+fn sampling(warmup: u64, reset_gap: u64) -> Replay {
+    Replay::new(
+        ReplayConfig::new(dec!(1), 3, warmup, reset_gap)
+            .unwrap()
+            .with_book_samples(1_000)
+            .unwrap(),
+    )
+}
+
+fn ms(ns: u64) -> u64 {
+    ns / 1_000_000
+}
+
+#[test]
+fn test_a_book_sample_shows_every_diff_before_its_time_and_none_at_it() {
+    let (mut statuses, mut diffs) = opening();
+    // A bid at 99.5, one tick from the mid 100.5, so at limit 0 with 100; one at 99, limit 1.
+    statuses.push(status(
+        START + 2_500_000_000,
+        STATUS_OPEN,
+        false,
+        9_950,
+        50,
+        3,
+    ));
+    statuses.push(status(
+        START + 2_500_000_000,
+        STATUS_OPEN,
+        false,
+        9_900,
+        100,
+        4,
+    ));
+    // Past three limits on either side: in no sample, and the side is read from the touch out.
+    statuses.push(status(
+        START + 2_500_000_000,
+        STATUS_OPEN,
+        false,
+        9_600,
+        100,
+        9,
+    ));
+    statuses.push(status(
+        START + 2_500_000_000,
+        STATUS_OPEN,
+        true,
+        10_500,
+        100,
+        10,
+    ));
+    // A block of two diffs at exactly START + 5 s: no sample at 5 s shows either.
+    statuses.push(status(
+        START + 5 * SECOND,
+        STATUS_OPEN,
+        true,
+        10_100,
+        400,
+        5,
+    ));
+    statuses.push(status(
+        START + 5 * SECOND,
+        STATUS_OPEN,
+        true,
+        10_200,
+        100,
+        6,
+    ));
+    diffs.push(new(3, QrSide::Bid, dec!(99.5), dec!(0.5)));
+    diffs.push(new(4, QrSide::Bid, dec!(99), dec!(1)));
+    diffs.push(new(9, QrSide::Bid, dec!(96), dec!(1)));
+    diffs.push(new(10, QrSide::Ask, dec!(105), dec!(1)));
+    diffs.push(new(5, QrSide::Ask, dec!(101), dec!(4)));
+    diffs.push(new(6, QrSide::Ask, dec!(102), dec!(1)));
+    let mut replay = sampling(0, u64::MAX);
+    let output = replay.ingest(&statuses, &diffs, &[]).unwrap();
+    // The first diff at START starts the grid after it. At START + 1 s the ask arrives, and the
+    // sample there shows the book before it: one sided, so no sample.
+    assert_eq!(replay.coverage().book_samples_without_touch, 1);
+    let times: Vec<u64> = output.book.iter().map(|s| s.value.timestamp_ms).collect();
+    assert_eq!(
+        times,
+        vec![
+            ms(START + 2 * SECOND),
+            ms(START + 3 * SECOND),
+            ms(START + 4 * SECOND),
+            ms(START + 5 * SECOND),
+        ]
+    );
+    let first = output.book[0].value;
+    assert_eq!(first.bid, [dec!(2), dec!(0), dec!(0), dec!(0), dec!(0)]);
+    assert_eq!(first.ask, [dec!(3), dec!(0), dec!(0), dec!(0), dec!(0)]);
+    assert_eq!((first.best_bid, first.best_ask), (dec!(100), dec!(101)));
+    assert_eq!(first.warmth, Warmth::Warm);
+    for sample in &output.book[1..] {
+        assert_eq!(
+            sample.value.bid,
+            [dec!(2.5), dec!(1), dec!(0), dec!(0), dec!(0)]
+        );
+        assert_eq!(
+            sample.value.ask,
+            [dec!(3), dec!(0), dec!(0), dec!(0), dec!(0)]
+        );
+    }
+    assert!(
+        output
+            .book
+            .iter()
+            .all(|s| s.time.evidence == TimeEvidence::Joined)
+    );
+    assert!(output.book.iter().all(|s| s.epoch == 0));
+
+    // The block applies, and the next diff, in another hour, shows it whole.
+    let later = START + 7 * SECOND;
+    let output = replay
+        .ingest(
+            &[status(later, CANCELED, false, 9_900, 100, 4)],
+            &[remove(4, "B", "99")],
+            &[],
+        )
+        .unwrap();
+    let times: Vec<u64> = output.book.iter().map(|s| s.value.timestamp_ms).collect();
+    assert_eq!(times, vec![ms(START + 6 * SECOND), ms(later)]);
+    for sample in &output.book {
+        assert_eq!(
+            sample.value.ask,
+            [dec!(7), dec!(1), dec!(0), dec!(0), dec!(0)]
+        );
+        assert_eq!(
+            sample.value.bid,
+            [dec!(2.5), dec!(1), dec!(0), dec!(0), dec!(0)]
+        );
+    }
+}
+
+#[test]
+fn test_a_book_sample_takes_the_weaker_time_evidence_and_the_warmth_at_its_time() {
+    let (mut statuses, mut diffs) = opening();
+    // A diff with no status inherits START + 1 s; the next joins at START + 3 s.
+    diffs.push(new(7, QrSide::Bid, dec!(99), dec!(1)));
+    statuses.push(status(
+        START + 3 * SECOND,
+        STATUS_OPEN,
+        false,
+        9_800,
+        100,
+        8,
+    ));
+    diffs.push(new(8, QrSide::Bid, dec!(98), dec!(1)));
+    let mut replay = sampling(2_500_000_000, u64::MAX);
+    let output = replay.ingest(&statuses, &diffs, &[]).unwrap();
+    let samples: Vec<_> = output
+        .book
+        .iter()
+        .map(|s| (s.value.timestamp_ms, s.time.evidence, s.value.warmth))
+        .collect();
+    assert_eq!(
+        samples,
+        vec![
+            (
+                ms(START + 2 * SECOND),
+                TimeEvidence::Inherited,
+                Warmth::Cold
+            ),
+            (
+                ms(START + 3 * SECOND),
+                TimeEvidence::Inherited,
+                Warmth::Warm
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_a_reset_leaves_no_book_sample_across_the_silence() {
+    let (statuses, diffs) = opening();
+    let mut replay = sampling(0, GAP);
+    let first = replay.ingest(&statuses, &diffs, &[]).unwrap();
+    assert!(first.book.is_empty());
+    let later = START + SECOND + GAP + 1;
+    let more = [
+        status(later, STATUS_OPEN, false, 9_900, 100, 3),
+        status(later + SECOND, STATUS_OPEN, true, 10_000, 100, 4),
+        status(later + 3 * SECOND, STATUS_OPEN, true, 10_100, 100, 5),
+    ];
+    let more_diffs = [
+        new(3, QrSide::Bid, dec!(99), dec!(1)),
+        new(4, QrSide::Ask, dec!(100), dec!(1)),
+        new(5, QrSide::Ask, dec!(101), dec!(1)),
+    ];
+    let output = replay.ingest(&more, &more_diffs, &[]).unwrap();
+    // Nothing of the forgotten book, neither as a sample nor as a grid time without a touch.
+    assert_eq!(replay.coverage().resets_on_diffs, 1);
+    assert!(output.book.iter().all(|s| s.epoch == 1));
+    assert!(output.book.iter().all(|s| s.value.timestamp_ms > ms(later)));
+    // After the reset: the grid restarts after the diff that showed it; at its first time the
+    // ask has not come, at the next it has. The other grid time without a touch is the
+    // opening's, at START + 1 s.
+    assert_eq!(replay.coverage().book_samples_without_touch, 2);
+    let times: Vec<u64> = output.book.iter().map(|s| s.value.timestamp_ms).collect();
+    assert_eq!(
+        times,
+        vec![ms(later - 1 + 2 * SECOND), ms(later - 1 + 3 * SECOND)]
+    );
+    assert_eq!(output.book[0].value.best_ask, dec!(100));
+}
+
+#[test]
+fn test_a_silence_in_the_trades_also_leaves_no_book_sample_across_it() {
+    let (statuses, diffs) = opening();
+    let mut replay = sampling(0, GAP);
+    replay
+        .ingest(
+            &statuses,
+            &diffs,
+            &[trade(START, dec!(100), TradeSide::Sell)],
+        )
+        .unwrap();
+    // Diffs keep coming every 30 s, so only the trades are silent, until a trade at 100 s.
+    let mut statuses = Vec::new();
+    let mut diffs = Vec::new();
+    for (i, at) in [30u64, 60, 90, 120].iter().enumerate() {
+        let oid = 10 + i as u64;
+        statuses.push(status(
+            START + at * SECOND,
+            STATUS_OPEN,
+            false,
+            9_900,
+            100,
+            oid,
+        ));
+        diffs.push(new(oid, QrSide::Bid, dec!(99), dec!(1)));
+    }
+    let output = replay
+        .ingest(
+            &statuses,
+            &diffs,
+            &[trade(START + 100 * SECOND, dec!(100), TradeSide::Sell)],
+        )
+        .unwrap();
+    assert_eq!(replay.coverage().resets_on_trades, 1);
+    let before: Vec<_> = output.book.iter().filter(|s| s.epoch == 0).collect();
+    let after: Vec<_> = output.book.iter().filter(|s| s.epoch == 1).collect();
+    // Before the reset, samples up to the last diff of the old epoch; none after the trade
+    // forgot the book, which has no touch again before the end.
+    assert_eq!(
+        before.last().unwrap().value.timestamp_ms,
+        ms(START + 90 * SECOND)
+    );
+    assert!(after.is_empty());
+    // The only grid time without a touch is the opening's: the forgotten stretch is not one.
+    assert_eq!(replay.coverage().book_samples_without_touch, 1);
+    assert!(
+        output
+            .book
+            .iter()
+            .all(|s| s.value.timestamp_ms <= ms(START + 90 * SECOND))
+    );
+}
+
+#[test]
+fn test_no_book_samples_unless_asked_and_the_grid_is_checked() {
+    let (statuses, diffs) = opening();
+    let mut more = statuses.clone();
+    more.push(status(
+        START + 5 * SECOND,
+        STATUS_OPEN,
+        false,
+        9_900,
+        100,
+        3,
+    ));
+    let mut more_diffs = diffs.clone();
+    more_diffs.push(new(3, QrSide::Bid, dec!(99), dec!(1)));
+    let mut replay = Replay::new(config(0));
+    let output = replay.ingest(&more, &more_diffs, &[]).unwrap();
+    assert!(output.book.is_empty());
+    assert_eq!(replay.coverage().book_samples_without_touch, 0);
+    assert!(config(0).book_sample_ns.is_none());
+    assert_eq!(
+        config(0).with_book_samples(250).unwrap().book_sample_ns,
+        Some(250_000_000)
+    );
+    assert!(config(0).with_book_samples(0).is_err());
+    assert!(config(0).with_book_samples(u64::MAX).is_err());
+    let six = ReplayConfig::new(dec!(1), 6, 0, u64::MAX).unwrap();
+    assert!(six.with_book_samples(1_000).is_err());
+    let five = ReplayConfig::new(dec!(1), 5, 0, u64::MAX).unwrap();
+    assert!(five.with_book_samples(1_000).is_ok());
+}
+
+#[test]
+fn test_book_samples_count_queues_in_event_sizes_and_the_spread_in_ticks() {
+    let statuses = vec![
+        status(START, STATUS_OPEN, false, 10_000, 125, 1),
+        status(START, STATUS_OPEN, true, 10_200, 300, 2),
+        status(START, STATUS_OPEN, false, 9_900, 40, 3),
+        status(START + 2 * SECOND, STATUS_OPEN, true, 10_300, 100, 4),
+    ];
+    let diffs = vec![
+        new(1, QrSide::Bid, dec!(100), dec!(1.25)),
+        new(2, QrSide::Ask, dec!(102), dec!(3)),
+        new(3, QrSide::Bid, dec!(99), dec!(0.4)),
+        new(4, QrSide::Ask, dec!(103), dec!(1)),
+    ];
+    let mut replay = Replay::new(
+        ReplayConfig::new(dec!(1), 3, 1_500_000_000, u64::MAX)
+            .unwrap()
+            .with_book_samples(1_000)
+            .unwrap(),
+    );
+    let output = replay.ingest(&statuses, &diffs, &[]).unwrap();
+    // Grid times START + 1 s (cold) and START + 2 s (warm).
+    assert_eq!(output.book.len(), 2);
+    let sizes = [dec!(0.5), dec!(0.25), dec!(1)];
+    let samples = book_samples(&output.book, &sizes, dec!(1)).unwrap();
+    assert_eq!(samples.len(), 1, "the cold sample is left out");
+    let sample = samples[0].value;
+    assert_eq!(sample.timestamp_ms, ms(START + 2 * SECOND));
+    // Mid 101: 100 and 102 are one tick away, limit 0; 99 is limit 1.
+    // 1.25 / 0.5 = 2.5 rounds to 2 (banker's, as the queue observations); 0.4 / 0.25 = 1.6 to 2.
+    assert_eq!(sample.bid, [2, 2, 0, 0, 0]);
+    assert_eq!(sample.ask, [6, 0, 0, 0, 0]);
+    assert_eq!(sample.spread_ticks, 2);
+    assert_eq!(samples[0].epoch, 0);
+    // The spread rounds up on a finer declared tick, as a count of ticks.
+    let halves = book_samples(&output.book, &sizes, dec!(0.75)).unwrap();
+    assert_eq!(halves[0].value.spread_ticks, 3);
+    // A limit with size needs an event size; an empty one does not.
+    assert!(book_samples(&output.book, &sizes[..1], dec!(1)).is_err());
+    assert!(book_samples(&output.book, &sizes[..2], dec!(1)).is_ok());
+    assert!(book_samples(&output.book, &[dec!(0.5), dec!(0), dec!(1)], dec!(1)).is_err());
+    assert!(book_samples(&output.book, &sizes, dec!(0)).is_err());
 }

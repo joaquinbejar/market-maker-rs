@@ -217,7 +217,7 @@ fn hedges_that_reduced(t: &Trajectory) -> u64 {
                 next_id += 1;
             }
             KernelAction::Quote { .. } => next_id += 2,
-            KernelAction::Hold | KernelAction::QuoteError(_) => {}
+            KernelAction::Hold | KernelAction::QuoteError(_) | KernelAction::Cancel => {}
         }
     }
     assert_eq!(next_id, t.last.next_order_id(), "order id derivation");

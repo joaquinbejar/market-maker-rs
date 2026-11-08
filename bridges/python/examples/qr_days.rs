@@ -5,6 +5,8 @@
 //! under `<out dir>/<split>/<regime>/day-<n>.json` as the bridge reads them, and prints the
 //! digests the design's manifest records: the dataset digest the environment reports for
 //! those rows, and the external digest of the parameters, the seed and the reference.
+//! A design may state a `seed_offset` (#108), added to every day's seed, for days that are
+//! none of #102's; without one the seeds are #102's.
 //! Everything here is synthetic, from made-up parameters.
 
 use std::fs;
@@ -129,6 +131,11 @@ fn main() -> Result<(), Failure> {
     );
     let splits = design.get("splits").ok_or("splits")?;
     let days = number(&design, "days")?;
+    // A study that needs days other than #102's states an offset; without one, #102's seeds.
+    let seed_offset = design
+        .get("seed_offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let sample_ms = u32::try_from(number(simulator, "sample_ms")?)?;
     let rows = u32::try_from(number(simulator, "rows_per_day")?)?;
     let reference_ticks = i64::try_from(number(simulator, "reference_ticks")?)?;
@@ -145,6 +152,7 @@ fn main() -> Result<(), Failure> {
             let seed = SEED_STRIDE
                 .checked_mul(number_of_regime)
                 .and_then(|base| base.checked_add(day))
+                .and_then(|seed| seed.checked_add(seed_offset))
                 .ok_or("seed")?;
             let episode = QrEpisode {
                 seed,

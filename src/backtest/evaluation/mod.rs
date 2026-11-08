@@ -30,7 +30,19 @@
 //! or to any position whose value is not `position * mark`. Those runs must not be
 //! given to this module: records carry no contract, so `check_contract` (feature
 //! `instruments`) is how a caller refuses a specification first. Hedge costs are not part of `net`:
-//! [`HedgeCosts::NotModelled`] says so, rather than a zero.
+//! with one instrument [`HedgeCosts::NotModelled`] says so, rather than a zero.
+//!
+//! # A hedge in a second instrument
+//!
+//! [`EvaluationInput::with_hedge`] adds a second instrument's marks, fills and funding
+//! payments (#266). The hedge is attributed against its own marks, by the same rule
+//! of the mark in force, into [`HedgeAttribution`]: `spread_capture +
+//! inventory_pnl - fees + funding`, checked against the hedge's cash, position and
+//! funding as the quoted lane is. Each of its terms goes into the bucket of the
+//! quoted mark in force at its time, or the first bucket before any quoted mark,
+//! so the buckets still sum to the total. It is reported in
+//! [`Attribution::hedge_costs`] and not in [`Attribution::net_pnl`], which stays
+//! the quoted lane's; [`BucketedAttribution::reconcile_lanes`] checks both lanes.
 //!
 //! # The mark in force
 //!
@@ -86,10 +98,10 @@ mod experiment;
 pub use attribution::check_contract;
 pub use attribution::{
     Attribution, BucketAttribution, BucketedAttribution, DailyAttribution, EvaluationInput,
-    ExecutedFill, FillQualityReport, FillQualitySpec, HedgeCosts, HedgeNotModelledReason,
-    InventoryStats, LedgerTotals, Mark, MetricValue, MetricsSpec, Reading, SideQuality,
-    WindowMetrics, attribute, attribute_by, attribute_daily, evaluate_window, fill_quality,
-    inventory_stats, max_drawdown,
+    ExecutedFill, FillQualityReport, FillQualitySpec, FundingPayment, HedgeAttribution, HedgeCosts,
+    HedgeNotModelledReason, InventoryStats, LedgerTotals, Mark, MetricValue, MetricsSpec, Reading,
+    SideQuality, WindowMetrics, attribute, attribute_by, attribute_daily, evaluate_window,
+    fill_quality, inventory_stats, max_drawdown,
 };
 pub use definitions::{
     Aggregation, CapitalDenominator, Direction, MetricDefinition, MetricHorizon, MetricId,
@@ -100,7 +112,7 @@ pub use experiment::{
     BootstrapConfig, BootstrapOutcome, Candidate, CandidateKind, CandidateRecord, EvaluationRow,
     Experiment, ExperimentConfig, HoldoutReport, Manifest, Provenance, RegimeLabeller, RowMetrics,
     RowOutcome, Scenario, ScenarioRecord, Selection, SharedPolicy, Splits, ValidatedExperiment,
-    ValidationReport, WindowKind, block_bootstrap,
+    ValidationReport, WindowKind, block_bootstrap, stratified_block_bootstrap,
 };
 
 use crate::Decimal;

@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 
+import gymnasium as gym
 import numpy as np
 import pytest
 from conftest import LONG_ROWS, config, walk
@@ -72,6 +73,64 @@ def test_an_interval_must_be_a_positive_whole_number_of_rows():
         with pytest.raises(ValueError):
             DecisionInterval(env, every)
     env.close()
+
+
+def test_an_interval_ends_where_the_episode_is_cut():
+    # Four steps in all: a decision of 3 rows, then one of the single row left.
+    env = DecisionInterval(MaskableMarketMakingEnv(config(max_steps=4), walk()), 3)
+    env.reset(seed=1)
+    *_, terminated, truncated, info = env.step(QUOTE)
+    assert info["rows"] == 3 and not (terminated or truncated)
+    *_, terminated, truncated, info = env.step(QUOTE)
+    assert truncated and not terminated and info["rows"] == 1
+    env.close()
+
+
+def test_a_hold_between_decisions_is_recorded_as_a_hold():
+    env = MaskableMarketMakingEnv(config(), LONG_ROWS)
+    env.reset(seed=1)
+    env.step(QUOTE)
+    *_, info = env.step_hold()
+    hold = {"kind": "hold", "indices": []}
+    assert info["applied_action"] == hold and info["decoded_action"] == hold
+    # The quote rests: nothing was canceled.
+    assert info["orders"]["canceled"] == 0
+    env.close()
+
+
+class Steady(gym.Env):
+    """Every observation is `value`, beyond the range the features keep to."""
+
+    def __init__(self, value):
+        self.value = value
+        self.observation_space = gym.spaces.Box(-5.0, 5.0, (6,), dtype=np.float32)
+        self.action_space = gym.spaces.Discrete(1)
+
+    def reset(self, *, seed=None, options=None):
+        return np.full(6, self.value, dtype=np.float32), {}
+
+    def step(self, action):
+        return np.full(6, self.value, dtype=np.float32), 0.0, False, False, {}
+
+
+def test_ema_features_stay_in_their_bounds_and_need_positive_half_lives():
+    env = EmaFeatures(Steady(3.0), (1,))
+    env.reset()
+    for _ in range(5):
+        observation, *_ = env.step(0)
+    assert np.array_equal(observation[6:], [1.0, 1.0])
+    env = EmaFeatures(Steady(-3.0), (1,))
+    observation, _ = env.reset()
+    assert np.array_equal(observation[6:], [-1.0, -1.0])
+    for half_lives in ((), (0,), (2, -1)):
+        with pytest.raises(ValueError, match="half-lives"):
+            EmaFeatures(Steady(0.0), half_lives)
+
+
+def test_a_history_is_a_positive_whole_number_of_decisions():
+    for length in (0, -2, 1.5):
+        with pytest.raises(ValueError, match="whole number"):
+            history(Steady(0.0), length)
 
 
 def test_ema_features_start_at_zero_each_episode_and_follow_the_decisions():
@@ -151,3 +210,48 @@ def test_an_interval_holds_a_residual_policys_orders_between_its_decisions():
             break
     assert placed > 0
     env.close()
+
+
+def test_a_chosen_duration_bins_the_last_value_and_holds_that_many_rows():
+    from mm_rl_bridge import BoxMarketMakingEnv
+    from mm_rl_bridge.wrappers import ChosenDuration
+
+    env = ChosenDuration(BoxMarketMakingEnv(config(policy="reject", max_steps=1000), walk()))
+    assert env.action_space.shape == (6,)
+    assert [env.duration_of(v) for v in (-1.0, -0.6, -0.4, 0.0, 0.4, 0.6, 1.0)] == [
+        1, 1, 5, 10, 10, 30, 30]
+    env.reset(seed=1)
+    quote = [1.0, 0.0, 0.5, 0.5, -1.0]
+    for value, rows in ((-1.0, 1), (-0.4, 5), (0.0, 10), (1.0, 30)):
+        _, _, terminated, truncated, info = env.step(quote + [value])
+        assert (info["duration"], info["rows"]) == (rows, rows)
+        assert not (terminated or truncated)
+    with pytest.raises(ValueError):
+        env.step(quote)
+    env.close()
+
+
+def test_a_chosen_duration_is_the_decision_then_direct_holds():
+    from mm_rl_bridge import BoxMarketMakingEnv
+    from mm_rl_bridge.wrappers import ChosenDuration
+
+    settings = config(policy="reject", max_steps=1000)
+    direct = BoxMarketMakingEnv(settings, walk())
+    wrapped = ChosenDuration(BoxMarketMakingEnv(settings, walk()))
+    direct.reset(seed=3)
+    wrapped.reset(seed=3)
+    quote = [1.0, 0.0, 0.0, 0.5, 0.5]
+    for step in range(20):
+        value = (-1.0, -0.4, 0.0)[step % 3]
+        observation, reward, terminated, truncated, info = wrapped.step(quote + [value])
+        rows = [direct.step(quote)]
+        while len(rows) < wrapped.duration_of(value) and not (rows[-1][2] or rows[-1][3]):
+            rows.append(direct.step_hold())
+        assert np.array_equal(observation, rows[-1][0]) and info["rows"] == len(rows)
+        assert Decimal(info["reward_exact"]) == sum(Decimal(r[4]["reward_exact"]) for r in rows)
+        for kind in info["orders"]:
+            assert info["orders"][kind] == sum(r[4]["orders"][kind] for r in rows)
+        if terminated or truncated:
+            break
+    direct.close()
+    wrapped.close()

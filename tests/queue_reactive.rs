@@ -1621,3 +1621,557 @@ fn test_event_sizes_reach_the_parameters_they_are_for() {
     .unwrap();
     assert_eq!(fit.parameters().expect("calibrated").event_sizes(), sizes);
 }
+
+fn queue_event(
+    side: QrSide,
+    kind: QrEventKind,
+    queue_before: u32,
+    waiting_seconds: f64,
+) -> QueueObservation {
+    QueueObservation {
+        timestamp_ms: 7,
+        side,
+        depth: 0,
+        kind,
+        queue_before,
+        waiting_seconds,
+    }
+}
+
+#[test]
+fn test_collapse_keeps_a_block_net_change_in_place() {
+    use QrEventKind::{Cancel, Limit};
+    let other = queue_event(QrSide::Ask, Cancel, 5, 0.25);
+    let events = [
+        queue_event(QrSide::Bid, Limit, 3, 2.0),
+        other,
+        queue_event(QrSide::Bid, Limit, 4, 0.0),
+        queue_event(QrSide::Bid, Cancel, 5, 0.0),
+        queue_event(QrSide::Bid, Limit, 4, 0.0),
+    ];
+    assert_eq!(
+        collapse_blocks(&events),
+        vec![
+            queue_event(QrSide::Bid, Limit, 3, 2.0),
+            queue_event(QrSide::Bid, Limit, 4, 0.0),
+            other,
+        ]
+    );
+}
+
+#[test]
+fn test_collapse_names_a_net_departure_by_whether_it_holds_a_market_order() {
+    use QrEventKind::{Cancel, Limit, Market};
+    let with_market = [
+        queue_event(QrSide::Bid, Cancel, 4, 1.0),
+        queue_event(QrSide::Bid, Market, 3, 0.0),
+        queue_event(QrSide::Bid, Limit, 2, 0.0),
+        queue_event(QrSide::Bid, Cancel, 3, 0.0),
+    ];
+    assert_eq!(
+        collapse_blocks(&with_market),
+        vec![
+            queue_event(QrSide::Bid, Market, 4, 1.0),
+            queue_event(QrSide::Bid, Market, 3, 0.0),
+        ]
+    );
+    let cancels = [
+        queue_event(QrSide::Ask, Cancel, 4, 1.0),
+        queue_event(QrSide::Ask, Cancel, 3, 0.0),
+    ];
+    assert_eq!(collapse_blocks(&cancels), cancels.to_vec());
+}
+
+#[test]
+fn test_collapse_carries_a_zero_net_block_wait_to_its_queue_next_event() {
+    use QrEventKind::{Cancel, Limit};
+    let events = [
+        queue_event(QrSide::Bid, Limit, 2, 1.5),
+        queue_event(QrSide::Bid, Cancel, 3, 0.0),
+        queue_event(QrSide::Ask, Limit, 1, 0.75),
+        queue_event(QrSide::Bid, Cancel, 2, 0.5),
+    ];
+    assert_eq!(
+        collapse_blocks(&events),
+        vec![
+            queue_event(QrSide::Ask, Limit, 1, 0.75),
+            queue_event(QrSide::Bid, Cancel, 2, 2.0),
+        ]
+    );
+}
+
+#[test]
+fn test_collapse_starts_a_block_at_a_wait_or_another_queue() {
+    use QrEventKind::{Cancel, Limit};
+    let waited = [
+        queue_event(QrSide::Bid, Limit, 2, 1.0),
+        queue_event(QrSide::Bid, Cancel, 3, 0.5),
+    ];
+    assert_eq!(collapse_blocks(&waited), waited.to_vec());
+    let sized = [
+        queue_event(QrSide::Bid, Limit, 2, 1.0),
+        queue_event(QrSide::Bid, Limit, 7, 0.0),
+    ];
+    assert_eq!(
+        collapse_blocks(&sized),
+        vec![
+            queue_event(QrSide::Bid, Limit, 2, 1.0),
+            queue_event(QrSide::Bid, Limit, 3, 0.0),
+        ],
+        "one event size each, from the first event's queue"
+    );
+    let other_side = [
+        queue_event(QrSide::Bid, Limit, 2, 1.0),
+        queue_event(QrSide::Ask, Cancel, 3, 0.0),
+    ];
+    assert_eq!(collapse_blocks(&other_side), other_side.to_vec());
+    let other_limit = [
+        queue_event(QrSide::Bid, Limit, 2, 1.0),
+        QueueObservation {
+            depth: 1,
+            ..queue_event(QrSide::Bid, Cancel, 3, 0.0)
+        },
+    ];
+    assert_eq!(collapse_blocks(&other_limit), other_limit.to_vec());
+}
+
+#[test]
+fn test_zero_waits_are_dropped_by_default_and_counted_on_request() {
+    use QrEventKind::{Cancel, Limit};
+    let events = [
+        queue_event(QrSide::Bid, Limit, 1, 1.0),
+        queue_event(QrSide::Bid, Limit, 2, 0.0),
+        queue_event(QrSide::Bid, Cancel, 3, 0.0),
+        queue_event(QrSide::Bid, Cancel, 2, -1.0),
+    ];
+    let reference = ReferenceObservation {
+        timestamp_ms: 7,
+        moved: true,
+        reinitialized: false,
+    };
+    let base = estimation_config(1, 3, 1, 1, UnsupportedPolicy::NearestSupported);
+    assert_eq!(base.zero_waits, ZeroWaitPolicy::Drop);
+    let run = |cfg: &QrEstimationConfig| {
+        estimate_parameters(&events, &[reference], &[dec!(1)], &window(100), cfg, "d").unwrap()
+    };
+    let dropped = run(&base);
+    assert_eq!((dropped.events, dropped.excluded_events), (1, 3));
+    let counted = run(&base.with_zero_waits(ZeroWaitPolicy::Count));
+    assert_eq!((counted.events, counted.excluded_events), (3, 1));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_a_config_without_zero_waits_reads_as_dropping_them() {
+    let cfg = estimation_config(1, 3, 1, 1, UnsupportedPolicy::NearestSupported)
+        .with_zero_waits(ZeroWaitPolicy::Count);
+    let mut value = serde_json::to_value(cfg).unwrap();
+    assert_eq!(value["zero_waits"], "Count");
+    value.as_object_mut().unwrap().remove("zero_waits");
+    let read: QrEstimationConfig = serde_json::from_value(value).unwrap();
+    assert_eq!(read, cfg.with_zero_waits(ZeroWaitPolicy::Drop));
+}
+
+#[test]
+fn test_counted_size_with_no_time_is_unsupported_not_absorbing() {
+    use QrEventKind::{Cancel, Limit};
+    // Size 2 is only ever passed through inside a block: its events wait zero.
+    let mut events = Vec::new();
+    for i in 0..40u64 {
+        for (k, (kind, queue_before, waiting_seconds)) in [
+            (Limit, 1, 1.0),
+            (Limit, 2, 0.0),
+            (Cancel, 3, 1.0),
+            (Cancel, 2, 0.0),
+            (Cancel, 1, 1.0),
+            (Limit, 0, 1.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            events.push(QueueObservation {
+                timestamp_ms: 10 * i + k as u64,
+                kind,
+                queue_before,
+                waiting_seconds,
+                ..queue_event(QrSide::Bid, Limit, 0, 0.0)
+            });
+        }
+    }
+    let reference = ReferenceObservation {
+        timestamp_ms: 0,
+        moved: true,
+        reinitialized: false,
+    };
+    let cfg = estimation_config(1, 4, 30, 1, UnsupportedPolicy::NearestSupported)
+        .with_zero_waits(ZeroWaitPolicy::Count);
+    let record =
+        estimate_parameters(&events, &[reference], &[dec!(1)], &window(1_000), &cfg, "d").unwrap();
+    let fit = record
+        .parameters()
+        .expect("a size with no time has no rate, not a zero one");
+    assert!(fit.is_supported(0, 0) && fit.is_supported(0, 1) && fit.is_supported(0, 3));
+    assert!(!fit.is_supported(0, 2), "80 events, but no time at size 2");
+}
+
+/// A redraw law: a quarter on each of sizes 1 to 4.
+fn reset_law() -> Vec<f64> {
+    (0..=CAP)
+        .map(|n| if (1..=4).contains(&n) { 0.25 } else { 0.0 })
+        .collect()
+}
+
+fn with_resets(rate: f64) -> QrParameters {
+    let rates = (0..=CAP).map(|n| if n == 0 { 0.0 } else { rate }).collect();
+    params().with_resets(rates, reset_law()).unwrap()
+}
+
+#[test]
+fn test_resets_are_validated_and_fingerprinted() {
+    let ok = |n: usize| vec![0.0; n];
+    let law = reset_law;
+    let refused = |rates: Vec<f64>, law: Vec<f64>| params().with_resets(rates, law).is_err();
+    assert!(params().reset_rates().is_none() && params().reset_law().is_none());
+    assert!(refused(ok(CAP), law()), "one rate per size");
+    assert!(refused(ok(CAP + 2), law()));
+    for bad in [-1.0, f64::NAN, f64::INFINITY, MAX_RATE * 2.0] {
+        let mut rates = ok(CAP + 1);
+        rates[3] = bad;
+        assert!(refused(rates, law()), "{bad}");
+    }
+    let mut at_zero = ok(CAP + 1);
+    at_zero[0] = 0.5;
+    assert!(refused(at_zero, law()), "an empty touch has no life");
+    let mut short = law();
+    short.pop();
+    assert!(refused(ok(CAP + 1), short), "one probability per size");
+    let mut negative = law();
+    negative[1] = -0.25;
+    negative[5] = 0.5;
+    assert!(refused(ok(CAP + 1), negative));
+    let mut over = law();
+    over[5] = 1e-6;
+    assert!(refused(ok(CAP + 1), over), "a law sums to 1");
+    let mut nan = law();
+    nan[6] = f64::NAN;
+    assert!(refused(ok(CAP + 1), nan));
+    let zero = params().with_resets(ok(CAP + 1), law()).unwrap();
+    assert_eq!(zero.reset_rates(), Some(&ok(CAP + 1)[..]));
+    assert_eq!(zero.reset_law(), Some(&law()[..]));
+    assert_ne!(zero.fingerprint(), params().fingerprint());
+    assert_ne!(
+        with_resets(0.3).fingerprint(),
+        with_resets(0.4).fingerprint()
+    );
+    let mut other = law();
+    other.swap(1, 6);
+    let moved = params().with_resets(ok(CAP + 1), other).unwrap();
+    assert_ne!(zero.fingerprint(), moved.fingerprint());
+}
+
+#[test]
+fn test_zero_reset_rates_leave_a_run_unchanged() {
+    let run = |p: QrParameters| {
+        QrSimulator::new(p, 9, 100)
+            .unwrap()
+            .run(2_000.0, 1.0)
+            .unwrap()
+    };
+    let plain = run(params());
+    let zero = run(params()
+        .with_resets(vec![0.0; CAP + 1], reset_law())
+        .unwrap());
+    assert_eq!(plain.events, zero.events);
+    assert_eq!(plain.samples, zero.samples);
+    assert!(zero.resets.is_empty());
+}
+
+#[test]
+fn test_a_reset_redraws_the_touch_queue_only() {
+    let mut sim = QrSimulator::new(with_resets(50.0), 3, 100).unwrap();
+    let mut seen = 0;
+    for _ in 0..2_000 {
+        let before = sim.state();
+        match sim.step().unwrap() {
+            QrStep::Reset {
+                reset,
+                queue_after,
+                reference,
+            } => {
+                seen += 1;
+                let after = sim.state();
+                let (touch, other) = match reset.side {
+                    QrSide::Bid => ((before.bid, after.bid), (before.ask, after.ask)),
+                    _ => ((before.ask, after.ask), (before.bid, after.bid)),
+                };
+                assert_eq!(reset.queue_before, touch.0[0]);
+                assert!(reset.queue_before > 0);
+                assert_eq!(reset.queue_after, Some(queue_after));
+                assert!((1..=4).contains(&queue_after), "drawn from the reset law");
+                if reference.is_none_or(|r| !r.moved) {
+                    assert_eq!(touch.1[0], queue_after);
+                    assert_eq!(touch.0[1..], touch.1[1..]);
+                    assert_eq!(other.0, other.1);
+                    assert_eq!(after.reference_ticks, before.reference_ticks);
+                }
+                let last = match reset.side {
+                    QrSide::Bid => before.bid_last[0],
+                    _ => before.ask_last[0],
+                };
+                assert_eq!(reset.waiting_seconds, after.time_seconds - last);
+                assert_eq!(after.events, before.events, "a reset is no queue event");
+            }
+            QrStep::Event { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(seen > 100, "{seen}");
+}
+
+#[test]
+fn test_estimate_recovers_resets_with_the_other_rates() {
+    let truth = with_resets(0.3);
+    let t = QrSimulator::new(truth.clone(), 21, 100)
+        .unwrap()
+        .run(200_000.0, 5.0)
+        .unwrap();
+    assert!(!t.resets.is_empty());
+    let end = t
+        .events
+        .last()
+        .unwrap()
+        .timestamp_ms
+        .max(t.resets.last().unwrap().timestamp_ms)
+        + 1;
+    let fit = |resets: &[ResetObservation]| {
+        estimate_parameters_with_resets(
+            &t.events,
+            resets,
+            &t.references,
+            &[dec!(1), dec!(1)],
+            &window(end),
+            &config(),
+            "d",
+        )
+        .unwrap()
+    };
+    let record = fit(&t.resets);
+    assert_eq!(record.excluded_events, 0);
+    assert_eq!(record.events, (t.events.len() + t.resets.len()) as u64);
+    let got = record.parameters().unwrap();
+    let resets = got.reset_rates().unwrap();
+    assert_eq!(resets[0], 0.0);
+    for (n, rate) in resets.iter().enumerate().take(6).skip(1) {
+        assert!((rate - 0.3).abs() < 0.03, "n{n} {rate}");
+    }
+    for (n, (g, w)) in got.reset_law().unwrap().iter().zip(reset_law()).enumerate() {
+        assert!((g - w).abs() < 0.02, "law n{n} {g} {w}");
+    }
+    // A reset that empties a touch can move the reference, which restarts every queue's
+    // clock and loses the time since its last event, as any move does; more moves, so a wider
+    // band than the reset-free recovery's 5 %.
+    for depth in 0..2 {
+        for n in 0..=5usize {
+            let (a, b) = (got.rates(depth).unwrap()[n], truth.rates(depth).unwrap()[n]);
+            for (g, w) in [(a.0, b.0), (a.1, b.1), (a.2, b.2)] {
+                assert!((g - w).abs() < 0.1 * w.max(0.2), "d{depth} n{n} {g} {w}");
+            }
+        }
+    }
+    // Without their waits, the touch's rates come out too high.
+    let plain = estimate_parameters(
+        &t.events,
+        &t.references,
+        &[dec!(1), dec!(1)],
+        &window(end),
+        &config(),
+        "d",
+    )
+    .unwrap();
+    let plain = plain.parameters().unwrap();
+    assert!(plain.reset_rates().is_none());
+    assert!(plain.rates(0).unwrap()[2].0 > got.rates(0).unwrap()[2].0 * 1.02);
+    // No resets: zero rates, the invariant law, and the other rates as without resets.
+    let none = fit(&[]);
+    let none = none.parameters().unwrap();
+    assert_eq!(none.reset_rates(), Some(&vec![0.0; CAP + 1][..]));
+    assert_eq!(none.reset_law(), none.invariant(0), "no new size seen");
+    assert_eq!(none.rates(0), plain.rates(0));
+}
+
+fn ask_reset(timestamp_ms: u64, queue_before: u32, waiting_seconds: f64) -> ResetObservation {
+    ResetObservation {
+        timestamp_ms,
+        side: QrSide::Ask,
+        queue_before,
+        waiting_seconds,
+        queue_after: None,
+    }
+}
+
+#[test]
+fn test_resets_at_zero_or_past_the_cap_or_unordered_are_refused() {
+    let t = generate(4, 2_000.0);
+    let end = t.events.last().unwrap().timestamp_ms + 1;
+    let run = |resets: &[ResetObservation]| {
+        estimate_parameters_with_resets(
+            &t.events,
+            resets,
+            &t.references,
+            &[dec!(1), dec!(1)],
+            &window(end),
+            &config(),
+            "d",
+        )
+    };
+    let base = run(&[]).unwrap().excluded_events;
+    let bad = [
+        ask_reset(1, 0, 1.0),
+        ask_reset(2, CAP as u32 + 1, 1.0),
+        ask_reset(3, 2, 0.0),
+        ask_reset(4, 2, f64::NAN),
+    ];
+    assert_eq!(run(&bad).unwrap().excluded_events, base + 4);
+    assert!(run(&[ask_reset(5, 2, 1.0), ask_reset(4, 2, 1.0)]).is_err());
+}
+
+#[test]
+fn test_reset_rate_is_resets_over_time_and_its_law_the_new_sizes() {
+    let event = |timestamp_ms, kind, queue_before, waiting_seconds| QueueObservation {
+        timestamp_ms,
+        side: QrSide::Bid,
+        depth: 0,
+        kind,
+        queue_before,
+        waiting_seconds,
+    };
+    let events = [
+        event(0, QrEventKind::Limit, 0, 0.5),
+        event(1, QrEventKind::Limit, 1, 0.25),
+        event(2, QrEventKind::Cancel, 2, 0.5),
+        event(2, QrEventKind::Cancel, 1, 0.0),
+    ];
+    let resets = [
+        ResetObservation {
+            queue_after: Some(3),
+            ..ask_reset(3, 1, 0.25)
+        },
+        ask_reset(4, 3, 0.0),
+        ResetObservation {
+            queue_after: Some(99),
+            ..ask_reset(5, 2, 0.0)
+        },
+    ];
+    let reference = ReferenceObservation {
+        timestamp_ms: 1,
+        moved: true,
+        reinitialized: false,
+    };
+    let cfg = estimation_config(1, 4, 1, 1, UnsupportedPolicy::NearestSupported)
+        .with_zero_waits(ZeroWaitPolicy::Count);
+    let record = estimate_parameters_with_resets(
+        &events,
+        &resets,
+        &[reference],
+        &[dec!(1)],
+        &window(100),
+        &cfg,
+        "d",
+    )
+    .unwrap();
+    let fit = record.parameters().unwrap();
+    let rates = fit.reset_rates().unwrap();
+    assert_eq!(rates[1], 2.0, "one reset in half a second at size 1");
+    assert_eq!(rates[3], 0.0, "no time at size 3");
+    assert_eq!(
+        fit.rates(0).unwrap()[1].0,
+        2.0,
+        "the reset's wait is time at its size"
+    );
+    assert_eq!(
+        fit.reset_law().unwrap(),
+        &[0.0, 0.0, 0.0, 0.5, 0.5],
+        "new sizes, past the cap at the cap, an unknown one left out"
+    );
+}
+
+#[test]
+fn test_constant_baseline_keeps_the_mean_reset_rate_and_the_law() {
+    let mut rates = vec![0.0; CAP + 1];
+    for (n, r) in rates.iter_mut().enumerate().skip(1) {
+        *r = 0.1 * n as f64;
+    }
+    let p = params().with_resets(rates.clone(), reset_law()).unwrap();
+    let law = p.invariant(0).unwrap();
+    let mean: f64 = rates.iter().zip(law).map(|(r, q)| r * q).sum();
+    let baseline = p.constant_baseline().unwrap();
+    let got = baseline.reset_rates().unwrap();
+    assert_eq!(got[0], 0.0);
+    assert!(got[1..].iter().all(|r| (r - mean).abs() < 1e-12));
+    assert_eq!(baseline.reset_law(), Some(&reset_law()[..]));
+    assert!(
+        params()
+            .constant_baseline()
+            .unwrap()
+            .reset_rates()
+            .is_none()
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_resets_export_and_older_exports_read_without_them() {
+    let p = with_resets(0.25);
+    let text = serde_json::to_string(&p).unwrap();
+    let back: QrParameters = serde_json::from_str(&text).unwrap();
+    assert_eq!(back, p);
+    assert_eq!(back.fingerprint(), p.fingerprint());
+    let old = serde_json::to_string(&params()).unwrap();
+    assert!(!old.contains("reset"));
+    let back: QrParameters = serde_json::from_str(&old).unwrap();
+    assert!(back.reset_rates().is_none());
+    for (field, what) in [
+        ("reset_law", "rates without their law"),
+        ("reset_rates", "a law without its rates"),
+    ] {
+        let mut half: serde_json::Value = serde_json::from_str(&text).unwrap();
+        half.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<QrParameters>(half).is_err(),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn test_resets_at_sizes_a_run_never_visits_leave_it_unchanged() {
+    // The capture's case: resets are seen at small touch sizes, while a transient fit's run
+    // lives near the cap. Here the cap is out of reach and the resets sit only there.
+    let mut table = table(1.0);
+    table[CAP - 1].0 = 0.0;
+    let reachable = QrParameters::new(
+        dec!(0.01),
+        0.6,
+        0.2,
+        vec![dec!(1), dec!(1)],
+        vec![table.clone(), table],
+        vec![vec![true; CAP + 1]; 2],
+        UnsupportedPolicy::Stop,
+    )
+    .unwrap();
+    assert_eq!(reachable.invariant(0).unwrap()[CAP], 0.0);
+    let mut rates = vec![0.0; CAP + 1];
+    rates[CAP] = 5.0;
+    let with = reachable.clone().with_resets(rates, reset_law()).unwrap();
+    assert_ne!(with.fingerprint(), reachable.fingerprint());
+    let run = |p: QrParameters| {
+        QrSimulator::new(p, 17, 100)
+            .unwrap()
+            .run(5_000.0, 1.0)
+            .unwrap()
+    };
+    let (plain, reset) = (run(reachable), run(with));
+    assert!(reset.resets.is_empty());
+    assert_eq!(plain.events, reset.events);
+    assert_eq!(plain.samples, reset.samples);
+}

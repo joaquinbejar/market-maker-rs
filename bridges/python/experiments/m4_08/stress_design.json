@@ -1,0 +1,55 @@
+{
+  "issue": 105,
+  "design_version": 1,
+  "what": "the second, margin-stress holdout of #105: the first holdout's frozen runs, unchanged, on new days, each step read under margin-rs's maintenance rule; it never revises the first holdout's verdict",
+  "data": "synthetic: #102's queue-reactive regimes and seed rule (stress_days.json), days 25 to 29 of each regime, generated with days 1 to 24, which reproduce #102's digests; their digests in stress_digests.json and their shocked copies (as design.json's shocks: -0.05 and 0.05 from row 4320) in stress_shocks.json, all committed before any run",
+  "days": [
+    25,
+    29
+  ],
+  "frozen": "the first holdout's manifest, frozen.json sha256 6bd5e41b69a7a3b0708c2f0968681137b1a44d0eaf08019bdbc96f504cb27ac6, every checkpoint and configuration checked against it; no run is trained, selected or changed",
+  "arms": "the 15 frozen runs (ppo, cpo, ppo_penalized at the selected lambda 0.1, five seeds each), no_trade and the selected Avellaneda-Stoikov point per regime, at the frozen fee 0.0002, unshocked and under each shock; execution, limits and costs as in the first holdout, the kernel's RiskLimits the only gate",
+  "account": {
+    "capital": "125",
+    "scale": 6,
+    "rule": "margin-rs 0.2 linear-im/1: an initial margin of 10 % and a maintenance margin of 5 % of the notional, one linear perpetual position of the delivered position in contracts of multiplier 1 at the observed row's mid. Only the maintenance margin enters the state; the initial margin is reported by margin-rs and gates nothing here, so this does not say a position up to 20 times the collateral was admitted: the kernel's RiskLimits (the first holdout's) are what admit orders",
+    "net": "the economic result: the kernel's net (the ledger change, fees included, RL penalties never in it) less the terminal close, which only the last step has",
+    "collateral": "variation margin settled into cash every step: cash, collateral and equity are all 125 + net, so the unrealised result is counted once, inside cash, and never added to it again",
+    "assessment": "margin_rs::maintenance::assess per step, from the previous step's state, the first from Healthy; recorded, never acted on (bridges/python/src/maintenance.rs, mm_rl_bridge.maintenance_path)",
+    "claim": "an observation diagnostic: the state of an account valued at the position the policy observed (delivered, after its latency) and the mid of the row it observed; it is not a venue's authoritative maintenance, which would value the venue's position at the current mark. It mixes information: the net is the venue's accounting at the step, while the position and the mid are what the policy had observed; it is read as such a diagnostic, not aligned to either"
+  },
+  "metrics": [
+    "steps in Healthy, ReduceOnly and Default per day",
+    "the share of a day's steps not Healthy",
+    "entries: each step from Healthy into ReduceOnly or straight into Default, where a closeout would start; a recovery to Healthy and a new step out of it is a new entry",
+    "entries into Default from any other state, counted apart",
+    "the largest maintenance shortfall of a day",
+    "the largest absolute position and fills per day beside them, so a margin result reads against exposure",
+    "net and the costs, as in the first holdout"
+  ],
+  "evaluation": {
+    "episode": "one UTC day",
+    "evaluation_seeds": [
+      101
+    ],
+    "daily_value": "a learned arm's day is the mean over its training seeds",
+    "bootstrap": {
+      "replicates": 2000,
+      "mean_block_days": 2,
+      "confidence_percent": 90,
+      "seed": 102,
+      "min_days": 4
+    },
+    "aggregation": "the unit is a regime and new holdout day: a learned arm's day is the unweighted mean over its five training seeds, a classical or no-trade arm's its single run; each row (unshocked, -0.05, 0.05) is read apart, so a day's shocked copies are never pooled with it or with each other, and every comparison pairs two arms day by day within one row; the bootstrap resamples days in blocks of mean length 2, in the order of (regime, day), as the first holdout's report does"
+  },
+  "decision_rule": {
+    "fewer_margin_states": "paired 90 % block bootstrap over days of the daily share of steps not Healthy: an arm has fewer margin states than another when the interval of the difference is below 0 (its upper bound is below 0) and neither arm breached a limit on any day",
+    "comparisons": "cpo against ppo_penalized; cpo and ppo against the selected Avellaneda-Stoikov point (a trading arm against a trading arm); ppo_penalized and cpo against ppo",
+    "trivial_baseline": "ppo_penalized did not trade on the first holdout's days: if it does not trade here either, it is Healthy by construction, and cpo against it measures trading against not trading; that is said plainly beside it",
+    "rows": "unshocked, -0.05 and 0.05, each read apart, per regime (5 days) and pooled (15 days)",
+    "label": "the second, margin-stress holdout; it does not revise the first holdout's decisions",
+    "breach": "a breach is a day on which an arm's largest absolute position or peak notional is beyond the kernel's limits (the first holdout's limit_breach); a comparison with a breach in either arm, in any of its days, is not shown, whatever its interval"
+  },
+  "holdout_rule": "read once by stress.py holdout, which refuses a second read, a manifest, checkpoint, configuration, design, shocks or lock other than the frozen ones, and records the hashes of this design, the digests, the shocked copies and its own code. Before any job reads a day it creates stress_holdout.started exclusively; it keeps it if the evaluation fails, and refuses to start while it exists, so a failed or concurrent attempt is never run again by the script: a recovery is by hand, recorded and declared",
+  "bounds": "One synthetic simulator, made-up parameters and five new days per regime bound what this can show. The account is a declared model: one linear position on 125 of collateral, assessed after each step; a venue's own margin, funding, its liquidation engine and the kernel's spot balance gate are not in it. Nothing here is a safety guarantee. Five new days per regime, 15 pooled, give limited precision. Closeouts are counted and not executed, so this cannot validate a liquidation's execution or its losses. The data's seeds follow #102's deterministic rule (1000003 * regime number + day), recorded with every day's digests before any run."
+}

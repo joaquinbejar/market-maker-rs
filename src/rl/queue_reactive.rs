@@ -9,6 +9,9 @@ use crate::types::error::{MMError, MMResult};
 /// Most rows of one episode, the simulator's own limit on a grid.
 pub const MAX_QR_ROWS: u32 = 1_000_000;
 
+/// Most reference moves one [`ReactiveQrMarket::react`] imposes.
+pub const MAX_REACTION_MOVES: u64 = 10_000;
+
 /// What to simulate for one episode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QrEpisode {
@@ -154,4 +157,212 @@ pub fn qr_market(
         stopped,
         end: simulator.state(),
     })
+}
+
+/// An episode's market that reacts to the agent from outside the simulated flow (#282).
+///
+/// It holds the rows [`qr_market`] makes and, for each row, the simulator's state the next
+/// row is simulated from: the one the row shows, unless a reaction changed it.
+/// [`ReactiveQrMarket::react`] imposes reference moves after a row, as a trade's permanent
+/// impact, and simulates every later row again with the simulator's own generator; that row
+/// and the rows before it do not change. With no reaction its market is [`qr_market`]'s.
+/// What causes a reaction, and how many moves, is the caller's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReactiveQrMarket {
+    params: QrParameters,
+    episode: QrEpisode,
+    config: KernelConfig,
+    ticks: Vec<MarketTick>,
+    states: Vec<QrState>,
+    stopped: Option<QrStep>,
+}
+
+impl ReactiveQrMarket {
+    /// Simulates the episode as [`qr_market`] does, keeping each row's state.
+    ///
+    /// # Errors
+    ///
+    /// As [`qr_market`].
+    pub fn new(
+        params: &QrParameters,
+        episode: &QrEpisode,
+        config: &KernelConfig,
+    ) -> MMResult<Self> {
+        if episode.sample_ms == 0 || episode.rows == 0 || episode.rows > MAX_QR_ROWS {
+            return Err(MMError::InvalidConfiguration(format!(
+                "invalid episode: {} rows, {} ms apart",
+                episode.rows, episode.sample_ms
+            )));
+        }
+        let doubled = config
+            .tick_size
+            .checked_mul(Decimal::TWO)
+            .filter(|doubled| *doubled == params.tick_size());
+        if doubled.is_none() {
+            return Err(MMError::InvalidConfiguration(format!(
+                "the kernel's tick {} must be half the simulator's {}",
+                config.tick_size,
+                params.tick_size()
+            )));
+        }
+        let simulator = QrSimulator::new(params.clone(), episode.seed, episode.reference_ticks)?;
+        let capacity = usize::try_from(episode.rows).unwrap_or(0);
+        let mut market = Self {
+            params: params.clone(),
+            episode: *episode,
+            config: config.clone(),
+            ticks: Vec::with_capacity(capacity),
+            states: Vec::with_capacity(capacity),
+            stopped: None,
+        };
+        market.push(&simulator.state(), episode.start_ms)?;
+        market.extend(simulator, episode.start_ms)?;
+        Ok(market)
+    }
+
+    fn push(&mut self, state: &QrState, timestamp_ms: u64) -> MMResult<()> {
+        self.ticks.push(row_of(
+            state,
+            &self.params,
+            self.config.tick_size,
+            timestamp_ms,
+        )?);
+        self.states.push(*state);
+        Ok(())
+    }
+
+    /// Simulates the rows after the last one, from `simulator` at that row's time
+    /// `timestamp_ms`.
+    fn extend(&mut self, mut simulator: QrSimulator, mut timestamp_ms: u64) -> MMResult<()> {
+        let seconds = f64::from(self.episode.sample_ms) / 1000.0;
+        let rows = usize::try_from(self.episode.rows).unwrap_or(usize::MAX);
+        while self.ticks.len() < rows {
+            let run = simulator.run(seconds, seconds)?;
+            if let Some(reason) = run.stopped {
+                self.stopped = Some(reason);
+                return Ok(());
+            }
+            timestamp_ms = timestamp_ms
+                .checked_add(u64::from(self.episode.sample_ms))
+                .ok_or_else(|| {
+                    MMError::InvalidConfiguration("the episode's time overflows u64".to_string())
+                })?;
+            self.push(&simulator.state(), timestamp_ms)?;
+        }
+        Ok(())
+    }
+
+    /// Imposes `moves` reference moves after row `row`, up for a positive count and down
+    /// for a negative one, each through [`QrSimulator::impose_reference_move`] on the state
+    /// the next row is simulated from, then simulates every later row again from it. Row
+    /// `row` itself and the rows before it do not change; a second reaction after the same
+    /// row adds to the first. No moves change nothing. Returns the volume the moves emptied
+    /// from the first limit's queues they passed through, in the event sizes' unit: modelled
+    /// consumption, not a trade of the agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] for a row past the market's last or more
+    /// than [`MAX_REACTION_MOVES`] moves, and the simulator's errors.
+    pub fn react(&mut self, row: usize, moves: i64) -> MMResult<Decimal> {
+        if moves.unsigned_abs() > MAX_REACTION_MOVES {
+            return Err(MMError::InvalidConfiguration(format!(
+                "{moves} moves, above the {MAX_REACTION_MOVES} a reaction imposes"
+            )));
+        }
+        let state = *self.states.get(row).ok_or_else(|| {
+            MMError::InvalidConfiguration(format!(
+                "row {row} is past the market's {} rows",
+                self.states.len()
+            ))
+        })?;
+        if moves == 0 {
+            return Ok(Decimal::ZERO);
+        }
+        let timestamp_ms = self
+            .ticks
+            .get(row)
+            .map(|tick| tick.timestamp)
+            .ok_or_else(|| MMError::InvalidConfiguration(format!("row {row} has no time")))?;
+        let mut simulator = QrSimulator::from_state(self.params.clone(), state)?;
+        let size = self
+            .params
+            .event_sizes()
+            .first()
+            .copied()
+            .ok_or_else(|| MMError::InvalidConfiguration("no event size".to_string()))?;
+        let mut emptied = Decimal::ZERO;
+        for _ in 0..moves.unsigned_abs() {
+            let touch = simulator.state();
+            let queue = if moves > 0 {
+                touch.ask[0]
+            } else {
+                touch.bid[0]
+            };
+            emptied = Decimal::from(queue)
+                .checked_mul(size)
+                .and_then(|volume| emptied.checked_add(volume))
+                .ok_or_else(|| MMError::NumericalError("emptied volume".to_string()))?;
+            simulator.impose_reference_move(moves > 0)?;
+        }
+        let next = row.saturating_add(1);
+        self.ticks.truncate(next);
+        self.states.truncate(next);
+        if let Some(slot) = self.states.get_mut(row) {
+            *slot = simulator.state();
+        }
+        self.stopped = None;
+        self.extend(simulator, timestamp_ms)?;
+        Ok(emptied)
+    }
+
+    /// The rows, as [`MarketTick`]s.
+    #[must_use]
+    pub fn ticks(&self) -> &[MarketTick] {
+        &self.ticks
+    }
+
+    /// For each row, the simulator's state the next row is simulated from.
+    #[must_use]
+    pub fn states(&self) -> &[QrState] {
+        &self.states
+    }
+
+    /// Why the simulator stopped before the last row asked for, if it did.
+    #[must_use]
+    pub fn stopped(&self) -> Option<QrStep> {
+        self.stopped
+    }
+
+    /// The market as [`qr_market`] returns it: the same dataset and digest for the same
+    /// rows, and as its end the state after the last row; where the simulator stopped, if
+    /// it stopped early, is not kept.
+    ///
+    /// # Errors
+    ///
+    /// As [`qr_market`], for a row the kernel refuses.
+    pub fn market(&self) -> MMResult<QrMarket> {
+        let mut external = [0_u8; 32];
+        let parts = self
+            .params
+            .fingerprint()
+            .to_le_bytes()
+            .into_iter()
+            .chain(self.episode.seed.to_le_bytes())
+            .chain(self.episode.reference_ticks.to_le_bytes());
+        for (slot, byte) in external.iter_mut().zip(parts) {
+            *slot = byte;
+        }
+        let end = self
+            .states
+            .last()
+            .copied()
+            .ok_or_else(|| MMError::InvalidMarketState("a market with no rows".to_string()))?;
+        Ok(QrMarket {
+            dataset: KernelDataset::from_ticks(&self.ticks, &self.config)?
+                .with_external_digest(external),
+            stopped: self.stopped,
+            end,
+        })
+    }
 }
