@@ -89,6 +89,10 @@ def test_the_helper_reads_maintenance_as_margin_rs_does():
     assert path[1][1:] == ("100.00", "0.01")
     with pytest.raises(Exception, match="position"):
         maintenance_path("125", 2, [("x", "100", "0")])
+    # An equity beyond a decimal is the bridge's error, not a panic.
+    from mm_rl_bridge import BridgeFailure
+    with pytest.raises(BridgeFailure, match="overflows"):
+        maintenance_path("79228162514264337593543950335", 6, [("0", "1", "1")])
 
 
 class Quoting:

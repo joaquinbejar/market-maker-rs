@@ -75,8 +75,8 @@ fn requirement(
 ///
 /// # Errors
 ///
-/// A message when `margin-rs` refuses an input: a scale it cannot round to, or a position
-/// or mark it cannot value.
+/// A message when `margin-rs` refuses an input (a scale it cannot round to, or a position
+/// or mark it cannot value) or when the capital plus a net result does not fit a decimal.
 pub fn maintenance_path(
     capital: Decimal,
     scale: u32,
@@ -94,7 +94,9 @@ pub fn maintenance_path(
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
         let required = requirement(&rule, &ids, *step)?;
-        let equity = capital + step.net;
+        let equity = capital
+            .checked_add(step.net)
+            .ok_or_else(|| format!("capital {capital} plus net {} overflows", step.net))?;
         let view = CollateralView {
             currency: currency.clone(),
             cash: equity,
@@ -216,5 +218,12 @@ mod tests {
             ]
         );
         assert_eq!(state_name(AccountState::ReduceOnly), "reduce_only");
+    }
+
+    #[test]
+    fn test_an_equity_that_overflows_is_an_error_not_a_panic() {
+        let error = maintenance_path(Decimal::MAX, 6, &[step("0", "1", "1")]).unwrap_err();
+        assert!(error.contains("overflows"), "{error}");
+        assert!(maintenance_path(Decimal::MAX, 6, &[step("0", "1", "0")]).is_ok());
     }
 }
