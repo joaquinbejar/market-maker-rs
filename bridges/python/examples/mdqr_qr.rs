@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use market_maker_rs::Decimal;
 use market_maker_rs::backtest::queue_reactive::{
     BookSample, DiscrepancyReport, MAX_LIMITS, QrEventKind, QrParameters, QrSide, QrSimulator,
-    QrStep, QueueObservation, ReferenceObservation, Trajectory, UnsupportedPolicy,
+    QrState, QrStep, QueueObservation, ReferenceObservation, Trajectory, UnsupportedPolicy,
     compare_trajectories,
 };
 use serde_json::{Value, json};
@@ -444,7 +444,11 @@ fn start_queues(side: &Value, cap: u32) -> Result<([u32; MAX_LIMITS], u32), Fail
 }
 
 /// One draw of a fitted arm from the window's starting book.
-fn draw(params: &QrParameters, sample: &Value, seed: u64) -> Result<(Trajectory, u32), Failure> {
+fn draw(
+    params: &QrParameters,
+    sample: &Value,
+    seed: u64,
+) -> Result<(Trajectory, Vec<i64>, u32), Failure> {
     let cap = u32::try_from(params.max_queue())?;
     let (bid, low) = start_queues(sample.get("bid").ok_or("bid")?, cap)?;
     let (ask, high) = start_queues(sample.get("ask").ok_or("ask")?, cap)?;
@@ -452,7 +456,32 @@ fn draw(params: &QrParameters, sample: &Value, seed: u64) -> Result<(Trajectory,
     state.bid = bid;
     state.ask = ask;
     let mut simulator = QrSimulator::from_state(params.clone(), state)?;
-    Ok((simulator.run(WINDOW_SECONDS, 1.0)?, low + high))
+    let trajectory = simulator.run(WINDOW_SECONDS, 1.0)?;
+    let directions = directions_of(params, state, trajectory.references.len())?;
+    Ok((trajectory, directions, low + high))
+}
+
+/// The sign of each of a run's reference outcomes, 0 where it did not move: the run again from
+/// its starting state, which is deterministic, reading the reference it keeps.
+fn directions_of(
+    params: &QrParameters,
+    state: QrState,
+    references: usize,
+) -> Result<Vec<i64>, Failure> {
+    let mut simulator = QrSimulator::from_state(params.clone(), state)?;
+    let mut out = Vec::with_capacity(references);
+    while out.len() < references {
+        let before = simulator.state().reference_ticks;
+        match simulator.step()? {
+            QrStep::Event { reference, .. } | QrStep::Reset { reference, .. } => {
+                if reference.is_some() {
+                    out.push((simulator.state().reference_ticks - before).signum());
+                }
+            }
+            other => return Err(format!("a run ended early on replay: {other:?}").into()),
+        }
+    }
+    Ok(out)
 }
 
 fn arms(fits: &Value, window: &Path, out: &Path, w: u64) -> Result<(), Failure> {
@@ -467,8 +496,9 @@ fn arms(fits: &Value, window: &Path, out: &Path, w: u64) -> Result<(), Failure> 
             .ok_or("no such arm")?;
         let params: QrParameters = serde_json::from_value(serialized.clone())?;
         for j in 1..=DRAWS {
-            let (trajectory, clamped) = draw(&params, sample, 106_000 + 100 * w + j)?;
+            let (trajectory, directions, clamped) = draw(&params, sample, 106_000 + 100 * w + j)?;
             let mut value = trajectory_json(&trajectory, ARM_LIMITS)?;
+            value["reference_directions"] = json!(directions);
             value["clamped_start_queues"] = json!(clamped);
             write(&out.join(format!("{arm}-w{w}-d{j}.json")), &value)?;
         }
