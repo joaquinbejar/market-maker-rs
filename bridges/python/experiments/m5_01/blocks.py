@@ -362,6 +362,7 @@ class Generator:
         self.tails = {int(k): v for k, v in model["tails"].items()}
         self.clipped_events = self.clipped_volume = self.volume = 0.0
         self.tail_draws = self.at_cap = self.events = 0
+        self.directions = []
 
     def _x(self, imbalance):
         book = self.book
@@ -421,7 +422,10 @@ class Generator:
         self.events += 1
         if after >= self.m.max_queue:
             self.at_cap += 1
+        ticks_before = book.reference_ticks
         reference = book.reference_move(mid_before, book.mid_half_ticks())
+        if reference is not None:
+            self.directions.append(book.reference_ticks - ticks_before)
         return s, d, k, q, done, reference
 
     def block(self):
