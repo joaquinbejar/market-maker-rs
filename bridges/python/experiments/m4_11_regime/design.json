@@ -1,6 +1,6 @@
 {
   "issue": 309,
-  "design_version": 1,
+  "design_version": 2,
   "data": "synthetic: #102's queue-reactive simulator and regimes, with made-up parameters, on new days generated for this study; no market data. The logs are generated here by #104's behaviours; their rewards are the simulator's consequences, not observed ones",
   "bounds": "One synthetic simulator whose rows do not react to orders, made-up parameters and 24 days per regime bound what this study can show. Every value is labelled [observed] (read from a log) or [simulated] (an interactive run in the same simulator); nothing here is an off-policy estimate.",
   "motivation": "A new experiment motivated by a validation result of #280, not a confirmatory continuation of it. #280's stop stays as the result of its registered design.",
@@ -32,9 +32,18 @@
     "holdout_rows": "generated only to fix their digests, written apart, and read by no step before the freeze"
   },
   "splits": {
-    "train": [1, 14],
-    "validation": [15, 19],
-    "holdout": [20, 24],
+    "train": [
+      1,
+      14
+    ],
+    "validation": [
+      15,
+      19
+    ],
+    "holdout": [
+      20,
+      24
+    ],
     "note": "All three splits are new days: this study reuses neither #280's logs nor its validation days nor #102's holdout days, so nothing evaluated before touches them."
   },
   "audit_of_280": {
@@ -43,41 +52,87 @@
       "what": "A direct diagnosis on this study's training logs, before any training. as_grid's action is a deterministic function of (regime, position, steps left, mask). For the key (position, steps left, mask) without the regime, and the same key with it, it reports the share of decisions whose key carries more than one as_grid action, and the highest agreement any classifier of that key can reach, which is the sum over keys of the count of the key's most frequent action divided by the decisions. It repeats both with the key of #104's state bin crossed with position and steps left in ten equal bins, so that features which could reveal the regime are represented.",
       "label": "[observed]",
       "rule": "With the regime, the agreement on the exact key must be 1.0: otherwise as_grid's labels are not what this design says and the study stops. Without the regime, the result is reported whatever it is; it decides nothing. An agreement of 1.0 without the regime would refute the aliasing reading, and that is reported as such.",
-      "limit": "The ceiling without the regime holds for that key only. A network sees the other features too, which may reveal the regime partly, so this ceiling is not a bound on BC."
+      "limit": "The ceiling without the regime holds for that key only. A network sees the other features too, which may reveal the regime partly, so this ceiling is not a bound on BC.",
+      "label_tested": "The action tested is the logs' target_code of as_grid, as_grid's greedy action coded after grid.canonical, never the logged epsilon-greedy action, on which the rule would fail by construction.",
+      "key_values": "Position and steps left are the raw exact values as_grid reads, recovered exactly from the log, and the mask is compared exactly, element by element.",
+      "reading": "An exact-key ceiling of 1.0 with the regime does not imply that BC reaches 90 %: as_grid's rounding boundaries move with steps left, and about 39 % of #280's misses where both quote were within one offset step. So a BC failure here does not refute aliasing, and a BC pass does not by itself prove aliasing caused #280's stop. Agreement per regime is reported beside the pooled rule."
     }
   },
   "executions": {
     "standard": {
       "what": "the queue standard for 10 s rows",
-      "fill_model": {"kind": "queue_position_rational", "lots": 1, "per_ms": 5000, "min_queue_ms": 0},
+      "fill_model": {
+        "kind": "queue_position_rational",
+        "lots": 1,
+        "per_ms": 5000,
+        "min_queue_ms": 0
+      },
       "latency": "#102's main latency"
     },
     "immediate_reference": {
       "what": "the queue gate's reference only",
-      "fill_model": {"kind": "immediate"},
+      "fill_model": {
+        "kind": "immediate"
+      },
       "latency": "#102's main latency"
     },
     "common": "#102's fee 0.0002, limits (20 lots, 2500 notional), terminal mark, the maskable grid with masking, and its observation scales"
   },
   "datasets": {
-    "standard_eps30": {"role": "primary", "execution": "standard", "behaviour": "#104's as_grid_eps30, behaviour seeds 1 to 5, on train and validation days"},
-    "standard_eps10": {"role": "secondary: a less exploratory behaviour", "execution": "standard", "behaviour": "#104's as_grid_eps10, behaviour seeds 1 to 5, on train and validation days"}
+    "standard_eps30": {
+      "role": "primary",
+      "execution": "standard",
+      "behaviour": "#104's as_grid_eps30, behaviour seeds 1 to 5, on train and validation days"
+    },
+    "standard_eps10": {
+      "role": "secondary: a less exploratory behaviour",
+      "execution": "standard",
+      "behaviour": "#104's as_grid_eps10, behaviour seeds 1 to 5, on train and validation days"
+    }
   },
   "arms": {
     "input": "#280's observation (11 row features and their presence flags) plus the three columns of the regime's one-hot, added when the logs are read and at inference; the stored logs keep #280's format and their records name the regime",
     "bc": {
       "what": "#280's behaviour cloning, unchanged except for the input",
-      "settings": {"hidden": [256, 256], "learning_rate": 0.0003, "batch_size": 256, "gradient_steps": 50000}
+      "settings": {
+        "hidden": [
+          256,
+          256
+        ],
+        "learning_rate": 0.0003,
+        "batch_size": 256,
+        "gradient_steps": 50000
+      }
     },
     "cql": {
       "what": "#280's discrete conservative Q-learning, unchanged except for the input",
-      "settings": {"hidden": [256, 256], "learning_rate": 0.0001, "batch_size": 256, "gradient_steps": 200000, "gamma": 0.99, "target_period": 2000},
-      "alpha_choices": [0.1, 1.0, 10.0],
+      "settings": {
+        "hidden": [
+          256,
+          256
+        ],
+        "learning_rate": 0.0001,
+        "batch_size": 256,
+        "gradient_steps": 200000,
+        "gamma": 0.99,
+        "target_period": 2000
+      },
+      "alpha_choices": [
+        0.1,
+        1.0,
+        10.0
+      ],
       "alpha_rule": "on the primary dataset: the alpha with the largest mean daily net over the validation days of every regime and the five training seeds, from interactive runs at environment seed 101 under the standard execution [simulated]; a tie to the smaller alpha. The secondary dataset uses that alpha and chooses nothing"
     },
     "reward_scale": "each dataset's rewards are divided by the standard deviation of its per-decision rewards over its training logs, computed before training",
     "implementation": "experiments/m4_11/offline.py, on torch; no new dependency",
-    "training_seeds": [1, 2, 3, 4, 5],
+    "training_seeds": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
     "threads_per_run": 1
   },
   "comparators": {
@@ -91,18 +146,47 @@
     "days": "holdout days 20 to 24 of each regime",
     "environment_seed": 101,
     "daily_value": "a day's exact net result at environment seed 101 [simulated]; for an arm with training seeds, the mean over its five seeds is the arm's daily value, and each seed is also reported",
-    "metrics": ["net", "fills", "largest absolute position", "gate refusals", "peak notional", "time beyond 5 lots", "limit breaches"],
+    "metrics": [
+      "net",
+      "fills",
+      "largest absolute position",
+      "gate refusals",
+      "peak notional",
+      "time beyond 5 lots",
+      "limit breaches"
+    ],
     "comparisons": [
-      ["cql", "maskable_ppo_regime"],
-      ["bc", "maskable_ppo_regime"],
-      ["cql", "bc"],
-      ["cql", "as_grid"],
-      ["bc", "as_grid"],
-      ["cql", "no_trade"],
-      ["maskable_ppo_regime", "maskable_ppo_blind"]
+      [
+        "cql",
+        "maskable_ppo_regime"
+      ],
+      [
+        "bc",
+        "maskable_ppo_regime"
+      ],
+      [
+        "cql",
+        "bc"
+      ],
+      [
+        "cql",
+        "as_grid"
+      ],
+      [
+        "bc",
+        "as_grid"
+      ],
+      [
+        "cql",
+        "no_trade"
+      ],
+      [
+        "maskable_ppo_regime",
+        "maskable_ppo_blind"
+      ]
     ],
     "intervals": "paired: the difference of the two arms' daily values day by day; Politis and Romano's stationary bootstrap over days with mean block 2 days, 2000 replicates, seed 309, 90 % percentile interval; per regime over its 5 days, and pooled by resampling each regime's days independently and averaging the regimes' means with equal weight",
-    "claims": "Comparison-specific only. No offline arm is called better or worse than another arm unless the paired 90 % interval excludes zero. An offline arm is called better than an interactive one only against maskable_ppo_regime. No claim about any market or about an estimated regime. Logged data, simulated consequences and interactive results are kept apart in every table."
+    "claims": "Comparison-specific only. No offline arm is called better or worse than another arm unless the paired 90 % interval excludes zero. An offline arm is called better than an interactive one only against maskable_ppo_regime. No claim about any market or about an estimated regime. Logged data, simulated consequences and interactive results are kept apart in every table. The equal-information comparison covers information only: CQL chooses among three alphas on validation, while maskable_ppo_regime uses set 0, chosen on #102's days under #102's main execution, untuned here with the extra input and the standard execution, and this asymmetry is stated beside every such comparison. Only the pooled interval carries a claim; the per-regime intervals (5 days, mean block 2) are descriptive. The seven comparisons have no multiplicity correction, which is stated with them."
   },
   "support": {
     "propensity": "#280's: at every decision of each trained arm's holdout run, the behaviour's exact probability of the arm's action; the shares at 0 and under 0.0001, which are zero by construction and are reported to show it",
@@ -110,21 +194,26 @@
     "label": "[observed] for the training counts; it says where an arm acts outside what its logs hold, not how well"
   },
   "attempts": {
-    "budget": "One attempt. A second one only for a fault of the pipeline that a test can reproduce (a crash, or a hash that does not match), in a new output directory, disclosed with the fault and the kept outputs of the first. A result is never a reason for a second attempt, and no setting, threshold or seed changes between attempts."
+    "budget": "One attempt. A second one only for a fault of the pipeline that a test can reproduce (a crash, or a hash that does not match), in a new output directory, disclosed with the fault and the kept outputs of the first. A result is never a reason for a second attempt, and no setting, threshold or seed changes between attempts. A second attempt is impossible once the holdout has started for this design, whichever attempt started it. There is no resume after a crash or an external kill of the holdout: it is reported as failed.",
+    "layout": "Every attempt is a directory attempt-<n> under one fixed attempts root given to the runner. The holdout marker is holdout-<design sha256>.started in that root, outside any attempt, created exclusively before the first holdout day is read and kept on failure. The runner refuses the holdout, and any new attempt's freeze, when it exists."
   },
   "stop_rules": [
     "Logs: a log whose sha256 differs from its record stops the step that reads it.",
     "Queue gate, before any log: on the validation days at environment seed 101, as_grid under the standard execution must have more than 0 fills over the days and a mean daily net different from its mean daily net under immediate fill. Otherwise stop and report.",
     "Determinism: the gate's standard runs of fixed_spread_4 on the first validation day of each regime are run twice and must be equal exactly.",
     "Aliasing: the rule in audit_of_280.aliasing.",
-    "BC sanity, threshold 90 %, before any choice of alpha or freeze: on each dataset's validation logs, the BC arm of every seed must choose as_grid's action on at least 90 % of the logged decisions. Otherwise stop and report, as #280 did. On standard_eps30 it is checked first, and CQL is not trained until it passes.",
+    "BC sanity, threshold 90 %, before any choice of alpha or freeze: on each dataset's validation logs, the BC arm of every seed must choose as_grid's action on at least 90 % of the logged decisions; agreement per regime is reported beside it and decides nothing. standard_eps30 is checked first and CQL is not trained until it passes. If standard_eps30 fails the whole study stops and reports, as #280 did. If only standard_eps10 fails, the secondary dataset stops, is reported as failed and leaves the freeze and the holdout, and the primary continues.",
     "CQL: a loss that is not finite stops the run, and it is reported; nothing is tuned beyond the alpha grid.",
     "Compute: a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds."
   ],
   "compute": {
     "max_parallel_runs": 4,
     "estimates": "set by a pilot step on training days, before any other step",
-    "when": "only on slots assigned by the coordination of the shared machine"
+    "when": "only on slots assigned by the coordination of the shared machine",
+    "budget_file": "The pilot step writes budget.json with its estimates, before any other step; the freeze records its sha256 and the holdout checks it."
   },
-  "holdout_rule": "The holdout days are read once, after the freeze has recorded the hashes of the design, the digests, the code, the chosen alpha, every log and every checkpoint; the runner refuses it before, and an exclusive marker created before the first holdout day is read is kept on failure, so it is not run again."
+  "holdout_rule": "The holdout days are read once, after the freeze has recorded the hashes of the design, the digests, the budget file, the code, the chosen alpha, every log and every checkpoint; the runner refuses it before, and the exclusive marker of attempts.layout, created before the first holdout day is read, is kept on failure, so it is not run again in this or any other attempt.",
+  "changes": [
+    "version 2, before any data or run exists: after a design review, the holdout marker moves to the attempts root and rules out a second attempt once the holdout started; the aliasing label and key are named; the BC rule's scope across datasets is stated; the reading of the ceiling, the tuning asymmetry, the width of the intervals and the budget file are stated."
+  ]
 }
