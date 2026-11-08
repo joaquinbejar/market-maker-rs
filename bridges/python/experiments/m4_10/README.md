@@ -52,6 +52,10 @@ All runs used v4, at cf930bd, on 3 processes.
 - **Holdout:** read once through `holdout_once.py` at f953f2c: 1305 jobs in 62 minutes. That is 1080 at the fee the rule chose (the secondary fee, so one fee row), plus the 225 descriptive jobs under immediate fill.
 - **Hashes:** `holdout.json` sha256 d84715e4a151f575776728b185b9a69b872c97914a3194884a08c56ad562ebb3; `report.json` sha256 25a9aae579a3599cecb51d2f26d8ad0879674b7c76509134e44c1c638ca54b6f (84 decisions).
 
+Found in review after the read:
+- The freeze hashes this runner and #103's, not the bridge's `wrappers.py` and `envs.py` (`ChosenDuration`, `DecisionInterval`). It did not bite: the whole bridge, Python and Rust, is byte-identical between the training run (cf930bd) and the holdout read (f953f2c). The merge of main after the read changed both files (#303's gate counts).
+- `holdout_once.py` creates its marker before `run.holdout` checks the hashes, so a mismatch would lock the holdout with nothing read. That is the conservative failure, and it did not happen; any recovery would be by hand and declared.
+
 The results are withheld here on purpose, as #103's and #105's are: another study's holdout is pending. They come from `report.json`, whose hash the pull request commits to.
 
 ## Bounds
