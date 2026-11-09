@@ -6,7 +6,107 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
 ### Added
+
+- The MDQR study of #106 in `bridges/python/experiments/m5_01`: a neural order book generator, a
+  block clock and a size head, trained on Hyperliquid BTC order flow from December 2025 against
+  queue-reactive, Hawkes and Poisson controls, after a synthetic recovery check. Real data, an
+  exploratory comparison on a reused holdout read once. By its frozen rule MDQR is discarded: it
+  fits queue sizes far better than the queue-reactive arms, but the best queues' correlation
+  fails against both, and the transfer rule cannot pass because every policy has zero fills on
+  those arms' rows. Hawkes failed as unstable. Experiment only; no public API change.
+- Quotes that expire at the venue as an RL action (#297). `RlConfig::with_quote_lives` takes
+  up to 8 strictly increasing lives in nanoseconds and adds `RlAction::ExpiringQuote`, of action
+  space version 5 (`EXPIRY_ACTION_SPACE_VERSION`), with an `EX` section in the fingerprint only
+  when lives are set: a configuration without them keeps its identity. Without lives the action
+  is outside the mask and, under the reject policy, a recorded error of code 204
+  (`ERR_EXPIRY_REFUSED`). A hedge lane and a residual policy refuse lives at construction. The
+  Python bridge takes `quote_lives_ns`; the maskable and continuous encodings gain a last
+  dimension whose first choice is no expiry, so a policy can still leave a quote resting.
+- Stage A of a bounded options market making study under quadratic rough Heston (#111), on
+  synthetic paths: the control checks do not pass and the greedy rule is worse in mean P&L than
+  always quoting within the bounds, where the delta gate does not bind, so it is not adopted. Experiment only; no public API change.
+
+- The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
+  #102's residual SAC retrained with and without a training adversary that, between five
+  phases, moves the episode's flow perturbation toward the point where the policy loses most on
+  scoring days. The adversary trains on #108's 12 points with the limit rate unchanged; the 12
+  points with a lower limit rate, #108's execution stress and #282's own impact are held out.
+  Both arms are evaluated once on fresh holdout days, with paired regime-stratified block
+  bootstrap intervals of the CVaR difference recomputed per replicate. The design was committed
+  and agreed before any code or run. No gain shown: at the selected held-out point the
+  adversarially trained policy's tail loss is not smaller, and it costs about 3.3 a day
+  unperturbed. The holdout was resumed once after an attempt killed from outside, as disclosed.
+- The regime adaptation and transfer study of #112 in `bridges/python/experiments/m5_08`, with
+  examples `regime_days` (synthetic days that change regime at fixed times, on the
+  queue-reactive and the Hawkes simulators) and `regime_alarm` (a causal volatility and VPIN
+  detector). Fixed, detector-adaptive, coordinate-search oracle and learned arms, with and
+  without the detector, under data shift, execution change and simulator error, on #103's
+  protocol, frozen before the single holdout. The result is a no-go on every group; the
+  detector raises tens of false alarms a calm day. Synthetic data only; no real-data claim.
+- The HSN study of #107 in `bridges/python/experiments/m5_02`: a learnable mixture-of-exponentials
+  memory against MLP, frame-stack, fixed-EMA, GRU, LSTM and #103's memory arms, in the paper's
+  single-asset setting (part A) and on #103's 1 s protocol over queue-reactive days (B) and
+  Hawkes flow that moves the mid (C, example `hawkes_days`). Designs frozen before each run,
+  one holdout read. HSN helps nowhere: A reproduces the paper's tie and not its power-law gain,
+  and a fixed spread beats every learned arm there; B is no gain and C revise. Synthetic only.
+- A frequent batch auction toy for #289 in `bridges/python/experiments/m5_05_batch`, synthetic
+  only and reported apart from the continuous order book. It collects orders for 500 ms, clears
+  them at one uniform price, and has submit and cancel delays of 30, 60 or 100 ms. The clearing
+  rule, the timing rule and the limits are stated in `fba.py` and checked against hand-computed
+  fixtures.
+  - #110's duration and latency arms ran on it from a design fixed before any run, with the
+    holdout read once behind an exclusive marker.
+  - At the chosen fee of 0, duration control helps only at 30 ms, weakly: the interval's lower
+    bound is 0.41. No claim is made at 60 or 100 ms; at 100 ms a seed also breached the
+    position limit.
+  - The holdout read the full arm's position once per step. Its no-breach condition at 30 ms is
+    therefore established by the toy's mechanism and by tests, after the holdout read, and is
+    confirmed on validation days (`audit.py`). The position, its peak and the drawdown are now
+    read at every clearing.
+  - At 0.0002 every trading arm loses.
+  - The learned arms use longer durations, unlike #110's, but the classical arm's mean beats them.
+  - The pilot curve did not plateau.
+
+- A quote the kernel expires by itself, exact in venue time (#297):
+  `backtest::kernel::KernelAction::ExpiringQuote` with `life_ns`. Each leg is canceled by the
+  venue `life_ns` after its own activation, whatever the latencies and jitter.
+  - The expiry is a venue message, scheduled when the leg activates, in `(time, sequence)`
+    order with the others. No latency is drawn.
+  - A leg fills only on rows strictly inside `(activation, activation + life_ns)`.
+  - An open order still holds at most two venue messages: the expiry takes the activation's
+    once the order is active.
+  - An expiry that beats the agent's cancel leaves the order awaiting that cancel, which the
+    venue rejects, as after a fill. A full fill, or the agent's cancel landing first, removes
+    the expiry.
+  - New events: `KernelEvent::Expired` and, at the end of the data, `KernelEvent::DroppedExpiry`.
+  - The state encoding gains message tags 3 (an expiry) and 4 (an activation with its life). A
+    run without expiring quotes writes neither, so its bytes and fingerprint are unchanged.
+  - The decoder refuses a life of 0, an expiry not naming a resting order, and two expiries for
+    one order.
+  - The RL action and the Python bridge come separately.
+
+- An offline training study for #280 in `bridges/python/experiments/m4_11`, synthetic only:
+  - behaviour cloning and a discrete conservative Q-learning trained on simulator logs;
+  - `design.json` committed before any run, with `run.py` and `offline.py`;
+  - a holdout that is read once, guarded by an exclusive marker;
+  - `sanity_diagnosis.py`.
+
+  The study stopped at its pre-registered BC sanity rule. BC agreed with the logged behaviour's
+  action on 81 to 82 % of the validation decisions, against the 90 % the rule requires. BC fails
+  to clone the behaviour's regime-dependent choice from an observation without the regime.
+  The holdout was not read.
+
+- `backtest::evaluation::stratified_block_bootstrap` (#280): a stationary block bootstrap of the
+  equally weighted mean of several groups' means, for example of regimes. Each group is
+  resampled on its own stream, group `i` seeded `seed + i`, so a single group gives exactly
+  `block_bootstrap`'s interval; the pool is the unweighted mean of the groups' replicate
+  means, and days are never pooled across groups. No group, an empty group, a value with no
+  finite `f64`, an invalid configuration or an overflowing seed is an `EvaluationError`, never a
+  panic. It is additive: a new public function, which #280's offline study, first planned as
+  scripts only, needs for its pooled intervals.
 
 - Counting of block-tied events in the queue-reactive estimator (#290):
   `QrEstimationConfig::zero_waits` with `ZeroWaitPolicy` (`Drop`, the default and the behaviour
@@ -774,6 +874,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The kernel's documentation builds under strict rustdoc with `kernel` or `rl` and without
+  `margin`: two links to `backtest::MarginAccount`, an item of the `margin` feature, are plain
+  code now.
 - Example `hyperliquid_validation` (#262) samples the walk-forward's mid at each change of the
   touch, from the replay's tops, instead of only when the mid changed. A touch that stays put
   while its sizes change is a live book, so its mid is a sample; read as a silence, it failed the
@@ -812,6 +915,21 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- The crate's own `Side` enum is gone from `execution`, `events` and the `prelude`: every order,
+  fill and query side is `financial_types::Action`, and `events::OptionStyle` is
+  `financial_types::OptionStyle`, both re-exported from the `prelude`.
+- `cargo-semver-checks` also reports `FillModel` and `AlertHandler` as newly sealed. They are not
+  sealed: code outside the crate still implements both, as the documentation test of
+  `AlertHandler` and the crate's integration tests do. The change to them is the `MMResult` return
+  of `FillModel::simulate_fill` and `AlertHandler::handle`, listed below.
+- `rl::RlConfig` gains the public field `quote_lives` (#297), so a struct literal must name it
+  (`RlConfig::new` sets `None`). `rl::ActionSpace` gains `expiry` and `rl::RlAction`
+  `ExpiringQuote`; both are `#[non_exhaustive]`.
+- `backtest::kernel::KernelAction` gains the variant `ExpiringQuote` and is now
+  `#[non_exhaustive]` (#297), so a match on it outside the crate needs a wildcard arm. The
+  decoder's counter bounds widen to what an expiring order can add: `next_msg_seq` to three
+  messages an order, and under the queue position model `stamp_seq` to four stamps an order
+  plus the fills. A state without expiring quotes encodes to the same bytes as before.
 - `backtest::kernel::KernelAction` gains the variant `Cancel` (#288), so an exhaustive match on
   it must handle it, and `rl::RlConfig` the public field `cancel_action`, so a struct literal
   must name it (`RlConfig::new` sets `false`). `rl::ActionSpace` gains `cancel` and

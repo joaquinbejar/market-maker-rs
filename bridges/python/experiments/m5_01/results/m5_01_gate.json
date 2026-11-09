@@ -1,0 +1,26 @@
+{
+ "fixed_spread/rational": {
+  "net": -6.397,
+  "fills": 232
+ },
+ "fixed_spread/immediate": {
+  "net": -12.7833,
+  "fills": 265
+ },
+ "avellaneda_stoikov/rational": {
+  "net": -8.2199,
+  "fills": 155
+ },
+ "avellaneda_stoikov/immediate": {
+  "net": -8.9575,
+  "fills": 175
+ },
+ "glft/rational": {
+  "net": 0.0,
+  "fills": 0
+ },
+ "glft/immediate": {
+  "net": 0.0,
+  "fills": 0
+ }
+}

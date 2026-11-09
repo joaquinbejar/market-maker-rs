@@ -1,0 +1,207 @@
+{
+ "issue": 107,
+ "part": "A",
+ "design_version": 1,
+ "status": "frozen before any training run of part A",
+ "data": "synthetic: two independent Hawkes processes of market orders, a Brownian mid with zero direct impact, exponential fill probability; the paper's setting as its text gives it, apart from our simulator",
+ "source": "Acero, Plank and Zhang, arXiv:2610.16524v1, single-asset experiments (Table 1)",
+ "layout": {
+  "buffer": 32,
+  "channels": 2,
+  "scalars": 3
+ },
+ "settings": [
+  {
+   "name": "exponential_n090",
+   "kernel": "exponential",
+   "n": 0.9,
+   "betas": [
+    5.0,
+    0.3
+   ],
+   "horizon": 0.5,
+   "hsn_init": "exponential",
+   "paper": {
+    "row": "Exp., n = 0.90",
+    "hsn": 0.0208,
+    "best_baseline": "MLP+frame-stack",
+    "best_baseline_value": 0.0211,
+    "expected": "tie"
+   }
+  },
+  {
+   "name": "power_law_eps015",
+   "kernel": "power_law",
+   "n": 0.7,
+   "eps": 0.15,
+   "tau0": 1.0,
+   "horizon": 0.5,
+   "hsn_init": "other",
+   "paper": {
+    "row": "Fractional, eps = 0.15",
+    "hsn": 0.0216,
+    "best_baseline": "MLP+frame-stack",
+    "best_baseline_value": 0.0163,
+    "expected": "hsn_better"
+   }
+  }
+ ],
+ "hsn_init": {
+  "exponential": {
+   "alphas": [
+    1.5,
+    0.1
+   ],
+   "betas": [
+    6.0,
+    0.4
+   ]
+  },
+  "other": {
+   "alphas": [
+    0.2,
+    0.4
+   ],
+   "betas": [
+    5.0,
+    0.3
+   ]
+  }
+ },
+ "arms": {
+  "mlp": {
+   "extractor": "mlp"
+  },
+  "mlp_frame_stack": {
+   "extractor": "frame_stack",
+   "frames": 8
+  },
+  "mlp_fixed_ema": {
+   "extractor": "fixed_ema",
+   "decays": [
+    0.1,
+    0.3,
+    0.7,
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    8.0
+   ]
+  },
+  "gru": {
+   "extractor": "recurrent",
+   "cell": "gru",
+   "embed": 8,
+   "hidden": 16
+  },
+  "lstm": {
+   "extractor": "recurrent",
+   "cell": "lstm",
+   "embed": 8,
+   "hidden": 14
+  },
+  "hsn": {
+   "extractor": "hsn",
+   "floor": 0.0001
+  }
+ },
+ "parameters": {
+  "target": 2600,
+  "tolerance": 0.1,
+  "min_width": 4,
+  "max_width": 96,
+  "rule": "each arm's policy and value MLPs have two hidden layers of one width, the integer width whose trainable parameter count is nearest the target; it must fall within the tolerance"
+ },
+ "widths": {
+  "mlp": 33,
+  "mlp_frame_stack": 24,
+  "mlp_fixed_ema": 26,
+  "gru": 17,
+  "lstm": 16,
+  "hsn": 31
+ },
+ "ppo": {
+  "n_steps": 1024,
+  "batch_size": 256,
+  "n_epochs": 10,
+  "learning_rate": 0.0003,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "ent_coef": 0.003,
+  "vf_coef": 0.5,
+  "max_grad_norm": 0.5
+ },
+ "budget_steps": 102400,
+ "training_seeds": [
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30
+ ],
+ "evaluation": {
+  "episodes": 100,
+  "seed_base": 1000000,
+  "policy": "deterministic: the Gaussian mean"
+ },
+ "audit": {
+  "seed": 7,
+  "episode_seed_base": 2000000,
+  "observations": 10000,
+  "timed": 10000
+ },
+ "reproduction": {
+  "statistic": "two-sided Welch t-test of HSN against the best control by mean, over the 30 training seeds' mean objectives, as the paper reports",
+  "significance": 0.05,
+  "rule": "a row reproduces when the observed class equals the paper's: tie when p >= 0.05; hsn_better when HSN's mean is above the best control's and p < 0.05; hsn_worse otherwise"
+ },
+ "choices": [
+  "The paper does not give n_epochs; SB3's default of 10 is used.",
+  "The paper maps the policy output to the spread range by a sigmoid; here the Gaussian is over the raw output in [-10, 10], which the trainer clips, and the environment applies the sigmoid. The initial log standard deviation is SB3's 0.",
+  "One fill is one unit. At Q = 5 the bid does not fill and at Q = -5 the ask does not; the order is still observed.",
+  "The step reward is the change of X + Q S minus gamma Q^2 dt, and the last step adds -kappa Q_T^2, so rewards sum exactly to the paper's objective.",
+  "A step runs from one decision to the next market order; the first decision is at t = 0 and the episode ends at T. There is no warm-up history: an episode starts with no past events, as the paper describes none.",
+  "Events are simulated by Ogata thinning, exact for non-increasing kernels. Every draw of an episode comes from its seed before the first step, so every arm meets the same episodes.",
+  "Each buffered event is its age and its side one-hot. The paper's frame-stack uses (dt, side); age carries the same information.",
+  "The scalar state is (S - S0) / (sigma sqrt T), Q / 5 and (T - t) / T.",
+  "Head widths come from the parameter rule, not the paper's per-arm widths, which do not give its stated counts under SB3's separate policy and value MLPs.",
+  "The Transformer baseline is not run: the issue asks for MLP, EMA and recurrent controls.",
+  "The paper's evaluation seeds are not given; seeds 1000000 to 1000099 are used for every arm."
+ ],
+ "estimate_minutes": 90,
+ "parallel": 2,
+ "overrun_rule": "a step that overruns its estimate by more than 50 % stops and is reported, without cutting seeds",
+ "seen_before_freeze": [
+  "Event counts of 2000 episodes per setting from the simulator alone, to check the setting: 1.28 market orders an episode on average for the exponential kernel and 0.89 for the power law, from an empty history.",
+  "Timing probes: hsn, gru and mlp trained 4096 steps on the exponential setting with seed 0, timed and not evaluated.",
+  "A pipeline check: every arm trained 2048 steps with seed 999 on both settings and evaluated on 3 episodes; every objective was 0 with 0 fills.",
+  "Seeds 0 and 999 are not training seeds, and none of this is evidence."
+ ]
+}

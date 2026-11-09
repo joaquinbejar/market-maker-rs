@@ -18,7 +18,7 @@
 //!
 //! [`ExecutionReport`] is the backtest's provisional execution vocabulary. It
 //! will be aligned with the shared multiproduct contracts once those are
-//! agreed; field names may change before 0.7.0.
+//! agreed; field names may change in a later version.
 //!
 //! # Example
 //!

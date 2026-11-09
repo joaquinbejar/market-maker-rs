@@ -24,7 +24,7 @@ use market_maker_rs::dec;
 use market_maker_rs::rl::{
     ERR_CROSS_HEDGE_REFUSED, EpisodeRecorder, HEDGED_ACTION_SPACE_VERSION,
     HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION, HedgeScales, InvalidActionPolicy,
-    ObservationScales, RlAction, RlConfig, RlEnv, RlState, TerminalValuation,
+    ObservationScales, QuoteLives, RlAction, RlConfig, RlEnv, RlState, TerminalValuation,
 };
 
 const MS: u64 = 1_000_000;
@@ -553,4 +553,20 @@ fn test_a_hedge_lane_refuses_the_cancel_action() {
         RlConfig::new(scales(), dec!(1)).with_cancel_action(),
     );
     assert!(matches!(refused, Err(e) if e.to_string().contains("cancel action")));
+}
+
+#[test]
+fn test_a_hedge_lane_refuses_quote_lives_at_construction() {
+    let d = data();
+    let refused = RlEnv::<'_, 3, 2>::new_hedged(
+        &d.cfg,
+        &d.quoted,
+        &d.lane,
+        &d.hedge,
+        grid(),
+        vec![1, 2],
+        hedge_scales(),
+        RlConfig::new(scales(), dec!(1)).with_quote_lives(QuoteLives::new(&[5]).unwrap()),
+    );
+    assert!(matches!(refused, Err(e) if e.to_string().contains("quote lives")));
 }

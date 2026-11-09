@@ -97,6 +97,22 @@ fn action_dict<'py>(py: Python<'py>, action: &KernelAction) -> PyResult<Bound<'p
             out.set_item("lots", lots)?;
         }
         KernelAction::Cancel => out.set_item("kind", "cancel")?,
+        KernelAction::ExpiringQuote {
+            bid,
+            ask,
+            bid_lots,
+            ask_lots,
+            life_ns,
+        } => {
+            out.set_item("kind", "expiring_quote")?;
+            out.set_item("bid", bid)?;
+            out.set_item("ask", ask)?;
+            out.set_item("bid_lots", bid_lots)?;
+            out.set_item("ask_lots", ask_lots)?;
+            out.set_item("life_ns", life_ns.get())?;
+        }
+        // An action this bridge does not know: a later kernel's.
+        _ => out.set_item("kind", "unknown")?,
     }
     Ok(out)
 }
@@ -119,6 +135,11 @@ fn info_dict<'py>(py: Python<'py>, info: &crate::worker::EnvInfo) -> PyResult<Bo
     out.set_item("sizes", info.sizes)?;
     out.set_item("hedge_actions", info.hedge_actions)?;
     out.set_item("cancel_action", info.cancel_action)?;
+    out.set_item(
+        "quote_lives_ns",
+        info.quote_lives
+            .map_or(Vec::new(), |lives| lives.as_slice().to_vec()),
+    )?;
     out.set_item("kernel_fingerprint", hex(info.kernel_fingerprint))?;
     out.set_item("dataset_digest", hex(info.dataset_digest))?;
     out.set_item("rows", info.rows)?;
@@ -341,6 +362,30 @@ impl NativeEnv {
     ) -> PyResult<Py<PyDict>> {
         let side = if bid { QuoteSide::Bid } else { QuoteSide::Ask };
         self.take_step(py, RlAction::OneSided { side, offset, size })
+    }
+
+    /// Replaces the resting orders with a bid and an ask that expire by themselves after the
+    /// life at `life` in `quote_lives_ns`.
+    #[allow(clippy::too_many_arguments)]
+    fn step_expiring_quote(
+        &self,
+        py: Python<'_>,
+        bid: usize,
+        ask: usize,
+        bid_size: usize,
+        ask_size: usize,
+        life: usize,
+    ) -> PyResult<Py<PyDict>> {
+        self.take_step(
+            py,
+            RlAction::ExpiringQuote {
+                bid,
+                ask,
+                bid_size,
+                ask_size,
+                life,
+            },
+        )
     }
 
     /// Cancels every resting or pending order and sends nothing.
