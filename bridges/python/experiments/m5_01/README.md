@@ -81,7 +81,7 @@ one noon window a day and the controls on all of `queue_train`, so training expo
   of the data's rows, and each policy's net and fills there were read. The holdout was claimed
   once, after that freeze, and read once, with no resume.
 - The holdout's windows were read by the QR arms before (#286), and #290 read training.
-- `design.json`'s text was edited after the holdout to remove internal references and local paths, with no change of meaning. The version under which the holdout ran is at commit `c1928b9`, sha256 `536e19b2db42326c6a2665d0c22215b9d26ebee8671f8a8b959cd1ece52c6ca0`.
+- `design.json`'s text was edited after the holdout to remove internal references and local paths, with no change of meaning. The version under which the holdout ran is at commit `c1928b9`, sha256 `536e19b2db42326c6a2665d0c22215b9d26ebee8671f8a8b959cd1ece52c6ca0`. This study is merged as a squash; commit `c1928b9` stays retrievable from the commits of its pull request (#318).
 
 ## Files
 
