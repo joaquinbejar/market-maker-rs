@@ -235,3 +235,52 @@ def project(rows, ceiling_hours=90.0):
     days = (24 * SELECTION_DAYS + 4 * HOLDOUT_DAYS) * len(SETTINGS)
     hours = per_setting_day * days / 3600
     return {"worst_seconds_per_day": worst, "projected_hours": hours, "over_ceiling": hours > ceiling_hours}
+
+
+def generate_pilot_days(causal, data_dir, binary):
+    """Writes the pilot's days with examples/hawkes_days and returns their sha256 by relative path."""
+    import subprocess
+
+    data_dir = pathlib.Path(data_dir)
+    impact = SETTINGS[PILOT_SETTING]
+    digests = {}
+    for point in (grid.points(impact)[0], grid.fixed_stress(impact)):
+        out = data_dir / "pilot" / PILOT_SETTING / point_id(point)
+        out.mkdir(parents=True, exist_ok=True)
+        config = out / "config.json"
+        config.write_text(json.dumps({"causal": grid.day_config(causal, point, "p", PILOT_DAYS, PILOT_OFFSET)}))
+        subprocess.run([str(binary), str(config), str(out)], check=True, stdout=subprocess.DEVNULL)
+        for day in range(1, PILOT_DAYS + 1):
+            path = day_path(data_dir, "pilot", PILOT_SETTING, point, day)
+            digests[str(path.relative_to(data_dir))] = sha256(path)
+    return digests
+
+
+def main(argv):
+    """python run.py pilot <out> <hawkes_days binary> <#107 causal output dir>"""
+    import time
+
+    step, out, binary, causal_out = argv
+    if step != "pilot":
+        raise SystemExit("only the pilot step is wired so far")
+    out, causal_out = pathlib.Path(out), pathlib.Path(causal_out)
+    out.mkdir(parents=True, exist_ok=True)
+    frozen = json.loads((causal_out / "frozen.json").read_text())
+    classical = check_classical(causal_out / "classical.json", frozen["classical_sha256"])
+    causal = json.loads((HERE.parent / "m5_02" / "design.json").read_text())["causal"]
+    digests = generate_pilot_days(causal, out, binary)
+    rows = []
+    with (out / "pilot.jsonl").open("a") as handle:
+        for job in pilot_jobs():
+            start = time.perf_counter()
+            result = evaluate(job, out, causal_out / "checkpoints", classical, digests)
+            seconds = time.perf_counter() - start
+            rows.append((job, seconds))
+            handle.write(json.dumps({"key": job_key(job), "seconds": seconds, "net": result["net"]}) + "\n")
+            handle.flush()
+    report = {"projection": project(rows), "load": os.getloadavg()}
+    (out / "pilot.json").write_text(json.dumps(report, indent=1))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
