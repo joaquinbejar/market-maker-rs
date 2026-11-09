@@ -60,7 +60,7 @@ one noon window a day and the controls on all of `queue_train`, so training expo
 ## Disclosures
 
 - **Chronology.** Extraction and hash checks of the capture began at 07:14 UTC on 2026-11-08, after
-  the design at bb524c1 was approved at 07:08 UTC. No semantic parse, replay or inspection of the
+  the design at bb524c1, committed at 07:08 UTC, was approved. No semantic parse, replay or inspection of the
   capture came before the later design agreement. Every extracted file matched the per-file
   manifest of #76.
 - **Hawkes is a failed arm.** Its fit on `queue_train` returned `HawkesFailure::Unstable` at all 4
