@@ -179,8 +179,8 @@ def test_the_timed_call_returns_the_result_and_its_seconds():
 def test_a_pool_at_its_limit_stops_running_workers(importable_timer):
     import time
     started = time.perf_counter()
-    rows, finished, _, charged = run.run_pool([0.0, 30.0], sleep_worker, 2, 8.0, "t")
-    assert rows is None and finished == 1 and 7.0 < charged < 25 and time.perf_counter() - started < 25
+    rows, finished, _, charged, failure = run.run_pool([0.0, 30.0], sleep_worker, 2, 8.0, "t")
+    assert failure is None and rows is None and finished == 1 and 7.0 < charged < 25 and time.perf_counter() - started < 25
 
 
 sleep_worker = _sleep
@@ -191,5 +191,25 @@ def test_five_jobs_on_four_workers_are_two_rounds():
 
 
 def test_process_seconds_are_each_jobs_own(importable_timer):
-    rows, finished, _, charged = run.run_pool([0.0, 0.0], sleep_worker, 2, None, "t")
+    rows, finished, _, charged, _failure = run.run_pool([0.0, 0.0], sleep_worker, 2, None, "t")
     assert rows == [0.0, 0.0] and finished == 2 and charged < 1.0
+
+
+def _fail_or_sleep(seconds):
+    if seconds < 0:
+        raise ValueError("job failed")
+    return _sleep(seconds)
+
+
+def test_a_failed_job_stops_the_others_and_is_charged(importable_timer):
+    import time
+    started = time.perf_counter()
+    rows, _, _, charged, failure = run.run_pool([-1.0, 30.0], _fail_or_sleep, 2, None, "t")
+    assert rows is None and isinstance(failure, ValueError) and charged >= 0.0
+    assert time.perf_counter() - started < 25
+
+
+def test_a_step_needs_a_pilot_that_did_not_stop_and_the_recorded_go():
+    assert run.may_continue({"stop": False}, True)
+    assert not run.may_continue({"stop": True}, True)
+    assert not run.may_continue({"stop": False}, False)

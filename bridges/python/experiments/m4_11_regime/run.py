@@ -490,45 +490,65 @@ def rounds(jobs, workers):
 
 
 def run_pool(jobs, worker, parallel, limit, label):
-    """The jobs in spawned processes, stopped at `limit` seconds. Returns (rows or None, the
-    finished count, elapsed, process seconds). At the limit the workers are terminated, and
+    """The jobs in spawned processes, stopped at `limit` seconds or at a job's failure. Returns
+    (rows or None, the finished count, elapsed, process seconds, the failure or None). At the limit the workers are terminated, and
     each job still running is charged the time since the start."""
     context = multiprocessing.get_context("spawn")
     started = time.perf_counter()
     executor = concurrent.futures.ProcessPoolExecutor(parallel, mp_context=context)
     futures = [executor.submit(timed_call, worker, job) for job in jobs]
     pending = set(futures)
+
+    def stopped(error):
+        # `_processes` is private; the Python of the run is pinned by its environment.
+        workers = list((executor._processes or {}).values())
+        executor.shutdown(wait=False, cancel_futures=True)
+        for process in workers:
+            process.terminate()
+        for process in workers:
+            process.join()
+        elapsed = time.perf_counter() - started
+        finished = [f.result()[1] for f in futures if f.done() and not f.cancelled()
+                    and f.exception() is None]
+        charged = sum(finished) + min(len(workers), len(jobs) - len(finished)) * elapsed
+        return None, len(finished), elapsed, charged, error
+
     try:
         while pending:
             timeout = None if limit is None else max(limit - (time.perf_counter() - started), 0.0)
             done, pending = concurrent.futures.wait(
                 pending, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
-                future.result()
+                if future.exception() is not None:
+                    return stopped(future.exception())
             print(f"{label}: {len(jobs) - len(pending)}/{len(jobs)} after "
                   f"{round(time.perf_counter() - started)} s", file=sys.stderr, flush=True)
             if pending and not done:
-                workers = list((executor._processes or {}).values())
-                executor.shutdown(wait=False, cancel_futures=True)
-                for process in workers:
-                    process.terminate()
-                for process in workers:
-                    process.join()
-                elapsed = time.perf_counter() - started
-                finished = [f.result()[1] for f in futures if f.done() and not f.cancelled()
-                            and f.exception() is None]
-                charged = sum(finished) + min(len(workers), len(pending)) * elapsed
-                return None, len(finished), elapsed, charged
+                return stopped(None)
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
     outcomes = [future.result() for future in futures]
     return ([row for row, _ in outcomes], len(jobs), time.perf_counter() - started,
-            sum(seconds for _, seconds in outcomes))
+            sum(seconds for _, seconds in outcomes), None)
 
 
 def step_limit(estimate, remaining_process_seconds, slots):
     """The smaller of 1.5 times the step's estimate and its share of the ceiling's remainder."""
     return min(OVERRUN * estimate, max(remaining_process_seconds, 0.0) / slots)
+
+
+def may_continue(budget, has_go):
+    """Whether a step may run: a pilot that did not stop, and a recorded compute go."""
+    return not budget.get("stop") and has_go
+
+
+def record_go(study, reference):
+    budget = study.read("budget")
+    if budget.get("stop"):
+        raise PermissionError("the pilot stopped the study")
+    return study.write("compute-go", {"reference": reference,
+                                      "ceiling_process_hours": budget["ceiling_process_hours"],
+                                      "budget_sha256": sha256(study.out / "budget.json")})
 
 
 def job_count_ok(jobs, planned, enforce):
@@ -542,14 +562,18 @@ def pool(jobs, worker, study, label, kind, planned, enforce=True):
     if not job_count_ok(jobs, planned, enforce):
         raise ValueError(f"{label} has {len(jobs)} jobs, the ceiling planned {planned}")
     budget = study.read("budget")
+    if not may_continue(budget, (study.out / "compute-go.json").exists()):
+        raise PermissionError("no step runs after a stopped pilot or without the recorded compute go")
     ledger_path = study.out / "ledger.json"
     spent = json.loads(ledger_path.read_text())["total"] if ledger_path.exists() else 0.0
     slots = min(study.parallel, len(jobs))
     estimate = job_seconds(study, kind) * rounds(len(jobs), study.parallel)
     limit = step_limit(estimate, budget["ceiling_process_hours"] * 3600 - spent, slots)
-    rows, finished, elapsed, process_seconds = run_pool(jobs, worker, study.parallel, limit if enforce else None, label)
+    rows, finished, elapsed, process_seconds, failure = run_pool(jobs, worker, study.parallel, limit if enforce else None, label)
     total = ledger_add(ledger_path, label, process_seconds)
     name = label.replace(" ", "-")
+    if failure is not None:
+        raise failure
     if rows is None:
         study.write(f"overrun-{name}", {"step": label, "seconds": elapsed, "limit": limit,
                                         "finished_jobs": finished, "jobs": len(jobs)})
@@ -968,7 +992,7 @@ def main():
     step, data_dir, run_dir, root, attempt, commit = sys.argv[1:7]
     args = sys.argv[7:]
     study = Study(data_dir, run_dir, root, attempt, commit)
-    steps = {"pilot": lambda: pilot(study), "gate": lambda: gate(study),
+    steps = {"pilot": lambda: pilot(study), "go": lambda: record_go(study, args[0]), "gate": lambda: gate(study),
              "logs": lambda: run_logs(study, args[0], args[1]), "audit": lambda: audit(study),
              "train": lambda: run_train(study, args[0], args[1], args[2] if len(args) > 2 else None),
              "sanity": lambda: sanity(study, args[0]), "ppo": lambda: run_ppo(study, args[0]),
