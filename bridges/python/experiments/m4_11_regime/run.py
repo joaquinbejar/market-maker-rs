@@ -64,8 +64,8 @@ PRIMARY, SECONDARY = "standard_eps30", "standard_eps10"
 BLOCK, REPLICATES, BOOTSTRAP_SEED = 2.0, 2000, 309
 THRESHOLD = 0.9
 OVERRUN = 1.5
-PPO_PILOT_STEPS = 2048
-OFFLINE_DAY_FACTOR = 3.0  # A network evaluated at every decision, over a rule; the pilot is a bound.
+PILOT_GRADIENT_STEPS = 5000
+PILOT_PPO_STEPS = 20000
 
 
 def load():
@@ -430,7 +430,10 @@ class Study:
         return prior.m4_07_epsilon("as_grid_eps10" if dataset.endswith("eps10") else "as_grid_eps30")
 
     def edges(self, dataset):
-        observations = np.concatenate([d["observation"] for d in prior.read_logs(self.logs(dataset, "train"))])
+        return self.edges_of(self.logs(dataset, "train"))
+
+    def edges_of(self, records):
+        observations = np.concatenate([d["observation"] for d in prior.read_logs(records)])
         return np.quantile(observations[observations[:, 16] > 0, 5], [0.2, 0.4, 0.6, 0.8]).tolist()
 
 
@@ -440,6 +443,15 @@ def require(study, name, why):
 
 def rule_policy(name):
     return {"kind": "rule", "name": name}
+
+
+def ledger_add(path, label, process_seconds):
+    """Adds a step's process seconds to the ledger and returns the total."""
+    ledger = json.loads(path.read_text()) if path.exists() else {"steps": [], "total": 0.0}
+    ledger["steps"].append({"step": label, "process_seconds": process_seconds})
+    ledger["total"] += process_seconds
+    path.write_text(json.dumps(ledger, indent=2))
+    return ledger["total"]
 
 
 def overran(elapsed, estimate):
@@ -469,6 +481,9 @@ def pool(jobs, worker, study, label, kind, enforce=True):
     rows = prior.pool(jobs, worker, study.parallel, label)
     elapsed = time.perf_counter() - started
     estimate = job_seconds(study, kind) * len(jobs) / study.parallel
+    spent = ledger_add(study.out / "ledger.json", label, elapsed * min(study.parallel, len(jobs)))
+    if enforce and spent > study.read("budget")["ceiling_process_hours"] * 3600:
+        raise RuntimeError(f"{label} passed the study's ceiling of process hours")
     if overran(elapsed, estimate):
         name = label.replace(" ", "-")
         study.write(f"overrun-{name}", {"step": label, "seconds": elapsed, "estimate": estimate})
@@ -477,40 +492,76 @@ def pool(jobs, worker, study, label, kind, enforce=True):
     return rows
 
 
-def pilot(study):
-    records_days = [(study.regimes[0], 1)]
-    regime, day = records_days[0]
-    path = study.out / "pilot" / "log.npz"
+PLANNED = {"rule_day": 63 + 45, "log_day": 570, "bc": 10, "cql": 20, "ppo": 10, "offline_day": 225 + 450}
+
+
+def ceiling_hours(seconds_by_kind):
+    """The design's total: every planned job's estimated seconds, times 1.5, in hours."""
+    return sum(PLANNED[k] * seconds_by_kind[k] for k in PLANNED) * OVERRUN / 3600
+
+
+def pilot_job(job):
+    """One timed unit of a kind; the concurrent workers are the load."""
+    torch.set_num_threads(1)
     started = time.perf_counter()
-    log = log_job(study.job(regime, day, "train", "standard", "as_grid_eps30", None, seed=1,
-                            behaviour="as_grid_eps30", epsilon=0.3, path=str(path)))
-    per_log_day = time.perf_counter() - started
-    data = offline.Transitions(offline.Actions(len(study.grid.offsets), len(study.grid.sizes)),
-                               days_with_regime([log]), 1.0)
-    out = {"log_day_seconds": round(per_log_day, 1)}
+    if job["kind"] == "train":
+        train_job(job["train"])
+    elif job["kind"] == "ppo":
+        ppo_job(job["ppo"])
+    elif job["kind"] == "log":
+        log_job(job["log"])
+    else:
+        run_job(job["run"])
+    return time.perf_counter() - started
+
+
+def pilot(study):
+    """Times under real load, on training days and attempt 1's training logs."""
+    records = json.loads((study.root / "attempt-1" / f"logs-{PRIMARY}-train.json").read_text())["logs"]
+    scale = reward_scale_of(records)
+    workers = range(1, study.parallel + 1)
+    regime, day = study.regimes[0], 1
+    k, m = len(study.grid.offsets), len(study.grid.sizes)
+    out, trained = {}, None
+    def timed(jobs):
+        return float(np.mean(prior.pool(jobs, pilot_job, study.parallel, "pilot")))
     for arm in ("bc", "cql"):
-        settings = dict(study.design["arms"][arm]["settings"], gradient_steps=500)
+        full = study.design["arms"][arm]["settings"]["gradient_steps"]
+        settings = dict(study.design["arms"][arm]["settings"], gradient_steps=PILOT_GRADIENT_STEPS)
         if arm == "cql":
             settings["alpha"] = 1.0
-        started = time.perf_counter()
-        offline.train(arm, data, 1, settings)
-        per = (time.perf_counter() - started) / 500
-        full = study.design["arms"][arm]["settings"]["gradient_steps"]
-        out[arm] = {"seconds_per_gradient_step": round(per, 5),
-                    "estimate_minutes_per_run": round(per * full / 60, 1)}
-    started = time.perf_counter()
-    run_job(study.job(regime, day, "train", "standard", "as_grid", rule_policy("as_grid")))
-    out["rule_day_seconds"] = round(time.perf_counter() - started, 1)
-    out["offline_day_seconds"] = round(out["rule_day_seconds"] * OFFLINE_DAY_FACTOR, 1)
+        paths = [study.out / "pilot" / f"{arm}-{w}.pt" for w in workers]
+        seconds = timed([{"kind": "train", "train": {
+            "dataset": PRIMARY, "arm": arm, "seed": w, "settings": settings, "logs": records,
+            "reward_scale": scale, "k": k, "m": m, "commit": study.commit, "path": str(path)}}
+            for w, path in zip(workers, paths, strict=True)])
+        out[arm] = {"seconds_per_gradient_step": seconds / PILOT_GRADIENT_STEPS,
+                    "estimate_seconds": seconds / PILOT_GRADIENT_STEPS * full}
+        if arm == "bc":
+            trained = json.loads(paths[0].with_suffix(".json").read_text())
+    edges = study.edges_of(records)
+    out["log_day_seconds"] = timed([{"kind": "log", "log": study.job(
+        regime, day, "train", "standard", "as_grid_eps30", None, seed=w, behaviour="as_grid_eps30",
+        epsilon=0.3, path=str(study.out / "pilot" / f"log-{w}.npz"))} for w in workers])
+    out["rule_day_seconds"] = timed([{"kind": "run", "run": study.job(
+        regime, day, "train", "standard", "as_grid", rule_policy("as_grid"))} for _ in workers])
+    out["offline_day_seconds"] = timed([{"kind": "run", "run": study.job(
+        regime, day, "train", "standard", "bc", {"kind": "offline", "metadata": trained},
+        seed_of_arm=1, epsilon=0.3, edges=edges)} for _ in workers])
     arm = study.m4_05["arms"]["maskable_ppo"]
-    started = time.perf_counter()
-    ppo_job({"arm": "pilot", "with_regime": True, "seed": 1, "steps": PPO_PILOT_STEPS,
-             "hyperparameters": arm["hyperparameter_sets"][0], "config": study.config("standard"),
-             "regimes": [regime], "days": [day], "data_dir": study.data_dir, "commit": study.commit,
-             "path": str(study.out / "pilot" / "ppo")})
-    out["ppo_seconds_per_step"] = round((time.perf_counter() - started) / PPO_PILOT_STEPS, 6)
+    ppo = timed([{"kind": "ppo", "ppo": {
+        "arm": "pilot", "with_regime": True, "seed": w, "steps": PILOT_PPO_STEPS,
+        "hyperparameters": arm["hyperparameter_sets"][0], "config": study.config("standard"),
+        "regimes": study.regimes, "days": study.days("train"), "data_dir": study.data_dir,
+        "commit": study.commit, "path": str(study.out / "pilot" / f"ppo-{w}")}} for w in workers])
+    out["ppo_seconds_per_step"] = ppo / PILOT_PPO_STEPS
     report = study.header("pilot")
     report.update(out)
+    report["ceiling_process_hours"] = ceiling_hours({
+        "rule_day": out["rule_day_seconds"], "log_day": out["log_day_seconds"],
+        "offline_day": out["offline_day_seconds"], "bc": out["bc"]["estimate_seconds"],
+        "cql": out["cql"]["estimate_seconds"],
+        "ppo": out["ppo_seconds_per_step"] * arm["budget_steps"]})
     return study.write("budget", report)
 
 
@@ -711,7 +762,8 @@ def freeze(study):
     report.update({"alpha": alpha, "tags": tags, "checkpoints": checkpoints, "logs": logs,
                    "reports": reports, "root": str(study.root),
                    "digests_sha256": sha256(HERE / "digests.json"),
-                   "budget_sha256": sha256(study.out / "budget.json")})
+                   "budget_sha256": sha256(study.out / "budget.json"),
+                   "ledger_sha256": sha256(study.out / "ledger.json")})
     return study.write("frozen", report)
 
 

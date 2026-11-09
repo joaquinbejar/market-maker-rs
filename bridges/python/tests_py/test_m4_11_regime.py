@@ -120,3 +120,17 @@ def test_input_precision_flags_two_raw_values_on_one_input():
            "raw_steps_left": np.array([1, 1])}
     out = run.input_precision([day])
     assert not out["position_one_to_one"] and out["steps_left_one_to_one"]
+
+
+def test_the_ceiling_is_every_planned_job_with_half_again():
+    seconds = dict.fromkeys(run.PLANNED, 0.0)
+    assert run.ceiling_hours(seconds) == 0.0
+    seconds["bc"] = 3600.0
+    assert run.ceiling_hours(seconds) == run.PLANNED["bc"] * 1.5
+
+
+def test_the_ledger_accumulates_process_seconds(tmp_path):
+    path = tmp_path / "ledger.json"
+    assert run.ledger_add(path, "a", 10.0) == 10.0
+    assert run.ledger_add(path, "b", 5.0) == 15.0
+    assert len(json.loads(path.read_text())["steps"]) == 2

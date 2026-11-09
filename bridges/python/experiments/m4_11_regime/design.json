@@ -1,6 +1,6 @@
 {
   "issue": 309,
-  "design_version": 3,
+  "design_version": 4,
   "data": "synthetic: #102's queue-reactive simulator and regimes, with made-up parameters, on new days generated for this study; no market data. The logs are generated here by #104's behaviours; their rewards are the simulator's consequences, not observed ones",
   "bounds": "One synthetic simulator whose rows do not react to orders, made-up parameters and 24 days per regime bound what this study can show. Every value is labelled [observed] (read from a log) or [simulated] (an interactive run in the same simulator); nothing here is an off-policy estimate.",
   "motivation": "A new experiment motivated by a validation result of #280, not a confirmatory continuation of it. #280's stop stays as the result of its registered design.",
@@ -11,7 +11,8 @@
       "#102 and #104's holdout values on #102's days 20 to 24 (as_grid -111.59, fixed spread 4 -138.93, maskable PPO about 0 a day)"
     ],
     "not_seen": "#280's holdout was never read. None of this study's days, logs or runs exist at the time of this design.",
-    "reused_choices": "as_grid's per-regime points and #102's volatility were selected on #102's days, and the arms' settings are #280's unchanged. Neither was chosen from this study's days."
+    "reused_choices": "as_grid's per-regime points and #102's volatility were selected on #102's days, and the arms' settings are #280's unchanged. Neither was chosen from this study's days.",
+    "seen_in_attempt_1": "Attempt 1 ran at commit 1beac05 and stopped at the compute rule: CQL at alpha 0.1 on standard_eps30 took 405 s against an estimate of 180 s, because its pilot timed 500 gradient steps on one logged day in one process. Seen from it: the gate passed; the audit (exact key: agreement ceiling 0.8146 without the regime and 1.0 with it; binned key: 0.7931 and 0.9240; position and steps left one to one); BC's validation agreement (standard_eps30 0.977 to 0.982, standard_eps10 0.984 to 0.987, by seed). No CQL or PPO output of attempt 1 was read, and none is used. Its directory is kept. The holdout was not started."
   },
   "regime_input": {
     "choice": "a one-hot of the regime (calm, stressed, thin, in that order) appended to the observation of the offline arms, and of the equal-information PPO comparator",
@@ -196,7 +197,8 @@
   },
   "attempts": {
     "budget": "One attempt. A second one only for a fault of the pipeline that a test can reproduce (a crash, or a hash that does not match), in a new output directory, disclosed with the fault and the kept outputs of the first. A result is never a reason for a second attempt, and no setting, threshold or seed changes between attempts. A second attempt is impossible once the holdout has started for this design, whichever attempt started it. There is no resume after a crash or an external kill of the holdout: it is reported as failed.",
-    "layout": "Every attempt is a directory attempt-<n> under one fixed attempts root given to the runner. The holdout marker is holdout-<design sha256>.started in that root, outside any attempt, created exclusively before the first holdout day is read and kept on failure. The runner refuses the holdout, and any new attempt's freeze, when it exists."
+    "layout": "Every attempt is a directory attempt-<n> under one fixed attempts root given to the runner. The holdout marker is holdout-<design sha256>.started in that root, outside any attempt, created exclusively before the first holdout day is read and kept on failure. The runner refuses the holdout, and any new attempt's freeze, when it exists.",
+    "attempt_2": "Attempt 2 is the last one and starts from scratch in attempt-2, at this design's commit: every step reruns, with no output of attempt 1 used except the pilot's timing on its training logs. If it overruns too, the study is reported as not completed."
   },
   "stop_rules": [
     "Logs: a log whose sha256 differs from its record stops the step that reads it.",
@@ -209,13 +211,15 @@
   ],
   "compute": {
     "max_parallel_runs": 4,
-    "estimates": "set by a pilot step on training days, before any other step",
+    "estimates": "set by a pilot under real load, before any other step of attempt 2: four concurrent workers per measured kind (5000 gradient steps of BC and of CQL on the full training logs of standard_eps30, read from attempt 1 for timing only and checked against their sha256; 20000 steps of PPO; one log day; one rule day; one day of a trained network)",
     "when": "only on slots assigned by the coordination of the shared machine",
-    "budget_file": "The pilot step writes budget.json with its estimates, before any other step; the freeze records its sha256 and the holdout checks it."
+    "budget_file": "The pilot step writes budget.json with its estimates, before any other step; the freeze records its sha256 and the holdout checks it.",
+    "ceiling": "The pilot writes to budget.json the total process hours: the sum over every planned job of its estimated seconds, times 1.5, over 3600. The runner keeps a ledger of the process seconds spent and stops when the ledger passes the ceiling; the holdout records an excess instead of stopping, since it is read once."
   },
   "holdout_rule": "The holdout days are read once, after the freeze has recorded the hashes of the design, the digests, the budget file, the code, the chosen alpha, every log and every checkpoint; the runner refuses it before, and the exclusive marker of attempts.layout, created before the first holdout day is read, is kept on failure, so it is not run again in this or any other attempt.",
   "changes": [
     "version 2, before any data or run exists: after a design review, the holdout marker moves to the attempts root and rules out a second attempt once the holdout started; the aliasing label and key are named; the BC rule's scope across datasets is stated; the reading of the ceiling, the tuning asymmetry, the width of the intervals and the budget file are stated.",
-    "version 3, before any data or run exists: after a second design review, BC on both datasets is checked before any CQL training; the audit reports the input's range and precision; the conclusions' limit and the unadjusted intervals are stated."
+    "version 3, before any data or run exists: after a second design review, BC on both datasets is checked before any CQL training; the audit reports the input's range and precision; the conclusions' limit and the unadjusted intervals are stated.",
+    "version 4, after attempt 1 stopped at the compute rule and before any CQL or PPO output was read: a representative pilot under real load, a total ceiling of process hours and a last attempt 2 from scratch. No hyperparameter, dataset, seed or gate changes. The disclosure records attempt 1."
   ]
 }
