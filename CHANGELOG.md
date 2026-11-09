@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- The MDQR study of #106 in `bridges/python/experiments/m5_01`: a neural order book generator, a
+  block clock and a size head, trained on Hyperliquid BTC order flow from December 2025 against
+  queue-reactive, Hawkes and Poisson controls, after a synthetic recovery check. Real data, an
+  exploratory comparison on a reused holdout read once. By its frozen rule MDQR is discarded: it
+  fits queue sizes far better than the queue-reactive arms, but the best queues' correlation
+  fails against both, and the transfer rule cannot pass because every policy has zero fills on
+  those arms' rows. Hawkes failed as unstable. Experiment only; no public API change.
+
 ### Added
 
 - Quotes that expire at the venue as an RL action (#297). `RlConfig::with_quote_lives` takes

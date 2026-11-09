@@ -1,0 +1,287 @@
+{
+ "issue": 106,
+ "design_version": 2,
+ "status": "version 2: stage S0 as in version 1 (run and passed), and the main study on the capture fixed here before any read of the capture",
+ "question": "does a small MDQR (a queue-reactive book whose intensities come from a neural network of the state, after Bodor and Carlier, arXiv 2501.08822v1) fix what #286 found for the fitted QR model (transient, queues climbing to the cap, worse than its constant baseline on queue TV) without artefacts, and do #102's policies transfer to it",
+ "approval": "design note v0, approved with changes: the Hyperliquid capture is the main data, synthetic QR days only as stage S0; K = 3 with the gap from the paper's 5 stated; current QR and its constant baseline are the controls, without waiting for #290; #102's policies transfer at their own execution",
+ "paper_gap": "the paper models 5 limits a side on FGBL futures, MLP 256-64 tanh, sizes 1 to 200; here K = 3 (the replay's declared depth, #263), MLP 128-64 tanh, sizes 1 to 64 in event-size units, and in S0 the truth's own 2 limits; no code was released with the paper, so this is a reimplementation from its text",
+ "s0": {
+  "purpose": "a control on synthetic data where QR is the truth: MDQR fitted on the truth's events must recover it, before any fit on the capture",
+  "data": "SYNTHETIC: the queue-reactive simulator at #102's calm parameters (experiments/m4_06/design.json, pinned below), not market data",
+  "truth": {
+   "source": "experiments/m4_06/design.json simulator.regimes[name = calm]",
+   "tick_size": "0.01",
+   "theta": 0.6,
+   "theta_reinit": 0.2,
+   "event_sizes": [
+    "1",
+    "2"
+   ],
+   "policy": "nearest_supported",
+   "rates": [
+    [
+     [
+      4.0,
+      0.0,
+      0.0
+     ],
+     [
+      4.0,
+      1.0,
+      1.0
+     ],
+     [
+      3.0,
+      2.0,
+      1.0
+     ],
+     [
+      2.0,
+      3.0,
+      1.0
+     ],
+     [
+      0.0,
+      4.0,
+      1.0
+     ]
+    ],
+    [
+     [
+      4.0,
+      0.0,
+      0.0
+     ],
+     [
+      4.0,
+      1.0,
+      1.0
+     ],
+     [
+      3.0,
+      2.0,
+      1.0
+     ],
+     [
+      2.0,
+      3.0,
+      1.0
+     ],
+     [
+      0.0,
+      4.0,
+      1.0
+     ]
+    ]
+   ]
+  },
+  "window_seconds": 14400.0,
+  "sample_ms": 1000,
+  "reference_ticks": 10000,
+  "max_events_per_window": 2000000,
+  "flow_interval_ms": 1000,
+  "seeds": {
+   "rule": "fixed here before any run; a window is one run of the simulator from a book drawn from the invariant laws",
+   "train": [
+    106001,
+    106002,
+    106003,
+    106004
+   ],
+   "evaluation": [
+    106101,
+    106102
+   ],
+   "truth_again": [
+    106201,
+    106202
+   ]
+  },
+  "model": {
+   "kind": "mdqr",
+   "limits": "the truth's 2 a side",
+   "mechanics": "the queue-reactive book of src/backtest/queue_reactive.rs: an event moves one queue by one event size; a mid move while the opposite first queue is empty moves the reference with probability theta, shifts the queues one limit with the event-size renormalization, and redraws the book from the invariant laws with probability theta_reinit; the same xorshift64* generator, so that with the truth's own intensities the model is the simulator event for event (a test)",
+   "intensity": "an MLP 128-64 tanh of the state to the log intensities of the 3 kinds x 2 sides x 2 limits; an intensity is 0 where the state forbids the event (a cancel or market order on an empty queue, a limit order on a full one)",
+   "state": "log(1 + queue) of each queue (4), the spread in ticks, the kind of the last event at each queue (one-hot, 4 x 4 with none), and the time since the last event at each queue, log(1 + seconds); no hour, since S0's windows have no time of day",
+   "sizes": "every S0 event moves a queue by one event size, so the size head is not used in S0; it is fitted on the capture only",
+   "clock": "continuous: S0's events have distinct times, so the block clock with the end-of-block token, needed for the capture's block-tied times, is not used in S0",
+   "mechanics_parameters": "theta, theta_reinit and the invariant laws estimated from the training windows (the share of eligible moves that moved, of moves that redrew, and the queue sizes at the samples, per limit, sides pooled)",
+   "fit": "maximum likelihood of the marked point process: for each event, log intensity of the event at the state before it, less the total intensity times the time since the previous event; Adam, learning rate 0.001, minibatch 4096, 8 epochs over the training windows' events, float64, torch with 1 thread",
+   "training_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+   ],
+   "simulation_seeds": "the evaluation windows' seeds, so each model window is drawn as the truth's window of the same index is"
+  },
+  "comparison": "compare_trajectories (src/backtest/queue_reactive.rs) of each model or truth_again window against the evaluation window of the same index, at flow_interval_ms; per window and per training seed",
+  "stop_rule": "MDQR passes S0 if, for every training seed, its mean over the evaluation windows of the queue size TV at each limit, and of the flow law TV for each kind, is at most the truth's self-discrepancy (truth_again against evaluation, the same mean) plus 0.05; else the study stops and reports that MDQR cannot recover the truth",
+  "compute": "0 job slots: CPU torch, 1 thread, in this window's share; an estimate is recorded after a timing pilot of one seed on one window"
+ },
+ "main_study": {
+  "data": {
+   "label": "REAL DATA: the public Hyperliquid Order Flow Dataset, BTC perpetual, December 2025 (Zenodo 18184441, version 1.0, CC BY 4.0), as recorded on #76; Hyperliquid only, never mixed with another dataset",
+   "archives": "the raw archives at <archive dir>, read only: book_diffs_202512.tar (sha256 b95f6166…13e8ec), btc_orders_202512.tar.xz (7bee8701…c9d4), trades_2025_12.tar (f2fbb81f…50cc, checked 2026-11-08)",
+   "members": "every hour of the epoch's replay, 2025-12-21 h15 to 2025-12-30 h18 UTC (220 hours), each as its three files o/<day>/btc_<hh>.data, d/<day>/ex<h> and t/<day>/<h>, gunzipped into <data dir>/; each file's sha256 is checked against #76's per-file manifest (2232 lines, sha256 94752eb07b5a4ad101806654704764489b60e9916e3ff2af234597ba2554a337) before it is read, and the report states that every file matched; the directory is deleted after the holdout",
+   "replay": "src/backtest/hyperliquid.rs as examples/hyperliquid_validation.rs runs it (#263): tick 1, limits K = 3, a reset on a silence over 60 s, a warm-up of 10 minutes, book samples every 1 s; the hours are ingested in order from h15 of 2025-12-21, the file holding the reset at 15:03:26"
+  },
+  "epoch": {
+   "window_utc": [
+    "2025-12-21T15:13:27Z",
+    "2025-12-30T18:33:42Z"
+   ],
+   "seconds": 789615,
+   "why": "the longest reset-free stretch of the month, warm after the reset at 15:03:26 and its 10 minute warm-up, as #263 and #290 used"
+  },
+  "split": {
+   "rule": "hyperliquid_validation's Protocol: training 600 per mille, validation 200, holdout the rest, by time, each boundary rounded down to a whole second; the first 100 per mille of training, at most 1 h, estimates the event sizes, and the rest is the queue fit's training",
+   "sizes": [
+    "2025-12-21T15:13:27Z",
+    "2025-12-21T16:13:27Z"
+   ],
+   "queue_train": [
+    "2025-12-21T16:13:27Z",
+    "2025-12-27T02:49:36Z"
+   ],
+   "validation": [
+    "2025-12-27T02:49:36Z",
+    "2025-12-28T22:41:39Z"
+   ],
+   "holdout": [
+    "2025-12-28T22:41:39Z",
+    "2025-12-30T18:33:42Z"
+   ],
+   "check": "the extractor computes the split with Protocol from the replay's own epoch and refuses to go on if it differs from these boundaries"
+  },
+  "windows": {
+   "rule": "2 h windows, fixed here; a window's events and samples come from the continuous replay, so its book carries its history",
+   "mdqr_train": [
+    [
+     "2025-12-22T12:00:00Z",
+     "2025-12-22T14:00:00Z"
+    ],
+    [
+     "2025-12-23T12:00:00Z",
+     "2025-12-23T14:00:00Z"
+    ],
+    [
+     "2025-12-24T12:00:00Z",
+     "2025-12-24T14:00:00Z"
+    ],
+    [
+     "2025-12-25T12:00:00Z",
+     "2025-12-25T14:00:00Z"
+    ],
+    [
+     "2025-12-26T12:00:00Z",
+     "2025-12-26T14:00:00Z"
+    ]
+   ],
+   "validation": [
+    [
+     "2025-12-27T12:00:00Z",
+     "2025-12-27T14:00:00Z"
+    ],
+    [
+     "2025-12-28T12:00:00Z",
+     "2025-12-28T14:00:00Z"
+    ]
+   ],
+   "holdout": [
+    [
+     "2025-12-28T22:41:39Z",
+     "2025-12-29T00:41:39Z"
+    ],
+    [
+     "2025-12-29T12:00:00Z",
+     "2025-12-29T14:00:00Z"
+    ],
+    [
+     "2025-12-30T12:00:00Z",
+     "2025-12-30T14:00:00Z"
+    ]
+   ],
+   "why": "MDQR trains on one 2 h window a training day (the full stretch, about 10 M events a day, is too many for CPU training at this budget); QR, Hawkes and Poisson fit on the whole queue_train as #263 does, so the controls are as strong as they were; the holdout's first window is #263's out-of-sample book window",
+   "disclosed": "#286 already compared QR and its constant baseline with the data on #263's holdout book window, and #290 read the training part; MDQR's fit and every MDQR figure are new, but the holdout is not unseen for the QR arms"
+  },
+  "arms": {
+   "qr": "#90's estimate on queue_train, as #263 fits it (ZeroWaitPolicy Drop, the default; #290's E0). #290 found it transient on this epoch: its simulated mean touch queue over the training part's first 2 h is 199.9 event sizes against the cap of 200, the data's 24.5; S1's cap rule is read for it too and reported",
+   "qr_constant": "the constant baseline of the Drop fit (#286), the only stationary QR model on this window per #290 (mean touch queue 58.7)",
+   "hawkes": "fit_hawkes on queue_train's first-limit segments, the decay chosen on validation from [0.1, 1, 10, 100] as #263 does",
+   "poisson": "fit_poisson on the same segments",
+   "mdqr": "MDQR-small at K = 3: the QR book's mechanics (theta, theta_reinit and the invariant laws estimated on the mdqr_train windows), an intensity network MLP 128-64 tanh, a size network MLP 128-64 tanh over sizes 1 to 64 event sizes (64 meaning 64 or more), 5 training seeds",
+   "qr_count": "the same estimate with ZeroWaitPolicy::Count (#290's E1), which counts the block-tied events #90 drops; #290 found it transient too (mean touch queue 132.7, drift positive at 132 of 201 sizes), so neither QR arm is stationary here and the comparison says so"
+  },
+  "clock": {
+   "blocks": "events at one timestamp form a block (80 to 89 % of waits are zero on the capture, #290: 54.9 events a block); the network's total intensity is the block rate, and a block's events are a sequence: after each event the state updates and the network chooses the next event or an end-of-block token, so no event is dropped",
+   "likelihood": "the block's waiting time under the block rate at the state after the previous block, plus the cross-entropy of each event and of the end token within the block, plus each event's size under the size network",
+   "zero_waits": "QR is fitted as #90 does (zero waits dropped), the comparison #290 found transient; MDQR's block clock is the stated alternative"
+  },
+  "state": "log(1 + queue) of the 6 queues in event sizes, the spread in ticks, the signed trade imbalance over the last 20 s, 1 min, 5 min and 15 min, the kind of the last event at each queue, the time since it, and the hour of the day as sine and cosine",
+  "fit": "as S0: Adam, learning rate 0.001, minibatch 4096 blocks, 8 epochs, float64, torch with 1 thread, seeds 1 to 5; early stopping on the validation windows' log-likelihood, at most 8 epochs, the epoch kept fixed before any holdout read",
+  "generative_metrics": "per holdout window, each arm's simulation from the window's starting book against the data: compare_trajectories (queue size TV per limit, spread TV, waiting KS, flow law TV, coverage), best bid and ask queue correlation, P(kind | queue, limit) TV, next mid move balanced accuracy, gamma shape of queue sizes, share of events at the cap; 2000 block bootstrap replicates over the 3 windows' 10 min blocks, mean block 2, seed 106",
+  "transfer": {
+   "rule": "#102's frozen arms (Avellaneda-Stoikov, GLFT, fixed spread, maskable PPO seeds 1 to 5, residual SAC seeds 1 to 5) run on each generator's rows at #102's own execution: 10 s rows, queue_position_rational at 1 lot per 5000 ms, min_queue 0, #102's fee, latency and limits; rows from a generator's sampled book at 10 s, top of book in kernel ticks and lots",
+   "check": "before any transfer run, on a validation window's generated rows, a classical arm fills and its net differs from immediate fill",
+   "read": "each policy's net per generator, the Kendall tau of the policies' ranking under MDQR against under QR and against the data's own rows, with bootstrap intervals; rows do not react to the policy's orders, as in #102",
+   "pins": {
+    "regime_config": "#102's arms keep one configuration per regime; the transfer's rule reads the arms at the calm regime's configuration and classical points, chosen before any transfer run and from no transfer result (#102's per-regime results were already known), since the capture has no matching regime; stressed and thin are reported beside it, outside the rule; if tau passes at calm only, the conclusion is limited to calm",
+    "learned": "the 'main' variant at the selected sets (maskable PPO set0, residual SAC set2), seeds 1 to 5, from the copy of frozen.json sha256 9de757b5bf76274882306c9a9c3d9257389deca64d24074948d1a95646c19458; each checkpoint's sha256 is checked, and the environment's spec id (observation, action and reward versions and their digest) must equal the checkpoint's, except for the action version 1 to 2 and the identity that hashes it, with hedge actions off, as #104 and #108 accepted, and its configuration must equal the checkpoint's calm configuration in every field except fill_model; the kernel fingerprint check alone does not apply, since fill_model is replaced as this section says; policy input and output shapes are checked against the checkpoint; the replaced configuration's kernel fingerprint is recorded in the output, so the run stays identified",
+    "rows": "each window gives 720 rows of 10 s: ts, bid, bid lots, ask, ask lots in #102's kernel (tick 0.005, lot 1). The reference starts at 100 and moves by 0.01 per signed mid move; a move of several ticks in the data counts as one step of 0.01, which flattens jumps for every arm and the data alike. A spread of s source ticks gives bid = reference - 0.005 s and ask = reference + 0.005 s, so one source tick is one kernel tick each side. Lots are the touch queue in event sizes, at least 1; the same mapping serves the data's rows and every generator, and absolute BTC prices are not used. In kernel ticks of 0.005: with R the signed count of moves since the start, mid = 20000 + 2 R, bid = mid - s and ask = mid + s, s the sample's spread in source ticks and at least 1, so bid < ask always. A move is a reference with moved true, a reinitialisation included; moved false is no move. Queues are integers in event sizes already, so lots = max(1, touch queue), no rounding; an empty side is 1 lot at its spread, and the row is never missing or a failed draw. A draw that does not reach 720 rows is a failure",
+    "episode": "max_steps stays #102's 8640 so the steps-left feature keeps its trained divisor and range: a window is the first 720 rows of a session, steps left running from 8640 to 7921, and the episode ends when the data ends, with #102's terminal mark. The classical arms keep #102's horizon of one day, with the session starting at the window's start",
+    "unit": "a policy's net per generator is the mean over windows, draws and, for MDQR, training seeds; tau-b is over the 13 policies' means, and its 90 % interval resamples the 10 min blocks of the paired rows within each window, as S2_primary; the resampling is of per-block net contributions of one run, not a re-simulation, since state carries across blocks; a block's net is the mark-to-market increment of the run over its 60 rows, and the last block receives the terminal mark",
+    "reported_beside": "the tau of the five groups (three classicals, the mean of each learned family) beside the rule's tau-b over 13 policies; the median touch lots and each arm's fill count per generator; whether stressed or thin would change the pass; descriptively, the realised 10 s volatility, spread and touch lots per generator beside #102's calm values, as the arms run outside their calibration, and the dispersion of the gamma statistic",
+    "consistency": "before any transfer on generated rows: one learned checkpoint per family, under #102's original fill model on #102's calm validation rows regenerated from its committed digests, must give #102's recorded validation value exactly; a mismatch stops the transfer and is reported. The exception on the action version rests on this and on the configuration equalling the checkpoint's; the kernel fingerprint under the original fill model is also recorded",
+    "episode_end": "an episode a risk rule ends early holds its last net for the remaining rows and its steps are recorded per policy; it is not a failed draw, which is a NaN, a block budget hit, an error or the rows check"
+   }
+  },
+  "stop_rules": {
+   "S1": "on validation, for every training seed: a 24 h simulation from each validation window's starting book (seeds 107000 + 100 w + seed); MDQR is discarded if any seed's run produces a NaN, a block over the event budget, or more than 1 % of its events at the cap; a single failure discards MDQR, reported with its failure mode; no seed is dropped to pass",
+   "S2_primary": "for each limit L in 1 to 3 and each comparator C in {qr (Drop), qr_count, qr_constant}: the paired difference of queue size TV (MDQR minus C) per 10 min block; 90 % percentile interval of its mean from a stationary block bootstrap within each window separately (never across windows), mean block 2, 2000 replicates, seed 106, windows weighted equally; passes when the interval's upper bound is below 0 for all 9 pairs",
+   "S2_dependencies": "non-inferiority against each QR arm (Drop and Count, both, no choice of the better one), with the same paired bootstrap, margin 0.02, favourable direction lower: (a) |correlation of best bid and best ask queues, model minus data|; (b) TV of P(kind | queue size bucket 1, 2-4, 5-16, 17-64, 65+, limit); (c) TV of the next mid move's direction law given the touch imbalance in 5 buckets; (d) |gamma shape of queue sizes, model minus data| per limit, averaged over limits; (e) share of events at the cap; each passes when the upper bound of MDQR minus the QR arm is at most 0.02",
+   "S2_transfer": "Kendall tau-b between the 13 policies' mean holdout nets on MDQR's rows and on each QR arm's rows, with a 90 % bootstrap interval over the paired blocks; passes when the point estimate is at least 0.6 against both QR arms; the interval is reported, not used; tau against the data's own rows is reported descriptively and is not in the rule, since agreement with a transient QR is consistency, not evidence of validity on real data",
+   "S2_undefined": "a metric undefined on a block (a constant series, no mid move) is dropped on that block for every arm alike and counted; a metric undefined on more than a quarter of the blocks fails; tau-b handles ties; a block undefined on any arm is dropped on all arms; a metric's undefined share is counted at the level of draws and blocks per arm, before averaging, and over a quarter on MDQR or a comparator fails",
+   "S2": "MDQR is adopted, provisionally on this epoch, only if S2_primary, every S2_dependencies metric and S2_transfer pass; else discarded with the evidence",
+   "S2_failed_draws": "a holdout draw that fails (NaN, block budget, an error) stays a failure: MDQR is not adopted if any of its holdout draws failed, and the undefined-metric exclusion applies only to statistics undefined on otherwise valid draws",
+   "S2_buckets": "the touch imbalance is (bid1 - ask1) / (bid1 + ask1) in event sizes, bucket edges -1, -0.6, -0.2, 0.2, 0.6, 1 (the last closed); a conditional TV is the mean over buckets of the per-bucket TV, weighted by the data's share of observations in each bucket on that block",
+   "S2_gamma": "the gamma shape in S2_dependencies (d) is estimated by moments, mean squared over variance, on the block's queue sizes; undefined at zero variance; zero queues are included",
+   "S2_empty_condition": "in a conditional TV, a condition where the data has mass and the model none reads as TV 1 for that condition, weighted as any other; it is defined and maximally different, so it is not an undefined metric",
+   "S2_cap": "metric (e) is each arm's share of events at its own cap: MDQR's mechanics cap is 358 (from the training windows) and the QR arms' is 200 (#263's fit); the caps differ, so the metric compares how often each model saturates its own book, not a common level, and the report says so"
+  },
+  "compute": "extraction and replay at 0 job slots, one process; MDQR training 5 seeds on 2 slots once granted; an estimate from a timing pilot of one seed on one training window, recorded in changes before the other fits",
+  "status_of_evidence": "EXPLORATORY on a reused holdout: #286 read this holdout for the QR arms and MDQR's design was informed by that failure, so S2 supports a provisional decision on this epoch only; a confirmatory claim needs a newly frozen, untouched period. MDQR trains on one noon window a day while QR, Hawkes and Poisson fit on all of queue_train, so training exposure is unequal and conclusions are bounded to this setup",
+  "simulation": {
+   "draws": "10 draws per arm, holdout window and (for MDQR) training seed; draw j of window w uses simulation seed 106000 + 100 w + j (w 1 to 3, j 1 to 10), the same for every arm, so arms are paired draw by draw",
+   "start": "every draw of every arm starts from the data's book at the window's start (its last sample before the start, in event sizes); MDQR's history features (trade imbalances, last event and time since it at each queue) are computed from the data strictly before the window's start, over the 15 min before it; QR, Hawkes and Poisson use only the starting book",
+   "seeds": "each of MDQR's 5 training seeds is simulated with all draws; an arm's metric on a 10 min block is the mean over its draws, and MDQR's is then the mean over its 5 seeds, each seed weighted equally; per-seed figures are reported beside, and no seed is selected",
+   "horizon": "a draw covers its 2 h window and is cut into 12 blocks of 10 min, the unit of the metrics and of the bootstrap"
+  },
+  "size_head": {
+   "support": "classes 1 to 63 event sizes and a tail class 64 or more; a tail draw takes a size from the training windows' empirical sizes of 64 or more for that kind and limit, stored with the fit",
+   "clipping": "a cancel or market order larger than its queue takes the whole queue (the queue empties); the share of events and of volume clipped, and the tail class's mass, are reported per arm and window",
+   "block_budget": "at most 2048 events in a block; reaching it ends the draw as a failure, counted and reported, never a silent truncation; in S1 a single budget hit is an instability",
+   "tail_absent": "a kind and limit with no training size of 64 or more has no tail class: the class is masked for it, never filled from elsewhere"
+  }
+ },
+ "pins": {
+  "m4_06_design_sha256": "9a1d1423d1f0e70eca9dd169d03cf85dca1b81ae7bd81516098cd1654165af2a"
+ },
+ "changes": [
+  "2026-11-08, design version 1 committed after one timing pilot and before any other S0 run: training seed 1 fitted on all 4 training windows (1309561 events) in 23 s on 1 thread, rather than one seed on one window as the compute line says; its fit was seen (log-likelihood per event by epoch, theta 0.604, theta_reinit 0.196, cap 4) and nothing else, no simulation and no comparison. The estimate: fit about 25 s a seed, so S0 needs no job slot.",
+  "2026-11-08, version 2, before any read of the capture: the main study fixed (data, members and manifest check, epoch, split, windows, arms, block clock, state, fit, metrics, transfer, stop rules). Seen before it: #263's and #290's published figures on this epoch (zero waits, block lengths, QR's transience), #286's holdout comparison of QR, and S0's own results; no capture file has been read by this window.",
+  "2026-11-08, version 2 amended before any read of the capture, to add a stronger control: a second QR arm, E1 (ZeroWaitPolicy::Count), since #90's Drop fit alone is a strawman on this capture; #290's figures cited for both; S2 reads against both QR arms. Nothing else changed.",
+  "2026-11-08, version 2 amended again before any read of the capture, after e2caa47 was checked: simulation draws, seeds, pairing and starting history; how MDQR's 5 seeds enter the metrics; S1 for every seed with no seed selection; S2 made executable (named metrics, directions, margin, paired within-window block bootstrap, 90 % intervals, both QR arms, tau-b point estimate, undefined metrics); the size head's tail class, clipping and a block event budget; and the comparison labelled exploratory on a reused holdout, with the unequal training exposure disclosed.",
+  "2026-11-08, the design was agreed at bb524c1; pinned after it, before any read or fit, the execution details it asked to fix: no tail class where training has no size of 64 or more, failed holdout draws stay failures, and the imbalance buckets and conditional TV weighting.",
+  "2026-11-08, before the replay of the capture: the fits' inputs are thinned by hyperliquid_validation's rule from the hours replayed, one in ceil(220 / 24) = 10 events, where #263 and #290 replayed the whole month (744 hours, one in 31); the QR, Hawkes and Poisson controls therefore see about three times as many queue_train events as #290's, so their figures need not equal #290's cited ones, which stay as context. Hawkes needs no holdout segments here. Observations are formed per part and hour file, so each slice's first event waits zero, as in validation.",
+  "2026-11-08, post-freeze handling decision, after the capture's replay, which the design did not provide for: the Hawkes fit on queue_train returned HawkesFailure::Unstable at all 4 candidate decays. No retuning and no other stride is run: Hawkes is reported as a failed arm with that cause, Poisson stays as the flow control, and S2, which reads only the QR arms, is unchanged. The inputs were thinned one in 10 here against one in 31 in #263, and the failure cannot be attributed to either the stride or the epoch. Agreed. Only each arm's fit status and the failure cause were seen, no fitted value or window content.",
+  "2026-11-08, implementation of the block clock and size head, before any MDQR fit and with no holdout read; three points the design left open, fixed from the mdqr_train windows only (block lengths, the share of small sizes, the count of events at a queue of zero): a size in event sizes maps to max(1, round(size)), as the replay rounds a queue, so the 39 to 48 % of training events under half an event size are one event size; the feasibility mask applies in simulation and not in the likelihood, since 2 to 4 % of training events are cancels or trades at a queue that rounds to zero; the state before an event is tracked causally from the last book sample strictly before its block and earlier events, never from the event's own queue_before, so the training state is an approximation of the book the simulator holds exactly. The block wait reads the state and clock of the previous block, so the wait is not in its own features.",
+  "2026-11-08, timing pilot before the other fits, as main_study.compute asks: seed 1 on the first mdqr_train window (62588 blocks, 1292692 events) with both validation windows for early stopping took 74 s and 9.3 GB in one process, 57 s of it fitting; the 5 windows are about 3.1 times the events, so a seed is estimated at a few minutes. The pilot's model is not used; seed 1 is refitted on all 5 windows.",
+  "2026-11-08, after S1 passed and before any S2 computation: S2_dependencies (c) needs the direction of each mid move, which the capture export did not write (references hold only moved and reinitialized). The metric is unchanged. mdqr_capture now also exports reference_directions, and the 220 hours are replayed once more from the same hash-checked files into a new directory; the original files are kept. verify_reexport.py aborts unless every window equals the original with the new fields removed, and the fits and summary are equal, before any new file is used. The holdout hours are re-read mechanically for that export only: on holdout windows only the count of directions is checked, and no metric or inspection of them precedes the evaluation step. Decided before any S2 computation.",
+  "2026-11-08, before any transfer run and before any holdout read: the transfer's pins (regime configuration, frozen arms, row mapping, episode length, the unit of the interval) and the gamma estimator, which the design left open; chosen without any result. The frozen arms are a copy made for this study, verified against their manifest. Amended, before any run: the steps-left divisor and classical horizon, the checks kept on spec and configuration, the spread map, and what is reported beside. Amended again, before any run: the row formulas, moves, lots and empty sides; field-wise checks and the replaced fingerprint; the manifest's full hash; a block's net; the calibration report.",
+  "2026-11-08, before any transfer run on generated rows and before any holdout read: the frozen arms were trained at action space version 1 and the crate is now at 2, so the spec check keeps #104's and #108's exception, and nothing else; found when the check refused. A 720 row episode has 719 steps, so the first 60 row block has 59 decisions and the others 60. Disclosed: before this entry the runner was tested on the first validation window of the data's rows (2025-12-27 12:00 to 14:00 UTC), and each of the 13 policies' net and fill count on it were read (the classical fixed spread and Avellaneda-Stoikov and the residual SAC arms filled; GLFT and maskable PPO did not). Those rows are outside the tau rule; calm and the other pins were already chosen.",
+  "2026-11-09, after checking the code and before the holdout was claimed: undefined metrics counted at draw level and dropped on all arms alike, a model with no mass on a data condition reading as TV 1, every draw required, an early stop not a failed draw, and transfer runs per regime so stressed and thin can be reported beside the rule. No holdout value has been read. Metric (e) reads each arm's own cap, which differ (358 and 200).",
+  "2026-11-09, after the holdout: references to internal messages and names removed from this file's text, with no change of meaning, so its hash differs from the 536e19b2... under which the holdout ran; that version is at commit c1928b9."
+ ]
+}

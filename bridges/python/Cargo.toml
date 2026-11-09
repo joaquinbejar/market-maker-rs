@@ -15,12 +15,12 @@ name = "mm_rl_bridge"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-market-maker-rs = { path = "../..", features = ["rl"] }
+market-maker-rs = { path = "../..", features = ["rl", "serde"] }
 # The maintenance reading of #105's margin-stress holdout, from margin-rs itself.
 margin-rs = "0.2"
 pyo3 = { version = "0.30", features = ["abi3-py311"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 
 [features]
 default = []
