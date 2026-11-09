@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
@@ -130,9 +131,13 @@ def select(rows, settings=SETTINGS):
     return out
 
 
-def claim(marker_dir, frozen_sha, journal=None, recover=None, journal_prefix_sha=None):
-    """One attempt per freeze; a recovery only after an external kill, with the prefix checked."""
-    marker = pathlib.Path(marker_dir) / f"holdout-{frozen_sha}.jsonl"
+def claim(marker_dir, design_sha, journal=None, recover=None):
+    """One attempt per design; a recovery only after an external kill, its journal prefix recorded.
+
+    On a recovery the torn last line is repaired, then the journal is hashed into the marker, and
+    `verify_prefix` checks at the end that those bytes did not change.
+    """
+    marker = pathlib.Path(marker_dir) / f"holdout-{design_sha}.jsonl"
     marker.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -142,14 +147,24 @@ def claim(marker_dir, frozen_sha, journal=None, recover=None, journal_prefix_sha
         lines = [json.loads(x) for x in marker.read_text().splitlines()]
         if sum(x["kind"] == "recovery" for x in lines) >= MAX_RECOVERIES:
             raise SystemExit("too many recoveries")
-        if journal is None or journal_prefix_sha is None or sha256(journal) != journal_prefix_sha:
-            raise SystemExit("the journal prefix does not match its recorded hash")
+        load_journal(journal)
+        data = pathlib.Path(journal).read_bytes()
         with marker.open("a") as handle:
-            handle.write(json.dumps({"kind": "recovery", "reason": recover}) + "\n")
+            handle.write(json.dumps({"kind": "recovery", "reason": recover, "prefix_bytes": len(data),
+                                     "prefix_sha256": hashlib.sha256(data).hexdigest()}) + "\n")
     else:
         with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps({"kind": "attempt", "frozen_sha256": frozen_sha}) + "\n")
+            handle.write(json.dumps({"kind": "attempt", "design_sha256": design_sha}) + "\n")
     return marker
+
+
+def verify_prefix(marker, journal):
+    """Raises if a recovery's recorded journal prefix changed by the end of the run."""
+    data = pathlib.Path(journal).read_bytes()
+    for line in pathlib.Path(marker).read_text().splitlines():
+        row = json.loads(line)
+        if row["kind"] == "recovery" and hashlib.sha256(data[: row["prefix_bytes"]]).hexdigest() != row["prefix_sha256"]:
+            raise SystemExit("the journal's recorded prefix changed")
 
 
 def day_path(data_dir, split, setting, point, day):
@@ -202,7 +217,7 @@ def evaluate(job, data_dir, checkpoints, classical, digests):
     policy = job["policy"]
     path = day_path(data_dir, job["split"], policy["setting"], job["point"], job["day"])
     if sha256(path) != digests[str(path.relative_to(data_dir))]:
-        raise SystemExit(f"{path} is not the committed day")
+        raise ValueError(f"{path} is not the committed day")
     rows = [tuple(r) for r in json.loads(path.read_text())]
     base, env = _env(rm, job, rows, classical)
     try:
@@ -218,7 +233,7 @@ def evaluate(job, data_dir, checkpoints, classical, digests):
     finally:
         env.close()
     if len(days) != 1:
-        raise SystemExit("the design evaluates one seed per day")
+        raise ValueError("the design evaluates one seed per day")
     return {"net": float(days[0]["net"]), "episode": days[0]}
 
 
@@ -255,20 +270,23 @@ def project(rows, generation_seconds_per_day=0.0, ceiling_hours=90.0):
             "over_ceiling": total > ceiling_hours}
 
 
+def spectral_radii(weights, points):
+    """{point id: radius} and the ids failing the design's check; those are removed and reported."""
+    radii = {point_id(p): grid.spectral_radius(grid.branching_matrix(weights, p["branching"])) for p in points}
+    return radii, sorted(point_id(p) for p in points if not grid.plausible(weights, p))
+
+
 def spectral_check(weights, points):
-    """The design's plausibility check, before any day is generated: stops if a point fails."""
-    radii = {}
-    for point in points:
-        radii[point_id(point)] = grid.spectral_radius(grid.branching_matrix(weights, point["branching"]))
-        if not grid.plausible(weights, point):
-            raise SystemExit(f"{point_id(point)} is not subcritical")
+    """The pilot's two points: it cannot time a point the study would remove, so it stops."""
+    radii, failed = spectral_radii(weights, points)
+    if failed:
+        raise SystemExit(f"{failed[0]} is not subcritical")
     return radii
 
 
 def generate_pilot_days(causal, data_dir, binary):
     """Writes the pilot's days with examples/hawkes_days and returns their sha256 by relative path."""
     import subprocess
-    import time
 
     generation = {}
     data_dir = pathlib.Path(data_dir)
@@ -292,8 +310,6 @@ def generate_pilot_days(causal, data_dir, binary):
 
 def pilot_step(argv):
     """python run.py pilot <out> <hawkes_days binary> <#107 causal output dir>"""
-    import time
-
     out, binary, causal_out = argv
     out, causal_out = pathlib.Path(out), pathlib.Path(causal_out)
     out.mkdir(parents=True, exist_ok=True)
@@ -332,37 +348,52 @@ def generate(causal, out, binary, split, setting, point, days):
     config = target / "config.json"
     config.write_text(json.dumps({"causal": grid.day_config(causal, point, "p", days, OFFSETS[split])}))
     subprocess.run([str(binary), str(config), str(target)], check=True, stdout=subprocess.DEVNULL)
-    paths = [day_path(out, split, setting, point, d) for d in range(1, days + 1)]
+    paths = []
+    for d in range(1, days + 1):
+        base = day_path(out, split, setting, point, d)
+        paths += [base, base.with_name(f"day-{d}.flow.json"), base.with_name(f"day-{d}.queues.json")]
     return {str(p.relative_to(out)): sha256(p) for p in paths}
 
 
-def days_selection(out, binary, digests_path, settings=SETTINGS):
-    """Every point's selection days, after the spectral check of every point; digests to commit."""
+def days_selection(out, binary, digests_path, pilot_jsonl, settings=SETTINGS):
+    """Every point's selection days, after the spectral check of every point; digests to commit.
+
+    A point failing that check is reported and generates no day; a failing unperturbed point
+    voids its setting.
+    """
+    budget = Budget(out, pilot_jsonl)
+    start = time.perf_counter()
     causal = causal_section()
-    radii, digests = {}, {}
+    radii, removed, digests = {}, {}, {}
     for setting, impact in settings.items():
-        radii[setting] = spectral_check(causal["flow"]["weights"], grid.points(impact))
+        radii[setting], removed[setting] = spectral_radii(causal["flow"]["weights"], grid.points(impact))
+        if point_id(grid.points(impact)[0]) in removed[setting]:
+            continue
         for point in grid.points(impact):
-            digests.update(generate(causal, out, binary, "selection", setting, point, SELECTION_DAYS))
-    pathlib.Path(digests_path).write_text(json.dumps({"digests": digests, "spectral_radius": radii}, indent=0))
+            if point_id(point) not in removed[setting]:
+                digests.update(generate(causal, out, binary, "selection", setting, point, SELECTION_DAYS))
+    pathlib.Path(digests_path).write_text(json.dumps(
+        {"digests": digests, "spectral_radius": radii, "spectral_removed": removed}, indent=0))
+    budget.charge("days-selection", (time.perf_counter() - start) / 3600)
 
 
 def point_statistics(out, split, setting, point, days):
     """Queue shares, market rate and impact slope of one point's days, with no policy."""
     import numpy as np
 
+    cap = causal_section()["flow"]["queue_cap"]
     below, queue, open_, rate, changes, signed = [], [], [], [], [], []
     for day in range(1, days + 1):
         base = day_path(out, split, setting, point, day)
         queues = np.asarray(json.loads(base.with_name(f"day-{day}.queues.json").read_text()), float)
         flow = np.asarray(json.loads(base.with_name(f"day-{day}.flow.json").read_text()), float)
         rows = np.asarray(json.loads(base.read_text()), float)
-        below.append(float((queues < QUEUE_CAP).mean()))
+        below.append(float((queues < cap).mean()))
         queue.append(float(queues.mean()))
         open_.append(float((queues > 0).mean()))
         rate.append(float(flow.sum(axis=1).mean() / 2))
         # Row r's orders move the mid of row r + 1; mids are in ticks, the bid being floor(mid).
-        mids = rows[:, 1]
+        mids = (rows[:, 1] + rows[:, 3]) / 2
         changes.append(mids[1:] - mids[:-1])
         signed.append(flow[:-1, 0] - flow[:-1, 1])
     return {"shares": {"below_cap": float(np.mean(below)), "mean_queue": float(np.mean(queue)),
@@ -372,28 +403,35 @@ def point_statistics(out, split, setting, point, days):
             "slope": grid.slope(np.concatenate(changes), np.concatenate(signed))}
 
 
-QUEUE_CAP = 20
-
-
-def identify(out, report_path, settings=SETTINGS):
+def identify(out, report_path, digests_path, settings=SETTINGS):
     """The identifiability rules on the selection days; failing points go in `removed`."""
     causal = causal_section()
     rates, weights = causal["flow"]["rates"], causal["flow"]["weights"]
+    record = json.loads(pathlib.Path(digests_path).read_text())
+    spectral = record["spectral_removed"]
+    for relative, expected in record["digests"].items():
+        if sha256(pathlib.Path(out) / relative) != expected:
+            raise SystemExit(f"{relative} is not the committed day")
     report = {}
     for setting, impact in settings.items():
         points = grid.points(impact)
-        base_stats = point_statistics(out, "selection", setting, points[0], SELECTION_DAYS)
-        base_formula = grid.rate_formula(rates, weights, points[0], base_stats["shares"])
-        rows, removed = {}, []
-        for point in points:
-            st = point_statistics(out, "selection", setting, point, SELECTION_DAYS)
-            formula = grid.rate_formula(rates, weights, point, st["shares"])
-            rate_ok = grid.rate_passes(st["market_rate"], base_stats["market_rate"], formula, base_formula)
-            impact_ok = grid.impact_passes(st["slope"], point["impact"])
-            rows[point_id(point)] = {**st, "formula": formula, "rate_ok": rate_ok, "impact_ok": impact_ok}
-            if not (rate_ok and impact_ok):
-                removed.append(point_id(point))
-        report[setting] = {"points": rows, "removed": removed}
+        removed = list(spectral[setting])
+        rows = {}
+        if point_id(points[0]) not in removed:
+            base_stats = point_statistics(out, "selection", setting, points[0], SELECTION_DAYS)
+            base_formula = grid.rate_formula(rates, weights, points[0], base_stats["shares"])
+            for point in points:
+                if point_id(point) in spectral[setting]:
+                    continue
+                st = point_statistics(out, "selection", setting, point, SELECTION_DAYS)
+                formula = grid.rate_formula(rates, weights, point, st["shares"])
+                rate_ok = grid.rate_passes(st["market_rate"], base_stats["market_rate"], formula, base_formula)
+                impact_ok = grid.impact_passes(st["slope"], point["impact"])
+                rows[point_id(point)] = {**st, "formula": formula, "rate_ok": rate_ok, "impact_ok": impact_ok}
+                if not (rate_ok and impact_ok):
+                    removed.append(point_id(point))
+        report[setting] = {"points": rows, "removed": removed, "spectral_removed": spectral[setting],
+                           "void": point_id(points[0]) in removed}
     pathlib.Path(report_path).write_text(json.dumps(report, indent=1))
 
 
@@ -402,19 +440,68 @@ def _worker(args):
     return job, evaluate(job, ctx["out"], ctx["checkpoints"], ctx["classical"], ctx["digests"])
 
 
-def run_pool(jobs, journal, processes, ctx):
-    """As run_journaled, with a pool; only the parent writes the journal."""
+CEILING_HOURS = 90.0
+STOP_FACTOR = 1.5
+
+
+class Budget:
+    """The process-hours ledger of the whole study; every step is charged, the pilot first."""
+
+    def __init__(self, out, pilot_jsonl):
+        self.path = pathlib.Path(out) / "budget.jsonl"
+        if not self.path.exists():
+            lines = pathlib.Path(pilot_jsonl).read_text().splitlines()
+            seconds = sum(json.loads(x)["seconds"] for x in lines)
+            self.charge("pilot", seconds / 3600)
+
+    def spent(self):
+        return sum(json.loads(x)["process_hours"] for x in self.path.read_text().splitlines())
+
+    def remaining(self):
+        return CEILING_HOURS - self.spent()
+
+    def charge(self, step, process_hours):
+        with self.path.open("a") as handle:
+            handle.write(json.dumps({"step": step, "process_hours": process_hours}) + "\n")
+
+
+def step_limit_seconds(jobs, worst_seconds, processes, remaining_hours):
+    """The wall limit of a step: 1.5 x its pilot-based estimate, or what the ceiling leaves."""
+    estimate = sum(worst_seconds[j["policy"]["arm"]] for j in jobs) / processes
+    return min(STOP_FACTOR * estimate, remaining_hours * 3600 / processes), estimate
+
+
+def run_pool(step, jobs, journal, processes, ctx, budget, worst_seconds):
+    """As run_journaled, with a pool; only the parent writes the journal.
+
+    Stops at the step's limit: the workers are terminated, the time is charged, and it reports.
+    """
     import multiprocessing
 
     journal = pathlib.Path(journal)
     done = load_journal(journal)
     todo = [j for j in jobs if job_key(j) not in done]
+    limit, estimate = step_limit_seconds(todo, worst_seconds, processes, budget.remaining())
+    start = time.perf_counter()
+    stopped = False
     with multiprocessing.get_context("spawn").Pool(processes) as pool, journal.open("a") as handle:
-        for job, result in pool.imap_unordered(_worker, [(j, ctx) for j in todo]):
+        results = pool.imap_unordered(_worker, [(j, ctx) for j in todo])
+        for _ in todo:
+            left = limit - (time.perf_counter() - start)
+            try:
+                job, result = results.next(timeout=max(left, 0.001))
+            except multiprocessing.TimeoutError:
+                stopped = True
+                pool.terminate()
+                break
             row = {"key": job_key(job), "result": result}
             done[row["key"]] = row
             handle.write(json.dumps(row) + "\n")
             handle.flush()
+    wall = time.perf_counter() - start
+    budget.charge(step, wall * processes / 3600)
+    if stopped:
+        raise SystemExit(f"{step} stopped at {wall:.0f} s, its limit (estimate {estimate:.0f} s): reported, no cut")
     return [(j, done[job_key(j)]["result"]) for j in jobs]
 
 
@@ -436,9 +523,22 @@ def load_journal(journal):
     return done
 
 
+def check_checkpoints(causal_out, frozen, settings=SETTINGS):
+    """Each learned checkpoint and its metadata against #107's frozen manifest."""
+    for setting in settings:
+        for arm in LEARNED:
+            for seed in SEEDS:
+                name = f"{arm}-{setting}-seed{seed}"
+                run = frozen["runs"][name]
+                if sha256(causal_out / "checkpoints" / f"{name}.zip") != run["checkpoint"] \
+                        or sha256(causal_out / "checkpoints" / f"{name}.json") != run["metadata"]:
+                    raise SystemExit(f"{name} is not the checkpoint #107 froze")
+
+
 def context(out, causal_out, digests_path):
     causal_out = pathlib.Path(causal_out)
     frozen = json.loads((causal_out / "frozen.json").read_text())
+    check_checkpoints(causal_out, frozen)
     return {"out": str(out), "checkpoints": str(causal_out / "checkpoints"),
             "classical": check_classical(causal_out / "classical.json", frozen["classical_sha256"]),
             "digests": json.loads(pathlib.Path(digests_path).read_text())["digests"]}
@@ -449,20 +549,35 @@ def removed_points(identify_path):
     return {s: set(v["removed"]) for s, v in report.items()}
 
 
-def selection_step(out, causal_out, digests_path, identify_path, processes):
+def worst_seconds_of(pilot_dir):
+    return json.loads((pathlib.Path(pilot_dir) / "pilot.json").read_text())["projection"]["worst_seconds_per_day"]
+
+
+def selection_step(out, causal_out, digests_path, identify_path, pilot_dir, processes):
+    report = json.loads(pathlib.Path(identify_path).read_text())
     removed = removed_points(identify_path)
-    jobs = [j for j in selection_jobs() if point_id(j["point"]) not in removed[j["policy"]["setting"]]]
-    rows = run_pool(jobs, pathlib.Path(out) / "selection.jsonl", processes, context(out, causal_out, digests_path))
+    jobs = [j for j in selection_jobs()
+            if not report[j["policy"]["setting"]]["void"] and point_id(j["point"]) not in removed[j["policy"]["setting"]]]
+    budget, worst = Budget(out, pathlib.Path(pilot_dir) / "pilot.jsonl"), worst_seconds_of(pilot_dir)
+    rows = run_pool("selection", jobs, pathlib.Path(out) / "selection.jsonl", processes,
+                    context(out, causal_out, digests_path), budget, worst)
     pathlib.Path(out, "selection.json").write_text(json.dumps(select(rows), indent=1))
 
 
-def freeze(out, design_path, digests_path, identify_path, pilot_paths):
+def code_hashes():
+    paths = [HERE / "run.py", HERE / "grid.py", HERE / "stats.py", HERE.parent / "m5_02" / "run_market.py"]
+    return {p.name: sha256(p) for p in paths}
+
+
+def freeze(out, design_path, digests_path, identify_path, pilot_paths, m107_frozen):
     """The manifest the holdout runs from: every input by hash, and each policy's pick."""
     out = pathlib.Path(out)
     selected = json.loads((out / "selection.json").read_text())
     manifest = {"design_sha256": sha256(design_path), "selection_digests_sha256": sha256(digests_path),
                 "identify_sha256": sha256(identify_path), "selection_sha256": sha256(out / "selection.json"),
-                "pilot_sha256": {str(p): sha256(p) for p in pilot_paths}, "selected": selected}
+                "pilot_sha256": {str(p): sha256(p) for p in pilot_paths}, "m107_frozen_sha256": sha256(m107_frozen),
+                "m107_frozen_path": str(m107_frozen), "code_sha256": code_hashes(),
+                "selected": selected}
     path = out / "frozen.json"
     if path.exists():
         raise SystemExit("already frozen")
@@ -470,34 +585,69 @@ def freeze(out, design_path, digests_path, identify_path, pilot_paths):
     return sha256(path)
 
 
-def days_holdout(out, binary, digests_path, identify_path, settings=SETTINGS):
+def verify_manifest(out, design_path, selection_digests, identify_path, holdout_digests, frozen_sha):
+    """Every frozen input and the code, checked before the claim."""
+    out = pathlib.Path(out)
+    if sha256(out / "frozen.json") != frozen_sha:
+        raise SystemExit("frozen.json is not the freeze named")
+    m = json.loads((out / "frozen.json").read_text())
+    checks = {"design": (design_path, m["design_sha256"]),
+              "selection digests": (selection_digests, m["selection_digests_sha256"]),
+              "identify": (identify_path, m["identify_sha256"]),
+              "selection": (out / "selection.json", m["selection_sha256"])}
+    checks["#107 freeze"] = (m["m107_frozen_path"], m["m107_frozen_sha256"])
+    checks.update({f"pilot {p}": (p, h) for p, h in m["pilot_sha256"].items()})
+    for name, (path, expected) in checks.items():
+        if sha256(path) != expected:
+            raise SystemExit(f"{name} is not the frozen one")
+    if code_hashes() != m["code_sha256"]:
+        raise SystemExit("the code is not the frozen one")
+    days = json.loads((out / "holdout_days.json").read_text())
+    if days["frozen_sha256"] != frozen_sha or days["digests_sha256"] != sha256(holdout_digests):
+        raise SystemExit("the holdout digests are not those written for this freeze")
+    return m
+
+
+def days_holdout(out, binary, digests_path, identify_path, pilot_jsonl, settings=SETTINGS):
     """The holdout days of the frozen points only; digests to commit before the holdout."""
     out = pathlib.Path(out)
+    budget = Budget(out, pilot_jsonl)
+    start = time.perf_counter()
     selected = json.loads((out / "frozen.json").read_text())["selected"]
-    removed = removed_points(identify_path)
+    report = json.loads(pathlib.Path(identify_path).read_text())
     causal, digests = causal_section(), {}
     for setting, impact in settings.items():
+        if report[setting]["void"]:
+            continue
         picks = [v["point"] for k, v in selected.items() if k.startswith(f"{setting}/")]
         wanted = {point_id(p): p for p in picks}
         for point in (grid.points(impact)[0], grid.fixed_stress(impact), grid.impact_only(impact)):
             wanted[point_id(point)] = point
         for pid, point in wanted.items():
-            if pid not in removed[setting]:
+            if pid not in report[setting]["removed"]:
                 digests.update(generate(causal, out, binary, "holdout", setting, point, HOLDOUT_DAYS))
     pathlib.Path(digests_path).write_text(json.dumps({"digests": digests}, indent=0))
+    (out / "holdout_days.json").write_text(json.dumps(
+        {"frozen_sha256": sha256(out / "frozen.json"), "digests_sha256": sha256(digests_path)}))
+    budget.charge("days-holdout", (time.perf_counter() - start) / 3600)
 
 
-def holdout_step(out, causal_out, digests_path, identify_path, frozen_sha, marker_dir, processes, recover=None,
-                 journal_prefix_sha=None):
+def holdout_step(out, causal_out, selection_digests, holdout_digests, identify_path, pilot_dir, frozen_sha,
+                 marker_dir, processes, recover=None):
     out = pathlib.Path(out)
-    if sha256(out / "frozen.json") != frozen_sha:
-        raise SystemExit("frozen.json is not the freeze named")
+    manifest = verify_manifest(out, HERE / "design.json", selection_digests, identify_path, holdout_digests, frozen_sha)
     journal = out / "holdout.jsonl"
-    claim(marker_dir, frozen_sha, journal if recover else None, recover, journal_prefix_sha)
-    selected = json.loads((out / "frozen.json").read_text())["selected"]
+    if journal.exists() and not recover:
+        raise SystemExit("holdout.jsonl exists; only a recovery may resume it")
+    marker = claim(marker_dir, manifest["design_sha256"], journal if recover else None, recover)
+    with marker.open("a") as handle:
+        handle.write(json.dumps({"kind": "holdout_digests", "sha256": sha256(holdout_digests)}) + "\n")
     removed = removed_points(identify_path)
-    jobs = holdout_jobs(selected, removed=removed)
-    rows = run_pool(jobs, journal, processes, context(out, causal_out, digests_path))
+    jobs = holdout_jobs(manifest["selected"], removed=removed)
+    budget = Budget(out, pathlib.Path(pilot_dir) / "pilot.jsonl")
+    rows = run_pool("holdout", jobs, journal, processes, context(out, causal_out, holdout_digests), budget,
+                    worst_seconds_of(pilot_dir))
+    verify_prefix(marker, journal)
     (out / "holdout.json").write_text(json.dumps(
         [{"key": job_key(j), "condition": j["condition"], "policy": j["policy"], "point": j["point"],
           "day": j["day"], "result": r} for j, r in rows]))
@@ -512,13 +662,13 @@ def main(argv):
     elif step == "identify":
         identify(*rest)
     elif step == "selection":
-        selection_step(*rest[:4], int(rest[4]))
+        selection_step(*rest[:5], int(rest[5]))
     elif step == "freeze":
-        print(freeze(rest[0], HERE / "design.json", rest[1], rest[2], rest[3:]))
+        print(freeze(rest[0], HERE / "design.json", rest[1], rest[2], rest[4:], rest[3]))
     elif step == "days-holdout":
         days_holdout(*rest)
     elif step == "holdout":
-        holdout_step(*rest[:5], rest[5], int(rest[6]), *(rest[7:] or []))
+        holdout_step(*rest[:8], int(rest[8]), *rest[9:])
     else:
         raise SystemExit(f"unknown step {step}")
 

@@ -1,6 +1,6 @@
 """The holdout tables of #108 part 2, from holdout.json and frozen.json. SYNTHETIC.
 
-    python experiments/m5_10/report.py <out dir>
+    python experiments/m5_10/report.py <out dir> <identify.json>
 
 Descriptive per arm and setting: an interval holding 0 is 'no difference shown', never
 equivalence or robustness. Margin shortfall is not measured: only the requirement is reported.
@@ -43,8 +43,13 @@ def net(row):
     return float(row["result"]["net"])
 
 
-def peak_position(row):
-    return float(row["result"]["episode"]["attribution"]["max_abs_position"])
+def attribution(row, name):
+    return float(row["result"]["episode"]["attribution"][name])
+
+
+def largest(by_day, field):
+    """The largest over every seed and day, so seed averaging cannot understate it."""
+    return max(field(r) for day in by_day.values() for r in day)
 
 
 def requirement(row):
@@ -61,8 +66,13 @@ def tables(rows, selected):
     for (setting, arm, condition), by_day in sorted(grouped.items()):
         values = series(by_day, net)
         entry = {"setting": setting, "arm": arm, "condition": condition, "mean_net": float(values.mean()),
-                 "cvar5_loss": stats.cvar_loss(values), "max_abs_position": float(series(by_day, peak_position).max()),
-                 "margin_requirement_max": float(series(by_day, requirement).max()),
+                 "cvar5_loss": stats.cvar_loss(values), "max_abs_position": largest(by_day, lambda r: attribution(r, "max_abs_position")),
+                 "mean_abs_position": float(series(by_day, lambda r: attribution(r, "mean_abs_position")).mean()),
+                 "max_drawdown": largest(by_day, lambda r: attribution(r, "max_drawdown")),
+                 "refusals": int(sum(r["result"]["episode"]["refusals"] for day in by_day.values() for r in day)),
+                 "attribution_mean": {k: float(series(by_day, lambda r: attribution(r, k)).mean())
+                                      for k in ("spread_capture", "inventory_pnl")},
+                 "margin_requirement_max": largest(by_day, requirement),
                  "limit_breaches": int(sum(breach(r) for day in by_day.values() for r in day))}
         base = grouped.get((setting, arm, "unperturbed"))
         if base is not None and condition != "unperturbed":
@@ -80,12 +90,20 @@ def tables(rows, selected):
     return out
 
 
-def main(out):
+def not_run(identify, expected=("unperturbed", "fixed_stress", "adversary", "impact_only")):
+    """What the removed points left out, with their queue shares."""
+    return {s: {"void": v["void"], "removed": v["removed"], "spectral_removed": v["spectral_removed"],
+                "shares": {k: {"empty": p["empty_share"], "cap": p["cap_share"]} for k, p in v["points"].items()}}
+            for s, v in identify.items()}
+
+
+def main(out, identify_path):
     out = pathlib.Path(out)
     rows = json.loads((out / "holdout.json").read_text())
     selected = json.loads((out / "frozen.json").read_text())["selected"]
-    (out / "report.json").write_text(json.dumps({"notes": NOTES, "rows": tables(rows, selected)}, indent=1))
+    (out / "report.json").write_text(json.dumps({"notes": NOTES, "rows": tables(rows, selected),
+                                                     "not_run": not_run(json.loads(pathlib.Path(identify_path).read_text()))}, indent=1))
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2])

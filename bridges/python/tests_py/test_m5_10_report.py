@@ -11,7 +11,9 @@ import report as rep  # noqa: E402
 
 
 def row(arm, condition, day, value, seed=None):
-    episode = {"attribution": {"max_abs_position": "3"}, "peak_notional": "100", "limit_breach": False}
+    episode = {"attribution": {"max_abs_position": str(seed or 3), "mean_abs_position": "1", "max_drawdown": "2",
+                               "spread_capture": "1", "inventory_pnl": "0"},
+               "peak_notional": "100", "limit_breach": False, "refusals": 1}
     return {"policy": {"setting": "s", "arm": arm, "seed": seed}, "condition": condition, "day": day,
             "result": {"net": value, "episode": episode}}
 
@@ -53,3 +55,15 @@ def test_notes_state_the_limits():
 def test_series_is_ordered_by_day():
     by_day = {2: [{"v": 2.0}], 1: [{"v": 1.0}]}
     assert np.array_equal(rep.series(by_day, lambda r: r["v"]), [1.0, 2.0])
+
+
+def test_largest_is_over_seeds_and_not_averaged():
+    table = {(r["arm"], r["condition"]): r for r in rep.tables(rows(), selected())}
+    assert table[("mlp", "adversary")]["max_abs_position"] == 2.0
+    assert table[("mlp", "adversary")]["refusals"] == 60
+
+
+def test_not_run_lists_removals_and_shares():
+    identify = {"s": {"void": False, "removed": ["x"], "spectral_removed": [],
+                      "points": {"y": {"empty_share": 0.1, "cap_share": 0.2}}}}
+    assert rep.not_run(identify)["s"]["shares"]["y"] == {"empty": 0.1, "cap": 0.2}

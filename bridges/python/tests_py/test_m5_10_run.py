@@ -61,18 +61,82 @@ def test_select_averages_seeds_and_breaks_ties_first():
     assert out["point"] == p[0] and out["selection_loss"] == 2
 
 
-def test_claim_recovery_rules(tmp_path):
-    r.claim(tmp_path / "m", "a" * 64)
+def test_claim_recovery_rules_and_design_key(tmp_path):
+    marker = r.claim(tmp_path / "m", "a" * 64)
+    assert marker.name == "holdout-" + "a" * 64 + ".jsonl"
     with pytest.raises(SystemExit, match="already started"):
         r.claim(tmp_path / "m", "a" * 64)
     journal = tmp_path / "j"
-    journal.write_text("x")
-    digest = hashlib.sha256(b"x").hexdigest()
-    with pytest.raises(SystemExit, match="prefix"):
-        r.claim(tmp_path / "m", "a" * 64, journal, "killed", "0" * 64)
-    r.claim(tmp_path / "m", "a" * 64, journal, "killed", digest)
+    journal.write_text('{"key": "a", "result": 1}\n{"tor')
+    r.claim(tmp_path / "m", "a" * 64, journal, "killed")
+    assert journal.read_text() == '{"key": "a", "result": 1}\n'
     with pytest.raises(SystemExit, match="too many"):
-        r.claim(tmp_path / "m", "a" * 64, journal, "again", digest)
+        r.claim(tmp_path / "m", "a" * 64, journal, "again")
+
+
+def test_prefix_is_verified_at_the_end(tmp_path):
+    journal = tmp_path / "j"
+    journal.write_text('{"key": "a", "result": 1}\n')
+    marker = r.claim(tmp_path / "m", "b" * 64)
+    marker = r.claim(tmp_path / "m", "b" * 64, journal, "killed")
+    with journal.open("a") as h:
+        h.write('{"key": "b", "result": 2}\n')
+    r.verify_prefix(marker, journal)
+    journal.write_text('{"key": "z", "result": 9}\n')
+    with pytest.raises(SystemExit, match="prefix changed"):
+        r.verify_prefix(marker, journal)
+
+
+def budget(tmp_path):
+    pilot = tmp_path / "p.jsonl"
+    pilot.write_text(json.dumps({"seconds": 3600}) + "\n")
+    return r.Budget(tmp_path, pilot)
+
+
+def test_budget_charges_the_pilot_and_every_step(tmp_path):
+    b = budget(tmp_path)
+    assert b.spent() == 1.0
+    b.charge("x", 2.0)
+    assert b.remaining() == r.CEILING_HOURS - 3.0
+
+
+def test_step_limit_is_the_smaller_of_factor_and_ceiling():
+    jobs = r.pilot_jobs()[:2]
+    assert r.step_limit_seconds(jobs, {"no_trade": 10}, 1, 90.0) == (30.0, 20.0)
+    assert r.step_limit_seconds(jobs, {"no_trade": 10}, 1, 0.001)[0] == pytest.approx(3.6)
+
+
+def test_spectral_failures_are_listed_not_fatal():
+    points = [r.grid.fixed_stress(1.0)]
+    assert r.spectral_radii([[[0, 0, 0], [0, 0, 0], [0, 0, 1.0]]], points)[1] == ["m2-l0.7-b1.2-i2.0"]
+
+
+def manifest(tmp_path):
+    for name in ("selection.json", "d", "i", "p", "design", "hd"):
+        (tmp_path / name).write_text("{}")
+    sha = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"], tmp_path / "d")
+    (tmp_path / "holdout_days.json").write_text(json.dumps(
+        {"frozen_sha256": sha, "digests_sha256": r.sha256(tmp_path / "hd")}))
+    return sha
+
+
+def test_manifest_checks_every_input(tmp_path):
+    sha = manifest(tmp_path)
+    args = (tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", tmp_path / "hd", sha)
+    assert r.verify_manifest(*args)["selected"] == {}
+    for name, why in (("i", "identify"), ("hd", "holdout digests"), ("p", "pilot")):
+        original = (tmp_path / name).read_text()
+        (tmp_path / name).write_text("[]")
+        with pytest.raises(SystemExit, match=why):
+            r.verify_manifest(*args)
+        (tmp_path / name).write_text(original)
+
+
+def test_manifest_detects_changed_code(tmp_path, monkeypatch):
+    sha = manifest(tmp_path)
+    monkeypatch.setattr(r, "code_hashes", lambda: {"run.py": "x"})
+    with pytest.raises(SystemExit, match="code"):
+        r.verify_manifest(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", tmp_path / "hd", sha)
 
 
 def test_day_configs_one_per_point_and_split(tmp_path):
@@ -151,16 +215,16 @@ def test_a_torn_middle_line_is_an_error(tmp_path):
 def test_freeze_is_single_and_hashes_inputs(tmp_path):
     for name in ("selection.json", "d", "i", "p", "design"):
         (tmp_path / name).write_text("{}")
-    digest = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"])
+    digest = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"], tmp_path / "d")
     assert digest == r.sha256(tmp_path / "frozen.json")
     with pytest.raises(SystemExit, match="already"):
-        r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [])
+        r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [], tmp_path / "d")
 
 
-def test_holdout_refuses_another_freeze(tmp_path):
+def test_holdout_refuses_another_freeze_before_any_marker(tmp_path):
     (tmp_path / "frozen.json").write_text("{}")
     with pytest.raises(SystemExit, match="not the freeze"):
-        r.holdout_step(tmp_path, tmp_path, tmp_path, tmp_path, "0" * 64, tmp_path / "m", 1)
+        r.holdout_step(tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, "0" * 64, tmp_path / "m", 1)
     assert not (tmp_path / "m").exists()
 
 
@@ -181,3 +245,37 @@ def test_holdout_jobs_drop_removed_conditions_per_setting():
     jobs = r.holdout_jobs(selected(), removed={"impact_0": {fixed}})
     assert len(jobs) == 4680 - 13 * 30
     assert not any(j["condition"] == "fixed_stress" and j["policy"]["setting"] == "impact_0" for j in jobs)
+
+
+def test_a_failing_worker_ends_the_run(tmp_path):
+    jobs = r.pilot_jobs()[:1]
+    pilot = tmp_path / "p.jsonl"
+    pilot.write_text(json.dumps({"seconds": 1}) + "\n")
+    ctx = {"out": str(tmp_path), "checkpoints": "", "classical": {}, "digests": {}}
+    with pytest.raises(Exception) as error:
+        r.run_pool("t", jobs, tmp_path / "j", 1, ctx, r.Budget(tmp_path, pilot), {"no_trade": 600})
+    assert not isinstance(error.value, SystemExit)
+
+
+def test_checkpoints_are_checked_against_the_manifest(tmp_path):
+    (tmp_path / "checkpoints").mkdir()
+    runs = {}
+    for setting in r.SETTINGS:
+        for arm in r.LEARNED:
+            for seed in r.SEEDS:
+                name = f"{arm}-{setting}-seed{seed}"
+                (tmp_path / "checkpoints" / f"{name}.zip").write_text("z")
+                (tmp_path / "checkpoints" / f"{name}.json").write_text("m")
+                runs[name] = {"checkpoint": hashlib.sha256(b"z").hexdigest(), "metadata": hashlib.sha256(b"m").hexdigest()}
+    r.check_checkpoints(tmp_path, {"runs": runs})
+    (tmp_path / "checkpoints" / "mlp-impact_0-seed1.json").write_text("x")
+    with pytest.raises(SystemExit, match="not the checkpoint"):
+        r.check_checkpoints(tmp_path, {"runs": runs})
+
+
+def test_first_attempt_refuses_an_existing_journal(tmp_path, monkeypatch):
+    (tmp_path / "holdout.jsonl").write_text("")
+    monkeypatch.setattr(r, "verify_manifest", lambda *_: {"design_sha256": "a" * 64})
+    with pytest.raises(SystemExit, match="only a recovery"):
+        r.holdout_step(tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, "x", tmp_path / "m", 1)
+    assert not (tmp_path / "m").exists()
