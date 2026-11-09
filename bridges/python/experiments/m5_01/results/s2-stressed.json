@@ -1,0 +1,283 @@
+{
+ "primary": {
+  "1/qr": {
+   "low": -0.6121924349610463,
+   "high": -0.5927797278256971,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "1/qr_count": {
+   "low": -0.5839440756585049,
+   "high": -0.5680166340119336,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "1/qr_constant": {
+   "low": -0.31402517838372596,
+   "high": -0.2747193463256662,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "2/qr": {
+   "low": -0.7421012619798428,
+   "high": -0.725720126793112,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "2/qr_count": {
+   "low": -0.4812612246104619,
+   "high": -0.4648488984727633,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "2/qr_constant": {
+   "low": -0.6331243137095777,
+   "high": -0.6071982244326963,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "3/qr": {
+   "low": -0.7840989674534719,
+   "high": -0.763997110886972,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "3/qr_count": {
+   "low": -0.22754739875100471,
+   "high": -0.18270206118994622,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "3/qr_constant": {
+   "low": -0.7232855148240894,
+   "high": -0.6828950039031101,
+   "undefined_share": 0.0,
+   "passes": true
+  }
+ },
+ "dependencies": {
+  "correlation/qr": {
+   "low": -0.03087334100813497,
+   "high": 0.05790055697240721,
+   "undefined_share": 0.0,
+   "passes": false
+  },
+  "correlation/qr_count": {
+   "low": 0.039602558845434024,
+   "high": 0.06423010285086603,
+   "undefined_share": 0.0,
+   "passes": false
+  },
+  "kind/qr": {
+   "low": -0.4333468255268175,
+   "high": -0.36102145347634135,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "kind/qr_count": {
+   "low": -0.19640481466486967,
+   "high": -0.15498613386605983,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "direction/qr": {
+   "low": -0.620142689279002,
+   "high": -0.5795510111735213,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "direction/qr_count": {
+   "low": -0.6226234099765187,
+   "high": -0.6037781644030573,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "gamma/qr": {
+   "low": -732608.0055260413,
+   "high": -629530.267638443,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "gamma/qr_count": {
+   "low": -42.14448296328243,
+   "high": -40.106611765037925,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "cap/qr": {
+   "low": -0.4060682449765698,
+   "high": -0.39316217123244457,
+   "undefined_share": 0.0,
+   "passes": true
+  },
+  "cap/qr_count": {
+   "low": 0.0023224396891992774,
+   "high": 0.002637268539103147,
+   "undefined_share": 0.0,
+   "passes": true
+  }
+ },
+ "tau": null,
+ "failed_draws": 0,
+ "beside": {
+  "group_tau/qr": NaN,
+  "group_tau/qr_count": NaN,
+  "tau_against_data": 0.7791937224739796,
+  "zero_fill_policies/qr": {
+   "avellaneda_stoikov": 1.0,
+   "fixed_spread": 1.0,
+   "glft": 1.0,
+   "maskable_ppo-1": 1.0,
+   "maskable_ppo-2": 1.0,
+   "maskable_ppo-3": 1.0,
+   "maskable_ppo-4": 1.0,
+   "maskable_ppo-5": 1.0,
+   "sac_residual_avellaneda_stoikov-1": 1.0,
+   "sac_residual_avellaneda_stoikov-2": 1.0,
+   "sac_residual_avellaneda_stoikov-3": 1.0,
+   "sac_residual_avellaneda_stoikov-4": 1.0,
+   "sac_residual_avellaneda_stoikov-5": 1.0
+  },
+  "tied_policies/qr": 12,
+  "rows/qr": {
+   "volatility_10s": 0.009938070287973494,
+   "median_spread": 2.0,
+   "median_touch_lots": 200.0
+  },
+  "zero_fill_policies/qr_count": {
+   "avellaneda_stoikov": 1.0,
+   "fixed_spread": 1.0,
+   "glft": 1.0,
+   "maskable_ppo-1": 1.0,
+   "maskable_ppo-2": 1.0,
+   "maskable_ppo-3": 1.0,
+   "maskable_ppo-4": 1.0,
+   "maskable_ppo-5": 1.0,
+   "sac_residual_avellaneda_stoikov-1": 1.0,
+   "sac_residual_avellaneda_stoikov-2": 1.0,
+   "sac_residual_avellaneda_stoikov-3": 1.0,
+   "sac_residual_avellaneda_stoikov-4": 1.0,
+   "sac_residual_avellaneda_stoikov-5": 1.0
+  },
+  "tied_policies/qr_count": 12,
+  "rows/qr_count": {
+   "volatility_10s": 0.0,
+   "median_spread": 2.0,
+   "median_touch_lots": 131.66666666666666
+  },
+  "zero_fill_policies/qr_constant": {
+   "avellaneda_stoikov": 1.0,
+   "fixed_spread": 1.0,
+   "glft": 1.0,
+   "maskable_ppo-1": 1.0,
+   "maskable_ppo-2": 1.0,
+   "maskable_ppo-3": 1.0,
+   "maskable_ppo-4": 1.0,
+   "maskable_ppo-5": 1.0,
+   "sac_residual_avellaneda_stoikov-1": 1.0,
+   "sac_residual_avellaneda_stoikov-2": 1.0,
+   "sac_residual_avellaneda_stoikov-3": 1.0,
+   "sac_residual_avellaneda_stoikov-4": 1.0,
+   "sac_residual_avellaneda_stoikov-5": 1.0
+  },
+  "tied_policies/qr_constant": 12,
+  "rows/qr_constant": {
+   "volatility_10s": 0.42314441409263087,
+   "median_spread": 2.0,
+   "median_touch_lots": 44.916666666666664
+  },
+  "zero_fill_policies/mdqr": {
+   "avellaneda_stoikov": 0.0,
+   "fixed_spread": 0.0,
+   "glft": 1.0,
+   "maskable_ppo-1": 1.0,
+   "maskable_ppo-2": 1.0,
+   "maskable_ppo-3": 1.0,
+   "maskable_ppo-4": 1.0,
+   "maskable_ppo-5": 0.9866666666666667,
+   "sac_residual_avellaneda_stoikov-1": 0.0,
+   "sac_residual_avellaneda_stoikov-2": 0.0,
+   "sac_residual_avellaneda_stoikov-3": 0.0,
+   "sac_residual_avellaneda_stoikov-4": 0.0,
+   "sac_residual_avellaneda_stoikov-5": 0.0
+  },
+  "tied_policies/mdqr": 4,
+  "rows/mdqr": {
+   "volatility_10s": 11.976962933682522,
+   "median_spread": 2.7666666666666666,
+   "median_touch_lots": 22.226666666666667
+  }
+ },
+ "label": "REAL DATA: Hyperliquid BTC, December 2025; a reused holdout, exploratory",
+ "tau_intervals": {
+  "qr": [
+   NaN,
+   NaN
+  ],
+  "qr_count": [
+   NaN,
+   NaN
+  ]
+ },
+ "policy_means": {
+  "mdqr": {
+   "avellaneda_stoikov": -31.80470436666667,
+   "fixed_spread": -385.8283951733333,
+   "glft": 0.0,
+   "maskable_ppo-1": 0.0,
+   "maskable_ppo-2": 0.0,
+   "maskable_ppo-3": 0.0,
+   "maskable_ppo-4": 0.0,
+   "maskable_ppo-5": -0.037000160000000004,
+   "sac_residual_avellaneda_stoikov-1": -29.431881599999997,
+   "sac_residual_avellaneda_stoikov-2": -29.747693486666666,
+   "sac_residual_avellaneda_stoikov-3": -29.59421866,
+   "sac_residual_avellaneda_stoikov-4": -30.479117079999998,
+   "sac_residual_avellaneda_stoikov-5": -28.93966344
+  }
+ },
+ "undefined_values_per_arm": {
+  "qr": {
+   "queue_tv_0": 0.0,
+   "queue_tv_1": 0.0,
+   "queue_tv_2": 0.0,
+   "correlation": 0.0,
+   "kind": 0.0,
+   "direction": 0.0,
+   "gamma": 0.0,
+   "cap": 0.0
+  },
+  "qr_count": {
+   "queue_tv_0": 0.0,
+   "queue_tv_1": 0.0,
+   "queue_tv_2": 0.0,
+   "correlation": 0.0,
+   "kind": 0.0,
+   "direction": 0.0,
+   "gamma": 0.0,
+   "cap": 0.0
+  },
+  "qr_constant": {
+   "queue_tv_0": 0.0,
+   "queue_tv_1": 0.0,
+   "queue_tv_2": 0.0,
+   "correlation": 0.0,
+   "kind": 0.0,
+   "direction": 0.0,
+   "gamma": 0.0,
+   "cap": 0.0
+  },
+  "mdqr": {
+   "queue_tv_0": 0.0,
+   "queue_tv_1": 0.0,
+   "queue_tv_2": 0.0,
+   "correlation": 0.0,
+   "kind": 0.0,
+   "direction": 0.0,
+   "gamma": 0.0,
+   "cap": 0.0
+  }
+ },
+ "reading_only": "discard",
+ "regime": "stressed"
+}
