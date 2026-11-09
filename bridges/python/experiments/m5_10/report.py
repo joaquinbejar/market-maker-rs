@@ -23,6 +23,9 @@ NOTES = ["SYNTHETIC: made-up Hawkes parameters; says nothing about a market.",
          "The classical set changed from the first design: GLFT replaces fixed spread, since #107 part C selected "
          "only Avellaneda-Stoikov and GLFT.",
          "The mean-loss adversary is not comparable with #295's CVaR adversary.",
+         "The primary's adversary searches only the points that passed the frozen rate test, likely the milder "
+         "flows; a loss or no difference under it is limited to those points, and fixed stress was not run.",
+         "The secondary's adversary searches every point; never compare it with the primary's as a robustness test.",
          "Margin shortfall: not measured; this simulator has no declared capital."]
 
 
@@ -62,7 +65,54 @@ def breach(row):
     return bool(row["result"]["episode"]["limit_breach"])
 
 
+def _pid(point):
+    return point_id(point)
+
+
+def check_primary(rows):
+    """The primary's table refuses a secondary row."""
+    if any(r["condition"].startswith("secondary_") for r in rows):
+        raise ValueError("a secondary row in the primary's table")
+
+
+def secondary_table(rows, primary_rows, identify=None, secondary_picks=None, primary_picks=None):
+    """Exploratory, 'not identified by the frozen rate test'; feeds no decision.
+
+    A policy whose pick over every point is its primary pick reuses those days, relabelled here.
+    """
+    base = daily(primary_rows)
+    reused = []
+    for row in primary_rows:
+        key = f"{row['policy']['setting']}/{row['policy']['arm']}"
+        if row["condition"] == "adversary" and secondary_picks and secondary_picks[key]["point"] == primary_picks[key]["point"]:
+            reused.append({**row, "condition": "secondary_adversary"})
+    grouped = daily(list(rows) + reused)
+    out = []
+    for (setting, arm, condition), by_day in sorted(grouped.items()):
+        values = series(by_day, net)
+        interval = stats.paired_interval(values - series(base[(setting, arm, "unperturbed")], net))
+        hold = grouped.get((setting, "no_trade", condition))
+        against_hold = None
+        if hold is not None and arm != "no_trade":
+            against_hold = stats.paired_interval(values - series(hold, net))
+        ratios = {}
+        if identify:
+            points = identify[setting]["points"]
+            base_point = points[next(iter(points))]
+            for pid in sorted({_pid(r["point"]) for d in by_day.values() for r in d}):
+                p = points[pid]
+                ratios[pid] = {"realised_over_formula": (p["market_rate"] / base_point["market_rate"])
+                               / (p["formula"] / base_point["formula"]),
+                               "empty_share": p["empty_share"], "cap_share": p["cap_share"]}
+        out.append({"label": "not identified by the frozen rate test, exploratory", "setting": setting, "arm": arm,
+                    "condition": condition, "mean_net": float(values.mean()), "cvar5_loss": stats.cvar_loss(values),
+                    "against_unperturbed": interval, "against_no_trade": against_hold,
+                    "reading": stats.reading(interval), "points_rate_test": ratios})
+    return out
+
+
 def tables(rows, selected):
+    check_primary(rows)
     grouped = daily(rows)
     out = []
     for (setting, arm, condition), by_day in sorted(grouped.items()):
@@ -109,8 +159,13 @@ def not_run(identify):
 def main(out, identify_path):
     out = pathlib.Path(out)
     rows = json.loads((out / "holdout.json").read_text())
-    selected = json.loads((out / "frozen.json").read_text())["selected"]
+    secondary_path = out / "holdout_secondary.json"
+    secondary = json.loads(secondary_path.read_text()) if secondary_path.exists() else []
+    frozen = json.loads((out / "frozen.json").read_text())
+    selected = frozen["selected"]
+    identify = json.loads(pathlib.Path(identify_path).read_text())
     (out / "report.json").write_text(json.dumps({"notes": NOTES, "rows": tables(rows, selected),
+                                                     "secondary": secondary_table(secondary, rows, identify, frozen["selected_secondary"], selected),
                                                      "not_run": not_run(json.loads(pathlib.Path(identify_path).read_text()))}, indent=1))
 
 

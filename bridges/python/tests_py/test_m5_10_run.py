@@ -115,7 +115,7 @@ def test_spectral_failures_are_listed_not_fatal():
 
 
 def manifest(tmp_path):
-    for name in ("selection.json", "d", "i", "p", "design", "hd"):
+    for name in ("selection.json", "selection_secondary.json", "d", "i", "p", "design", "hd"):
         (tmp_path / name).write_text("{}")
     sha = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"], tmp_path / "d", tmp_path / "d")
     (tmp_path / "holdout_days.json").write_text(json.dumps(
@@ -216,7 +216,7 @@ def test_a_torn_middle_line_is_an_error(tmp_path):
 
 
 def test_freeze_is_single_and_hashes_inputs(tmp_path):
-    for name in ("selection.json", "d", "i", "p", "design"):
+    for name in ("selection.json", "selection_secondary.json", "d", "i", "p", "design"):
         (tmp_path / name).write_text("{}")
     digest = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"], tmp_path / "d", tmp_path / "d")
     assert digest == r.sha256(tmp_path / "frozen.json")
@@ -312,3 +312,34 @@ def test_a_failed_run_is_charged(tmp_path):
     with pytest.raises(Exception):
         r.run_pool("t", r.pilot_jobs()[:1], tmp_path / "j", 1, ctx, budget, {"no_trade": 600})
     assert any(json.loads(x)["step"] == "t" for x in budget.path.read_text().splitlines())
+
+
+def test_secondary_jobs_reuse_the_primary_pick_and_run_another():
+    impact = 0.0
+    fixed = r.point_id(r.grid.fixed_stress(impact))
+    primary = {r.policy_key(p): {"point": r.grid.points(impact)[1]} for p in r.policies("impact_0")}
+    other = {r.policy_key(p): {"point": r.grid.fixed_stress(impact)} for p in r.policies("impact_0")}
+    jobs = r.secondary_jobs(other, {"impact_0": {fixed}}, primary, settings={"impact_0": impact})
+    assert {j["condition"] for j in jobs} == {"secondary_fixed_stress", "secondary_adversary"}
+    assert len(jobs) == 2 * 13 * 30
+    same = r.secondary_jobs(primary, {"impact_0": set()}, primary, settings={"impact_0": impact})
+    assert same == []
+
+
+def test_primary_selection_is_byte_identical_after_the_secondary(tmp_path, monkeypatch):
+    (tmp_path / "selection.json").write_text('{"x": 1}')
+    identify = {s: {"void": False, "removed": [], "spectral_removed": [], "points": {}} for s in r.SETTINGS}
+    (tmp_path / "i").write_text(json.dumps(identify))
+    (tmp_path / "pilot.jsonl").write_text(json.dumps({"seconds": 1}) + "\n")
+    (tmp_path / "pilot.json").write_text(json.dumps({"projection": {"worst_seconds_per_day": {}}}))
+    monkeypatch.setattr(r, "context", lambda *_: {})
+    monkeypatch.setattr(r, "run_pool", lambda *_: [])
+    before = (tmp_path / "selection.json").read_bytes()
+    r.secondary_selection_step(tmp_path, tmp_path, tmp_path, tmp_path / "i", tmp_path, 1)
+    assert (tmp_path / "selection.json").read_bytes() == before
+    assert (tmp_path / "selection_secondary.json").exists()
+
+
+def test_secondary_selection_needs_the_primary(tmp_path):
+    with pytest.raises(SystemExit, match="comes first"):
+        r.secondary_selection_step(tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, 1)

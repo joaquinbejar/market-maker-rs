@@ -573,12 +573,54 @@ def code_hashes():
     return {p.name: sha256(p) for p in paths}
 
 
+def secondary_selection_step(out, causal_out, digests_path, identify_path, pilot_dir, processes):
+    """The removed points' selection rows, after the primary's selection is written.
+
+    The secondary's own pick is over every point; it reads the primary's rows, never writes them.
+    """
+    out = pathlib.Path(out)
+    if not (out / "selection.json").exists():
+        raise SystemExit("the primary's selection comes first")
+    report = json.loads(pathlib.Path(identify_path).read_text())
+    removed = removed_points(identify_path)
+    spectral = {s: set(v["spectral_removed"]) for s, v in report.items()}
+    all_jobs = [j for j in selection_jobs() if not report[j["policy"]["setting"]]["void"]
+                and point_id(j["point"]) not in spectral[j["policy"]["setting"]]]
+    jobs = [j for j in all_jobs if point_id(j["point"]) in removed[j["policy"]["setting"]]]
+    budget, worst = Budget(out, pathlib.Path(pilot_dir) / "pilot.jsonl"), worst_seconds_of(pilot_dir)
+    rows = run_pool("selection-secondary", jobs, out / "selection_secondary.jsonl", processes,
+                    context(out, causal_out, digests_path), budget, worst)
+    primary = load_journal(out / "selection.jsonl")
+    primary_rows = [(j, primary[job_key(j)]["result"]) for j in all_jobs if job_key(j) in primary]
+    (out / "selection_secondary.json").write_text(json.dumps(select(primary_rows + rows), indent=1))
+
+
+def secondary_jobs(picks, removed, primary_picks, settings=SETTINGS):
+    """Labelled secondary holdout jobs: the fixed stress and the pick over every point."""
+    jobs = []
+    for s, impact in settings.items():
+        if point_id(grid.points(impact)[0]) in removed.get(s, ()):
+            continue
+        for p in policies(s):
+            named = {}
+            if point_id(grid.fixed_stress(impact)) in removed.get(s, ()):
+                named["secondary_fixed_stress"] = grid.fixed_stress(impact)
+            pick = picks[policy_key(p)]["point"]
+            if pick != primary_picks[policy_key(p)]["point"]:
+                named["secondary_adversary"] = pick  # the primary's own pick is reused in the report
+            jobs += [{"split": "holdout", "condition": c, "policy": p, "point": pt, "day": d}
+                     for c, pt in named.items() for d in range(1, HOLDOUT_DAYS + 1)]
+    return jobs
+
+
 def freeze(out, design_path, digests_path, identify_path, pilot_paths, m107_frozen, binary):
     """The manifest the holdout runs from: every input by hash, and each policy's pick."""
     out = pathlib.Path(out)
     selected = json.loads((out / "selection.json").read_text())
     manifest = {"design_sha256": sha256(design_path), "selection_digests_sha256": sha256(digests_path),
                 "identify_sha256": sha256(identify_path), "selection_sha256": sha256(out / "selection.json"),
+                "selection_secondary_sha256": sha256(out / "selection_secondary.json"),
+                "selected_secondary": json.loads((out / "selection_secondary.json").read_text()),
                 "pilot_sha256": {str(p): sha256(p) for p in pilot_paths}, "m107_frozen_sha256": sha256(m107_frozen),
                 "m107_frozen_path": str(m107_frozen), "generator_sha256": sha256(binary), "code_sha256": code_hashes(),
                 "selected": selected}
@@ -598,7 +640,8 @@ def verify_manifest(out, design_path, selection_digests, identify_path, holdout_
     checks = {"design": (design_path, m["design_sha256"]),
               "selection digests": (selection_digests, m["selection_digests_sha256"]),
               "identify": (identify_path, m["identify_sha256"]),
-              "selection": (out / "selection.json", m["selection_sha256"])}
+              "selection": (out / "selection.json", m["selection_sha256"]),
+              "secondary selection": (out / "selection_secondary.json", m["selection_secondary_sha256"])}
     checks["#107 freeze"] = (m["m107_frozen_path"], m["m107_frozen_sha256"])
     checks.update({f"pilot {p}": (p, h) for p, h in m["pilot_sha256"].items()})
     for name, (path, expected) in checks.items():
@@ -630,13 +673,22 @@ def days_holdout(out, binary, digests_path, identify_path, pilot_jsonl, settings
         wanted = {point_id(p): p for p in picks}
         for point in (grid.points(impact)[0], grid.fixed_stress(impact), grid.impact_only(impact)):
             wanted[point_id(point)] = point
+        for v in [x for k, x in manifest["selected_secondary"].items() if k.startswith(f"{setting}/")]:
+            wanted[point_id(v["point"])] = v["point"]
+        spectral = report[setting]["spectral_removed"]
         for pid, point in wanted.items():
-            if pid not in report[setting]["removed"]:
+            if pid not in spectral:
                 digests.update(generate(causal, out, binary, "holdout", setting, point, HOLDOUT_DAYS))
     pathlib.Path(digests_path).write_text(json.dumps({"digests": digests}, indent=0))
     (out / "holdout_days.json").write_text(json.dumps(
         {"frozen_sha256": sha256(out / "frozen.json"), "digests_sha256": sha256(digests_path)}))
     budget.charge("days-holdout", (time.perf_counter() - start) / 3600)
+
+
+def write_rows(path, rows):
+    pathlib.Path(path).write_text(json.dumps(
+        [{"key": job_key(j), "condition": j["condition"], "policy": j["policy"], "point": j["point"],
+          "day": j["day"], "result": r} for j, r in rows]))
 
 
 def holdout_step(out, causal_out, selection_digests, holdout_digests, identify_path, pilot_dir, frozen_sha,
@@ -657,9 +709,16 @@ def holdout_step(out, causal_out, selection_digests, holdout_digests, identify_p
     rows = run_pool("holdout", jobs, journal, processes, ctx, budget,
                     worst_seconds_of(pilot_dir))
     verify_prefix(marker, journal)
-    (out / "holdout.json").write_text(json.dumps(
-        [{"key": job_key(j), "condition": j["condition"], "policy": j["policy"], "point": j["point"],
-          "day": j["day"], "result": r} for j, r in rows]))
+    write_rows(out / "holdout.json", rows)
+    # The secondary runs after the primary is written, so a stop cannot cost the primary.
+    secondary = secondary_jobs(manifest["selected_secondary"], removed, manifest["selected"])
+    try:
+        rows = run_pool("holdout-secondary", secondary, out / "holdout_secondary.jsonl", processes, ctx, budget,
+                        worst_seconds_of(pilot_dir))
+    except (Exception, SystemExit) as error:  # the primary stays valid; the secondary's failure is reported
+        (out / "holdout_secondary_failed.json").write_text(json.dumps({"error": repr(error)}))
+        return
+    write_rows(out / "holdout_secondary.json", rows)
 
 
 def main(argv):
@@ -672,6 +731,8 @@ def main(argv):
         identify(*rest)
     elif step == "selection":
         selection_step(*rest[:5], int(rest[5]))
+    elif step == "selection-secondary":
+        secondary_selection_step(*rest[:5], int(rest[5]))
     elif step == "freeze":
         print(freeze(rest[0], HERE / "design.json", rest[1], rest[2], rest[5:], rest[3], rest[4]))
     elif step == "days-holdout":

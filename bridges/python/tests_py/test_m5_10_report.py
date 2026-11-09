@@ -75,3 +75,23 @@ def test_not_run_names_conditions():
     assert out["impact_0"]["conditions_not_run"] == ["fixed_stress"]
     assert len(out["impact_low"]["conditions_not_run"]) == 4
     assert out["impact_0"]["shares"]["y"] == {"empty": 0.1, "cap": 0.2}
+
+
+def test_primary_table_refuses_secondary_rows():
+    with pytest.raises(ValueError):
+        rep.tables(rows() + [row("mlp", "secondary_adversary", 1, 0.0)], selected())
+
+
+def test_secondary_is_labelled_and_apart():
+    extra = [row("mlp", "secondary_fixed_stress", d, 0.0, 1) for d in range(1, 31)]
+    out = rep.secondary_table(extra, rows())
+    assert out[0]["label"].startswith("not identified") and out[0]["reading"] == "below 0"
+
+
+def test_a_reused_pick_is_relabelled_only_in_the_secondary():
+    base = rows()
+    picks = {"s/mlp": {"point": 1}, "s/no_trade": {"point": 2}}
+    primary = {"s/mlp": {"point": 1}, "s/no_trade": {"point": 3}}
+    out = rep.secondary_table([], base, None, picks, primary)
+    assert [(r["arm"], r["condition"]) for r in out] == [("mlp", "secondary_adversary")]
+    assert all(r["condition"] != "secondary_adversary" for r in base)

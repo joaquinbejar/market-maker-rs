@@ -1,7 +1,7 @@
 {
  "issue": 108,
- "design_version": 5,
- "status": "fixed before any code or run; part 2 of #108, after PR #295",
+ "design_version": 6,
+ "status": "fixed before any policy ran. The design was fixed before any code; since then the selection days were generated and identify.json read (see secondary_not_identified and changes), and no policy has run on them",
  "data": "SYNTHETIC: every result is from made-up Hawkes parameters and says nothing about a market",
  "closed_by_295": {
   "done": "bounded flow perturbations of #102's queue-reactive regimes, fixed stress, grid adversary, selection apart from a holdout read once, classical and learned arms, inventory, drawdown, CVaR",
@@ -113,7 +113,52 @@
     "selection": "the 14 removed points x 10 days x 13 policy runs x 3 settings = 5460 days",
     "holdout": "fixed_stress (30 x 13 x 3 = 1170 days) and the secondary pick (at most 1170 days), on holdout days and in the same single attempt"
    },
-   "reported": "apart from the primary, in its own table, with each point's realised over formula ratio and queue shares"
+   "reported": "apart from the primary, in its own table, with each point's realised over formula ratio and queue shares",
+   "isolation": "primary jobs run first and are written out complete before any secondary job starts, in their own journals and outputs. A secondary failure or stop leaves the primary valid and is reported; a primary failure stops the attempt",
+   "surviving_pick": "the secondary's pick over all 24 points may land on a surviving point. If it is the policy's own primary pick, those holdout days are reused and shown only in the secondary table under its label; a different surviving point is run. 'At most 1170' reflects this",
+   "fixed_stress": "the primary table keeps fixed_stress as not run, with no substitute; the secondary's fixed-stress row is never quoted as the primary's",
+   "comparisons": "the same pairs, intervals and metrics as the primary (each arm against itself unperturbed and against no-trade under the same condition), plus each point's realised over formula ratio and queue shares",
+   "primary_claim": {
+    "surviving_points": {
+     "impact_0": [
+      "m1-l0.7-b1-i0.0",
+      "m1-l0.7-b1-i0.25",
+      "m1-l1-b1-i0.0",
+      "m1-l1-b1-i0.25",
+      "m1-l1-b1.2-i0.0",
+      "m1-l1-b1.2-i0.25",
+      "m1.5-l1-b1-i0.0",
+      "m1.5-l1-b1-i0.25",
+      "m2-l1-b1-i0.0",
+      "m2-l1-b1-i0.25"
+     ],
+     "impact_low": [
+      "m1-l0.7-b1-i0.25",
+      "m1-l0.7-b1-i1.0",
+      "m1-l1-b1-i0.25",
+      "m1-l1-b1-i1.0",
+      "m1-l1-b1.2-i0.25",
+      "m1-l1-b1.2-i1.0",
+      "m1.5-l1-b1-i0.25",
+      "m1.5-l1-b1-i1.0",
+      "m2-l1-b1-i0.25",
+      "m2-l1-b1-i1.0"
+     ],
+     "impact_high": [
+      "m1-l0.7-b1-i1.0",
+      "m1-l0.7-b1-i2.0",
+      "m1-l1-b1-i1.0",
+      "m1-l1-b1-i2.0",
+      "m1-l1-b1.2-i1.0",
+      "m1-l1-b1.2-i2.0",
+      "m1.5-l1-b1-i1.0",
+      "m1.5-l1-b1-i2.0",
+      "m2-l1-b1-i1.0",
+      "m2-l1-b1-i2.0"
+     ]
+    },
+    "claim": "the primary's worst case is the worst over these surviving points, not over the declared grid. If the survivors are the milder flows, as the empty-queue pattern suggests, the primary does not cover the stressed region"
+   }
   }
  },
  "part_2_281_impact": {
@@ -143,13 +188,15 @@
  "seen_before_freeze": [
   "#107 part C's design and README tables",
   "#295's and #281's PR text and designs",
-  "no day of this study has been generated"
+  "the pilot's cost and days on seeds outside every split",
+  "the selection days' queue, flow and mid statistics in identify.json, sha256 7346691aa7c3a1c4277362fc12f38c26b2769de76b5a700c9e0e2ff421a5cb62, committed as experiments/m5_10/identify.json; no policy result on them"
  ],
  "changes": [
   "before any code or run, from review of f583fbc: count formula, pilot at the slowest arm and most active point under load, ceiling raised from 60 to 90 process-hours from that count, cuts from the pilot only, removed points, identifiability estimates, stationary bootstrap named, recovery condition and marker location, part 2 runner, model hashes and estimand, no secondary fee, impact is the flow's and not the agent's",
   "before any code or run, from review of 378e653: seed formulas written as stride x day + offset, and a failing unperturbed point removes its setting; the identifiability formula, absolute tolerance at impact 0, removal rule and stationary bootstrap of the entry above answer the same review",
   "before any code or run, from a defect found reading the generator: the baselines depend on the queue, so the rate test uses time-averaged open shares and the point-over-unperturbed ratio, with its approximation stated. No ratio or formula value had been computed on any data",
   "before any run, reading #107's classical.json for the runner: #107 part C has no fixed-spread point, its classical arms are Avellaneda-Stoikov and GLFT, so GLFT replaces fixed spread; the policy count stays 13",
-  "after identify.json was seen (sha256 7346691a...cb62) and before any policy ran: a secondary analysis of the 14 points the frozen rate test removed, labelled not identified, exploratory, feeding no decision and unable to change the primary's selection. The 10 %, the formula and the primary are unchanged"
+  "after identify.json was seen (sha256 7346691a...cb62) and before any policy ran: a secondary analysis of the 14 points the frozen rate test removed, labelled not identified, exploratory, feeding no decision and unable to change the primary's selection. The 10 %, the formula and the primary are unchanged",
+  "after review of v5, before any policy ran: stale statements corrected, isolation of the primary, reuse of a surviving pick, fixed stress labelling, the secondary's comparisons, the primary's claim and the surviving points listed, identify.json committed"
  ]
 }
