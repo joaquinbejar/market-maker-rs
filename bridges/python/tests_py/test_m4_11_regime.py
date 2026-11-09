@@ -134,3 +134,44 @@ def test_the_ledger_accumulates_process_seconds(tmp_path):
     assert run.ledger_add(path, "a", 10.0) == 10.0
     assert run.ledger_add(path, "b", 5.0) == 15.0
     assert len(json.loads(path.read_text())["steps"]) == 2
+
+
+def test_a_step_is_limited_by_its_estimate_or_the_ceilings_remainder():
+    assert run.step_limit(100.0, 4000.0, 4) == 150.0
+    assert run.step_limit(100.0, 400.0, 4) == 100.0
+    assert run.step_limit(100.0, -5.0, 4) == 0.0
+
+
+def test_the_job_count_must_equal_the_plan_except_at_the_holdout():
+    assert run.job_count_ok([1, 2], 2, True) and not run.job_count_ok([1], 2, True)
+    assert run.job_count_ok([1], 2, False) and not run.job_count_ok([1, 2, 3], 2, False)
+
+
+def test_the_planned_jobs_are_the_steps_counts():
+    assert run.PLANNED["log_day"] == 570 and run.PLANNED["cql"] == 20
+    assert run.PLANNED["offline_day"] == 225 + 495
+
+
+def _sleep(seconds):
+    import time
+    time.sleep(seconds)
+    return seconds
+
+
+def test_a_pool_at_its_limit_stops_running_workers():
+    import time
+    started = time.perf_counter()
+    rows, finished, _, charged = run.run_pool([0.0, 30.0], sleep_worker, 2, 8.0, "t")
+    assert rows is None and finished == 1 and 7.0 < charged < 25 and time.perf_counter() - started < 25
+
+
+sleep_worker = _sleep
+
+
+def test_five_jobs_on_four_workers_are_two_rounds():
+    assert run.rounds(5, 4) == 2 and run.rounds(4, 4) == 1
+
+
+def test_process_seconds_are_each_jobs_own():
+    rows, finished, _, charged = run.run_pool([0.0, 0.0], sleep_worker, 2, None, "t")
+    assert rows == [0.0, 0.0] and finished == 2 and charged < 1.0

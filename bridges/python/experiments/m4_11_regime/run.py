@@ -21,8 +21,11 @@ Steps, in order:
 Everything here is synthetic: #102's simulator on new days, whose rows do not react to orders.
 """
 
+import concurrent.futures
 import importlib.util
 import json
+import math
+import multiprocessing
 import os
 import pathlib
 import sys
@@ -474,30 +477,100 @@ def job_seconds(study, kind):
     return budget[kind]["seconds_per_gradient_step"] * design["arms"][kind]["settings"]["gradient_steps"]
 
 
-def pool(jobs, worker, study, label, kind, enforce=True):
-    """The jobs in parallel. A step over the compute rule writes what it knows and stops, except
-    the holdout, which is read once and records the overrun in its report instead."""
+def timed_call(worker, job):
+    """A job's result and its own seconds."""
     started = time.perf_counter()
-    rows = prior.pool(jobs, worker, study.parallel, label)
-    elapsed = time.perf_counter() - started
-    estimate = job_seconds(study, kind) * len(jobs) / study.parallel
-    spent = ledger_add(study.out / "ledger.json", label, elapsed * min(study.parallel, len(jobs)))
-    if enforce and spent > study.read("budget")["ceiling_process_hours"] * 3600:
-        raise RuntimeError(f"{label} passed the study's ceiling of process hours")
-    if overran(elapsed, estimate):
-        name = label.replace(" ", "-")
-        study.write(f"overrun-{name}", {"step": label, "seconds": elapsed, "estimate": estimate})
-        if enforce:
-            raise RuntimeError(f"{label} overran its estimate: {elapsed:.0f} s against {estimate:.0f} s")
+    result = worker(job)
+    return result, time.perf_counter() - started
+
+
+def rounds(jobs, workers):
+    """Rounds of whole jobs on the workers."""
+    return math.ceil(jobs / workers)
+
+
+def run_pool(jobs, worker, parallel, limit, label):
+    """The jobs in spawned processes, stopped at `limit` seconds. Returns (rows or None, the
+    finished count, elapsed, process seconds). At the limit the workers are terminated, and
+    each job still running is charged the time since the start."""
+    context = multiprocessing.get_context("spawn")
+    started = time.perf_counter()
+    executor = concurrent.futures.ProcessPoolExecutor(parallel, mp_context=context)
+    futures = [executor.submit(timed_call, worker, job) for job in jobs]
+    pending = set(futures)
+    try:
+        while pending:
+            timeout = None if limit is None else max(limit - (time.perf_counter() - started), 0.0)
+            done, pending = concurrent.futures.wait(
+                pending, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                future.result()
+            print(f"{label}: {len(jobs) - len(pending)}/{len(jobs)} after "
+                  f"{round(time.perf_counter() - started)} s", file=sys.stderr, flush=True)
+            if pending and not done:
+                workers = list((executor._processes or {}).values())
+                executor.shutdown(wait=False, cancel_futures=True)
+                for process in workers:
+                    process.terminate()
+                for process in workers:
+                    process.join()
+                elapsed = time.perf_counter() - started
+                finished = [f.result()[1] for f in futures if f.done() and not f.cancelled()
+                            and f.exception() is None]
+                charged = sum(finished) + min(len(workers), len(pending)) * elapsed
+                return None, len(finished), elapsed, charged
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    outcomes = [future.result() for future in futures]
+    return ([row for row, _ in outcomes], len(jobs), time.perf_counter() - started,
+            sum(seconds for _, seconds in outcomes))
+
+
+def step_limit(estimate, remaining_process_seconds, slots):
+    """The smaller of 1.5 times the step's estimate and its share of the ceiling's remainder."""
+    return min(OVERRUN * estimate, max(remaining_process_seconds, 0.0) / slots)
+
+
+def job_count_ok(jobs, planned, enforce):
+    """A step's jobs equal its planned count; the holdout may drop a failed secondary dataset."""
+    return len(jobs) == planned if enforce else len(jobs) <= planned
+
+
+def pool(jobs, worker, study, label, kind, planned, enforce=True):
+    """The jobs in parallel under the step's limit. Only the holdout, read once, is not stopped:
+    it records an excess instead."""
+    if not job_count_ok(jobs, planned, enforce):
+        raise ValueError(f"{label} has {len(jobs)} jobs, the ceiling planned {planned}")
+    budget = study.read("budget")
+    ledger_path = study.out / "ledger.json"
+    spent = json.loads(ledger_path.read_text())["total"] if ledger_path.exists() else 0.0
+    slots = min(study.parallel, len(jobs))
+    estimate = job_seconds(study, kind) * rounds(len(jobs), study.parallel)
+    limit = step_limit(estimate, budget["ceiling_process_hours"] * 3600 - spent, slots)
+    rows, finished, elapsed, process_seconds = run_pool(jobs, worker, study.parallel, limit if enforce else None, label)
+    total = ledger_add(ledger_path, label, process_seconds)
+    name = label.replace(" ", "-")
+    if rows is None:
+        study.write(f"overrun-{name}", {"step": label, "seconds": elapsed, "limit": limit,
+                                        "finished_jobs": finished, "jobs": len(jobs)})
+        raise RuntimeError(f"{label} reached its limit of {limit:.0f} s with {finished}/{len(jobs)} jobs")
+    if elapsed > limit or total > budget["ceiling_process_hours"] * 3600:
+        study.write(f"overrun-{name}", {"step": label, "seconds": elapsed, "limit": limit,
+                                        "process_seconds_total": total})
     return rows
 
 
-PLANNED = {"rule_day": 63 + 45, "log_day": 570, "bc": 10, "cql": 20, "ppo": 10, "offline_day": 225 + 450}
+STEP_JOBS = {"gate": 63, "logs_train": 210, "logs_validation": 75, "train": 5, "ppo": 5,
+             "select": 225, "holdout": 495}
+PLANNED = {"rule_day": STEP_JOBS["gate"], "log_day": 2 * (STEP_JOBS["logs_train"] + STEP_JOBS["logs_validation"]),
+           "bc": 2 * STEP_JOBS["train"], "cql": 4 * STEP_JOBS["train"], "ppo": 2 * STEP_JOBS["ppo"],
+           "offline_day": STEP_JOBS["select"] + STEP_JOBS["holdout"]}
 
 
-def ceiling_hours(seconds_by_kind):
-    """The design's total: every planned job's estimated seconds, times 1.5, in hours."""
-    return sum(PLANNED[k] * seconds_by_kind[k] for k in PLANNED) * OVERRUN / 3600
+def ceiling_hours(seconds_by_kind, pilot_process_seconds=0.0):
+    """The design's total: every planned job's estimated seconds and the pilot's, times 1.5, in
+    hours."""
+    return (sum(PLANNED[k] * seconds_by_kind[k] for k in PLANNED) + pilot_process_seconds) * OVERRUN / 3600
 
 
 def pilot_job(job):
@@ -520,16 +593,21 @@ def pilot(study):
     records = json.loads((study.root / "attempt-1" / f"logs-{PRIMARY}-train.json").read_text())["logs"]
     scale = reward_scale_of(records)
     workers = range(1, study.parallel + 1)
-    regime, day = study.regimes[0], 1
+    day = 1
     k, m = len(study.grid.offsets), len(study.grid.sizes)
     out, trained = {}, None
+    spent = [0.0]
+
     def timed(jobs):
-        return float(np.mean(prior.pool(jobs, pilot_job, study.parallel, "pilot")))
+        seconds = prior.pool(jobs, pilot_job, study.parallel, "pilot")
+        spent[0] += float(np.sum(seconds))
+        return float(np.mean(seconds))
+
     for arm in ("bc", "cql"):
         full = study.design["arms"][arm]["settings"]["gradient_steps"]
         settings = dict(study.design["arms"][arm]["settings"], gradient_steps=PILOT_GRADIENT_STEPS)
         if arm == "cql":
-            settings["alpha"] = 1.0
+            settings["alpha"] = 0.1
         paths = [study.out / "pilot" / f"{arm}-{w}.pt" for w in workers]
         seconds = timed([{"kind": "train", "train": {
             "dataset": PRIMARY, "arm": arm, "seed": w, "settings": settings, "logs": records,
@@ -541,13 +619,13 @@ def pilot(study):
             trained = json.loads(paths[0].with_suffix(".json").read_text())
     edges = study.edges_of(records)
     out["log_day_seconds"] = timed([{"kind": "log", "log": study.job(
-        regime, day, "train", "standard", "as_grid_eps30", None, seed=w, behaviour="as_grid_eps30",
+        study.regimes[w % 3], day, "train", "standard", "as_grid_eps30", None, seed=w, behaviour="as_grid_eps30",
         epsilon=0.3, path=str(study.out / "pilot" / f"log-{w}.npz"))} for w in workers])
     out["rule_day_seconds"] = timed([{"kind": "run", "run": study.job(
-        regime, day, "train", "standard", "as_grid", rule_policy("as_grid"))} for _ in workers])
+        study.regimes[w % 3], day, "train", "standard", "as_grid", rule_policy("as_grid"))} for w in workers])
     out["offline_day_seconds"] = timed([{"kind": "run", "run": study.job(
-        regime, day, "train", "standard", "bc", {"kind": "offline", "metadata": trained},
-        seed_of_arm=1, epsilon=0.3, edges=edges)} for _ in workers])
+        study.regimes[w % 3], day, "train", "standard", "bc", {"kind": "offline", "metadata": trained},
+        seed_of_arm=1, epsilon=0.3, edges=edges)} for w in workers])
     arm = study.m4_05["arms"]["maskable_ppo"]
     ppo = timed([{"kind": "ppo", "ppo": {
         "arm": "pilot", "with_regime": True, "seed": w, "steps": PILOT_PPO_STEPS,
@@ -561,7 +639,12 @@ def pilot(study):
         "rule_day": out["rule_day_seconds"], "log_day": out["log_day_seconds"],
         "offline_day": out["offline_day_seconds"], "bc": out["bc"]["estimate_seconds"],
         "cql": out["cql"]["estimate_seconds"],
-        "ppo": out["ppo_seconds_per_step"] * arm["budget_steps"]})
+        "ppo": out["ppo_seconds_per_step"] * arm["budget_steps"]}, spent[0])
+    report["pilot_process_seconds"] = spent[0]
+    maximum = study.design["compute"]["maximum_process_hours"]
+    report["maximum_process_hours"] = maximum
+    report["stop"] = report["ceiling_process_hours"] > maximum
+    ledger_add(study.out / "ledger.json", "pilot", spent[0])
     return study.write("budget", report)
 
 
@@ -573,7 +656,7 @@ def gate(study):
     first = study.days("validation")[0]
     repeats = [study.job(regime, first, "validation", "standard", "fixed_spread_4",
                          rule_policy("fixed_spread_4")) for regime in study.regimes]
-    rows = pool(jobs + repeats, run_job, study, "gate", "rule_day")
+    rows = pool(jobs + repeats, run_job, study, "gate", "rule_day", STEP_JOBS["gate"])
     runs, again = rows[:len(jobs)], rows[len(jobs):]
     summary = prior.gate_summary(runs)
     reference = {(r["regime"], r["day"]): r["net"] for r in runs
@@ -601,7 +684,7 @@ def run_logs(study, dataset, split):
                       path=str(study.out / "logs" / dataset / split / regime / f"day-{day}" / f"seed{seed}.npz"))
             for regime in study.regimes for day in study.days(split) for seed in seeds]
     report = study.header(f"logs {dataset} {split}")
-    report["logs"] = pool(jobs, log_job, study, f"logs {dataset} {split}", "log_day")
+    report["logs"] = pool(jobs, log_job, study, f"logs {dataset} {split}", "log_day", STEP_JOBS[f"logs_{split}"])
     return study.write(f"logs-{dataset}-{split}", report)
 
 
@@ -653,7 +736,7 @@ def run_train(study, dataset, arm, alpha=None):
              "commit": study.commit,
              "path": str(study.out / "checkpoints" / dataset / f"{tag}-seed{seed}.pt")}
             for seed in study.design["arms"]["training_seeds"]]
-    rows = pool(jobs, train_job, study, f"train {dataset} {tag}", arm)
+    rows = pool(jobs, train_job, study, f"train {dataset} {tag}", arm, STEP_JOBS["train"])
     report = study.header(f"train {dataset} {tag}")
     report.update({"runs": rows, "reward_scale": scale,
                    "stop": not all(r["finished"] for r in rows)})
@@ -696,7 +779,7 @@ def run_ppo(study, variant):
              "commit": study.commit, "path": str(study.out / "checkpoints" / name / f"seed{seed}")}
             for seed in study.design["arms"]["training_seeds"]]
     report = study.header(name)
-    report["runs"] = pool(jobs, ppo_job, study, name, "ppo")
+    report["runs"] = pool(jobs, ppo_job, study, name, "ppo", STEP_JOBS["ppo"])
     return study.write(name, report)
 
 
@@ -714,7 +797,7 @@ def select(study):
                                   {"kind": "offline", "metadata": run}, seed_of_arm=run["seed"],
                                   epsilon=study.epsilon(PRIMARY), edges=edges)
                         for regime in study.regimes for day in study.days("validation"))
-    rows = pool(jobs, run_job, study, "select", "offline_day")
+    rows = pool(jobs, run_job, study, "select", "offline_day", STEP_JOBS["select"])
     for row in rows:
         row.pop("support_raw", None)
         row.pop("support_bins", None)
@@ -851,7 +934,7 @@ def holdout(study, frozen_sha256):
     with os.fdopen(descriptor, "w") as marker:
         marker.write(json.dumps({"commit": study.commit, "frozen_sha256": frozen_sha256,
                                  "attempt": study.out.name, "jobs": len(jobs), "at": time.time()}))
-    rows = pool(jobs, run_job, study, "holdout", "offline_day", enforce=False)
+    rows = pool(jobs, run_job, study, "holdout", "offline_day", STEP_JOBS["holdout"], enforce=False)
     for job, row in zip(jobs, rows, strict=True):
         row["dataset"] = job.get("dataset")
     support = support_report(study, rows)
