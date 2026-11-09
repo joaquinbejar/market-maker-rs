@@ -1,8 +1,8 @@
 # Research consolidation (#114): draft
 
 **Status: draft.** The decisions below are proposals for review, not adopted decisions. Nothing
-here authorizes deployment or live trading. Closure notes for #102, #104 and #106 are pending and
-may change the rows for those issues. The row for #108 has a marked placeholder.
+here authorizes deployment or live trading. The row for #108 has a marked placeholder. The closing
+comment on each closed issue states its limits and governs over any summary here.
 
 Commits are the merge commits on `main`. Detailed tables, hashes and commands stay in each
 experiment's `README.md`, its `design.json` and its issue, and are not copied here.
@@ -38,9 +38,9 @@ Common limits, which apply to every learned-policy row unless it says otherwise:
 
 | Issue | Experiment | Paper | Commit | Data | Result | Proposed |
 |---|---|---|---|---|---|---|
-| #102 classical, pure RL, residual RL | `m4_05` | none named | `26f388ca1` | SYNTHETIC, QR regimes, 10 s | Maskable PPO learned not to trade: equivalent to no-trade, "revise". Residual SAC -27.95 a day pooled, "discard" against GLFT, +41.96 against the Avellaneda-Stoikov it corrects. No quoting arm made money. GLFT's exact quote was refused on 88.5 % of decisions (#264). | No-go. Note pending. |
+| #102 classical, pure RL, residual RL | `m4_05` | none named | `26f388ca1` | SYNTHETIC, QR regimes, 10 s | Maskable PPO learned not to trade: equivalent to no-trade, "revise". Residual SAC -27.95 a day pooled, "discard" against GLFT, +41.96 against the Avellaneda-Stoikov it corrects. No quoting arm made money. GLFT's exact quote was refused on 88.5 % of decisions (#264), so the discard against it is a weak comparison. | No-go. Closed with reduced scope by the owner. |
 | #103 memory and frequency | `m4_06` | arXiv 2407.21025v1 | `e1191ec18` | SYNTHETIC, QR regimes, 1 s | At the primary fee no memory or frequency effect shown; of 12 learned pairs, 7 equivalent to no-trade, 5 worse, none better. At 0.0002, all 12 worse than no-trade. The fee rule's reading is disclosed. | No-go |
-| #104 offline evaluation support | `m4_07` | arXiv 2408.02322v2 | `e143926b2` | SYNTHETIC; REAL for a state coverage diagnostic only | No-go on every target and log. Importance sampling's interval held the truth in 2 of 24 rows. On the capture, offline learning or evaluation is a no-go by construction. | No-go. Note pending. |
+| #104 offline evaluation support | `m4_07` | arXiv 2408.02322v2 | `e143926b2` | SYNTHETIC; REAL for a state coverage diagnostic only | No-go on every target and log. Importance sampling's interval held the truth in 2 of 24 rows. On the capture, offline learning or evaluation is a no-go by construction. A correction after the holdout changed no decision. | No-go. Closed as a documented no-go. |
 | #105 constrained RL | `m4_08` | arXiv 1705.10528v1 | `15fb184a6`, stress `4f247a150` | SYNTHETIC, QR regimes, shocks | Penalized PPO's lower cost is the cost of not trading (5 of 5 seeds never filled). CPO better than PPO on cost in 4 of 12 rows, with a net interval including 0. Under the margin-stress holdout, CPO has more non-healthy states than Avellaneda-Stoikov. Not a safety guarantee. | No-go |
 | #280 offline training | `m4_11` | none named | `0458d929b` | SYNTHETIC | Stopped at its behaviour cloning sanity rule; holdout never read. | Closed by stop rule |
 | #309 offline training, regime in input | `m4_11_regime` | none named | `246cd7aab` | SYNTHETIC | No offline policy better than an interactive one. PPO comparators never traded, undiagnosed. CQL at equal information chose not trading. New experiment motivated by #280, not its continuation. | No-go |
@@ -49,22 +49,22 @@ Common limits, which apply to every learned-policy row unless it says otherwise:
 
 | Issue | Experiment | Paper | Commit | Data | Result | Proposed |
 |---|---|---|---|---|---|---|
-| #106 MDQR generator | `m5_01` | arXiv 2501.08822v1 | `049e8fcba` | S0 SYNTHETIC; main study REAL, reused holdout, exploratory | Discarded by its frozen rule: best-queue correlation fails against both QR arms, and the transfer cannot pass because all 13 policies have zero fills on the QR arms' rows. All 9 primary queue-size comparisons pass, against QR arms that are transient on this epoch. | Discard. Note pending. |
+| #106 MDQR generator | `m5_01` | arXiv 2501.08822v1 | `049e8fcba` | S0 SYNTHETIC; main study REAL, reused holdout, exploratory | Discarded by its frozen rule: best-queue correlation fails against both QR arms, and the transfer cannot pass because all 13 policies have zero fills on the QR arms' rows. All 9 primary queue-size comparisons pass, against QR arms that are transient or saturated on this epoch. | Discard. Closed with waivers by the owner. |
 | #107 HSN | `m5_02` | arXiv 2610.16524v1 | `811b3063a` | SYNTHETIC | Paper's exponential tie reproduced; power-law gain not reproduced. A fixed spread does as well as any memory there. On #103's protocol and Hawkes flow, HSN helps nowhere. | No-go |
 | #108 adversarial robustness | `m5_03` | arXiv 2609.22785v1 | `64aa49036` | SYNTHETIC, perturbed QR regimes | Every quoting arm loses much more under the adversary's flow. PPO barely trades. See the placeholder below. | **Placeholder** |
 | #109 consistent time travel | `time_travel_queues` example | arXiv 2408.02322v2 | `c9ebe4f96` | SYNTHETIC with a truth; REAL without one | On synthetic data, time travel's error is about that of an independent path. On the capture it changes outcomes a lot, and that is not evidence of impact. | No-go; keep chronological replay |
 | #110 quote duration (Relaver) | `m4_10` | arXiv 2505.12465v1 | `dd4e73d05` | SYNTHETIC, QR regimes, 100 ms | Duration was not learned: 1-row duration on over 99.7 % of decisions. Its one "helps" compares not trading with losing a little. | No-go on the order book |
 | #289 frequent batch auction toy | `m5_05_batch` | arXiv 2505.12465v1 | `8771c2549` | SYNTHETIC, a toy with other rules | Weak duration effect at one latency of three at fee 0; none at 0.0002. Avellaneda-Stoikov's mean exceeds both learned arms. Never comparable with the order book results. | No claim beyond the toy |
-| #111 quadratic rough Heston | `m5_07` | arXiv 2212.10164v1, 2107.01611 | `4bb36db9b` | SYNTHETIC at SPX/VIX parameters | Do not adopt: control checks not passed and the greedy rule is worse in mean P&L than always quoting within the bounds, where the gate does not bind. Lower standard deviation, not at matched risk. Stage B pending on OptionStratLib#974; stage C not run. The paper's V0 and x* were not reproduced. | Do not adopt |
+| #111 quadratic rough Heston | `m5_07` | arXiv 2212.10164v1, 2107.01611 | `4bb36db9b` | SYNTHETIC at SPX/VIX parameters | Do not adopt: control checks not passed and the greedy rule is worse in mean P&L than always quoting within the bounds, where the gate does not bind. Lower standard deviation, not at matched risk. Stage B pending on OptionStratLib#974; stage C not run. The paper's V0 and x* were not reproduced. | Do not adopt. Closed on stage A alone by the owner. |
 | #112 regime adaptation and transfer | `m5_08` | arXiv 1901.08938v1 | `5da0d96f6` | SYNTHETIC only | No-go on both comparisons, every simulator and execution group. | No-go |
 | #281 adversarial training | `m5_05` | none named | `4eca6e6dd` | SYNTHETIC | No gain shown: A minus B in CVaR5 loss +6.39 [-2.94, 13.98], at a cost of 3.32 a day of net. Holdout resumed once after an external kill, disclosed. | No-go on this evidence; open |
 | #282 policies under impact | `m5_04` | none named | `e88bdf6b7` | SYNTHETIC | **Did not complete**: 7617 of 8981 jobs, no freeze, no holdout. | No result |
 | #113 multi-agent feasibility | none, API reading | arXiv 2407.21025v1 | none | none | Prototype postponed; nothing run. | Postpone |
 | arbitrage-rs#6 deep hedging | outside this repo | see that issue | not reviewed | not reviewed | **Not reviewed in this draft.** | Open |
 
-**#108 PLACEHOLDER.** To be completed when #108's closure is decided. Known so far: its learned
-criterion on impact stays open, and margin was not measured beyond a made-up capital that #102's
-notional limit makes a shortfall of 0 by construction.
+**#108 PLACEHOLDER.** To be completed when #108's pending work merges and it closes, with margin
+not measured: the only figure is a requirement against a made-up capital of 250, which #102's
+notional limit makes a shortfall of 0 by construction. Its learned criterion on impact stays open.
 
 ## Product matrix
 
@@ -126,9 +126,10 @@ These stay visible, and none is closed by this document.
 | #112 | **No-go with H not run**: the Hyperliquid capture was not evaluated, and no real-data claim is made. S3, the neural simulator, also not run. |
 | #281 | **Impact condition not run yet**: 13 held-out conditions, not 14. |
 | #108 | **Margin not measured**, and its criterion on impact is open. Placeholder above. |
-| #111 | Stages B and C not run; Example 3 coded, not run; Example 2's decoupled cell not runnable. |
-| #106 | Hawkes arm failed as unstable; the consistency check is uninformative for maskable PPO. |
-| #102 | Hedging, alpha and margin not run. Queue position absent. |
+| #111 | Closed on stage A alone. Stages B and C not run; Example 3 coded, not run; Example 2's decoupled cell not runnable. |
+| #106 | Waived by the owner given the discard: snapshot and restore compatibility untested; determinism shown only by synthetic tests, with no real-data repeat; event size laws not compared against QR; toolchain versions not recorded. The Hawkes arm failed as unstable; the transfer's consistency check is uninformative for maskable PPO. |
+| #102 | Closed with reduced scope. Alpha and hedge ablations not run; queue and latency ablations degenerate (#267, #268) and not rerun after those fixes; markout not measured; rejections not in the posted tables; capital is peak notional and inventory, without margin. The conclusions do not extend to binding queues, real latency or real data. |
+| #104 | Logs have no explicit terminal or per-decision execution column; censoring not analysed separately; outputs recorded by sha256, not committed. A go would need new logged data with recorded propensities. |
 | Margin | margin-rs stress scenarios unused by #111; #105 reports a recorded assessment only. |
 | Real execution | No study has our own orders, fills or queue position on a real venue. |
 | arbitrage-rs#6 | Deep hedging not reviewed here. |
