@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
+### Added
+
 - The MDQR study of #106 in `bridges/python/experiments/m5_01`: a neural order book generator, a
   block clock and a size head, trained on Hyperliquid BTC order flow from December 2025 against
   queue-reactive, Hawkes and Poisson controls, after a synthetic recovery check. Real data, an
@@ -13,9 +17,6 @@ project follows [Semantic Versioning](https://semver.org/).
   fits queue sizes far better than the queue-reactive arms, but the best queues' correlation
   fails against both, and the transfer rule cannot pass because every policy has zero fills on
   those arms' rows. Hawkes failed as unstable. Experiment only; no public API change.
-
-### Added
-
 - Quotes that expire at the venue as an RL action (#297). `RlConfig::with_quote_lives` takes
   up to 8 strictly increasing lives in nanoseconds and adds `RlAction::ExpiringQuote`, of action
   space version 5 (`EXPIRY_ACTION_SPACE_VERSION`), with an `EX` section in the fingerprint only
@@ -914,6 +915,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- The crate's own `Side` enum is gone from `execution`, `events` and the `prelude`: every order,
+  fill and query side is `financial_types::Action`, and `events::OptionStyle` is
+  `financial_types::OptionStyle`, both re-exported from the `prelude`.
+- `cargo-semver-checks` also reports `FillModel` and `AlertHandler` as newly sealed. They are not
+  sealed: code outside the crate still implements both, as the documentation test of
+  `AlertHandler` and the crate's integration tests do. The change to them is the `MMResult` return
+  of `FillModel::simulate_fill` and `AlertHandler::handle`, listed below.
 - `rl::RlConfig` gains the public field `quote_lives` (#297), so a struct literal must name it
   (`RlConfig::new` sets `None`). `rl::ActionSpace` gains `expiry` and `rl::RlAction`
   `ExpiringQuote`; both are `#[non_exhaustive]`.

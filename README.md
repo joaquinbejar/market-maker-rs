@@ -15,8 +15,12 @@
 ## Market Making Library
 
 A comprehensive Rust library implementing quantitative market making strategies based on
-the Avellaneda-Stoikov model and extensions. This library provides production-ready
-components for building automated market making systems for financial markets.
+the Avellaneda-Stoikov model and extensions. It provides components for building
+automated market making systems, causal backtests of them, and a deterministic kernel
+that an external reinforcement learning trainer can step.
+
+A live deployment still needs its own exchange connectivity, monitoring and validation:
+the results in this repository are simulations and replays, not evidence of profit.
 
 ### Overview
 
@@ -42,6 +46,9 @@ liquidity to the market.
 - **Grid Trading**: Multi-level order placement with geometric/arithmetic spacing
 - **Adaptive Spread**: Dynamic spread adjustment based on order book imbalance
 - **Depth-Based Offering**: Size adjustment based on market depth
+- **Signal Quotes**: Causal, bounded quote adjustment from order book imbalance (`strategy::signal_quote`)
+- **Walk-Forward Calibration**: Chronological splits and causal calibration, with venues that close (`strategy::walk_forward`)
+- **Joint Quotes**: Closed-form quotes for correlated assets (feature `multi-underlying`)
 
 #### Risk Management
 
@@ -59,6 +66,7 @@ liquidity to the market.
 - **Order Intensity Estimation**: Fill rate modeling for parameter calibration
 - **Live Metrics**: Real-time operational metrics with atomic counters
 - **Prometheus Export**: Optional metrics export with Grafana dashboard
+- **Micro-Price**: Stoikov's micro-price (`analytics::micro_price`)
 
 #### Backtesting
 
@@ -66,6 +74,15 @@ liquidity to the market.
 - **Fill Models**: Immediate, queue position, probabilistic, market impact
 - **Performance Metrics**: Sharpe, Sortino, Calmar, max drawdown, profit factor
 - **Slippage Models**: Fixed, percentage, volatility-based
+- **Evaluation Harness**: Experiments that compare strategies under one set of rules, metric
+  attribution, fee scenarios and block bootstrap intervals (`backtest::evaluation`)
+- **Order Flow Simulators**: A seedable queue-reactive simulator, with an opt-in reference that
+  reacts to the agent (`backtest::queue_reactive`), and the QRH-I queue-reactive Hawkes model
+  with seasonality (`backtest::hawkes`)
+- **Hyperliquid Replay**: Decoders for its streams and a rebuilt book sampled on a time grid
+  (`backtest::hyperliquid`, feature `serde`)
+- **Derivative Contracts**: Several dated futures against one ledger, perpetual funding,
+  contract lifecycle and initial margin before an order (features `margin` and `instruments`)
 
 #### Execution
 
@@ -90,6 +107,23 @@ liquidity to the market.
 - **Chain-Level Risk**: Aggregate Greeks across the chain
 - **ATM Detection**: Automatic spread adjustment for ATM options
 - **Chain Risk Manager**: Chain-wide limits and hedging
+
+#### Reinforcement Learning Support (Features: `kernel`, `rl`)
+
+- **Financial Kernel**: The backtest loop as a resumable, `Copy` state machine with a canonical
+  encoding, exactly equivalent to the engine inside its documented subset
+- **Versioned Spaces**: Observations, actions, masks and a `Decimal` reward that reconciles with
+  the evaluation harness
+- **Quote Control**: Cancel-only actions and quotes that expire at the venue, exact in venue time
+- **Hedging**: A hedge lane in a second instrument, and a balance gate through `margin-rs`
+- **Residual Policies**: Corrections on top of a classical quote
+- **Python Bridge**: `bridges/python`, a nested crate outside this package, for external trainers
+
+#### Options, Surfaces and Settlement (Feature: `options`)
+
+- **Pricing**: European option valuation (`options::pricing`)
+- **Volatility Surfaces**: SVI slices and surfaces, calibration and upstream surfaces (`options::surface`)
+- **Settlement**: Option positions held and settled in a `margin-rs` ledger (`options::settlement`, with `margin`)
 
 #### Parameter Calibration
 
@@ -131,7 +165,7 @@ Where:
 - [`backtest`]: Historical simulation with fill models and metrics
 - [`types`]: Common types, decimals, and error definitions
 - [`prelude`]: Convenient re-exports of commonly used types
-- `options`: Options pricing, Greeks, and market making (feature: `options`)
+- `options`: Options pricing, surfaces, Greeks, settlement and market making (feature: `options`)
 - `chain`: Option chain integration and multi-strike quoting (feature: `chain`)
 - `api`: REST/WebSocket API layer (feature: `api`)
 - `persistence`: Data persistence layer (feature: `persistence`)
@@ -145,6 +179,7 @@ Where:
   (feature: `instruments`, with `margin` for the conversion), and the net edge
   of a spot and a dated future, a calendar spread under an assumed exit and a
   roll plan (feature: `arbitrage`)
+- `rl`: Versioned observation, action and reward spaces over the kernel (feature: `rl`)
 
 ### Quick Start
 
@@ -233,6 +268,15 @@ crate's own serialization support.
   for an external RL trainer or engine: features a real agent could know, masks
   apart from the hard limits, and a `Decimal` reward that reconciles with
   `backtest::evaluation`, with the `f32` derived from it. Implies `kernel`.
+
+### Research Status
+
+The 0.7.0 cycle added an out-of-sample research program under `bridges/python/experiments`,
+which is not part of the published crate. Each study fixes its design before reading its
+holdout and reports negative results. So far no learned policy has been shown to beat the
+classical quotes out of sample, so the crate recommends none. Most of these studies are
+synthetic, and some remain open: treat their conclusions as limited to the setting each report
+states.
 
 ### Examples
 
