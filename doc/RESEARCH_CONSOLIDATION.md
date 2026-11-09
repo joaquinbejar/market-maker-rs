@@ -43,7 +43,7 @@ Common limits, which apply to every learned-policy row unless it says otherwise:
 | #104 offline evaluation support | `m4_07` | arXiv 2408.02322v2 | `e143926b2` | SYNTHETIC; REAL for a state coverage diagnostic only | No-go on every target and log. Importance sampling's interval held the truth in 2 of 24 rows. On the capture, offline learning or evaluation is a no-go by construction. A correction after the holdout changed no decision. | No-go. Closed as a documented no-go. |
 | #105 constrained RL | `m4_08` | arXiv 1705.10528v1 | `15fb184a6`, stress `4f247a150` | SYNTHETIC, QR regimes, shocks | Penalized PPO's lower cost is the cost of not trading (5 of 5 seeds never filled). CPO better than PPO on cost in 4 of 12 rows, with a net interval including 0. Under the margin-stress holdout, CPO has more non-healthy states than Avellaneda-Stoikov. Not a safety guarantee. | No-go |
 | #280 offline training | `m4_11` | none named | `0458d929b` | SYNTHETIC | Stopped at its behaviour cloning sanity rule; holdout never read. | Closed by stop rule |
-| #309 offline training, regime in input | `m4_11_regime` | none named | `246cd7aab` | SYNTHETIC | No offline policy better than an interactive one. PPO comparators never traded, undiagnosed. CQL at equal information chose not trading. New experiment motivated by #280, not its continuation. | No-go |
+| #309 offline training, regime in input | `m4_11_regime` | none named | `246cd7aab` | SYNTHETIC | No offline policy better than an interactive one. PPO comparators never traded, undiagnosed. CQL's chosen alpha does not trade on the primary dataset; on `standard_eps10` it trades and loses. New experiment motivated by #280, not its continuation. | No-go |
 
 ### M5: components
 
@@ -54,7 +54,7 @@ Common limits, which apply to every learned-policy row unless it says otherwise:
 | #108 adversarial robustness | `m5_03` | arXiv 2609.22785v1 | `64aa49036` | SYNTHETIC, perturbed QR regimes | Every quoting arm loses much more under the adversary's flow. PPO barely trades. See the placeholder below. | **Placeholder** |
 | #109 consistent time travel | `time_travel_queues` example | arXiv 2408.02322v2 | `c9ebe4f96` | SYNTHETIC with a truth; REAL without one | On synthetic data, time travel's error is about that of an independent path. On the capture it changes outcomes a lot, and that is not evidence of impact. | No-go; keep chronological replay |
 | #110 quote duration (Relaver) | `m4_10` | arXiv 2505.12465v1 | `dd4e73d05` | SYNTHETIC, QR regimes, 100 ms | Duration was not learned: 1-row duration on over 99.7 % of decisions. Its one "helps" compares not trading with losing a little. | No-go on the order book |
-| #289 frequent batch auction toy | `m5_05_batch` | arXiv 2505.12465v1 | `8771c2549` | SYNTHETIC, a toy with other rules | Weak duration effect at one latency of three at fee 0; none at 0.0002. Avellaneda-Stoikov's mean exceeds both learned arms. Never comparable with the order book results. | No claim beyond the toy |
+| #289 frequent batch auction toy | `m5_05_batch` | arXiv 2505.12465v1 | `8771c2549` | SYNTHETIC, a toy with other rules | Weak duration effect at one latency of three at fee 0. At 0.0002 the duration arm is worse than without duration at every latency, each interval below 0. Avellaneda-Stoikov's mean exceeds both learned arms. Never comparable with the order book results. | No claim beyond the toy |
 | #111 quadratic rough Heston | `m5_07` | arXiv 2212.10164v1, 2107.01611 | `4bb36db9b` | SYNTHETIC at SPX/VIX parameters | Do not adopt: control checks not passed and the greedy rule is worse in mean P&L than always quoting within the bounds, where the gate does not bind. Lower standard deviation, not at matched risk. Stage B pending on OptionStratLib#974; stage C not run. The paper's V0 and x* were not reproduced. | Do not adopt. Closed on stage A alone by the owner. |
 | #112 regime adaptation and transfer | `m5_08` | arXiv 1901.08938v1 | `5da0d96f6` | SYNTHETIC only | No-go on both comparisons, every simulator and execution group. | No-go |
 | #281 adversarial training | `m5_05` | none named | `4eca6e6dd` | SYNTHETIC | No gain shown: A minus B in CVaR5 loss +6.39 [-2.94, 13.98], at a cost of 3.32 a day of net. Holdout resumed once after an external kill, disclosed. | No-go on this evidence; open |
@@ -87,7 +87,7 @@ The learned studies use one abstract instrument, so they are **not evidence for 
 
 | Component | Proposal | Basis and limit |
 |---|---|---|
-| Avellaneda-Stoikov, GLFT, fixed spread | Keep as baselines | Comparators only: they lost in these simulators. Not evidence of profitability. |
+| Avellaneda-Stoikov, GLFT, fixed spread | Keep as baselines | Comparators only. They lost in the order book simulators at these fees; Avellaneda-Stoikov is positive in #289's toy at fee 0, and a fixed spread scores above the learned arms in #107's part A. Neither is evidence of profitability on a market. |
 | Pure RL, residual RL | No-go for adoption | #102. The research code stays as evidence. |
 | Memory, HSN, decision frequency | No-go | #103, #107 |
 | Learned quote duration | No-go on the order book | #110. #297's venue-time expiry remains a crate feature, with no study of a policy using it. |
