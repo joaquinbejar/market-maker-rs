@@ -6,6 +6,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The study of #282 in `bridges/python/experiments/m5_04`, not completed: the design, runner and
+  holdout report of learned policies against a market that reacts to their orders, on synthetic
+  days. The selection reached its process-hour limit with 7617 of 8981 jobs written, so nothing
+  was frozen, the holdout never ran, and there is no result and no claim.
+
 ## [0.7.0] - 2026-11-09
 
 ### Added

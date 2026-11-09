@@ -121,7 +121,7 @@
     "estimate": "about 50-65 process-hours for selection and holdout",
     "max_parallel_runs": 4,
     "threads_per_run": 1,
-    "slots": "only when the coordinator assigns them"
+    "slots": "only when assigned"
   },
   "changes": [
     {
