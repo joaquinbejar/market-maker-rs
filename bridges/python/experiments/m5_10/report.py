@@ -105,10 +105,26 @@ def secondary_table(rows, primary_rows, identify=None, secondary_picks=None, pri
                                / (p["formula"] / base_point["formula"]),
                                "empty_share": p["empty_share"], "cap_share": p["cap_share"]}
         out.append({"label": "not identified by the frozen rate test, exploratory", "setting": setting, "arm": arm,
-                    "condition": condition, "mean_net": float(values.mean()), "cvar5_loss": stats.cvar_loss(values),
-                    "against_unperturbed": interval, "against_no_trade": against_hold,
-                    "reading": stats.reading(interval), "points_rate_test": ratios})
+                    "condition": condition, **metrics(by_day), "against_unperturbed": interval, "against_no_trade": against_hold,
+                    "reading": stats.reading(interval), "points_rate_test": ratios,
+                    "selection_loss": (secondary_picks or {}).get(f"{setting}/{arm}", {}).get("selection_loss")
+                    if condition == "secondary_adversary" else None,
+                    "holdout_mean_loss": -float(values.mean()) if condition == "secondary_adversary" else None})
     return out
+
+
+def metrics(by_day):
+    """The metrics shared by the primary's and the secondary's rows."""
+    values = series(by_day, net)
+    return {"mean_net": float(values.mean()), "cvar5_loss": stats.cvar_loss(values),
+            "max_abs_position": largest(by_day, lambda r: attribution(r, "max_abs_position")),
+            "mean_abs_position": float(series(by_day, lambda r: attribution(r, "mean_abs_position")).mean()),
+            "max_drawdown": largest(by_day, lambda r: attribution(r, "max_drawdown")),
+            "refusals": int(sum(r["result"]["episode"]["refusals"] for day in by_day.values() for r in day)),
+            "attribution_mean": {k: float(series(by_day, lambda r: attribution(r, k)).mean())
+                                 for k in ("spread_capture", "inventory_pnl")},
+            "margin_requirement_max": largest(by_day, requirement),
+            "limit_breaches": int(sum(breach(r) for day in by_day.values() for r in day))}
 
 
 def tables(rows, selected):
@@ -117,15 +133,7 @@ def tables(rows, selected):
     out = []
     for (setting, arm, condition), by_day in sorted(grouped.items()):
         values = series(by_day, net)
-        entry = {"setting": setting, "arm": arm, "condition": condition, "mean_net": float(values.mean()),
-                 "cvar5_loss": stats.cvar_loss(values), "max_abs_position": largest(by_day, lambda r: attribution(r, "max_abs_position")),
-                 "mean_abs_position": float(series(by_day, lambda r: attribution(r, "mean_abs_position")).mean()),
-                 "max_drawdown": largest(by_day, lambda r: attribution(r, "max_drawdown")),
-                 "refusals": int(sum(r["result"]["episode"]["refusals"] for day in by_day.values() for r in day)),
-                 "attribution_mean": {k: float(series(by_day, lambda r: attribution(r, k)).mean())
-                                      for k in ("spread_capture", "inventory_pnl")},
-                 "margin_requirement_max": largest(by_day, requirement),
-                 "limit_breaches": int(sum(breach(r) for day in by_day.values() for r in day))}
+        entry = {"setting": setting, "arm": arm, "condition": condition, **metrics(by_day)}
         base = grouped.get((setting, arm, "unperturbed"))
         if base is not None and condition != "unperturbed":
             interval = stats.paired_interval(values - series(base, net))
@@ -160,12 +168,16 @@ def main(out, identify_path):
     out = pathlib.Path(out)
     rows = json.loads((out / "holdout.json").read_text())
     secondary_path = out / "holdout_secondary.json"
+    failed_path = out / "holdout_secondary_failed.json"
+    failure = json.loads(failed_path.read_text()) if failed_path.exists() else None
     secondary = json.loads(secondary_path.read_text()) if secondary_path.exists() else []
     frozen = json.loads((out / "frozen.json").read_text())
     selected = frozen["selected"]
     identify = json.loads(pathlib.Path(identify_path).read_text())
     (out / "report.json").write_text(json.dumps({"notes": NOTES, "rows": tables(rows, selected),
-                                                     "secondary": secondary_table(secondary, rows, identify, frozen["selected_secondary"], selected),
+                                                     "secondary_failure": failure,
+                                                     "secondary": None if failure else secondary_table(
+                                                         secondary, rows, identify, frozen["selected_secondary"], selected),
                                                      "not_run": not_run(json.loads(pathlib.Path(identify_path).read_text()))}, indent=1))
 
 

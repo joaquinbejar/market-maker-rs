@@ -95,3 +95,22 @@ def test_a_reused_pick_is_relabelled_only_in_the_secondary():
     out = rep.secondary_table([], base, None, picks, primary)
     assert [(r["arm"], r["condition"]) for r in out] == [("mlp", "secondary_adversary")]
     assert all(r["condition"] != "secondary_adversary" for r in base)
+
+
+def test_secondary_shares_the_primary_metrics():
+    extra = [row("mlp", "secondary_fixed_stress", d, 0.0, 1) for d in range(1, 31)]
+    r = rep.secondary_table(extra, rows())[0]
+    for key in ("max_abs_position", "mean_abs_position", "max_drawdown", "refusals", "attribution_mean",
+                "margin_requirement_max", "limit_breaches"):
+        assert key in r
+
+
+def test_a_failed_secondary_prints_no_table(tmp_path):
+    import json
+    (tmp_path / "holdout.json").write_text(json.dumps(rows()))
+    (tmp_path / "frozen.json").write_text(json.dumps({"selected": selected(), "selected_secondary": {}}))
+    (tmp_path / "holdout_secondary_failed.json").write_text(json.dumps({"error": "x"}))
+    (tmp_path / "i").write_text("{}")
+    rep.main(tmp_path, tmp_path / "i")
+    out = json.loads((tmp_path / "report.json").read_text())
+    assert out["secondary"] is None and out["secondary_failure"] == {"error": "x"}
