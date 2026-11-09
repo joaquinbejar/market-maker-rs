@@ -63,7 +63,12 @@ def test_largest_is_over_seeds_and_not_averaged():
     assert table[("mlp", "adversary")]["refusals"] == 60
 
 
-def test_not_run_lists_removals_and_shares():
-    identify = {"s": {"void": False, "removed": ["x"], "spectral_removed": [],
-                      "points": {"y": {"empty_share": 0.1, "cap_share": 0.2}}}}
-    assert rep.not_run(identify)["s"]["shares"]["y"] == {"empty": 0.1, "cap": 0.2}
+def test_not_run_names_conditions():
+    fixed = rep.point_id(rep.grid.fixed_stress(0.0))
+    identify = {"impact_0": {"void": False, "removed": [fixed], "spectral_removed": [],
+                             "points": {"y": {"empty_share": 0.1, "cap_share": 0.2}}},
+                "impact_low": {"void": True, "removed": ["u"], "spectral_removed": [], "points": {}}}
+    out = rep.not_run(identify)
+    assert out["impact_0"]["conditions_not_run"] == ["fixed_stress"]
+    assert len(out["impact_low"]["conditions_not_run"]) == 4
+    assert out["impact_0"]["shares"]["y"] == {"empty": 0.1, "cap": 0.2}

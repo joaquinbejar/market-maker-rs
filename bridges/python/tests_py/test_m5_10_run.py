@@ -114,7 +114,7 @@ def test_spectral_failures_are_listed_not_fatal():
 def manifest(tmp_path):
     for name in ("selection.json", "d", "i", "p", "design", "hd"):
         (tmp_path / name).write_text("{}")
-    sha = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"], tmp_path / "d")
+    sha = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"], tmp_path / "d", tmp_path / "d")
     (tmp_path / "holdout_days.json").write_text(json.dumps(
         {"frozen_sha256": sha, "digests_sha256": r.sha256(tmp_path / "hd")}))
     return sha
@@ -215,10 +215,10 @@ def test_a_torn_middle_line_is_an_error(tmp_path):
 def test_freeze_is_single_and_hashes_inputs(tmp_path):
     for name in ("selection.json", "d", "i", "p", "design"):
         (tmp_path / name).write_text("{}")
-    digest = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"], tmp_path / "d")
+    digest = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"], tmp_path / "d", tmp_path / "d")
     assert digest == r.sha256(tmp_path / "frozen.json")
     with pytest.raises(SystemExit, match="already"):
-        r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [], tmp_path / "d")
+        r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [], tmp_path / "d", tmp_path / "d")
 
 
 def test_holdout_refuses_another_freeze_before_any_marker(tmp_path):
@@ -276,6 +276,36 @@ def test_checkpoints_are_checked_against_the_manifest(tmp_path):
 def test_first_attempt_refuses_an_existing_journal(tmp_path, monkeypatch):
     (tmp_path / "holdout.jsonl").write_text("")
     monkeypatch.setattr(r, "verify_manifest", lambda *_: {"design_sha256": "a" * 64})
+    monkeypatch.setattr(r, "removed_points", lambda *_: {})
     with pytest.raises(SystemExit, match="only a recovery"):
         r.holdout_step(tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, "x", tmp_path / "m", 1)
     assert not (tmp_path / "m").exists()
+
+
+def test_void_setting_has_no_holdout_jobs():
+    base = r.point_id(r.grid.points(0.0)[0])
+    picks = {k: v for k, v in selected().items() if not k.startswith("impact_0/")}
+    jobs = r.holdout_jobs(picks, removed={"impact_0": {base}})
+    assert not any(j["policy"]["setting"] == "impact_0" for j in jobs) and len(jobs) == 3120
+
+
+def test_a_failing_context_leaves_no_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(r, "verify_manifest", lambda *_: {"design_sha256": "a" * 64, "selected": {}})
+    monkeypatch.setattr(r, "removed_points", lambda *_: {})
+    monkeypatch.setattr(r, "holdout_jobs", lambda *_, **__: [])
+    def boom(*_):
+        raise SystemExit("missing checkpoint")
+    monkeypatch.setattr(r, "context", boom)
+    with pytest.raises(SystemExit, match="missing"):
+        r.holdout_step(tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, "x", tmp_path / "m", 1)
+    assert not (tmp_path / "m").exists()
+
+
+def test_a_failed_run_is_charged(tmp_path):
+    pilot = tmp_path / "p.jsonl"
+    pilot.write_text(json.dumps({"seconds": 1}) + "\n")
+    budget = r.Budget(tmp_path, pilot)
+    ctx = {"out": str(tmp_path), "checkpoints": "", "classical": {}, "digests": {}}
+    with pytest.raises(Exception):
+        r.run_pool("t", r.pilot_jobs()[:1], tmp_path / "j", 1, ctx, budget, {"no_trade": 600})
+    assert any(json.loads(x)["step"] == "t" for x in budget.path.read_text().splitlines())

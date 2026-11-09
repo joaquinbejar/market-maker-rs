@@ -71,6 +71,8 @@ def policy_key(policy):
 def holdout_jobs(selected_by_policy, settings=SETTINGS, removed=None):
     jobs = []
     for s, impact in settings.items():
+        if point_id(grid.points(impact)[0]) in (removed or {}).get(s, ()):
+            continue  # a void setting: it has no selection and is reported as not run
         for p in policies(s):
             conditions = condition_points(impact, selected_by_policy[policy_key(p)]["point"],
                                           (removed or {}).get(s, ()))
@@ -484,22 +486,24 @@ def run_pool(step, jobs, journal, processes, ctx, budget, worst_seconds):
     limit, estimate = step_limit_seconds(todo, worst_seconds, processes, budget.remaining())
     start = time.perf_counter()
     stopped = False
-    with multiprocessing.get_context("spawn").Pool(processes) as pool, journal.open("a") as handle:
-        results = pool.imap_unordered(_worker, [(j, ctx) for j in todo])
-        for _ in todo:
-            left = limit - (time.perf_counter() - start)
-            try:
-                job, result = results.next(timeout=max(left, 0.001))
-            except multiprocessing.TimeoutError:
-                stopped = True
-                pool.terminate()
-                break
-            row = {"key": job_key(job), "result": result}
-            done[row["key"]] = row
-            handle.write(json.dumps(row) + "\n")
-            handle.flush()
+    try:
+        with multiprocessing.get_context("spawn").Pool(processes) as pool, journal.open("a") as handle:
+            results = pool.imap_unordered(_worker, [(j, ctx) for j in todo])
+            for _ in todo:
+                left = limit - (time.perf_counter() - start)
+                try:
+                    job, result = results.next(timeout=max(left, 0.001))
+                except multiprocessing.TimeoutError:
+                    stopped = True
+                    pool.terminate()
+                    break
+                row = {"key": job_key(job), "result": result}
+                done[row["key"]] = row
+                handle.write(json.dumps(row) + "\n")
+                handle.flush()
+    finally:
+        budget.charge(step, (time.perf_counter() - start) * processes / 3600)
     wall = time.perf_counter() - start
-    budget.charge(step, wall * processes / 3600)
     if stopped:
         raise SystemExit(f"{step} stopped at {wall:.0f} s, its limit (estimate {estimate:.0f} s): reported, no cut")
     return [(j, done[job_key(j)]["result"]) for j in jobs]
@@ -569,14 +573,14 @@ def code_hashes():
     return {p.name: sha256(p) for p in paths}
 
 
-def freeze(out, design_path, digests_path, identify_path, pilot_paths, m107_frozen):
+def freeze(out, design_path, digests_path, identify_path, pilot_paths, m107_frozen, binary):
     """The manifest the holdout runs from: every input by hash, and each policy's pick."""
     out = pathlib.Path(out)
     selected = json.loads((out / "selection.json").read_text())
     manifest = {"design_sha256": sha256(design_path), "selection_digests_sha256": sha256(digests_path),
                 "identify_sha256": sha256(identify_path), "selection_sha256": sha256(out / "selection.json"),
                 "pilot_sha256": {str(p): sha256(p) for p in pilot_paths}, "m107_frozen_sha256": sha256(m107_frozen),
-                "m107_frozen_path": str(m107_frozen), "code_sha256": code_hashes(),
+                "m107_frozen_path": str(m107_frozen), "generator_sha256": sha256(binary), "code_sha256": code_hashes(),
                 "selected": selected}
     path = out / "frozen.json"
     if path.exists():
@@ -613,7 +617,10 @@ def days_holdout(out, binary, digests_path, identify_path, pilot_jsonl, settings
     out = pathlib.Path(out)
     budget = Budget(out, pilot_jsonl)
     start = time.perf_counter()
-    selected = json.loads((out / "frozen.json").read_text())["selected"]
+    manifest = json.loads((out / "frozen.json").read_text())
+    if sha256(binary) != manifest["generator_sha256"]:
+        raise SystemExit("the generator is not the frozen one")
+    selected = manifest["selected"]
     report = json.loads(pathlib.Path(identify_path).read_text())
     causal, digests = causal_section(), {}
     for setting, impact in settings.items():
@@ -639,13 +646,15 @@ def holdout_step(out, causal_out, selection_digests, holdout_digests, identify_p
     journal = out / "holdout.jsonl"
     if journal.exists() and not recover:
         raise SystemExit("holdout.jsonl exists; only a recovery may resume it")
+    # Everything that needs no holdout row fails here, before the single attempt is claimed.
+    removed = removed_points(identify_path)
+    jobs = holdout_jobs(manifest["selected"], removed=removed)
+    ctx = context(out, causal_out, holdout_digests)
     marker = claim(marker_dir, manifest["design_sha256"], journal if recover else None, recover)
     with marker.open("a") as handle:
         handle.write(json.dumps({"kind": "holdout_digests", "sha256": sha256(holdout_digests)}) + "\n")
-    removed = removed_points(identify_path)
-    jobs = holdout_jobs(manifest["selected"], removed=removed)
     budget = Budget(out, pathlib.Path(pilot_dir) / "pilot.jsonl")
-    rows = run_pool("holdout", jobs, journal, processes, context(out, causal_out, holdout_digests), budget,
+    rows = run_pool("holdout", jobs, journal, processes, ctx, budget,
                     worst_seconds_of(pilot_dir))
     verify_prefix(marker, journal)
     (out / "holdout.json").write_text(json.dumps(
@@ -664,7 +673,7 @@ def main(argv):
     elif step == "selection":
         selection_step(*rest[:5], int(rest[5]))
     elif step == "freeze":
-        print(freeze(rest[0], HERE / "design.json", rest[1], rest[2], rest[4:], rest[3]))
+        print(freeze(rest[0], HERE / "design.json", rest[1], rest[2], rest[5:], rest[3], rest[4]))
     elif step == "days-holdout":
         days_holdout(*rest)
     elif step == "holdout":

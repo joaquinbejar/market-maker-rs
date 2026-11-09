@@ -13,7 +13,9 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import grid  # noqa: E402
 import stats  # noqa: E402
+from run import SETTINGS, point_id  # noqa: E402
 
 MAINTENANCE = 0.05  # margin-rs linear-im/1, as #108's part 1
 NOTES = ["SYNTHETIC: made-up Hawkes parameters; says nothing about a market.",
@@ -90,11 +92,18 @@ def tables(rows, selected):
     return out
 
 
-def not_run(identify, expected=("unperturbed", "fixed_stress", "adversary", "impact_only")):
-    """What the removed points left out, with their queue shares."""
-    return {s: {"void": v["void"], "removed": v["removed"], "spectral_removed": v["spectral_removed"],
-                "shares": {k: {"empty": p["empty_share"], "cap": p["cap_share"]} for k, p in v["points"].items()}}
-            for s, v in identify.items()}
+def not_run(identify):
+    """Per setting, the conditions not run because of a removed point, with the queue shares."""
+    out = {}
+    for setting, v in identify.items():
+        impact = SETTINGS[setting]
+        named = {"fixed_stress": grid.fixed_stress(impact), "impact_only": grid.impact_only(impact)}
+        conditions = ["unperturbed", "fixed_stress", "adversary", "impact_only"] if v["void"] else \
+            [name for name, point in named.items() if point_id(point) in v["removed"]]
+        out[setting] = {"void": v["void"], "conditions_not_run": conditions, "removed_points": v["removed"],
+                        "spectral_removed": v["spectral_removed"],
+                        "shares": {k: {"empty": p["empty_share"], "cap": p["cap_share"]} for k, p in v["points"].items()}}
+    return out
 
 
 def main(out, identify_path):
