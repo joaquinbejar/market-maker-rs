@@ -381,7 +381,7 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
         .unwrap()
         .info()
         .spec;
-    assert!(known_versions(&id, false));
+    assert!(known_versions(&id, false, false));
     for change in 0..4 {
         let mut later = id;
         match change {
@@ -390,7 +390,7 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
             2 => later.reward += 1,
             _ => later.episode += 1,
         }
-        assert!(!known_versions(&later, false));
+        assert!(!known_versions(&later, false, false));
     }
     // An environment with a hedge lane in a second instrument is not one this bridge drives.
     let hedged = SpecId {
@@ -399,7 +399,7 @@ fn test_versions_are_the_ones_this_bridge_was_written_for() {
         reward: HEDGED_REWARD_VERSION,
         ..id
     };
-    assert!(!known_versions(&hedged, false));
+    assert!(!known_versions(&hedged, false, false));
 }
 
 #[test]
@@ -772,7 +772,7 @@ fn test_hedge_actions_are_off_by_default_and_change_the_specification() {
     let hedged = Worker::spawn(bridge, long_rows(), None).unwrap();
     let (p, h) = (plain.info().spec, hedged.info().spec);
     // The same versions, so the bridge drives both; another identity.
-    assert!(known_versions(&p, false) && known_versions(&h, false));
+    assert!(known_versions(&p, false, false) && known_versions(&h, false, false));
     assert_ne!(p.fingerprint, h.fingerprint);
     // The flag in the configuration.
     let mut json: serde_json::Value =
@@ -1356,8 +1356,13 @@ fn test_the_cancel_action_is_off_by_default_and_its_space_is_refused_without_it(
     assert_eq!(c.action, BUILT_FOR_CANCEL_ACTION);
     assert_ne!(p.fingerprint, c.fingerprint);
     // Each space is known only with the configuration that asks for it.
-    assert!(known_versions(&p, false) && !known_versions(&p, true));
-    assert!(known_versions(&c, true) && !known_versions(&c, false));
+    assert!(known_versions(&p, false, false) && !known_versions(&p, true, false));
+    assert!(known_versions(&c, true, false) && !known_versions(&c, false, false));
+    let mut e = c;
+    e.action = BUILT_FOR_EXPIRY_ACTION;
+    assert!(known_versions(&e, false, true) && known_versions(&e, true, true));
+    assert!(!known_versions(&e, false, false) && !known_versions(&e, true, false));
+    assert!(!known_versions(&c, true, true) && !known_versions(&p, false, true));
     // A checkpoint of one is refused by the other, before any step.
     assert!(matches!(
         Worker::spawn(config("close", "reject", 100), long_rows(), Some(c)),

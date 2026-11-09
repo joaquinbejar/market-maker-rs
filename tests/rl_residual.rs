@@ -610,3 +610,19 @@ fn test_env_no_output_bypasses_the_notional_limit() {
     }
     assert!(filled, "the fixture never reaches the limit");
 }
+
+#[test]
+fn test_a_residual_environment_refuses_quote_lives_at_construction() {
+    let cfg = kernel_config();
+    let data = KernelDataset::from_ticks(&rows(3), &cfg).unwrap();
+    let refused = ResidualEnv::<'_, AvellanedaQuoter>::new(
+        &cfg,
+        &data,
+        avellaneda(),
+        dec!(1),
+        BOUNDS,
+        RlConfig::new(scales(), dec!(1))
+            .with_quote_lives(market_maker_rs::rl::QuoteLives::new(&[5]).unwrap()),
+    );
+    assert!(matches!(refused, Err(e) if e.to_string().contains("quote lives")));
+}

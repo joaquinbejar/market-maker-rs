@@ -8,6 +8,40 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The offline training study with the regime in the input of #309 in
+  `bridges/python/experiments/m4_11_regime`, synthetic only, on new days. Behaviour cloning passes
+  the sanity rule #280 stopped at, on both datasets. On the holdout no trading arm made money:
+  maskable PPO, with or without the regime, and CQL on the primary dataset held at every decision,
+  and no offline policy was better than an interactive one. Experiment scripts only; no public
+  API change.
+- The study of #282 in `bridges/python/experiments/m5_04`, not completed: the design, runner and
+  holdout report of learned policies against a market that reacts to their orders, on synthetic
+  days. The selection reached its process-hour limit with 7617 of 8981 jobs written, so nothing
+  was frozen, the holdout never ran, and there is no result and no claim.
+
+## [0.7.0] - 2026-11-09
+
+### Added
+
+- The MDQR study of #106 in `bridges/python/experiments/m5_01`: a neural order book generator, a
+  block clock and a size head, trained on Hyperliquid BTC order flow from December 2025 against
+  queue-reactive, Hawkes and Poisson controls, after a synthetic recovery check. Real data, an
+  exploratory comparison on a reused holdout read once. By its frozen rule MDQR is discarded: it
+  fits queue sizes far better than the queue-reactive arms, but the best queues' correlation
+  fails against both, and the transfer rule cannot pass because every policy has zero fills on
+  those arms' rows. Hawkes failed as unstable. Experiment only; no public API change.
+- Quotes that expire at the venue as an RL action (#297). `RlConfig::with_quote_lives` takes
+  up to 8 strictly increasing lives in nanoseconds and adds `RlAction::ExpiringQuote`, of action
+  space version 5 (`EXPIRY_ACTION_SPACE_VERSION`), with an `EX` section in the fingerprint only
+  when lives are set: a configuration without them keeps its identity. Without lives the action
+  is outside the mask and, under the reject policy, a recorded error of code 204
+  (`ERR_EXPIRY_REFUSED`). A hedge lane and a residual policy refuse lives at construction. The
+  Python bridge takes `quote_lives_ns`; the maskable and continuous encodings gain a last
+  dimension whose first choice is no expiry, so a policy can still leave a quote resting.
+- Stage A of a bounded options market making study under quadratic rough Heston (#111), on
+  synthetic paths: the control checks do not pass and the greedy rule is worse in mean P&L than
+  always quoting within the bounds, where the delta gate does not bind, so it is not adopted. Experiment only; no public API change.
+
 - The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
   #102's residual SAC retrained with and without a training adversary that, between five
   phases, moves the episode's flow perturbation toward the point where the policy loses most on
@@ -894,6 +928,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- The crate's own `Side` enum is gone from `execution`, `events` and the `prelude`: every order,
+  fill and query side is `financial_types::Action`, and `events::OptionStyle` is
+  `financial_types::OptionStyle`, both re-exported from the `prelude`.
+- `cargo-semver-checks` also reports `FillModel` and `AlertHandler` as newly sealed. They are not
+  sealed: code outside the crate still implements both, as the documentation test of
+  `AlertHandler` and the crate's integration tests do. The change to them is the `MMResult` return
+  of `FillModel::simulate_fill` and `AlertHandler::handle`, listed below.
+- `rl::RlConfig` gains the public field `quote_lives` (#297), so a struct literal must name it
+  (`RlConfig::new` sets `None`). `rl::ActionSpace` gains `expiry` and `rl::RlAction`
+  `ExpiringQuote`; both are `#[non_exhaustive]`.
 - `backtest::kernel::KernelAction` gains the variant `ExpiringQuote` and is now
   `#[non_exhaustive]` (#297), so a match on it outside the crate needs a wildcard arm. The
   decoder's counter bounds widen to what an expiring order can add: `next_msg_seq` to three

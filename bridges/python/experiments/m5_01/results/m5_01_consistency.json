@@ -1,0 +1,62 @@
+[
+ {
+  "arm": "maskable_ppo",
+  "day": 15,
+  "recorded": "0",
+  "value": "0"
+ },
+ {
+  "arm": "maskable_ppo",
+  "day": 16,
+  "recorded": "0",
+  "value": "0"
+ },
+ {
+  "arm": "maskable_ppo",
+  "day": 17,
+  "recorded": "0",
+  "value": "0"
+ },
+ {
+  "arm": "maskable_ppo",
+  "day": 18,
+  "recorded": "0",
+  "value": "0"
+ },
+ {
+  "arm": "maskable_ppo",
+  "day": 19,
+  "recorded": "0",
+  "value": "0"
+ },
+ {
+  "arm": "sac_residual_avellaneda_stoikov",
+  "day": 15,
+  "recorded": "-9.632822",
+  "value": "-9.632822"
+ },
+ {
+  "arm": "sac_residual_avellaneda_stoikov",
+  "day": 16,
+  "recorded": "-15.048779",
+  "value": "-15.048779"
+ },
+ {
+  "arm": "sac_residual_avellaneda_stoikov",
+  "day": 17,
+  "recorded": "-19.751922",
+  "value": "-19.751922"
+ },
+ {
+  "arm": "sac_residual_avellaneda_stoikov",
+  "day": 18,
+  "recorded": "-20.824349",
+  "value": "-20.824349"
+ },
+ {
+  "arm": "sac_residual_avellaneda_stoikov",
+  "day": 19,
+  "recorded": "-16.429002",
+  "value": "-16.429002"
+ }
+]
