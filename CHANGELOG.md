@@ -8,6 +8,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The offline training study with the regime in the input of #309 in
+  `bridges/python/experiments/m4_11_regime`, synthetic only, on new days. Behaviour cloning passes
+  the sanity rule #280 stopped at, on both datasets. On the holdout no trading arm made money:
+  maskable PPO, with or without the regime, and CQL on the primary dataset held at every decision,
+  and no offline policy was better than an interactive one. Experiment scripts only; no public
+  API change.
 - The adversarial training study of #281 in `bridges/python/experiments/m5_05`, synthetic only:
   #102's residual SAC retrained with and without a training adversary that, between five
   phases, moves the episode's flow perturbation toward the point where the policy loses most on
