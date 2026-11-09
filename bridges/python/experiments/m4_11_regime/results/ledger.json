@@ -1,0 +1,69 @@
+{
+  "steps": [
+    {
+      "step": "pilot",
+      "process_seconds": 113.76530541402462
+    },
+    {
+      "step": "gate",
+      "process_seconds": 18.91573629004415
+    },
+    {
+      "step": "logs standard_eps30 train",
+      "process_seconds": 119.93135737603006
+    },
+    {
+      "step": "logs standard_eps30 validation",
+      "process_seconds": 42.76202695797838
+    },
+    {
+      "step": "logs standard_eps10 train",
+      "process_seconds": 115.24227749997226
+    },
+    {
+      "step": "logs standard_eps10 validation",
+      "process_seconds": 41.420559587102616
+    },
+    {
+      "step": "train standard_eps30 bc",
+      "process_seconds": 204.61830533399188
+    },
+    {
+      "step": "train standard_eps10 bc",
+      "process_seconds": 205.0622732500051
+    },
+    {
+      "step": "train standard_eps30 cql-alpha0.1",
+      "process_seconds": 1132.9731437500159
+    },
+    {
+      "step": "train standard_eps30 cql-alpha1.0",
+      "process_seconds": 1139.8671899970068
+    },
+    {
+      "step": "train standard_eps30 cql-alpha10.0",
+      "process_seconds": 1137.9936530409905
+    },
+    {
+      "step": "select",
+      "process_seconds": 192.37426149917883
+    },
+    {
+      "step": "train standard_eps10 cql-alpha0.1",
+      "process_seconds": 1129.0813566670113
+    },
+    {
+      "step": "maskable_ppo_regime",
+      "process_seconds": 4824.827819457991
+    },
+    {
+      "step": "maskable_ppo_blind",
+      "process_seconds": 4756.759682416989
+    },
+    {
+      "step": "holdout",
+      "process_seconds": 676.5592593730689
+    }
+  ],
+  "total": 15852.1542079114
+}
