@@ -72,8 +72,8 @@ fills on every holdout day. So the comparison of CQL with PPO at equal informati
 dataset compares two policies that do not trade, and says nothing about offline against
 interactive training beyond that. There were no gate refusals or limit breaches.
 
-**Paired differences of the pooled mean, 90 % interval, unadjusted over seven comparisons
-`[simulated]`.** Only pooled intervals carry a claim; the design fixes why.
+**Paired differences of the pooled mean, 90 % interval, unadjusted over seven comparisons on
+each dataset, 13 intervals in all `[simulated]`.** Only pooled intervals carry a claim; the design fixes why.
 
 | Comparison | standard_eps30 | standard_eps10 |
 |---|---|---|
@@ -81,14 +81,18 @@ interactive training beyond that. There were no gate refusals or limit breaches.
 | bc - maskable_ppo_regime | -102.41 [-103.20, -101.59] | -102.84 [-103.64, -101.96] |
 | cql - bc | 102.41 [101.59, 103.20] | 15.62 [14.38, 16.79] |
 | cql - as_grid | 102.98 [102.04, 103.86] | 15.76 [14.30, 17.14] |
-| bc - as_grid | 0.57 [0.17, 0.95] | 0.14 [-0.30, 0.57] |
+| bc - as_grid | 0.56 [0.17, 0.95] | 0.14 [-0.30, 0.57] |
 | cql - no_trade | 0 [0, 0] | -87.22 [-89.03, -85.36] |
 
 maskable_ppo_regime - maskable_ppo_blind is 0 [0, 0]: neither trades, so the value of the input to
 PPO could not be measured here. CQL's alpha was chosen on validation and PPO's recipe was not
 tuned here, so the comparisons are at equal information only.
 
-bc - as_grid on `standard_eps30` excludes zero, at 0.57 a day [0.17, 0.95]: a tiny effect, unadjusted.
+bc - as_grid on `standard_eps30` excludes zero, at 0.56 a day [0.17, 0.95]: a tiny effect, unadjusted.
+
+**Limit on the PPO comparators.** Why they hold at every decision was not diagnosed: this study does
+not tell a learned hold from a training that failed. Their zero fills are not a finding about PPO,
+and the comparisons against them say only that those policies, as trained here, did not trade.
 
 No offline policy is better than an interactive one on these days: the only intervals excluding
 zero against maskable_ppo_regime are worse for the offline arm. CQL's better net against as_grid
