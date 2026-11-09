@@ -8,7 +8,10 @@ import numpy as np
 
 ROOT = pathlib.Path(__file__).parents[1] / "experiments"
 sys.path.insert(0, str(ROOT / "m5_10"))
-import grid as g  # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from m5_10_load import module  # noqa: E402
+
+g = module("grid")
 
 WEIGHTS = json.loads((ROOT / "m5_02" / "design.json").read_text())["causal"]["flow"]["weights"]
 RATES = {"limit": 1.5, "cancel_per_lot": 0.05, "market": 0.3}

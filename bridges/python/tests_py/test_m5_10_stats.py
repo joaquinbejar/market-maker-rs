@@ -6,7 +6,10 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "experiments" / "m5_10"))
-import stats as s  # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from m5_10_load import module  # noqa: E402
+
+s = module("stats")
 
 
 def test_adversary_takes_the_largest_mean_loss_and_the_first_on_a_tie():

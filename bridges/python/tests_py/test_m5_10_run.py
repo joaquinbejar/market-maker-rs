@@ -8,7 +8,10 @@ import sys
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "experiments" / "m5_10"))
-import run as r  # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from m5_10_load import module  # noqa: E402
+
+r = module("run")
 
 
 def selected():

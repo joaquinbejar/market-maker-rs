@@ -7,7 +7,10 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "experiments" / "m5_10"))
-import report as rep  # noqa: E402
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from m5_10_load import module  # noqa: E402
+
+rep = module("report")
 
 
 def row(arm, condition, day, value, seed=None):
