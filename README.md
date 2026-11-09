@@ -272,11 +272,11 @@ crate's own serialization support.
 ### Research Status
 
 The 0.7.0 cycle added an out-of-sample research program under `bridges/python/experiments`,
-which is not part of the published crate. Each study fixes its design before reading its
-holdout and reports negative results. So far no learned policy has been shown to beat the
-classical quotes out of sample, so the crate recommends none. Most of these studies are
-synthetic, and some remain open: treat their conclusions as limited to the setting each report
-states.
+which is not part of the published crate. The studies fix their designs in advance, disclose
+any exception, such as a holdout that had been read before, and report negative results. So
+far no learned policy has been shown to beat the best classical comparator out of sample, so
+the crate recommends none. Most of these studies are synthetic, and some remain open: treat
+their conclusions as limited to the setting each report states.
 
 ### Examples
 
