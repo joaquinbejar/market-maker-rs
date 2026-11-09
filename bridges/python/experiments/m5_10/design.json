@@ -1,6 +1,6 @@
 {
  "issue": 108,
- "design_version": 4,
+ "design_version": 5,
  "status": "fixed before any code or run; part 2 of #108, after PR #295",
  "data": "SYNTHETIC: every result is from made-up Hawkes parameters and says nothing about a market",
  "closed_by_295": {
@@ -101,7 +101,20 @@
   },
   "reading": "descriptive, per arm and setting. A loss is reported as a loss; an interval containing 0 is 'no difference shown', never equivalence or robustness; no adopt decision",
   "once": "the holdout runs once from a frozen manifest, behind an O_EXCL marker claimed before any day is read, at the fixed path /Users/joaquin/tmp/worktrees/market-maker-rs/m5_10_markers/, outside the output directory, with a frozen_sha256 check. One recovery at most, only after an external kill, resumed from the journal with the journal prefix's hash checked, as #281",
-  "impact_meaning": "impact here is the market orders' impact on the mid in the generator's rows; the agent's own fills do not move the mid, unlike #282's reactive episode, and no conclusion about own impact is drawn"
+  "impact_meaning": "impact here is the market orders' impact on the mid in the generator's rows; the agent's own fills do not move the mid, unlike #282's reactive episode, and no conclusion about own impact is drawn",
+  "secondary_not_identified": {
+   "status": "secondary and exploratory, labelled 'not identified by the frozen rate test'. No reading, decision or selection of the primary rests on it",
+   "decided": "after identify.json (sha256 7346691aa7c3a1c4277362fc12f38c26b2769de76b5a700c9e0e2ff421a5cb62) had been seen and before any policy ran; that file showed the rate test removing the same 14 of 24 points in every setting, fixed stress included, and every impact slope test passing",
+   "explanation_untested": "realised over formula rate falls as the empty-queue share grows (0.97 at 3 % empty, 0.70 at 19 %). That this is the suppression at the empty queue named in rate_reading is an untested interpretation",
+   "rule_unchanged": "the 10 % and the formula are unchanged; the primary analysis is as approved: only the 10 surviving points of a setting, fixed_stress reported as not run",
+   "feeds_decision": "only the primary analysis feeds the report's reading. There is no go or no-go on the secondary",
+   "selection": "the primary's adversary picks only among the 10 surviving points, computed without any secondary row. The secondary's own pick is over all 24 points of a setting, using the primary's selection rows for the 10 and new rows for the 14; it cannot change the primary's pick",
+   "added_runs": {
+    "selection": "the 14 removed points x 10 days x 13 policy runs x 3 settings = 5460 days",
+    "holdout": "fixed_stress (30 x 13 x 3 = 1170 days) and the secondary pick (at most 1170 days), on holdout days and in the same single attempt"
+   },
+   "reported": "apart from the primary, in its own table, with each point's realised over formula ratio and queue shares"
+  }
  },
  "part_2_281_impact": {
   "what": "#281's condition declared and not run: its A and B frozen models (10 models, seeds 1 to 5) at kappa = 2 kappa0 per regime through #282's reactive runner",
@@ -124,7 +137,8 @@
   "ceiling_note": "at 15 s a day the count is 58.5 process-hours, and #282 ran 1.5x to 2x its unloaded rate on a contended machine",
   "pilot": "before selection, under the machine's load at the time: 2 days per arm, on design seeds outside every split, at the slowest arm (lstm) and the most active point (market 2, limit 0.7, branching 1.2, highest impact) as well as unperturbed; its output file is hashed in the freeze",
   "stop_rule": "cuts are decided from pilot cost alone, before any selection day runs, in this order: drop impact_low, then lstm; no seed is cut. During a step, stop at 1.5 x its pilot-based estimate or at the ceiling and report; a mid-step stop never triggers a cut after results exist",
-  "slots": "none until assigned, not before #282 ends"
+  "slots": "none until assigned, not before #282 ends",
+  "count_v5": "primary: selection 10 x 10 x 13 x 3 = 3900, holdout 3 conditions x 30 x 13 x 3 = 3510. Secondary: 5460 + 1170 + at most 1170 = 7800. Total at most 15210 policy days, against 14040 before; at the pilot's worst rates about 51.6 process-hours, under the 90 ceiling"
  },
  "seen_before_freeze": [
   "#107 part C's design and README tables",
@@ -135,6 +149,7 @@
   "before any code or run, from review of f583fbc: count formula, pilot at the slowest arm and most active point under load, ceiling raised from 60 to 90 process-hours from that count, cuts from the pilot only, removed points, identifiability estimates, stationary bootstrap named, recovery condition and marker location, part 2 runner, model hashes and estimand, no secondary fee, impact is the flow's and not the agent's",
   "before any code or run, from review of 378e653: seed formulas written as stride x day + offset, and a failing unperturbed point removes its setting; the identifiability formula, absolute tolerance at impact 0, removal rule and stationary bootstrap of the entry above answer the same review",
   "before any code or run, from a defect found reading the generator: the baselines depend on the queue, so the rate test uses time-averaged open shares and the point-over-unperturbed ratio, with its approximation stated. No ratio or formula value had been computed on any data",
-  "before any run, reading #107's classical.json for the runner: #107 part C has no fixed-spread point, its classical arms are Avellaneda-Stoikov and GLFT, so GLFT replaces fixed spread; the policy count stays 13"
+  "before any run, reading #107's classical.json for the runner: #107 part C has no fixed-spread point, its classical arms are Avellaneda-Stoikov and GLFT, so GLFT replaces fixed spread; the policy count stays 13",
+  "after identify.json was seen (sha256 7346691a...cb62) and before any policy ran: a secondary analysis of the 14 points the frozen rate test removed, labelled not identified, exploratory, feeding no decision and unable to change the primary's selection. The 10 %, the formula and the primary are unchanged"
  ]
 }
