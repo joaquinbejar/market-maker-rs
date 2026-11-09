@@ -81,3 +81,17 @@ def test_day_configs_one_per_point_and_split(tmp_path):
     assert len(written) == 2 * 3 * 24
     sample = json.loads(written[0].read_text())["causal"]
     assert sample["seed_offset"] == 100000 and sample["days"] == 10
+
+
+def test_pilot_covers_every_arm_at_both_points():
+    jobs = r.pilot_jobs()
+    assert len(jobs) == 2 * 13 * 2
+    assert {j["policy"]["arm"] for j in jobs} == {"no_trade", "avellaneda_stoikov", "glft", "mlp", "lstm"}
+    assert r.point_id(jobs[-1]["point"]) == "m2-l0.7-b1.2-i2.0"
+
+
+def test_project_uses_each_arm_slowest_point():
+    rows = [(j, 20.0 if j["point"]["market"] == 2 else 10.0) for j in r.pilot_jobs()]
+    out = r.project(rows)
+    assert out["projected_hours"] == pytest.approx(20.0 * 13 * 360 * 3 / 3600)
+    assert out["over_ceiling"] is False

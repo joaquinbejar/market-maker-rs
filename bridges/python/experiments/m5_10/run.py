@@ -209,3 +209,29 @@ def evaluate(job, data_dir, checkpoints, classical, digests):
     finally:
         env.close()
     return {"net": float(days[0]["net"]), "episode": days[0]}
+
+
+PILOT_SETTING = "impact_high"
+PILOT_OFFSET = 500000
+PILOT_DAYS = 2
+
+
+def pilot_jobs():
+    """2 days per arm at the unperturbed and the most active point, on seeds outside every split."""
+    impact = SETTINGS[PILOT_SETTING]
+    return [{"split": "pilot", "policy": p, "point": pt, "day": d}
+            for pt in (grid.points(impact)[0], grid.fixed_stress(impact))
+            for p in policies(PILOT_SETTING) for d in range(1, PILOT_DAYS + 1)]
+
+
+def project(rows, ceiling_hours=90.0):
+    """Process-hours for the whole count from the pilot's per-day seconds, the slowest point's."""
+    per_arm = {}
+    for job, seconds in rows:
+        per_arm.setdefault(job["policy"]["arm"], {}).setdefault(point_id(job["point"]), []).append(seconds)
+    worst = {arm: max(sum(v) / len(v) for v in points.values()) for arm, points in per_arm.items()}
+    runs = {"no_trade": 1, "avellaneda_stoikov": 1, "glft": 1, "mlp": 5, "lstm": 5}
+    per_setting_day = sum(worst[arm] * n for arm, n in runs.items())
+    days = (24 * SELECTION_DAYS + 4 * HOLDOUT_DAYS) * len(SETTINGS)
+    hours = per_setting_day * days / 3600
+    return {"worst_seconds_per_day": worst, "projected_hours": hours, "over_ceiling": hours > ceiling_hours}
