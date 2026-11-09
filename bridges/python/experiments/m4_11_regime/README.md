@@ -50,7 +50,8 @@ on `standard_eps30` and 0.9835 to 0.9865 on `standard_eps10`. The input and the 
 from #280, so this does not by itself prove that aliasing caused #280's stop.
 
 **Choice of alpha `[simulated]`, on validation.** Mean daily net: alpha 0.1, 0; alpha 1.0, -101.24;
-alpha 10, -103.20. The largest is alpha 0.1, which never trades.
+alpha 10, -103.20. The rule picks alpha 0.1, which never trades and is the only one that does not
+lose: the choice selected not trading rather than a strength of CQL.
 
 **Holdout, mean daily net `[simulated]`, environment seed 101, 5 days per regime.**
 
@@ -87,6 +88,8 @@ maskable_ppo_regime - maskable_ppo_blind is 0 [0, 0]: neither trades, so the val
 PPO could not be measured here. CQL's alpha was chosen on validation and PPO's recipe was not
 tuned here, so the comparisons are at equal information only.
 
+bc - as_grid on `standard_eps30` excludes zero, at 0.57 a day [0.17, 0.95]: a tiny effect, unadjusted.
+
 No offline policy is better than an interactive one on these days: the only intervals excluding
 zero against maskable_ppo_regime are worse for the offline arm. CQL's better net against as_grid
 and BC reflects trading less in a setting where every trading arm loses. No claim is made about
@@ -95,3 +98,12 @@ any market or about an estimated regime.
 **Support `[observed]`.** Every holdout decision of every offline arm has a behaviour propensity
 above 0, as designed. The share of decisions whose (state bin, action) pair the training logs
 hold 0 times is at most 0.0016, and fewer than 10 times at most 0.0082.
+
+## Evidence
+
+`results/` holds the reports of attempt 2, with local directories replaced by placeholders, so
+their hashes differ from the run's. The run used commit 249ad33975012a00f52736ee080584fbc4763e2b,
+whose `design.json` has sha256
+fb90fae88399e37307a7aa0efa3f68e9b67ede8eb4017fedf889804d4307c274, and whose `frozen.json` had
+sha256 69f04c7f690e7133d377272745244b84fc5d6e71db17dca26dabc3bc3613cb56. After the run, the words
+of `changes` in `design.json` were edited without changing their meaning.

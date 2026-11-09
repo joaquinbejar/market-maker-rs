@@ -1,0 +1,116 @@
+{
+  "binned": {
+    "agreement_ceiling": 0.79312144813939,
+    "ambiguous_share": 0.6235818740043766,
+    "decisions": 1814190,
+    "keys": 7432
+  },
+  "binned_with_regime": {
+    "agreement_ceiling": 0.923975438074292,
+    "ambiguous_share": 0.2293558006603498,
+    "decisions": 1814190,
+    "keys": 16910
+  },
+  "bounds": "One synthetic simulator whose rows do not react to orders, made-up parameters and 24 days per regime bound what this study can show. Every value is labelled [observed] (read from a log) or [simulated] (an interactive run in the same simulator); nothing here is an off-policy estimate.",
+  "code_sha256": {
+    "m4_05/run.py": "502f333cc206015f2085f54e9973bcb49d07431139f38af60b408dfb033e2428",
+    "m4_07/estimate.py": "9ceab15647d46a564bd6e093529a51d70bdce1a0b79daf61260ab63456c889ea",
+    "m4_07/run.py": "c51772a1834e68ebf91277eaa03b2d5c700cbdf0648cc24f3b7a0b1c7f677847",
+    "m4_11/offline.py": "fcfda3f0aa4fce3855279d713491da126a1bdacf758883102ea2671c737c063a",
+    "m4_11/run.py": "2191abf1cbd890070fcb3a8457c2f8ec3f191b6239363522a97bcb0d6aa14d01",
+    "regime.py": "afa0dfc08894266f226a98daee5ce2858ecf2cdb208486f498996111cfed4b42",
+    "run.py": "8b1de98087ecc1c5b2bd16f3074b7c34b250b6abec13e130d7f347fd14dfa1b6"
+  },
+  "commit": "249ad33975012a00f52736ee080584fbc4763e2b",
+  "data": "synthetic: #102's queue-reactive simulator and regimes, with made-up parameters, on new days generated for this study; no market data. The logs are generated here by #104's behaviours; their rewards are the simulator's consequences, not observed ones",
+  "design_sha256": "fb90fae88399e37307a7aa0efa3f68e9b67ede8eb4017fedf889804d4307c274",
+  "disclosure": {
+    "not_seen": "#280's holdout was never read. None of this study's days, logs or runs exist at the time of this design.",
+    "reused_choices": "as_grid's per-regime points and #102's volatility were selected on #102's days, and the arms' settings are #280's unchanged. Neither was chosen from this study's days.",
+    "seen_before_this_design": [
+      "#280's BC agreement with as_grid on standard_eps30: validation 0.8132, 0.8144, 0.8197, 0.8194, 0.8187 for seeds 1 to 5, train within 0.004 of it, and its per-regime split (calm 0.61 to 0.72, stressed 0.84 to 0.90, thin 0.90 to 0.93)",
+      "#280's logged action equals as_grid's on 70.06 % of its validation decisions; about 39 % of its misses where both quote are within one offset step",
+      "#102 and #104's holdout values on #102's days 20 to 24 (as_grid -111.59, fixed spread 4 -138.93, maskable PPO about 0 a day)"
+    ],
+    "seen_in_attempt_1": "Attempt 1 ran at commit 1beac05 and stopped at the compute rule: CQL at alpha 0.1 on standard_eps30 took 405 s against an estimate of 180 s, because its pilot timed 500 gradient steps on one logged day in one process, and because its estimate treated 5 jobs on 4 workers as 1.25 job lengths when whole jobs take 2. Seen from it: the gate passed; the audit (exact key: agreement ceiling 0.8146 without the regime and 1.0 with it; binned key: 0.7931 and 0.9240; position and steps left one to one); BC's validation agreement (standard_eps30 0.977 to 0.982, standard_eps10 0.984 to 0.987, by seed). No CQL or PPO output of attempt 1 was read, and none is used. Its directory is kept. The holdout was not started."
+  },
+  "exact": {
+    "agreement_ceiling": 0.8145580121155997,
+    "ambiguous_share": 0.5321300415061267,
+    "decisions": 1814190,
+    "keys": 82385
+  },
+  "exact_with_regime": {
+    "agreement_ceiling": 1.0,
+    "ambiguous_share": 0.0,
+    "decisions": 1814190,
+    "keys": 187589
+  },
+  "input_precision": {
+    "column_max": [
+      1.0,
+      1.0,
+      0.5,
+      0.800000011920929,
+      0.800000011920929,
+      1.0,
+      1.0,
+      0.5401250123977661,
+      0.03125,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "column_min": [
+      0.20000000298023224,
+      -1.0,
+      0.0,
+      0.0,
+      0.0,
+      -1.0,
+      -0.949999988079071,
+      -0.7231112122535706,
+      0.0,
+      0.0,
+      0.00023148147738538682,
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "position_one_to_one": true,
+    "steps_left_one_to_one": true
+  },
+  "label": "[observed]",
+  "step": "audit",
+  "stop": false,
+  "versions": {
+    "bridge": "0.1.0",
+    "device": "cpu",
+    "gymnasium": "1.4.0",
+    "market_maker_rs": "0.6.1",
+    "numpy": "2.5.4",
+    "python": "3.12.16",
+    "sb3_contrib": "2.9.2",
+    "stable_baselines3": "2.9.2",
+    "threads": 1,
+    "torch": "2.15.0"
+  }
+}
