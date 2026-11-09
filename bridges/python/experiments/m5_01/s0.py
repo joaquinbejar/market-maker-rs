@@ -7,11 +7,11 @@ From `bridges/python`:
 
     cargo run --release --example mdqr_qr -- truth experiments/m5_01/design.json <data dir>
     cargo run --release --example mdqr_qr -- parameters experiments/m5_01/design.json > <out dir>/truth.json
-    python experiments/m5_01/run.py check <data dir> <out dir>
-    python experiments/m5_01/run.py fit <data dir> <out dir> <training seed>
-    python experiments/m5_01/run.py simulate <data dir> <out dir> <training seed>
-    python experiments/m5_01/run.py compare <data dir> <out dir> <compare binary>
-    python experiments/m5_01/run.py decide <out dir>
+    python experiments/m5_01/s0.py check <data dir> <out dir>
+    python experiments/m5_01/s0.py fit <data dir> <out dir> <training seed>
+    python experiments/m5_01/s0.py simulate <data dir> <out dir> <training seed>
+    python experiments/m5_01/s0.py compare <data dir> <out dir> <compare binary>
+    python experiments/m5_01/s0.py decide <out dir>
 
 `check` records the sha256 of every window and the design's pins in `data.json`; every later
 step refuses a window whose hash differs. `fit` writes `fit-<seed>.json` (the mechanics, the

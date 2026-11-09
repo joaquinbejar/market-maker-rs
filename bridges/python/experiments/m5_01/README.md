@@ -85,6 +85,8 @@ one noon window a day and the controls on all of `queue_train`, so training expo
 
 ## Files
 
+S0's script is `s0.py`; its results were produced when it was named `run.py`, a rename made after the holdout so that its module does not shadow another study's.
+
 `results/` holds S1, the consistency and gate checks, the three `s2-<regime>.json` and the run log.
 The capture and its derived windows are not in the repository; the capture is public. From
 `bridges/python`, `extract.py`, `examples/mdqr_capture` (at the root), `train.py`, `evaluate.py`,

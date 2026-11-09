@@ -13,7 +13,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 EXPERIMENT = HERE.parent / "experiments" / "m5_01"
 sys.path.insert(0, str(EXPERIMENT))
 import mdqr  # noqa: E402
-import run  # noqa: E402
+import s0 as run  # noqa: E402
 
 FIXTURE = json.loads((HERE / "fixtures" / "m5_01_qr_60s.json").read_text())
 DESIGN = json.loads((EXPERIMENT / "design.json").read_text())
