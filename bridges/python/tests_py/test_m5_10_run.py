@@ -95,3 +95,22 @@ def test_project_uses_each_arm_slowest_point():
     out = r.project(rows)
     assert out["projected_hours"] == pytest.approx(20.0 * 13 * 360 * 3 / 3600)
     assert out["over_ceiling"] is False
+
+
+def test_spectral_check_records_and_stops():
+    weights = [[[0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.1]]]
+    points = [r.grid.fixed_stress(1.0)]
+    assert r.spectral_check(weights, points)["m2-l0.7-b1.2-i2.0"] == pytest.approx(0.12)
+    with pytest.raises(SystemExit, match="subcritical"):
+        r.spectral_check([[[0, 0, 0], [0, 0, 0], [0, 0, 1.0]]], points)
+
+
+def test_pilot_refuses_an_existing_output(tmp_path):
+    (tmp_path / "pilot.jsonl").write_text("")
+    (tmp_path / "frozen.json").write_text(json.dumps({"classical_sha256": ""}))
+    good = {s: {a: {} for a in r.CLASSICAL} for s in r.SETTINGS}
+    (tmp_path / "classical.json").write_text(json.dumps({"selected": good}))
+    digest = hashlib.sha256((tmp_path / "classical.json").read_bytes()).hexdigest()
+    (tmp_path / "frozen.json").write_text(json.dumps({"classical_sha256": digest}))
+    with pytest.raises(SystemExit, match="already exists"):
+        r.main(["pilot", str(tmp_path), "unused", str(tmp_path)])

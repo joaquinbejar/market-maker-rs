@@ -5,6 +5,7 @@ loading this module trains and reads nothing. The marker directory is an argumen
 the output directory.
 """
 
+import functools
 import hashlib
 import json
 import os
@@ -163,6 +164,7 @@ def write_day_configs(causal, out, settings=SETTINGS):
     return written
 
 
+@functools.lru_cache(maxsize=1)
 def _runner():
     """#107's runner, whose environment, wrappers and checkpoint checks are reused unchanged."""
     import importlib.util
@@ -208,6 +210,8 @@ def evaluate(job, data_dir, checkpoints, classical, digests):
                 for s in base["evaluation"]["evaluation_seeds"]]
     finally:
         env.close()
+    if len(days) != 1:
+        raise SystemExit("the design evaluates one seed per day")
     return {"net": float(days[0]["net"]), "episode": days[0]}
 
 
@@ -237,6 +241,16 @@ def project(rows, ceiling_hours=90.0):
     return {"worst_seconds_per_day": worst, "projected_hours": hours, "over_ceiling": hours > ceiling_hours}
 
 
+def spectral_check(weights, points):
+    """The design's plausibility check, before any day is generated: stops if a point fails."""
+    radii = {}
+    for point in points:
+        radii[point_id(point)] = grid.spectral_radius(grid.branching_matrix(weights, point["branching"]))
+        if not grid.plausible(weights, point):
+            raise SystemExit(f"{point_id(point)} is not subcritical")
+    return radii
+
+
 def generate_pilot_days(causal, data_dir, binary):
     """Writes the pilot's days with examples/hawkes_days and returns their sha256 by relative path."""
     import subprocess
@@ -244,7 +258,9 @@ def generate_pilot_days(causal, data_dir, binary):
     data_dir = pathlib.Path(data_dir)
     impact = SETTINGS[PILOT_SETTING]
     digests = {}
-    for point in (grid.points(impact)[0], grid.fixed_stress(impact)):
+    points = (grid.points(impact)[0], grid.fixed_stress(impact))
+    radii = spectral_check(causal["flow"]["weights"], points)
+    for point in points:
         out = data_dir / "pilot" / PILOT_SETTING / point_id(point)
         out.mkdir(parents=True, exist_ok=True)
         config = out / "config.json"
@@ -253,7 +269,7 @@ def generate_pilot_days(causal, data_dir, binary):
         for day in range(1, PILOT_DAYS + 1):
             path = day_path(data_dir, "pilot", PILOT_SETTING, point, day)
             digests[str(path.relative_to(data_dir))] = sha256(path)
-    return digests
+    return digests, radii
 
 
 def main(argv):
@@ -268,9 +284,12 @@ def main(argv):
     frozen = json.loads((causal_out / "frozen.json").read_text())
     classical = check_classical(causal_out / "classical.json", frozen["classical_sha256"])
     causal = json.loads((HERE.parent / "m5_02" / "design.json").read_text())["causal"]
-    digests = generate_pilot_days(causal, out, binary)
+    if (out / "pilot.jsonl").exists():
+        raise SystemExit("a pilot output already exists; one pilot per output directory")
+    digests, radii = generate_pilot_days(causal, out, binary)
+    _runner()  # imported once here, so its one-off cost is outside every job's time
     rows = []
-    with (out / "pilot.jsonl").open("a") as handle:
+    with (out / "pilot.jsonl").open("x") as handle:
         for job in pilot_jobs():
             start = time.perf_counter()
             result = evaluate(job, out, causal_out / "checkpoints", classical, digests)
@@ -278,7 +297,7 @@ def main(argv):
             rows.append((job, seconds))
             handle.write(json.dumps({"key": job_key(job), "seconds": seconds, "net": result["net"]}) + "\n")
             handle.flush()
-    report = {"projection": project(rows), "load": os.getloadavg()}
+    report = {"projection": project(rows), "spectral_radius": radii, "load": os.getloadavg()}
     (out / "pilot.json").write_text(json.dumps(report, indent=1))
 
 
