@@ -270,6 +270,18 @@ fn main() -> Result<(), Failure> {
                 dir.join(format!("day-{day}.flow.json")),
                 serde_json::to_vec(&flow)?,
             )?;
+            // A design with `seed_offset` also keeps the true queues (rows show at least 1 lot).
+            if causal.get("seed_offset").is_some() {
+                let queues: Vec<[u32; 2]> = bid_queues
+                    .iter()
+                    .zip(&ask_queues)
+                    .map(|(b, a)| [*b, *a])
+                    .collect();
+                fs::write(
+                    dir.join(format!("day-{day}.queues.json")),
+                    serde_json::to_vec(&queues)?,
+                )?;
+            }
             records.push(json!({
                 "setting": name,
                 "day": day,

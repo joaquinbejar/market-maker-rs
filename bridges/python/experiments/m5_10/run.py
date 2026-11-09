@@ -67,11 +67,12 @@ def policy_key(policy):
     return f"{policy['setting']}/{policy['arm']}"
 
 
-def holdout_jobs(selected_by_policy, settings=SETTINGS, removed=()):
+def holdout_jobs(selected_by_policy, settings=SETTINGS, removed=None):
     jobs = []
     for s, impact in settings.items():
         for p in policies(s):
-            conditions = condition_points(impact, selected_by_policy[policy_key(p)]["point"], removed)
+            conditions = condition_points(impact, selected_by_policy[policy_key(p)]["point"],
+                                          (removed or {}).get(s, ()))
             for name, pt in conditions.items():
                 jobs += [{"split": "holdout", "condition": name, "policy": p, "point": pt, "day": d}
                          for d in range(1, HOLDOUT_DAYS + 1)]
@@ -99,11 +100,7 @@ def job_key(job):
 def run_journaled(jobs, journal, evaluate):
     """Runs the jobs not yet in the journal, appending each result; a restart skips the done ones."""
     journal = pathlib.Path(journal)
-    done = {}
-    if journal.exists():
-        for line in journal.read_text().splitlines():
-            row = json.loads(line)
-            done[row["key"]] = row
+    done = load_journal(journal)
     with journal.open("a") as handle:
         for job in jobs:
             key = job_key(job)
@@ -293,13 +290,11 @@ def generate_pilot_days(causal, data_dir, binary):
     return digests, radii, generation
 
 
-def main(argv):
+def pilot_step(argv):
     """python run.py pilot <out> <hawkes_days binary> <#107 causal output dir>"""
     import time
 
-    step, out, binary, causal_out = argv
-    if step != "pilot":
-        raise SystemExit("only the pilot step is wired so far")
+    out, binary, causal_out = argv
     out, causal_out = pathlib.Path(out), pathlib.Path(causal_out)
     out.mkdir(parents=True, exist_ok=True)
     frozen = json.loads((causal_out / "frozen.json").read_text())
@@ -321,6 +316,211 @@ def main(argv):
     report = {"projection": project(rows, max(generation.values())), "generation_seconds_per_day": generation,
               "first_job_seconds": rows[0][1], "spectral_radius": radii, "load": os.getloadavg()}
     (out / "pilot.json").write_text(json.dumps(report, indent=1))
+
+
+def causal_section():
+    return json.loads((HERE.parent / "m5_02" / "design.json").read_text())["causal"]
+
+
+def generate(causal, out, binary, split, setting, point, days):
+    """Writes one point's days and returns {relative path: sha256}."""
+    import subprocess
+
+    out = pathlib.Path(out)
+    target = out / split / setting / point_id(point)
+    target.mkdir(parents=True, exist_ok=True)
+    config = target / "config.json"
+    config.write_text(json.dumps({"causal": grid.day_config(causal, point, "p", days, OFFSETS[split])}))
+    subprocess.run([str(binary), str(config), str(target)], check=True, stdout=subprocess.DEVNULL)
+    paths = [day_path(out, split, setting, point, d) for d in range(1, days + 1)]
+    return {str(p.relative_to(out)): sha256(p) for p in paths}
+
+
+def days_selection(out, binary, digests_path, settings=SETTINGS):
+    """Every point's selection days, after the spectral check of every point; digests to commit."""
+    causal = causal_section()
+    radii, digests = {}, {}
+    for setting, impact in settings.items():
+        radii[setting] = spectral_check(causal["flow"]["weights"], grid.points(impact))
+        for point in grid.points(impact):
+            digests.update(generate(causal, out, binary, "selection", setting, point, SELECTION_DAYS))
+    pathlib.Path(digests_path).write_text(json.dumps({"digests": digests, "spectral_radius": radii}, indent=0))
+
+
+def point_statistics(out, split, setting, point, days):
+    """Queue shares, market rate and impact slope of one point's days, with no policy."""
+    import numpy as np
+
+    below, queue, open_, rate, changes, signed = [], [], [], [], [], []
+    for day in range(1, days + 1):
+        base = day_path(out, split, setting, point, day)
+        queues = np.asarray(json.loads(base.with_name(f"day-{day}.queues.json").read_text()), float)
+        flow = np.asarray(json.loads(base.with_name(f"day-{day}.flow.json").read_text()), float)
+        rows = np.asarray(json.loads(base.read_text()), float)
+        below.append(float((queues < QUEUE_CAP).mean()))
+        queue.append(float(queues.mean()))
+        open_.append(float((queues > 0).mean()))
+        rate.append(float(flow.sum(axis=1).mean() / 2))
+        # Row r's orders move the mid of row r + 1; mids are in ticks, the bid being floor(mid).
+        mids = rows[:, 1]
+        changes.append(mids[1:] - mids[:-1])
+        signed.append(flow[:-1, 0] - flow[:-1, 1])
+    return {"shares": {"below_cap": float(np.mean(below)), "mean_queue": float(np.mean(queue)),
+                       "non_empty": float(np.mean(open_))},
+            "cap_share": 1 - float(np.mean(below)), "empty_share": 1 - float(np.mean(open_)),
+            "market_rate": float(np.mean(rate)),
+            "slope": grid.slope(np.concatenate(changes), np.concatenate(signed))}
+
+
+QUEUE_CAP = 20
+
+
+def identify(out, report_path, settings=SETTINGS):
+    """The identifiability rules on the selection days; failing points go in `removed`."""
+    causal = causal_section()
+    rates, weights = causal["flow"]["rates"], causal["flow"]["weights"]
+    report = {}
+    for setting, impact in settings.items():
+        points = grid.points(impact)
+        base_stats = point_statistics(out, "selection", setting, points[0], SELECTION_DAYS)
+        base_formula = grid.rate_formula(rates, weights, points[0], base_stats["shares"])
+        rows, removed = {}, []
+        for point in points:
+            st = point_statistics(out, "selection", setting, point, SELECTION_DAYS)
+            formula = grid.rate_formula(rates, weights, point, st["shares"])
+            rate_ok = grid.rate_passes(st["market_rate"], base_stats["market_rate"], formula, base_formula)
+            impact_ok = grid.impact_passes(st["slope"], point["impact"])
+            rows[point_id(point)] = {**st, "formula": formula, "rate_ok": rate_ok, "impact_ok": impact_ok}
+            if not (rate_ok and impact_ok):
+                removed.append(point_id(point))
+        report[setting] = {"points": rows, "removed": removed}
+    pathlib.Path(report_path).write_text(json.dumps(report, indent=1))
+
+
+def _worker(args):
+    job, ctx = args
+    return job, evaluate(job, ctx["out"], ctx["checkpoints"], ctx["classical"], ctx["digests"])
+
+
+def run_pool(jobs, journal, processes, ctx):
+    """As run_journaled, with a pool; only the parent writes the journal."""
+    import multiprocessing
+
+    journal = pathlib.Path(journal)
+    done = load_journal(journal)
+    todo = [j for j in jobs if job_key(j) not in done]
+    with multiprocessing.get_context("spawn").Pool(processes) as pool, journal.open("a") as handle:
+        for job, result in pool.imap_unordered(_worker, [(j, ctx) for j in todo]):
+            row = {"key": job_key(job), "result": result}
+            done[row["key"]] = row
+            handle.write(json.dumps(row) + "\n")
+            handle.flush()
+    return [(j, done[job_key(j)]["result"]) for j in jobs]
+
+
+def load_journal(journal):
+    journal = pathlib.Path(journal)
+    if not journal.exists():
+        return {}
+    lines = journal.read_text().splitlines()
+    done = {}
+    for i, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            if i != len(lines) - 1:
+                raise
+            journal.write_text("".join(x + "\n" for x in lines[:-1]))
+            break
+        done[row["key"]] = row
+    return done
+
+
+def context(out, causal_out, digests_path):
+    causal_out = pathlib.Path(causal_out)
+    frozen = json.loads((causal_out / "frozen.json").read_text())
+    return {"out": str(out), "checkpoints": str(causal_out / "checkpoints"),
+            "classical": check_classical(causal_out / "classical.json", frozen["classical_sha256"]),
+            "digests": json.loads(pathlib.Path(digests_path).read_text())["digests"]}
+
+
+def removed_points(identify_path):
+    report = json.loads(pathlib.Path(identify_path).read_text())
+    return {s: set(v["removed"]) for s, v in report.items()}
+
+
+def selection_step(out, causal_out, digests_path, identify_path, processes):
+    removed = removed_points(identify_path)
+    jobs = [j for j in selection_jobs() if point_id(j["point"]) not in removed[j["policy"]["setting"]]]
+    rows = run_pool(jobs, pathlib.Path(out) / "selection.jsonl", processes, context(out, causal_out, digests_path))
+    pathlib.Path(out, "selection.json").write_text(json.dumps(select(rows), indent=1))
+
+
+def freeze(out, design_path, digests_path, identify_path, pilot_paths):
+    """The manifest the holdout runs from: every input by hash, and each policy's pick."""
+    out = pathlib.Path(out)
+    selected = json.loads((out / "selection.json").read_text())
+    manifest = {"design_sha256": sha256(design_path), "selection_digests_sha256": sha256(digests_path),
+                "identify_sha256": sha256(identify_path), "selection_sha256": sha256(out / "selection.json"),
+                "pilot_sha256": {str(p): sha256(p) for p in pilot_paths}, "selected": selected}
+    path = out / "frozen.json"
+    if path.exists():
+        raise SystemExit("already frozen")
+    path.write_text(json.dumps(manifest, indent=1, sort_keys=True))
+    return sha256(path)
+
+
+def days_holdout(out, binary, digests_path, identify_path, settings=SETTINGS):
+    """The holdout days of the frozen points only; digests to commit before the holdout."""
+    out = pathlib.Path(out)
+    selected = json.loads((out / "frozen.json").read_text())["selected"]
+    removed = removed_points(identify_path)
+    causal, digests = causal_section(), {}
+    for setting, impact in settings.items():
+        picks = [v["point"] for k, v in selected.items() if k.startswith(f"{setting}/")]
+        wanted = {point_id(p): p for p in picks}
+        for point in (grid.points(impact)[0], grid.fixed_stress(impact), grid.impact_only(impact)):
+            wanted[point_id(point)] = point
+        for pid, point in wanted.items():
+            if pid not in removed[setting]:
+                digests.update(generate(causal, out, binary, "holdout", setting, point, HOLDOUT_DAYS))
+    pathlib.Path(digests_path).write_text(json.dumps({"digests": digests}, indent=0))
+
+
+def holdout_step(out, causal_out, digests_path, identify_path, frozen_sha, marker_dir, processes, recover=None,
+                 journal_prefix_sha=None):
+    out = pathlib.Path(out)
+    if sha256(out / "frozen.json") != frozen_sha:
+        raise SystemExit("frozen.json is not the freeze named")
+    journal = out / "holdout.jsonl"
+    claim(marker_dir, frozen_sha, journal if recover else None, recover, journal_prefix_sha)
+    selected = json.loads((out / "frozen.json").read_text())["selected"]
+    removed = removed_points(identify_path)
+    jobs = holdout_jobs(selected, removed=removed)
+    rows = run_pool(jobs, journal, processes, context(out, causal_out, digests_path))
+    (out / "holdout.json").write_text(json.dumps(
+        [{"key": job_key(j), "condition": j["condition"], "policy": j["policy"], "point": j["point"],
+          "day": j["day"], "result": r} for j, r in rows]))
+
+
+def main(argv):
+    step, rest = argv[0], argv[1:]
+    if step == "pilot":
+        pilot_step(rest)
+    elif step == "days-selection":
+        days_selection(*rest)
+    elif step == "identify":
+        identify(*rest)
+    elif step == "selection":
+        selection_step(*rest[:4], int(rest[4]))
+    elif step == "freeze":
+        print(freeze(rest[0], HERE / "design.json", rest[1], rest[2], rest[3:]))
+    elif step == "days-holdout":
+        days_holdout(*rest)
+    elif step == "holdout":
+        holdout_step(*rest[:5], rest[5], int(rest[6]), *(rest[7:] or []))
+    else:
+        raise SystemExit(f"unknown step {step}")
 
 
 if __name__ == "__main__":

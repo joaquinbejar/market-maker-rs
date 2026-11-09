@@ -116,7 +116,7 @@ def test_pilot_refuses_an_existing_output(tmp_path):
     digest = hashlib.sha256((tmp_path / "classical.json").read_bytes()).hexdigest()
     (tmp_path / "frozen.json").write_text(json.dumps({"classical_sha256": digest}))
     with pytest.raises(SystemExit, match="already exists"):
-        r.main(["pilot", str(tmp_path), "unused", str(tmp_path)])
+        r.pilot_step([str(tmp_path), "unused", str(tmp_path)])
 
 
 def test_select_tie_uses_grid_order_whatever_the_row_order():
@@ -132,3 +132,52 @@ def test_removed_named_points_leave_no_substitute():
     fixed = r.point_id(r.grid.fixed_stress(impact))
     assert "fixed_stress" not in r.condition_points(impact, adv, {fixed})
     assert r.condition_points(impact, adv, {r.point_id(r.grid.points(impact)[0])}) == {}
+
+
+def test_torn_last_line_is_dropped_and_the_job_reruns(tmp_path):
+    journal = tmp_path / "j"
+    journal.write_text('{"key": "a", "result": 1}\n{"key": "b", "res')
+    assert list(r.load_journal(journal)) == ["a"]
+    assert journal.read_text() == '{"key": "a", "result": 1}\n'
+
+
+def test_a_torn_middle_line_is_an_error(tmp_path):
+    journal = tmp_path / "j"
+    journal.write_text('{"key": "a"\n{"key": "b"}\n')
+    with pytest.raises(json.JSONDecodeError):
+        r.load_journal(journal)
+
+
+def test_freeze_is_single_and_hashes_inputs(tmp_path):
+    for name in ("selection.json", "d", "i", "p", "design"):
+        (tmp_path / name).write_text("{}")
+    digest = r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [tmp_path / "p"])
+    assert digest == r.sha256(tmp_path / "frozen.json")
+    with pytest.raises(SystemExit, match="already"):
+        r.freeze(tmp_path, tmp_path / "design", tmp_path / "d", tmp_path / "i", [])
+
+
+def test_holdout_refuses_another_freeze(tmp_path):
+    (tmp_path / "frozen.json").write_text("{}")
+    with pytest.raises(SystemExit, match="not the freeze"):
+        r.holdout_step(tmp_path, tmp_path, tmp_path, tmp_path, "0" * 64, tmp_path / "m", 1)
+    assert not (tmp_path / "m").exists()
+
+
+def test_point_statistics_on_a_toy_day(tmp_path):
+    point = r.grid.points(0.0)[0]
+    path = r.day_path(tmp_path, "selection", "impact_0", point, 1)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps([[0, 10, 1, 11, 1], [1, 11, 1, 12, 1], [2, 11, 1, 12, 1]]))
+    path.with_name("day-1.flow.json").write_text(json.dumps([[1, 0], [0, 0], [0, 0]]))
+    path.with_name("day-1.queues.json").write_text(json.dumps([[0, 20], [5, 5], [5, 5]]))
+    st = r.point_statistics(tmp_path, "selection", "impact_0", point, 1)
+    assert st["empty_share"] == pytest.approx(1 / 6) and st["cap_share"] == pytest.approx(1 / 6)
+    assert st["market_rate"] == pytest.approx(1 / 6) and st["slope"] == pytest.approx(1)
+
+
+def test_holdout_jobs_drop_removed_conditions_per_setting():
+    fixed = r.point_id(r.grid.fixed_stress(0.0))
+    jobs = r.holdout_jobs(selected(), removed={"impact_0": {fixed}})
+    assert len(jobs) == 4680 - 13 * 30
+    assert not any(j["condition"] == "fixed_stress" and j["policy"]["setting"] == "impact_0" for j in jobs)
