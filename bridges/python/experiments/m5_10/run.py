@@ -218,6 +218,9 @@ def evaluate(job, data_dir, checkpoints, classical, digests):
 PILOT_SETTING = "impact_high"
 PILOT_OFFSET = 500000
 PILOT_DAYS = 2
+# Selection: 24 points x 10 days x 3 settings. Holdout: at most 8 points per setting (the three
+# named conditions and each of the 5 arms' own pick) x 30 days x 3 settings.
+GENERATED_DAYS = 24 * SELECTION_DAYS * 3 + 8 * HOLDOUT_DAYS * 3
 
 
 def pilot_jobs():
@@ -228,7 +231,7 @@ def pilot_jobs():
             for p in policies(PILOT_SETTING) for d in range(1, PILOT_DAYS + 1)]
 
 
-def project(rows, ceiling_hours=90.0):
+def project(rows, generation_seconds_per_day=0.0, ceiling_hours=90.0):
     """Process-hours for the whole count from the pilot's per-day seconds, the slowest point's."""
     per_arm = {}
     for job, seconds in rows:
@@ -238,7 +241,11 @@ def project(rows, ceiling_hours=90.0):
     per_setting_day = sum(worst[arm] * n for arm, n in runs.items())
     days = (24 * SELECTION_DAYS + 4 * HOLDOUT_DAYS) * len(SETTINGS)
     hours = per_setting_day * days / 3600
-    return {"worst_seconds_per_day": worst, "projected_hours": hours, "over_ceiling": hours > ceiling_hours}
+    generation = generation_seconds_per_day * GENERATED_DAYS / 3600
+    total = hours + generation
+    return {"worst_seconds_per_day": worst, "policy_hours": hours, "generation_seconds_per_day": generation_seconds_per_day,
+            "generated_days": GENERATED_DAYS, "generation_hours": generation, "projected_hours": total,
+            "over_ceiling": total > ceiling_hours}
 
 
 def spectral_check(weights, points):
@@ -254,7 +261,9 @@ def spectral_check(weights, points):
 def generate_pilot_days(causal, data_dir, binary):
     """Writes the pilot's days with examples/hawkes_days and returns their sha256 by relative path."""
     import subprocess
+    import time
 
+    generation = {}
     data_dir = pathlib.Path(data_dir)
     impact = SETTINGS[PILOT_SETTING]
     digests = {}
@@ -265,11 +274,13 @@ def generate_pilot_days(causal, data_dir, binary):
         out.mkdir(parents=True, exist_ok=True)
         config = out / "config.json"
         config.write_text(json.dumps({"causal": grid.day_config(causal, point, "p", PILOT_DAYS, PILOT_OFFSET)}))
+        start = time.perf_counter()
         subprocess.run([str(binary), str(config), str(out)], check=True, stdout=subprocess.DEVNULL)
+        generation[point_id(point)] = (time.perf_counter() - start) / PILOT_DAYS
         for day in range(1, PILOT_DAYS + 1):
             path = day_path(data_dir, "pilot", PILOT_SETTING, point, day)
             digests[str(path.relative_to(data_dir))] = sha256(path)
-    return digests, radii
+    return digests, radii, generation
 
 
 def main(argv):
@@ -286,7 +297,7 @@ def main(argv):
     causal = json.loads((HERE.parent / "m5_02" / "design.json").read_text())["causal"]
     if (out / "pilot.jsonl").exists():
         raise SystemExit("a pilot output already exists; one pilot per output directory")
-    digests, radii = generate_pilot_days(causal, out, binary)
+    digests, radii, generation = generate_pilot_days(causal, out, binary)
     _runner()  # imported once here, so its one-off cost is outside every job's time
     rows = []
     with (out / "pilot.jsonl").open("x") as handle:
@@ -297,7 +308,8 @@ def main(argv):
             rows.append((job, seconds))
             handle.write(json.dumps({"key": job_key(job), "seconds": seconds, "net": result["net"]}) + "\n")
             handle.flush()
-    report = {"projection": project(rows), "spectral_radius": radii, "load": os.getloadavg()}
+    report = {"projection": project(rows, max(generation.values())), "generation_seconds_per_day": generation,
+              "first_job_seconds": rows[0][1], "spectral_radius": radii, "load": os.getloadavg()}
     (out / "pilot.json").write_text(json.dumps(report, indent=1))
 
 

@@ -95,6 +95,9 @@ def test_project_uses_each_arm_slowest_point():
     out = r.project(rows)
     assert out["projected_hours"] == pytest.approx(20.0 * 13 * 360 * 3 / 3600)
     assert out["over_ceiling"] is False
+    with_days = r.project(rows, 36.0)
+    assert with_days["generation_hours"] == pytest.approx(14.4)
+    assert with_days["projected_hours"] == pytest.approx(out["projected_hours"] + 14.4)
 
 
 def test_spectral_check_records_and_stops():
