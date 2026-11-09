@@ -158,7 +158,25 @@ def _sleep(seconds):
     return seconds
 
 
-def test_a_pool_at_its_limit_stops_running_workers():
+def timed_here(worker, job):
+    """`run.timed_call`, importable by the spawned workers of a test: the runner's module is
+    loaded from a path here, and is importable only as a script's `__main__`."""
+    import time
+    started = time.perf_counter()
+    return worker(job), time.perf_counter() - started
+
+
+@pytest.fixture
+def importable_timer(monkeypatch):
+    monkeypatch.setattr(run, "timed_call", timed_here)
+
+
+def test_the_timed_call_returns_the_result_and_its_seconds():
+    result, seconds = run.timed_call(_sleep, 0.0)
+    assert result == 0.0 and 0.0 <= seconds < 1.0
+
+
+def test_a_pool_at_its_limit_stops_running_workers(importable_timer):
     import time
     started = time.perf_counter()
     rows, finished, _, charged = run.run_pool([0.0, 30.0], sleep_worker, 2, 8.0, "t")
@@ -172,6 +190,6 @@ def test_five_jobs_on_four_workers_are_two_rounds():
     assert run.rounds(5, 4) == 2 and run.rounds(4, 4) == 1
 
 
-def test_process_seconds_are_each_jobs_own():
+def test_process_seconds_are_each_jobs_own(importable_timer):
     rows, finished, _, charged = run.run_pool([0.0, 0.0], sleep_worker, 2, None, "t")
     assert rows == [0.0, 0.0] and finished == 2 and charged < 1.0
