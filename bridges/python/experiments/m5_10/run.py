@@ -49,10 +49,17 @@ def selection_jobs(settings=SETTINGS):
             for p in policies(s) for d in range(1, SELECTION_DAYS + 1)]
 
 
-def condition_points(setting, impact, selected):
-    """unperturbed, fixed stress, the arm's own adversary point and impact only."""
-    return {"unperturbed": grid.points(impact)[0], "fixed_stress": grid.fixed_stress(impact),
-            "adversary": selected, "impact_only": grid.impact_only(impact)}
+def condition_points(impact, selected, removed=()):
+    """unperturbed, fixed stress, the arm's own adversary point and impact only.
+
+    A removed named point leaves its condition not run, with no substitute; a removed
+    unperturbed point voids the setting.
+    """
+    named = {"unperturbed": grid.points(impact)[0], "fixed_stress": grid.fixed_stress(impact),
+             "adversary": selected, "impact_only": grid.impact_only(impact)}
+    if point_id(named["unperturbed"]) in removed:
+        return {}
+    return {name: pt for name, pt in named.items() if point_id(pt) not in removed}
 
 
 def policy_key(policy):
@@ -60,11 +67,11 @@ def policy_key(policy):
     return f"{policy['setting']}/{policy['arm']}"
 
 
-def holdout_jobs(selected_by_policy, settings=SETTINGS):
+def holdout_jobs(selected_by_policy, settings=SETTINGS, removed=()):
     jobs = []
     for s, impact in settings.items():
         for p in policies(s):
-            conditions = condition_points(s, impact, selected_by_policy[policy_key(p)])
+            conditions = condition_points(impact, selected_by_policy[policy_key(p)]["point"], removed)
             for name, pt in conditions.items():
                 jobs += [{"split": "holdout", "condition": name, "policy": p, "point": pt, "day": d}
                          for d in range(1, HOLDOUT_DAYS + 1)]
@@ -107,8 +114,11 @@ def run_journaled(jobs, journal, evaluate):
     return [done[job_key(job)] for job in jobs]
 
 
-def select(rows):
-    """{policy_key: grid index} from selection rows: mean daily loss, seeds of an arm averaged."""
+def select(rows, settings=SETTINGS):
+    """{policy_key: the point and its selection loss}: mean daily loss, seeds of an arm averaged.
+
+    Candidates are taken in grid order, so a tie goes to the first point of the grid.
+    """
     by = {}
     for job, row in rows:
         key = policy_key(job["policy"])
@@ -116,10 +126,10 @@ def select(rows):
         by.setdefault(key, {}).setdefault(pid, {}).setdefault(job["day"], []).append(-row["net"])
     out = {}
     for key, per_point in by.items():
-        ids = list(per_point)
-        losses = {i: [sum(v) / len(v) for v in per_point[pid].values()] for i, pid in enumerate(ids)}
-        best, means = stats.pick_adversary(ids, losses)
-        out[key] = {"point": ids[best], "selection_loss": means[best]}
+        points = [p for p in grid.points(settings[key.split("/")[0]]) if point_id(p) in per_point]
+        losses = {i: [sum(v) / len(v) for v in per_point[point_id(p)].values()] for i, p in enumerate(points)}
+        best, means = stats.pick_adversary(points, losses)
+        out[key] = {"point": points[best], "selection_loss": means[best]}
     return out
 
 

@@ -12,7 +12,7 @@ import run as r  # noqa: E402
 
 
 def selected():
-    return {r.policy_key(p): r.grid.points(i)[3] for s, i in r.SETTINGS.items() for p in r.policies(s)}
+    return {r.policy_key(p): {"point": r.grid.points(i)[3]} for s, i in r.SETTINGS.items() for p in r.policies(s)}
 
 
 def test_counts_match_the_design():
@@ -58,7 +58,7 @@ def test_select_averages_seeds_and_breaks_ties_first():
     rows = [({"policy": policy(s), "point": p[i], "day": 1}, {"net": n})
             for i, s, n in ((0, 1, -1), (0, 2, -3), (1, 1, -2), (1, 2, -2), (2, 1, 0), (2, 2, 0))]
     out = r.select(rows)["impact_0/mlp"]
-    assert out["point"] == r.point_id(p[0]) and out["selection_loss"] == 2
+    assert out["point"] == p[0] and out["selection_loss"] == 2
 
 
 def test_claim_recovery_rules(tmp_path):
@@ -117,3 +117,18 @@ def test_pilot_refuses_an_existing_output(tmp_path):
     (tmp_path / "frozen.json").write_text(json.dumps({"classical_sha256": digest}))
     with pytest.raises(SystemExit, match="already exists"):
         r.main(["pilot", str(tmp_path), "unused", str(tmp_path)])
+
+
+def test_select_tie_uses_grid_order_whatever_the_row_order():
+    p = r.grid.points(0.0)
+    policy = {"arm": "glft", "setting": "impact_0", "seed": None}
+    rows = [({"policy": policy, "point": p[i], "day": 1}, {"net": -1}) for i in (5, 2, 7)]
+    assert r.select(rows)["impact_0/glft"]["point"] == p[2]
+
+
+def test_removed_named_points_leave_no_substitute():
+    impact = 0.25
+    adv = r.grid.points(impact)[3]
+    fixed = r.point_id(r.grid.fixed_stress(impact))
+    assert "fixed_stress" not in r.condition_points(impact, adv, {fixed})
+    assert r.condition_points(impact, adv, {r.point_id(r.grid.points(impact)[0])}) == {}
