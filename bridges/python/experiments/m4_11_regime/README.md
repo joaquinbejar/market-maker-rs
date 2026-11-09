@@ -27,8 +27,7 @@ From reading `experiments/m4_11/run.py` and `experiments/m4_07/run.py`:
   and steps left that the aliasing diagnosis keys on.
 
 The `audit` step reports, before any training, the aliasing diagnosis and whether position and
-steps left reach the network unclipped and one to one. Its result is recorded here once it has
-run.
+steps left reach the network unclipped and one to one.
 
 The audit found position and steps left one to one with the input, inside the columns' observed
 ranges (position -0.95 to 1.0 in units of 20 lots, steps left up to 1.0), so neither is clipped
