@@ -8,6 +8,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A draft consolidation of the research program in `doc/RESEARCH_CONSOLIDATION.md` (#114): evidence and product matrices, proposed go or no-go decisions, and the gaps. Documentation only.
+
+### Added
+
 - The offline training study with the regime in the input of #309 in
   `bridges/python/experiments/m4_11_regime`, synthetic only, on new days. Behaviour cloning passes
   the sanity rule #280 stopped at, on both datasets. On the holdout no trading arm made money:
