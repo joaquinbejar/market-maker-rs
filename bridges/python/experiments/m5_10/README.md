@@ -19,7 +19,7 @@ read once. Intervals are paired 90 % stationary block bootstraps (mean block 2 d
 replicates, seed 108).
 
 **The identifiability test removed 14 of 24 points per setting.** Before any policy ran, the frozen rate
-test removed them before any policy ran, the fixed stress included; every impact slope test passed. Realised over formula rate falls as the empty-queue share grows (0.97 at 3 %, 0.70 at
+test removed them, the fixed stress included; every impact slope test passed. Realised over formula rate falls as the empty-queue share grows (0.97 at 3 %, 0.70 at
 19 %); that this is the suppression at the empty queue the design named is untested. The rule was
 not changed. So the **primary** analysis (the only one feeding a reading) searches the 10
 surviving points only, and fixed stress is reported not run in every setting. Its worst case is
@@ -98,11 +98,11 @@ Daily net per day, against the same arm unperturbed and against no-trade under t
 | impact_low | mlp | adversary | -126.2 | [-130.9, -117.6] | reused from the primary |
 | impact_low | mlp | fixed_stress | -18.9 | [-22.5, -11.6] | own |
 
-What was measured: for 13 of 15 policies the pick over all 24 points was a surviving point,
-its primary pick, so no removed point lost more than the worst surviving one for them; only
-Avellaneda-Stoikov at impact 0 and impact 1.0 picked a removed point. The fixed stress lost less
-than the primary picks. The removed points were not the costlier ones here: the loss comes from
-the impact step, which is among the surviving points. Rows marked
+What was measured: for 13 of 15 policies (3 of them no-trade) the pick over all 24 points was
+the surviving primary pick. Avellaneda-Stoikov at impact 0 and 1.0 picked a removed point, which
+lost more than its primary pick by 2.3 and 0.3 a day. The fixed stress lost less than the
+primary picks in every row. Much of the loss comes with the impact step, which is among the
+surviving points: impact alone costs about half of the adversary's loss. Rows marked
 reused are the primary's own adversary days, because that policy's pick over every point was its
 primary pick; they are not independent evidence.
 
