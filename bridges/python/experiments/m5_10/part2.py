@@ -123,5 +123,20 @@ def main(run_dir, out281, out, marker_dir, processes):
     (out / "part2.json").write_text(json.dumps(result, indent=1, default=str))
 
 
+def selftest():
+    """Run as a script with --selftest: a function only #281's runner has, pickled to a real
+    spawn worker, resolves there to #281's runner."""
+    import concurrent.futures
+    import multiprocessing
+
+    run, _ = load_runner()
+    with concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn")) as pool:
+        name = pool.submit(run.unperturbed_name).result()
+    print(json.dumps({"worker_unperturbed_name": name, "parent": run.unperturbed_name()}))
+
+
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    if sys.argv[1:] == ["--selftest"]:
+        selftest()
+    else:
+        main(*sys.argv[1:])

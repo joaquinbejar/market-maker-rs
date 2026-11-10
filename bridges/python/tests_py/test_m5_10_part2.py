@@ -57,3 +57,14 @@ def test_jobs_are_a_and_b_only_at_impact():
     out = p2.jobs(M, None, None, {}, {"calm": 0.5})
     assert out == [{"condition": "impact", "arms": ("adversarial", "baseline"), "split": "holdout",
                     "impact": True, "kappa": 0.5}]
+
+
+def test_a_spawn_worker_of_the_script_resolves_281s_runner():
+    """part2.py started as a script, as the run starts it, so pytest's path cannot hide the bug."""
+    import json
+    import subprocess
+
+    out = subprocess.run([sys.executable, str(p2.HERE / "part2.py"), "--selftest"], check=True,
+                         capture_output=True, text=True, cwd=str(p2.HERE.parents[1])).stdout
+    result = json.loads(out.strip().splitlines()[-1])
+    assert result["worker_unperturbed_name"] == result["parent"]
