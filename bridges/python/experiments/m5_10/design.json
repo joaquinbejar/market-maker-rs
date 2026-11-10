@@ -1,0 +1,203 @@
+{
+ "issue": 108,
+ "design_version": 7,
+ "status": "fixed before any policy ran. The design was fixed before any code; since then the selection days were generated and identify.json read (see secondary_not_identified and changes), and no policy has run on them",
+ "data": "SYNTHETIC: every result is from made-up Hawkes parameters and says nothing about a market",
+ "closed_by_295": {
+  "done": "bounded flow perturbations of #102's queue-reactive regimes, fixed stress, grid adversary, selection apart from a holdout read once, classical and learned arms, inventory, drawdown, CVaR",
+  "not_done": [
+   "Hawkes flow, which the issue names (#91)",
+   "flow and impact together on a simulator whose market orders move the mid",
+   "margin shortfall against a real capital: #295 used a made-up capital of 250"
+  ],
+  "elsewhere": "#282 (m5_04) frozen #102 arms under own impact; #281 (m5_05) adversarial training",
+  "closes_108": "the part 2 PR closes #108 only if part 1 reports every declared arm and condition and part 2 ran or is declared not run with its reason; margin shortfall is stated as not measured, so the PR must say whether that scope item is waived"
+ },
+ "part_1_hawkes": {
+  "simulator": "experiments/m5_02/design.json causal section, examples/hawkes_days.rs; base rates, decays, weights, diffusion, spread and kernel unchanged; made-up",
+  "impact_settings": {
+   "impact_0": 0.0,
+   "impact_low": 0.25,
+   "impact_high": 1.0
+  },
+  "perturbations": {
+   "market_rate": [
+    1,
+    1.5,
+    2
+   ],
+   "limit_rate": [
+    1,
+    0.7
+   ],
+   "branching_scale": [
+    1,
+    1.2
+   ],
+   "impact_step": {
+    "rule": "the policy's own setting or the next higher: 0 to 0.25, 0.25 to 1, 1 to 2",
+    "note": "two values per setting"
+   },
+   "grid": "product in the listed order, 24 points per setting, the unperturbed point first; ties take the first in grid order",
+   "plausibility": "bounds are #108's ranges; branching_scale multiplies every weight and each point must keep the spectral radius of Sum_u alpha_u, the matrix HawkesParameters::new checks, below 1, checked and recorded by code before any day is generated; a failing point is removed and reported",
+   "identifiability": {
+    "rate": "the market entry of (I - K)^-1 mu, K = Sum_u alpha_u with cross-excitation, mu = (limit x P(q < cap), cancel x E[q], market x P(q > 0)), each average time-weighted over the point's selection days. Tested: realised market orders per row at the point over the unperturbed point, against the same ratio of the formula; |ratio / ratio_formula - 1| <= 0.10",
+    "impact": "OLS slope of per-row mid change on the row's signed market orders; for impact_ticks > 0, |slope / impact_ticks - 1| <= 0.10; at impact 0, |slope| <= 0.025 ticks, 10 % of the smallest non-zero impact",
+    "when": "before freeze, with no policy; a failing point is reported and removed",
+    "rate_reading": "mu uses realised queue statistics, so the test checks the branching response given the realised queue, not the closed-loop rate. The crate masks the whole intensity at an empty queue and at the cap, so excited events are suppressed there and (I - K)^-1 overstates the response: a known approximation. Empty-queue and cap shares are reported per point. The 10 % is unmeasured and fixed before any ratio is computed, and a removal under it may reflect this approximation",
+    "unperturbed": "the rate check at the unperturbed point is true by construction (ratio 1 = 1) and carries no evidence; its impact slope is the only live test there"
+   },
+   "removed_points": "a point failing the spectral or identifiability check is removed before freeze. If it is the fixed stress, or the impact-only point, that condition is reported as not run, with no substitute. If the unperturbed point fails, that whole setting is reported as not run, since every comparison in it needs that point"
+  },
+  "fixed_stress": "market 2, limit 0.7, branching 1.2, next higher impact",
+  "adversary": {
+   "picks": "for each policy (the seeds of a learned arm being one policy), the point with the largest mean daily loss over its selection days; a tail statistic is not used since 10 days do not resolve one",
+   "information": "parameters set before a day; sees nothing of its path; changes neither matching, accounting nor limits",
+   "used_on": "selection days only; the holdout is not used by it",
+   "comparability": "the mean-loss rule differs from #295's CVaR rule, so the two parts' adversary results are not comparable",
+   "selection_noise": "24 candidates pick up selection noise: the selected point's selection-day and holdout loss are reported side by side"
+  },
+  "arms": {
+   "no_trade": "hold",
+   "classical": "Avellaneda-Stoikov and GLFT at #107 part C's points selected on its validation days per setting, classical.json (its only classical arms)",
+   "learned": "#107 part C's frozen mlp and lstm, seeds 1 to 5, in every setting (validation chose mlp at impact 0 and lstm at the other two as control); HSN and the other arms left out for compute, stated",
+   "learned_cut_effect": "if lstm is cut, learned claims are limited to mlp and the comparison with the validation-chosen control at impact_low and impact_high is stated as not available"
+  },
+  "no_training": "learned arms are loaded and verified by sha256 against #107's manifest and evaluated deterministically; this study trains nothing",
+  "execution": "#107 part C's: queue_position_rational, 1 lot per 500 ms, no minimum time; fee -0.0001 and the same limits and latency for every arm; #107's secondary fee 0.0002 is not run in this study",
+  "days": {
+   "selection": {
+    "count": 10,
+    "per_point": true,
+    "seed": "1000003 x day + 100000, day 1 to 10"
+   },
+   "holdout": {
+    "count": 30,
+    "seed": "1000003 x day + 300000, day 1 to 30; #107's days used 1000003 + day, so no seed is reused"
+   },
+   "digests": "committed before any policy runs"
+  },
+  "conditions": [
+   "unperturbed",
+   "fixed_stress",
+   "adversary at the policy's own selected point",
+   "impact only (next higher impact, flow unperturbed)"
+  ],
+  "metrics": [
+   "daily net and attribution",
+   "largest and mean absolute position",
+   "max drawdown",
+   "5 % CVaR of daily net (worst 2 of 30)",
+   "limit breaches and refusals",
+   "margin-rs maintenance requirement at the day's peak position, reported as a requirement"
+  ],
+  "margin_shortfall": "not measured: this simulator has no declared capital and none is made up; margin-rs#7 gives a requirement, not a capital",
+  "intervals": {
+   "kind": "paired 90 % stationary block bootstrap over holdout days of the daily difference",
+   "replicates": 2000,
+   "mean_block_days": 2,
+   "seed": 108,
+   "pairs": "each arm stressed against itself unperturbed, and against no-trade under the same condition"
+  },
+  "reading": "descriptive, per arm and setting. A loss is reported as a loss; an interval containing 0 is 'no difference shown', never equivalence or robustness; no adopt decision",
+  "once": "the holdout runs once from a frozen manifest, behind an O_EXCL marker claimed before any day is read, at the fixed path m5_10_markers, a sibling of the study's output directories, passed to the runner as an argument and named in the run's log, outside the output directory, with a frozen_sha256 check. One recovery at most, only after an external kill, resumed from the journal with the journal prefix's hash checked, as #281",
+  "impact_meaning": "impact here is the market orders' impact on the mid in the generator's rows; the agent's own fills do not move the mid, unlike #282's reactive episode, and no conclusion about own impact is drawn",
+  "secondary_not_identified": {
+   "status": "secondary and exploratory, labelled 'not identified by the frozen rate test'. No reading, decision or selection of the primary rests on it",
+   "decided": "after identify.json (sha256 7346691aa7c3a1c4277362fc12f38c26b2769de76b5a700c9e0e2ff421a5cb62) had been seen and before any policy ran; that file showed the rate test removing the same 14 of 24 points in every setting, fixed stress included, and every impact slope test passing",
+   "explanation_untested": "realised over formula rate falls as the empty-queue share grows (0.97 at 3 % empty, 0.70 at 19 %). That this is the suppression at the empty queue named in rate_reading is an untested interpretation",
+   "rule_unchanged": "the 10 % and the formula are unchanged; the primary analysis is as approved: only the 10 surviving points of a setting, fixed_stress reported as not run",
+   "feeds_decision": "only the primary analysis feeds the report's reading. There is no go or no-go on the secondary",
+   "selection": "the primary's adversary picks only among the 10 surviving points, computed without any secondary row. The secondary's own pick is over all 24 points of a setting, using the primary's selection rows for the 10 and new rows for the 14; it cannot change the primary's pick",
+   "added_runs": {
+    "selection": "the 14 removed points x 10 days x 13 policy runs x 3 settings = 5460 days",
+    "holdout": "fixed_stress (30 x 13 x 3 = 1170 days) and the secondary pick (at most 1170 days), on holdout days and in the same single attempt"
+   },
+   "reported": "apart from the primary, in its own table, with each point's realised over formula ratio and queue shares",
+   "isolation": "primary jobs run first and are written out complete before any secondary job starts, in their own journals and outputs. A secondary failure or stop leaves the primary valid and is reported; a primary failure stops the attempt",
+   "surviving_pick": "the secondary's pick over all 24 points may land on a surviving point. If it is the policy's own primary pick, those holdout days are reused and shown only in the secondary table under its label; a different surviving point is run. 'At most 1170' reflects this",
+   "fixed_stress": "the primary table keeps fixed_stress as not run, with no substitute; the secondary's fixed-stress row is never quoted as the primary's",
+   "comparisons": "the same pairs, intervals and metrics as the primary (each arm against itself unperturbed and against no-trade under the same condition), plus each point's realised over formula ratio and queue shares",
+   "primary_claim": {
+    "surviving_points": {
+     "impact_0": [
+      "m1-l0.7-b1-i0.0",
+      "m1-l0.7-b1-i0.25",
+      "m1-l1-b1-i0.0",
+      "m1-l1-b1-i0.25",
+      "m1-l1-b1.2-i0.0",
+      "m1-l1-b1.2-i0.25",
+      "m1.5-l1-b1-i0.0",
+      "m1.5-l1-b1-i0.25",
+      "m2-l1-b1-i0.0",
+      "m2-l1-b1-i0.25"
+     ],
+     "impact_low": [
+      "m1-l0.7-b1-i0.25",
+      "m1-l0.7-b1-i1.0",
+      "m1-l1-b1-i0.25",
+      "m1-l1-b1-i1.0",
+      "m1-l1-b1.2-i0.25",
+      "m1-l1-b1.2-i1.0",
+      "m1.5-l1-b1-i0.25",
+      "m1.5-l1-b1-i1.0",
+      "m2-l1-b1-i0.25",
+      "m2-l1-b1-i1.0"
+     ],
+     "impact_high": [
+      "m1-l0.7-b1-i1.0",
+      "m1-l0.7-b1-i2.0",
+      "m1-l1-b1-i1.0",
+      "m1-l1-b1-i2.0",
+      "m1-l1-b1.2-i1.0",
+      "m1-l1-b1.2-i2.0",
+      "m1.5-l1-b1-i1.0",
+      "m1.5-l1-b1-i2.0",
+      "m2-l1-b1-i1.0",
+      "m2-l1-b1-i2.0"
+     ]
+    },
+    "claim": "the primary's worst case is the worst over these surviving points, not over the declared grid. If the survivors are the milder flows, as the empty-queue pattern suggests, the primary does not cover the stressed region"
+   }
+  }
+ },
+ "part_2_281_impact": {
+  "what": "#281's condition declared and not run: its A and B frozen models (10 models, seeds 1 to 5) at kappa = 2 kappa0 per regime through #282's reactive runner",
+  "days": "#281's 30 holdout days, seed offset 300000, and its train-only kappa0",
+  "gated_on": "#282's runner merged on main; otherwise reported not run, nothing replaces it",
+  "disclosure": "those base days were already read for #281's other 13 conditions, so this is a one-off added condition; it has no bearing on #281's decision and is reported apart",
+  "intervals": "#281's paired stratified stationary block bootstrap, 2000 replicates, seed 281",
+  "once": "one attempt, same marker directory and recovery condition as part 1",
+  "runner": "#282's runner as merged on main; its merge commit is written into part 2's manifest before any day runs. Today it exists only on branch feature/282-reactive-impact (2f3a8a3); if not merged, not run",
+  "models": "checked against the hashes in experiments/m5_05/frozen_models.json",
+  "estimand": "#281's D_tail and D_net at impact; no primary claim",
+  "multiplicity": "#281 compared A with B on 13 conditions; this makes 14, unadjusted"
+ },
+ "compute": {
+  "count": "selection = S x P x 10 x 13 policy runs (no_trade, AS, GLFT, 5 mlp, 5 lstm); holdout = S x 4 x 30 x 13. With S = 3, P = 24: 9360 + 4680 = 14040 days of 86400 rows",
+  "ceiling_process_hours": {
+   "part_1": 90,
+   "part_2": 6
+  },
+  "ceiling_note": "at 15 s a day the count is 58.5 process-hours, and #282 ran 1.5x to 2x its unloaded rate on a contended machine",
+  "pilot": "before selection, under the machine's load at the time: 2 days per arm, on design seeds outside every split, at the slowest arm (lstm) and the most active point (market 2, limit 0.7, branching 1.2, highest impact) as well as unperturbed; its output file is hashed in the freeze",
+  "stop_rule": "cuts are decided from pilot cost alone, before any selection day runs, in this order: drop impact_low, then lstm; no seed is cut. During a step, stop at 1.5 x its pilot-based estimate or at the ceiling and report; a mid-step stop never triggers a cut after results exist",
+  "slots": "none until assigned, not before #282 ends",
+  "count_v5": "primary: selection 10 x 10 x 13 x 3 = 3900, holdout 3 conditions x 30 x 13 x 3 = 3510. Secondary: 5460 + 1170 + at most 1170 = 7800. Total at most 15210 policy days, against 14040 before; at the pilot's worst rates about 51.6 process-hours, under the 90 ceiling"
+ },
+ "seen_before_freeze": [
+  "#107 part C's design and README tables",
+  "#295's and #281's PR text and designs",
+  "the pilot's cost and days on seeds outside every split",
+  "the selection days' queue, flow and mid statistics in identify.json, sha256 7346691aa7c3a1c4277362fc12f38c26b2769de76b5a700c9e0e2ff421a5cb62, committed as experiments/m5_10/identify.json; no policy result on them"
+ ],
+ "changes": [
+  "before any code or run, from review of f583fbc: count formula, pilot at the slowest arm and most active point under load, ceiling raised from 60 to 90 process-hours from that count, cuts from the pilot only, removed points, identifiability estimates, stationary bootstrap named, recovery condition and marker location, part 2 runner, model hashes and estimand, no secondary fee, impact is the flow's and not the agent's",
+  "before any code or run, from review of 378e653: seed formulas written as stride x day + offset, and a failing unperturbed point removes its setting; the identifiability formula, absolute tolerance at impact 0, removal rule and stationary bootstrap of the entry above answer the same review",
+  "before any code or run, from a defect found reading the generator: the baselines depend on the queue, so the rate test uses time-averaged open shares and the point-over-unperturbed ratio, with its approximation stated. No ratio or formula value had been computed on any data",
+  "before any run, reading #107's classical.json for the runner: #107 part C has no fixed-spread point, its classical arms are Avellaneda-Stoikov and GLFT, so GLFT replaces fixed spread; the policy count stays 13",
+  "after identify.json was seen (sha256 7346691a...cb62) and before any policy ran: a secondary analysis of the 14 points the frozen rate test removed, labelled not identified, exploratory, feeding no decision and unable to change the primary's selection. The 10 %, the formula and the primary are unchanged",
+  "after review of v5, before any policy ran: stale statements corrected, isolation of the primary, reuse of a surviving pick, fixed stress labelling, the secondary's comparisons, the primary's claim and the surviving points listed, identify.json committed",
+  "before any policy ran: text only, the marker directory's absolute local path replaced by its name"
+ ]
+}
