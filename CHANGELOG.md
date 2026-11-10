@@ -10,8 +10,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 - The Hawkes robustness study of #108 in `bridges/python/experiments/m5_10`, synthetic only, with
   #107's frozen policies. The frozen identifiability test removed 14 of 24 points per setting, the
-  fixed stress included, so the primary adversary searches the milder surviving flows; under them
-  every quoting arm loses heavily once flow moves the mid, and little without impact. Margin
+  fixed stress included, so the primary adversary searches the surviving points only; every
+  quoting arm loses heavily once flow moves the mid, and little without impact. Margin
   shortfall is not measured. #281's impact condition was not completed: its single run stopped at
   its limit. Experiment scripts only, plus a `seed_offset` option in the `hawkes_days` example; no
   public API change.
