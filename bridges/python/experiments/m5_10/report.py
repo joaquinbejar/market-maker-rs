@@ -86,6 +86,7 @@ def secondary_table(rows, primary_rows, identify=None, secondary_picks=None, pri
         key = f"{row['policy']['setting']}/{row['policy']['arm']}"
         if row["condition"] == "adversary" and secondary_picks and secondary_picks[key]["point"] == primary_picks[key]["point"]:
             reused.append({**row, "condition": "secondary_adversary"})
+    reused_keys = {(r["policy"]["setting"], r["policy"]["arm"], "secondary_adversary") for r in reused}
     grouped = daily(list(rows) + reused)
     out = []
     for (setting, arm, condition), by_day in sorted(grouped.items()):
@@ -105,7 +106,8 @@ def secondary_table(rows, primary_rows, identify=None, secondary_picks=None, pri
                                / (p["formula"] / base_point["formula"]),
                                "empty_share": p["empty_share"], "cap_share": p["cap_share"]}
         out.append({"label": "not identified by the frozen rate test, exploratory", "setting": setting, "arm": arm,
-                    "condition": condition, **metrics(by_day), "against_unperturbed": interval, "against_no_trade": against_hold,
+                    "condition": condition, "reused_primary_rows": (setting, arm, condition) in reused_keys,
+                    **metrics(by_day), "against_unperturbed": interval, "against_no_trade": against_hold,
                     "reading": stats.reading(interval), "points_rate_test": ratios,
                     "selection_loss": (secondary_picks or {}).get(f"{setting}/{arm}", {}).get("selection_loss")
                     if condition == "secondary_adversary" else None,

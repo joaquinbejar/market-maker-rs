@@ -18,9 +18,8 @@ the point with the largest mean daily loss on 10 selection days; the holdout is 
 read once. Intervals are paired 90 % stationary block bootstraps (mean block 2 days, 2000
 replicates, seed 108).
 
-**The identifiability test removed the strongest flows.** Before any policy ran, the frozen rate
-test removed 14 of 24 points in every setting, the fixed stress included; every impact slope test
-passed. Realised over formula rate falls as the empty-queue share grows (0.97 at 3 %, 0.70 at
+**The identifiability test removed 14 of 24 points per setting.** Before any policy ran, the frozen rate
+test removed them before any policy ran, the fixed stress included; every impact slope test passed. Realised over formula rate falls as the empty-queue share grows (0.97 at 3 %, 0.70 at
 19 %); that this is the suppression at the empty queue the design named is untested. The rule was
 not changed. So the **primary** analysis (the only one feeding a reading) searches the 10
 surviving points only, and fixed stress is reported not run in every setting. Its worst case is
@@ -72,34 +71,36 @@ Daily net per day, against the same arm unperturbed and against no-trade under t
 
 ### Secondary (exploratory, not identified by the frozen rate test)
 
-| setting | arm | condition | mean net | vs unperturbed |
-|---|---|---|---|---|
-| impact_0 | avellaneda_stoikov | adversary | -10.1 | [-12.2, -3.3] |
-| impact_0 | avellaneda_stoikov | fixed_stress | -5.7 | [-6.6, +0.2] |
-| impact_0 | glft | adversary | -1.3 | [-3.2, +1.0] |
-| impact_0 | glft | fixed_stress | +0.6 | [-1.2, +2.8] |
-| impact_0 | lstm | adversary | -18.5 | [-13.0, -8.7] |
-| impact_0 | lstm | fixed_stress | -12.5 | [-6.6, -3.1] |
-| impact_0 | mlp | adversary | -0.8 | [-4.8, +1.0] |
-| impact_0 | mlp | fixed_stress | -0.5 | [-3.6, +0.3] |
-| impact_high | avellaneda_stoikov | adversary | -132.0 | [-132.6, -127.9] |
-| impact_high | avellaneda_stoikov | fixed_stress | -61.2 | [-60.9, -58.0] |
-| impact_high | glft | adversary | -415.6 | [-410.1, -395.5] |
-| impact_high | glft | fixed_stress | -161.9 | [-156.3, -141.8] |
-| impact_high | lstm | adversary | -147.7 | [-158.7, -115.5] |
-| impact_high | lstm | fixed_stress | -72.1 | [-80.1, -45.7] |
-| impact_high | mlp | adversary | -162.9 | [-173.2, -142.9] |
-| impact_high | mlp | fixed_stress | -44.1 | [-45.5, -34.0] |
-| impact_low | avellaneda_stoikov | adversary | -175.4 | [-185.2, -160.0] |
-| impact_low | avellaneda_stoikov | fixed_stress | -67.1 | [-72.0, -57.0] |
-| impact_low | glft | adversary | -148.3 | [-151.9, -142.7] |
-| impact_low | glft | fixed_stress | -56.3 | [-58.9, -51.4] |
-| impact_low | lstm | adversary | -148.5 | [-158.8, -122.9] |
-| impact_low | lstm | fixed_stress | -84.4 | [-87.0, -68.0] |
-| impact_low | mlp | adversary | -126.2 | [-130.9, -117.6] |
-| impact_low | mlp | fixed_stress | -18.9 | [-22.5, -11.6] |
+| setting | arm | condition | mean net | vs unperturbed | rows |
+|---|---|---|---|---|---|
+| impact_0 | avellaneda_stoikov | adversary | -10.1 | [-12.2, -3.3] | own |
+| impact_0 | avellaneda_stoikov | fixed_stress | -5.7 | [-6.6, +0.2] | own |
+| impact_0 | glft | adversary | -1.3 | [-3.2, +1.0] | reused from the primary |
+| impact_0 | glft | fixed_stress | +0.6 | [-1.2, +2.8] | own |
+| impact_0 | lstm | adversary | -18.5 | [-13.0, -8.7] | reused from the primary |
+| impact_0 | lstm | fixed_stress | -12.5 | [-6.6, -3.1] | own |
+| impact_0 | mlp | adversary | -0.8 | [-4.8, +1.0] | reused from the primary |
+| impact_0 | mlp | fixed_stress | -0.5 | [-3.6, +0.3] | own |
+| impact_high | avellaneda_stoikov | adversary | -132.0 | [-132.6, -127.9] | own |
+| impact_high | avellaneda_stoikov | fixed_stress | -61.2 | [-60.9, -58.0] | own |
+| impact_high | glft | adversary | -415.6 | [-410.1, -395.5] | reused from the primary |
+| impact_high | glft | fixed_stress | -161.9 | [-156.3, -141.8] | own |
+| impact_high | lstm | adversary | -147.7 | [-158.7, -115.5] | reused from the primary |
+| impact_high | lstm | fixed_stress | -72.1 | [-80.1, -45.7] | own |
+| impact_high | mlp | adversary | -162.9 | [-173.2, -142.9] | reused from the primary |
+| impact_high | mlp | fixed_stress | -44.1 | [-45.5, -34.0] | own |
+| impact_low | avellaneda_stoikov | adversary | -175.4 | [-185.2, -160.0] | reused from the primary |
+| impact_low | avellaneda_stoikov | fixed_stress | -67.1 | [-72.0, -57.0] | own |
+| impact_low | glft | adversary | -148.3 | [-151.9, -142.7] | reused from the primary |
+| impact_low | glft | fixed_stress | -56.3 | [-58.9, -51.4] | own |
+| impact_low | lstm | adversary | -148.5 | [-158.8, -122.9] | reused from the primary |
+| impact_low | lstm | fixed_stress | -84.4 | [-87.0, -68.0] | own |
+| impact_low | mlp | adversary | -126.2 | [-130.9, -117.6] | reused from the primary |
+| impact_low | mlp | fixed_stress | -18.9 | [-22.5, -11.6] | own |
 
-The fixed stress also loses at impact 0.25 and 1.0, less than the primary adversaries' picks.
+The fixed stress also loses at impact 0.25 and 1.0, less than the primary adversaries' picks. Rows marked
+reused are the primary's own adversary days, because that policy's pick over every point was its
+primary pick; they are not independent evidence.
 
 ## Part 2: #281's impact condition
 
@@ -112,7 +113,8 @@ were read for #281's other 13 conditions, with no bearing on #281's decision.
   not read for results.
 - The cause is my cost estimate: part 2 had no pilot, and its reactive episodes ran about 2
   process-minutes a day, some 6 times part 1's, so it needed about 10 process-hours.
-- Attempt 2 was declared the last before it ran; there is no third attempt.
+- Attempt 2 was declared the last before it ran; there is no third attempt. Completing it would
+  need a pilot of the reactive episodes and a budget of about 10 process-hours on its own.
 
 ## Disclosures
 
@@ -125,15 +127,16 @@ were read for #281's other 13 conditions, with no bearing on #281's decision.
   (`frozen.sha256`); the freeze file holds local paths and stays out of the repository.
 - Part 2 attempt 1 failed at start: every spawn worker raised ModuleNotFoundError because
   #281's runner was loaded under a new module name; the journal had 0 lines and no day was read.
-  It was approved by both reviewers, one of whom states their check did not reproduce the real
-  load. Attempt 2, decided before any outcome existed, ran under a second marker recording attempt 1, with
+  The code had been checked at its exact SHA without a real spawned run, which is how the fault
+  was missed. Attempt 2, decided before any outcome existed, ran under a second marker recording attempt 1, with
   the import fixed and a script-level spawn test.
 - Spend: 47.7 process-hours in part 1 and 6.0 in part 2, 53.7 of the 90 ceiling.
 - Operating rules: the marker directory (`m5_10_markers`) is an argument and must be the same
   every time; a restart after a limit stop needs an explicit decision; a killed run's time is
   charged by hand from its logs; a second holdout_secondary journal is not refused.
 - The evaluation used an older bridge virtual environment (#107's), whose `test_training`
-  version check fails; #107's checkpoints were evaluated with it.
+  version check fails, as do its `test_quote_lives` tests (a stale bridge); #107's checkpoints
+  were evaluated with it. `make pre-push`, which builds the current bridge, passes.
 
 ## Steps
 

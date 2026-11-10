@@ -94,6 +94,7 @@ def test_a_reused_pick_is_relabelled_only_in_the_secondary():
     primary = {"s/mlp": {"point": 1}, "s/no_trade": {"point": 3}}
     out = rep.secondary_table([], base, None, picks, primary)
     assert [(r["arm"], r["condition"]) for r in out] == [("mlp", "secondary_adversary")]
+    assert out[0]["reused_primary_rows"] is True
     assert all(r["condition"] != "secondary_adversary" for r in base)
 
 
