@@ -10,7 +10,6 @@ seed) and D_net at impact, A - B, with #281's stratified stationary bootstrap. N
 """
 
 import hashlib
-import importlib.util
 import json
 import os
 import pathlib
@@ -23,32 +22,59 @@ BUDGET_LEFT_HOURS = 90.0 - 47.7  # part 1's ledger at its end
 PART2_CEILING_HOURS = 6.0
 
 
-def _module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+def load_runner():
+    """#281's runner and report, imported by their own names from their directory, so the
+    pickled jobs resolve in spawn workers (which inherit sys.path). Loading by path under a
+    new name broke attempt 1: the workers could not import that name."""
+    directory = str(HERE.parent / "m5_05")
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    import report  # noqa: E402
+    import run  # noqa: E402
+
+    if pathlib.Path(run.__file__).resolve().parent != HERE.parent / "m5_05":
+        raise SystemExit("another study's run module shadows #281's")
+    return run, report
+
+
+def check_runner_commit(repo):
+    """#282's runner here is the one merged at RUNNER_MERGE_COMMIT, an ancestor of HEAD."""
+    import subprocess
+
+    subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", RUNNER_MERGE_COMMIT, "HEAD"], check=True)
+    blob = subprocess.run(["git", "-C", str(repo), "show", f"{RUNNER_MERGE_COMMIT}:bridges/python/experiments/m5_04/run.py"],
+                          check=True, capture_output=True).stdout
+    if hashlib.sha256(blob).hexdigest() != sha256(HERE.parent / "m5_04" / "run.py"):
+        raise SystemExit("m5_04/run.py is not the one merged at the runner's commit")
+
+
+ATTEMPT_1 = {"attempt": 1, "pid": 86547, "head": "7ff4aa15e7bdb5a759643e576075f5d939015c38",
+             "cause": "every spawn worker failed with ModuleNotFoundError: No module named 'm5_05_run'",
+             "rows": 0, "days_read": 0}
 
 
 def sha256(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 
 
-def marker_path(marker_dir):
-    return pathlib.Path(marker_dir) / f"part2-{sha256(HERE / 'design.json')}.jsonl"
+def marker_path(marker_dir, attempt=2):
+    suffix = "" if attempt == 1 else f"-attempt{attempt}"
+    return pathlib.Path(marker_dir) / f"part2-{sha256(HERE / 'design.json')}{suffix}.jsonl"
 
 
 def claim(marker_dir, manifest):
     """One attempt: an O_EXCL marker before any day is read; a failure is never rerun."""
+    if not marker_path(marker_dir, 1).exists():
+        raise SystemExit("attempt 1's marker is missing; this run is attempt 2 only")
     path = marker_path(marker_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
-        raise SystemExit("part 2 was attempted already; it is not rerun") from None
+        raise SystemExit("part 2's last attempt was made already; it is not rerun") from None
     with os.fdopen(fd, "w") as handle:
-        handle.write(json.dumps({"kind": "attempt", "at": time.time(), **manifest}) + "\n")
+        handle.write(json.dumps({"kind": "previous", **ATTEMPT_1}) + "\n")
+        handle.write(json.dumps({"kind": "attempt", "attempt": 2, "at": time.time(), **manifest}) + "\n")
     return path
 
 
@@ -69,8 +95,8 @@ def estimands(report, rows):
 
 
 def main(run_dir, out281, out, marker_dir, processes):
-    m505 = _module("m5_05_run", HERE.parent / "m5_05" / "run.py")
-    report = _module("m5_05_report", HERE.parent / "m5_05" / "report.py")
+    check_runner_commit(HERE)
+    m505, report = load_runner()
     out, out281 = pathlib.Path(out), pathlib.Path(out281)
     out.mkdir(parents=True, exist_ok=True)
     ctx = m505.Context(run_dir)
