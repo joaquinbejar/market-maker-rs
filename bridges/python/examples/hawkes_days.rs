@@ -225,7 +225,14 @@ fn main() -> Result<(), Failure> {
     let settings = get(causal, "settings")?.as_array().ok_or("settings")?;
     for day in 1..=days {
         // The flow and the diffusion of a day are the same in every setting.
-        let seed = SEED_STRIDE.checked_add(day).ok_or("seed")?;
+        // #107's days use stride + day; a design with `seed_offset` uses stride x day + offset.
+        let seed = match causal.get("seed_offset").and_then(Value::as_u64) {
+            Some(offset) => SEED_STRIDE
+                .checked_mul(day)
+                .and_then(|s| s.checked_add(offset))
+                .ok_or("seed")?,
+            None => SEED_STRIDE.checked_add(day).ok_or("seed")?,
+        };
         let (ask_queues, buys) = side_day(&params, seed.wrapping_mul(2), initial, rows)?;
         let (bid_queues, sells) = side_day(&params, seed.wrapping_mul(2) + 1, initial, rows)?;
         for setting in settings {
@@ -263,6 +270,18 @@ fn main() -> Result<(), Failure> {
                 dir.join(format!("day-{day}.flow.json")),
                 serde_json::to_vec(&flow)?,
             )?;
+            // A design with `seed_offset` also keeps the true queues (rows show at least 1 lot).
+            if causal.get("seed_offset").is_some() {
+                let queues: Vec<[u32; 2]> = bid_queues
+                    .iter()
+                    .zip(&ask_queues)
+                    .map(|(b, a)| [*b, *a])
+                    .collect();
+                fs::write(
+                    dir.join(format!("day-{day}.queues.json")),
+                    serde_json::to_vec(&queues)?,
+                )?;
+            }
             records.push(json!({
                 "setting": name,
                 "day": day,

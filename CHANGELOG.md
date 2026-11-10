@@ -9,6 +9,14 @@ project follows [Semantic Versioning](https://semver.org/).
 ### Added
 
 - A consolidation of the research program in `doc/RESEARCH_CONSOLIDATION.md` (#114): evidence and product matrices, proposed go or no-go decisions, and the gaps. Documentation only.
+- The Hawkes robustness study of #108 in `bridges/python/experiments/m5_10`, synthetic only, with
+  #107's frozen policies. The frozen identifiability test removed 14 of 24 points per setting, the
+  fixed stress included, so the primary adversary searches the surviving points only; every
+  quoting arm loses heavily once flow moves the mid, and little without impact. Margin
+  shortfall is not measured. #281's impact condition was not completed: its single run stopped at
+  its limit. Experiment scripts only, plus a `seed_offset` option in the `hawkes_days` example; no
+  public API change.
+
 - The offline training study with the regime in the input of #309 in
   `bridges/python/experiments/m4_11_regime`, synthetic only, on new days. Behaviour cloning passes
   the sanity rule #280 stopped at, on both datasets. On the holdout no trading arm made money:
