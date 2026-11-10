@@ -32,8 +32,9 @@ def load_runner():
     import report  # noqa: E402
     import run  # noqa: E402
 
-    if pathlib.Path(run.__file__).resolve().parent != HERE.parent / "m5_05":
-        raise SystemExit("another study's run module shadows #281's")
+    for module in (run, report):
+        if pathlib.Path(module.__file__).resolve().parent != HERE.parent / "m5_05":
+            raise SystemExit(f"another study's {module.__name__} module shadows #281's")
     return run, report
 
 
