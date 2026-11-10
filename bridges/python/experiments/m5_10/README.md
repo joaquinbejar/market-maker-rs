@@ -112,7 +112,7 @@ were read for #281's other 13 conditions, with no bearing on #281's decision.
   not read for results.
 - The cause is my cost estimate: part 2 had no pilot, and its reactive episodes ran about 2
   process-minutes a day, some 6 times part 1's, so it needed about 10 process-hours.
-- The coordinator ruled that attempt 2 was the last; there is no third attempt.
+- Attempt 2 was declared the last before it ran; there is no third attempt.
 
 ## Disclosures
 
@@ -126,11 +126,11 @@ were read for #281's other 13 conditions, with no bearing on #281's decision.
 - Part 2 attempt 1 failed at start: every spawn worker raised ModuleNotFoundError because
   #281's runner was loaded under a new module name; the journal had 0 lines and no day was read.
   It was approved by both reviewers, one of whom states their check did not reproduce the real
-  load. With the coordinator's go, attempt 2 ran under a second marker recording attempt 1, with
+  load. Attempt 2, decided before any outcome existed, ran under a second marker recording attempt 1, with
   the import fixed and a script-level spawn test.
 - Spend: 47.7 process-hours in part 1 and 6.0 in part 2, 53.7 of the 90 ceiling.
 - Operating rules: the marker directory (`m5_10_markers`) is an argument and must be the same
-  every time; a restart after a limit stop needs the coordinator's go; a killed run's time is
+  every time; a restart after a limit stop needs an explicit decision; a killed run's time is
   charged by hand from its logs; a second holdout_secondary journal is not refused.
 - The evaluation used an older bridge virtual environment (#107's), whose `test_training`
   version check fails; #107's checkpoints were evaluated with it.
