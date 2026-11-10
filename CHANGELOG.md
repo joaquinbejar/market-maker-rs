@@ -8,6 +8,7 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A consolidation of the research program in `doc/RESEARCH_CONSOLIDATION.md` (#114): evidence and product matrices, proposed go or no-go decisions, and the gaps. Documentation only.
 - The Hawkes robustness study of #108 in `bridges/python/experiments/m5_10`, synthetic only, with
   #107's frozen policies. The frozen identifiability test removed 14 of 24 points per setting, the
   fixed stress included, so the primary adversary searches the surviving points only; every
