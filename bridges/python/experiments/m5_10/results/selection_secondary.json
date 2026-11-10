@@ -1,0 +1,137 @@
+{
+ "impact_0/no_trade": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1,
+   "impact": 0.0
+  },
+  "selection_loss": 0.0
+ },
+ "impact_0/avellaneda_stoikov": {
+  "point": {
+   "market": 1,
+   "limit": 0.7,
+   "branching": 1.2,
+   "impact": 0.25
+  },
+  "selection_loss": 15.740496199999999
+ },
+ "impact_0/glft": {
+  "point": {
+   "market": 1.5,
+   "limit": 1,
+   "branching": 1,
+   "impact": 0.25
+  },
+  "selection_loss": 1.50367135
+ },
+ "impact_0/mlp": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 0.25
+  },
+  "selection_loss": 0.3721471499999998
+ },
+ "impact_0/lstm": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 0.25
+  },
+  "selection_loss": 20.524895060000002
+ },
+ "impact_low/no_trade": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1,
+   "impact": 0.25
+  },
+  "selection_loss": 0.0
+ },
+ "impact_low/avellaneda_stoikov": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 1.0
+  },
+  "selection_loss": 194.3294722
+ },
+ "impact_low/glft": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 1.0
+  },
+  "selection_loss": 147.3104128
+ },
+ "impact_low/mlp": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 1.0
+  },
+  "selection_loss": 138.86790752
+ },
+ "impact_low/lstm": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 1.0
+  },
+  "selection_loss": 162.36120384
+ },
+ "impact_high/no_trade": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1,
+   "impact": 1.0
+  },
+  "selection_loss": 0.0
+ },
+ "impact_high/avellaneda_stoikov": {
+  "point": {
+   "market": 1.5,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 2.0
+  },
+  "selection_loss": 131.4460876
+ },
+ "impact_high/glft": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 2.0
+  },
+  "selection_loss": 408.07374605
+ },
+ "impact_high/mlp": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 2.0
+  },
+  "selection_loss": 179.41050493999998
+ },
+ "impact_high/lstm": {
+  "point": {
+   "market": 1,
+   "limit": 1,
+   "branching": 1.2,
+   "impact": 2.0
+  },
+  "selection_loss": 171.85444943
+ }
+}

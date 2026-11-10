@@ -23,7 +23,7 @@ test removed them before any policy ran, the fixed stress included; every impact
 19 %); that this is the suppression at the empty queue the design named is untested. The rule was
 not changed. So the **primary** analysis (the only one feeding a reading) searches the 10
 surviving points only, and fixed stress is reported not run in every setting. Its worst case is
-the worst over those points, likely the milder flows, not over the declared grid. A **secondary**,
+the worst over those points, not over the declared grid. A **secondary**,
 exploratory analysis of the 14 removed points, labelled "not identified by the frozen rate test",
 was decided after `identify.json` was seen and before any policy ran; it feeds no decision and
 never changed the primary's pick. Never compare the two adversaries as a robustness test of each
@@ -33,7 +33,7 @@ other.
 
 Daily net per day, against the same arm unperturbed and against no-trade under the same condition.
 
-| setting | arm | condition | mean net | CVaR5 loss | vs unperturbed | vs no-trade |
+| setting | arm | condition | mean daily net | CVaR5 loss | against unperturbed, 90 % | against no-trade, 90 % |
 |---|---|---|---|---|---|---|
 | impact_0 | avellaneda_stoikov | adversary | -7.8 | 48.4 | [-10.6, +0.4] | [-12.4, -3.1] |
 | impact_0 | avellaneda_stoikov | impact_only | -6.5 | 48.0 | [-9.6, +1.3] | [-12.1, -1.3] |
@@ -71,7 +71,7 @@ Daily net per day, against the same arm unperturbed and against no-trade under t
 
 ### Secondary (exploratory, not identified by the frozen rate test)
 
-| setting | arm | condition | mean net | vs unperturbed | rows |
+| setting | arm | condition | mean daily net | daily net against unperturbed, 90 % | rows |
 |---|---|---|---|---|---|
 | impact_0 | avellaneda_stoikov | adversary | -10.1 | [-12.2, -3.3] | own |
 | impact_0 | avellaneda_stoikov | fixed_stress | -5.7 | [-6.6, +0.2] | own |
@@ -98,7 +98,11 @@ Daily net per day, against the same arm unperturbed and against no-trade under t
 | impact_low | mlp | adversary | -126.2 | [-130.9, -117.6] | reused from the primary |
 | impact_low | mlp | fixed_stress | -18.9 | [-22.5, -11.6] | own |
 
-The fixed stress also loses at impact 0.25 and 1.0, less than the primary adversaries' picks. Rows marked
+What was measured: for 13 of 15 policies the pick over all 24 points was a surviving point,
+its primary pick, so no removed point lost more than the worst surviving one for them; only
+Avellaneda-Stoikov at impact 0 and impact 1.0 picked a removed point. The fixed stress lost less
+than the primary picks. The removed points were not the costlier ones here: the loss comes from
+the impact step, which is among the surviving points. Rows marked
 reused are the primary's own adversary days, because that policy's pick over every point was its
 primary pick; they are not independent evidence.
 
@@ -111,7 +115,7 @@ were read for #281's other 13 conditions, with no bearing on #281's decision.
 - Attempt 2 stopped at its coded limit, 5400 s on 4 processes (the design's 6 process-hours),
   with 142 of 300 seed-days journaled. No estimand is drawn from the partial rows, and they were
   not read for results.
-- The cause is my cost estimate: part 2 had no pilot, and its reactive episodes ran about 2
+- The cause is the cost estimate: part 2 had no pilot, and its reactive episodes ran about 2
   process-minutes a day, some 6 times part 1's, so it needed about 10 process-hours.
 - Attempt 2 was declared the last before it ran; there is no third attempt. Completing it would
   need a pilot of the reactive episodes and a budget of about 10 process-hours on its own.
@@ -137,6 +141,12 @@ were read for #281's other 13 conditions, with no bearing on #281's decision.
 - The evaluation used an older bridge virtual environment (#107's), whose `test_training`
   version check fails, as do its `test_quote_lives` tests (a stale bridge); #107's checkpoints
   were evaluated with it. `make pre-push`, which builds the current bridge, passes.
+
+## Results in the repository
+
+`results/` holds `report.json`, `selection.json`, `selection_secondary.json`, `budget.jsonl` and
+the three markers. The holdout rows (`holdout.json`, 3.3 MB, and `holdout_secondary.json`) and the
+days are kept outside the repository; their sha256 are in the PR and the report's inputs.
 
 ## Steps
 

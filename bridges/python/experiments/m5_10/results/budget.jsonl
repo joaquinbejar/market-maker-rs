@@ -1,0 +1,7 @@
+{"step": "pilot", "process_hours": 0.16611717284750033}
+{"step": "days-selection", "process_hours": 0.011578775243053516}
+{"step": "selection", "process_hours": 13.231326884767784}
+{"step": "selection-secondary", "process_hours": 18.67905641439778}
+{"step": "days-holdout", "process_hours": 0.00798209421278039}
+{"step": "holdout", "process_hours": 11.559242022592224}
+{"step": "holdout-secondary", "process_hours": 3.9685032221288807}
