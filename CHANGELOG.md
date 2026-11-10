@@ -6,6 +6,13 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-10
+
+### Changed
+
+- Package metadata: crates.io keywords `market-making`, `avellaneda-stoikov`, `glft`,
+  `backtesting` and `trading`, and the `simulation` category. No code change.
+
 ### Added
 
 - A consolidation of the research program in `doc/RESEARCH_CONSOLIDATION.md` (#114): evidence and product matrices, proposed go or no-go decisions, and the gaps. Documentation only.

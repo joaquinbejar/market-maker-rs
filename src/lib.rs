@@ -264,6 +264,9 @@
 //! the crate recommends none. Most of these studies are synthetic, and some remain open: treat
 //! their conclusions as limited to the setting each report states.
 //!
+//! The consolidated report, with the evidence and product matrices and the open gaps, is
+//! `doc/RESEARCH_CONSOLIDATION.md` in the repository.
+//!
 //! ## Examples
 //!
 //! ### Risk Management
