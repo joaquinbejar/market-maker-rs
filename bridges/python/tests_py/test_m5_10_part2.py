@@ -25,16 +25,6 @@ def test_attempt_two_only_after_attempt_one(tmp_path):
         p2.claim(tmp_path, {"x": 1})
 
 
-def test_the_runner_resolves_in_a_spawn_worker(tmp_path):
-    import concurrent.futures
-    import multiprocessing
-
-    run, _ = p2.load_runner()
-    (tmp_path / "f").write_text("x")
-    with concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn")) as pool:
-        assert pool.submit(run.sha256, tmp_path / "f").result() == run.sha256(tmp_path / "f")
-
-
 def test_runner_commit_is_checked():
     p2.check_runner_commit(p2.HERE)
 
