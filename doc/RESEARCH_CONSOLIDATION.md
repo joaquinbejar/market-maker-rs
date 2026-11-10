@@ -64,7 +64,7 @@ Common limits, which apply to every learned-policy row unless it says otherwise:
 
 **#108, read with these limits.** The Hawkes study's frozen rate test removed 14 of 24 points in
 every setting before any policy ran, the fixed stress included, so the primary adversary searched
-only the 10 surviving points, likely the milder flows, and the fixed stress is reported not run
+only the 10 surviving points, and the fixed stress is reported not run
 under the frozen rule. An analysis of the removed points is secondary and exploratory, and feeds
 no decision. The policies are #107 C's frozen ones, and the agent's own fills do not move the mid.
 Part 2, #281's impact condition through #282's reactive runner, did not complete: its second and
