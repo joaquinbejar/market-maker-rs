@@ -1,6 +1,6 @@
-# Research consolidation (#114): draft
+# Research consolidation (#114)
 
-**Status: draft.** The decisions below are proposals for review, not adopted decisions. Nothing
+The decisions below are proposals for review, not adopted decisions. Nothing
 here authorizes deployment or live trading. #108's row follows PR #323, open when this was written. The closing
 comment on each closed issue states its limits and governs over any summary here.
 
