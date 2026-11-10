@@ -1,7 +1,7 @@
 # Research consolidation (#114): draft
 
 **Status: draft.** The decisions below are proposals for review, not adopted decisions. Nothing
-here authorizes deployment or live trading. The row for #108 has a marked placeholder. The closing
+here authorizes deployment or live trading. #108's row follows PR #323, open when this was written. The closing
 comment on each closed issue states its limits and governs over any summary here.
 
 Commits are the merge commits on `main`. Detailed tables, hashes and commands stay in each
@@ -51,7 +51,7 @@ Common limits, which apply to every learned-policy row unless it says otherwise:
 |---|---|---|---|---|---|---|
 | #106 MDQR generator | `m5_01` | arXiv 2501.08822v1 | `049e8fcba` | S0 SYNTHETIC; main study REAL, reused holdout, exploratory | Discarded by its frozen rule: best-queue correlation fails against both QR arms, and the transfer cannot pass because all 13 policies have zero fills on the QR arms' rows. All 9 primary queue-size comparisons pass, against QR arms that are transient or saturated on this epoch. | Discard. Closed with waivers by the owner. |
 | #107 HSN | `m5_02` | arXiv 2610.16524v1 | `811b3063a` | SYNTHETIC | Paper's exponential tie reproduced; power-law gain not reproduced. A fixed spread does as well as any memory there. On #103's protocol and Hawkes flow, HSN helps nowhere. | No-go |
-| #108 adversarial robustness | `m5_03` | arXiv 2609.22785v1 | `64aa49036` | SYNTHETIC, perturbed QR regimes | Every quoting arm loses much more under the adversary's flow. PPO barely trades. See the placeholder below. | **Placeholder** |
+| #108 adversarial robustness | `m5_03`, `m5_10` | arXiv 2609.22785v1 | `64aa49036`; #323 open at `b1b4737` | SYNTHETIC: perturbed QR regimes; #107 C's Hawkes flow with impact | QR regimes: every quoting arm loses much more under the adversary's flow; PPO barely trades. Hawkes, primary: at impact 0.25 and 1.0 every quoting arm loses heavily under its adversary and under impact alone, below no-trade; at impact 0 the surviving stresses cost little. No limit breach. See below. | No-go as robustness evidence |
 | #109 consistent time travel | `time_travel_queues` example | arXiv 2408.02322v2 | `c9ebe4f96` | SYNTHETIC with a truth; REAL without one | On synthetic data, time travel's error is about that of an independent path. On the capture it changes outcomes a lot, and that is not evidence of impact. | No-go; keep chronological replay |
 | #110 quote duration (Relaver) | `m4_10` | arXiv 2505.12465v1 | `dd4e73d05` | SYNTHETIC, QR regimes, 100 ms | Duration was not learned: 1-row duration on over 99.7 % of decisions. Its one "helps" compares not trading with losing a little. | No-go on the order book |
 | #289 frequent batch auction toy | `m5_05_batch` | arXiv 2505.12465v1 | `8771c2549` | SYNTHETIC, a toy with other rules | Weak duration effect at one latency of three at fee 0. At 0.0002 the duration arm is worse than without duration at every latency, each interval below 0. Avellaneda-Stoikov's mean exceeds both learned arms. Never comparable with the order book results. | No claim beyond the toy |
@@ -62,9 +62,16 @@ Common limits, which apply to every learned-policy row unless it says otherwise:
 | #113 multi-agent feasibility | none, API reading | arXiv 2407.21025v1 | none | none | Prototype postponed; nothing run. | Postpone |
 | arbitrage-rs#6 deep hedging | outside this repo | see that issue | not reviewed | not reviewed | **Not reviewed in this draft.** | Open |
 
-**#108 PLACEHOLDER.** To be completed when #108's pending work merges and it closes, with margin
-not measured: the only figure is a requirement against a made-up capital of 250, which #102's
-notional limit makes a shortfall of 0 by construction. Its learned criterion on impact stays open.
+**#108, read with these limits.** The Hawkes study's frozen rate test removed 14 of 24 points in
+every setting before any policy ran, the fixed stress included, so the primary adversary searched
+only the 10 surviving points, likely the milder flows, and the fixed stress is reported not run
+under the frozen rule. An analysis of the removed points is secondary and exploratory, and feeds
+no decision. The policies are #107 C's frozen ones, and the agent's own fills do not move the mid.
+Part 2, #281's impact condition through #282's reactive runner, did not complete: its second and
+last attempt stopped at its limit with 142 of 300 seed-days, and no estimand is drawn from them.
+**Margin was not measured**: the Hawkes simulator has no capital, and part 1's only figure is a
+requirement against a made-up capital of 250 that #102's notional limit makes a shortfall of 0 by
+construction.
 
 ## Product matrix
 
@@ -124,8 +131,8 @@ These stay visible, and none is closed by this document.
 |---|---|
 | #282 | Closed by the owner's decision with **impact unmeasured**: the selection stopped at its budget, with no freeze and no holdout. |
 | #112 | **No-go with H not run**: the Hyperliquid capture was not evaluated, and no real-data claim is made. S3, the neural simulator, also not run. |
-| #281 | **Impact condition not run yet**: 13 held-out conditions, not 14. |
-| #108 | **Margin not measured**, and its criterion on impact is open. Placeholder above. |
+| #281 | **Impact condition not completed**: 13 held-out conditions, not 14. #108's part 2 ran it twice and stopped at its limit with 142 of 300 seed-days; nothing is drawn from them. |
+| #108 | **Margin not measured.** Fixed stress not run under the frozen rule; the primary adversary searched only the points the rate test kept. |
 | #111 | Closed on stage A alone. Stages B and C not run; Example 3 coded, not run; Example 2's decoupled cell not runnable. |
 | #106 | Waived by the owner given the discard: snapshot and restore compatibility untested; determinism shown only by synthetic tests, with no real-data repeat; event size laws not compared against QR; toolchain versions not recorded. The Hawkes arm failed as unstable; the transfer's consistency check is uninformative for maskable PPO. |
 | #102 | Closed with reduced scope. Alpha and hedge ablations not run; queue and latency ablations degenerate (#267, #268) and not rerun after those fixes; markout not measured; rejections not in the posted tables; capital is peak notional and inventory, without margin. The conclusions do not extend to binding queues, real latency or real data. |
