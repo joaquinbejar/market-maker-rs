@@ -1,6 +1,6 @@
 [package]
 name = "market-maker-rs"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
@@ -9,8 +9,8 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/joaquinbejar/market-maker-rs"
 homepage = "https://github.com/joaquinbejar/market-maker-rs"
-keywords = ["finance", "market-making", "trading", "quantitative", "avellaneda-stoikov"]
-categories = ["finance", "mathematics", "algorithms"]
+keywords = ["market-making", "avellaneda-stoikov", "glft", "backtesting", "trading"]
+categories = ["finance", "mathematics", "algorithms", "simulation"]
 include = [
     "benches/**/*",
     "src/**/*",
