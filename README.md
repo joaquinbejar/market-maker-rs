@@ -630,9 +630,18 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) · [crates.io](https://crates.io/crates/option-chain-orderbook) | Option chain order book system (underlying, expiration, strike) built on OrderBook-rs, PriceLevel and OptionStratLib. |
-| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
-| [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) · [crates.io](https://crates.io/crates/orderbook-rs) | High-performance, lock-free limit order book and matching engine. |
-| [pretty-simple-display](https://github.com/joaquinbejar/pretty-simple-display) · [crates.io](https://crates.io/crates/pretty-simple-display) | Derive macros for pretty and simple JSON display formatting. |
+| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Option chain order book used by the optional `chain` feature for chain-level quoting. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing and Greeks used by the optional `options` feature. |
+| [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) | Limit order book and matching engine used as the core book for quoting and backtesting. |
+| [arbitrage-rs](https://github.com/joaquinbejar/arbitrage-rs) | Arbitrage models used by the optional `arbitrage` feature for opportunity detection. |
+| [financial_types](https://github.com/joaquinbejar/financial_types) | Fundamental financial enums and contract specifications used across the crate. |
+| [margin-rs](https://github.com/joaquinbejar/margin-rs) | Risk and margin engine used by the optional `margin` feature for accounting and pretrade risk. |
+| [pretty-simple-display](https://github.com/joaquinbejar/pretty-simple-display) | Derive macros for JSON display formatting used by the optional `serde` feature. |
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [quotebook](https://github.com/joaquinbejar/quotebook) | RFQ on Solana with off-chain signed maker quotes; uses market-maker-rs to compute maker quotes. |
 
 <!-- related-projects:end -->
