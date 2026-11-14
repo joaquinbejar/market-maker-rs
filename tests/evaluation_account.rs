@@ -594,6 +594,49 @@ fn test_records_are_checked() {
             .with_orders(&small)
     ));
     assert!(refused(base().with_marks(&marks).with_fills(&named)));
+    // A fill of exactly the offered size must end filled.
+    let mut exact = fill(0, Action::Buy, dec!(1), dec!(2));
+    exact.order_id = Some(8);
+    let exact = [exact];
+    let full = OrderRecord {
+        id: 8,
+        accepted_quantity: dec!(2),
+        replace_increase: Decimal::ZERO,
+        accepted_replaces: 0,
+        end_state: OrderEnd::Filled,
+        liquidation: false,
+    };
+    for end_state in [OrderEnd::Cancelled, OrderEnd::Expired, OrderEnd::Open] {
+        let orders = [OrderRecord { end_state, ..full }];
+        assert!(refused(
+            base()
+                .with_marks(&marks)
+                .with_fills(&exact)
+                .with_orders(&orders)
+        ));
+    }
+    // A replace increase needs an accepted replace.
+    let unreplaced = [OrderRecord {
+        accepted_quantity: dec!(1),
+        replace_increase: dec!(1),
+        ..full
+    }];
+    assert!(refused(
+        base()
+            .with_marks(&marks)
+            .with_fills(&exact)
+            .with_orders(&unreplaced)
+    ));
+    let replaced = [OrderRecord {
+        accepted_replaces: 1,
+        ..unreplaced[0]
+    }];
+    assert!(!refused(
+        base()
+            .with_marks(&marks)
+            .with_fills(&exact)
+            .with_orders(&replaced)
+    ));
     // A fill with no mark and no opening price is refused by the attribution.
     let early = [fill(0, Action::Buy, dec!(1), dec!(1))];
     let input = AccountInput::new(ns(0, 100), vec![base().with_fills(&early)], &[]).unwrap();
@@ -873,6 +916,20 @@ fn test_a_future_settles_at_expiry() {
     let q = lane_fill_quality(&input, 0, spec).unwrap();
     // Sell markout: -(197 - 200.5).
     assert_eq!(q.all.signed_markout, Some(dec!(3.5)));
+    // A horizon of 15 falls before the settlement: the mark at 20 measures it
+    // within a delay of 5, and leaves it unmeasured within a delay of 4.
+    let within = LaneQualitySpec {
+        horizon: 15,
+        max_mark_delay: 5,
+    };
+    let q = lane_fill_quality(&input, 0, within).unwrap();
+    assert_eq!(q.all.signed_markout, Some(dec!(3.5)));
+    let short = LaneQualitySpec {
+        horizon: 15,
+        max_mark_delay: 4,
+    };
+    let q = lane_fill_quality(&input, 0, short).unwrap();
+    assert_eq!(q.all.signed_markout, None);
 }
 
 #[test]
@@ -901,4 +958,31 @@ fn test_a_base_fee_with_a_multiplier() {
     assert_eq!(outcome.final_position, dec!(1.9));
     // Volume gross of the fee: 2 * 10.
     assert_eq!(outcome.volume, dec!(20));
+}
+
+#[test]
+fn test_an_order_accepted_before_the_window_records_its_open_size_at_the_start() {
+    // Accepted before the window starting at 10 and open for 6 at its start;
+    // filled for 6 inside it: accepted quantity 6, ended filled.
+    let marks = [mark(10, dec!(10))];
+    let mut inside = fill(12, Action::Sell, dec!(10), dec!(6));
+    inside.order_id = Some(3);
+    let fills = [inside];
+    let orders = [OrderRecord {
+        id: 3,
+        accepted_quantity: dec!(6),
+        replace_increase: Decimal::ZERO,
+        accepted_replaces: 0,
+        end_state: OrderEnd::Filled,
+        liquidation: false,
+    }];
+    let lane = LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+        .with_marks(&marks)
+        .with_fills(&fills)
+        .with_orders(&orders);
+    let input = AccountInput::new(ns(10, 20), vec![lane], &[]).unwrap();
+    let stats = attribute_account(&input).unwrap().lanes[0].orders;
+    assert_eq!(stats.accepted_quantity, dec!(6));
+    assert_eq!(stats.filled_quantity, dec!(6));
+    assert_eq!(stats.ended_filled, 1);
 }

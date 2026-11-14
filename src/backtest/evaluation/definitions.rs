@@ -171,8 +171,8 @@ pub enum MetricId {
     FillRatioByCount,
     /// [`MetricId::FilledQuantity`] over [`MetricId::AcceptedQuantity`].
     FillRatioByQuantity,
-    /// Largest absolute difference of an attributed net result, of a lane or of
-    /// the account, to the books.
+    /// Largest absolute difference of an attributed net result, of a lane, of a
+    /// role or of the account, to the books.
     ReconciliationResidual,
 }
 

@@ -281,19 +281,26 @@ pub enum OrderEnd {
 /// accepted plus every positive increase of the open quantity by an accepted
 /// replace. An order accepted for 10, filled for 8 and replaced to an open size
 /// of 10 has offered 18. Its fills never exceed it, and an order that ended
-/// [`OrderEnd::Filled`] was filled for exactly it.
+/// [`OrderEnd::Filled`] was filled for exactly it, and an order filled for
+/// exactly it ended [`OrderEnd::Filled`].
+///
+/// For an order accepted before the window, `accepted_quantity` is its open
+/// quantity at the window start, since fills before the window cannot be
+/// recorded. An order accepted before the window, open for 6 at the start and
+/// filled for 6 inside it, is recorded with an accepted quantity of 6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct OrderRecord {
     /// Identifier, unique within the lane.
     pub id: u64,
-    /// Contracts of the order when the venue accepted it. Positive.
+    /// Contracts of the order when the venue accepted it, or its open quantity
+    /// at the window start for an order accepted before the window. Positive.
     pub accepted_quantity: Decimal,
     /// The sum of every positive increase of the open quantity by an accepted
     /// replace, in contracts. Never negative; a replace that lowers the open
     /// quantity adds nothing.
     pub replace_increase: Decimal,
-    /// Replaces the venue accepted.
+    /// Replaces the venue accepted. Positive when `replace_increase` is.
     pub accepted_replaces: u64,
     /// How it ended.
     pub end_state: OrderEnd,
@@ -523,6 +530,12 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
                 order.id
             ));
         }
+        if order.replace_increase > Decimal::ZERO && order.accepted_replaces == 0 {
+            return refuse(format!(
+                "order {} has a replace increase but no accepted replace",
+                order.id
+            ));
+        }
         let offered = order.offered_quantity()?;
         if ids
             .insert(order.id, (offered, Decimal::ZERO, order.end_state))
@@ -545,6 +558,11 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
         if *end == OrderEnd::Filled && filled != offered {
             return refuse(format!(
                 "order {id} ended filled with {filled} of {offered} contracts filled"
+            ));
+        }
+        if *end != OrderEnd::Filled && filled == offered {
+            return refuse(format!(
+                "order {id} is filled for its offered size but did not end filled"
             ));
         }
     }
@@ -1300,10 +1318,12 @@ pub struct LaneQualityReport {
 
 /// Measures the fills of one lane at one horizon, against the lane's own marks.
 /// The mark in force before the lane's first mark is its opening price; a
-/// settlement is not a mark. To measure a fill whose horizon falls at or after
-/// the settlement against the settlement price, pass a [`LaneMark`] at the
-/// settlement instant with that price: a mark at the settlement instant is
-/// admitted, is applied before it, and leaves the attribution unchanged.
+/// settlement is not a mark. To measure a fill against the settlement price,
+/// pass a [`LaneMark`] at the settlement instant with that price. Such a mark is
+/// admitted and applied before the settlement. It measures a fill whose horizon
+/// falls at the settlement, or before it within `max_mark_delay`; a later
+/// horizon stays unmeasured. It leaves the net unchanged, and the split too
+/// unless a fill or transfer shares the settlement instant.
 ///
 /// # Errors
 ///
