@@ -4,7 +4,9 @@
 spaces. The crate embeds it as `market_maker_rs::rl::RL_SPACES_FIXTURES`. It is generated
 by `tests/rl_external.rs`, which also checks it on every test run; rewrite it with
 `MM_WRITE_RL_FIXTURES=1 cargo test --features rl --test rl_external` only after a
-deliberate change of a space version or of `ACTION_HEAD_LAYOUT_VERSION`.
+deliberate change of a space version or of `ACTION_HEAD_LAYOUT_VERSION`. That run skips the
+comparison with the embedded constant, which still holds the old file until the crate is
+rebuilt; run the test once more without the variable to check the embedded copy.
 
 - `format`: the version of this file's layout (2).
 - `head_layout_version`: `ACTION_HEAD_LAYOUT_VERSION`, the head order and kind codes the

@@ -331,6 +331,8 @@ fn sweep_lane<'a>(
 pub enum HedgeNotModelledReason {
     /// The records hold one instrument, so they have no hedge leg.
     SingleInstrument,
+    /// The declared instruments include none in the hedge role, so there is no hedge leg.
+    NoHedgeInstrument,
 }
 
 /// Costs of a hedge.

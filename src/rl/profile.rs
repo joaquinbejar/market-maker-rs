@@ -123,7 +123,10 @@ impl InstrumentAction {
 /// specification that [`RlEnv::new`](crate::rl::RlEnv::new) states for the same kernel
 /// configuration (tick, lot, largest price and order size, `max_steps`), grid, `ORD` and
 /// [`RlConfig`], to the byte, as long as no decision step is set
-/// ([`RlProfile::with_step_ns`]). Any other profile adds the instruments and the index head,
+/// ([`RlProfile::with_step_ns`]) and the grid is one the profile accepts: offsets and sizes
+/// strictly increasing (so sorted and unique) and every size within the largest order size.
+/// [`RlEnv::new`](crate::rl::RlEnv::new) accepts more grids than that; for those there is
+/// no profile to compare. Any other profile adds the instruments and the index head,
 /// of action version [`MULTI_INSTRUMENT_ACTION_SPACE_VERSION`], whose observation is one
 /// feature vector per instrument ([`RlSpec::profile_observation`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -237,6 +240,11 @@ impl RlProfile {
         if !plain {
             spec.action.version = MULTI_INSTRUMENT_ACTION_SPACE_VERSION;
             spec.action.instruments = self.instruments.clone();
+            if !hedged {
+                spec.action.hedge = HedgeActions::NotModelled {
+                    reason: HedgeNotModelledReason::NoHedgeInstrument,
+                };
+            }
         }
         Ok(spec)
     }

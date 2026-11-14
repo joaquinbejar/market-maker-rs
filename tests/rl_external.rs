@@ -996,16 +996,21 @@ fn fixtures() -> Value {
 fn test_published_fixtures_match() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
     let generated = fixtures();
-    if std::env::var_os("MM_WRITE_RL_FIXTURES").is_some() {
+    let write = std::env::var_os("MM_WRITE_RL_FIXTURES").is_some();
+    if write {
         let mut text = serde_json::to_string_pretty(&generated).unwrap();
         text.push('\n');
         std::fs::write(&path, text).unwrap();
     }
     let text = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(
-        text, RL_SPACES_FIXTURES,
-        "rebuild to embed the rewritten {FIXTURE}"
-    );
+    // The embedded copy is the file as of the last build, so a rewrite is checked against
+    // it by the next run, without the variable.
+    if !write {
+        assert_eq!(
+            text, RL_SPACES_FIXTURES,
+            "rebuild to embed the rewritten {FIXTURE}"
+        );
+    }
     let published: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(published, generated, "{FIXTURE} is out of date");
     rebuild_from_plain_data(&published);
@@ -1070,4 +1075,40 @@ fn rebuild_from_plain_data(published: &Value) {
             assert_eq!(v.values[i].to_bits(), value.to_bits());
         }
     }
+}
+
+/// The mid is the environment's: `exact_product` normalizes it, so the raw values carry the
+/// same `Decimal` scale as `RlEnv::observe`, and an inexact mid is the same error.
+#[test]
+fn test_observation_mid_has_the_environment_scale() {
+    let space = ObservationSpace::from_scales(&configs()[0].1.scales, 16, 200).unwrap();
+    let gap = FeatureId::ALL
+        .iter()
+        .position(|id| *id == FeatureId::EntryGap)
+        .unwrap();
+    // 401 half ticks of 0.50: a mid of 100.25, not 100.250.
+    let o = obs(
+        Some(0),
+        1_000,
+        (199, 1, 202, 1),
+        dec!(1),
+        dec!(100),
+        (0, 0),
+        0,
+    );
+    let v = observation_features(&space, &o, None, dec!(0.50), 200).unwrap();
+    let raw = v.raw[gap].unwrap();
+    assert_eq!(raw, dec!(0.25));
+    assert_eq!(raw.to_string(), "0.25");
+    assert_eq!(raw.scale(), 2);
+    // Half of 3e-28 is not a Decimal.
+    let o = obs(Some(0), 1_000, (1, 1, 2, 1), dec!(1), dec!(0), (0, 0), 0);
+    let err = observation_features(&space, &o, None, Decimal::new(1, 28), 200).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        market_maker_rs::types::error::MMError::NumericalError(
+            "mid is not exact in a Decimal".to_string()
+        )
+        .to_string()
+    );
 }

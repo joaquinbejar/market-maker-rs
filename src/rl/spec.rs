@@ -583,6 +583,9 @@ impl HedgeActions {
                 reason: HedgeNotModelledReason::SingleInstrument,
             } => 1,
             Self::MarketableAtTouch => 2,
+            Self::NotModelled {
+                reason: HedgeNotModelledReason::NoHedgeInstrument,
+            } => 3,
         }
     }
 }

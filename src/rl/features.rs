@@ -4,6 +4,7 @@ use rust_decimal::prelude::ToPrimitive;
 
 use crate::Decimal;
 use crate::backtest::kernel::Observation;
+use crate::types::decimal::exact_product;
 use crate::types::error::{MMError, MMResult};
 
 use super::spec::{FEATURE_COUNT, FeatureId, FeatureSpec, HEDGE_FEATURE_COUNT, ObservationSpace};
@@ -85,6 +86,10 @@ impl HedgeFeatureVector {
         }
         Ok(Self { row, raw, values })
     }
+}
+
+fn inexact(what: &str) -> MMError {
+    MMError::NumericalError(format!("{what} is not exact in a Decimal"))
 }
 
 fn numeric(what: &str) -> MMError {
@@ -190,14 +195,11 @@ pub fn observation_features(
                 .bid
                 .checked_add(obs.ask)
                 .ok_or_else(|| numeric("observed mid"))?;
+            // As the environment computes it, so the scale and the error match.
             let twice = Decimal::from(mid2)
                 .checked_mul(tick_size)
-                .ok_or_else(|| numeric("observed mid"))?;
-            Some(
-                twice
-                    .checked_mul(Decimal::new(5, 1))
-                    .ok_or_else(|| numeric("observed mid"))?,
-            )
+                .ok_or_else(|| inexact("mid"))?;
+            Some(exact_product(twice, Decimal::new(5, 1)).ok_or_else(|| inexact("mid"))?)
         }
         None => None,
     };
