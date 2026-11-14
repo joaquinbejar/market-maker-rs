@@ -6,6 +6,29 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Accounts of many lanes in `backtest::evaluation` (#327): `AccountInput` holds any number of
+  quoted or hedge lanes in a `Window` with a declared `TimeUnit` down to nanoseconds, and
+  `attribute_account` attributes each lane against its own marks with a contract multiplier,
+  option lanes valued at their mark (a mark of zero admitted), an opening position and price,
+  funding on any lane, expiry `Settlement` with its rounding, closes that are not fills
+  (`LaneTransfer`) and `AccountFlow`s outside the lanes. Totals per role and per account,
+  reconciliation per lane with `AccountAttribution::reconcile` and `residuals`. `LaneFill` carries
+  maker or taker and a flag that keeps it out of fill quality; `lane_fill_quality` splits by
+  liquidity. `OrderRecord`s give fill ratios by count and by quantity. `lane_contract` (feature
+  `instruments`) reads a lane's kind and multiplier from a specification.
+- New `MetricId`s with their definitions: `Funding`, `TransferEdge`, `ExternalFlows`,
+  `SettlementRounding`, `Orders`, `FilledOrders`, `AcceptedQuantity`, `FilledQuantity`,
+  `FillRatioByCount`, `FillRatioByQuantity` and `ReconciliationResidual`, appended to
+  `MetricId::ALL`; `MetricId::WINDOW` and `MetricId::ACCOUNT` split them by report.
+
+### Changed
+
+- `MetricId::ALL` holds 28 ids instead of 17. The existing ids keep their positions, and the
+  single lane attribution and `WindowMetrics::values` are unchanged.
+- `TimeWindow` documents that it is half open and how to pass a closed interval.
+
 ## [0.7.1] - 2026-11-10
 
 ### Added

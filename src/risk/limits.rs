@@ -186,11 +186,7 @@ impl RiskLimits {
         let new_notional = new_position.abs().checked_mul(price).ok_or_else(|| {
             MMError::NumericalError(format!("notional overflow: {new_position} * {price}"))
         })?;
-        if new_notional > self.max_notional {
-            return Ok(false);
-        }
-
-        Ok(true)
+        Ok(new_notional <= self.max_notional)
     }
 
     /// Calculates a scaled order size based on current position.

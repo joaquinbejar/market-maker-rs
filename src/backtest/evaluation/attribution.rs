@@ -20,14 +20,14 @@ const DAY_MS: u64 = 86_400_000;
 /// Most days [`attribute_daily`] lists, which bounds its allocation.
 const MAX_CALENDAR_DAYS: u64 = 1_000_000;
 
-type EvalResult<T> = Result<T, EvaluationError>;
+pub(super) type EvalResult<T> = Result<T, EvaluationError>;
 
-fn add(a: Decimal, b: Decimal, what: &'static str) -> EvalResult<Decimal> {
+pub(super) fn add(a: Decimal, b: Decimal, what: &'static str) -> EvalResult<Decimal> {
     exact_add(a, b).ok_or(EvaluationError::Inexact { what })
 }
 
 /// `-value`, which a `Decimal` always holds.
-fn negated(mut value: Decimal) -> Decimal {
+pub(super) fn negated(mut value: Decimal) -> Decimal {
     value.set_sign_negative(!value.is_sign_negative());
     value
 }
@@ -36,11 +36,11 @@ pub(super) fn sub(a: Decimal, b: Decimal, what: &'static str) -> EvalResult<Deci
     add(a, negated(b), what)
 }
 
-fn mul(a: Decimal, b: Decimal, what: &'static str) -> EvalResult<Decimal> {
+pub(super) fn mul(a: Decimal, b: Decimal, what: &'static str) -> EvalResult<Decimal> {
     exact_product(a, b).ok_or(EvaluationError::Inexact { what })
 }
 
-fn invalid<T>(reason: String) -> EvalResult<T> {
+pub(super) fn invalid<T>(reason: String) -> EvalResult<T> {
     Err(EvaluationError::InvalidInput { reason })
 }
 
@@ -972,7 +972,7 @@ pub struct FillQualityReport {
 
 /// Running sums of a [`SideQuality`].
 #[derive(Default)]
-struct QualitySums {
+pub(super) struct QualitySums {
     fills: u64,
     measured: u64,
     volume: Decimal,
@@ -983,9 +983,21 @@ struct QualitySums {
 }
 
 impl QualitySums {
-    fn record(
+    pub(super) fn record(
         &mut self,
         fill: &ExecutedFill,
+        side: Decimal,
+        at_fill: Decimal,
+        at_horizon: Option<Decimal>,
+    ) -> EvalResult<()> {
+        self.record_amount(fill.quantity, fill.price, side, at_fill, at_horizon)
+    }
+
+    /// [`QualitySums::record`] for a size `quantity` at `price`.
+    pub(super) fn record_amount(
+        &mut self,
+        quantity: Decimal,
+        price: Decimal,
         side: Decimal,
         at_fill: Decimal,
         at_horizon: Option<Decimal>,
@@ -995,16 +1007,16 @@ impl QualitySums {
             return Ok(());
         };
         self.measured = self.measured.saturating_add(1);
-        self.volume = add(self.volume, fill.quantity, "measured volume")?;
-        let signed = mul(side, fill.quantity, "fill quality")?;
-        let later = mul(signed, sub(at_horizon, fill.price, "markout")?, "markout")?;
+        self.volume = add(self.volume, quantity, "measured volume")?;
+        let signed = mul(side, quantity, "fill quality")?;
+        let later = mul(signed, sub(at_horizon, price, "markout")?, "markout")?;
         self.markout = add(self.markout, later, "markout")?;
-        let now = mul(signed, sub(at_fill, fill.price, "capture")?, "capture")?;
+        let now = mul(signed, sub(at_fill, price, "capture")?, "capture")?;
         self.capture = add(self.capture, now, "capture")?;
         Ok(())
     }
 
-    fn finish(&self) -> EvalResult<SideQuality> {
+    pub(super) fn finish(&self) -> EvalResult<SideQuality> {
         let two = Decimal::TWO;
         let per_unit = |sum: Decimal| -> EvalResult<Option<Decimal>> {
             if self.measured == 0 {
@@ -1139,7 +1151,7 @@ pub struct MetricValue {
 }
 
 impl MetricValue {
-    fn new(id: MetricId, horizon_ms: Option<u64>, reading: Reading) -> Self {
+    pub(super) fn new(id: MetricId, horizon_ms: Option<u64>, reading: Reading) -> Self {
         Self {
             id,
             definition: id.definition(),
@@ -1287,6 +1299,8 @@ pub fn evaluate_window(
 ///
 /// Returns [`EvaluationError::UnsupportedContract`] for anything else, such as an
 /// inverse contract, an option, or a linear contract with another multiplier.
+/// [`lane_contract`](super::lane_contract) admits those two for an
+/// [`AccountInput`](super::AccountInput).
 #[cfg(feature = "instruments")]
 pub fn check_contract(spec: &financial_types::instrument::InstrumentSpec) -> EvalResult<()> {
     use financial_types::instrument::{ContractKind, Margining, SizeKind};

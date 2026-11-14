@@ -62,6 +62,33 @@
 //! mark in force: a fill on a day with no marks counts on the earlier day that owns
 //! that mark.
 //!
+//! # Accounts of many lanes
+//!
+//! [`AccountInput`] holds any number of lanes, each quoted or a hedge, in one
+//! [`Window`] whose instants carry a declared [`TimeUnit`], down to nanoseconds.
+//! Every lane is attributed against its own marks by the same rule of the mark in
+//! force, with what a derivatives venue adds:
+//!
+//! - a contract multiplier `M`, so a position of `c` contracts is worth `c M mark`
+//!   ([`lane_contract`] reads it from a specification, feature `instruments`);
+//! - option lanes, valued linearly at the option's mark with the premium as the
+//!   fill's cash; a mark of zero is admitted, a negative one is not;
+//! - an [`Opening`] position and price, so a window need not start flat;
+//! - funding on any lane, quoted or hedge;
+//! - a [`Settlement`] that ends a position without a fill, its move booked to
+//!   inventory and the difference of its given cash to the exact value reported;
+//! - closes that are not fills ([`LaneTransfer`], such as an auto deleveraging
+//!   close) with their own edge, and [`AccountFlow`]s outside every lane;
+//! - maker or taker on each fill, fill quality split by it, and a flag that keeps
+//!   a fill, such as a liquidation, out of fill quality;
+//! - [`OrderRecord`]s and fill ratios by count and by quantity.
+//!
+//! [`attribute_account`] gives each lane, the totals per role and for the account,
+//! and checks each lane against its cash; [`AccountAttribution::reconcile`]
+//! compares every lane and the account with the books. A single lane account built
+//! from the records of [`EvaluationInput`] attributes to the same numbers as
+//! [`attribute`].
+//!
 //! # Experiments
 //!
 //! [`Experiment`] holds one copy of the execution rules. A [`Candidate`] brings only a
@@ -85,15 +112,25 @@
 //!
 //! # Limits
 //!
-//! A window starts flat and nothing carries over from another window. The input
+//! An [`EvaluationInput`] window starts flat and nothing carries over from
+//! another window; an [`AccountInput`] lane takes an [`Opening`] instead. The input
 //! holds nothing outside its window, which [`EvaluationInput::new`] checks, so a
 //! markout near the end of a window cannot read a later window's marks: that fill
 //! is counted as excluded instead.
 
+mod account;
 mod attribution;
 mod definitions;
 mod experiment;
 
+pub use account::{
+    AccountAttribution, AccountBooks, AccountFlow, AccountInput, FlowKind, LaneAttribution,
+    LaneFill, LaneFunding, LaneKind, LaneMark, LaneOutcome, LaneQualityReport, LaneQualitySpec,
+    LaneRecords, LaneRole, LaneTotals, LaneTransfer, Liquidity, Opening, OrderEnd, OrderRecord,
+    OrderStats, Residuals, Settlement, TimeUnit, Window, attribute_account, lane_fill_quality,
+};
+#[cfg(feature = "instruments")]
+pub use account::{LaneContract, lane_contract};
 #[cfg(feature = "instruments")]
 pub use attribution::check_contract;
 pub use attribution::{

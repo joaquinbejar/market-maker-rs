@@ -555,7 +555,7 @@ fn test_metric_table_declares_each_metric_and_values_carry_their_definition() {
     };
     let metrics = evaluate_window(&input(3000, &marks, &fills), &spec).unwrap();
     let values = metrics.values().unwrap();
-    for id in MetricId::ALL {
+    for id in MetricId::WINDOW {
         assert!(values.iter().any(|v| v.id == id), "{id:?} is not reported");
     }
     for value in &values {
@@ -772,8 +772,101 @@ fn test_every_metric_declares_the_literal_definition() {
             C::DeclaredCapital,
             A::Quotient,
         ),
+        (
+            M::Funding,
+            U::Quote,
+            D::PositiveIsGain,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::TransferEdge,
+            U::Quote,
+            D::PositiveIsGain,
+            H::AtFill,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::ExternalFlows,
+            U::Quote,
+            D::PositiveIsGain,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::SettlementRounding,
+            U::Quote,
+            D::PositiveIsGain,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::Orders,
+            U::Count,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::Count,
+        ),
+        (
+            M::FilledOrders,
+            U::Count,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::Count,
+        ),
+        (
+            M::AcceptedQuantity,
+            U::Base,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::FilledQuantity,
+            U::Base,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::Sum,
+        ),
+        (
+            M::FillRatioByCount,
+            U::Ratio,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::Quotient,
+        ),
+        (
+            M::FillRatioByQuantity,
+            U::Ratio,
+            D::Magnitude,
+            H::Window,
+            C::None,
+            A::Quotient,
+        ),
+        (
+            M::ReconciliationResidual,
+            U::Quote,
+            D::MagnitudeIsCost,
+            H::Window,
+            C::None,
+            A::Maximum,
+        ),
     ];
     assert_eq!(table.len(), M::ALL.len());
+    assert_eq!(
+        M::ALL.to_vec(),
+        [M::WINDOW.as_slice(), M::ACCOUNT.as_slice()].concat(),
+        "every metric is a window or an account one"
+    );
     for (row, id) in table.iter().zip(M::ALL) {
         assert_eq!(row.0, id, "the table follows MetricId::ALL");
         assert_eq!(
