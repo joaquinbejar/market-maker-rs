@@ -25,12 +25,38 @@ project follows [Semantic Versioning](https://semver.org/).
   `SettlementRounding`, `Orders`, `FilledOrders`, `AcceptedQuantity`, `FilledQuantity`,
   `FillRatioByCount`, `FillRatioByQuantity` and `ReconciliationResidual`, appended to
   `MetricId::ALL`; `MetricId::WINDOW` and `MetricId::ACCOUNT` split them by report.
+- `rl`: `RlProfile` builds an `RlSpec` from a declared profile with no kernel: an ordered
+  subset of instruments (`InstrumentSpace`: role, depth, grids, `max_orders`), scales, order
+  limit, `max_steps` and reward settings. One plain quoted instrument gives the same bytes
+  and `SpecId` as `RlEnv`; any other profile adds an instrument index head, of action space
+  version `MULTI_INSTRUMENT_ACTION_SPACE_VERSION` (6) (#326).
+- `rl`: public pure observation functions, `ObservationSpace::from_scales`,
+  `observation_features` and `PreviousRow` (#326).
+- `rl`: `RlSpec::action_head_sizes`, `RlSpec::decode_action` and `RlSpec::encode_action`,
+  the layout of the discrete action heads (`ActionHead`, `InstrumentAction`) (#326).
+- `rl`: `RewardMark::ExternalVenueMark`, a reward marked at a mark the external environment
+  supplies, in the spec bytes and fingerprint (#326).
+- `rl`: with an instrument index head the observation is the 11 features per instrument,
+  concatenated in profile order with each instrument's own tick
+  (`RlSpec::profile_observation`); `RlSpec::shape` counts them and
+  `RlSpec::instrument_shapes` gives each instrument's grids. A depth other than 1 is refused.
+- `rl`: instrument roles decide the actions: a quoted instrument offers hold, quote, one
+  sided orders and cancel; a hedge instrument offers hold and hedge, and needs the hedge
+  actions. `RlSpec::offered_kinds` gives the kind mask per instrument, and
+  `RlSpec::decode_action` refuses any other kind (#326).
+- `rl`: `ACTION_HEAD_LAYOUT_VERSION`, the version of the head order and kind codes, and
+  `RlProfile::with_step_ns`, a decision step that enters the `SpecId` of a profile (#326).
+- `MMError::InvalidAction`, returned for an action row that is out of range or not offered.
+- Published fixtures in `doc/fixtures/rl_spaces.json`, also embedded as
+  `rl::RL_SPACES_FIXTURES`: spec bytes and ids, feature vectors of plain inputs per
+  instrument and decoded action head rows (#326).
 
 ### Changed
 
 - `MetricId::ALL` holds 28 ids instead of 17. The existing ids keep their positions, and the
   single lane attribution and `WindowMetrics::values` are unchanged.
 - `TimeWindow` documents that it is half open and how to pass a closed interval.
+- `RiskLimits` notional check written as one comparison, for the newer Clippy.
 
 ## [0.7.1] - 2026-11-10
 

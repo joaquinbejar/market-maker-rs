@@ -23,6 +23,19 @@ pub const CANCEL_ACTION_SPACE_VERSION: u16 = 4;
 /// Version of the action space with quotes that expire at the venue: [`QuoteExpiry::Lives`],
 /// with or without the cancel-only action.
 pub const EXPIRY_ACTION_SPACE_VERSION: u16 = 5;
+/// Version of the action space of a declared profile with an instrument index head: the
+/// actions of the versions before it, each on the instrument that
+/// [`ActionSpace::instruments`] lists at the index head's value, as its role offers them
+/// ([`InstrumentRole`]).
+///
+/// The observation of such a specification is the vector of the [`FEATURE_COUNT`] features
+/// of [`ObservationSpace`] for each instrument, concatenated in the order of
+/// [`ActionSpace::instruments`], each computed with that instrument's own tick (sizes are
+/// already in its own lots): [`RlSpec::profile_observation`]. Every instrument has depth 1:
+/// a deeper book is refused until the space has features for the levels past the touch.
+pub const MULTI_INSTRUMENT_ACTION_SPACE_VERSION: u16 = 6;
+/// The most instruments a declared profile can hold.
+pub const MAX_PROFILE_INSTRUMENTS: usize = 64;
 /// The most quote lives an action space can offer.
 pub const MAX_QUOTE_LIVES: usize = 8;
 /// The longest quote life, in nanoseconds: 2^62, about 146 years, so that an activation time
@@ -388,6 +401,33 @@ pub struct ObservationSpace {
 }
 
 impl ObservationSpace {
+    /// The observation space for `scales`, with `order_capacity` the divisor of
+    /// [`FeatureId::OpenOrders`] and [`FeatureId::AwaitingCancel`] and `max_steps` the divisor
+    /// of [`FeatureId::StepsLeft`]. It is the space an [`RlEnv`](crate::rl::RlEnv) with
+    /// `ORD = order_capacity` over a kernel of `max_steps` states, with no kernel built.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidConfiguration`] for a scale that is not positive, or a zero
+    /// `order_capacity` or `max_steps`.
+    pub fn from_scales(
+        scales: &ObservationScales,
+        order_capacity: u64,
+        max_steps: u64,
+    ) -> MMResult<Self> {
+        scales.validate()?;
+        if order_capacity == 0 || max_steps == 0 {
+            return Err(MMError::InvalidConfiguration(format!(
+                "order_capacity and max_steps must be positive, got {order_capacity} and {max_steps}"
+            )));
+        }
+        Ok(Self::new(
+            scales,
+            Decimal::from(order_capacity),
+            Decimal::from(max_steps),
+        ))
+    }
+
     pub(super) fn new(scales: &ObservationScales, orders: Decimal, max_steps: Decimal) -> Self {
         let spec = |id, unit, as_of, horizon, memory, divisor| FeatureSpec {
             id,
@@ -543,6 +583,9 @@ impl HedgeActions {
                 reason: HedgeNotModelledReason::SingleInstrument,
             } => 1,
             Self::MarketableAtTouch => 2,
+            Self::NotModelled {
+                reason: HedgeNotModelledReason::NoHedgeInstrument,
+            } => 3,
         }
     }
 }
@@ -660,6 +703,110 @@ pub struct CrossHedgeSpace {
     pub sizes_lots: Vec<u64>,
 }
 
+/// The role of an instrument in a declared profile: which kinds of action the policy can
+/// take on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InstrumentRole {
+    /// The policy quotes it: hold, quote and one sided orders, the cancel action when the
+    /// configuration has it and the expiring quote when it has lives. In a profile of more
+    /// than one plain instrument no hedge is offered on it; alone and plain it offers what
+    /// [`RlEnv`](crate::rl::RlEnv) does, the hedge included when the configuration has it.
+    Quoted,
+    /// The policy hedges in it: hold and the hedge only, with a size from its own grid. It
+    /// declares no offsets, and a profile that holds one needs the hedge actions in its
+    /// configuration.
+    Hedge,
+}
+
+impl InstrumentRole {
+    const fn code(self) -> u16 {
+        match self {
+            Self::Quoted => 1,
+            Self::Hedge => 2,
+        }
+    }
+}
+
+/// One instrument of a declared profile, at its position in the ordered subset that the
+/// instrument index head points into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InstrumentSpace {
+    /// Quoted or hedge.
+    pub role: InstrumentRole,
+    /// Value of one tick, in quote per base.
+    pub tick_size: Decimal,
+    /// Value of one lot, in base units.
+    pub lot_size: Decimal,
+    /// Largest price, in quote per base.
+    pub max_price: Decimal,
+    /// Largest order size, in base units.
+    pub max_order_size: Decimal,
+    /// Levels of the book the environment observes on each side.
+    pub depth: u16,
+    /// Bid offsets from the observed mid, in ticks, strictly increasing; empty for a hedge
+    /// instrument.
+    pub bid_offsets_ticks: Vec<u16>,
+    /// Ask offsets from the observed mid, in ticks, strictly increasing; empty for a hedge
+    /// instrument.
+    pub ask_offsets_ticks: Vec<u16>,
+    /// Order sizes, in lots, strictly increasing, each at most `max_order_size`.
+    pub sizes_lots: Vec<u64>,
+    /// The most resting orders per side the action space can create.
+    pub max_orders: u16,
+}
+
+impl InstrumentSpace {
+    /// An instrument with depth 1 and one resting order per side, which is what
+    /// [`RlEnv`](crate::rl::RlEnv) models.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        role: InstrumentRole,
+        tick_size: Decimal,
+        lot_size: Decimal,
+        max_price: Decimal,
+        max_order_size: Decimal,
+        bid_offsets_ticks: Vec<u16>,
+        ask_offsets_ticks: Vec<u16>,
+        sizes_lots: Vec<u64>,
+    ) -> Self {
+        Self {
+            role,
+            tick_size,
+            lot_size,
+            max_price,
+            max_order_size,
+            depth: 1,
+            bid_offsets_ticks,
+            ask_offsets_ticks,
+            sizes_lots,
+            max_orders: 1,
+        }
+    }
+
+    /// Sets the observed book depth.
+    #[must_use]
+    pub fn with_depth(mut self, depth: u16) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Sets the most resting orders per side.
+    #[must_use]
+    pub fn with_max_orders(mut self, max_orders: u16) -> Self {
+        self.max_orders = max_orders;
+        self
+    }
+
+    /// Whether this is what [`RlEnv`](crate::rl::RlEnv) models alone: quoted, depth 1, one
+    /// order per side.
+    pub(super) fn is_plain(&self) -> bool {
+        self.role == InstrumentRole::Quoted && self.depth == 1 && self.max_orders == 1
+    }
+}
+
 /// The action space.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -692,6 +839,10 @@ pub struct ActionSpace {
     pub cancel: CancelActions,
     /// Whether a quote can expire by itself.
     pub expiry: QuoteExpiry,
+    /// The ordered instruments of a declared profile, whose positions are the values of the
+    /// instrument index head. Empty for one plain quoted instrument, described by the fields
+    /// above, as [`RlEnv`](crate::rl::RlEnv) builds; the first entry otherwise repeats them.
+    pub instruments: Vec<InstrumentSpace>,
 }
 
 /// The one kind of reward of this version.
@@ -717,12 +868,16 @@ pub enum RewardMark {
     /// The mid of the last row the kernel completed. The kernel's own unrealized value
     /// moves to the last fill price between rows, which the attribution does not.
     LastCompletedRow,
+    /// A mark the external environment supplies at each step, such as its venue's mark
+    /// price. The crate computes no reward with it: the environment that declares it does.
+    ExternalVenueMark,
 }
 
 impl RewardMark {
     const fn code(self) -> u16 {
         match self {
             Self::LastCompletedRow => 1,
+            Self::ExternalVenueMark => 2,
         }
     }
 }
@@ -780,9 +935,17 @@ pub struct EpisodeSpec {
     pub max_steps: u64,
     /// What values the inventory on termination. Truncation closes nothing.
     pub terminal: TerminalValuation,
+    /// The time between two decisions, in nanoseconds, as a declared profile states it.
+    /// `None` for [`RlEnv`](crate::rl::RlEnv), whose decisions follow the rows of its data,
+    /// and then absent from [`RlSpec::to_bytes`].
+    pub step_ns: Option<u64>,
 }
 
 /// The sizes of the spaces.
+///
+/// For a declared profile with an instrument index head, `features` is the length of the
+/// whole concatenated vector and the grid fields are those of the first instrument;
+/// [`RlSpec::instrument_shapes`] gives each instrument's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceShape {
     /// Length of the feature vector.
@@ -932,6 +1095,32 @@ impl RlSpec {
                 put_u64(&mut out, *life);
             }
         }
+        // Likewise for the instruments of a declared profile.
+        if !a.instruments.is_empty() {
+            out.extend_from_slice(b"IN");
+            put_len(&mut out, a.instruments.len());
+            for i in &a.instruments {
+                put_u16(&mut out, i.role.code());
+                put_decimal(&mut out, i.tick_size);
+                put_decimal(&mut out, i.lot_size);
+                put_decimal(&mut out, i.max_price);
+                put_decimal(&mut out, i.max_order_size);
+                put_u16(&mut out, i.depth);
+                put_len(&mut out, i.bid_offsets_ticks.len());
+                for offset in &i.bid_offsets_ticks {
+                    put_u16(&mut out, *offset);
+                }
+                put_len(&mut out, i.ask_offsets_ticks.len());
+                for offset in &i.ask_offsets_ticks {
+                    put_u16(&mut out, *offset);
+                }
+                put_len(&mut out, i.sizes_lots.len());
+                for size in &i.sizes_lots {
+                    put_u64(&mut out, *size);
+                }
+                put_u16(&mut out, i.max_orders);
+            }
+        }
         let r = &self.reward;
         put_u16(&mut out, r.version);
         put_u16(&mut out, r.kind.code());
@@ -951,6 +1140,11 @@ impl RlSpec {
         put_u16(&mut out, e.version);
         put_u64(&mut out, e.max_steps);
         put_u16(&mut out, e.terminal.code());
+        // Absent for an environment of this crate, whose bytes stay as they were.
+        if let Some(step_ns) = e.step_ns {
+            out.extend_from_slice(b"SN");
+            put_u64(&mut out, step_ns);
+        }
         out
     }
 
@@ -966,11 +1160,15 @@ impl RlSpec {
         }
     }
 
-    /// The sizes of the spaces.
+    /// The sizes of the spaces; see [`SpaceShape`] for a declared profile.
     #[must_use]
     pub fn shape(&self) -> SpaceShape {
         SpaceShape {
-            features: self.observation.features.len(),
+            features: self
+                .observation
+                .features
+                .len()
+                .saturating_mul(self.action.instruments.len().max(1)),
             bid_offsets: self.action.bid_offsets_ticks.len(),
             ask_offsets: self.action.ask_offsets_ticks.len(),
             sizes: self.action.sizes_lots.len(),
@@ -981,6 +1179,28 @@ impl RlSpec {
                 .as_ref()
                 .map_or(0, |c| c.sizes_lots.len()),
         }
+    }
+
+    /// The sizes of each instrument's part of the spaces, in the order of the instrument
+    /// index head: its features and its own grids. One entry, equal to
+    /// [`RlSpec::shape`], without an instrument index head.
+    #[must_use]
+    pub fn instrument_shapes(&self) -> Vec<SpaceShape> {
+        if self.action.instruments.is_empty() {
+            return vec![self.shape()];
+        }
+        self.action
+            .instruments
+            .iter()
+            .map(|i| SpaceShape {
+                features: self.observation.features.len(),
+                bid_offsets: i.bid_offsets_ticks.len(),
+                ask_offsets: i.ask_offsets_ticks.len(),
+                sizes: i.sizes_lots.len(),
+                hedge_features: 0,
+                hedge_sizes: 0,
+            })
+            .collect()
     }
 
     /// Checks that this is the specification a consumer was built for.

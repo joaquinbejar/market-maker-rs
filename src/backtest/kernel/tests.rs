@@ -1773,6 +1773,7 @@ fn test_quote_error_name_inverts_quote_error_code_for_every_variant() {
         MMError::FillBookedCheckFailed(String::new()),
         MMError::GreeksMissFill,
         MMError::QuotingHalted(String::new()),
+        MMError::InvalidAction(String::new()),
     ];
     let mut codes = Vec::new();
     for error in &errors {
@@ -1785,7 +1786,7 @@ fn test_quote_error_name_inverts_quote_error_code_for_every_variant() {
     codes.sort_unstable();
     codes.dedup();
     assert_eq!(codes.len(), errors.len());
-    for code in [0, 16, 100, 101, 102, 200] {
+    for code in [0, 17, 100, 101, 102, 200] {
         assert_eq!(quote_error_name(ErrCode(code)), None);
     }
 }

@@ -119,6 +119,41 @@
 //! of every decision. There is no mask here: what the correction cannot do is clipped or
 //! falls back to the classical action, with the reason logged.
 //!
+//! # External environments
+//!
+//! An environment outside this crate, such as a venue simulator, can reuse these spaces and
+//! prove that its observations and actions are the crate's. [`RlProfile`] declares an
+//! ordered subset of instruments ([`InstrumentSpace`]: role, book depth, grids and
+//! `max_orders`), the scales, the order limit, `max_steps` and the reward settings, and
+//! [`RlProfile::spec`] builds the [`RlSpec`] with no kernel. For one plain quoted instrument
+//! it is the specification [`RlEnv`] states, to the byte, unless a decision step
+//! ([`RlProfile::with_step_ns`]) enters its identity; otherwise the action space gains an
+//! instrument index head, of version [`MULTI_INSTRUMENT_ACTION_SPACE_VERSION`], and the
+//! observation is the 11 features of [`ObservationSpace`] for each instrument, concatenated
+//! in the profile's order, each computed with that instrument's own tick
+//! ([`RlSpec::profile_observation`]); [`RlSpec::shape`] counts them all and
+//! [`RlSpec::instrument_shapes`] gives each instrument's grids. A book depth other than 1 is
+//! refused until the space has features for the levels past the touch.
+//!
+//! The role of an instrument ([`InstrumentRole`]) decides its actions: a quoted instrument
+//! offers hold, quote, one sided orders and the cancel action, with the expiring quote when
+//! the configuration has lives; a hedge instrument offers hold and the hedge only, and a
+//! profile that holds one needs the hedge actions.
+//! [`RewardMark::ExternalVenueMark`] declares a reward marked at a mark the environment
+//! supplies; the environment computes that reward itself.
+//!
+//! [`ObservationSpace::from_scales`] and [`observation_features`] compute the feature vector
+//! from explicit inputs, with [`PreviousRow`] the only memory, and
+//! [`RlSpec::decode_action`] turns a row of discrete head values ([`ActionHead`]) into an
+//! [`InstrumentAction`], with [`RlSpec::encode_action`] its inverse. It refuses, with
+//! [`MMError::InvalidAction`](crate::types::error::MMError::InvalidAction), a kind that
+//! [`RlSpec::offered_kinds`] does not give for the instrument and a head outside its grid:
+//! [`RlSpec::action_head_sizes`] is a product space that over declares. The kind codes and
+//! the head order are versioned by [`ACTION_HEAD_LAYOUT_VERSION`]. The file
+//! `doc/fixtures/rl_spaces.json`, shipped with the crate as [`RL_SPACES_FIXTURES`], holds declared profiles with their
+//! spec bytes and ids, plain inputs with their expected feature vectors, and head rows with
+//! their expected actions, for such an environment's own tests.
+//!
 //! # Limits
 //!
 //! One linear spot instrument with fees in the quote asset, as the kernel. The reward
@@ -163,6 +198,7 @@
 mod audit;
 mod env;
 mod features;
+mod profile;
 mod queue_reactive;
 mod residual;
 mod spec;
@@ -175,7 +211,11 @@ pub use env::{
     ERR_ACTION_OFF_GRID, ERR_CANCEL_REFUSED, ERR_CROSS_HEDGE_REFUSED, ERR_EXPIRY_REFUSED,
     ERR_HEDGE_REFUSED, RlAction, RlConfig, RlEnv, RlState, StepReward, TerminalClose, Transition,
 };
-pub use features::{FeatureVector, HedgeFeatureVector};
+pub use features::{FeatureVector, HedgeFeatureVector, PreviousRow, observation_features};
+pub use profile::{
+    ACTION_HEAD_COUNT, ACTION_HEAD_LAYOUT_VERSION, ACTION_KIND_COUNT, ActionHead, InstrumentAction,
+    RL_SPACES_FIXTURES, RlProfile,
+};
 pub use queue_reactive::{
     MAX_QR_ROWS, MAX_REACTION_MOVES, QrEpisode, QrMarket, ReactiveQrMarket, qr_market,
 };
@@ -188,8 +228,9 @@ pub use spec::{
     CrossHedgeSpace, EPISODE_VERSION, EXPIRY_ACTION_SPACE_VERSION, EpisodeSpec, FEATURE_COUNT,
     FeatureHorizon, FeatureId, FeatureSpec, FeatureUnit, HEDGE_FEATURE_COUNT,
     HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION,
-    HedgeActions, HedgeScales, InvalidActionPolicy, MAX_QUOTE_LIFE_NS, MAX_QUOTE_LIVES,
-    OBSERVATION_SPACE_VERSION, ObservationScales, ObservationSpace, QuoteExpiry, QuoteLives,
-    REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec, SpaceShape, SpecId, StateMemory,
-    TerminalValuation,
+    HedgeActions, HedgeScales, InstrumentRole, InstrumentSpace, InvalidActionPolicy,
+    MAX_PROFILE_INSTRUMENTS, MAX_QUOTE_LIFE_NS, MAX_QUOTE_LIVES,
+    MULTI_INSTRUMENT_ACTION_SPACE_VERSION, OBSERVATION_SPACE_VERSION, ObservationScales,
+    ObservationSpace, QuoteExpiry, QuoteLives, REWARD_VERSION, RewardKind, RewardMark, RewardSpec,
+    RlSpec, SpaceShape, SpecId, StateMemory, TerminalValuation,
 };
