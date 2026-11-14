@@ -143,6 +143,14 @@ pub enum MMError {
     /// is true for it. The message carries the status.
     #[error("quoting halted: {0}")]
     QuotingHalted(String) = 14,
+
+    /// A policy's action is not one the specification offers.
+    ///
+    /// This error occurs when a row of discrete action heads has the wrong
+    /// length, a head outside its range for the chosen instrument, or a kind
+    /// the specification does not offer on that instrument. Nothing was done.
+    #[error("invalid action: {0}")]
+    InvalidAction(String) = 15,
 }
 
 /// The message of [`MMError::PriceUnderflow`].
@@ -191,7 +199,8 @@ impl MMError {
             | Self::LockPoisoned(msg)
             | Self::FillNotBooked(msg)
             | Self::FillBookedCheckFailed(msg)
-            | Self::QuotingHalted(msg) => msg,
+            | Self::QuotingHalted(msg)
+            | Self::InvalidAction(msg) => msg,
             Self::UnsupportedContract { reason } => reason,
             Self::UnsupportedAction { .. } => "only buy and sell are supported",
             Self::PriceUnderflow => PRICE_UNDERFLOW_MESSAGE,
@@ -310,6 +319,7 @@ mod tests {
             MMError::FillBookedCheckFailed("test".to_string()),
             MMError::GreeksMissFill,
             MMError::QuotingHalted("test".to_string()),
+            MMError::InvalidAction("test".to_string()),
             MMError::InvalidPositionUpdate("test".to_string()),
             MMError::InvalidQuoteGeneration("test".to_string()),
             MMError::InvalidTimestamp("test".to_string()),

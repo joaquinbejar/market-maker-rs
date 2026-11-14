@@ -9,10 +9,11 @@
 
 use crate::Decimal;
 use crate::backtest::evaluation::{HedgeNotModelledReason, MetricId, MetricUnit};
-use crate::backtest::kernel::QuoteSide;
+use crate::backtest::kernel::{Observation, QuoteSide};
 use crate::types::error::{MMError, MMResult};
 
 use super::env::{RlAction, RlConfig};
+use super::features::{FeatureVector, PreviousRow, observation_features};
 use super::spec::{
     ACTION_SPACE_VERSION, ActionSpace, CANCEL_ACTION_SPACE_VERSION, CancelActions, EPISODE_VERSION,
     EXPIRY_ACTION_SPACE_VERSION, EpisodeSpec, HedgeActions, InstrumentRole, InstrumentSpace,
@@ -20,11 +21,24 @@ use super::spec::{
     REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec,
 };
 
+/// Version of the layout of the discrete action heads: the order of [`ActionHead::ALL`],
+/// the kind codes of [`ActionHead::Kind`] and which heads each kind reads. It is raised when
+/// any of them changes; a code or a head is never reused with another meaning under the
+/// same version. It is not part of [`RlSpec::to_bytes`], which describes the actions, not
+/// how a policy's heads encode them.
+pub const ACTION_HEAD_LAYOUT_VERSION: u16 = 1;
+
 /// Number of discrete action heads, in the order of [`ActionHead`].
 pub const ACTION_HEAD_COUNT: usize = 7;
 
 /// Number of values of [`ActionHead::Kind`].
 pub const ACTION_KIND_COUNT: usize = 8;
+
+/// The fixtures of `doc/fixtures/rl_spaces.json`, for an external environment's own tests:
+/// declared profiles with their spec bytes and ids, plain inputs with their expected feature
+/// vectors, and head rows with their expected actions or refusals. `doc/fixtures/RL_SPACES.md`
+/// describes the format.
+pub const RL_SPACES_FIXTURES: &str = include_str!("../../doc/fixtures/rl_spaces.json");
 
 /// A discrete action head, at its position in a row of head values.
 ///
@@ -33,7 +47,10 @@ pub const ACTION_KIND_COUNT: usize = 8;
 /// 4 [`RlAction::Hedge`], 5 [`RlAction::CrossHedge`], 6 [`RlAction::Cancel`] and
 /// 7 [`RlAction::ExpiringQuote`]. A one sided order reads the offset and size heads of its
 /// side; a hedge and a hedge in the second instrument read [`ActionHead::BidSize`]. A kind
-/// ignores the heads it does not read, and [`RlSpec::encode_action`] writes 0 there.
+/// ignores the heads it does not read, and [`RlSpec::encode_action`] writes 0 there. Code 5
+/// exists only for the hedge lane of [`RlEnv::new_hedged`](crate::rl::RlEnv::new_hedged); a
+/// declared profile never offers it. The layout is versioned by
+/// [`ACTION_HEAD_LAYOUT_VERSION`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ActionHead {
@@ -105,8 +122,10 @@ impl InstrumentAction {
 /// With one quoted instrument of depth 1 and one order per side, [`RlProfile::spec`] is the
 /// specification that [`RlEnv::new`](crate::rl::RlEnv::new) states for the same kernel
 /// configuration (tick, lot, largest price and order size, `max_steps`), grid, `ORD` and
-/// [`RlConfig`], to the byte. Any other profile adds the instruments and the index head, of
-/// action version [`MULTI_INSTRUMENT_ACTION_SPACE_VERSION`].
+/// [`RlConfig`], to the byte, as long as no decision step is set
+/// ([`RlProfile::with_step_ns`]). Any other profile adds the instruments and the index head,
+/// of action version [`MULTI_INSTRUMENT_ACTION_SPACE_VERSION`], whose observation is one
+/// feature vector per instrument ([`RlSpec::profile_observation`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct RlProfile {
@@ -122,6 +141,10 @@ pub struct RlProfile {
     pub max_steps: u64,
     /// What values an open position in the reward.
     pub reward_mark: RewardMark,
+    /// The time between two decisions, in nanoseconds, written into the specification and
+    /// its [`SpecId`](crate::rl::SpecId) when set. `None` keeps the bytes of an
+    /// [`RlEnv`](crate::rl::RlEnv), whose decisions follow its rows.
+    pub step_ns: Option<u64>,
 }
 
 impl RlProfile {
@@ -139,7 +162,15 @@ impl RlProfile {
             order_capacity,
             max_steps,
             reward_mark: RewardMark::LastCompletedRow,
+            step_ns: None,
         }
+    }
+
+    /// Sets the time between two decisions, in nanoseconds.
+    #[must_use]
+    pub fn with_step_ns(mut self, step_ns: u64) -> Self {
+        self.step_ns = Some(step_ns);
+        self
     }
 
     /// Sets what values an open position, such as [`RewardMark::ExternalVenueMark`].
@@ -154,11 +185,15 @@ impl RlProfile {
     /// # Errors
     ///
     /// Returns [`MMError::InvalidConfiguration`] for a scale, `f32_unit`,
-    /// `order_capacity` or `max_steps` that is not positive, a negative penalty, no
-    /// instruments or more than [`MAX_PROFILE_INSTRUMENTS`], a first instrument that is not
-    /// quoted, and an instrument with a tick, lot, largest price or order size that is not
-    /// positive, a zero depth or `max_orders`, empty grids, grids of more than 64 values,
-    /// bid and ask offsets of different lengths, or a zero size.
+    /// `order_capacity`, `max_steps` or decision step that is not positive, a negative
+    /// penalty, no instruments or more than [`MAX_PROFILE_INSTRUMENTS`], a first instrument
+    /// that is not quoted, a hedge instrument without the hedge actions, the hedge actions
+    /// in a profile of more than one plain instrument with no hedge instrument, and an
+    /// instrument with a tick, lot, largest price or order size that is not positive, a
+    /// depth other than 1, a zero `max_orders`, grids of more than 64 values or not strictly
+    /// increasing, a size of zero lots or above `max_order_size`, and for a quoted
+    /// instrument empty offsets or bid and ask offsets of different lengths, for a hedge
+    /// instrument any offset.
     pub fn spec(&self) -> MMResult<RlSpec> {
         let refuse = |why: String| Err(MMError::InvalidConfiguration(why));
         let cfg = &self.config;
@@ -178,10 +213,28 @@ impl RlProfile {
         if first.role != InstrumentRole::Quoted {
             return refuse("the first instrument of a profile must be quoted".to_string());
         }
+        let plain = self.instruments.len() == 1 && first.is_plain();
+        let hedged = self
+            .instruments
+            .iter()
+            .any(|i| i.role == InstrumentRole::Hedge);
+        if hedged && !cfg.hedge_actions {
+            return refuse("a profile with a hedge instrument needs the hedge actions".to_string());
+        }
+        if !plain && !hedged && cfg.hedge_actions {
+            return refuse(
+                "the hedge actions of a profile of more than one plain instrument need a hedge instrument"
+                    .to_string(),
+            );
+        }
+        if self.step_ns == Some(0) {
+            return refuse("step_ns must be positive, got 0".to_string());
+        }
         let observation =
             ObservationSpace::from_scales(&cfg.scales, self.order_capacity, self.max_steps)?;
         let mut spec = build_spec(observation, first, cfg, self.max_steps, self.reward_mark);
-        if !(self.instruments.len() == 1 && first.is_plain()) {
+        spec.episode.step_ns = self.step_ns;
+        if !plain {
             spec.action.version = MULTI_INSTRUMENT_ACTION_SPACE_VERSION;
             spec.action.instruments = self.instruments.clone();
         }
@@ -221,19 +274,40 @@ fn check_instrument(index: usize, i: &InstrumentSpace) -> MMResult<()> {
             return refuse(format!("{name} must be positive, got {value}"));
         }
     }
-    if i.depth == 0 || i.max_orders == 0 {
+    if i.depth != 1 {
         return refuse(format!(
-            "depth and max_orders must be positive, got {} and {}",
-            i.depth, i.max_orders
+            "depth must be 1 until the space has features past the touch, got {}",
+            i.depth
         ));
     }
+    if i.max_orders == 0 {
+        return refuse("max_orders must be positive, got 0".to_string());
+    }
     let offsets = i.bid_offsets_ticks.len();
-    if offsets == 0 || offsets > 64 || i.ask_offsets_ticks.len() != offsets {
-        return refuse(format!(
-            "bid and ask offsets must be 1 to 64 values each, of the same length, got {} and {}",
-            offsets,
-            i.ask_offsets_ticks.len()
-        ));
+    match i.role {
+        InstrumentRole::Quoted => {
+            if offsets == 0 || offsets > 64 || i.ask_offsets_ticks.len() != offsets {
+                return refuse(format!(
+                    "bid and ask offsets must be 1 to 64 values each, of the same length, got {} and {}",
+                    offsets,
+                    i.ask_offsets_ticks.len()
+                ));
+            }
+        }
+        InstrumentRole::Hedge => {
+            if offsets != 0 || !i.ask_offsets_ticks.is_empty() {
+                return refuse("a hedge instrument declares no offsets".to_string());
+            }
+        }
+    }
+    for (name, increasing) in [
+        ("bid offsets", strictly_increasing(&i.bid_offsets_ticks)),
+        ("ask offsets", strictly_increasing(&i.ask_offsets_ticks)),
+        ("sizes", strictly_increasing(&i.sizes_lots)),
+    ] {
+        if !increasing {
+            return refuse(format!("{name} must be strictly increasing"));
+        }
     }
     if i.sizes_lots.is_empty() || i.sizes_lots.len() > 64 || i.sizes_lots.contains(&0) {
         return refuse(format!(
@@ -241,7 +315,20 @@ fn check_instrument(index: usize, i: &InstrumentSpace) -> MMResult<()> {
             i.sizes_lots
         ));
     }
+    for size in &i.sizes_lots {
+        let base = Decimal::from(*size).checked_mul(i.lot_size);
+        if base.is_none_or(|base| base > i.max_order_size) {
+            return refuse(format!(
+                "a size of {size} lots exceeds max_order_size {}",
+                i.max_order_size
+            ));
+        }
+    }
     Ok(())
+}
+
+fn strictly_increasing<T: PartialOrd>(values: &[T]) -> bool {
+    values.iter().zip(values.iter().skip(1)).all(|(a, b)| a < b)
 }
 
 /// The specification of one instrument under `config`, as an environment states it.
@@ -303,12 +390,17 @@ pub(super) fn build_spec(
             version: EPISODE_VERSION,
             max_steps,
             terminal: config.terminal,
+            step_ns: None,
         },
     }
 }
 
 /// The grid of one instrument: bid offsets, ask offsets and sizes.
 type Grid<'a> = (&'a [u16], &'a [u16], &'a [u64]);
+
+fn invalid(why: String) -> MMError {
+    MMError::InvalidAction(why)
+}
 
 impl RlSpec {
     fn grid(&self, instrument: usize) -> MMResult<Grid<'_>> {
@@ -320,7 +412,7 @@ impl RlSpec {
         } else if let Some(i) = a.instruments.get(instrument) {
             return Ok((&i.bid_offsets_ticks, &i.ask_offsets_ticks, &i.sizes_lots));
         }
-        Err(MMError::InvalidConfiguration(format!(
+        Err(invalid(format!(
             "instrument head {instrument} is outside the specification's {} instruments",
             a.instruments.len().max(1)
         )))
@@ -340,9 +432,44 @@ impl RlSpec {
             .map_or(0, |c| c.sizes_lots.len())
     }
 
+    /// The kinds of action the specification offers on the instrument at `instrument`, by
+    /// their codes in [`ActionHead::Kind`]: the mask of the kind head once the instrument
+    /// head is chosen. [`RlSpec::decode_action`] refuses every other kind.
+    ///
+    /// Without an instrument index head: hold, quote and both one sided orders, then the
+    /// hedge, the hedge in the second instrument, the cancel and the expiring quote as the
+    /// action space has them. With one, by [`InstrumentRole`]: a quoted instrument offers
+    /// hold, quote, both one sided orders, the cancel when the configuration has it and the
+    /// expiring quote when it has lives; a hedge instrument offers hold and the hedge.
+    /// Code 5 is never offered there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidAction`] for an instrument outside the specification.
+    pub fn offered_kinds(&self, instrument: usize) -> MMResult<[bool; ACTION_KIND_COUNT]> {
+        self.grid(instrument)?;
+        let a = &self.action;
+        let cancel = a.cancel == CancelActions::CancelOnly;
+        let lives = self.lives() > 0;
+        let quoted = [true, true, true, true, false, false, cancel, lives];
+        Ok(match a.instruments.get(instrument).map(|i| i.role) {
+            None => {
+                let mut kinds = quoted;
+                kinds[4] = a.hedge == HedgeActions::MarketableAtTouch;
+                kinds[5] = a.cross_hedge.is_some();
+                kinds
+            }
+            Some(InstrumentRole::Hedge) => [true, false, false, false, true, false, false, false],
+            Some(_) => quoted,
+        })
+    }
+
     /// The number of values of each head, in the order of [`ActionHead::ALL`]: what a
-    /// multi discrete policy samples. An offset or size head has the largest grid of the
-    /// instruments, and a value past the chosen instrument's grid does not decode.
+    /// multi discrete policy samples. This product space over declares: an offset or size
+    /// head has the largest grid of the instruments, and the kind head every code, while a
+    /// row decodes only with a kind that [`RlSpec::offered_kinds`] gives for its instrument
+    /// and heads inside that instrument's grid. A policy masks its heads with
+    /// [`RlSpec::offered_kinds`] and the grids of [`RlSpec::instrument_shapes`].
     #[must_use]
     pub fn action_head_sizes(&self) -> [usize; ACTION_HEAD_COUNT] {
         let a = &self.action;
@@ -372,31 +499,82 @@ impl RlSpec {
         ]
     }
 
-    /// The action of a row of head values, in the order of [`ActionHead::ALL`]. A kind that
-    /// the specification does not offer, such as a hedge without hedge actions, decodes all
-    /// the same: the mask and the [`InvalidActionPolicy`](crate::rl::InvalidActionPolicy)
-    /// decide on it.
+    /// The observation of a specification with an instrument index head: one
+    /// [`FeatureVector`] per instrument, in the order of the index head, each from that
+    /// instrument's own observation and previous row and computed with its own tick. The
+    /// policy's input is their `values` concatenated, [`RlSpec::shape`]`().features` long.
+    /// Without an index head it is the one vector of
+    /// [`observation_features`](crate::rl::observation_features).
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::InvalidConfiguration`] for a row that is not
-    /// [`ACTION_HEAD_COUNT`] long, an unknown kind, an instrument outside the
-    /// specification, or a head the kind reads that is outside its range for that
-    /// instrument: its grid, the hedge sizes of the second instrument or the quote lives.
+    /// Returns [`MMError::InvalidConfiguration`] for a number of inputs other than the
+    /// number of instruments, and [`MMError::NumericalError`] if a value does not convert.
+    pub fn profile_observation(
+        &self,
+        inputs: &[(Observation, Option<PreviousRow>)],
+    ) -> MMResult<Vec<FeatureVector>> {
+        let a = &self.action;
+        let ticks: Vec<Decimal> = if a.instruments.is_empty() {
+            vec![a.tick_size]
+        } else {
+            a.instruments.iter().map(|i| i.tick_size).collect()
+        };
+        if inputs.len() != ticks.len() {
+            return Err(MMError::InvalidConfiguration(format!(
+                "the observation has {} instruments, got {} inputs",
+                ticks.len(),
+                inputs.len()
+            )));
+        }
+        inputs
+            .iter()
+            .zip(ticks)
+            .map(|((obs, previous), tick)| {
+                observation_features(
+                    &self.observation,
+                    obs,
+                    *previous,
+                    tick,
+                    self.episode.max_steps,
+                )
+            })
+            .collect()
+    }
+
+    /// The action of a row of head values, in the order of [`ActionHead::ALL`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MMError::InvalidAction`] for a row that is not [`ACTION_HEAD_COUNT`]
+    /// long, an instrument outside the specification, a kind that
+    /// [`RlSpec::offered_kinds`] does not give for that instrument, or a head the kind reads
+    /// that is outside its range for that instrument: its grid, the hedge sizes of the
+    /// second instrument or the quote lives.
     pub fn decode_action(&self, heads: &[usize]) -> MMResult<InstrumentAction> {
         let row: &[usize; ACTION_HEAD_COUNT] = heads.try_into().map_err(|_| {
-            MMError::InvalidConfiguration(format!(
+            invalid(format!(
                 "an action row has {ACTION_HEAD_COUNT} heads, got {}",
                 heads.len()
             ))
         })?;
         let [kind, instrument, bid, ask, bid_size, ask_size, life] = *row;
         let (bids, asks, sizes) = self.grid(instrument)?;
+        if !self
+            .offered_kinds(instrument)?
+            .get(kind)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(invalid(format!(
+                "kind {kind} is not offered on instrument {instrument}"
+            )));
+        }
         let check = |head: ActionHead, value: usize, len: usize| {
             if value < len {
                 Ok(value)
             } else {
-                Err(MMError::InvalidConfiguration(format!(
+                Err(invalid(format!(
                     "head {head:?} is {value}, outside its {len} values"
                 )))
             }
@@ -426,18 +604,13 @@ impl RlSpec {
                 size: check(ActionHead::BidSize, bid_size, self.cross_sizes())?,
             },
             6 => RlAction::Cancel,
-            7 => RlAction::ExpiringQuote {
+            _ => RlAction::ExpiringQuote {
                 bid: check(ActionHead::Bid, bid, bids.len())?,
                 ask: check(ActionHead::Ask, ask, asks.len())?,
                 bid_size: check(ActionHead::BidSize, bid_size, sizes.len())?,
                 ask_size: check(ActionHead::AskSize, ask_size, sizes.len())?,
                 life: check(ActionHead::Life, life, self.lives())?,
             },
-            other => {
-                return Err(MMError::InvalidConfiguration(format!(
-                    "head Kind is {other}, outside its {ACTION_KIND_COUNT} values"
-                )));
-            }
         };
         Ok(InstrumentAction { instrument, action })
     }

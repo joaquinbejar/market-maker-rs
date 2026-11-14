@@ -22,10 +22,11 @@ use market_maker_rs::backtest::kernel::{
 };
 use market_maker_rs::dec;
 use market_maker_rs::rl::{
-    ACTION_HEAD_COUNT, ACTION_KIND_COUNT, ActionHead, InstrumentAction, InstrumentRole,
-    InstrumentSpace, InvalidActionPolicy, MULTI_INSTRUMENT_ACTION_SPACE_VERSION, ObservationScales,
-    ObservationSpace, PreviousRow, QuoteLives, RewardMark, RlAction, RlConfig, RlEnv, RlProfile,
-    RlSpec, TerminalValuation, observation_features,
+    ACTION_HEAD_COUNT, ACTION_HEAD_LAYOUT_VERSION, ACTION_KIND_COUNT, ActionHead, FEATURE_COUNT,
+    FeatureId, HedgeActions, InstrumentAction, InstrumentRole, InstrumentSpace,
+    InvalidActionPolicy, MULTI_INSTRUMENT_ACTION_SPACE_VERSION, ObservationScales,
+    ObservationSpace, PreviousRow, QuoteLives, RL_SPACES_FIXTURES, RewardMark, RlAction, RlConfig,
+    RlEnv, RlProfile, RlSpec, TerminalValuation, observation_features,
 };
 use market_maker_rs::types::error::MMError;
 use serde_json::{Value, json};
@@ -80,11 +81,35 @@ fn hedge() -> InstrumentSpace {
         dec!(0.01),
         dec!(100000),
         dec!(5),
-        vec![0, 2],
-        vec![0, 2],
+        vec![],
+        vec![],
         vec![1, 5, 10],
     )
-    .with_depth(5)
+}
+
+/// A second quoted instrument, with its own tick and lot and a larger grid.
+fn quoted_b() -> InstrumentSpace {
+    InstrumentSpace::new(
+        InstrumentRole::Quoted,
+        dec!(0.25),
+        dec!(0.1),
+        dec!(5000),
+        dec!(10),
+        vec![0, 2, 4, 8],
+        vec![0, 2, 4, 8],
+        vec![1, 3, 5],
+    )
+}
+
+fn two_quoted() -> RlProfile {
+    let cfg = kernel();
+    RlProfile::new(
+        vec![quoted(&cfg), quoted_b()],
+        RlConfig::new(scales(), dec!(1)).with_cancel_action(),
+        16,
+        200,
+    )
+    .with_step_ns(1_000_000)
 }
 
 /// The configurations an environment of this crate can state, each by name.
@@ -141,6 +166,7 @@ fn fixture_profiles() -> Vec<(&'static str, RlProfile)> {
         )
         .with_reward_mark(RewardMark::ExternalVenueMark),
     ));
+    out.push(("two_quoted", two_quoted()));
     out
 }
 
@@ -170,11 +196,13 @@ fn test_external_mark_and_instruments_change_the_identity() {
     assert_ne!(marked.to_bytes(), plain.to_bytes());
 
     let cfg = kernel();
-    let deeper = RlProfile::new(vec![quoted(&cfg).with_depth(2)], base, 16, cfg.max_steps)
-        .spec()
-        .unwrap();
-    assert_eq!(deeper.action.version, MULTI_INSTRUMENT_ACTION_SPACE_VERSION);
-    assert_eq!(deeper.action.instruments.len(), 1);
+    let stepped = profile(base).with_step_ns(1_000_000).spec().unwrap();
+    assert_eq!(stepped.episode.step_ns, Some(1_000_000));
+    assert_eq!(plain.episode.step_ns, None);
+    assert_eq!(stepped.action, plain.action);
+    assert_ne!(stepped.to_bytes(), plain.to_bytes());
+    let slower = profile(base).with_step_ns(2_000_000).spec().unwrap();
+    assert_ne!(slower.id().fingerprint, stepped.id().fingerprint);
     let more = RlProfile::new(
         vec![quoted(&cfg).with_max_orders(2)],
         base,
@@ -183,24 +211,38 @@ fn test_external_mark_and_instruments_change_the_identity() {
     )
     .spec()
     .unwrap();
-    let two = RlProfile::new(vec![quoted(&cfg), hedge()], base, 16, cfg.max_steps)
-        .spec()
-        .unwrap();
-    let swapped_role = RlProfile::new(
-        vec![quoted(&cfg), {
-            let mut h = hedge();
-            h.role = InstrumentRole::Quoted;
-            h
-        }],
-        base,
+    assert_eq!(more.action.version, MULTI_INSTRUMENT_ACTION_SPACE_VERSION);
+    assert_eq!(more.action.instruments.len(), 1);
+    let two = RlProfile::new(
+        vec![quoted(&cfg), hedge()],
+        base.with_hedge_actions(),
         16,
         cfg.max_steps,
     )
     .spec()
     .unwrap();
+    assert_eq!(two.action.hedge, HedgeActions::MarketableAtTouch);
+    let swapped_role = RlProfile::new(
+        vec![quoted(&cfg), {
+            let mut h = quoted_b();
+            h.role = InstrumentRole::Hedge;
+            h.bid_offsets_ticks.clear();
+            h.ask_offsets_ticks.clear();
+            h
+        }],
+        base.with_hedge_actions(),
+        16,
+        cfg.max_steps,
+    )
+    .spec()
+    .unwrap();
+    let two_b = RlProfile::new(vec![quoted(&cfg), quoted_b()], base, 16, cfg.max_steps)
+        .spec()
+        .unwrap();
     let ids = [
         plain.id().fingerprint,
-        deeper.id().fingerprint,
+        stepped.id().fingerprint,
+        two_b.id().fingerprint,
         more.id().fingerprint,
         two.id().fingerprint,
         swapped_role.id().fingerprint,
@@ -215,6 +257,84 @@ fn test_external_mark_and_instruments_change_the_identity() {
         two.action_head_sizes(),
         [ACTION_KIND_COUNT, 2, 3, 3, 3, 3, 1]
     );
+}
+
+#[test]
+fn test_shape_counts_every_instrument() {
+    let cfg = kernel();
+    let base = RlConfig::new(scales(), dec!(1));
+    let plain = profile(base).spec().unwrap();
+    assert_eq!(plain.shape().features, FEATURE_COUNT);
+    assert_eq!(plain.instrument_shapes(), vec![plain.shape()]);
+    let spec = two_quoted().spec().unwrap();
+    let shape = spec.shape();
+    assert_eq!(shape.features, 2 * FEATURE_COUNT);
+    assert_eq!((shape.bid_offsets, shape.sizes), (3, 2));
+    let each = spec.instrument_shapes();
+    assert_eq!(each.len(), 2);
+    assert_eq!(
+        (
+            each[1].features,
+            each[1].bid_offsets,
+            each[1].ask_offsets,
+            each[1].sizes
+        ),
+        (FEATURE_COUNT, 4, 4, 3)
+    );
+    let hedged = RlProfile::new(
+        vec![quoted(&cfg), hedge()],
+        base.with_hedge_actions(),
+        16,
+        100,
+    )
+    .spec()
+    .unwrap();
+    assert_eq!(hedged.instrument_shapes()[1].bid_offsets, 0);
+    assert_eq!(hedged.instrument_shapes()[1].sizes, 3);
+}
+
+#[test]
+fn test_roles_decide_the_offered_kinds() {
+    let cfg = kernel();
+    let base = RlConfig::new(scales(), dec!(1));
+    let spec = RlProfile::new(
+        vec![quoted(&cfg), hedge()],
+        base.with_hedge_actions().with_cancel_action(),
+        16,
+        100,
+    )
+    .spec()
+    .unwrap();
+    assert_eq!(
+        spec.offered_kinds(0).unwrap(),
+        [true, true, true, true, false, false, true, false]
+    );
+    assert_eq!(
+        spec.offered_kinds(1).unwrap(),
+        [true, false, false, false, true, false, false, false]
+    );
+    assert!(matches!(
+        spec.offered_kinds(2),
+        Err(MMError::InvalidAction(_))
+    ));
+    let not_offered = |row: [usize; ACTION_HEAD_COUNT]| {
+        matches!(spec.decode_action(&row), Err(MMError::InvalidAction(_)))
+    };
+    // No quote, one sided order or cancel on a hedge instrument, and no hedge on a quoted one.
+    assert!(not_offered([1, 1, 0, 0, 0, 0, 0]));
+    assert!(not_offered([2, 1, 0, 0, 0, 0, 0]));
+    assert!(not_offered([6, 1, 0, 0, 0, 0, 0]));
+    assert!(not_offered([4, 0, 0, 0, 0, 0, 0]));
+    assert!(not_offered([5, 0, 0, 0, 0, 0, 0]));
+    assert!(not_offered([7, 0, 0, 0, 0, 0, 0]));
+    assert_eq!(
+        spec.decode_action(&[4, 1, 0, 0, 2, 0, 0]).unwrap(),
+        InstrumentAction::new(1, RlAction::Hedge { size: 2 })
+    );
+    // The plain environment layout keeps its hedge on the one instrument.
+    let plain = profile(base.with_hedge_actions()).spec().unwrap();
+    assert!(plain.offered_kinds(0).unwrap()[4]);
+    assert!(!profile(base).spec().unwrap().offered_kinds(0).unwrap()[4]);
 }
 
 #[test]
@@ -246,8 +366,55 @@ fn test_profile_refuses_what_it_cannot_state() {
         16,
         100
     )));
+    // A hedge instrument needs the hedge actions, and the hedge actions of a profile need a
+    // hedge instrument once it is not one plain instrument.
+    assert!(refused(RlProfile::new(
+        vec![quoted(&cfg), hedge()],
+        base,
+        16,
+        100
+    )));
+    assert!(refused(RlProfile::new(
+        vec![quoted(&cfg), quoted_b()],
+        base.with_hedge_actions(),
+        16,
+        100
+    )));
+    assert!(refused(profile(base).with_step_ns(0)));
+    assert!(refused(RlProfile::new(
+        vec![quoted(&cfg), {
+            let mut h = hedge();
+            h.bid_offsets_ticks = vec![0];
+            h.ask_offsets_ticks = vec![0];
+            h
+        }],
+        base.with_hedge_actions(),
+        16,
+        100
+    )));
     for broken in [
         quoted(&cfg).with_depth(0),
+        quoted(&cfg).with_depth(2),
+        {
+            let mut i = quoted(&cfg);
+            i.bid_offsets_ticks = vec![1, 0, 10];
+            i
+        },
+        {
+            let mut i = quoted(&cfg);
+            i.ask_offsets_ticks = vec![0, 1, 1];
+            i
+        },
+        {
+            let mut i = quoted(&cfg);
+            i.sizes_lots = vec![1, 1];
+            i
+        },
+        {
+            let mut i = quoted(&cfg);
+            i.sizes_lots = vec![1, 20];
+            i
+        },
         quoted(&cfg).with_max_orders(0),
         {
             let mut i = quoted(&cfg);
@@ -314,12 +481,52 @@ fn test_observation_from_explicit_inputs_equals_the_environment() {
             let ours =
                 observation_features(&space, &obs, previous, cfg.tick_size, cfg.max_steps).unwrap();
             assert_eq!(ours, env.observe(&state).unwrap(), "{name} step {steps}");
+            assert_eq!(
+                spec.profile_observation(&[(obs, previous)]).unwrap(),
+                vec![ours]
+            );
             previous = PreviousRow::of(&obs).or(previous);
             env.step(&mut state, action).unwrap();
             steps += 1;
         }
         assert!(steps >= 3, "{name}");
     }
+}
+
+#[test]
+fn test_profile_observation_uses_each_instruments_tick() {
+    let spec = two_quoted().spec().unwrap();
+    let cases = observation_cases();
+    let (_, first, first_previous) = cases[2];
+    let (_, second, second_previous) = cases[3];
+    let both = spec
+        .profile_observation(&[(first, first_previous), (second, second_previous)])
+        .unwrap();
+    assert_eq!(both.len(), 2);
+    let ticks = [kernel().tick_size, quoted_b().tick_size];
+    for ((v, (o, previous)), tick) in both
+        .iter()
+        .zip([(first, first_previous), (second, second_previous)])
+        .zip(ticks)
+    {
+        assert_eq!(
+            *v,
+            observation_features(&spec.observation, &o, previous, tick, 200).unwrap()
+        );
+    }
+    // The entry gap reads the mid in price, so the tick of instrument 1 is visible there.
+    let at_first_tick =
+        observation_features(&spec.observation, &second, second_previous, ticks[0], 200).unwrap();
+    let gap = FeatureId::ALL
+        .iter()
+        .position(|f| *f == FeatureId::EntryGap)
+        .unwrap();
+    assert_ne!(both[1].raw[gap], at_first_tick.raw[gap]);
+    assert_eq!(both[1].raw[gap], Some(dec!(-70.5)));
+    assert!(matches!(
+        spec.profile_observation(&[(first, None)]),
+        Err(MMError::InvalidConfiguration(_))
+    ));
 }
 
 #[test]
@@ -330,9 +537,15 @@ fn test_action_heads_round_trip() {
     for spec in [
         profile(base).spec().unwrap(),
         profile(lives).spec().unwrap(),
-        RlProfile::new(vec![quoted(&cfg), hedge()], lives, 16, 100)
-            .spec()
-            .unwrap(),
+        RlProfile::new(
+            vec![quoted(&cfg), hedge()],
+            lives.with_hedge_actions(),
+            16,
+            100,
+        )
+        .spec()
+        .unwrap(),
+        two_quoted().spec().unwrap(),
     ] {
         let sizes = spec.action_head_sizes();
         assert_eq!(sizes.len(), ACTION_HEAD_COUNT);
@@ -356,7 +569,7 @@ fn test_action_heads_round_trip() {
                         assert!(canonical[i] == row[i] || canonical[i] == 0, "{row:?}");
                     }
                 }
-                Err(e) => assert!(matches!(e, MMError::InvalidConfiguration(_))),
+                Err(e) => assert!(matches!(e, MMError::InvalidAction(_))),
             }
         }
         assert!(decoded > 0);
@@ -369,6 +582,36 @@ fn test_action_heads_round_trip() {
         // No hedge lane, so no hedge size in the second instrument.
         assert!(spec.decode_action(&[5, 0, 0, 0, 0, 0, 0]).is_err());
     }
+    // A quote and a one sided order on instrument 1, on its own grid.
+    let spec = two_quoted().spec().unwrap();
+    assert_eq!(
+        spec.decode_action(&[1, 1, 3, 2, 2, 0, 0]).unwrap(),
+        InstrumentAction::new(
+            1,
+            RlAction::Quote {
+                bid: 3,
+                ask: 2,
+                bid_size: 2,
+                ask_size: 0
+            }
+        )
+    );
+    assert_eq!(
+        spec.decode_action(&[2, 1, 3, 0, 2, 0, 0]).unwrap(),
+        InstrumentAction::new(
+            1,
+            RlAction::OneSided {
+                side: QuoteSide::Bid,
+                offset: 3,
+                size: 2
+            }
+        )
+    );
+    // The same heads are past the grid of instrument 0.
+    assert!(matches!(
+        spec.decode_action(&[1, 0, 3, 2, 2, 0, 0]),
+        Err(MMError::InvalidAction(_))
+    ));
     // Without lives an expiring quote has no life to point at.
     let plain = profile(base).spec().unwrap();
     assert!(plain.decode_action(&[7, 0, 0, 0, 0, 0, 0]).is_err());
@@ -448,6 +691,7 @@ fn profile_json(p: &RlProfile) -> Value {
         "order_capacity": p.order_capacity,
         "max_steps": p.max_steps,
         "reward_mark": mark_name(p.reward_mark),
+        "step_ns": p.step_ns,
     })
 }
 
@@ -513,7 +757,7 @@ fn profile_from_json(v: &Value) -> RlProfile {
         let lives: Vec<u64> = lives.iter().map(u).collect();
         config = config.with_quote_lives(QuoteLives::new(&lives).unwrap());
     }
-    RlProfile::new(
+    let profile = RlProfile::new(
         instruments,
         config,
         u(&v["order_capacity"]),
@@ -523,7 +767,11 @@ fn profile_from_json(v: &Value) -> RlProfile {
         RewardMark::LastCompletedRow
     } else {
         RewardMark::ExternalVenueMark
-    })
+    });
+    match v["step_ns"].as_u64() {
+        Some(step_ns) => profile.with_step_ns(step_ns),
+        None => profile,
+    }
 }
 
 fn action_json(a: &InstrumentAction) -> Value {
@@ -656,6 +904,12 @@ fn action_rows(spec: &RlSpec) -> Vec<Vec<usize>> {
     rows.push(vec![ACTION_KIND_COUNT, 0, 0, 0, 0, 0, 0]);
     rows.push(vec![1, sizes[1], 0, 0, 0, 0, 0]);
     rows.push(vec![1, 0, sizes[2], 0, 0, 0, 0]);
+    if sizes[1] > 1 {
+        // A quote and both one sided orders on instrument 1.
+        rows.push(vec![1, 1, 1, 2, 0, 2, 0]);
+        rows.push(vec![2, 1, 1, 0, 1, 0, 0]);
+        rows.push(vec![3, 1, 0, 1, 0, 1, 0]);
+    }
     rows
 }
 
@@ -685,19 +939,28 @@ fn fixtures() -> Value {
                     let canonical = spec.encode_action(&action).unwrap();
                     json!({"decoded": action_json(&action), "canonical_heads": canonical})
                 }
-                Err(_) => json!({"error": "invalid_configuration"}),
+                Err(e) => {
+                    assert!(matches!(e, MMError::InvalidAction(_)), "{e}");
+                    json!({"error": "invalid_action"})
+                }
             };
             actions.push(json!({"profile": name, "heads": row, "expected": expected}));
         }
-        if name != "plain" && name != "two_instruments" {
+        if !matches!(name, "plain" | "two_instruments" | "two_quoted") {
             continue;
         }
-        let tick = p.instruments[0].tick_size;
-        for (case, o, previous) in observation_cases() {
+        for (instrument, (case, o, previous)) in p
+            .instruments
+            .iter()
+            .enumerate()
+            .flat_map(|(i, _)| observation_cases().into_iter().map(move |c| (i, c)))
+        {
+            let tick = p.instruments[instrument].tick_size;
             let v =
                 observation_features(&spec.observation, &o, previous, tick, p.max_steps).unwrap();
             observations.push(json!({
                 "profile": name,
+                "instrument": instrument,
                 "case": case,
                 "tick_size": d(tick),
                 "previous": previous.map(|r| json!({"mid2": r.mid2, "ts_ns": r.ts_ns})),
@@ -720,7 +983,8 @@ fn fixtures() -> Value {
         }
     }
     json!({
-        "format": 1,
+        "format": 2,
+        "head_layout_version": ACTION_HEAD_LAYOUT_VERSION,
         "about": "Fixtures of the rl spaces: declared profiles with their spec bytes and ids, plain observation inputs with their expected feature vectors, and action head rows with their expected decoded actions. Decimals and f32 values are strings, the f32 in its shortest round trip form. Generated by tests/rl_external.rs.",
         "profiles": profiles,
         "observations": observations,
@@ -737,7 +1001,12 @@ fn test_published_fixtures_match() {
         text.push('\n');
         std::fs::write(&path, text).unwrap();
     }
-    let published: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text, RL_SPACES_FIXTURES,
+        "rebuild to embed the rewritten {FIXTURE}"
+    );
+    let published: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(published, generated, "{FIXTURE} is out of date");
     rebuild_from_plain_data(&published);
 }
@@ -781,6 +1050,8 @@ fn rebuild_from_plain_data(published: &Value) {
             .as_object()
             .map(|r| PreviousRow::new(u(&r["mid2"]), u(&r["ts_ns"])));
         let tick = Decimal::from_str(entry["tick_size"].as_str().unwrap()).unwrap();
+        let instrument = usize::try_from(u(&entry["instrument"])).unwrap();
+        assert_eq!(tick, p.instruments[instrument].tick_size);
         let v = observation_features(&spec.observation, &observation, previous, tick, p.max_steps)
             .unwrap();
         for (i, raw) in v.raw.iter().enumerate() {

@@ -25,7 +25,14 @@ pub const CANCEL_ACTION_SPACE_VERSION: u16 = 4;
 pub const EXPIRY_ACTION_SPACE_VERSION: u16 = 5;
 /// Version of the action space of a declared profile with an instrument index head: the
 /// actions of the versions before it, each on the instrument that
-/// [`ActionSpace::instruments`] lists at the index head's value.
+/// [`ActionSpace::instruments`] lists at the index head's value, as its role offers them
+/// ([`InstrumentRole`]).
+///
+/// The observation of such a specification is the vector of the [`FEATURE_COUNT`] features
+/// of [`ObservationSpace`] for each instrument, concatenated in the order of
+/// [`ActionSpace::instruments`], each computed with that instrument's own tick (sizes are
+/// already in its own lots): [`RlSpec::profile_observation`]. Every instrument has depth 1:
+/// a deeper book is refused until the space has features for the levels past the touch.
 pub const MULTI_INSTRUMENT_ACTION_SPACE_VERSION: u16 = 6;
 /// The most instruments a declared profile can hold.
 pub const MAX_PROFILE_INSTRUMENTS: usize = 64;
@@ -693,13 +700,19 @@ pub struct CrossHedgeSpace {
     pub sizes_lots: Vec<u64>,
 }
 
-/// The role of an instrument in a declared profile.
+/// The role of an instrument in a declared profile: which kinds of action the policy can
+/// take on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InstrumentRole {
-    /// The policy quotes it.
+    /// The policy quotes it: hold, quote and one sided orders, the cancel action when the
+    /// configuration has it and the expiring quote when it has lives. In a profile of more
+    /// than one plain instrument no hedge is offered on it; alone and plain it offers what
+    /// [`RlEnv`](crate::rl::RlEnv) does, the hedge included when the configuration has it.
     Quoted,
-    /// The policy hedges in it.
+    /// The policy hedges in it: hold and the hedge only, with a size from its own grid. It
+    /// declares no offsets, and a profile that holds one needs the hedge actions in its
+    /// configuration.
     Hedge,
 }
 
@@ -729,11 +742,13 @@ pub struct InstrumentSpace {
     pub max_order_size: Decimal,
     /// Levels of the book the environment observes on each side.
     pub depth: u16,
-    /// Bid offsets from the observed mid, in ticks.
+    /// Bid offsets from the observed mid, in ticks, strictly increasing; empty for a hedge
+    /// instrument.
     pub bid_offsets_ticks: Vec<u16>,
-    /// Ask offsets from the observed mid, in ticks.
+    /// Ask offsets from the observed mid, in ticks, strictly increasing; empty for a hedge
+    /// instrument.
     pub ask_offsets_ticks: Vec<u16>,
-    /// Order sizes, in lots.
+    /// Order sizes, in lots, strictly increasing, each at most `max_order_size`.
     pub sizes_lots: Vec<u64>,
     /// The most resting orders per side the action space can create.
     pub max_orders: u16,
@@ -917,9 +932,17 @@ pub struct EpisodeSpec {
     pub max_steps: u64,
     /// What values the inventory on termination. Truncation closes nothing.
     pub terminal: TerminalValuation,
+    /// The time between two decisions, in nanoseconds, as a declared profile states it.
+    /// `None` for [`RlEnv`](crate::rl::RlEnv), whose decisions follow the rows of its data,
+    /// and then absent from [`RlSpec::to_bytes`].
+    pub step_ns: Option<u64>,
 }
 
 /// The sizes of the spaces.
+///
+/// For a declared profile with an instrument index head, `features` is the length of the
+/// whole concatenated vector and the grid fields are those of the first instrument;
+/// [`RlSpec::instrument_shapes`] gives each instrument's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceShape {
     /// Length of the feature vector.
@@ -1114,6 +1137,11 @@ impl RlSpec {
         put_u16(&mut out, e.version);
         put_u64(&mut out, e.max_steps);
         put_u16(&mut out, e.terminal.code());
+        // Absent for an environment of this crate, whose bytes stay as they were.
+        if let Some(step_ns) = e.step_ns {
+            out.extend_from_slice(b"SN");
+            put_u64(&mut out, step_ns);
+        }
         out
     }
 
@@ -1129,11 +1157,15 @@ impl RlSpec {
         }
     }
 
-    /// The sizes of the spaces.
+    /// The sizes of the spaces; see [`SpaceShape`] for a declared profile.
     #[must_use]
     pub fn shape(&self) -> SpaceShape {
         SpaceShape {
-            features: self.observation.features.len(),
+            features: self
+                .observation
+                .features
+                .len()
+                .saturating_mul(self.action.instruments.len().max(1)),
             bid_offsets: self.action.bid_offsets_ticks.len(),
             ask_offsets: self.action.ask_offsets_ticks.len(),
             sizes: self.action.sizes_lots.len(),
@@ -1144,6 +1176,28 @@ impl RlSpec {
                 .as_ref()
                 .map_or(0, |c| c.sizes_lots.len()),
         }
+    }
+
+    /// The sizes of each instrument's part of the spaces, in the order of the instrument
+    /// index head: its features and its own grids. One entry, equal to
+    /// [`RlSpec::shape`], without an instrument index head.
+    #[must_use]
+    pub fn instrument_shapes(&self) -> Vec<SpaceShape> {
+        if self.action.instruments.is_empty() {
+            return vec![self.shape()];
+        }
+        self.action
+            .instruments
+            .iter()
+            .map(|i| SpaceShape {
+                features: self.observation.features.len(),
+                bid_offsets: i.bid_offsets_ticks.len(),
+                ask_offsets: i.ask_offsets_ticks.len(),
+                sizes: i.sizes_lots.len(),
+                hedge_features: 0,
+                hedge_sizes: 0,
+            })
+            .collect()
     }
 
     /// Checks that this is the specification a consumer was built for.

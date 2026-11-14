@@ -20,7 +20,7 @@ use crate::types::decimal::{exact_add, exact_product};
 use crate::types::error::{MMError, MMResult};
 
 use super::audit::{EpisodeRecorder, EpisodeRecords};
-use super::features::{FeatureVector, HedgeFeatureVector, PreviousRow, feature_vector};
+use super::features::{FeatureVector, HedgeFeatureVector, PreviousRow, observation_features};
 use super::profile::build_spec;
 use super::spec::{
     CrossHedgeSpace, HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION,
@@ -843,21 +843,11 @@ impl<
     pub fn observe(&self, state: &RlState<ORD, MSG, DLV, OBS>) -> MMResult<FeatureVector> {
         self.check_owned(state)?;
         let obs = self.kernel.observe(&state.kernel);
-        let mid = match obs.row {
-            Some(_) => {
-                let mid2 = obs
-                    .bid
-                    .checked_add(obs.ask)
-                    .ok_or_else(|| inexact("observed mid"))?;
-                Some(self.mid_of(mid2)?)
-            }
-            None => None,
-        };
-        feature_vector(
+        observation_features(
             &self.spec.observation,
             &obs,
             state.previous,
-            mid,
+            self.spec.action.tick_size,
             self.spec.episode.max_steps,
         )
     }

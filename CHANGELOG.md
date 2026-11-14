@@ -36,8 +36,20 @@ project follows [Semantic Versioning](https://semver.org/).
   the layout of the discrete action heads (`ActionHead`, `InstrumentAction`) (#326).
 - `rl`: `RewardMark::ExternalVenueMark`, a reward marked at a mark the external environment
   supplies, in the spec bytes and fingerprint (#326).
-- Published fixtures in `doc/fixtures/rl_spaces.json`: spec bytes and ids, feature vectors
-  of plain inputs and decoded action head rows (#326).
+- `rl`: with an instrument index head the observation is the 11 features per instrument,
+  concatenated in profile order with each instrument's own tick
+  (`RlSpec::profile_observation`); `RlSpec::shape` counts them and
+  `RlSpec::instrument_shapes` gives each instrument's grids. A depth other than 1 is refused.
+- `rl`: instrument roles decide the actions: a quoted instrument offers hold, quote, one
+  sided orders and cancel; a hedge instrument offers hold and hedge, and needs the hedge
+  actions. `RlSpec::offered_kinds` gives the kind mask per instrument, and
+  `RlSpec::decode_action` refuses any other kind (#326).
+- `rl`: `ACTION_HEAD_LAYOUT_VERSION`, the version of the head order and kind codes, and
+  `RlProfile::with_step_ns`, a decision step that enters the `SpecId` of a profile (#326).
+- `MMError::InvalidAction`, returned for an action row that is out of range or not offered.
+- Published fixtures in `doc/fixtures/rl_spaces.json`, also embedded as
+  `rl::RL_SPACES_FIXTURES`: spec bytes and ids, feature vectors of plain inputs per
+  instrument and decoded action head rows (#326).
 
 ### Changed
 

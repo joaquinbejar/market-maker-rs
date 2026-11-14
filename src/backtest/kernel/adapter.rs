@@ -60,6 +60,7 @@ pub fn quote_error_code(error: &MMError) -> ErrCode {
         MMError::FillBookedCheckFailed(_) => 13,
         MMError::GreeksMissFill => 14,
         MMError::QuotingHalted(_) => 15,
+        MMError::InvalidAction(_) => 16,
     })
 }
 
@@ -84,6 +85,7 @@ pub fn quote_error_name(code: ErrCode) -> Option<&'static str> {
         13 => "FillBookedCheckFailed",
         14 => "GreeksMissFill",
         15 => "QuotingHalted",
+        16 => "InvalidAction",
         _ => return None,
     })
 }
