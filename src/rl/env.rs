@@ -6,8 +6,7 @@ use rust_decimal::prelude::ToPrimitive;
 
 use crate::Decimal;
 use crate::backtest::evaluation::{
-    EvaluationError, EvaluationInput, ExecutedFill, FundingPayment, HedgeNotModelledReason,
-    LedgerTotals, Mark, MetricId, MetricUnit, attribute,
+    EvaluationError, EvaluationInput, ExecutedFill, FundingPayment, LedgerTotals, Mark, attribute,
 };
 use crate::backtest::kernel::{
     ActionGrid, ActionMask, ActionStatus, ErrCode, EventSink, FinancialKernel, HedgeEvent,
@@ -22,12 +21,11 @@ use crate::types::error::{MMError, MMResult};
 
 use super::audit::{EpisodeRecorder, EpisodeRecords};
 use super::features::{FeatureVector, HedgeFeatureVector, PreviousRow, feature_vector};
+use super::profile::build_spec;
 use super::spec::{
-    ACTION_SPACE_VERSION, ActionSpace, CANCEL_ACTION_SPACE_VERSION, CancelActions, CrossHedgeSpace,
-    EPISODE_VERSION, EXPIRY_ACTION_SPACE_VERSION, EpisodeSpec, HEDGED_ACTION_SPACE_VERSION,
-    HEDGED_OBSERVATION_SPACE_VERSION, HEDGED_REWARD_VERSION, HedgeActions, HedgeScales,
-    InvalidActionPolicy, ObservationScales, ObservationSpace, QuoteExpiry, QuoteLives,
-    REWARD_VERSION, RewardKind, RewardMark, RewardSpec, RlSpec, TerminalValuation,
+    CrossHedgeSpace, HEDGED_ACTION_SPACE_VERSION, HEDGED_OBSERVATION_SPACE_VERSION,
+    HEDGED_REWARD_VERSION, HedgeScales, InstrumentRole, InstrumentSpace, InvalidActionPolicy,
+    ObservationScales, ObservationSpace, QuoteLives, RewardMark, RlSpec, TerminalValuation,
 };
 
 /// Code of an action whose indices are not on the grid, or whose price is not
@@ -45,12 +43,12 @@ pub const ERR_HEDGE_REFUSED: ErrCode = ErrCode(201);
 /// past zero.
 pub const ERR_CROSS_HEDGE_REFUSED: ErrCode = ErrCode(202);
 
-/// Code of a cancel when the action space has none ([`CancelActions::NotModelled`]),
+/// Code of a cancel when the action space has none ([`CancelActions::NotModelled`](super::CancelActions::NotModelled)),
 /// under [`InvalidActionPolicy::Reject`].
 pub const ERR_CANCEL_REFUSED: ErrCode = ErrCode(203);
 
 /// Code of an expiring quote when the action space has no lives
-/// ([`QuoteExpiry::NotModelled`]), under [`InvalidActionPolicy::Reject`].
+/// ([`QuoteExpiry::NotModelled`](super::QuoteExpiry::NotModelled)), under [`InvalidActionPolicy::Reject`].
 pub const ERR_EXPIRY_REFUSED: ErrCode = ErrCode(204);
 
 const NS_PER_MS: u64 = 1_000_000;
@@ -68,11 +66,11 @@ pub struct RlConfig {
     pub invalid_action_penalty: Decimal,
     /// What values the inventory on termination.
     pub terminal: TerminalValuation,
-    /// Whether [`RlAction::Hedge`] exists, as [`HedgeActions::MarketableAtTouch`].
+    /// Whether [`RlAction::Hedge`] exists, as [`HedgeActions::MarketableAtTouch`](super::HedgeActions::MarketableAtTouch).
     pub hedge_actions: bool,
-    /// Whether [`RlAction::Cancel`] exists, as [`CancelActions::CancelOnly`].
+    /// Whether [`RlAction::Cancel`] exists, as [`CancelActions::CancelOnly`](super::CancelActions::CancelOnly).
     pub cancel_action: bool,
-    /// The lives of [`RlAction::ExpiringQuote`], as [`QuoteExpiry::Lives`].
+    /// The lives of [`RlAction::ExpiringQuote`], as [`QuoteExpiry::Lives`](super::QuoteExpiry::Lives).
     pub quote_lives: Option<QuoteLives>,
 }
 
@@ -108,15 +106,15 @@ impl RlConfig {
         self
     }
 
-    /// Adds [`RlAction::Hedge`] to the action space, as [`HedgeActions::MarketableAtTouch`].
+    /// Adds [`RlAction::Hedge`] to the action space, as [`HedgeActions::MarketableAtTouch`](super::HedgeActions::MarketableAtTouch).
     #[must_use]
     pub fn with_hedge_actions(mut self) -> Self {
         self.hedge_actions = true;
         self
     }
 
-    /// Adds [`RlAction::Cancel`] to the action space, as [`CancelActions::CancelOnly`], of
-    /// version [`CANCEL_ACTION_SPACE_VERSION`].
+    /// Adds [`RlAction::Cancel`] to the action space, as [`CancelActions::CancelOnly`](super::CancelActions::CancelOnly), of
+    /// version [`CANCEL_ACTION_SPACE_VERSION`](super::CANCEL_ACTION_SPACE_VERSION).
     #[must_use]
     pub fn with_cancel_action(mut self) -> Self {
         self.cancel_action = true;
@@ -124,7 +122,7 @@ impl RlConfig {
     }
 
     /// Adds [`RlAction::ExpiringQuote`] with these lives, of action space version
-    /// [`EXPIRY_ACTION_SPACE_VERSION`], with or without the cancel action.
+    /// [`EXPIRY_ACTION_SPACE_VERSION`](super::EXPIRY_ACTION_SPACE_VERSION), with or without the cancel action.
     #[must_use]
     pub fn with_quote_lives(mut self, lives: QuoteLives) -> Self {
         self.quote_lives = Some(lives);
@@ -159,7 +157,7 @@ pub enum RlAction {
         size: usize,
     },
     /// Reduce the delivered position with a marketable order at the observed touch, as
-    /// [`HedgeActions::MarketableAtTouch`] states. It replaces the resting orders.
+    /// [`HedgeActions::MarketableAtTouch`](super::HedgeActions::MarketableAtTouch) states. It replaces the resting orders.
     Hedge {
         /// Index of the size in the grid's sizes, at most the delivered position at the decision.
         size: usize,
@@ -171,11 +169,11 @@ pub enum RlAction {
         /// Index of the size in the hedge sizes, never taking the net exposure past zero.
         size: usize,
     },
-    /// Cancel every resting or pending order and send nothing, as [`CancelActions::CancelOnly`]
+    /// Cancel every resting or pending order and send nothing, as [`CancelActions::CancelOnly`](super::CancelActions::CancelOnly)
     /// states. Outside the mask without it.
     Cancel,
     /// Replace the resting orders with a bid and an ask that expire by themselves, as
-    /// [`QuoteExpiry::Lives`] states. Outside the mask without lives, or with `life` out of
+    /// [`QuoteExpiry::Lives`](super::QuoteExpiry::Lives) states. Outside the mask without lives, or with `life` out of
     /// range.
     ExpiringQuote {
         /// Index of the bid offset.
@@ -519,62 +517,26 @@ impl<
         config: RlConfig,
     ) -> MMResult<Self> {
         let orders = Decimal::from(u64::try_from(ORD).unwrap_or(u64::MAX));
-        let spec = RlSpec {
-            observation: ObservationSpace::new(
+        let spec = build_spec(
+            ObservationSpace::new(
                 &config.scales,
                 orders,
                 Decimal::from(kernel_config.max_steps),
             ),
-            action: ActionSpace {
-                version: if config.quote_lives.is_some() {
-                    EXPIRY_ACTION_SPACE_VERSION
-                } else if config.cancel_action {
-                    CANCEL_ACTION_SPACE_VERSION
-                } else {
-                    ACTION_SPACE_VERSION
-                },
-                tick_size: kernel_config.tick_size,
-                lot_size: kernel_config.lot_size,
-                max_price: kernel_config.max_price,
-                max_order_size: kernel_config.max_order_size,
-                bid_offsets_ticks: grid.bid_offsets().to_vec(),
-                ask_offsets_ticks: grid.ask_offsets().to_vec(),
-                sizes_lots: grid.sizes().to_vec(),
-                invalid_action: config.invalid_action,
-                hedge: if config.hedge_actions {
-                    HedgeActions::MarketableAtTouch
-                } else {
-                    HedgeActions::NotModelled {
-                        reason: HedgeNotModelledReason::SingleInstrument,
-                    }
-                },
-                cross_hedge: None,
-                cancel: if config.cancel_action {
-                    CancelActions::CancelOnly
-                } else {
-                    CancelActions::NotModelled
-                },
-                expiry: match &config.quote_lives {
-                    Some(lives) => QuoteExpiry::Lives(lives.as_slice().to_vec()),
-                    None => QuoteExpiry::NotModelled,
-                },
-            },
-            reward: RewardSpec {
-                version: REWARD_VERSION,
-                kind: RewardKind::NetEquityChange,
-                metric: MetricId::NetPnl,
-                unit: MetricUnit::Quote,
-                mark: RewardMark::LastCompletedRow,
-                invalid_action_penalty: config.invalid_action_penalty,
-                f32_unit: config.f32_unit,
-                policy_input: false,
-            },
-            episode: EpisodeSpec {
-                version: EPISODE_VERSION,
-                max_steps: kernel_config.max_steps,
-                terminal: config.terminal,
-            },
-        };
+            &InstrumentSpace::new(
+                InstrumentRole::Quoted,
+                kernel_config.tick_size,
+                kernel_config.lot_size,
+                kernel_config.max_price,
+                kernel_config.max_order_size,
+                grid.bid_offsets().to_vec(),
+                grid.ask_offsets().to_vec(),
+                grid.sizes().to_vec(),
+            ),
+            &config,
+            kernel_config.max_steps,
+            RewardMark::LastCompletedRow,
+        );
         Ok(Self {
             kernel,
             grid,

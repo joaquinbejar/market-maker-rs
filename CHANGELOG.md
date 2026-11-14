@@ -25,12 +25,26 @@ project follows [Semantic Versioning](https://semver.org/).
   `SettlementRounding`, `Orders`, `FilledOrders`, `AcceptedQuantity`, `FilledQuantity`,
   `FillRatioByCount`, `FillRatioByQuantity` and `ReconciliationResidual`, appended to
   `MetricId::ALL`; `MetricId::WINDOW` and `MetricId::ACCOUNT` split them by report.
+- `rl`: `RlProfile` builds an `RlSpec` from a declared profile with no kernel: an ordered
+  subset of instruments (`InstrumentSpace`: role, depth, grids, `max_orders`), scales, order
+  limit, `max_steps` and reward settings. One plain quoted instrument gives the same bytes
+  and `SpecId` as `RlEnv`; any other profile adds an instrument index head, of action space
+  version `MULTI_INSTRUMENT_ACTION_SPACE_VERSION` (6) (#326).
+- `rl`: public pure observation functions, `ObservationSpace::from_scales`,
+  `observation_features` and `PreviousRow` (#326).
+- `rl`: `RlSpec::action_head_sizes`, `RlSpec::decode_action` and `RlSpec::encode_action`,
+  the layout of the discrete action heads (`ActionHead`, `InstrumentAction`) (#326).
+- `rl`: `RewardMark::ExternalVenueMark`, a reward marked at a mark the external environment
+  supplies, in the spec bytes and fingerprint (#326).
+- Published fixtures in `doc/fixtures/rl_spaces.json`: spec bytes and ids, feature vectors
+  of plain inputs and decoded action head rows (#326).
 
 ### Changed
 
 - `MetricId::ALL` holds 28 ids instead of 17. The existing ids keep their positions, and the
   single lane attribution and `WindowMetrics::values` are unchanged.
 - `TimeWindow` documents that it is half open and how to pass a closed interval.
+- `RiskLimits` notional check written as one comparison, for the newer Clippy.
 
 ## [0.7.1] - 2026-11-10
 

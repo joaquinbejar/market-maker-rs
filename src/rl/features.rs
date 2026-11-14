@@ -11,11 +11,30 @@ use super::spec::{FEATURE_COUNT, FeatureId, FeatureSpec, HEDGE_FEATURE_COUNT, Ob
 /// Nanoseconds as a `Decimal` count of milliseconds has this scale.
 const NS_SCALE: u32 = 6;
 
-/// What the agent saw at its previous decision.
+/// What the agent saw at its previous decision: the only memory of the observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PreviousRow {
-    pub(super) mid2: u64,
-    pub(super) ts_ns: u64,
+#[non_exhaustive]
+pub struct PreviousRow {
+    /// `bid + ask` of that decision's observed row, in ticks: twice its mid.
+    pub mid2: u64,
+    /// That row's exchange time, in nanoseconds.
+    pub ts_ns: u64,
+}
+
+impl PreviousRow {
+    /// A previous row of `mid2` half ticks at `ts_ns`.
+    #[must_use]
+    pub fn new(mid2: u64, ts_ns: u64) -> Self {
+        Self { mid2, ts_ns }
+    }
+
+    /// What a decision on `obs` leaves for the next one, as an environment keeps it: its
+    /// observed row, or `None` with no row, in which case the memory stays as it was.
+    #[must_use]
+    pub fn of(obs: &Observation) -> Option<Self> {
+        obs.row?;
+        Some(Self::new(obs.bid.checked_add(obs.ask)?, obs.ts_ns))
+    }
 }
 
 /// The observation at a decision.
@@ -147,6 +166,42 @@ fn raw_value(
         | FeatureId::HedgePosition
         | FeatureId::HedgeInFlight => None,
     })
+}
+
+/// The feature vector of `obs`, from explicit inputs and no hidden state: `previous` is
+/// what the previous decision left ([`PreviousRow::of`] the observation it decided on, or
+/// the memory before it when it saw no row), `tick_size` values one tick, and `max_steps`
+/// is the specification's. It is what [`RlEnv::observe`](crate::rl::RlEnv::observe) returns
+/// for the same inputs.
+///
+/// # Errors
+///
+/// Returns [`MMError::NumericalError`] if a value does not convert.
+pub fn observation_features(
+    space: &ObservationSpace,
+    obs: &Observation,
+    previous: Option<PreviousRow>,
+    tick_size: Decimal,
+    max_steps: u64,
+) -> MMResult<FeatureVector> {
+    let mid = match obs.row {
+        Some(_) => {
+            let mid2 = obs
+                .bid
+                .checked_add(obs.ask)
+                .ok_or_else(|| numeric("observed mid"))?;
+            let twice = Decimal::from(mid2)
+                .checked_mul(tick_size)
+                .ok_or_else(|| numeric("observed mid"))?;
+            Some(
+                twice
+                    .checked_mul(Decimal::new(5, 1))
+                    .ok_or_else(|| numeric("observed mid"))?,
+            )
+        }
+        None => None,
+    };
+    feature_vector(space, obs, previous, mid, max_steps)
 }
 
 /// The feature vector of `obs`. `mid` is the mid of the observed row, if any.
