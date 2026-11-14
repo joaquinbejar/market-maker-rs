@@ -70,7 +70,7 @@
 //! force, with what a derivatives venue adds:
 //!
 //! - a contract multiplier `M`, so a position of `c` contracts is worth `c M mark`
-//!   ([`lane_contract`] reads it from a specification, feature `instruments`);
+//!   (`lane_contract` reads it from a specification, feature `instruments`);
 //! - option lanes, valued linearly at the option's mark with the premium as the
 //!   fill's cash; a mark of zero is admitted, a negative one is not;
 //! - an [`Opening`] position and price, so a window need not start flat;

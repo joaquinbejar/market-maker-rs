@@ -192,8 +192,9 @@ pub struct LaneFunding {
 }
 
 /// A position change that is not a fill, such as an auto deleveraging close.
-/// It has no fee; its edge against the mark in force is
-/// [`LaneAttribution::transfer_edge`].
+/// It has no fee. Its cash is taken as given, as [`Settlement::cash`] is, so a
+/// venue's rounding of the close stays in it; its edge against the mark in
+/// force is [`LaneAttribution::transfer_edge`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LaneTransfer {
@@ -201,10 +202,11 @@ pub struct LaneTransfer {
     pub time: u64,
     /// Our side: [`Action::Buy`] or [`Action::Sell`].
     pub side: Action,
-    /// Price per unit of the underlying. Never negative.
-    pub price: Decimal,
     /// Contracts. Positive.
     pub quantity: Decimal,
+    /// The signed gross cash of the close: received is positive, so a buy
+    /// usually carries a negative amount.
+    pub cash: Decimal,
 }
 
 /// The end of a lane's position without a fill, such as an option or a future
@@ -274,20 +276,44 @@ pub enum OrderEnd {
 }
 
 /// An order the venue accepted on a lane.
+///
+/// Its offered quantity is [`OrderRecord::offered_quantity`]: the size first
+/// accepted plus every positive increase of the open quantity by an accepted
+/// replace. An order accepted for 10, filled for 8 and replaced to an open size
+/// of 10 has offered 18. Its fills never exceed it, and an order that ended
+/// [`OrderEnd::Filled`] was filled for exactly it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct OrderRecord {
     /// Identifier, unique within the lane.
     pub id: u64,
-    /// Contracts accepted, the largest over its replaces. Positive, and at
-    /// least the size of its fills.
+    /// Contracts of the order when the venue accepted it. Positive.
     pub accepted_quantity: Decimal,
+    /// The sum of every positive increase of the open quantity by an accepted
+    /// replace, in contracts. Never negative; a replace that lowers the open
+    /// quantity adds nothing.
+    pub replace_increase: Decimal,
     /// Replaces the venue accepted.
     pub accepted_replaces: u64,
     /// How it ended.
     pub end_state: OrderEnd,
     /// A liquidation order, left out of the fill ratios.
     pub liquidation: bool,
+}
+
+impl OrderRecord {
+    /// Contracts offered: `accepted_quantity + replace_increase`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationError::Inexact`] if the sum would round.
+    pub fn offered_quantity(&self) -> EvalResult<Decimal> {
+        add(
+            self.accepted_quantity,
+            self.replace_increase,
+            "offered quantity",
+        )
+    }
 }
 
 /// The records of one lane.
@@ -460,10 +486,8 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
     }
     for transfer in lane.transfers {
         let t = transfer.time;
-        if transfer.price < Decimal::ZERO || transfer.quantity <= Decimal::ZERO {
-            return refuse(format!(
-                "transfer at {t} needs a price of at least zero and a positive size"
-            ));
+        if transfer.quantity <= Decimal::ZERO {
+            return refuse(format!("transfer at {t} needs a positive size"));
         }
         signed(transfer.side, transfer.quantity, "transfer", t)?;
     }
@@ -493,8 +517,15 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
         if order.accepted_quantity <= Decimal::ZERO {
             return refuse(format!("order {} needs a positive accepted size", order.id));
         }
+        if order.replace_increase < Decimal::ZERO {
+            return refuse(format!(
+                "order {} has a negative replace increase",
+                order.id
+            ));
+        }
+        let offered = order.offered_quantity()?;
         if ids
-            .insert(order.id, (order.accepted_quantity, Decimal::ZERO))
+            .insert(order.id, (offered, Decimal::ZERO, order.end_state))
             .is_some()
         {
             return refuse(format!("order {} is recorded twice", order.id));
@@ -502,12 +533,19 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
     }
     for fill in lane.fills {
         let Some(id) = fill.order_id else { continue };
-        let Some((accepted, filled)) = ids.get_mut(&id) else {
+        let Some((offered, filled, _)) = ids.get_mut(&id) else {
             return refuse(format!("fill at {} names unknown order {id}", fill.time));
         };
         *filled = add(*filled, fill.quantity, "order fills")?;
-        if *filled > *accepted {
-            return refuse(format!("order {id} is filled beyond its accepted size"));
+        if *filled > *offered {
+            return refuse(format!("order {id} is filled beyond its offered size"));
+        }
+    }
+    for (id, (offered, filled, end)) in &ids {
+        if *end == OrderEnd::Filled && filled != offered {
+            return refuse(format!(
+                "order {id} ended filled with {filled} of {offered} contracts filled"
+            ));
         }
     }
     Ok(())
@@ -529,9 +567,10 @@ impl<'a> AccountInput<'a> {
     /// Returns [`EvaluationError::InvalidInput`] when a record is outside the
     /// window or out of order, a multiplier or size is not positive, a price or
     /// mark is negative, a fill or transfer is neither a buy nor a sell, an option
-    /// fill has a base fee, a record of a lane comes after its settlement, or an
-    /// order is recorded twice, is named by no fill's lane, or is filled beyond
-    /// its accepted size.
+    /// fill has a base fee, a record of a lane comes after its settlement, an
+    /// order is recorded twice or has a negative replace increase, a fill names
+    /// an order its lane does not record, an order is filled beyond its offered
+    /// size, or an order that ended filled was filled for less than it offered.
     pub fn new(
         window: Window,
         lanes: Vec<LaneRecords<'a>>,
@@ -566,7 +605,9 @@ impl<'a> AccountInput<'a> {
 ///
 /// ```text
 /// spread capture      = Σ s c M (M_f - P)        over fills
-/// transfer edge       = Σ s c M (M_f - P)        over transfers
+/// transfer edge       = Σ (X + s c M M_f)        over transfers, X the
+///                       transfer's signed cash, so s c M (M_f - P) when
+///                       X = -s c M P exactly
 /// inventory           = Σ p_i M (M_i - M_{i-1}), from the opening price, to
 ///                       the settlement price if any
 /// base fees           = Σ b M M_f
@@ -580,7 +621,8 @@ impl<'a> AccountInput<'a> {
 pub struct LaneAttribution {
     /// Earned against the mark in force at each fill.
     pub spread_capture: Decimal,
-    /// Earned against the mark in force at each close that is not a fill.
+    /// Earned against the mark in force at each close that is not a fill: its
+    /// signed cash plus the value at that mark of the contracts it moved.
     pub transfer_edge: Decimal,
     /// The position times later moves of the lane's price.
     pub inventory_pnl: Decimal,
@@ -625,7 +667,8 @@ impl LaneAttribution {
 }
 
 /// The orders of a lane, liquidation orders left out of every count but their
-/// own.
+/// own. Quantities are in units of the underlying, contracts times the lane's
+/// multiplier, so they add up across lanes of different multipliers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
@@ -634,12 +677,20 @@ pub struct OrderStats {
     pub orders: u64,
     /// Orders with at least one fill.
     pub filled_orders: u64,
-    /// Contracts accepted.
+    /// Units offered, [`OrderRecord::offered_quantity`] times the multiplier.
     pub accepted_quantity: Decimal,
-    /// Contracts filled.
+    /// Units filled.
     pub filled_quantity: Decimal,
     /// Replaces accepted.
     pub accepted_replaces: u64,
+    /// Orders that ended [`OrderEnd::Filled`].
+    pub ended_filled: u64,
+    /// Orders that ended [`OrderEnd::Cancelled`].
+    pub ended_cancelled: u64,
+    /// Orders that ended [`OrderEnd::Expired`].
+    pub ended_expired: u64,
+    /// Orders still open when the window ended, [`OrderEnd::Open`].
+    pub ended_open: u64,
     /// Liquidation orders, left out of the above.
     pub liquidation_orders: u64,
 }
@@ -677,6 +728,10 @@ impl OrderStats {
         self.accepted_replaces = self
             .accepted_replaces
             .saturating_add(other.accepted_replaces);
+        self.ended_filled = self.ended_filled.saturating_add(other.ended_filled);
+        self.ended_cancelled = self.ended_cancelled.saturating_add(other.ended_cancelled);
+        self.ended_expired = self.ended_expired.saturating_add(other.ended_expired);
+        self.ended_open = self.ended_open.saturating_add(other.ended_open);
         self.liquidation_orders = self
             .liquidation_orders
             .saturating_add(other.liquidation_orders);
@@ -685,6 +740,7 @@ impl OrderStats {
 }
 
 fn order_stats(lane: &LaneRecords<'_>) -> EvalResult<OrderStats> {
+    let m = lane.multiplier;
     let mut filled: BTreeMap<u64, Decimal> = BTreeMap::new();
     for fill in lane.fills {
         if let Some(id) = fill.order_id {
@@ -703,15 +759,20 @@ fn order_stats(lane: &LaneRecords<'_>) -> EvalResult<OrderStats> {
         if !done.is_zero() {
             stats.filled_orders = stats.filled_orders.saturating_add(1);
         }
-        stats.accepted_quantity = add(
-            stats.accepted_quantity,
-            order.accepted_quantity,
-            "accepted quantity",
-        )?;
+        let offered = mul(order.offered_quantity()?, m, "offered quantity")?;
+        stats.accepted_quantity = add(stats.accepted_quantity, offered, "offered quantity")?;
+        let done = mul(done, m, "filled quantity")?;
         stats.filled_quantity = add(stats.filled_quantity, done, "filled quantity")?;
         stats.accepted_replaces = stats
             .accepted_replaces
             .saturating_add(order.accepted_replaces);
+        let count = match order.end_state {
+            OrderEnd::Filled => &mut stats.ended_filled,
+            OrderEnd::Cancelled => &mut stats.ended_cancelled,
+            OrderEnd::Expired => &mut stats.ended_expired,
+            OrderEnd::Open => &mut stats.ended_open,
+        };
+        *count = count.saturating_add(1);
     }
     Ok(stats)
 }
@@ -733,7 +794,8 @@ pub struct LaneOutcome {
     pub settled: bool,
     /// Fills.
     pub fills: u64,
-    /// Contracts filled, gross of base fees.
+    /// Units of the underlying filled, contracts times the multiplier, gross of
+    /// base fees.
     pub volume: Decimal,
     /// Orders.
     pub orders: OrderStats,
@@ -867,7 +929,7 @@ fn attribute_lane(index: usize, lane: &LaneRecords<'_>) -> EvalResult<LaneOutcom
                     sub(contracts, fill.base_fee, "position")?,
                     "position",
                 )?;
-                volume = add(volume, fill.quantity, "volume")?;
+                volume = add(volume, units.abs(), "volume")?;
             }
             Event::Transfer(transfer) => {
                 let mark = match in_force {
@@ -876,13 +938,13 @@ fn attribute_lane(index: usize, lane: &LaneRecords<'_>) -> EvalResult<LaneOutcom
                 };
                 let contracts = signed(transfer.side, transfer.quantity, "transfer", time)?;
                 let units = mul(contracts, m, "transfer size")?;
-                let edge = sub(mark, transfer.price, "transfer edge")?;
-                row.transfer_edge = add(
-                    row.transfer_edge,
-                    mul(units, edge, "transfer edge")?,
+                let edge = add(
+                    transfer.cash,
+                    mul(units, mark, "transfer edge")?,
                     "transfer edge",
                 )?;
-                cash = sub(cash, mul(units, transfer.price, "cash")?, "cash")?;
+                row.transfer_edge = add(row.transfer_edge, edge, "transfer edge")?;
+                cash = add(cash, transfer.cash, "cash")?;
                 position = add(position, contracts, "position")?;
             }
             Event::Settle(settlement) => {
@@ -991,26 +1053,34 @@ pub struct AccountBooks {
     pub net_pnl: Decimal,
 }
 
-/// Attributed minus booked, per lane and for the account.
+/// Residuals against the books, per lane, per role and for the account. Every
+/// residual is attributed minus booked: positive when the attribution reports
+/// more than the books.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
 pub struct Residuals {
     /// Each lane's `(net pnl, final position)` residual.
     pub lanes: Vec<(Decimal, Decimal)>,
+    /// The quoted lanes' net result residual: their attributed sum minus the
+    /// sum of their booked results.
+    pub quoted: Decimal,
+    /// The hedge lanes' net result residual, likewise.
+    pub hedge: Decimal,
     /// The account's net result residual.
     pub net_pnl: Decimal,
 }
 
 impl Residuals {
-    /// The largest absolute net result residual, of a lane or of the account,
-    /// [`MetricId::ReconciliationResidual`]. Position residuals are in contracts
-    /// and are not part of it.
+    /// The largest absolute net result residual, of a lane, a role or the
+    /// account, [`MetricId::ReconciliationResidual`]. Position residuals are in
+    /// contracts and are not part of it.
     #[must_use]
     pub fn largest(&self) -> Decimal {
         self.lanes
             .iter()
             .map(|(net, _)| net.abs())
+            .chain([self.quoted.abs(), self.hedge.abs()])
             .fold(self.net_pnl.abs(), Decimal::max)
     }
 
@@ -1018,6 +1088,8 @@ impl Residuals {
     #[must_use]
     pub fn is_zero(&self) -> bool {
         self.net_pnl.is_zero()
+            && self.quoted.is_zero()
+            && self.hedge.is_zero()
             && self
                 .lanes
                 .iter()
@@ -1026,7 +1098,7 @@ impl Residuals {
 }
 
 impl AccountAttribution {
-    /// Attributed minus booked, per lane and for the account.
+    /// Attributed minus booked, per lane, per role and for the account.
     ///
     /// # Errors
     ///
@@ -1052,8 +1124,29 @@ impl AccountAttribution {
                 ))
             })
             .collect::<EvalResult<Vec<_>>>()?;
+        let booked = |role: LaneRole| {
+            self.lanes
+                .iter()
+                .zip(&books.lanes)
+                .filter(|(lane, _)| lane.role == role)
+                .try_fold(Decimal::ZERO, |sum, (_, b)| {
+                    add(sum, b.net_pnl, "booked role")
+                })
+        };
+        let quoted = sub(
+            self.quoted.attribution.net_pnl,
+            booked(LaneRole::Quoted)?,
+            "residual",
+        )?;
+        let hedge = sub(
+            self.hedge.attribution.net_pnl,
+            booked(LaneRole::Hedge)?,
+            "residual",
+        )?;
         Ok(Residuals {
             lanes,
+            quoted,
+            hedge,
             net_pnl: sub(self.net_pnl, books.net_pnl, "residual")?,
         })
     }
@@ -1094,9 +1187,9 @@ impl AccountAttribution {
     }
 
     /// The account's metrics: its attribution, fills and orders over every lane,
-    /// and the largest reconciliation residual when `books` are given. Fill
-    /// ratios by quantity sum contracts across lanes, so read them per lane
-    /// with [`LaneOutcome::values`] when lanes differ in size.
+    /// and the largest reconciliation residual when `books` are given.
+    /// Quantities are in units of the underlying, so ratios over lanes of
+    /// different multipliers weigh each lane by its size.
     ///
     /// # Errors
     ///
@@ -1149,8 +1242,8 @@ fn order_values(orders: &OrderStats) -> Vec<MetricValue> {
 }
 
 impl LaneOutcome {
-    /// The lane's metrics: its attribution, fills, volume in contracts, and
-    /// orders.
+    /// The lane's metrics: its attribution, fills, volume in units of the
+    /// underlying, and orders.
     #[must_use]
     pub fn values(&self) -> Vec<MetricValue> {
         let a = &self.attribution;
@@ -1207,7 +1300,10 @@ pub struct LaneQualityReport {
 
 /// Measures the fills of one lane at one horizon, against the lane's own marks.
 /// The mark in force before the lane's first mark is its opening price; a
-/// settlement is not a mark.
+/// settlement is not a mark. To measure a fill whose horizon falls at or after
+/// the settlement against the settlement price, pass a [`LaneMark`] at the
+/// settlement instant with that price: a mark at the settlement instant is
+/// admitted, is applied before it, and leaves the attribution unchanged.
 ///
 /// # Errors
 ///

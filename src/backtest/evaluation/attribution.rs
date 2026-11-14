@@ -1186,7 +1186,7 @@ pub struct WindowMetrics {
 
 impl WindowMetrics {
     /// Every metric of the window with its definition, in the order of
-    /// [`MetricId::ALL`], the fill quality ones once per horizon.
+    /// [`MetricId::WINDOW`], the fill quality ones once per horizon.
     ///
     /// # Errors
     ///

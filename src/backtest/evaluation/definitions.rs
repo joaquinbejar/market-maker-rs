@@ -149,8 +149,8 @@ pub enum MetricId {
     MaxDrawdownOnCapital,
     /// Funding received on any lane; negative when paid.
     Funding,
-    /// `Σ s c M (M_f - P)` over position changes that are not fills, such as an
-    /// auto deleveraging close.
+    /// `Σ (X + s c M M_f)` over position changes that are not fills, such as an
+    /// auto deleveraging close, `X` the signed gross cash of the close as given.
     TransferEdge,
     /// Account cash outside every lane, such as an auto deleveraging top up or an
     /// insurance fund draw; received is positive.
@@ -161,10 +161,11 @@ pub enum MetricId {
     Orders,
     /// Orders with at least one fill, liquidation orders left out.
     FilledOrders,
-    /// Size accepted over the orders, in contracts of the lane: base units when
-    /// the multiplier is one.
+    /// Size offered over the orders, in units of the underlying (contracts times
+    /// the multiplier): the size first accepted plus every positive increase of
+    /// the open quantity by an accepted replace.
     AcceptedQuantity,
-    /// Size filled over the orders, in contracts of the lane.
+    /// Size filled over the orders, in units of the underlying.
     FilledQuantity,
     /// [`MetricId::FilledOrders`] over [`MetricId::Orders`].
     FillRatioByCount,

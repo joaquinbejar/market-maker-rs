@@ -172,8 +172,8 @@ fn test_an_auto_deleveraging_close_and_account_flows() {
     let transfers = [LaneTransfer {
         time: 7,
         side: Action::Buy,
-        price: dec!(101),
         quantity: dec!(3),
+        cash: dec!(-303),
     }];
     let flows = [
         AccountFlow {
@@ -239,6 +239,7 @@ fn ordered() -> (Vec<LaneMark>, Vec<LaneFill>, Vec<OrderRecord>) {
     let order = |id, accepted_quantity, accepted_replaces, end_state, liquidation| OrderRecord {
         id,
         accepted_quantity,
+        replace_increase: Decimal::ZERO,
         accepted_replaces,
         end_state,
         liquidation,
@@ -266,12 +267,20 @@ fn test_fill_ratios_by_count_and_by_quantity() {
     // Orders 1 to 4; order 5 is a liquidation.
     assert_eq!(stats.orders, 4);
     assert_eq!(stats.filled_orders, 2);
-    assert_eq!(stats.accepted_quantity, dec!(10));
-    assert_eq!(stats.filled_quantity, dec!(5));
+    // In units of the underlying, multiplier 2: 10 and 5 contracts.
+    assert_eq!(stats.accepted_quantity, dec!(20));
+    assert_eq!(stats.filled_quantity, dec!(10));
     assert_eq!(stats.accepted_replaces, 3);
     assert_eq!(stats.liquidation_orders, 1);
+    // End states of orders 1 to 4, the open one included.
+    assert_eq!(stats.ended_filled, 0);
+    assert_eq!(stats.ended_cancelled, 2);
+    assert_eq!(stats.ended_expired, 1);
+    assert_eq!(stats.ended_open, 1);
+    // Volume: (3 + 2) contracts of 2 units.
+    assert_eq!(account.lanes[0].volume, dec!(10));
     let values = account.lanes[0].values();
-    // 2 / 4 and 5 / 10.
+    // 2 / 4 and 10 / 20.
     assert_eq!(
         value(&values, MetricId::FillRatioByCount),
         Reading::Value(dec!(0.5))
@@ -287,11 +296,11 @@ fn test_fill_ratios_by_count_and_by_quantity() {
     );
     assert_eq!(
         value(&values, MetricId::AcceptedQuantity),
-        Reading::Value(dec!(10))
+        Reading::Value(dec!(20))
     );
     assert_eq!(
         value(&values, MetricId::FilledQuantity),
-        Reading::Value(dec!(5))
+        Reading::Value(dec!(10))
     );
     // No order, no ratio.
     let bare = LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1));
@@ -407,6 +416,9 @@ fn test_many_lanes_total_per_role_and_reconcile_per_lane() {
     ));
     let residuals = account.residuals(&off).unwrap();
     assert_eq!(residuals.lanes[1], (dec!(-0.02), dec!(0)));
+    // Attributed minus booked: the quoted role reports 0.02 less than its books.
+    assert_eq!(residuals.quoted, dec!(-0.02));
+    assert_eq!(residuals.hedge, dec!(0));
     assert_eq!(residuals.largest(), dec!(0.02));
     let values = account.values(Some(&off)).unwrap();
     assert_eq!(
@@ -570,6 +582,7 @@ fn test_records_are_checked() {
     let small = [OrderRecord {
         id: 7,
         accepted_quantity: dec!(1),
+        replace_increase: Decimal::ZERO,
         accepted_replaces: 0,
         end_state: OrderEnd::Filled,
         liquidation: false,
@@ -635,4 +648,257 @@ fn test_lane_contract_reads_the_multiplier_and_refuses_inverse() {
         lane_contract(&inverse),
         Err(EvaluationError::UnsupportedContract { .. })
     ));
+}
+
+#[test]
+fn test_a_transfer_takes_its_cash_as_given() {
+    // A long of 3 at 100, multiplier 1, closed by a transfer that pays 100.01 in
+    // all, not 3 * price; mark 100.5 at 0.
+    let marks = [mark(0, dec!(100.5))];
+    let transfers = [LaneTransfer {
+        time: 1,
+        side: Action::Sell,
+        quantity: dec!(3),
+        cash: dec!(100.01),
+    }];
+    let lane = LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+        .with_opening(Opening {
+            position: dec!(3),
+            price: dec!(100),
+        })
+        .with_marks(&marks)
+        .with_transfers(&transfers);
+    let input = AccountInput::new(ns(0, 10), vec![lane], &[]).unwrap();
+    let account = attribute_account(&input).unwrap();
+    let a = account.lanes[0].attribution;
+    // Edge: 100.01 + (-1) 3 * 1 * 100.5 = 100.01 - 301.5.
+    assert_eq!(a.transfer_edge, dec!(-201.49));
+    // Inventory: 3 (100.5 - 100).
+    assert_eq!(a.inventory_pnl, dec!(1.5));
+    // Directly: cash 100.01, flat, less the opening value 300.
+    assert_eq!(a.net_pnl, dec!(-199.99));
+    assert_eq!(account.lanes[0].final_position, dec!(0));
+
+    // A sell side transfer at a price: short 2 contracts of multiplier 10 at a
+    // mark of 50 for 1001 received, so an edge of 1001 - 2 * 10 * 50.
+    let transfers = [LaneTransfer {
+        time: 1,
+        side: Action::Sell,
+        quantity: dec!(2),
+        cash: dec!(1001),
+    }];
+    let marks = [mark(0, dec!(50)), mark(5, dec!(49))];
+    let lane = LaneRecords::new(LaneRole::Hedge, LaneKind::Linear, dec!(10))
+        .with_marks(&marks)
+        .with_transfers(&transfers);
+    let account =
+        attribute_account(&AccountInput::new(ns(0, 10), vec![lane], &[]).unwrap()).unwrap();
+    let a = account.lanes[0].attribution;
+    assert_eq!(a.transfer_edge, dec!(1));
+    // Inventory: -20 (49 - 50).
+    assert_eq!(a.inventory_pnl, dec!(20));
+    // Directly: 1001 - 20 * 49.
+    assert_eq!(a.net_pnl, dec!(21));
+    assert_eq!(account.lanes[0].final_position, dec!(-2));
+}
+
+#[test]
+fn test_order_quantities_add_up_in_units_across_multipliers() {
+    // Lane A, multiplier 1: an order of 4, filled 4. Lane B, multiplier 100: an
+    // order of 1, filled 0.5 then cancelled.
+    let a_marks = [mark(0, dec!(10))];
+    let mut a_fill = fill(0, Action::Buy, dec!(10), dec!(4));
+    a_fill.order_id = Some(1);
+    let a_fills = [a_fill];
+    let order = |id, accepted_quantity, end_state| OrderRecord {
+        id,
+        accepted_quantity,
+        replace_increase: Decimal::ZERO,
+        accepted_replaces: 0,
+        end_state,
+        liquidation: false,
+    };
+    let a_orders = [order(1, dec!(4), OrderEnd::Filled)];
+    let b_marks = [mark(0, dec!(10))];
+    let mut b_fill = fill(0, Action::Sell, dec!(10), dec!(0.5));
+    b_fill.order_id = Some(1);
+    let b_fills = [b_fill];
+    let b_orders = [order(1, dec!(1), OrderEnd::Cancelled)];
+    let lanes = vec![
+        LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+            .with_marks(&a_marks)
+            .with_fills(&a_fills)
+            .with_orders(&a_orders),
+        LaneRecords::new(LaneRole::Hedge, LaneKind::Linear, dec!(100))
+            .with_marks(&b_marks)
+            .with_fills(&b_fills)
+            .with_orders(&b_orders),
+    ];
+    let account = attribute_account(&AccountInput::new(ns(0, 10), lanes, &[]).unwrap()).unwrap();
+    let all = account.all_lanes.orders;
+    // Offered 4 + 100, filled 4 + 50: a ratio of 54 / 104, not of 4.5 / 5.
+    assert_eq!(all.accepted_quantity, dec!(104));
+    assert_eq!(all.filled_quantity, dec!(54));
+    assert_eq!(all.ended_filled, 1);
+    assert_eq!(all.ended_cancelled, 1);
+    assert_eq!(account.lanes[1].volume, dec!(50));
+    let values = account.values(None).unwrap();
+    assert_eq!(
+        value(&values, MetricId::FillRatioByQuantity),
+        Reading::Value(dec!(54) / dec!(104))
+    );
+}
+
+#[test]
+fn test_a_replace_that_raises_the_open_size_adds_to_the_offer() {
+    // Accepted 10, filled 8, replaced to an open size of 10 (an increase of 8),
+    // filled 10 more: offered 18, filled 18, ended filled.
+    let marks = [mark(0, dec!(10))];
+    let mut first = fill(1, Action::Buy, dec!(10), dec!(8));
+    first.order_id = Some(1);
+    let mut second = fill(3, Action::Buy, dec!(10), dec!(10));
+    second.order_id = Some(1);
+    let fills = [first, second];
+    let record = OrderRecord {
+        id: 1,
+        accepted_quantity: dec!(10),
+        replace_increase: dec!(8),
+        accepted_replaces: 1,
+        end_state: OrderEnd::Filled,
+        liquidation: false,
+    };
+    assert_eq!(record.offered_quantity().unwrap(), dec!(18));
+    let orders = [record];
+    let lane = || {
+        LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+            .with_marks(&marks)
+            .with_fills(&fills)
+    };
+    let input = AccountInput::new(ns(0, 10), vec![lane().with_orders(&orders)], &[]).unwrap();
+    let stats = attribute_account(&input).unwrap().lanes[0].orders;
+    assert_eq!(stats.accepted_quantity, dec!(18));
+    assert_eq!(stats.filled_quantity, dec!(18));
+    assert_eq!(stats.ended_filled, 1);
+    // Without the increase the fills exceed the offer.
+    let short = [OrderRecord {
+        replace_increase: Decimal::ZERO,
+        ..record
+    }];
+    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&short)], &[]).is_err());
+    // Ended filled with 18 of 20 filled is refused.
+    let more = [OrderRecord {
+        replace_increase: dec!(10),
+        ..record
+    }];
+    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&more)], &[]).is_err());
+    // The same order still open is admitted.
+    let open = [OrderRecord {
+        replace_increase: dec!(10),
+        end_state: OrderEnd::Open,
+        ..record
+    }];
+    let input = AccountInput::new(ns(0, 10), vec![lane().with_orders(&open)], &[]).unwrap();
+    let stats = attribute_account(&input).unwrap().lanes[0].orders;
+    assert_eq!(stats.ended_open, 1);
+    assert_eq!(stats.ended_filled, 0);
+}
+
+#[test]
+fn test_settlement_rounding_within_half_a_quantum() {
+    // A long of 1 of multiplier 1, settled at 100.005 and paid 100.00, the cash
+    // rounded to the cent.
+    let marks = [mark(0, dec!(100))];
+    let lane = LaneRecords::new(LaneRole::Quoted, LaneKind::Option, dec!(1))
+        .with_opening(Opening {
+            position: dec!(1),
+            price: dec!(100),
+        })
+        .with_marks(&marks)
+        .with_settlement(Settlement {
+            time: 5,
+            price: dec!(100.005),
+            cash: dec!(100.00),
+        });
+    let account =
+        attribute_account(&AccountInput::new(ns(0, 10), vec![lane], &[]).unwrap()).unwrap();
+    let a = account.lanes[0].attribution;
+    assert_eq!(a.inventory_pnl, dec!(0.005));
+    assert_eq!(a.settlement_rounding, dec!(-0.005));
+    assert_eq!(a.net_pnl, dec!(0));
+}
+
+#[test]
+fn test_a_future_settles_at_expiry() {
+    // A short of 2 futures of multiplier 5, sold at 200.5 under a mark of 200,
+    // mark 198 at 10, settled at 197: the account pays 1970 for the short.
+    let marks = [mark(0, dec!(200)), mark(10, dec!(198))];
+    let fills = [fill(0, Action::Sell, dec!(200.5), dec!(2))];
+    let lane = LaneRecords::new(LaneRole::Hedge, LaneKind::Linear, dec!(5))
+        .with_marks(&marks)
+        .with_fills(&fills)
+        .with_settlement(Settlement {
+            time: 20,
+            price: dec!(197),
+            cash: dec!(-1970),
+        });
+    let account =
+        attribute_account(&AccountInput::new(ns(0, 100), vec![lane], &[]).unwrap()).unwrap();
+    let outcome = account.lanes[0];
+    let a = outcome.attribution;
+    // -2 * 5 (200 - 200.5).
+    assert_eq!(a.spread_capture, dec!(5));
+    // -10 (198 - 200) - 10 (197 - 198).
+    assert_eq!(a.inventory_pnl, dec!(30));
+    assert_eq!(a.settlement_rounding, dec!(0));
+    // Directly: 2005 - 1970.
+    assert_eq!(a.net_pnl, dec!(35));
+    assert_eq!(outcome.final_position, dec!(0));
+    assert!(outcome.settled);
+    // A mark at the settlement instant serves as the horizon mark.
+    let marks = [mark(0, dec!(200)), mark(10, dec!(198)), mark(20, dec!(197))];
+    let lane = LaneRecords::new(LaneRole::Hedge, LaneKind::Linear, dec!(5))
+        .with_marks(&marks)
+        .with_fills(&fills)
+        .with_settlement(Settlement {
+            time: 20,
+            price: dec!(197),
+            cash: dec!(-1970),
+        });
+    let input = AccountInput::new(ns(0, 100), vec![lane], &[]).unwrap();
+    assert_eq!(attribute_account(&input).unwrap().lanes[0].attribution, a);
+    let spec = LaneQualitySpec {
+        horizon: 20,
+        max_mark_delay: 0,
+    };
+    let q = lane_fill_quality(&input, 0, spec).unwrap();
+    // Sell markout: -(197 - 200.5).
+    assert_eq!(q.all.signed_markout, Some(dec!(3.5)));
+}
+
+#[test]
+fn test_a_base_fee_with_a_multiplier() {
+    // Multiplier 10: a buy of 2 at 49 under a mark of 50, fee 0.1 contracts;
+    // mark 51 later.
+    let marks = [mark(0, dec!(50)), mark(5, dec!(51))];
+    let mut buy = fill(0, Action::Buy, dec!(49), dec!(2));
+    buy.base_fee = dec!(0.1);
+    let fills = [buy];
+    let lane = LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(10))
+        .with_marks(&marks)
+        .with_fills(&fills);
+    let account =
+        attribute_account(&AccountInput::new(ns(0, 10), vec![lane], &[]).unwrap()).unwrap();
+    let outcome = account.lanes[0];
+    let a = outcome.attribution;
+    // 2 * 10 (50 - 49).
+    assert_eq!(a.spread_capture, dec!(20));
+    // 0.1 * 10 * 50.
+    assert_eq!(a.base_fees, dec!(50));
+    // 1.9 * 10 (51 - 50).
+    assert_eq!(a.inventory_pnl, dec!(19));
+    // Directly: -980 + 1.9 * 10 * 51 = -980 + 969.
+    assert_eq!(a.net_pnl, dec!(-11));
+    assert_eq!(outcome.final_position, dec!(1.9));
+    // Volume gross of the fee: 2 * 10.
+    assert_eq!(outcome.volume, dec!(20));
 }
