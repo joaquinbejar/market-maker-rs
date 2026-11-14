@@ -147,11 +147,38 @@ pub enum MetricId {
     NetReturnOnCapital,
     /// [`MetricId::MaxDrawdown`] over the capital.
     MaxDrawdownOnCapital,
+    /// Funding received on any lane; negative when paid.
+    Funding,
+    /// `Σ (X + s c M M_f)` over position changes that are not fills, such as an
+    /// auto deleveraging close, `X` the signed gross cash of the close as given.
+    TransferEdge,
+    /// Account cash outside every lane, such as an auto deleveraging top up or an
+    /// insurance fund draw; received is positive.
+    ExternalFlows,
+    /// Settlement cash minus `p M S`, the exact value of the settled position.
+    SettlementRounding,
+    /// Orders, liquidation orders left out.
+    Orders,
+    /// Orders with at least one fill, liquidation orders left out.
+    FilledOrders,
+    /// Size offered over the orders, in units of the underlying (contracts times
+    /// the multiplier): the size first accepted plus every positive increase of
+    /// the open quantity by an accepted replace.
+    AcceptedQuantity,
+    /// Size filled over the orders, in units of the underlying.
+    FilledQuantity,
+    /// [`MetricId::FilledOrders`] over [`MetricId::Orders`].
+    FillRatioByCount,
+    /// [`MetricId::FilledQuantity`] over [`MetricId::AcceptedQuantity`].
+    FillRatioByQuantity,
+    /// Largest absolute difference of an attributed net result, of a lane, of a
+    /// role or of the account, to the books.
+    ReconciliationResidual,
 }
 
 impl MetricId {
     /// Every metric.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 28] = [
         Self::NetPnl,
         Self::SpreadCapture,
         Self::InventoryPnl,
@@ -169,6 +196,54 @@ impl MetricId {
         Self::MaxDrawdown,
         Self::NetReturnOnCapital,
         Self::MaxDrawdownOnCapital,
+        Self::Funding,
+        Self::TransferEdge,
+        Self::ExternalFlows,
+        Self::SettlementRounding,
+        Self::Orders,
+        Self::FilledOrders,
+        Self::AcceptedQuantity,
+        Self::FilledQuantity,
+        Self::FillRatioByCount,
+        Self::FillRatioByQuantity,
+        Self::ReconciliationResidual,
+    ];
+
+    /// The metrics [`WindowMetrics::values`](super::WindowMetrics::values) reports, in order.
+    pub const WINDOW: [Self; 17] = [
+        Self::NetPnl,
+        Self::SpreadCapture,
+        Self::InventoryPnl,
+        Self::QuoteFees,
+        Self::BaseFees,
+        Self::HedgeCosts,
+        Self::SignedMarkout,
+        Self::RealizedSpread,
+        Self::EffectiveSpread,
+        Self::PriceImpact,
+        Self::Fills,
+        Self::Volume,
+        Self::MeanAbsInventory,
+        Self::MaxAbsInventory,
+        Self::MaxDrawdown,
+        Self::NetReturnOnCapital,
+        Self::MaxDrawdownOnCapital,
+    ];
+
+    /// The metrics only an account of many lanes reports, in order: [`AccountAttribution::values`](super::AccountAttribution::values) and
+    /// [`LaneOutcome::values`](super::LaneOutcome::values).
+    pub const ACCOUNT: [Self; 11] = [
+        Self::Funding,
+        Self::TransferEdge,
+        Self::ExternalFlows,
+        Self::SettlementRounding,
+        Self::Orders,
+        Self::FilledOrders,
+        Self::AcceptedQuantity,
+        Self::FilledQuantity,
+        Self::FillRatioByCount,
+        Self::FillRatioByQuantity,
+        Self::ReconciliationResidual,
     ];
 
     /// The declared meaning of this metric.
@@ -233,6 +308,22 @@ impl MetricId {
                 C::DeclaredCapital,
                 A::Quotient,
             ),
+            Self::Funding | Self::ExternalFlows | Self::SettlementRounding => {
+                (U::Quote, D::PositiveIsGain, H::Window, C::None, A::Sum)
+            }
+            Self::TransferEdge => (U::Quote, D::PositiveIsGain, H::AtFill, C::None, A::Sum),
+            Self::Orders | Self::FilledOrders => {
+                (U::Count, D::Magnitude, H::Window, C::None, A::Count)
+            }
+            Self::AcceptedQuantity | Self::FilledQuantity => {
+                (U::Base, D::Magnitude, H::Window, C::None, A::Sum)
+            }
+            Self::FillRatioByCount | Self::FillRatioByQuantity => {
+                (U::Ratio, D::Magnitude, H::Window, C::None, A::Quotient)
+            }
+            Self::ReconciliationResidual => {
+                (U::Quote, D::MagnitudeIsCost, H::Window, C::None, A::Maximum)
+            }
         };
         MetricDefinition {
             unit,

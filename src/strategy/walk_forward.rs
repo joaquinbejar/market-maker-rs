@@ -150,6 +150,11 @@ const RATE_ZERO_BELOW: f64 = 1e-28;
 const K_BRACKET_LIMIT: f64 = 1e15;
 
 /// Half-open time interval `[start_ms, end_ms)`.
+///
+/// A record at `t` is inside when `start_ms <= t < end_ms`. A caller with a
+/// closed interval `[a, b]` passes `end_ms = b + 1`. For instants in another
+/// unit, such as nanoseconds, see
+/// [`evaluation::Window`](crate::backtest::evaluation::Window).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TimeWindow {
