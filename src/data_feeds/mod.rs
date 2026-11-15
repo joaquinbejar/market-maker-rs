@@ -6,6 +6,7 @@
 //! - Trade feed processing
 //! - Implied volatility surface updates
 //! - Mock data feed for testing
+//! - Live exchange trades through `fin-stream` (feature `live-feeds`)
 //!
 //! # Example
 //!
@@ -25,6 +26,8 @@
 //! ```
 
 mod feed;
+#[cfg(feature = "live-feeds")]
+pub mod live;
 mod mock;
 mod types;
 

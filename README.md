@@ -239,6 +239,8 @@ crate's own serialization support.
   accountant (`backtest::MarginLedgerAccountant`) and its risk gate as the
   pretrade policy (`backtest::MarginAccount`)
 - `data-feeds`: Enable real-time market data feed abstractions
+- `live-feeds`: Live Binance, Coinbase, Alpaca and Polygon trades mapped into
+  `Trade` and `PriceUpdate` through `fin-stream` (`data_feeds::live`, includes `data-feeds`)
 - `l3`: Enable order by order (L3) book reconstruction: snapshot and
   sequenced messages, fail closed on gaps and inconsistencies, a quality
   manifest, and volume ahead under declared hypotheses (no dependencies)

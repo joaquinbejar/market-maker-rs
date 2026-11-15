@@ -8,6 +8,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `live-feeds` feature: `data_feeds::live` maps `fin-stream`'s normalized Binance, Coinbase,
+  Alpaca and Polygon trades into `Trade` and `PriceUpdate` (`normalize_trade`, `From`), and
+  `ReconnectConfig::reconnect_policy` gives the matching `fin-stream` reconnect policy.
 - Accounts of many lanes in `backtest::evaluation` (#327): `AccountInput` holds any number of
   quoted or hedge lanes in a `Window` with a declared `TimeUnit` down to nanoseconds, and
   `attribute_account` attributes each lane against its own marks with a contract multiplier,
