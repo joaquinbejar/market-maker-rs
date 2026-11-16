@@ -57,7 +57,7 @@ option-chain-orderbook = { version = "0.15", optional = true }
 axum = { version = "0.8", optional = true }
 utoipa = { version = "6.0", features = ["axum_extras"], optional = true }
 tower-http = { version = "0.7", features = ["cors"], optional = true }
-fin-stream = { version = "2.13", default-features = false, optional = true }
+fin-stream = { version = "2.14", default-features = false, features = ["net"], optional = true }
 
 [dev-dependencies]
 # Plans the hedges of the kernel's replay gate (tests/support/kernel_gate.rs).
