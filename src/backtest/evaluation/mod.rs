@@ -126,8 +126,9 @@ mod experiment;
 pub use account::{
     AccountAttribution, AccountBooks, AccountFlow, AccountInput, FlowKind, LaneAttribution,
     LaneFill, LaneFunding, LaneKind, LaneMark, LaneOutcome, LaneQualityReport, LaneQualitySpec,
-    LaneRecords, LaneRole, LaneTotals, LaneTransfer, Liquidity, Opening, OrderEnd, OrderRecord,
-    OrderStats, Residuals, Settlement, TimeUnit, Window, attribute_account, lane_fill_quality,
+    LaneRecords, LaneRole, LaneSequence, LaneTotals, LaneTransfer, Liquidity, Opening, OrderEnd,
+    OrderRecord, OrderStats, Residuals, Settlement, TimeUnit, Window, attribute_account,
+    lane_fill_quality,
 };
 #[cfg(feature = "instruments")]
 pub use account::{LaneContract, lane_contract};

@@ -12,9 +12,9 @@ use market_maker_rs::Decimal;
 use market_maker_rs::backtest::evaluation::{
     AccountBooks, AccountFlow, AccountInput, EvaluationError, EvaluationInput, ExecutedFill,
     FlowKind, FundingPayment, LaneFill, LaneFunding, LaneKind, LaneMark, LaneQualitySpec,
-    LaneRecords, LaneRole, LaneTransfer, LedgerTotals, Liquidity, Mark, MetricId, Opening,
-    OrderEnd, OrderRecord, Reading, Settlement, TimeUnit, Window, attribute, attribute_account,
-    lane_fill_quality,
+    LaneRecords, LaneRole, LaneSequence, LaneTransfer, LedgerTotals, Liquidity, Mark, MetricId,
+    Opening, OrderEnd, OrderRecord, Reading, Settlement, TimeUnit, Window, attribute,
+    attribute_account, lane_fill_quality,
 };
 use market_maker_rs::dec;
 use market_maker_rs::execution::Action;
@@ -828,12 +828,20 @@ fn test_a_replace_that_raises_the_open_size_adds_to_the_offer() {
         ..record
     }];
     assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&short)], &[]).is_err());
-    // Ended filled with 18 of 20 filled is refused.
+    // Ended filled with 18 of 20 filled is admitted for a replaced order, as a
+    // replace may have lowered the open size; without a replace it is refused.
     let more = [OrderRecord {
         replace_increase: dec!(10),
         ..record
     }];
-    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&more)], &[]).is_err());
+    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&more)], &[]).is_ok());
+    let unreplaced = [OrderRecord {
+        accepted_quantity: dec!(20),
+        replace_increase: Decimal::ZERO,
+        accepted_replaces: 0,
+        ..record
+    }];
+    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&unreplaced)], &[]).is_err());
     // The same order still open is admitted.
     let open = [OrderRecord {
         replace_increase: dec!(10),
@@ -985,4 +993,143 @@ fn test_an_order_accepted_before_the_window_records_its_open_size_at_the_start()
     assert_eq!(stats.accepted_quantity, dec!(6));
     assert_eq!(stats.filled_quantity, dec!(6));
     assert_eq!(stats.ended_filled, 1);
+}
+
+#[test]
+fn test_an_order_reduced_by_a_replace_then_filled_ends_filled() {
+    // Accepted 5, replaced down to 2 (no increase), filled 2: offered 5,
+    // filled 2, ended filled. Fill ratio by quantity 2 / 5.
+    let marks = [mark(0, dec!(10))];
+    let mut only = fill(2, Action::Buy, dec!(10), dec!(2));
+    only.order_id = Some(7);
+    let fills = [only];
+    let record = OrderRecord {
+        id: 7,
+        accepted_quantity: dec!(5),
+        replace_increase: Decimal::ZERO,
+        accepted_replaces: 1,
+        end_state: OrderEnd::Filled,
+        liquidation: false,
+    };
+    let orders = [record];
+    let lane = |orders| {
+        LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+            .with_marks(&marks)
+            .with_fills(&fills)
+            .with_orders(orders)
+    };
+    let input = AccountInput::new(ns(0, 10), vec![lane(&orders)], &[]).unwrap();
+    let stats = attribute_account(&input).unwrap().lanes[0].orders;
+    assert_eq!(stats.accepted_quantity, dec!(5));
+    assert_eq!(stats.filled_quantity, dec!(2));
+    assert_eq!(stats.ended_filled, 1);
+    // The same record with no accepted replace is refused.
+    let plain = [OrderRecord {
+        accepted_replaces: 0,
+        ..record
+    }];
+    assert!(matches!(
+        AccountInput::new(ns(0, 10), vec![lane(&plain)], &[]),
+        Err(EvaluationError::InvalidInput { .. })
+    ));
+}
+
+#[test]
+fn test_a_sequence_orders_a_fill_before_a_mark_of_its_instant() {
+    // Marks 10 at 0 and 12 at 5; a buy of 1 at 11 at 5. By default the mark
+    // at 5 comes first: spread capture 12 - 11 = 1, inventory 0. Sequenced
+    // fill (1) before mark (2): the fill sees 10, spread capture 10 - 11 = -1,
+    // and the move to 12 on a position of 1 earns inventory 2. Net 1 either way.
+    // A mark of 12 at 7 measures the fill after a horizon of 1; it moves
+    // nothing. Price impact is 12 - 12 = 0 by default and 12 - 10 = 2 when
+    // sequenced.
+    let marks = [mark(0, dec!(10)), mark(5, dec!(12)), mark(7, dec!(12))];
+    let fills = [fill(5, Action::Buy, dec!(11), dec!(1))];
+    let base = || {
+        LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+            .with_marks(&marks)
+            .with_fills(&fills)
+    };
+    let default = AccountInput::new(ns(0, 10), vec![base()], &[]).unwrap();
+    let row = attribute_account(&default).unwrap().lanes[0].attribution;
+    assert_eq!(row.spread_capture, dec!(1));
+    assert_eq!(row.inventory_pnl, dec!(0));
+    assert_eq!(row.net_pnl, dec!(1));
+    let spec = LaneQualitySpec {
+        horizon: 1,
+        max_mark_delay: 10,
+    };
+    let quality = lane_fill_quality(&default, 0, spec).unwrap();
+
+    let sequenced = AccountInput::new(
+        ns(0, 10),
+        vec![base().with_sequence(LaneSequence::new(&[0, 2, 0], &[1], &[]))],
+        &[],
+    )
+    .unwrap();
+    let row = attribute_account(&sequenced).unwrap().lanes[0].attribution;
+    assert_eq!(row.spread_capture, dec!(-1));
+    assert_eq!(row.inventory_pnl, dec!(2));
+    assert_eq!(row.net_pnl, dec!(1));
+    let seq_quality = lane_fill_quality(&sequenced, 0, spec).unwrap();
+    assert_eq!(quality.all.measured, 1);
+    assert_eq!(seq_quality.all.measured, 1);
+    assert_ne!(quality.all.price_impact, seq_quality.all.price_impact);
+
+    // Sequence numbers that tie keep the default order.
+    let tied = AccountInput::new(
+        ns(0, 10),
+        vec![base().with_sequence(LaneSequence::new(&[0, 1, 0], &[1], &[]))],
+        &[],
+    )
+    .unwrap();
+    let row = attribute_account(&tied).unwrap().lanes[0].attribution;
+    assert_eq!(row.spread_capture, dec!(1));
+
+    // One number per record is required.
+    assert!(matches!(
+        AccountInput::new(
+            ns(0, 10),
+            vec![base().with_sequence(LaneSequence::new(&[0], &[1], &[]))],
+            &[],
+        ),
+        Err(EvaluationError::InvalidInput { .. })
+    ));
+}
+
+#[test]
+fn test_a_sequence_orders_a_transfer_before_a_mark_of_its_instant() {
+    // Long 1 from the opening at 10; marks 12 at 5; a transfer sells 1 at 5
+    // for cash 11. Default: edge against 12 is 11 - 12 = -1, inventory 2.
+    // Sequenced before the mark: edge against 10 is 1, inventory 0.
+    let marks = [mark(5, dec!(12))];
+    let transfers = [LaneTransfer {
+        time: 5,
+        side: Action::Sell,
+        quantity: dec!(1),
+        cash: dec!(11),
+    }];
+    let base = || {
+        LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+            .with_opening(Opening {
+                position: dec!(1),
+                price: dec!(10),
+            })
+            .with_marks(&marks)
+            .with_transfers(&transfers)
+    };
+    let default = AccountInput::new(ns(0, 10), vec![base()], &[]).unwrap();
+    let row = attribute_account(&default).unwrap().lanes[0].attribution;
+    assert_eq!(row.transfer_edge, dec!(-1));
+    assert_eq!(row.inventory_pnl, dec!(2));
+    let sequenced = AccountInput::new(
+        ns(0, 10),
+        vec![base().with_sequence(LaneSequence::new(&[2], &[], &[1]))],
+        &[],
+    )
+    .unwrap();
+    let row = attribute_account(&sequenced).unwrap().lanes[0].attribution;
+    assert_eq!(row.transfer_edge, dec!(1));
+    assert_eq!(row.inventory_pnl, dec!(0));
+    assert_eq!(row.net_pnl, dec!(1));
 }

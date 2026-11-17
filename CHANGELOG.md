@@ -6,6 +6,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-17
+
+### Added
+
+- `backtest::evaluation::LaneSequence` and `LaneRecords::with_sequence`: an
+  optional source sequence number per mark, fill and transfer of a lane, used
+  as the tie break after the time. A fill or transfer numbered before a mark
+  of its instant is attributed, and its fill quality measured, against the
+  mark in force before that mark. Without a sequence the order is unchanged:
+  at one instant the marks come first (#333).
+
+### Fixed
+
+- `backtest::evaluation`: an order with an accepted replace that ended
+  `OrderEnd::Filled` with fewer fills than its offered quantity is admitted,
+  since a replace that lowers the open quantity withdraws contracts without
+  lowering the offer. An order accepted for 5, replaced down to 2 and filled
+  for 2 is no longer refused. Orders with no accepted replace still have to be
+  filled for exactly their offered quantity to end filled (#332).
+
 ## [0.8.0] - 2026-11-15
 
 ### Added
