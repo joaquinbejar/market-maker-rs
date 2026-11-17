@@ -278,29 +278,40 @@ pub enum OrderEnd {
 /// An order the venue accepted on a lane.
 ///
 /// Its offered quantity is [`OrderRecord::offered_quantity`]: the size first
-/// accepted plus every positive increase of the open quantity by an accepted
-/// replace. An order accepted for 10, filled for 8 and replaced to an open size
-/// of 10 has offered 18. Its fills never exceed it, and an order that ended
-/// [`OrderEnd::Filled`] was filled for exactly it, and an order filled for
-/// exactly it ended [`OrderEnd::Filled`].
+/// accepted plus every increase of the open quantity by an accepted replace.
+/// An order accepted for 10, filled for 8 and replaced to an open size of 10
+/// has offered 18. A replace that lowers the open quantity withdraws contracts
+/// without lowering the offer; the sum of those decreases is
+/// [`OrderRecord::replace_decrease`]. The order can be filled for at most
+/// [`OrderRecord::fillable_quantity`], the offer less the decreases; it ended
+/// [`OrderEnd::Filled`] if and only if it was filled for exactly that. An
+/// order accepted for 5, replaced down to 2 and filled for 2 has offered 5,
+/// withdrawn 3, filled 2, and ended filled.
 ///
 /// For an order accepted before the window, `accepted_quantity` is its open
 /// quantity at the window start, since fills before the window cannot be
 /// recorded. An order accepted before the window, open for 6 at the start and
 /// filled for 6 inside it, is recorded with an accepted quantity of 6.
+///
+/// Build it with [`OrderRecord::new`] and the `with_` methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub struct OrderRecord {
     /// Identifier, unique within the lane.
     pub id: u64,
     /// Contracts of the order when the venue accepted it, or its open quantity
     /// at the window start for an order accepted before the window. Positive.
     pub accepted_quantity: Decimal,
-    /// The sum of every positive increase of the open quantity by an accepted
-    /// replace, in contracts. Never negative; a replace that lowers the open
-    /// quantity adds nothing.
+    /// The sum of every increase of the open quantity by an accepted replace,
+    /// in contracts. Never negative.
     pub replace_increase: Decimal,
-    /// Replaces the venue accepted. Positive when `replace_increase` is.
+    /// The sum of every decrease of the open quantity by an accepted replace,
+    /// in contracts. Never negative; it does not lower the offer.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub replace_decrease: Decimal,
+    /// Replaces the venue accepted. Positive when `replace_increase` or
+    /// `replace_decrease` is.
     pub accepted_replaces: u64,
     /// How it ended.
     pub end_state: OrderEnd,
@@ -309,6 +320,50 @@ pub struct OrderRecord {
 }
 
 impl OrderRecord {
+    /// An order accepted for `accepted_quantity` that ended in `end_state`,
+    /// never replaced and not a liquidation.
+    #[must_use]
+    pub fn new(id: u64, accepted_quantity: Decimal, end_state: OrderEnd) -> Self {
+        Self {
+            id,
+            accepted_quantity,
+            replace_increase: Decimal::ZERO,
+            replace_decrease: Decimal::ZERO,
+            accepted_replaces: 0,
+            end_state,
+            liquidation: false,
+        }
+    }
+
+    /// With `accepted_replaces` accepted replaces that raised the open
+    /// quantity by `increase` and lowered it by `decrease` in all.
+    #[must_use]
+    pub fn with_replaces(
+        mut self,
+        accepted_replaces: u64,
+        increase: Decimal,
+        decrease: Decimal,
+    ) -> Self {
+        self.accepted_replaces = accepted_replaces;
+        self.replace_increase = increase;
+        self.replace_decrease = decrease;
+        self
+    }
+
+    /// With the end state.
+    #[must_use]
+    pub fn with_end_state(mut self, end_state: OrderEnd) -> Self {
+        self.end_state = end_state;
+        self
+    }
+
+    /// As a liquidation order, or not.
+    #[must_use]
+    pub fn with_liquidation(mut self, liquidation: bool) -> Self {
+        self.liquidation = liquidation;
+        self
+    }
+
     /// Contracts offered: `accepted_quantity + replace_increase`.
     ///
     /// # Errors
@@ -319,6 +374,21 @@ impl OrderRecord {
             self.accepted_quantity,
             self.replace_increase,
             "offered quantity",
+        )
+    }
+
+    /// Contracts the order could be filled for:
+    /// `offered_quantity - replace_decrease`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationError::Inexact`] if the sum or difference would
+    /// round.
+    pub fn fillable_quantity(&self) -> EvalResult<Decimal> {
+        sub(
+            self.offered_quantity()?,
+            self.replace_decrease,
+            "fillable quantity",
         )
     }
 }
@@ -347,6 +417,43 @@ pub struct LaneRecords<'a> {
     pub settlement: Option<Settlement>,
     /// Orders.
     pub orders: &'a [OrderRecord],
+    /// The source order of the marks, fills and transfers, used to break ties
+    /// at one instant; when `None`, the marks of an instant come first.
+    pub sequence: Option<LaneSequence<'a>>,
+}
+
+/// Source sequence numbers of a lane's marks, fills and transfers, one per
+/// record and in the same order as [`LaneRecords::marks`],
+/// [`LaneRecords::fills`] and [`LaneRecords::transfers`].
+///
+/// At one instant the records are applied by ascending sequence number, so a
+/// fill numbered before a mark of its instant is valued at the mark in force
+/// before that mark. Records of one instant that share a number keep the
+/// default order: marks, then fills, then transfers. The settlement is always
+/// last at its instant. Numbers need not be contiguous nor unique across
+/// instants, but the marks of one instant, which are given in their applied
+/// order, must have non decreasing numbers.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct LaneSequence<'a> {
+    /// One number per mark.
+    pub marks: &'a [u64],
+    /// One number per fill.
+    pub fills: &'a [u64],
+    /// One number per transfer.
+    pub transfers: &'a [u64],
+}
+
+impl<'a> LaneSequence<'a> {
+    /// Sequence numbers of the marks, fills and transfers.
+    #[must_use]
+    pub fn new(marks: &'a [u64], fills: &'a [u64], transfers: &'a [u64]) -> Self {
+        Self {
+            marks,
+            fills,
+            transfers,
+        }
+    }
 }
 
 impl<'a> LaneRecords<'a> {
@@ -364,7 +471,37 @@ impl<'a> LaneRecords<'a> {
             funding: &[],
             settlement: None,
             orders: &[],
+            sequence: None,
         }
+    }
+
+    /// With the source order of the marks, fills and transfers within one
+    /// instant; see [`LaneSequence`].
+    #[must_use]
+    pub fn with_sequence(mut self, sequence: LaneSequence<'a>) -> Self {
+        self.sequence = Some(sequence);
+        self
+    }
+
+    /// The sequence number of mark `i`, zero without a sequence.
+    fn mark_sequence(&self, i: usize) -> u64 {
+        self.sequence
+            .and_then(|s| s.marks.get(i).copied())
+            .unwrap_or(0)
+    }
+
+    /// The sequence number of fill `i`, zero without a sequence.
+    fn fill_sequence(&self, i: usize) -> u64 {
+        self.sequence
+            .and_then(|s| s.fills.get(i).copied())
+            .unwrap_or(0)
+    }
+
+    /// The sequence number of transfer `i`, zero without a sequence.
+    fn transfer_sequence(&self, i: usize) -> u64 {
+        self.sequence
+            .and_then(|s| s.transfers.get(i).copied())
+            .unwrap_or(0)
     }
 
     /// With an opening position.
@@ -476,6 +613,26 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
         "funding",
         lane.funding.iter().map(|f| f.time),
     )?;
+    if let Some(sequence) = lane.sequence
+        && (sequence.marks.len() != lane.marks.len()
+            || sequence.fills.len() != lane.fills.len()
+            || sequence.transfers.len() != lane.transfers.len())
+    {
+        return refuse("the sequence needs one number per mark, fill and transfer".to_string());
+    }
+    if let Some(sequence) = lane.sequence
+        && let Some(mark) = lane
+            .marks
+            .iter()
+            .zip(sequence.marks)
+            .zip(lane.marks.iter().zip(sequence.marks).skip(1))
+            .find_map(|((before, b), (mark, n))| {
+                (mark.time == before.time && n < b).then_some(mark)
+            })
+    {
+        let t = mark.time;
+        return refuse(format!("the sequence numbers of the marks at {t} decrease"));
+    }
     if let Some(mark) = lane.marks.iter().find(|m| m.price < Decimal::ZERO) {
         return refuse(format!("mark at {} is negative", mark.time));
     }
@@ -530,15 +687,26 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
                 order.id
             ));
         }
-        if order.replace_increase > Decimal::ZERO && order.accepted_replaces == 0 {
+        if order.replace_decrease < Decimal::ZERO {
             return refuse(format!(
-                "order {} has a replace increase but no accepted replace",
+                "order {} has a negative replace decrease",
                 order.id
             ));
         }
-        let offered = order.offered_quantity()?;
+        if (order.replace_increase > Decimal::ZERO || order.replace_decrease > Decimal::ZERO)
+            && order.accepted_replaces == 0
+        {
+            return refuse(format!(
+                "order {} has a replace increase or decrease but no accepted replace",
+                order.id
+            ));
+        }
+        let fillable = order.fillable_quantity()?;
+        if fillable < Decimal::ZERO {
+            return refuse(format!("order {} withdraws more than it offered", order.id));
+        }
         if ids
-            .insert(order.id, (offered, Decimal::ZERO, order.end_state))
+            .insert(order.id, (fillable, Decimal::ZERO, order.end_state))
             .is_some()
         {
             return refuse(format!("order {} is recorded twice", order.id));
@@ -546,23 +714,25 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
     }
     for fill in lane.fills {
         let Some(id) = fill.order_id else { continue };
-        let Some((offered, filled, _)) = ids.get_mut(&id) else {
+        let Some((fillable, filled, _)) = ids.get_mut(&id) else {
             return refuse(format!("fill at {} names unknown order {id}", fill.time));
         };
         *filled = add(*filled, fill.quantity, "order fills")?;
-        if *filled > *offered {
-            return refuse(format!("order {id} is filled beyond its offered size"));
-        }
-    }
-    for (id, (offered, filled, end)) in &ids {
-        if *end == OrderEnd::Filled && filled != offered {
+        if *filled > *fillable {
             return refuse(format!(
-                "order {id} ended filled with {filled} of {offered} contracts filled"
+                "order {id} is filled beyond its offered size less its replace decreases"
             ));
         }
-        if *end != OrderEnd::Filled && filled == offered {
+    }
+    for (id, (fillable, filled, end)) in &ids {
+        if *end == OrderEnd::Filled && filled != fillable {
             return refuse(format!(
-                "order {id} is filled for its offered size but did not end filled"
+                "order {id} ended filled with {filled} of {fillable} fillable contracts filled"
+            ));
+        }
+        if *end != OrderEnd::Filled && filled == fillable {
+            return refuse(format!(
+                "order {id} is filled for its fillable size but did not end filled"
             ));
         }
     }
@@ -875,27 +1045,37 @@ enum Event<'a> {
 }
 
 /// The lane's marks, fills, transfers and settlement, by time; at one instant
-/// the marks first, in the order given, then the fills, the transfers and the
-/// settlement.
+/// by the [`LaneSequence`] if any, then the marks first, in the order given,
+/// then the fills, the transfers and the settlement, which is always last.
 fn events<'a>(lane: &'a LaneRecords<'a>) -> Vec<(u64, u8, Event<'a>)> {
-    let mut events: Vec<(u64, u8, Event<'a>)> = lane
+    let mut events: Vec<(u64, u64, u8, Event<'a>)> = lane
         .marks
         .iter()
-        .map(|m| (m.time, 0, Event::Mark(m)))
-        .chain(lane.fills.iter().map(|f| (f.time, 1, Event::Fill(f))))
+        .enumerate()
+        .map(|(i, m)| (m.time, lane.mark_sequence(i), 0, Event::Mark(m)))
+        .chain(
+            lane.fills
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.time, lane.fill_sequence(i), 1, Event::Fill(f))),
+        )
         .chain(
             lane.transfers
                 .iter()
-                .map(|t| (t.time, 2, Event::Transfer(t))),
+                .enumerate()
+                .map(|(i, t)| (t.time, lane.transfer_sequence(i), 2, Event::Transfer(t))),
         )
         .chain(
             lane.settlement
                 .iter()
-                .map(|s| (s.time, 3, Event::Settle(s))),
+                .map(|s| (s.time, u64::MAX, 3, Event::Settle(s))),
         )
         .collect();
-    events.sort_by_key(|(time, rank, _)| (*time, *rank));
+    events.sort_by_key(|(time, sequence, rank, _)| (*time, *sequence, *rank));
     events
+        .into_iter()
+        .map(|(time, _, rank, event)| (time, rank, event))
+        .collect()
 }
 
 fn attribute_lane(index: usize, lane: &LaneRecords<'_>) -> EvalResult<LaneOutcome> {
@@ -1323,7 +1503,9 @@ pub struct LaneQualityReport {
 /// admitted and applied before the settlement. It measures a fill whose horizon
 /// falls at the settlement, or before it within `max_mark_delay`; a later
 /// horizon stays unmeasured. It leaves the net unchanged, and the split too
-/// unless a fill or transfer shares the settlement instant.
+/// unless a fill or transfer shares the settlement instant. The mark in force
+/// at a fill is the one the attribution applies last before it, so a
+/// [`LaneSequence`] decides it at a shared instant.
 ///
 /// # Errors
 ///
@@ -1346,7 +1528,7 @@ pub fn lane_fill_quality(
     let opening = records.opening.map(|o| o.price);
     let mut sums: [QualitySums; 5] = Default::default();
     let mut flagged = 0_u64;
-    for fill in records.fills {
+    for (index, fill) in records.fills.iter().enumerate() {
         if fill.excluded_from_quality {
             flagged = flagged.saturating_add(1);
             continue;
@@ -1358,7 +1540,22 @@ pub fn lane_fill_quality(
         let Some(latest) = due.checked_add(spec.max_mark_delay) else {
             return invalid(format!("mark delay overflows at the fill at {t}"));
         };
-        let in_force = marks.partition_point(|m| m.time <= t);
+        let sequence = records.fill_sequence(index);
+        // The mark in force: the last applied before the fill, as `events`
+        // orders them. The marks of one instant have non decreasing sequence
+        // numbers, so those at `t` numbered at most the fill's come first.
+        let start = marks.partition_point(|m| m.time < t);
+        let in_force = start.saturating_add(
+            marks
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .take_while(|(i, m)| {
+                    m.time == t && records.mark_sequence(start.saturating_add(*i)) <= sequence
+                })
+                .count(),
+        );
         let at_fill = in_force
             .checked_sub(1)
             .and_then(|i| marks.get(i))
