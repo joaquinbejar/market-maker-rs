@@ -284,9 +284,11 @@ pub enum OrderEnd {
 /// exactly it ended [`OrderEnd::Filled`]. An order with no accepted replace
 /// that ended [`OrderEnd::Filled`] was filled for exactly it; one with an
 /// accepted replace may have ended filled for less, since a replace that lowers
-/// the open quantity withdraws contracts without lowering the offer. An order
-/// accepted for 5, replaced down to 2 and filled for 2 has offered 5, filled 2,
-/// and ended filled.
+/// the open quantity withdraws contracts without lowering the offer, but it
+/// was filled for some contracts. An order accepted for 5, replaced down to 2
+/// and filled for 2 has offered 5, filled 2, and ended filled. As decreases
+/// are not recorded, this check of a replaced order is necessary but not
+/// sufficient.
 ///
 /// For an order accepted before the window, `accepted_quantity` is its open
 /// quantity at the window start, since fills before the window cannot be
@@ -365,7 +367,8 @@ pub struct LaneRecords<'a> {
 /// before that mark. Records of one instant that share a number keep the
 /// default order: marks, then fills, then transfers. The settlement is always
 /// last at its instant. Numbers need not be contiguous nor unique across
-/// instants.
+/// instants, but the marks of one instant, which are given in their applied
+/// order, must have non decreasing numbers.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct LaneSequence<'a> {
@@ -553,6 +556,19 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
     {
         return refuse("the sequence needs one number per mark, fill and transfer".to_string());
     }
+    if let Some(sequence) = lane.sequence
+        && let Some(mark) = lane
+            .marks
+            .iter()
+            .zip(sequence.marks)
+            .zip(lane.marks.iter().zip(sequence.marks).skip(1))
+            .find_map(|((before, b), (mark, n))| {
+                (mark.time == before.time && n < b).then_some(mark)
+            })
+    {
+        let t = mark.time;
+        return refuse(format!("the sequence numbers of the marks at {t} decrease"));
+    }
     if let Some(mark) = lane.marks.iter().find(|m| m.price < Decimal::ZERO) {
         return refuse(format!("mark at {} is negative", mark.time));
     }
@@ -640,10 +656,16 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
         }
     }
     for (id, (offered, filled, end, replaced)) in &ids {
+        // A replaced order may have had its open quantity lowered, which no
+        // field records, so for it this check is necessary but not
+        // sufficient: it needs some fill, and never more than the offer.
         if *end == OrderEnd::Filled && filled != offered && !*replaced {
             return refuse(format!(
                 "order {id} ended filled with {filled} of {offered} contracts filled"
             ));
+        }
+        if *end == OrderEnd::Filled && *replaced && filled.is_zero() {
+            return refuse(format!("order {id} ended filled with no fill"));
         }
         if *end != OrderEnd::Filled && filled == offered {
             return refuse(format!(
@@ -1457,13 +1479,24 @@ pub fn lane_fill_quality(
         };
         let sequence = records.fill_sequence(index);
         // The mark in force: the last applied before the fill, as `events`
-        // orders them.
-        let at_fill = marks
-            .iter()
-            .enumerate()
-            .filter(|(i, m)| m.time < t || (m.time == t && records.mark_sequence(*i) <= sequence))
-            .max_by_key(|(i, m)| (m.time, records.mark_sequence(*i), *i))
-            .map(|(_, m)| m.price)
+        // orders them. The marks of one instant have non decreasing sequence
+        // numbers, so those at `t` numbered at most the fill's come first.
+        let start = marks.partition_point(|m| m.time < t);
+        let in_force = start.saturating_add(
+            marks
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .take_while(|(i, m)| {
+                    m.time == t && records.mark_sequence(start.saturating_add(*i)) <= sequence
+                })
+                .count(),
+        );
+        let at_fill = in_force
+            .checked_sub(1)
+            .and_then(|i| marks.get(i))
+            .map(|m| m.price)
             .or(opening)
             .ok_or_else(|| EvaluationError::InvalidInput {
                 reason: format!("lane {lane}: the fill at {t} has no mark at or before it"),

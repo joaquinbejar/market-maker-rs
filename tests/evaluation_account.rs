@@ -1032,6 +1032,12 @@ fn test_an_order_reduced_by_a_replace_then_filled_ends_filled() {
         AccountInput::new(ns(0, 10), vec![lane(&plain)], &[]),
         Err(EvaluationError::InvalidInput { .. })
     ));
+    // A replaced order that ended filled with no fill is refused.
+    let unfilled = [OrderRecord { id: 8, ..record }];
+    assert!(matches!(
+        AccountInput::new(ns(0, 10), vec![lane(&unfilled)], &[]),
+        Err(EvaluationError::InvalidInput { .. })
+    ));
 }
 
 #[test]
@@ -1041,8 +1047,10 @@ fn test_a_sequence_orders_a_fill_before_a_mark_of_its_instant() {
     // fill (1) before mark (2): the fill sees 10, spread capture 10 - 11 = -1,
     // and the move to 12 on a position of 1 earns inventory 2. Net 1 either way.
     // A mark of 12 at 7 measures the fill after a horizon of 1; it moves
-    // nothing. Price impact is 12 - 12 = 0 by default and 12 - 10 = 2 when
-    // sequenced.
+    // nothing. For this buy at 11 the effective spread is 2 (m - 11) and the
+    // realized spread 2 (12 - 11) = 2, so the price impact is 2 (m - 12): with
+    // m = 12 by default, effective 2 and impact 0; with m = 10 when sequenced,
+    // effective -2 and impact -4.
     let marks = [mark(0, dec!(10)), mark(5, dec!(12)), mark(7, dec!(12))];
     let fills = [fill(5, Action::Buy, dec!(11), dec!(1))];
     let base = || {
@@ -1074,7 +1082,10 @@ fn test_a_sequence_orders_a_fill_before_a_mark_of_its_instant() {
     let seq_quality = lane_fill_quality(&sequenced, 0, spec).unwrap();
     assert_eq!(quality.all.measured, 1);
     assert_eq!(seq_quality.all.measured, 1);
-    assert_ne!(quality.all.price_impact, seq_quality.all.price_impact);
+    assert_eq!(quality.all.price_impact, Some(dec!(0)));
+    assert_eq!(seq_quality.all.price_impact, Some(dec!(-4)));
+    assert_eq!(quality.all.effective_spread, Some(dec!(2)));
+    assert_eq!(seq_quality.all.effective_spread, Some(dec!(-2)));
 
     // Sequence numbers that tie keep the default order.
     let tied = AccountInput::new(
@@ -1087,14 +1098,69 @@ fn test_a_sequence_orders_a_fill_before_a_mark_of_its_instant() {
     assert_eq!(row.spread_capture, dec!(1));
 
     // One number per record is required.
+    for sequence in [
+        LaneSequence::new(&[0, 2], &[1], &[]),
+        LaneSequence::new(&[0, 2, 0], &[], &[]),
+        LaneSequence::new(&[0, 2, 0], &[1, 1], &[]),
+        LaneSequence::new(&[0, 2, 0], &[1], &[3]),
+    ] {
+        assert!(matches!(
+            AccountInput::new(ns(0, 10), vec![base().with_sequence(sequence)], &[]),
+            Err(EvaluationError::InvalidInput { .. })
+        ));
+    }
+}
+
+#[test]
+fn test_a_sequence_needs_non_decreasing_marks_at_one_instant() {
+    let marks = [mark(5, dec!(10)), mark(5, dec!(12))];
+    let lane = |sequence: &'static [u64]| {
+        LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+            .with_marks(&marks)
+            .with_sequence(LaneSequence::new(sequence, &[], &[]))
+    };
+    assert!(AccountInput::new(ns(0, 10), vec![lane(&[1, 1])], &[]).is_ok());
+    assert!(AccountInput::new(ns(0, 10), vec![lane(&[1, 2])], &[]).is_ok());
     assert!(matches!(
-        AccountInput::new(
-            ns(0, 10),
-            vec![base().with_sequence(LaneSequence::new(&[0], &[1], &[]))],
-            &[],
-        ),
+        AccountInput::new(ns(0, 10), vec![lane(&[2, 1])], &[]),
         Err(EvaluationError::InvalidInput { .. })
     ));
+    // Marks at different instants may decrease.
+    let apart = [mark(4, dec!(10)), mark(5, dec!(12))];
+    let lane = LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+        .with_marks(&apart)
+        .with_sequence(LaneSequence::new(&[2, 1], &[], &[]));
+    assert!(AccountInput::new(ns(0, 10), vec![lane], &[]).is_ok());
+}
+
+#[test]
+fn test_the_settlement_stays_last_against_the_highest_sequence() {
+    // Long 1 from the opening at 10; a mark of 12 and a settlement at 14, both
+    // at 5. The mark numbered u64::MAX still comes before the settlement: the
+    // inventory earns 2 at the mark and the settlement rounding is zero.
+    let marks = [mark(5, dec!(12))];
+    let lane = LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+        .with_opening(Opening {
+            position: dec!(1),
+            price: dec!(10),
+        })
+        .with_marks(&marks)
+        .with_settlement(Settlement {
+            time: 5,
+            price: dec!(14),
+            cash: dec!(14),
+        });
+    let plain = AccountInput::new(ns(0, 10), vec![lane], &[]).unwrap();
+    let expected = attribute_account(&plain).unwrap().lanes[0].attribution;
+    let sequenced = AccountInput::new(
+        ns(0, 10),
+        vec![lane.with_sequence(LaneSequence::new(&[u64::MAX], &[], &[]))],
+        &[],
+    )
+    .unwrap();
+    let row = attribute_account(&sequenced).unwrap().lanes[0].attribution;
+    assert_eq!(row, expected);
+    assert_eq!(row.net_pnl, dec!(4));
 }
 
 #[test]
