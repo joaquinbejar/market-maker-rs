@@ -6,29 +6,39 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.8.1] - 2026-11-17
+## [0.9.0] - 2026-11-17
+
+### Breaking
+
+- `backtest::evaluation::OrderRecord` is `#[non_exhaustive]` and has a new
+  field, `replace_decrease`: the sum of every decrease of the open quantity
+  by an accepted replace. Build it with `OrderRecord::new` and
+  `with_replaces`, `with_end_state` and `with_liquidation`; struct literals
+  no longer compile outside the crate. With `serde`, a missing
+  `replace_decrease` reads as zero.
+- An order that ended `OrderEnd::Filled` must be filled for exactly
+  `OrderRecord::fillable_quantity`, `accepted_quantity + replace_increase -
+  replace_decrease`, and an order filled for exactly that must end filled.
+  Fills beyond it are refused. Records with no decrease are checked as before.
 
 ### Added
 
+- `OrderRecord::fillable_quantity`. The offered quantity of the fill ratios
+  stays `accepted_quantity + replace_increase`.
 - `backtest::evaluation::LaneSequence` and `LaneRecords::with_sequence`: an
   optional source sequence number per mark, fill and transfer of a lane, used
   as the tie break after the time. A fill or transfer numbered before a mark
   of its instant is attributed, and its fill quality measured, against the
   mark in force before that mark. Without a sequence the order is unchanged:
-  at one instant the marks come first. The marks of one instant must have
-  non decreasing sequence numbers (#333).
+  at one instant the marks come first. The settlement stays last at its
+  instant, the sequence needs one number per record, and the marks of one
+  instant must have non decreasing numbers (#333).
 
 ### Fixed
 
-- `backtest::evaluation`: an order with an accepted replace that ended
-  `OrderEnd::Filled` with fewer fills than its offered quantity is admitted,
-  since a replace that lowers the open quantity withdraws contracts without
-  lowering the offer. An order accepted for 5, replaced down to 2 and filled
-  for 2 is no longer refused. Orders with no accepted replace still have to be
-  filled for exactly their offered quantity to end filled. A replaced order
-  that ended filled still needs at least one fill and no more than its offer;
-  as `OrderRecord` records no replace decreases, this check is necessary but
-  not sufficient (#332).
+- `backtest::evaluation`: an order accepted for 5, replaced down to 2 and
+  filled for 2 can be recorded as ended filled, with a `replace_decrease` of
+  3 (#332).
 
 ## [0.8.0] - 2026-11-15
 

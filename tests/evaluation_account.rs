@@ -236,13 +236,10 @@ fn ordered() -> (Vec<LaneMark>, Vec<LaneFill>, Vec<OrderRecord>) {
     let mut sell = fill(100, Action::Sell, dec!(11.1), dec!(2));
     sell.order_id = Some(2);
     sell.liquidity = Liquidity::Taker;
-    let order = |id, accepted_quantity, accepted_replaces, end_state, liquidation| OrderRecord {
-        id,
-        accepted_quantity,
-        replace_increase: Decimal::ZERO,
-        accepted_replaces,
-        end_state,
-        liquidation,
+    let order = |id, accepted_quantity, accepted_replaces, end_state, liquidation| {
+        OrderRecord::new(id, accepted_quantity, end_state)
+            .with_replaces(accepted_replaces, Decimal::ZERO, Decimal::ZERO)
+            .with_liquidation(liquidation)
     };
     let orders = vec![
         order(1, dec!(5), 2, OrderEnd::Cancelled, false),
@@ -579,14 +576,7 @@ fn test_records_are_checked() {
     let mut named = fill(0, Action::Buy, dec!(1), dec!(2));
     named.order_id = Some(7);
     let named = [named];
-    let small = [OrderRecord {
-        id: 7,
-        accepted_quantity: dec!(1),
-        replace_increase: Decimal::ZERO,
-        accepted_replaces: 0,
-        end_state: OrderEnd::Filled,
-        liquidation: false,
-    }];
+    let small = [OrderRecord::new(7, dec!(1), OrderEnd::Filled)];
     assert!(refused(
         base()
             .with_marks(&marks)
@@ -598,16 +588,9 @@ fn test_records_are_checked() {
     let mut exact = fill(0, Action::Buy, dec!(1), dec!(2));
     exact.order_id = Some(8);
     let exact = [exact];
-    let full = OrderRecord {
-        id: 8,
-        accepted_quantity: dec!(2),
-        replace_increase: Decimal::ZERO,
-        accepted_replaces: 0,
-        end_state: OrderEnd::Filled,
-        liquidation: false,
-    };
+    let full = OrderRecord::new(8, dec!(2), OrderEnd::Filled);
     for end_state in [OrderEnd::Cancelled, OrderEnd::Expired, OrderEnd::Open] {
-        let orders = [OrderRecord { end_state, ..full }];
+        let orders = [full.with_end_state(end_state)];
         assert!(refused(
             base()
                 .with_marks(&marks)
@@ -616,21 +599,15 @@ fn test_records_are_checked() {
         ));
     }
     // A replace increase needs an accepted replace.
-    let unreplaced = [OrderRecord {
-        accepted_quantity: dec!(1),
-        replace_increase: dec!(1),
-        ..full
-    }];
+    let mut unreplaced = [OrderRecord::new(8, dec!(1), OrderEnd::Filled)];
+    unreplaced[0].replace_increase = dec!(1);
     assert!(refused(
         base()
             .with_marks(&marks)
             .with_fills(&exact)
             .with_orders(&unreplaced)
     ));
-    let replaced = [OrderRecord {
-        accepted_replaces: 1,
-        ..unreplaced[0]
-    }];
+    let replaced = [unreplaced[0].with_replaces(1, dec!(1), Decimal::ZERO)];
     assert!(!refused(
         base()
             .with_marks(&marks)
@@ -753,14 +730,7 @@ fn test_order_quantities_add_up_in_units_across_multipliers() {
     let mut a_fill = fill(0, Action::Buy, dec!(10), dec!(4));
     a_fill.order_id = Some(1);
     let a_fills = [a_fill];
-    let order = |id, accepted_quantity, end_state| OrderRecord {
-        id,
-        accepted_quantity,
-        replace_increase: Decimal::ZERO,
-        accepted_replaces: 0,
-        end_state,
-        liquidation: false,
-    };
+    let order = OrderRecord::new;
     let a_orders = [order(1, dec!(4), OrderEnd::Filled)];
     let b_marks = [mark(0, dec!(10))];
     let mut b_fill = fill(0, Action::Sell, dec!(10), dec!(0.5));
@@ -802,14 +772,8 @@ fn test_a_replace_that_raises_the_open_size_adds_to_the_offer() {
     let mut second = fill(3, Action::Buy, dec!(10), dec!(10));
     second.order_id = Some(1);
     let fills = [first, second];
-    let record = OrderRecord {
-        id: 1,
-        accepted_quantity: dec!(10),
-        replace_increase: dec!(8),
-        accepted_replaces: 1,
-        end_state: OrderEnd::Filled,
-        liquidation: false,
-    };
+    let record =
+        OrderRecord::new(1, dec!(10), OrderEnd::Filled).with_replaces(1, dec!(8), Decimal::ZERO);
     assert_eq!(record.offered_quantity().unwrap(), dec!(18));
     let orders = [record];
     let lane = || {
@@ -823,31 +787,18 @@ fn test_a_replace_that_raises_the_open_size_adds_to_the_offer() {
     assert_eq!(stats.filled_quantity, dec!(18));
     assert_eq!(stats.ended_filled, 1);
     // Without the increase the fills exceed the offer.
-    let short = [OrderRecord {
-        replace_increase: Decimal::ZERO,
-        ..record
-    }];
+    let short = [record.with_replaces(1, Decimal::ZERO, Decimal::ZERO)];
     assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&short)], &[]).is_err());
-    // Ended filled with 18 of 20 filled is admitted for a replaced order, as a
-    // replace may have lowered the open size; without a replace it is refused.
-    let more = [OrderRecord {
-        replace_increase: dec!(10),
-        ..record
-    }];
-    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&more)], &[]).is_ok());
-    let unreplaced = [OrderRecord {
-        accepted_quantity: dec!(20),
-        replace_increase: Decimal::ZERO,
-        accepted_replaces: 0,
-        ..record
-    }];
-    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&unreplaced)], &[]).is_err());
+    // Ended filled with 18 of 20 fillable is refused; with a decrease of 2 it
+    // is 18 of 18 and admitted.
+    let more = [record.with_replaces(1, dec!(10), Decimal::ZERO)];
+    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&more)], &[]).is_err());
+    let withdrawn = [record.with_replaces(2, dec!(10), dec!(2))];
+    assert!(AccountInput::new(ns(0, 10), vec![lane().with_orders(&withdrawn)], &[]).is_ok());
     // The same order still open is admitted.
-    let open = [OrderRecord {
-        replace_increase: dec!(10),
-        end_state: OrderEnd::Open,
-        ..record
-    }];
+    let open = [record
+        .with_replaces(1, dec!(10), Decimal::ZERO)
+        .with_end_state(OrderEnd::Open)];
     let input = AccountInput::new(ns(0, 10), vec![lane().with_orders(&open)], &[]).unwrap();
     let stats = attribute_account(&input).unwrap().lanes[0].orders;
     assert_eq!(stats.ended_open, 1);
@@ -976,14 +927,7 @@ fn test_an_order_accepted_before_the_window_records_its_open_size_at_the_start()
     let mut inside = fill(12, Action::Sell, dec!(10), dec!(6));
     inside.order_id = Some(3);
     let fills = [inside];
-    let orders = [OrderRecord {
-        id: 3,
-        accepted_quantity: dec!(6),
-        replace_increase: Decimal::ZERO,
-        accepted_replaces: 0,
-        end_state: OrderEnd::Filled,
-        liquidation: false,
-    }];
+    let orders = [OrderRecord::new(3, dec!(6), OrderEnd::Filled)];
     let lane = LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
         .with_marks(&marks)
         .with_fills(&fills)
@@ -997,20 +941,16 @@ fn test_an_order_accepted_before_the_window_records_its_open_size_at_the_start()
 
 #[test]
 fn test_an_order_reduced_by_a_replace_then_filled_ends_filled() {
-    // Accepted 5, replaced down to 2 (no increase), filled 2: offered 5,
-    // filled 2, ended filled. Fill ratio by quantity 2 / 5.
+    // Accepted 5, replaced down to 2 (a decrease of 3), filled 2: offered 5,
+    // fillable 2, filled 2, ended filled. The fill ratio keeps the offer of 5.
     let marks = [mark(0, dec!(10))];
     let mut only = fill(2, Action::Buy, dec!(10), dec!(2));
     only.order_id = Some(7);
     let fills = [only];
-    let record = OrderRecord {
-        id: 7,
-        accepted_quantity: dec!(5),
-        replace_increase: Decimal::ZERO,
-        accepted_replaces: 1,
-        end_state: OrderEnd::Filled,
-        liquidation: false,
-    };
+    let record =
+        OrderRecord::new(7, dec!(5), OrderEnd::Filled).with_replaces(1, Decimal::ZERO, dec!(3));
+    assert_eq!(record.offered_quantity().unwrap(), dec!(5));
+    assert_eq!(record.fillable_quantity().unwrap(), dec!(2));
     let orders = [record];
     let lane = |orders| {
         LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
@@ -1023,21 +963,38 @@ fn test_an_order_reduced_by_a_replace_then_filled_ends_filled() {
     assert_eq!(stats.accepted_quantity, dec!(5));
     assert_eq!(stats.filled_quantity, dec!(2));
     assert_eq!(stats.ended_filled, 1);
-    // The same record with no accepted replace is refused.
-    let plain = [OrderRecord {
-        accepted_replaces: 0,
-        ..record
-    }];
-    assert!(matches!(
-        AccountInput::new(ns(0, 10), vec![lane(&plain)], &[]),
-        Err(EvaluationError::InvalidInput { .. })
-    ));
+    let refused = |orders: &[OrderRecord]| {
+        let lane = LaneRecords::new(LaneRole::Quoted, LaneKind::Linear, dec!(1))
+            .with_marks(&marks)
+            .with_fills(&fills)
+            .with_orders(orders);
+        matches!(
+            AccountInput::new(ns(0, 10), vec![lane], &[]),
+            Err(EvaluationError::InvalidInput { .. })
+        )
+    };
+    // A decrease too small or too large for the fills is refused, ended filled.
+    assert!(refused(&[record.with_replaces(1, Decimal::ZERO, dec!(2))]));
+    assert!(refused(&[record.with_replaces(1, Decimal::ZERO, dec!(4))]));
+    // Without the decrease the order is 2 of 5 filled and cannot end filled.
+    assert!(refused(&[record.with_replaces(
+        1,
+        Decimal::ZERO,
+        Decimal::ZERO
+    )]));
+    // Filled for its fillable size, it must end filled.
+    assert!(refused(&[record.with_end_state(OrderEnd::Cancelled)]));
+    // A decrease needs an accepted replace, is never negative, and never
+    // withdraws more than the offer.
+    assert!(refused(&[record.with_replaces(0, Decimal::ZERO, dec!(3))]));
+    assert!(refused(&[record.with_replaces(1, Decimal::ZERO, dec!(-1))]));
+    assert!(refused(&[record
+        .with_replaces(1, Decimal::ZERO, dec!(6))
+        .with_end_state(OrderEnd::Cancelled)]));
     // A replaced order that ended filled with no fill is refused.
-    let unfilled = [OrderRecord { id: 8, ..record }];
-    assert!(matches!(
-        AccountInput::new(ns(0, 10), vec![lane(&unfilled)], &[]),
-        Err(EvaluationError::InvalidInput { .. })
-    ));
+    assert!(refused(&[
+        OrderRecord::new(8, dec!(5), OrderEnd::Filled).with_replaces(1, Decimal::ZERO, dec!(3))
+    ]));
 }
 
 #[test]

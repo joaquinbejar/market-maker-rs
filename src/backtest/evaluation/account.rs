@@ -278,35 +278,40 @@ pub enum OrderEnd {
 /// An order the venue accepted on a lane.
 ///
 /// Its offered quantity is [`OrderRecord::offered_quantity`]: the size first
-/// accepted plus every positive increase of the open quantity by an accepted
-/// replace. An order accepted for 10, filled for 8 and replaced to an open size
-/// of 10 has offered 18. Its fills never exceed it, and an order filled for
-/// exactly it ended [`OrderEnd::Filled`]. An order with no accepted replace
-/// that ended [`OrderEnd::Filled`] was filled for exactly it; one with an
-/// accepted replace may have ended filled for less, since a replace that lowers
-/// the open quantity withdraws contracts without lowering the offer, but it
-/// was filled for some contracts. An order accepted for 5, replaced down to 2
-/// and filled for 2 has offered 5, filled 2, and ended filled. As decreases
-/// are not recorded, this check of a replaced order is necessary but not
-/// sufficient.
+/// accepted plus every increase of the open quantity by an accepted replace.
+/// An order accepted for 10, filled for 8 and replaced to an open size of 10
+/// has offered 18. A replace that lowers the open quantity withdraws contracts
+/// without lowering the offer; the sum of those decreases is
+/// [`OrderRecord::replace_decrease`]. The order can be filled for at most
+/// [`OrderRecord::fillable_quantity`], the offer less the decreases; it ended
+/// [`OrderEnd::Filled`] if and only if it was filled for exactly that. An
+/// order accepted for 5, replaced down to 2 and filled for 2 has offered 5,
+/// withdrawn 3, filled 2, and ended filled.
 ///
 /// For an order accepted before the window, `accepted_quantity` is its open
 /// quantity at the window start, since fills before the window cannot be
 /// recorded. An order accepted before the window, open for 6 at the start and
 /// filled for 6 inside it, is recorded with an accepted quantity of 6.
+///
+/// Build it with [`OrderRecord::new`] and the `with_` methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
 pub struct OrderRecord {
     /// Identifier, unique within the lane.
     pub id: u64,
     /// Contracts of the order when the venue accepted it, or its open quantity
     /// at the window start for an order accepted before the window. Positive.
     pub accepted_quantity: Decimal,
-    /// The sum of every positive increase of the open quantity by an accepted
-    /// replace, in contracts. Never negative; a replace that lowers the open
-    /// quantity adds nothing and does not lower the offer.
+    /// The sum of every increase of the open quantity by an accepted replace,
+    /// in contracts. Never negative.
     pub replace_increase: Decimal,
-    /// Replaces the venue accepted. Positive when `replace_increase` is.
+    /// The sum of every decrease of the open quantity by an accepted replace,
+    /// in contracts. Never negative; it does not lower the offer.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub replace_decrease: Decimal,
+    /// Replaces the venue accepted. Positive when `replace_increase` or
+    /// `replace_decrease` is.
     pub accepted_replaces: u64,
     /// How it ended.
     pub end_state: OrderEnd,
@@ -315,6 +320,50 @@ pub struct OrderRecord {
 }
 
 impl OrderRecord {
+    /// An order accepted for `accepted_quantity` that ended in `end_state`,
+    /// never replaced and not a liquidation.
+    #[must_use]
+    pub fn new(id: u64, accepted_quantity: Decimal, end_state: OrderEnd) -> Self {
+        Self {
+            id,
+            accepted_quantity,
+            replace_increase: Decimal::ZERO,
+            replace_decrease: Decimal::ZERO,
+            accepted_replaces: 0,
+            end_state,
+            liquidation: false,
+        }
+    }
+
+    /// With `accepted_replaces` accepted replaces that raised the open
+    /// quantity by `increase` and lowered it by `decrease` in all.
+    #[must_use]
+    pub fn with_replaces(
+        mut self,
+        accepted_replaces: u64,
+        increase: Decimal,
+        decrease: Decimal,
+    ) -> Self {
+        self.accepted_replaces = accepted_replaces;
+        self.replace_increase = increase;
+        self.replace_decrease = decrease;
+        self
+    }
+
+    /// With the end state.
+    #[must_use]
+    pub fn with_end_state(mut self, end_state: OrderEnd) -> Self {
+        self.end_state = end_state;
+        self
+    }
+
+    /// As a liquidation order, or not.
+    #[must_use]
+    pub fn with_liquidation(mut self, liquidation: bool) -> Self {
+        self.liquidation = liquidation;
+        self
+    }
+
     /// Contracts offered: `accepted_quantity + replace_increase`.
     ///
     /// # Errors
@@ -325,6 +374,21 @@ impl OrderRecord {
             self.accepted_quantity,
             self.replace_increase,
             "offered quantity",
+        )
+    }
+
+    /// Contracts the order could be filled for:
+    /// `offered_quantity - replace_decrease`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationError::Inexact`] if the sum or difference would
+    /// round.
+    pub fn fillable_quantity(&self) -> EvalResult<Decimal> {
+        sub(
+            self.offered_quantity()?,
+            self.replace_decrease,
+            "fillable quantity",
         )
     }
 }
@@ -623,23 +687,26 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
                 order.id
             ));
         }
-        if order.replace_increase > Decimal::ZERO && order.accepted_replaces == 0 {
+        if order.replace_decrease < Decimal::ZERO {
             return refuse(format!(
-                "order {} has a replace increase but no accepted replace",
+                "order {} has a negative replace decrease",
                 order.id
             ));
         }
-        let offered = order.offered_quantity()?;
+        if (order.replace_increase > Decimal::ZERO || order.replace_decrease > Decimal::ZERO)
+            && order.accepted_replaces == 0
+        {
+            return refuse(format!(
+                "order {} has a replace increase or decrease but no accepted replace",
+                order.id
+            ));
+        }
+        let fillable = order.fillable_quantity()?;
+        if fillable < Decimal::ZERO {
+            return refuse(format!("order {} withdraws more than it offered", order.id));
+        }
         if ids
-            .insert(
-                order.id,
-                (
-                    offered,
-                    Decimal::ZERO,
-                    order.end_state,
-                    order.accepted_replaces > 0,
-                ),
-            )
+            .insert(order.id, (fillable, Decimal::ZERO, order.end_state))
             .is_some()
         {
             return refuse(format!("order {} is recorded twice", order.id));
@@ -647,29 +714,25 @@ fn check_lane(window: &Window, index: usize, lane: &LaneRecords<'_>) -> EvalResu
     }
     for fill in lane.fills {
         let Some(id) = fill.order_id else { continue };
-        let Some((offered, filled, _, _)) = ids.get_mut(&id) else {
+        let Some((fillable, filled, _)) = ids.get_mut(&id) else {
             return refuse(format!("fill at {} names unknown order {id}", fill.time));
         };
         *filled = add(*filled, fill.quantity, "order fills")?;
-        if *filled > *offered {
-            return refuse(format!("order {id} is filled beyond its offered size"));
-        }
-    }
-    for (id, (offered, filled, end, replaced)) in &ids {
-        // A replaced order may have had its open quantity lowered, which no
-        // field records, so for it this check is necessary but not
-        // sufficient: it needs some fill, and never more than the offer.
-        if *end == OrderEnd::Filled && filled != offered && !*replaced {
+        if *filled > *fillable {
             return refuse(format!(
-                "order {id} ended filled with {filled} of {offered} contracts filled"
+                "order {id} is filled beyond its offered size less its replace decreases"
             ));
         }
-        if *end == OrderEnd::Filled && *replaced && filled.is_zero() {
-            return refuse(format!("order {id} ended filled with no fill"));
-        }
-        if *end != OrderEnd::Filled && filled == offered {
+    }
+    for (id, (fillable, filled, end)) in &ids {
+        if *end == OrderEnd::Filled && filled != fillable {
             return refuse(format!(
-                "order {id} is filled for its offered size but did not end filled"
+                "order {id} ended filled with {filled} of {fillable} fillable contracts filled"
+            ));
+        }
+        if *end != OrderEnd::Filled && filled == fillable {
+            return refuse(format!(
+                "order {id} is filled for its fillable size but did not end filled"
             ));
         }
     }
