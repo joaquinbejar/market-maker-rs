@@ -166,7 +166,7 @@ pub enum FeatureUnit {
 }
 
 impl FeatureUnit {
-    const fn code(self) -> u16 {
+    pub(super) const fn code(self) -> u16 {
         match self {
             Self::Ticks => 1,
             Self::Milliseconds => 2,
@@ -194,7 +194,7 @@ pub enum AsOf {
 }
 
 impl AsOf {
-    const fn code(self) -> u16 {
+    pub(super) const fn code(self) -> u16 {
         match self {
             Self::ObservedRow => 1,
             Self::DeliveredReports => 2,
@@ -219,7 +219,7 @@ pub enum FeatureHorizon {
 }
 
 impl FeatureHorizon {
-    const fn code(self) -> u16 {
+    pub(super) const fn code(self) -> u16 {
         match self {
             Self::Instant => 1,
             Self::SincePreviousDecision => 2,
@@ -240,7 +240,7 @@ pub enum StateMemory {
 }
 
 impl StateMemory {
-    const fn code(self) -> u16 {
+    pub(super) const fn code(self) -> u16 {
         match self {
             Self::None => 1,
             Self::PreviousDecision => 2,

@@ -32,6 +32,9 @@ path = "src/lib.rs"
 
 [dependencies]
 thiserror = "2.0"
+# ln, sqrt and erfc in portable Rust, with no platform math library, for the float
+# paths whose results are checked against fixtures on several architectures.
+libm = { version = "0.2", default-features = false }
 rust_decimal = "1.43"
 rust_decimal_macros = "1.40"
 # Shared order direction and option style (`Action`, `OptionStyle`). It

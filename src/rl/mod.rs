@@ -198,6 +198,7 @@
 mod audit;
 mod env;
 mod features;
+mod options;
 mod profile;
 mod queue_reactive;
 mod residual;
@@ -212,6 +213,15 @@ pub use env::{
     ERR_HEDGE_REFUSED, RlAction, RlConfig, RlEnv, RlState, StepReward, TerminalClose, Transition,
 };
 pub use features::{FeatureVector, HedgeFeatureVector, PreviousRow, observation_features};
+pub use options::{
+    AGENT_FEATURE_COUNT, AgentFeature, AgentInput, DELTA_DECIMALS, Lane, LinearPosition,
+    ListedOption, MAX_WINDOW_RANKS, NET_DELTA_VERSION, OPTIONS_ACTION_SPACE_VERSION,
+    OPTIONS_HEAD_COUNT, OPTIONS_KIND_COUNT, OPTIONS_OBSERVATION_SPACE_VERSION,
+    OPTIONS_REWARD_VERSION, OptionPosition, OptionsAction, OptionsHead, OptionsKind,
+    OptionsObservation, OptionsProfile, OptionsScales, RL_OPTIONS_FIXTURES, SLOT_FEATURE_COUNT,
+    SlotFeature, SlotInput, black_scholes_delta, black_scholes_delta_unrounded, hedge_cap_lots,
+    net_delta,
+};
 pub use profile::{
     ACTION_HEAD_COUNT, ACTION_HEAD_LAYOUT_VERSION, ACTION_KIND_COUNT, ActionHead, InstrumentAction,
     RL_SPACES_FIXTURES, RlProfile,
