@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `rl::OptionsProfile`: observation and action spaces of an options quoting agent over a
+  moving window of series. The instrument head indexes relative slots (`E_w` expiry ranks,
+  `K_w` strike ranks per expiry, both rights) plus one hedge lane; slots are ranked exactly
+  from the delivered listing and index mark (`OptionsProfile::resolve_slots`). Every profile
+  constant, including the delta volatility `sigma_delta`, enters its `SpecId`.
+- `rl::net_delta`, `rl::black_scholes_delta` and `rl::hedge_cap_lots`: the net delta of an
+  agent with a Black Scholes delta at rate 0 on a reproducible float path (`libm` `ln`,
+  `sqrt` and `erfc`, no fused multiply add, each delta rounded half to even to `1e-9`).
+- `doc/fixtures/rl_options.json` (`rl::RL_OPTIONS_FIXTURES`), checked in CI on `x86_64` and
+  `aarch64`.
+- The `rl` feature depends on `libm`.
+
 ## [0.9.0] - 2026-11-17
 
 ### Breaking
