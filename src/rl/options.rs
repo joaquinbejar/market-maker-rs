@@ -1325,6 +1325,7 @@ pub fn black_scholes_delta(
 /// # Errors
 ///
 /// As [`black_scholes_delta`].
+#[doc(hidden)]
 pub fn black_scholes_delta_unrounded(
     spot: Decimal,
     strike: Decimal,

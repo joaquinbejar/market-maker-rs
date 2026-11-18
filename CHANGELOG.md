@@ -19,8 +19,8 @@ project follows [Semantic Versioning](https://semver.org/).
 - `doc/fixtures/rl_options.json` (`rl::RL_OPTIONS_FIXTURES`), checked in CI on `x86_64` and
   `aarch64`.
 - `libm` 0.2 is a dependency, with no default features.
-- `rl::black_scholes_delta_unrounded`: `d1` and the delta before rounding, for fixtures
-  that compare bits.
+- `rl::black_scholes_delta_unrounded` (hidden from the docs): `d1` and the delta before
+  rounding, a hook for fixtures that compare bits.
 
 ## [0.9.0] - 2026-11-17
 
