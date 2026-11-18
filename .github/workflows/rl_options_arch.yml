@@ -36,4 +36,4 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.arch }}"
 
       - name: Spaces and net delta against the published fixtures
-        run: cargo test --locked --features rl --test rl_options
+        run: cargo test --features rl --test rl_options
