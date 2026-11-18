@@ -16,7 +16,8 @@ use market_maker_rs::rl::{
     AgentInput, Lane, LinearPosition, ListedOption, NET_DELTA_VERSION,
     OPTIONS_ACTION_SPACE_VERSION, OPTIONS_OBSERVATION_SPACE_VERSION, ObservationScales,
     OptionPosition, OptionsAction, OptionsKind, OptionsProfile, OptionsScales, PreviousRow,
-    RL_OPTIONS_FIXTURES, SlotInput, black_scholes_delta, hedge_cap_lots,
+    RL_OPTIONS_FIXTURES, SlotInput, black_scholes_delta, black_scholes_delta_unrounded,
+    hedge_cap_lots,
 };
 use market_maker_rs::types::error::MMError;
 use serde_json::{Value, json};
@@ -167,6 +168,27 @@ fn slot_cases() -> Value {
             .collect();
         cases.push(json!({ "name": name, "index_mark": opt(mark), "slots": named }));
     }
+    let one_expiry: Vec<ListedOption> = listed
+        .iter()
+        .filter(|l| l.expiry_symbol == "W1")
+        .cloned()
+        .collect();
+    let slots = p.resolve_slots(Some(dec!(100)), &one_expiry).unwrap();
+    let named: Vec<Value> = slots
+        .iter()
+        .map(|s| {
+            s.map_or(Value::Null, |i| {
+                let l = &one_expiry[i];
+                json!([l.expiry_symbol, l.strike.to_string(), style_name(l.style)])
+            })
+        })
+        .collect();
+    cases.push(json!({
+        "name": "only_W1_listed",
+        "index_mark": "100",
+        "listed_filter": "W1",
+        "slots": named,
+    }));
     let listed_json: Vec<Value> = listed
         .iter()
         .map(|l| {
@@ -268,7 +290,7 @@ fn action_cases() -> Value {
             Ok(a) => json!({
                 "row": row,
                 "kind": a.kind.code(),
-                "lane": match a.lane { Lane::Option(s) => json!(s), Lane::Hedge => json!("hedge") },
+                "lane": match a.lane { Lane::Option(s) => json!(s), Lane::Hedge => json!("hedge"), _ => unreachable!() },
                 "canonical": p.encode_action(&a).unwrap(),
             }),
             Err(MMError::InvalidAction(_)) => json!({ "row": row, "invalid_action": true }),
@@ -297,13 +319,23 @@ fn delta_cases() -> Value {
                 for v in sigmas {
                     for style in [OptionStyle::Call, OptionStyle::Put] {
                         let d = black_scholes_delta(s, k, t, v, style).unwrap();
+                        let bits = black_scholes_delta_unrounded(s, k, t, v, style)
+                            .unwrap()
+                            .map_or((Value::Null, Value::Null), |(d1, raw)| {
+                                (
+                                    json!(format!("{:016x}", d1.to_bits())),
+                                    json!(format!("{:016x}", raw.to_bits())),
+                                )
+                            });
                         cases.push(json!([
                             s.to_string(),
                             k.to_string(),
                             t.to_string(),
                             v.to_string(),
                             style_name(style),
-                            d.to_string()
+                            d.to_string(),
+                            bits.0,
+                            bits.1
                         ]));
                     }
                 }
@@ -313,7 +345,7 @@ fn delta_cases() -> Value {
     json!(cases)
 }
 
-fn net_delta_case() -> Value {
+fn net_delta_case(index_mark: Decimal, extra_lots: Decimal) -> Value {
     let p = proposed();
     let decision = DAY_NS / 2;
     let linear = [
@@ -325,14 +357,21 @@ fn net_delta_case() -> Value {
         OptionPosition::new(dec!(-2), dec!(0.1), dec!(95), OptionStyle::Put, 3 * DAY_NS),
         OptionPosition::new(dec!(4), dec!(0.1), dec!(105), OptionStyle::Call, DAY_NS / 4),
         OptionPosition::new(dec!(0), dec!(0.1), dec!(110), OptionStyle::Call, DAY_NS),
+        OptionPosition::new(
+            extra_lots,
+            dec!(0.1),
+            dec!(100),
+            OptionStyle::Call,
+            2 * DAY_NS,
+        ),
     ];
     let nd = p
-        .net_delta(dec!(99.8), decision, DAY_NS, &linear, &options)
+        .net_delta(index_mark, decision, DAY_NS, &linear, &options)
         .unwrap();
     let cap = hedge_cap_lots(nd, dec!(0.1)).unwrap();
     json!({
         "profile": "proposed",
-        "index_mark": "99.8",
+        "index_mark": index_mark.to_string(),
         "decision_ns": decision,
         "day_ns": DAY_NS,
         "linear": linear.iter().map(|l| json!([l.lots.to_string(), l.lot_size.to_string()])).collect::<Vec<_>>(),
@@ -354,7 +393,10 @@ fn fixtures() -> Value {
         "observation": observation_case(),
         "actions": action_cases(),
         "deltas": delta_cases(),
-        "net_delta": net_delta_case(),
+        "net_delta": [
+            net_delta_case(dec!(99.8), dec!(0)),
+            net_delta_case(dec!(101), dec!(-40)),
+        ],
     })
 }
 
@@ -434,16 +476,61 @@ fn the_profile_refuses_a_non_positive_sigma() {
 
 #[test]
 fn the_fingerprint_moves_with_every_constant() {
+    type Change = (&'static str, fn(&mut OptionsProfile));
+    let changes: &[Change] = &[
+        ("expiry_ranks", |p| p.expiry_ranks = 3),
+        ("strike_ranks", |p| p.strike_ranks = 4),
+        ("sigma_delta", |p| p.sigma_delta = dec!(0.61)),
+        ("scales.strike_distance", |p| {
+            p.scales.strike_distance = dec!(999)
+        }),
+        ("scales.time_to_expiry_ms", |p| {
+            p.scales.time_to_expiry_ms = dec!(1)
+        }),
+        ("scales.offset_ticks", |p| p.scales.offset_ticks = dec!(21)),
+        ("scales.depth_lots", |p| p.scales.depth_lots = dec!(51)),
+        ("scales.venue_mark", |p| p.scales.venue_mark = dec!(501)),
+        ("scales.position_lots", |p| {
+            p.scales.position_lots = dec!(22)
+        }),
+        ("scales.equity", |p| p.scales.equity = dec!(10001)),
+        ("scales.net_delta", |p| p.scales.net_delta = dec!(11)),
+        ("hedge_scales.spread_ticks", |p| {
+            p.hedge_scales.spread_ticks = dec!(12)
+        }),
+        ("hedge_scales.mid_change_ticks", |p| {
+            p.hedge_scales.mid_change_ticks = dec!(13)
+        }),
+        ("hedge_scales.row_gap_ms", |p| {
+            p.hedge_scales.row_gap_ms = dec!(1001)
+        }),
+        ("hedge_scales.size_lots", |p| {
+            p.hedge_scales.size_lots = dec!(14)
+        }),
+        ("hedge_scales.position", |p| {
+            p.hedge_scales.position = dec!(15)
+        }),
+        ("hedge_scales.entry_gap", |p| {
+            p.hedge_scales.entry_gap = dec!(101)
+        }),
+        ("bid_offsets_ticks", |p| {
+            p.bid_offsets_ticks = vec![1, 2, 4, 9]
+        }),
+        ("ask_offsets_ticks", |p| p.ask_offsets_ticks = vec![1, 2, 4]),
+        ("sizes_lots", |p| p.sizes_lots = vec![1, 2, 6]),
+        ("max_orders", |p| p.max_orders = 3),
+        ("max_steps", |p| p.max_steps = 18),
+        ("step_ns", |p| p.step_ns = 999_999_999),
+    ];
     let base = proposed().id().unwrap();
-    let mut p = proposed();
-    p.sigma_delta = dec!(0.61);
-    assert_ne!(p.id().unwrap(), base);
-    let mut p = proposed();
-    p.strike_ranks = 4;
-    assert_ne!(p.id().unwrap(), base);
-    let mut p = proposed();
-    p.scales.net_delta = dec!(11);
-    assert_ne!(p.id().unwrap(), base);
+    let mut seen = vec![base];
+    for (name, change) in changes {
+        let mut p = proposed();
+        change(&mut p);
+        let id = p.id().unwrap();
+        assert!(!seen.contains(&id), "{name} does not move the fingerprint");
+        seen.push(id);
+    }
     assert!(proposed().ensure(base).is_ok());
 }
 

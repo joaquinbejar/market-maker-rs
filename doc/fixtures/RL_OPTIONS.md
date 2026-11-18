@@ -4,7 +4,7 @@
 quoting spaces (`rl::OptionsProfile`) and of the net delta (`rl::net_delta`,
 `rl::black_scholes_delta`). The crate embeds it as `market_maker_rs::rl::RL_OPTIONS_FIXTURES`.
 It is generated and checked by `tests/rl_options.rs`; CI checks the same file on `x86_64` and
-`aarch64`, so every delta is bit identical on both. Rewrite it with
+`aarch64` (`.github/workflows/cross_arch.yml`), so every delta is bit identical on both. Rewrite it with
 `MM_WRITE_RL_OPTIONS_FIXTURES=1 cargo test --features rl --test rl_options` only after a
 deliberate change of `OPTIONS_OBSERVATION_SPACE_VERSION`, `OPTIONS_ACTION_SPACE_VERSION` or
 `NET_DELTA_VERSION`, then run the test again without the variable to check the embedded copy.
@@ -21,9 +21,18 @@ deliberate change of `OPTIONS_OBSERVATION_SPACE_VERSION`, `OPTIONS_ACTION_SPACE_
   normalized `f32` values in observation order (slots, hedge lane, agent).
 - `actions`: head rows of the `small` profile with the decoded kind, lane and canonical row,
   or `invalid_action` when `OptionsProfile::decode_action` refuses the row.
-- `deltas`: `[S, K, tau, sigma, style, delta]` rows; tau in years, delta rounded half to even
-  to `1e-9`. Rows come in call and put pairs of the same inputs.
-- `net_delta`: linear positions `[lots, lot size]`, option positions
-  `[lots, base per lot, strike, style, expiry ns]`, the net delta and the hedge cap in lots.
+- `deltas`: `[S, K, tau, sigma, style, delta, d1 bits, raw delta bits]` rows; tau in years,
+  delta rounded half to even to `1e-9`; the bits are the `f64::to_bits` hex of `d1` and of the
+  delta before rounding (`black_scholes_delta_unrounded`), `null` at or past expiry. A
+  consumer compares bits first: a rounded delta can hide a one bit difference. Rows come in
+  call and put pairs of the same inputs.
+- `net_delta`: cases of linear positions `[lots, lot size]`, option positions
+  `[lots, base per lot, strike, style, expiry ns]`, the net delta and the hedge cap in lots;
+  the second has a negative net delta with a nonzero cap.
+- `slots` also has a case with fewer listed expiries than `E_w`.
+
+The bits depend on the `libm` release that Cargo resolves: a new `0.2.x` may change a last
+bit of `ln`, `sqrt` or `erfc`. A consumer should run the embedded fixtures
+(`RL_OPTIONS_FIXTURES`) against the `libm` it builds with, not only trust this file.
 
 Decimals are strings. Each `f32` is a string in its shortest round trip form.

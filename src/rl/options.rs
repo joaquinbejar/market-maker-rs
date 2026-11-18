@@ -42,24 +42,27 @@
 //! delta at rate 0 and a constant volatility ([`OptionsProfile::sigma_delta`]). The float
 //! part is reproducible across architectures: inputs are converted from `Decimal` to `f64`
 //! once by correctly rounded parsing, `ln`, `sqrt` and `erfc` come from the `libm` crate
-//! (pure Rust, the same code on every target), every other operation is an IEEE basic
+//! (portable Rust with no platform math library), every other operation is an IEEE basic
 //! operation (Rust never contracts a multiply and an add into an FMA, and nothing here
 //! calls `mul_add`), and each delta is rounded half to even to `1e-9` from its exact binary
-//! value before it returns to `Decimal`. The fixtures of [`RL_OPTIONS_FIXTURES`] are
-//! checked on `x86_64` and `aarch64`.
+//! value before it returns to `Decimal`. Determinism rests on `libm` and the basic
+//! operations; the rounding only lowers the odds that a last bit difference shows. The
+//! fixtures of [`RL_OPTIONS_FIXTURES`] carry the unrounded bits and are checked on `x86_64`
+//! and `aarch64`; a different `libm` release can change those bits, so a consumer runs them
+//! against its own build.
 //!
 //! The reward is not specified here: each environment computes it from its own
 //! accounting, so the reward field of the [`SpecId`] is 0.
 
 use std::cmp::Ordering;
 
-use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 
 use crate::Decimal;
 use crate::backtest::kernel::Observation;
 use crate::backtest::kernel::fnv1a128;
 use crate::types::action::OptionStyle;
+use crate::types::det_float::{decimal_to_f64, round_half_even_decimals};
 use crate::types::error::{MMError, MMResult};
 
 use super::features::{FeatureVector, PreviousRow, observation_features};
@@ -116,11 +119,12 @@ pub enum SlotFeature {
     /// Expiry instant minus the decision instant, in milliseconds; negative once the
     /// instant has passed and the series is still listed in the view.
     TimeToExpiry,
-    /// Observed mid minus the best bid, in ticks of the series. No value without both
-    /// sides.
-    BidOffset,
-    /// Best ask minus the observed mid, in ticks. No value without both sides.
-    AskOffset,
+    /// Half the observed spread, `(ask - bid) / 2`, in ticks of the series. No value
+    /// without both sides.
+    HalfSpread,
+    /// The delivered venue mark minus the observed mid, in ticks. No value without both
+    /// sides or without a mark.
+    MarkOffset,
     /// Size at the best bid, in lots. No value without a bid.
     BidSize,
     /// Size at the best ask, in lots. No value without an ask.
@@ -145,8 +149,8 @@ impl SlotFeature {
         Self::Present,
         Self::StrikeDistance,
         Self::TimeToExpiry,
-        Self::BidOffset,
-        Self::AskOffset,
+        Self::HalfSpread,
+        Self::MarkOffset,
         Self::BidSize,
         Self::AskSize,
         Self::VenueMark,
@@ -184,7 +188,7 @@ pub struct OptionsScales {
     pub strike_distance: Decimal,
     /// Divisor of [`SlotFeature::TimeToExpiry`], in milliseconds.
     pub time_to_expiry_ms: Decimal,
-    /// Divisor of [`SlotFeature::BidOffset`] and [`SlotFeature::AskOffset`], in ticks.
+    /// Divisor of [`SlotFeature::HalfSpread`] and [`SlotFeature::MarkOffset`], in ticks.
     pub offset_ticks: Decimal,
     /// Divisor of the book sizes, in lots: the profile depth.
     pub depth_lots: Decimal,
@@ -465,6 +469,7 @@ impl OptionsProfile {
             put_decimal(&mut out, value);
         }
         let hedge = self.hedge_space()?;
+        put_u16(&mut out, hedge.version);
         put_u64(&mut out, hedge.features.len() as u64);
         for feature in &hedge.features {
             put_u64(&mut out, feature.id.index() as u64);
@@ -528,13 +533,26 @@ impl OptionsProfile {
     ///
     /// # Errors
     ///
-    /// Returns [`MMError::InvalidConfiguration`] when two entries share an expiry symbol,
-    /// a strike and a style, or one expiry symbol has two instants.
+    /// Returns [`MMError::InvalidConfiguration`] when two entries of `listed` share an
+    /// expiry symbol, a strike and a style, or one expiry symbol has two instants, whether
+    /// or not they fall in the window. A strike whose distance to the mark overflows ranks
+    /// after every other strike.
     pub fn resolve_slots(
         &self,
         index_mark: Option<Decimal>,
         listed: &[ListedOption],
     ) -> MMResult<Vec<Option<usize>>> {
+        for (n, a) in listed.iter().enumerate() {
+            for b in listed.iter().skip(n.saturating_add(1)) {
+                if a.expiry_symbol == b.expiry_symbol && a.strike == b.strike && a.style == b.style
+                {
+                    return Err(config(format!(
+                        "series {} {} {:?} is listed twice",
+                        a.expiry_symbol, a.strike, a.style
+                    )));
+                }
+            }
+        }
         let mut slots = vec![None; self.option_slots()];
         let Some(mark) = index_mark else {
             return Ok(slots);
@@ -569,8 +587,9 @@ impl OptionsProfile {
             strikes.sort_unstable();
             strikes.dedup();
             strikes.sort_by(|a, b| {
-                let da = a.checked_sub(mark).map(|d| d.abs());
-                let db = b.checked_sub(mark).map(|d| d.abs());
+                let distance = |v: &Decimal| v.checked_sub(mark).map_or(Decimal::MAX, |d| d.abs());
+                let da = distance(a);
+                let db = distance(b);
                 da.cmp(&db).then(a.cmp(b))
             });
             for (k, strike) in strikes
@@ -579,19 +598,14 @@ impl OptionsProfile {
                 .enumerate()
             {
                 for style in [OptionStyle::Call, OptionStyle::Put] {
-                    let mut found = listed.iter().enumerate().filter(|(_, i)| {
+                    let first = listed.iter().position(|i| {
                         i.expiry_symbol == *symbol && i.strike == *strike && i.style == style
                     });
-                    let first = found.next().map(|(n, _)| n);
-                    if found.next().is_some() {
-                        return Err(config(format!(
-                            "series {symbol} {strike} {style:?} is listed twice"
-                        )));
-                    }
                     if let Some(slot) = self.slot_index(e, k, style)
-                        && let Some(cell) = slots.get_mut(slot) {
-                            *cell = first;
-                        }
+                        && let Some(cell) = slots.get_mut(slot)
+                    {
+                        *cell = first;
+                    }
                 }
             }
         }
@@ -928,27 +942,27 @@ impl SlotInput {
             .ok_or_else(|| numeric("time to expiry"))?;
         let to_expiry_ms = Decimal::try_from_i128_with_scale(to_expiry_ns, 6)
             .map_err(|_| numeric("time to expiry"))?;
-        let (bid_offset, ask_offset) = match (self.best_bid, self.best_ask) {
+        let (half_spread, mark_offset) = match (self.best_bid, self.best_ask) {
             (Some((bid, _)), Some((ask, _))) => {
                 let mid2 = bid.checked_add(ask).ok_or_else(|| numeric("mid"))?;
                 let tick2 = self
                     .tick_size
                     .checked_mul(Decimal::TWO)
                     .ok_or_else(|| numeric("tick"))?;
-                let bid2 = bid.checked_add(bid).ok_or_else(|| numeric("bid"))?;
-                let ask2 = ask.checked_add(ask).ok_or_else(|| numeric("ask"))?;
-                (
-                    Some(
-                        mid2.checked_sub(bid2)
+                let half = ask
+                    .checked_sub(bid)
+                    .and_then(|v| v.checked_div(tick2))
+                    .ok_or_else(|| numeric("half spread"))?;
+                let mark = match self.venue_mark {
+                    Some(m) => Some(
+                        m.checked_add(m)
+                            .and_then(|m2| m2.checked_sub(mid2))
                             .and_then(|v| v.checked_div(tick2))
-                            .ok_or_else(|| numeric("bid offset"))?,
+                            .ok_or_else(|| numeric("mark offset"))?,
                     ),
-                    Some(
-                        ask2.checked_sub(mid2)
-                            .and_then(|v| v.checked_div(tick2))
-                            .ok_or_else(|| numeric("ask offset"))?,
-                    ),
-                )
+                    None => None,
+                };
+                (Some(half), mark)
             }
             _ => (None, None),
         };
@@ -961,8 +975,8 @@ impl SlotInput {
                     .ok_or_else(|| numeric("strike distance"))?,
             ),
             Some(to_expiry_ms),
-            bid_offset,
-            ask_offset,
+            half_spread,
+            mark_offset,
             self.best_bid.map(|(_, size)| size),
             self.best_ask.map(|(_, size)| size),
             self.venue_mark,
@@ -1085,6 +1099,7 @@ impl OptionsKind {
 
 /// The instrument of an action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Lane {
     /// An option slot.
     Option(usize),
@@ -1243,12 +1258,24 @@ pub fn hedge_cap_lots(net_delta: Decimal, lot_size: Decimal) -> MMResult<u64> {
     if lot_size <= Decimal::ZERO {
         return Err(config(format!("lot size must be positive, got {lot_size}")));
     }
-    net_delta
-        .abs()
+    let target = net_delta.abs();
+    let mut cap = target
         .checked_div(lot_size)
         .map(|v| v.trunc())
         .and_then(|v| v.to_u64())
-        .ok_or_else(|| numeric("hedge cap"))
+        .ok_or_else(|| numeric("hedge cap"))?;
+    // The division rounds at 28 digits; settle the cap on exact products so that
+    // `cap * lot_size <= |net_delta| < (cap + 1) * lot_size`.
+    let lots = |n: u64| Decimal::from(n).checked_mul(lot_size);
+    while cap > 0 && lots(cap).is_none_or(|v| v > target) {
+        cap = cap.saturating_sub(1);
+    }
+    while let Some(next) = cap.checked_add(1)
+        && lots(next).is_some_and(|v| v <= target)
+    {
+        cap = next;
+    }
+    Ok(cap)
 }
 
 /// The Black Scholes delta at rate 0, rounded half to even to [`DELTA_DECIMALS`].
@@ -1287,10 +1314,36 @@ pub fn black_scholes_delta(
             _ => Decimal::ZERO,
         });
     }
-    let s = to_f64(spot)?;
-    let k = to_f64(strike)?;
-    let t = to_f64(tau)?;
-    let v = to_f64(sigma)?;
+    let (_, delta) = black_scholes_delta_unrounded(spot, strike, tau, sigma, style)?
+        .ok_or_else(|| numeric("delta"))?;
+    round_half_even_decimals(delta, DELTA_DECIMALS)
+}
+
+/// `d1` and the delta of [`black_scholes_delta`] before rounding, for a fixture that
+/// compares bits; `None` at or past expiry, where the delta is exact.
+///
+/// # Errors
+///
+/// As [`black_scholes_delta`].
+pub fn black_scholes_delta_unrounded(
+    spot: Decimal,
+    strike: Decimal,
+    tau: Decimal,
+    sigma: Decimal,
+    style: OptionStyle,
+) -> MMResult<Option<(f64, f64)>> {
+    for (name, value) in [("spot", spot), ("strike", strike), ("sigma", sigma)] {
+        if value <= Decimal::ZERO {
+            return Err(config(format!("{name} must be positive, got {value}")));
+        }
+    }
+    if tau <= Decimal::ZERO {
+        return Ok(None);
+    }
+    let s = decimal_to_f64(spot)?;
+    let k = decimal_to_f64(strike)?;
+    let t = decimal_to_f64(tau)?;
+    let v = decimal_to_f64(sigma)?;
     let numerator = libm::log(s / k) + ((v * v) * t) / 2.0;
     let denominator = v * libm::sqrt(t);
     let d1 = numerator / denominator;
@@ -1299,71 +1352,11 @@ pub fn black_scholes_delta(
         OptionStyle::Call => n,
         OptionStyle::Put => n - 1.0,
     };
-    round_half_even(delta, DELTA_DECIMALS)
-}
-
-/// `value` as the nearest `f64`, by Rust's correctly rounded parsing of its decimal form.
-fn to_f64(value: Decimal) -> MMResult<f64> {
-    let parsed: f64 = value
-        .normalize()
-        .to_string()
-        .parse()
-        .map_err(|_| numeric("decimal to f64"))?;
-    if parsed.is_finite() {
-        Ok(parsed)
+    if d1.is_finite() && delta.is_finite() {
+        Ok(Some((d1, delta)))
     } else {
-        Err(numeric("decimal to f64"))
+        Err(numeric("delta is not finite"))
     }
-}
-
-/// `x` rounded half to even to `decimals` places, from its exact binary value.
-///
-/// Rust prints the exact decimal expansion of an `f64` with enough digits (an `f64` has at
-/// most 1074 fractional digits), so the digit after the last kept one and whether anything
-/// follows it decide the rounding with no float arithmetic.
-fn round_half_even(x: f64, decimals: u32) -> MMResult<Decimal> {
-    if !x.is_finite() {
-        return Err(numeric("delta is not finite"));
-    }
-    let exact = format!("{:.1074}", x.abs());
-    let (int_part, frac) = exact.split_once('.').ok_or_else(|| numeric("delta"))?;
-    let digits = frac.as_bytes();
-    let keep = usize::try_from(decimals).map_err(|_| numeric("delta"))?;
-    let kept = frac.get(..keep).ok_or_else(|| numeric("delta"))?;
-    let next = digits.get(keep).copied().ok_or_else(|| numeric("delta"))?;
-    let rest_nonzero = digits
-        .get(keep.saturating_add(1)..)
-        .is_some_and(|rest| rest.iter().any(|d| *d != b'0'));
-    let truncated =
-        Decimal::from_str_exact(&format!("{int_part}.{kept}")).map_err(|_| numeric("delta"))?;
-    let odd = |d: &u8| d.checked_sub(b'0').is_some_and(|v| v & 1 == 1);
-    let last_odd = kept
-        .as_bytes()
-        .last()
-        .or_else(|| int_part.as_bytes().last())
-        .is_some_and(odd);
-    let up = match next.cmp(&b'5') {
-        Ordering::Greater => true,
-        Ordering::Less => false,
-        Ordering::Equal => rest_nonzero || last_odd,
-    };
-    let magnitude = if up {
-        truncated
-            .checked_add(Decimal::new(1, decimals))
-            .ok_or_else(|| numeric("delta"))?
-    } else {
-        truncated
-    };
-    let signed = if x.is_sign_negative() {
-        Decimal::ZERO
-            .checked_sub(magnitude)
-            .ok_or_else(|| numeric("delta"))?
-    } else {
-        magnitude
-    };
-    Ok(signed
-        .round_dp_with_strategy(decimals, RoundingStrategy::MidpointNearestEven)
-        .normalize())
 }
 
 fn normalize(value: Option<Decimal>, divisor: Decimal) -> MMResult<f32> {
@@ -1426,22 +1419,6 @@ fn numeric(what: &str) -> MMError {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
-
-    #[test]
-    fn rounding_is_half_even_on_the_exact_value() {
-        // 2^-10 = 0.0009765625 is a tie at 9 places: kept digit 2 is even.
-        assert_eq!(
-            round_half_even(0.000_976_562_5, 9).unwrap(),
-            dec!(0.000976562)
-        );
-        // 3 * 2^-10 = 0.0029296875: kept digit 7 is odd, so it rounds up.
-        assert_eq!(
-            round_half_even(0.002_929_687_5, 9).unwrap(),
-            dec!(0.002929688)
-        );
-        assert_eq!(round_half_even(-0.5, 9).unwrap(), dec!(-0.5));
-        assert_eq!(round_half_even(0.999_999_999_9, 9).unwrap(), dec!(1));
-    }
 
     #[test]
     fn at_the_money_call_and_put_differ_by_one() {

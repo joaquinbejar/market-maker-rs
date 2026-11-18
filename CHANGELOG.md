@@ -18,7 +18,9 @@ project follows [Semantic Versioning](https://semver.org/).
   `sqrt` and `erfc`, no fused multiply add, each delta rounded half to even to `1e-9`).
 - `doc/fixtures/rl_options.json` (`rl::RL_OPTIONS_FIXTURES`), checked in CI on `x86_64` and
   `aarch64`.
-- The `rl` feature depends on `libm`.
+- `libm` 0.2 is a dependency, with no default features.
+- `rl::black_scholes_delta_unrounded`: `d1` and the delta before rounding, for fixtures
+  that compare bits.
 
 ## [0.9.0] - 2026-11-17
 

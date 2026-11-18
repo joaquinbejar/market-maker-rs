@@ -219,7 +219,8 @@ pub use options::{
     OPTIONS_HEAD_COUNT, OPTIONS_KIND_COUNT, OPTIONS_OBSERVATION_SPACE_VERSION,
     OPTIONS_REWARD_VERSION, OptionPosition, OptionsAction, OptionsHead, OptionsKind,
     OptionsObservation, OptionsProfile, OptionsScales, RL_OPTIONS_FIXTURES, SLOT_FEATURE_COUNT,
-    SlotFeature, SlotInput, black_scholes_delta, hedge_cap_lots, net_delta,
+    SlotFeature, SlotInput, black_scholes_delta, black_scholes_delta_unrounded, hedge_cap_lots,
+    net_delta,
 };
 pub use profile::{
     ACTION_HEAD_COUNT, ACTION_HEAD_LAYOUT_VERSION, ACTION_KIND_COUNT, ActionHead, InstrumentAction,

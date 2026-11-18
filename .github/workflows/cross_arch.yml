@@ -1,4 +1,4 @@
-name: RL options fixtures across architectures
+name: Float fixtures across architectures
 
 on:
   push:
@@ -14,7 +14,7 @@ env:
 
 jobs:
   fixtures:
-    name: rl options fixtures (${{ matrix.arch }})
+    name: float fixtures (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
