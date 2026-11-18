@@ -6,6 +6,27 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Behavior changes (0.10.0)
+
+- `strategy::avellaneda_stoikov` is deterministic across targets, and its
+  outputs are bit identical on x86_64 and aarch64. All three quoting
+  functions return different values than 0.9.0:
+  - The reservation price and the inventory term `γ * σ² * (T - t)` of the
+    spread move: `σ²` is now `σ * σ` in `Decimal` instead of
+    `decimal_powi`, which went through `f64`.
+  - The adverse selection term moves: `ln(1 + γ/k)` is now `(γ/k) * L`
+    with `L = log1p(γ/k) / (γ/k)` from the `libm` crate, rounded half to
+    even to 12 significant digits (`LOG_RATIO_SIGNIFICANT_DIGITS`), instead
+    of the platform `ln` of `1 + γ/k` through `f64`. The change is about
+    1e-12 relative or less for `γ/k` up to about 4e17; a very small `γ/k` no
+    longer loses accuracy or collapses to zero.
+- The refusals are documented under `# Errors`: `InvalidMarketState` or
+  `InvalidConfiguration` for a non positive input, `NumericalError` when an
+  intermediate overflows `Decimal` or when `γ / k` underflows to zero at the
+  28 decimal places of `Decimal` (message "gamma / k underflows"), and
+  `InvalidQuoteGeneration` when the bid is not positive or not below the
+  ask.
+
 ### Added
 
 - `rl::OptionsProfile`: observation and action spaces of an options quoting agent over a
@@ -21,6 +42,11 @@ project follows [Semantic Versioning](https://semver.org/).
 - `libm` 0.2 is a dependency, with no default features.
 - `rl::black_scholes_delta_unrounded` (hidden from the docs): `d1` and the delta before
   rounding, a hook for fixtures that compare bits.
+- `doc/fixtures/avellaneda_stoikov.json`, embedded as
+  `strategy::avellaneda_stoikov::AVELLANEDA_STOIKOV_FIXTURES`: a grid of
+  inputs with the expected reservation price, spread, bid and ask (refusals
+  included), and a table of `log1p(x) / x` with its unrounded `f64` bits and
+  rounded value, checked on x86_64 and aarch64 in CI.
 
 ## [0.9.0] - 2026-11-17
 

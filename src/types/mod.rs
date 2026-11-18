@@ -21,5 +21,4 @@ pub mod action;
 pub mod fee;
 
 /// Conversions between `Decimal` and `f64` that give the same bits on every target.
-#[cfg_attr(not(feature = "rl"), allow(dead_code))]
 pub(crate) mod det_float;

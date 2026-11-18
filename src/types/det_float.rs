@@ -35,7 +35,6 @@ pub(crate) fn round_half_even_decimals(x: f64, decimals: u32) -> MMResult<Decima
 
 /// `x` rounded half to even to `significant` significant digits, from its exact binary
 /// value. Zero stays zero.
-#[allow(dead_code)] // for the strategy float paths
 pub(crate) fn round_half_even_significant(x: f64, significant: u32) -> MMResult<Decimal> {
     let (int_part, frac) = exact_digits(x)?;
     let digits: Vec<u8> = int_part.bytes().chain(frac.bytes()).collect();
