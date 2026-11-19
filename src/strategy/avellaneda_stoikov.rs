@@ -32,20 +32,64 @@
 //!   `σ = v * s`
 //! - `T - t`: milliseconds, converted to years of 365 days
 //! - `γ` and `k`: 1 / price units
-//! - `ln` and powers are evaluated through `f64`, so accuracy depends on the
-//!   inputs. On the validated fixtures the relative error is around 1e-15.
-//!   It degrades as `γ / k` shrinks, because `1 + γ / k` loses digits when it
-//!   is converted to `f64` before `ln`: at zero horizon with `γ = 1e-10` and
-//!   `k = 1` the spread is off by about 8e-8 relative, and below about 1e-16
-//!   the intensity term collapses to zero and quote generation fails. The
-//!   continuous quotes are not rounded to tick here
+//! - The continuous quotes are not rounded to tick here.
+//!
+//! ### Deterministic arithmetic
+//! Everything except the logarithm is `Decimal` arithmetic: `σ²` is
+//! `σ * σ`, and the products, sums and divisions are checked `Decimal`
+//! operations. Products and sums of these inputs are exact; a `Decimal`
+//! division rounds at 28 significant digits, so it is deterministic but not
+//! exact. The only float step is `ln(1 + γ/k)`, evaluated as `x * L` with
+//! `x = γ / k` (a `Decimal`) and
+//!
+//! ```text
+//! L = log1p(x) / x
+//! ```
+//!
+//! `x` goes to `f64` once, by parsing its decimal string (correctly rounded),
+//! `log1p` is the pure software [`libm`] implementation, and the division is
+//! a single IEEE 754 basic operation. No fused multiply add is used (never
+//! `mul_add`), and Rust never contracts float operations implicitly. That is
+//! what makes the value the same on every IEEE 754 target: determinism rests
+//! on `libm` plus IEEE basic operations. `L` is then rounded half to even to
+//! 12 significant digits
+//! ([`LOG_RATIO_SIGNIFICANT_DIGITS`](crate::strategy::avellaneda_stoikov::LOG_RATIO_SIGNIFICANT_DIGITS))
+//! and converted back to `Decimal` (for `γ / k` above about 4e17, where `L` is
+//! below 1e-16, it keeps the 28 decimal places of `Decimal` instead); the rounding only lowers the odds that a
+//! change of the last float bit (a different `libm` release, say) shows in
+//! the quotes. The adverse selection term is then
+//! `(2/γ) * x * L = (2/k) * L` in `Decimal`.
+//!
+//! `log1p` keeps full relative accuracy for a small `γ / k`, where
+//! `ln(1 + γ/k)` would first lose the digits of `γ/k` in the sum, and the
+//! significant digit rounding of `L` is relative, so the term carries a
+//! relative error of about 1e-12 for `γ / k` up to about 4e17. The outputs are
+//! bit identical on x86_64 and aarch64; `doc/fixtures/avellaneda_stoikov.json`
+//! ([`AVELLANEDA_STOIKOV_FIXTURES`](crate::strategy::avellaneda_stoikov::AVELLANEDA_STOIKOV_FIXTURES))
+//! pins them and is checked on both.
 
 use crate::Decimal;
-use crate::types::decimal::{decimal_ln, decimal_powi};
+use crate::types::det_float::{
+    decimal_to_f64, round_half_even_decimals, round_half_even_significant,
+};
 use crate::types::error::{MMError, MMResult};
 
 const SECONDS_PER_MILLISECOND: Decimal = Decimal::from_parts(1, 0, 0, false, 3); // 0.001
 const SECONDS_PER_YEAR: Decimal = Decimal::from_parts(31_536_000, 0, 0, false, 0); // 31_536_000
+
+/// Significant digits kept, half to even, of the float ratio `log1p(γ/k) / (γ/k)`
+/// (see the module docs).
+pub const LOG_RATIO_SIGNIFICANT_DIGITS: u32 = 12;
+
+/// Below this ratio (`γ / k` above about 4e17) the ratio keeps the 28 decimal places of
+/// `Decimal` instead of [`LOG_RATIO_SIGNIFICANT_DIGITS`] significant digits.
+const SIGNIFICANT_ROUNDING_FLOOR: f64 = 1e-16;
+
+/// The fixtures of `doc/fixtures/avellaneda_stoikov.json`: a grid of inputs with the
+/// expected reservation price, spread, bid and ask as decimal strings, identical on every
+/// target. `doc/fixtures/AVELLANEDA_STOIKOV.md` describes the format.
+pub const AVELLANEDA_STOIKOV_FIXTURES: &str =
+    include_str!("../../doc/fixtures/avellaneda_stoikov.json");
 
 /// Calculates the reservation price according to the Avellaneda-Stoikov model.
 ///
@@ -74,6 +118,9 @@ const SECONDS_PER_YEAR: Decimal = Decimal::from_parts(31_536_000, 0, 0, false, 0
 ///
 /// Returns `MMError::InvalidConfiguration` if:
 /// - risk_aversion is not positive or finite
+///
+/// Returns `MMError::NumericalError` if `σ²` or `q * γ * σ² * (T - t)` overflows
+/// `Decimal`, or the time to terminal in years does.
 ///
 /// # Examples
 ///
@@ -122,7 +169,7 @@ pub fn calculate_reservation_price(
     let time_to_terminal_years = years_to_terminal(time_to_terminal_ms)?;
 
     // Formula: r = s - q * γ * σ² * (T - t)
-    let volatility_squared = decimal_powi(volatility, 2)?;
+    let volatility_squared = checked(volatility.checked_mul(volatility), "volatility squared")?;
     let adjustment = checked(
         inventory
             .checked_mul(risk_aversion)
@@ -154,7 +201,13 @@ pub fn calculate_reservation_price(
 ///
 /// # Errors
 ///
-/// Returns `MMError::InvalidConfiguration` if any parameter is not positive or finite.
+/// Returns `MMError::InvalidConfiguration` if any parameter is not positive.
+///
+/// Returns `MMError::NumericalError` if:
+/// - `σ²`, the inventory risk term `γ * σ² * (T - t)`, `γ / k`, the adverse
+///   selection term or the spread overflows `Decimal`
+/// - `γ / k` underflows: it rounds to zero at the 28 decimal places of `Decimal`
+///   (for example `γ = 1e-20` with `k = 1e10`)
 ///
 /// # Examples
 ///
@@ -200,7 +253,7 @@ pub fn calculate_optimal_spread(
     let time_to_terminal_years = years_to_terminal(time_to_terminal_ms)?;
 
     // Formula: δ = γ * σ² * (T - t) + (2/γ) * ln(1 + γ/k)
-    let volatility_squared = decimal_powi(volatility, 2)?;
+    let volatility_squared = checked(volatility.checked_mul(volatility), "volatility squared")?;
     let inventory_risk_term = checked(
         risk_aversion
             .checked_mul(volatility_squared)
@@ -208,17 +261,13 @@ pub fn calculate_optimal_spread(
         "inventory risk term",
     )?;
 
-    let two = Decimal::from(2);
-    let adverse_selection_inner = checked(
-        risk_aversion
-            .checked_div(order_intensity)
-            .and_then(|x| Decimal::ONE.checked_add(x)),
-        "1 + gamma / k",
-    )?;
-    let adverse_selection_ln = decimal_ln(adverse_selection_inner)?;
+    // (2/γ) * ln(1 + γ/k) = (2/k) * L, with L = log1p(γ/k) / (γ/k).
+    let ratio = checked(risk_aversion.checked_div(order_intensity), "gamma / k")?;
+    let (_, log_ratio) = log1p_ratio_parts(ratio)?;
     let adverse_selection_term = checked(
-        two.checked_div(risk_aversion)
-            .and_then(|x| x.checked_mul(adverse_selection_ln)),
+        Decimal::TWO
+            .checked_div(order_intensity)
+            .and_then(|x| x.checked_mul(log_ratio)),
         "adverse selection term",
     )?;
 
@@ -256,7 +305,10 @@ pub fn calculate_optimal_spread(
 ///
 /// # Errors
 ///
-/// Returns errors from underlying calculations if inputs are invalid.
+/// Returns the errors of [`calculate_reservation_price`] and
+/// [`calculate_optimal_spread`], `MMError::NumericalError` if the half spread,
+/// bid or ask overflows, and `MMError::InvalidQuoteGeneration` if the bid is not
+/// below the ask or not positive.
 ///
 /// # Examples
 ///
@@ -324,6 +376,36 @@ pub fn calculate_optimal_quotes(
 /// Maps a failed checked `Decimal` operation to [`MMError::NumericalError`].
 fn checked(value: Option<Decimal>, what: &str) -> MMResult<Decimal> {
     value.ok_or_else(|| MMError::NumericalError(format!("avellaneda-stoikov: {what} overflows")))
+}
+
+/// `log1p(x) / x` for a positive `x`, through `libm` and IEEE basic operations only:
+/// the unrounded `f64` ratio and the ratio rounded half to even to
+/// [`LOG_RATIO_SIGNIFICANT_DIGITS`]. Exposed for the fixture tests.
+///
+/// # Errors
+///
+/// `MMError::NumericalError` with "gamma / k underflows" if `x` is not positive.
+#[doc(hidden)]
+pub fn log1p_ratio_parts(x: Decimal) -> MMResult<(f64, Decimal)> {
+    if x <= Decimal::ZERO {
+        return Err(MMError::NumericalError(
+            "avellaneda-stoikov: gamma / k underflows".to_string(),
+        ));
+    }
+    // `decimal_to_f64` is a correctly rounded parse, so the f64 does not depend on the
+    // target. A positive Decimal is at least 1e-28 and below 8e28, so it is a positive,
+    // finite f64.
+    let xf = decimal_to_f64(x)?;
+    let ratio = libm::log1p(xf) / xf;
+    // `ratio` lies in (8e-28, 1]; the rounding reads its exact binary value. Below 1e-16
+    // (x above about 4e17) 12 significant digits would need more than the 28 decimal
+    // places of `Decimal`, so the ratio keeps 28 places there.
+    let rounded = if ratio < SIGNIFICANT_ROUNDING_FLOOR {
+        round_half_even_decimals(ratio, Decimal::MAX_SCALE)?
+    } else {
+        round_half_even_significant(ratio, LOG_RATIO_SIGNIFICANT_DIGITS)?
+    };
+    Ok((ratio, rounded))
 }
 
 /// Time to terminal in years (365 day year), with checked arithmetic.

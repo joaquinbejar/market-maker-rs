@@ -30,8 +30,9 @@
 //! d = g*sig*sig*t + (D(2)/g) * (1 + g/k).ln()
 //! ```
 //!
-//! **Tolerance**: the implementation evaluates `ln` and `powi` through `f64`
-//! (`types::decimal`), so values are compared with a relative tolerance of
+//! **Tolerance**: the implementation evaluates `ln(1 + gamma / k)` as
+//! `(gamma / k) * log1p(gamma / k) / (gamma / k)` through `libm`, with the
+//! ratio rounded to 12 significant digits, so values are compared with a relative tolerance of
 //! `1e-12` (absolute `1e-12` near zero). The continuous solution is compared
 //! before any tick rounding; rounding to tick belongs to the execution layer
 //! and is checked in `avellaneda_stoikov_simulation.rs`.

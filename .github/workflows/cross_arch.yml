@@ -37,3 +37,9 @@ jobs:
 
       - name: Spaces and net delta against the published fixtures
         run: cargo test --features rl --test rl_options
+
+      - name: Avellaneda Stoikov quotes against the published fixtures
+        run: |
+          cargo test --test avellaneda_stoikov_golden
+          cargo test --test avellaneda_stoikov_fixtures
+          cargo test --lib strategy::avellaneda_stoikov
