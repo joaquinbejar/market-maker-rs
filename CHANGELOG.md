@@ -6,7 +6,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Behavior changes (0.10.0)
+## [0.10.0] - 2026-11-19
+
+### Behavior changes
 
 - `strategy::avellaneda_stoikov` is deterministic across targets, and its
   outputs are bit identical on x86_64 and aarch64. All three quoting
